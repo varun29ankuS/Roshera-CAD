@@ -603,8 +603,16 @@ fn compact_summary_reflects_the_full_certificate() {
             vec![EntityRef::Arc(arc)],
         ));
     }
+    // The arcs are drawn at radius 5 and dimensioned 6: as stored the
+    // slot is solvable but not sound. A solve makes it sound.
+    let stored = certify_sketch(&slot.sketch).compact();
+    assert!(!stored.sound, "unsolved radii are not sound: {stored:?}");
+    assert!(stored.solvable, "the radii are solvable: {stored:?}");
+    slot.sketch
+        .solve_constraints()
+        .expect("a fully-dimensioned slot solves");
     let clean = certify_sketch(&slot.sketch).compact();
-    assert!(clean.sound);
+    assert!(clean.sound, "the solved slot is sound: {clean:?}");
     assert!(clean.witnesses.is_empty());
     assert_eq!(clean.under_constrained_entities, 0);
     assert_eq!(clean.over_constrained_entities, 0);

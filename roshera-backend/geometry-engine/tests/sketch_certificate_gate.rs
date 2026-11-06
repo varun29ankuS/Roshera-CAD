@@ -910,3 +910,136 @@ fn adversarial_transitive_coincidence_vs_xcoordinate_conflict() {
         "transitive coincidence vs coordinate is unsound"
     );
 }
+
+/// SK-C2: SOUND means every constraint holds on the sketch AS STORED. A
+/// 10 x 7 rectangle carrying `Length(40)` on its bottom edge is consistent
+/// (a solve would fix it) but it is not the sketch the constraint describes,
+/// so it must not read SOUND.
+#[test]
+fn a_sketch_that_violates_a_stored_constraint_is_not_sound() {
+    let sketch = Sketch::new("unsolved".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let c = sketch.add_point(Point2d::new(10.0, 7.0));
+    let d = sketch.add_point(Point2d::new(0.0, 7.0));
+    let bottom = sketch.add_line(a, b).expect("a-b");
+    sketch.add_line(b, c).expect("b-c");
+    sketch.add_line(c, d).expect("c-d");
+    sketch.add_line(d, a).expect("d-a");
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Length(40.0),
+        vec![EntityRef::Line(bottom)],
+        ConstraintPriority::Required,
+    ));
+
+    let cert = certify_sketch(&sketch);
+
+    assert!(cert.constraint_consistent, "a lone Length is consistent");
+    assert!(
+        !cert.is_sound(),
+        "the stored edge is 10, its constraint says 40: the sketch is NOT sound: {}",
+        cert.summary()
+    );
+
+    // Solving it makes it sound: the gate is satisfaction, not the constraint.
+    sketch.solve_constraints().expect("a lone Length solves");
+    let solved = certify_sketch(&sketch);
+    assert!(
+        solved.is_sound(),
+        "after a solve the same sketch is sound: {}",
+        solved.summary()
+    );
+}
+
+/// SK-C2: a full-rank system with no real solution. A triangle whose three
+/// sides are dimensioned 1, 1 and 5 has exactly as many constraints as
+/// non-rigid freedoms (rank 3, nothing redundant), yet 1 + 1 < 5 so no
+/// triangle exists. The solver cannot reach zero residual and must say so
+/// (`Diverged`), and the sketch must be neither solvable nor sound.
+#[test]
+fn an_infeasible_full_rank_triangle_diverges_and_is_not_sound() {
+    let sketch = Sketch::new("impossible".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(1.0, 0.0));
+    let c = sketch.add_point(Point2d::new(0.5, 0.8));
+    let ab = sketch.add_line(a, b).expect("a-b");
+    let bc = sketch.add_line(b, c).expect("b-c");
+    let ca = sketch.add_line(c, a).expect("c-a");
+    for (line, len) in [(ab, 1.0), (bc, 1.0), (ca, 5.0)] {
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Length(len),
+            vec![EntityRef::Line(line)],
+            ConstraintPriority::Required,
+        ));
+    }
+
+    let cert = certify_sketch(&sketch);
+
+    assert!(
+        matches!(
+            cert.solver,
+            geometry_engine::sketch2d::SolverVerdict::Diverged { final_error } if final_error > 1e-3
+        ),
+        "sides 1, 1, 5 admit no triangle and nothing is redundant: the verdict is Diverged with the residual left over: {:?}",
+        cert.solver
+    );
+    assert!(!cert.solvable, "no triangle has sides 1, 1, 5: {cert:?}");
+    assert!(
+        !cert.constraints_satisfied,
+        "the stored sides are not 1, 1, 5"
+    );
+    assert!(
+        !cert.is_sound(),
+        "an impossible sketch must not read sound: {}",
+        cert.summary()
+    );
+}
+
+/// SK-C2: the checked door refuses a dimension value no geometry can have,
+/// with the same rules the edit path (`set_scalar`) already applies. A
+/// negative distance used to be stored and only surfaced as a residual.
+#[test]
+fn the_checked_door_refuses_an_impossible_dimension_value() {
+    let sketch = Sketch::new("values".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let line = sketch.add_line(a, b).expect("a-b");
+
+    for bad in [
+        DimensionalConstraint::Length(-5.0),
+        DimensionalConstraint::Length(0.0),
+        DimensionalConstraint::Length(f64::NAN),
+        DimensionalConstraint::Length(f64::INFINITY),
+    ] {
+        let refused = sketch.try_add_constraint(Constraint::new_dimensional(
+            bad.clone(),
+            vec![EntityRef::Line(line)],
+            ConstraintPriority::Required,
+        ));
+        assert!(
+            refused.is_err(),
+            "{bad:?} names no geometry and must be refused at the door"
+        );
+    }
+    assert_eq!(
+        sketch.all_constraints().len(),
+        0,
+        "a refused constraint is never stored"
+    );
+
+    let distance = sketch.try_add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Distance(-5.0),
+        vec![EntityRef::Point(a), EntityRef::Point(b)],
+        ConstraintPriority::Required,
+    ));
+    assert!(distance.is_err(), "Distance(-5) must be refused");
+
+    // A signed value stays admissible; a positive length is accepted.
+    sketch
+        .try_add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Length(12.0),
+            vec![EntityRef::Line(line)],
+            ConstraintPriority::Required,
+        ))
+        .expect("a positive length is a valid dimension");
+}

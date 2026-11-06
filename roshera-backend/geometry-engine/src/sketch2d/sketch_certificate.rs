@@ -521,10 +521,15 @@ pub struct SketchValidityCertificate {
 
 impl SketchValidityCertificate {
     /// The single can't-lie predicate: a sketch is SOUND when its constraint
-    /// system is satisfiable, its geometry is valid, and it does not
-    /// self-intersect. DOF freedom and open profiles are reported, not failed.
+    /// system is consistent, every constraint holds on the geometry AS
+    /// STORED, its geometry is valid, and it does not self-intersect. A
+    /// sketch a solve would fix is `solvable` but not yet sound. DOF freedom
+    /// and open profiles are reported, not failed.
     pub fn is_sound(&self) -> bool {
-        self.constraint_consistent && self.entities_valid && self.self_intersection_free
+        self.constraint_consistent
+            && self.constraints_satisfied
+            && self.entities_valid
+            && self.self_intersection_free
     }
 
     /// One-line human summary for the agent eye / blackboard.

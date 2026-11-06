@@ -376,6 +376,45 @@ impl DimensionalConstraint {
         }
         Ok(())
     }
+
+    /// Check the value this constraint carries against the rules
+    /// [`Self::set_scalar`] applies to an edit: finite, and > 0 for the
+    /// length-like kinds. `CenterOfMass` needs both coordinates finite.
+    /// One rule set for the add door and the edit door.
+    pub fn validate_value(&self) -> Result<(), DimensionalUpdateError> {
+        let value = match *self {
+            DimensionalConstraint::CenterOfMass { x, y } => {
+                for v in [x, y] {
+                    if !v.is_finite() {
+                        return Err(DimensionalUpdateError::InvalidValue {
+                            value: v,
+                            reason: "center of mass must be a finite point",
+                        });
+                    }
+                }
+                return Ok(());
+            }
+            DimensionalConstraint::Distance(v)
+            | DimensionalConstraint::Angle(v)
+            | DimensionalConstraint::Radius(v)
+            | DimensionalConstraint::Diameter(v)
+            | DimensionalConstraint::Length(v)
+            | DimensionalConstraint::XCoordinate(v)
+            | DimensionalConstraint::YCoordinate(v)
+            | DimensionalConstraint::Area(v)
+            | DimensionalConstraint::Perimeter(v)
+            | DimensionalConstraint::ArcLength(v)
+            | DimensionalConstraint::Curvature(v)
+            | DimensionalConstraint::Slope(v)
+            | DimensionalConstraint::OffsetDistance(v)
+            | DimensionalConstraint::AspectRatio(v)
+            | DimensionalConstraint::MinDistance(v)
+            | DimensionalConstraint::MaxDistance(v)
+            | DimensionalConstraint::MomentOfInertia(v) => v,
+        };
+        let mut probe = *self;
+        probe.set_scalar(value)
+    }
 }
 
 /// Failure modes for `ConstraintStore::update_dimensional_value` and

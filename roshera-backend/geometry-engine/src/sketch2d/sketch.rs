@@ -9,7 +9,9 @@
 
 use super::arc2d::ParametricArc2d;
 use super::circle2d::ParametricCircle2d;
-use super::constraints::{ConstraintStore, DimensionalUpdateError, EntityRef};
+use super::constraints::{
+    ConstraintStore, ConstraintType, DimensionalUpdateError, EntityRef, GeometricConstraint,
+};
 use super::ellipse2d::ParametricEllipse2d;
 use super::line2d::ParametricLine2d;
 use super::point2d::ParametricPoint2d;
@@ -987,8 +989,39 @@ impl Sketch {
     /// the wire surface and the kernel share one definition of shape.
     /// [`Sketch::add_constraint`] remains the unchecked internal door
     /// used by the ops layer, which mints only defined shapes.
+    ///
+    /// It also refuses a VALUE no geometry can have — a non-finite
+    /// number, or a non-positive length, radius or distance — with the
+    /// rules the edit door ([`DimensionalConstraint::set_scalar`])
+    /// already applies, so `Distance(-5)` cannot enter by adding where
+    /// it could not enter by editing.
+    ///
+    /// [`DimensionalConstraint::set_scalar`]: super::constraints::DimensionalConstraint::set_scalar
     pub fn try_add_constraint(&self, constraint: Constraint) -> Sketch2dResult<ConstraintId> {
         constraint.validate_shape()?;
+        let invalid = |value: f64, reason: &str| Sketch2dError::InvalidParameter {
+            parameter: format!("{:?}", constraint.constraint_type),
+            value: value.to_string(),
+            constraint: reason.to_string(),
+        };
+        match constraint.constraint_type {
+            ConstraintType::Dimensional(dim) => {
+                if let Err(e) = dim.validate_value() {
+                    return Err(match e {
+                        DimensionalUpdateError::InvalidValue { value, reason } => {
+                            invalid(value, reason)
+                        }
+                        other => invalid(f64::NAN, &other.to_string()),
+                    });
+                }
+            }
+            ConstraintType::Geometric(GeometricConstraint::IntersectionAngle(angle))
+                if !angle.is_finite() =>
+            {
+                return Err(invalid(angle, "angle must be a finite real number"));
+            }
+            ConstraintType::Geometric(_) => {}
+        }
         Ok(self.add_constraint(constraint))
     }
 
