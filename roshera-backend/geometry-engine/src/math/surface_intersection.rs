@@ -40,6 +40,7 @@
 use crate::math::bspline::KnotVector;
 use crate::math::nurbs::NurbsCurve;
 use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
+use crate::primitives::development::Development;
 use crate::primitives::surface::{Surface, SurfaceType};
 
 /// A single discretized point on a surface-surface intersection curve.
@@ -257,6 +258,21 @@ fn intersect_surfaces_marching(
             tolerance.distance(),
             t_start.elapsed(),
         );
+        for (k, s) in seeds.iter().enumerate() {
+            eprintln!(
+                "[ssi]   seed {k}: pos=({:.4},{:.4},{:.4}) tangent=({:.3},{:.3},{:.3}) uv1=({:.4},{:.4}) uv2=({:.4},{:.4})",
+                s.position.x,
+                s.position.y,
+                s.position.z,
+                s.tangent.x,
+                s.tangent.y,
+                s.tangent.z,
+                s.uv1.0,
+                s.uv1.1,
+                s.uv2.0,
+                s.uv2.1
+            );
+        }
     }
 
     // Coverage radius for consuming seeds that fall on an already-traced
@@ -326,6 +342,67 @@ fn ssi_trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ROSHERA_SSI_TRACE").is_ok_and(|v| v != "0"))
 }
 
+/// Total seed samples per surface (the historical 20 × 20).
+const SEED_BUDGET: usize = 400;
+
+/// Seed grid for surface 1 over its parameter box: `(n_u, n_v, cell)`, the
+/// sample counts along `u` and `v` and the world-space size of one cell.
+///
+/// A DEVELOPABLE surface (cylinder / cone, [`Development`]) is gridded in
+/// TRUE lengths: the counts are proportioned to the box's real extent along
+/// `u` (the widest iso-`v` arc) and `v` (the ruling length), and the cell size
+/// is the true cell diagonal. The historical rule — 20 × 20 in parameters,
+/// cell = (corner-to-corner distance)/20 — is anisotropic on these: a
+/// cylinder's (u_lo, v_lo) and (u_hi, v_hi) corners sit at the SAME angle, so
+/// the cell scale was the height alone while the angular step was R·2π/19,
+/// and on a wide short band a cut between angular samples was filtered out at
+/// every sample (the branch silently vanished). Any other surface keeps the
+/// historical grid unchanged.
+fn seed_grid(
+    surface1: &dyn Surface,
+    bounds1: ((f64, f64), (f64, f64)),
+) -> MathResult<(usize, usize, f64)> {
+    let ((u_lo, u_hi), (v_lo, v_hi)) = bounds1;
+    let corners = [(u_lo, v_lo), (u_hi, v_hi), (u_lo, v_hi), (u_hi, v_lo)];
+    if let Some(dev) = Development::for_region(surface1, &corners) {
+        // True length of an iso-v arc / iso-u ruling, measured in the
+        // development (exact for the straight ruling, chord-summed for the
+        // arc).
+        let arc_u = |v: f64| -> f64 {
+            const N: usize = 64;
+            (0..N)
+                .map(|k| {
+                    let ua = u_lo + (u_hi - u_lo) * k as f64 / N as f64;
+                    let ub = u_lo + (u_hi - u_lo) * (k + 1) as f64 / N as f64;
+                    let (xa, ya) = dev.to_development(ua, v);
+                    let (xb, yb) = dev.to_development(ub, v);
+                    ((xb - xa).powi(2) + (yb - ya).powi(2)).sqrt()
+                })
+                .sum()
+        };
+        let len_u = arc_u(v_lo).max(arc_u(v_hi));
+        let (xa, ya) = dev.to_development(u_lo, v_lo);
+        let (xb, yb) = dev.to_development(u_lo, v_hi);
+        let len_v = ((xb - xa).powi(2) + (yb - ya).powi(2)).sqrt();
+        if len_u > 0.0 && len_v > 0.0 {
+            let aspect = len_u / len_v;
+            let n_u = ((SEED_BUDGET as f64 * aspect).sqrt().round() as usize).clamp(4, 200);
+            let n_v = (SEED_BUDGET / n_u).clamp(4, 200);
+            let du = len_u / (n_u - 1) as f64;
+            let dv = len_v / (n_v - 1) as f64;
+            return Ok((n_u, n_v, (du * du + dv * dv).sqrt()));
+        }
+    }
+    let grid = 20usize;
+    let corner_ll = surface1.evaluate_full(u_lo, v_lo)?.position;
+    let corner_ur = surface1.evaluate_full(u_hi, v_hi)?.position;
+    Ok((
+        grid,
+        grid,
+        (corner_ur - corner_ll).magnitude() / grid as f64,
+    ))
+}
+
 /// Grid-sample surface 1 and project each sample onto surface 2; retain
 /// samples whose projection lands within distance tolerance.
 fn find_intersection_seeds(
@@ -335,7 +412,6 @@ fn find_intersection_seeds(
 ) -> MathResult<Vec<IntersectionPoint>> {
     let mut seeds = Vec::new();
 
-    let grid_size = 20usize;
     let raw_bounds = surface1.parameter_bounds();
 
     // Clamp infinite bounds (e.g. open cylinders/cones) to a finite sampling
@@ -353,19 +429,17 @@ fn find_intersection_seeds(
         clamp(raw_bounds.1 .0, raw_bounds.1 .1),
     );
 
-    // Characteristic world-space scale of a single grid cell on surface1 —
-    // used to size the seeding pre-filter so that cells that *straddle* the
-    // intersection still admit their nearest-sample as a candidate.
-    let corner_ll = surface1.evaluate_full(bounds1.0 .0, bounds1.1 .0)?.position;
-    let corner_ur = surface1.evaluate_full(bounds1.0 .1, bounds1.1 .1)?.position;
-    let world_diag = (corner_ur - corner_ll).magnitude();
-    let cell_scale = world_diag / grid_size as f64;
+    // Grid counts along u / v and the characteristic world-space size of one
+    // grid cell on surface1 — the cell size sizes the seeding pre-filter so
+    // that cells that *straddle* the intersection still admit their
+    // nearest-sample as a candidate.
+    let (grid_u, grid_v, cell_scale) = seed_grid(surface1, bounds1)?;
     let seed_prefilter = (cell_scale * 2.0).max(tolerance.distance() * 1e4);
 
-    for i in 0..grid_size {
-        for j in 0..grid_size {
-            let u_t = i as f64 / (grid_size - 1) as f64;
-            let v_t = j as f64 / (grid_size - 1) as f64;
+    for i in 0..grid_u {
+        for j in 0..grid_v {
+            let u_t = i as f64 / (grid_u - 1) as f64;
+            let v_t = j as f64 / (grid_v - 1) as f64;
             let u1 = bounds1.0 .0 + u_t * (bounds1.0 .1 - bounds1.0 .0);
             let v1 = bounds1.1 .0 + v_t * (bounds1.1 .1 - bounds1.1 .0);
 
@@ -558,7 +632,26 @@ fn find_closest_point_on_surface_from(
         let f_vv = surf_point.dv.magnitude_squared() + delta.dot(&surf_point.dvv);
 
         let det = f_uu * f_vv - f_uv * f_uv;
-        if det.abs() < 1e-10 {
+        // A DEGENERATE parametrisation here (a sphere pole, a cone apex): the
+        // first derivatives no longer span the tangent plane. The Hessian
+        // determinant does not show it — at a pole `∂P/∂u = 0` but
+        // `∂²P/∂u∂v ≠ 0`, so `det = −f_uv²` is far from zero and Newton takes
+        // pure-u steps, which do not move the point at all. The march then
+        // stalled at its seed ("stationary-at-floor", measured on a cylinder ∩
+        // sphere whose loop passes through the sphere's poles). The
+        // surface's own closest point is exact for the analytic surfaces and
+        // independent of the parametrisation; use it when available.
+        let span = surf_point.du.cross(&surf_point.dv).magnitude();
+        let scale = surf_point.du.magnitude_squared() + surf_point.dv.magnitude_squared();
+        let degenerate = !(span > 1e-9 * scale);
+        if degenerate || det.abs() < 1e-10 {
+            if let Ok((cu, cv)) = surface.closest_point(target, *tolerance) {
+                let position = surface.evaluate_full(cu, cv)?.position;
+                return Ok(ClosestPoint {
+                    position,
+                    uv: (cu, cv),
+                });
+            }
             break;
         }
 

@@ -39,10 +39,12 @@
 use super::edge_cache::EdgeSampleCache;
 use super::surface::polygon_signed_area_uv;
 use super::{MeshVertex, TessellationParams, TriangleMesh};
-use crate::math::{Point3, Tolerance, Vector3};
+use crate::math::{MathResult, Point3, Tolerance, Vector3};
+use crate::primitives::development::Development;
 use crate::primitives::face::Face;
 use crate::primitives::r#loop::{Loop, LoopType};
 use crate::primitives::surface::Surface;
+use crate::primitives::surface::SurfacePoint;
 use crate::primitives::topology_builder::BRepModel;
 
 /// Failure modes for `tessellate_curved_cdt`.
@@ -908,6 +910,136 @@ fn rebuild_outer_at_branch(
     })
 }
 
+/// The surface AS THE MESHER SEES IT after Step 0 — evaluated at the 2D chart
+/// coordinates the CDT works in. Steps 1–5 (handedness, Steiner seeding, CDT,
+/// refinement, emission) only ever evaluate the surface through this, so the
+/// chart can be swapped without touching them: the native `(u, v)` chart (the
+/// surface itself), or the isometric development of a developable surface
+/// ([`DevelopedChart`]).
+pub(crate) trait MeshChart {
+    fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint>;
+    fn point_at(&self, u: f64, v: f64) -> MathResult<Point3>;
+    fn normal_at(&self, u: f64, v: f64) -> MathResult<Vector3>;
+    fn is_developable(&self) -> bool;
+    fn type_name(&self) -> &'static str;
+    /// The surface's NATIVE `(u, v)` at chart `(u, v)`. Emitted mesh vertices
+    /// carry native coordinates — downstream checks (the certificate's
+    /// period-spanning boundary-crossing test) read them against the
+    /// surface's own period.
+    fn native_uv(&self, u: f64, v: f64) -> (f64, f64);
+    /// `true` when the chart's `v` axis is KNOWN to run along the surface's
+    /// straight rulings (iso-`u` lines are straight segments in 3D). The
+    /// seeding economy then needs no probe — and a probe can be fooled: a
+    /// ruling parametrised at non-uniform speed (the conformal cone's
+    /// `b = ln ρ`) is straight but its chart midpoint is not its 3D midpoint.
+    fn rulings_along_v(&self) -> bool;
+}
+
+impl MeshChart for dyn Surface {
+    fn native_uv(&self, u: f64, v: f64) -> (f64, f64) {
+        (u, v)
+    }
+    fn rulings_along_v(&self) -> bool {
+        false
+    }
+    fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
+        Surface::evaluate_full(self, u, v)
+    }
+    fn point_at(&self, u: f64, v: f64) -> MathResult<Point3> {
+        Surface::point_at(self, u, v)
+    }
+    fn normal_at(&self, u: f64, v: f64) -> MathResult<Vector3> {
+        Surface::normal_at(self, u, v)
+    }
+    fn is_developable(&self) -> bool {
+        Surface::is_developable(self)
+    }
+    fn type_name(&self) -> &'static str {
+        Surface::type_name(self)
+    }
+}
+
+/// The face's outward normal at chart `(u, v)`: the chart's surface normal
+/// signed by the face orientation (what `Face::normal_at` computes for the
+/// native chart).
+fn oriented_normal<S: MeshChart + ?Sized>(
+    surface: &S,
+    face: &Face,
+    u: f64,
+    v: f64,
+) -> MathResult<Vector3> {
+    Ok(surface.normal_at(u, v)? * face.orientation.sign())
+}
+
+/// A developable face meshed in its CONFORMAL development chart
+/// ([`Development::to_conformal`]): angles in the chart are true 3D angles,
+/// so Delaunay maximises the true minimum angle, and the surface's straight
+/// rulings stay on the chart's `v` axis, so the straight-direction seeding
+/// economy below still applies. The native `(θ, v)` chart is anisotropic (a
+/// θ unit is `r` long, and on a cone `r` varies across the face) — a triangle
+/// well-shaped there can be a 0.5° sliver in 3D with a facet normal tens of
+/// degrees off the surface (measured: cone minus a square prism, 48°,
+/// failing the certificate's mesh quality). The ISOMETRIC development was
+/// tried first: it destroys the ruling alignment, so the economy collapsed
+/// nothing and the cone faces were seeded with 25–41 k points each.
+///
+/// Built from the ALREADY-PROJECTED, periodicity-unwrapped boundary (Step 0
+/// stays in `(u, v)`, where the seam logic lives).
+pub(crate) struct DevelopedChart<'a> {
+    inner: &'a dyn Surface,
+    development: Development,
+}
+
+impl<'a> DevelopedChart<'a> {
+    /// `uv_points`: every projected (unwrapped) boundary sample of the face.
+    pub(crate) fn for_face(inner: &'a dyn Surface, uv_points: &[(f64, f64)]) -> Option<Self> {
+        Development::for_region(inner, uv_points).map(|development| Self { inner, development })
+    }
+
+    /// Native `(u, v)` → conformal chart.
+    pub(crate) fn to_chart(&self, (u, v): (f64, f64)) -> (f64, f64) {
+        self.development.to_conformal(u, v)
+    }
+}
+
+impl MeshChart for DevelopedChart<'_> {
+    fn evaluate_full(&self, x: f64, y: f64) -> MathResult<SurfacePoint> {
+        let ((u, v), j) = self.development.from_conformal(x, y);
+        let mut e = Surface::evaluate_full(self.inner, u, v)?;
+        let (pu, pv) = (e.du, e.dv);
+        e.du = pu * j[0][0] + pv * j[1][0];
+        e.dv = pu * j[0][1] + pv * j[1][1];
+        // Second derivatives in the development: not read by Steps 1–5
+        // (position, first derivatives and normal only); zero rather than a
+        // wrong chain-rule value.
+        e.duu = Vector3::ZERO;
+        e.duv = Vector3::ZERO;
+        e.dvv = Vector3::ZERO;
+        Ok(e)
+    }
+    fn point_at(&self, x: f64, y: f64) -> MathResult<Point3> {
+        let ((u, v), _) = self.development.from_conformal(x, y);
+        Surface::point_at(self.inner, u, v)
+    }
+    fn normal_at(&self, x: f64, y: f64) -> MathResult<Vector3> {
+        let ((u, v), _) = self.development.from_conformal(x, y);
+        Surface::normal_at(self.inner, u, v)
+    }
+    fn is_developable(&self) -> bool {
+        true
+    }
+    fn type_name(&self) -> &'static str {
+        Surface::type_name(self.inner)
+    }
+    fn native_uv(&self, x: f64, y: f64) -> (f64, f64) {
+        self.development.from_conformal(x, y).0
+    }
+    fn rulings_along_v(&self) -> bool {
+        // The conformal development puts every ruling on an iso-`a` line.
+        true
+    }
+}
+
 /// Compute the "chart handedness" of a surface at the centre of an
 /// unwrapped UV bbox. Returns `+1` if `(∂P/∂u × ∂P/∂v)` is parallel
 /// to the face's outward normal at that point, `-1` if anti-parallel.
@@ -927,7 +1059,7 @@ fn rebuild_outer_at_branch(
 /// the centre, default to `+1`. The resulting triangulation is still
 /// valid mesh data — only the per-triangle winding may be inverted,
 /// which `weld_mesh_watertight` tolerates within `weld_tolerance`.
-fn compute_chart_sign(surface: &dyn Surface, face: &Face, model: &BRepModel, bbox: UvBBox) -> i32 {
+fn compute_chart_sign<S: MeshChart + ?Sized>(surface: &S, bbox: UvBBox) -> i32 {
     let (u_lo, u_hi, v_lo, v_hi) = bbox;
     let u_mid = (u_lo + u_hi) * 0.5;
     let v_mid = (v_lo + v_hi) * 0.5;
@@ -940,19 +1072,14 @@ fn compute_chart_sign(surface: &dyn Surface, face: &Face, model: &BRepModel, bbo
         Ok(n) => n,
         Err(_) => return 1,
     };
-    let face_normal = match face.normal_at(u_mid, v_mid, &model.surfaces) {
+    // The chart-handedness question is whether `(∂u × ∂v)` agrees with the
+    // SURFACE's declared positive normal (the face orientation is applied
+    // separately at emission). Read from the chart, so a developed chart's
+    // handedness is judged in its own coordinates.
+    let intrinsic_normal = match surface.normal_at(u_mid, v_mid) {
         Ok(n) => n,
         Err(_) => return 1,
     };
-    // `face.normal_at` already factors in `face.orientation.sign()`,
-    // so we need to compare against the surface-intrinsic normal,
-    // which is `chart_normal` here. We un-do the orientation flip:
-    // `face.orientation.sign()` returns -1.0 for Backward faces,
-    // and `face.normal_at` multiplies the surface normal by that
-    // sign internally. The chart-handedness question is whether
-    // `(∂u × ∂v)` agrees with the *surface*'s declared positive
-    // direction — i.e. with `face_normal * face.orientation.sign()`.
-    let intrinsic_normal = face_normal * face.orientation.sign();
     if chart_normal.dot(&intrinsic_normal) >= 0.0 {
         1
     } else {
@@ -1016,8 +1143,8 @@ fn point_segment_distance_uv(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64
 /// fixed `cross` value (an iso-`v` line); `false` sweeps `v` at each fixed `u`.
 /// A straight direction has zero sagitta at every level, so it returns
 /// `min_segments` immediately — the developable economy is preserved.
-fn chord_segments(
-    surface: &dyn Surface,
+fn chord_segments<S: MeshChart + ?Sized>(
+    surface: &S,
     params: &TessellationParams,
     along_u: bool,
     p_lo: f64,
@@ -1058,8 +1185,8 @@ fn chord_segments(
     n.clamp(params.min_segments, params.max_segments)
 }
 
-fn generate_steiner_candidates(
-    surface: &dyn Surface,
+fn generate_steiner_candidates<S: MeshChart + ?Sized>(
+    surface: &S,
     bbox: UvBBox,
     outer_polygon: &[(f64, f64)],
     inner_polygons: &[Vec<(f64, f64)>],
@@ -1162,9 +1289,10 @@ fn generate_steiner_candidates(
     let u_straight = [v_lo, v_mid, v_hi]
         .iter()
         .all(|&v| straight_chain(pos(u_lo, v), pos(u_mid, v), pos(u_hi, v)));
-    let v_straight = [u_lo, u_mid, u_hi]
-        .iter()
-        .all(|&u| straight_chain(pos(u, v_lo), pos(u, v_mid), pos(u, v_hi)));
+    let v_straight = surface.rulings_along_v()
+        || [u_lo, u_mid, u_hi]
+            .iter()
+            .all(|&u| straight_chain(pos(u, v_lo), pos(u, v_mid), pos(u, v_hi)));
     // SCOPE, not idea. The collapse is right for a hole-free lateral: every
     // interior sample along a straight generator is collinear, adds no shape,
     // and the elongated triangles it leaves are safe because nothing can
@@ -1604,12 +1732,12 @@ pub(crate) fn run_cdt(
 ///
 /// Returns `Err(ProjectionFailed)` if `surface.point_at` fails on an
 /// interior point.
-fn resolve_position_3d(
+fn resolve_position_3d<S: MeshChart + ?Sized>(
     i: usize,
     outer: &ProjectedLoop,
     inners: &[ProjectedLoop],
     pts2d: &[(f64, f64)],
-    surface: &dyn Surface,
+    surface: &S,
 ) -> Result<Point3, CurvedCdtError> {
     // pts2d layout (matches run_cdt's append order):
     //   [0 .. outer.len())                              → outer boundary
@@ -1654,14 +1782,13 @@ fn resolve_position_3d(
 /// quality where it matters, none where it doesn't. Returns `false` on any
 /// evaluation failure (treat as not-failing → do not force refinement).
 #[allow(clippy::too_many_arguments)]
-fn triangle_fails_fidelity(
+fn triangle_fails_fidelity<S: MeshChart + ?Sized>(
     tri: &[usize; 3],
     pts2d: &[(f64, f64)],
     outer: &ProjectedLoop,
     inners: &[ProjectedLoop],
-    surface: &dyn Surface,
+    surface: &S,
     face: &Face,
-    model: &BRepModel,
     params: &TessellationParams,
 ) -> bool {
     let (ia, ib, ic) = (tri[0], tri[1], tri[2]);
@@ -1697,13 +1824,9 @@ fn triangle_fails_fidelity(
         (pa.z + pb.z + pc.z) / 3.0,
     );
     let chord_error = (p_centroid - plane_centroid).dot(&plane_normal).abs();
-    let normal_centroid = face
-        .normal_at(u_c, v_c, &model.surfaces)
-        .unwrap_or(plane_normal);
+    let normal_centroid = oriented_normal(surface, face, u_c, v_c).unwrap_or(plane_normal);
     let ang = |u: f64, v: f64| -> f64 {
-        let n = face
-            .normal_at(u, v, &model.surfaces)
-            .unwrap_or(plane_normal);
+        let n = oriented_normal(surface, face, u, v).unwrap_or(plane_normal);
         normal_centroid.dot(&n).clamp(-1.0, 1.0).acos()
     };
     let max_dev = ang(ua, va).max(ang(ub, vb)).max(ang(uc, vc));
@@ -1732,14 +1855,13 @@ fn triangle_fails_fidelity(
 /// contained) triangle, so a candidate is never lost — only relocated.
 ///
 /// Returns the (possibly empty) refinement set.
-fn collect_refinement_centroids(
+fn collect_refinement_centroids<S: MeshChart + ?Sized>(
     triangles: &[[usize; 3]],
     pts2d: &[(f64, f64)],
     outer: &ProjectedLoop,
     inners: &[ProjectedLoop],
-    surface: &dyn Surface,
+    surface: &S,
     face: &Face,
-    model: &BRepModel,
     params: &TessellationParams,
 ) -> Vec<((f64, f64), f64)> {
     use crate::math::circumcircle::{circumcircle_2d, radius_edge_ratio_sq};
@@ -1798,18 +1920,10 @@ fn collect_refinement_centroids(
 
         // Normal deviation: max angle between the surface normal at
         // the centroid and the three corner normals.
-        let normal_centroid = face
-            .normal_at(u_c, v_c, &model.surfaces)
-            .unwrap_or(plane_normal);
-        let normal_a = face
-            .normal_at(ua, va, &model.surfaces)
-            .unwrap_or(plane_normal);
-        let normal_b = face
-            .normal_at(ub, vb, &model.surfaces)
-            .unwrap_or(plane_normal);
-        let normal_c = face
-            .normal_at(uc, vc, &model.surfaces)
-            .unwrap_or(plane_normal);
+        let normal_centroid = oriented_normal(surface, face, u_c, v_c).unwrap_or(plane_normal);
+        let normal_a = oriented_normal(surface, face, ua, va).unwrap_or(plane_normal);
+        let normal_b = oriented_normal(surface, face, ub, vb).unwrap_or(plane_normal);
+        let normal_c = oriented_normal(surface, face, uc, vc).unwrap_or(plane_normal);
         let ang = |n: Vector3| -> f64 {
             let d = normal_centroid.dot(&n).clamp(-1.0, 1.0);
             d.acos()
@@ -2053,14 +2167,13 @@ fn boundary_keepout_uv(outer: &ProjectedLoop) -> f64 {
 /// quality defect (the CDT-β.1 18°/5 % spec), and skipping it left 0.57°
 /// slivers on the bump-patch fixture (Task 4C).
 #[allow(clippy::too_many_arguments)]
-fn scan_skinny_triangles(
+fn scan_skinny_triangles<S: MeshChart + ?Sized>(
     triangles: &[[usize; 3]],
     pts2d: &[(f64, f64)],
     outer: &ProjectedLoop,
     inners: &[ProjectedLoop],
-    surface: &dyn Surface,
+    surface: &S,
     face: &Face,
-    model: &BRepModel,
     params: &TessellationParams,
 ) -> Vec<((f64, f64), f64)> {
     use crate::math::circumcircle::{circumcircle_2d, radius_edge_ratio_sq};
@@ -2086,8 +2199,7 @@ fn scan_skinny_triangles(
         // (see the doc comment). Doubly-curved surfaces refine every skinny
         // triangle: the 18°/5 % spec is a mesh-quality bar, not a fidelity
         // bar.
-        if developable
-            && !triangle_fails_fidelity(tri, pts2d, outer, inners, surface, face, model, params)
+        if developable && !triangle_fails_fidelity(tri, pts2d, outer, inners, surface, face, params)
         {
             continue;
         }
@@ -2176,28 +2288,26 @@ fn scan_encroached_segments(
 /// diagnostic drops. Returns the augmentation set with `converged`
 /// signalling whether the pass produced any insertion.
 #[allow(clippy::too_many_arguments)]
-fn scan_one_pass(
+fn scan_one_pass<S: MeshChart + ?Sized>(
     triangles: &[[usize; 3]],
     pts2d: &[(f64, f64)],
     outer: &ProjectedLoop,
     inners: &[ProjectedLoop],
     outer_uv_len: usize,
     inner_uv_lens: &[usize],
-    surface: &dyn Surface,
+    surface: &S,
     face: &Face,
-    model: &BRepModel,
     params: &TessellationParams,
 ) -> RefinementDelta {
     // (1) α-style chord & normal violations (circumcenter insertion,
     //     centroid fallback).
-    let mut candidates = collect_refinement_centroids(
-        triangles, pts2d, outer, inners, surface, face, model, params,
-    );
+    let mut candidates =
+        collect_refinement_centroids(triangles, pts2d, outer, inners, surface, face, params);
 
     // (2) Skinny-triangle circumcenters (fidelity-gated on developables
     //     only).
     candidates.extend(scan_skinny_triangles(
-        triangles, pts2d, outer, inners, surface, face, model, params,
+        triangles, pts2d, outer, inners, surface, face, params,
     ));
 
     // (3) Batch-insertion conflict filter: greedy independent set in
@@ -2251,16 +2361,15 @@ fn scan_one_pass(
 /// Returns the final `(pts2d, triangles)` pair, ready for Step 5
 /// mesh emission.
 #[allow(clippy::too_many_arguments)]
-fn refine_to_convergence(
+fn refine_to_convergence<S: MeshChart + ?Sized>(
     outer: &ProjectedLoop,
     inners: &[ProjectedLoop],
     inner_polygons: &[Vec<(f64, f64)>],
     initial_steiner: Vec<(f64, f64)>,
     initial_pts2d: Vec<(f64, f64)>,
     initial_triangles: Vec<[usize; 3]>,
-    surface: &dyn Surface,
+    surface: &S,
     face: &Face,
-    model: &BRepModel,
     params: &TessellationParams,
 ) -> (Vec<(f64, f64)>, Vec<[usize; 3]>) {
     // Developable fast-path (cylinder / cone). A zero-Gaussian-curvature lateral
@@ -2308,7 +2417,6 @@ fn refine_to_convergence(
             &inner_uv_lens,
             surface,
             face,
-            model,
             params,
         );
         if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
@@ -2392,11 +2500,54 @@ pub(crate) fn tessellate_curved_cdt(
     cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) -> Result<(), CurvedCdtError> {
-    // Step 0 — boundary projection.
-    let (outer, inners, outer_bbox) = run_boundary_projection(face, model, cache, surface)?;
+    // Step 0 — boundary projection, in the surface's native (u, v) with the
+    // periodicity unwrap and branch re-cuts.
+    let (mut outer, mut inners, outer_bbox) = run_boundary_projection(face, model, cache, surface)?;
 
+    // A developable face (cylinder / cone) is then meshed in its ISOMETRIC
+    // development: the projected boundary is mapped into it and Steps 1–5 run
+    // in true lengths and angles (see `DevelopedChart`). Every other surface
+    // keeps its native chart unchanged.
+    let all_uv: Vec<(f64, f64)> = outer
+        .points_uv
+        .iter()
+        .chain(inners.iter().flat_map(|l| l.points_uv.iter()))
+        .copied()
+        .collect();
+    if let Some(chart) = DevelopedChart::for_face(surface, &all_uv) {
+        for lp in std::iter::once(&mut outer).chain(inners.iter_mut()) {
+            for p in &mut lp.points_uv {
+                *p = chart.to_chart(*p);
+            }
+        }
+        let bbox = outer.points_uv.iter().fold(
+            (
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ),
+            |(ul, uh, vl, vh), &(u, v)| (ul.min(u), uh.max(u), vl.min(v), vh.max(v)),
+        );
+        return mesh_in_chart(&chart, face, params, mesh, outer, inners, bbox);
+    }
+    mesh_in_chart(surface, face, params, mesh, outer, inners, outer_bbox)
+}
+
+/// Steps 1–5 of [`tessellate_curved_cdt`], in whichever chart the face is
+/// meshed in (native or developed): handedness, Steiner seeding, CDT,
+/// refinement, emission. `outer` / `inners` carry chart coordinates.
+fn mesh_in_chart<S: MeshChart + ?Sized>(
+    surface: &S,
+    face: &Face,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+    outer: ProjectedLoop,
+    inners: Vec<ProjectedLoop>,
+    outer_bbox: UvBBox,
+) -> Result<(), CurvedCdtError> {
     // Step 1 — chart handedness.
-    let chart_sign = compute_chart_sign(surface, face, model, outer_bbox);
+    let chart_sign = compute_chart_sign(surface, outer_bbox);
 
     // Step 2 — Steiner candidates on a curvature-driven grid.
     let inner_polygons: Vec<Vec<(f64, f64)>> = inners.iter().map(|p| p.points_uv.clone()).collect();
@@ -2467,7 +2618,6 @@ pub(crate) fn tessellate_curved_cdt(
         triangles,
         surface,
         face,
-        model,
         params,
     );
 
@@ -2476,11 +2626,11 @@ pub(crate) fn tessellate_curved_cdt(
     let vertex_base = mesh.vertices.len() as u32;
     for (i, &(u, v)) in final_pts2d.iter().enumerate() {
         let position = resolve_position_3d(i, &outer, &inners, &final_pts2d, surface)?;
-        let normal = face.normal_at(u, v, &model.surfaces).unwrap_or(Vector3::Z);
+        let normal = oriented_normal(surface, face, u, v).unwrap_or(Vector3::Z);
         mesh.add_vertex(MeshVertex {
             position,
             normal,
-            uv: Some((u, v)),
+            uv: Some(surface.native_uv(u, v)),
         });
     }
 
@@ -3008,7 +3158,7 @@ mod tests {
             .get(face.surface_id)
             .expect("surface must be present");
         let bbox: UvBBox = (0.0, 1.0, 0.0, 1.0);
-        let sign = compute_chart_sign(surface, face, &model, bbox);
+        let sign = compute_chart_sign(surface, bbox);
         assert_eq!(
             sign, 1,
             "right-handed flat NURBS patch must produce chart_sign = +1; got {sign}"
@@ -3033,7 +3183,7 @@ mod tests {
             .get(face.surface_id)
             .expect("surface must be present");
         let bbox: UvBBox = (0.0, 1.0, 0.0, 1.0);
-        let sign = compute_chart_sign(surface, face, &model, bbox);
+        let sign = compute_chart_sign(surface, bbox);
         assert_eq!(
             sign, -1,
             "LH-chart NURBS with Backward face orientation must produce chart_sign = -1; got {sign}"
@@ -3583,16 +3733,8 @@ mod tests {
             loop_type: LoopType::Outer,
         };
 
-        let circs = scan_skinny_triangles(
-            &triangles,
-            &pts2d,
-            &outer,
-            &[],
-            surface,
-            face_ref,
-            &model,
-            &params,
-        );
+        let circs =
+            scan_skinny_triangles(&triangles, &pts2d, &outer, &[], surface, face_ref, &params);
         assert!(
             circs.is_empty(),
             "a skinny but geometrically faithful (flat-surface) triangle must NOT \

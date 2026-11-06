@@ -173,6 +173,44 @@ fn cone_cut_by_a_square_prism_keeps_a_sound_apex_cap() {
     assert_sound_built_and_placed(&mut m, res, "cone ∩ square prism");
 }
 
+/// cone minus the same square prism: the complement — the eight regions
+/// outside the walls kept, the apex cap removed, a square hole through the
+/// base. Volume = cone − (cone ∩ prism).
+/// RED 2026-11-05 (mesh quality only): brep_valid / watertight / oriented /
+/// self-x-free all TRUE and the volume exact, but mesh_quality_clean=false —
+/// curved-CDT slivers (min angle ~0.5°) in the side strips just above the base
+/// rim: a row of interior Steiner points meets one side-hyperbola sample.
+/// Passed with the old cubic-FIT hyperbola (luck of sample positions); exact
+/// conics (single-span, multi-span, arc-length spans) all leave the sliver.
+#[test]
+fn cone_minus_a_square_prism_is_sound() {
+    let mut m = BRepModel::new();
+    let cone = sid(TopologyBuilder::new(&mut m)
+        .create_cone_3d(Point3::ORIGIN, Vector3::Z, 8.0, 0.0, 10.0)
+        .expect("cone"));
+    let prism = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(6.0, 6.0, 30.0)
+        .expect("prism"));
+    let res = boolean_operation(
+        &mut m,
+        cone,
+        prism,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("cone minus square prism");
+    let sqrt2 = std::f64::consts::SQRT_2;
+    let int_r = 4.0 * 27.0 * (sqrt2 + (1.0 + sqrt2).ln()) / 3.0;
+    let cone_v = std::f64::consts::PI * 64.0 * 10.0 / 3.0;
+    assert_volume(
+        &mut m,
+        res,
+        cone_v - (360.0 - 1.25 * int_r),
+        "cone minus square prism",
+    );
+    assert_sound_built_and_placed(&mut m, res, "cone minus square prism");
+}
+
 /// torus(R10, r3, axis Z) minus everything above z = 1: the torus face left
 /// is bounded by two major circles at z = 1 and runs the LONG way round the
 /// tube (≈219°) — the arc the parameter-bounds grid could get backwards.
