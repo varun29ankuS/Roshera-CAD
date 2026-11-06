@@ -123,6 +123,38 @@ with the kernel items (one kernel + one UX), so neither side waits weeks.
 
 ## The queue (two a day)
 
+### Now — large imports (Varun 2026-11-06, "add the two items and solve them")
+
+The robot arm never reached the live viewport: the server ran out of memory
+registering 572 imported parts, and a client cut-off left 33 of them in the
+scene while the model held all of them.
+
+- **IMP-1 An import lands whole or not at all.** `import_step_geometry`
+  merges every solid into the live model, then registers them one by one
+  across `.await`s; when the client disconnects axum drops the handler
+  future mid-loop, so the model holds solids the scene never shows. Fix: the
+  merge → certify → register pipeline runs in a detached task the request
+  only awaits (a dropped request no longer cancels it). A server crash
+  mid-import is a durability question, not this one.
+- **IMP-2 Registering imported parts is fast and light.** Per part the
+  route builds the full mesh as a JSON value into the response (neither
+  client reads it), certifies under the model write lock, and each
+  certificate validates the WHOLE model then keeps that part's errors
+  (`validate_solid_scoped`) and rescans every face for orphans — quadratic
+  in the part count. Fix: drop the mesh from the response; certify a batch
+  with one model-level pass and per-part checks in bounded parallel; heavy
+  work off the async workers.
+
+  Status 2026-11-06: IMP-1 done (bf4d7554). IMP-2 partly done (4c98497c,
+  bf4d7554): batch certify + mesh on a 4-thread pool, mesh dropped from the
+  response, snapshot off the async workers. Robot arm, debug: importer
+  1028 s -> 244 s; batch certify of 572 parts 270 s; server peak 616 MB
+  (it never was the memory hog). The live import still had not finished
+  after 28 min; the unmeasured step is warming mass properties for 572
+  parts. Next: time that, then re-run live (release build, or with
+  CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1 so the run is not reaped).
+
+
 ### Day 1 — sketch certificate honesty
 
 1. **SK-C1 Certificate certifies a re-solved copy, not the stored sketch.**
