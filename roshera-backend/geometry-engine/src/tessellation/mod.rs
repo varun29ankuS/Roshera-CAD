@@ -111,6 +111,28 @@ impl TessellationParams {
         }
     }
 
+    /// Parameters for the mesh that mass properties integrate over:
+    /// [`Self::fine`] with its maximum edge length floored at
+    /// [`MASS_PROPERTIES_EDGE_FLOOR`] of the part's size.
+    ///
+    /// `fine()`'s 0.01 mm edge length is absolute, so on any part much
+    /// larger than a millimetre it pins every curved direction at the
+    /// segment cap. A 20 mm gear from the robot-arm assembly integrated
+    /// over 1.7 million triangles (1006 s, debug); floored, 69 thousand
+    /// (20 s), with the volume moving 1e-4 relative — fifty times inside
+    /// the 5e-3 bound mass properties report. Chord tolerance, angle and
+    /// segment limits stay `fine()`'s: those set the accuracy, the edge
+    /// length only sets element size. (`tessellate_solid` already floors
+    /// the chord the same way.)
+    pub fn mass_properties(solid: &Solid, model: &BRepModel) -> Self {
+        let fine = Self::fine();
+        let floor = solid_extent(solid, model) * MASS_PROPERTIES_EDGE_FLOOR;
+        Self {
+            max_edge_length: fine.max_edge_length.max(floor),
+            ..fine
+        }
+    }
+
     /// Parameters for the LIVE viewport broadcast — the mesh the server
     /// tessellates after every interactive geometry op and pushes to the
     /// frontend. `default()`'s 1-micron chord (and up to 100 segments per
@@ -241,6 +263,12 @@ fn solid_extent(solid: &Solid, model: &BRepModel) -> f64 {
     let d = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
     (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6)
 }
+
+/// Floor on the mass-properties mesh's edge length, as a fraction of the
+/// part's size (see [`TessellationParams::mass_properties`]). Measured on
+/// the robot arm's gear: 0.2 % meshed in 44 s, 0.5 % in 20 s, 1 % in 40 s
+/// (more refinement), each within 1e-4 of the unfloored volume.
+pub const MASS_PROPERTIES_EDGE_FLOOR: f64 = 5.0e-3;
 
 /// Most worker threads [`tessellate_solids`] uses. Each worker holds one
 /// solid's mesh while it builds, so this bounds peak memory as well as CPU.

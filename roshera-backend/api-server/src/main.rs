@@ -5902,10 +5902,9 @@ async fn register_imported_solids(
     let heavy = tokio::task::spawn_blocking(move || {
         let model = &mut *guard;
         // Mass properties first: installing that cache is a mutable touch
-        // that would clear a certificate computed before it.
-        for &id in &ids {
-            let _ = model.calculate_solid_volume(id);
-        }
+        // that would clear a certificate computed before it. One batch on
+        // a bounded pool, not one part at a time (IMP-2).
+        model.calculate_solid_volumes(&ids);
         let certs = model.certify_solids(&ids);
         let certified: Vec<u32> = certs.iter().map(|(id, _)| *id).collect();
         let mut meshes: std::collections::HashMap<u32, _> =

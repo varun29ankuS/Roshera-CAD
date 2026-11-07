@@ -1,0 +1,117 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+//! IMP-2: the mesh that mass properties integrate over scales with the part.
+//!
+//! `fine()` carries an ABSOLUTE 0.01 mm maximum edge length. The chord
+//! tolerance was already floored to the part's size, the edge length was
+//! not, so on a 20 mm gear from the robot-arm assembly every curved face
+//! hit the 200-segment cap and the volume mesh came out at 1.7 million
+//! triangles (1006 s, debug) against 69 thousand (20 s) with the edge
+//! length floored at 0.5 % of the part — for a volume change of 1e-4
+//! relative, fifty times inside the 5e-3 bound mass properties claim.
+
+use geometry_engine::math::{Point3, Vector3};
+use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+use geometry_engine::primitives::solid::SolidId;
+use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+use geometry_engine::tessellation::{tessellate_solid, TessellationParams, TriangleMesh};
+
+fn solid(id: GeometryId) -> SolidId {
+    match id {
+        GeometryId::Solid(s) => s,
+        other => panic!("expected a solid, got {other:?}"),
+    }
+}
+
+/// A 20 mm cube with a 4 mm through-bore along z: trimmed faces, so its
+/// mass properties take the mesh path, with straight edges well short of
+/// the part's diagonal and an exact answer to check against.
+fn bored_block() -> (BRepModel, SolidId) {
+    let mut model = BRepModel::new();
+    let block = solid(
+        TopologyBuilder::new(&mut model)
+            .create_box_3d(20.0, 20.0, 20.0)
+            .expect("block"),
+    );
+    let bore = solid(
+        TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(
+                Point3::new(0.0, 0.0, -15.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                4.0,
+                30.0,
+            )
+            .expect("bore"),
+    );
+    let result = boolean_operation(
+        &mut model,
+        block,
+        bore,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("bored block");
+    (model, result)
+}
+
+fn mesh_volume(mesh: &TriangleMesh) -> f64 {
+    mesh.triangles
+        .iter()
+        .map(|t| {
+            let a = mesh.vertices[t[0] as usize].position;
+            let b = mesh.vertices[t[1] as usize].position;
+            let c = mesh.vertices[t[2] as usize].position;
+            (a.x * (b.y * c.z - b.z * c.y) - a.y * (b.x * c.z - b.z * c.x)
+                + a.z * (b.x * c.y - b.y * c.x))
+                / 6.0
+        })
+        .sum()
+}
+
+#[test]
+fn the_mass_properties_mesh_edge_length_is_floored_to_the_part_size() {
+    let (model, id) = bored_block();
+    let part = model.solids.get(id).expect("part");
+    let params = TessellationParams::mass_properties(part, &model);
+    let fine = TessellationParams::fine();
+    assert!(
+        params.max_edge_length > fine.max_edge_length,
+        "a 20 mm part floors the 0.01 mm edge length: got {}",
+        params.max_edge_length
+    );
+    // Only the edge length moves: the accuracy controls stay `fine()`'s.
+    assert_eq!(params.chord_tolerance, fine.chord_tolerance);
+    assert_eq!(params.max_angle_deviation, fine.max_angle_deviation);
+    assert_eq!(params.max_segments, fine.max_segments);
+}
+
+#[test]
+fn volume_is_integrated_on_the_size_floored_mesh() {
+    let (mut model, id) = bored_block();
+    let expected = {
+        let part = model.solids.get(id).expect("part");
+        let params = TessellationParams::mass_properties(part, &model);
+        mesh_volume(&tessellate_solid(part, &model, &params))
+    };
+    let volume = model.calculate_solid_volume(id).expect("volume");
+    assert!(
+        (volume - expected).abs() <= 1e-9 * expected.abs(),
+        "mass properties must integrate the size-floored mesh: \
+         volume {volume} vs that mesh's {expected}"
+    );
+}
+
+#[test]
+fn the_floored_volume_keeps_the_claimed_accuracy() {
+    let (mut model, id) = bored_block();
+    let exact = 20.0_f64.powi(3) - std::f64::consts::PI * 4.0 * 4.0 * 20.0;
+    let volume = model.calculate_solid_volume(id).expect("volume");
+    let rel = (volume - exact).abs() / exact;
+    assert!(
+        rel <= 5e-3,
+        "volume {volume} vs exact {exact}: relative error {rel} exceeds the \
+         5e-3 bound mass properties report"
+    );
+}

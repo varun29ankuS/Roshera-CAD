@@ -100,6 +100,45 @@ fn a_batch_certificate_equals_the_certificate_each_solid_gets_alone() {
     assert_eq!(again, batch, "an unmutated model certifies identically");
 }
 
+/// IMP-2: `calculate_solid_volumes` computes a batch's mass properties in
+/// parallel and must give every solid exactly the volume (and the cached
+/// mass properties behind it) `calculate_solid_volume` gives it alone —
+/// the box takes the exact-polyhedron path, the cylinder and sphere the
+/// mesh path, and the torn box whatever the solo call does with it.
+#[test]
+fn a_batch_of_volumes_equals_each_solid_measured_alone() {
+    let (mut batch_model, ids, _) = scene();
+    let batch = batch_model.calculate_solid_volumes(&ids);
+    assert_eq!(
+        batch.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        ids,
+        "every id measured, in input order"
+    );
+    for (id, volume) in &batch {
+        let (mut alone_model, _, _) = scene();
+        let alone = alone_model.calculate_solid_volume(*id);
+        assert_eq!(*volume, alone, "solid {id}: batch volume equals solo");
+        // The batch installs the same cache the solo call does: the next
+        // read on the batch model is the solo model's cached value.
+        assert_eq!(
+            batch_model.calculate_solid_surface_area(*id),
+            alone_model.calculate_solid_surface_area(*id),
+            "solid {id}: the cached mass properties match"
+        );
+    }
+
+    // Volumes first, then certificates: the certificates survive, so a
+    // registration that warms volumes and then certifies keeps its verdicts.
+    let certs = batch_model.certify_solids(&ids);
+    for (id, cert) in &certs {
+        assert_eq!(
+            batch_model.cached_soundness(*id),
+            Some(cert.is_sound()),
+            "solid {id}: certificate still cached after the volume batch"
+        );
+    }
+}
+
 /// IMP-2: `tessellate_solids` meshes a batch in parallel and must hand back,
 /// for every solid, exactly the mesh `tessellate_solid` builds alone, in
 /// input order.

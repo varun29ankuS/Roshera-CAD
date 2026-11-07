@@ -47,6 +47,11 @@ pub(crate) const CERTIFICATE_MESH_WELD_EPS: f64 = 1e-6;
 /// this bounds the batch's peak memory as well as its CPU share.
 const CERTIFY_BATCH_THREADS: usize = 4;
 
+/// Most worker threads [`BRepModel::calculate_solid_volumes`] uses. Each
+/// worker holds one solid's mass-properties mesh while it integrates, so
+/// this bounds peak memory as well as CPU.
+const MASS_PROPERTIES_BATCH_THREADS: usize = 4;
+
 /// Verify a computed mass-properties result against the PHYSICAL contract of a
 /// real rigid body, returning `Err(reason)` with a machine-readable cause when
 /// any check fails so the caller can REFUSE (rather than emit a lie).
@@ -4625,6 +4630,19 @@ impl BRepModel {
                 return Some(cached.clone());
             }
         }
+        let props = self.measure_mass_properties(solid_id)?;
+        if let Some(solid) = self.solids.get_mut(solid_id) {
+            solid.install_mass_props_cache(props.clone());
+        }
+        Some(props)
+    }
+
+    /// The uncached measurement behind [`Self::compute_solid_mass_properties`]
+    /// — read-only, so a batch can run it for many solids in parallel.
+    fn measure_mass_properties(
+        &self,
+        solid_id: u32,
+    ) -> Option<crate::primitives::solid::SolidMassProperties> {
         // The robust workhorse: mesh Tonon over the fine tessellation, valid
         // for arbitrary curved/trimmed geometry. It is both the fallback and
         // the independent oracle the exact upgrade cross-checks against.
@@ -4638,14 +4656,76 @@ impl BRepModel {
         // analytic path off the hot route for trimmed/curved solids. Trimmed or
         // curved solids do NOT qualify and keep the honest mesh estimate — the
         // kernel refuses to claim an exactness it cannot back.
-        let props = self
-            .try_exact_polyhedron_mass_properties(solid_id, &mesh)
-            .unwrap_or(mesh);
+        Some(
+            self.try_exact_polyhedron_mass_properties(solid_id, &mesh)
+                .unwrap_or(mesh),
+        )
+    }
 
-        if let Some(solid) = self.solids.get_mut(solid_id) {
-            solid.install_mass_props_cache(props.clone());
+    /// [`Self::calculate_solid_volume`] for many solids at once: each
+    /// solid's mass properties measured in parallel on a small bounded pool,
+    /// then installed in its cache exactly as the solo call installs them.
+    /// Ids not in the model are skipped; the rest come back in input order
+    /// with the volume the solo call returns.
+    ///
+    /// Installing the mass-properties cache is a mutable touch that clears
+    /// a solid's cached certificate, so a caller that wants both runs this
+    /// FIRST and [`Self::certify_solids`] after. Used where a whole set of
+    /// parts is measured at once: registering an imported assembly, and the
+    /// evidence pack's every-part listing.
+    pub fn calculate_solid_volumes(
+        &mut self,
+        solid_ids: &[SolidId],
+    ) -> Vec<(SolidId, Option<f64>)> {
+        let present: Vec<SolidId> = solid_ids
+            .iter()
+            .copied()
+            .filter(|&id| self.solids.get(id).is_some())
+            .collect();
+        let cold: Vec<SolidId> = present
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.solids
+                    .get(id)
+                    .map(|s| s.cached_mass_props_ref().is_none())
+                    .unwrap_or(false)
+            })
+            .collect();
+        let mut measured: std::collections::HashMap<SolidId, Option<f64>> =
+            std::collections::HashMap::with_capacity(cold.len());
+        if !cold.is_empty() {
+            let this: &Self = self;
+            let work = || {
+                use rayon::prelude::*;
+                cold.par_iter()
+                    .map(|&id| (id, this.measure_mass_properties(id)))
+                    .collect::<Vec<_>>()
+            };
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .clamp(1, MASS_PROPERTIES_BATCH_THREADS);
+            let computed = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+                Ok(pool) => pool.install(work),
+                Err(_) => work(),
+            };
+            for (id, props) in computed {
+                // Same as the solo call: a refused measurement installs
+                // nothing and reads back `None`.
+                measured.insert(id, props.as_ref().map(|p| p.volume));
+                if let (Some(props), Some(solid)) = (props, self.solids.get_mut(id)) {
+                    solid.install_mass_props_cache(props);
+                }
+            }
         }
-        Some(props)
+        present
+            .into_iter()
+            .map(|id| match measured.get(&id) {
+                Some(volume) => (id, *volume),
+                None => (id, self.calculate_solid_volume(id)),
+            })
+            .collect()
     }
 
     /// Attempt an EXACT analytic mass-properties result for an untrimmed
@@ -4761,10 +4841,13 @@ impl BRepModel {
         &self,
         solid_id: u32,
     ) -> Option<crate::primitives::solid::SolidMassProperties> {
-        self.mesh_based_mass_properties_at(
-            solid_id,
-            &crate::tessellation::TessellationParams::fine(),
-        )
+        // `fine()` accuracy on a mesh whose element size scales with the
+        // part — see `TessellationParams::mass_properties` (IMP-2).
+        let params = crate::tessellation::TessellationParams::mass_properties(
+            self.solids.get(solid_id)?,
+            self,
+        );
+        self.mesh_based_mass_properties_at(solid_id, &params)
     }
 
     /// Audit-quality analytic volume — the divergence-theorem mesh volume at

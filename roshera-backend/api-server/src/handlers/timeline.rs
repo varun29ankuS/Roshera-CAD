@@ -3161,6 +3161,10 @@ pub async fn get_evidence_pack(
             .iter()
             .map(|(id, solid)| (id, solid.name.clone()))
             .collect();
+        // Measure every part in one bounded parallel batch; the per-part
+        // `mass_properties_for` below then reads each solid's cache.
+        let ids: Vec<u32> = seeds.iter().map(|(id, _)| *id).collect();
+        model.calculate_solid_volumes(&ids);
         let mut parts = Vec::with_capacity(seeds.len());
         for (solid_id, name) in seeds {
             let uuid = state.get_uuid(solid_id).map(|u| u.to_string());

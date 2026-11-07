@@ -151,8 +151,18 @@ scene while the model held all of them.
   1028 s -> 244 s; batch certify of 572 parts 270 s; server peak 616 MB
   (it never was the memory hog). The live import still had not finished
   after 28 min; the unmeasured step is warming mass properties for 572
-  parts. Next: time that, then re-run live (release build, or with
-  CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1 so the run is not reaped).
+  parts.
+
+  2026-11-07: measured — warming the volumes took 2801 s (debug), 2520 s
+  of it on three copies of one 20 mm part: `fine()`'s ABSOLUTE 0.01 mm
+  edge length pinned its 38 NURBS faces at the segment cap, 1.7 M
+  triangles per copy (1006 s). Fix: the mass-properties mesh floors its
+  edge length at 0.5 % of the part (`TessellationParams::mass_properties`):
+  69 k triangles, 20 s, volume moved 1e-4 relative (bound reported: 5e-3).
+  Plus `calculate_solid_volumes`, the batch on a 4-thread pool, wired into
+  import registration and the evidence pack (which looped every part the
+  same way). Owed: the full geometry-engine red-gate (reaped twice), then
+  a live arm import.
 
 
 ### Day 1 — sketch certificate honesty
