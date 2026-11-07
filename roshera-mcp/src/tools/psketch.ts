@@ -134,14 +134,30 @@ export function registerPsketchTools(server: ToolHost) {
 
   server.tool(
     "psketch_solve",
-    "Run the Newton-Raphson solver. Converged = geometry satisfies every " +
-      "constraint exactly. Returns status + solved entity positions.",
+    "Run the Newton-Raphson solver. Converged = all constraints hold, " +
+      "rank pins every DOF. Returns status, violations, dof, certificate, points.",
     { csketch_id: z.string().uuid().describe("csketch id (psketch_begin)") },
     async ({ csketch_id }) => {
       try {
         const report = await api("POST", `/api/csketch/${csketch_id}/solve`, {});
         const summary = await api("GET", `/api/csketch/${csketch_id}`);
-        return ok({ status: report.status, points: summary.points });
+        // SK-C4: the verdict is rank-adjudicated server-side; hand the
+        // agent the evidence behind it, not the status word alone.
+        return ok({
+          status: report.status,
+          violations: report.violations,
+          dof: report.dof
+            ? {
+                status: report.dof.status,
+                redundant: report.dof.redundant,
+                conflicts: report.dof.conflicts,
+                unsupported: report.dof.unsupported,
+                singular_configuration: report.dof.singular_configuration,
+              }
+            : null,
+          certificate: report.certificate,
+          points: summary.points,
+        });
       } catch (e) {
         return fail(e);
       }

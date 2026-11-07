@@ -133,11 +133,16 @@ console.log("(s) SURFACE: kb_lookup in the FULL table only; minimal bill unmoved
   // KaTeX notation the Blackboard renders, with a worked line). Both are
   // deliberate description growth on resident tools; neither touches
   // kb_lookup, which is still in neither CORE_SURFACE nor META_SURFACE.
+  // Pin moved 7970 -> 7973 (2026-11-07, SK-C4): psketch_solve's description
+  // stopped claiming "satisfies every constraint exactly" and now states what
+  // Converged means (every constraint holds, rank pins every DOF) and that it
+  // returns violations, dof and the certificate. +3 tokens on a resident
+  // tool; kb_lookup is still in neither CORE_SURFACE nor META_SURFACE.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
-  if (minimalBill === 7970)
-    pass(`minimal bill ${minimalBill} == pin 7970 (kb_lookup's zero marginal cost holds)`);
+  if (minimalBill === 7973)
+    pass(`minimal bill ${minimalBill} == pin 7973 (kb_lookup's zero marginal cost holds)`);
   else
-    fail(`minimal bill ${minimalBill} != 7970 — something moved the resident surface`);
+    fail(`minimal bill ${minimalBill} != 7973 — something moved the resident surface`);
 }
 
 // ── (p) PROVENANCE ──────────────────────────────────────────────────────────

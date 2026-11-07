@@ -1066,11 +1066,18 @@ impl ConstraintSolver {
     ///
     /// Final status precedence:
     /// 1. `Unstable` if linear solve never produced a step.
-    /// 2. The captured DOF verdict (`OverConstrained` /
-    ///    `UnderConstrained`) when present — even if Newton-Raphson
-    ///    drove the residual under the tolerance, the system is still
-    ///    structurally degenerate and the UI needs to know.
-    /// 3. `Converged` / `NotConverged` otherwise.
+    /// 2. Residual above tolerance: `OverConstrained` when the count
+    ///    has more rows than parameters (dependent rows that cannot all
+    ///    hold — a real conflict), otherwise `NotConverged`. A count
+    ///    verdict never stands in for a solve that did not converge
+    ///    (SK-C4): an under-constrained count over a diverged solve
+    ///    used to report `UnderConstrained`, which callers read as
+    ///    "solved, with freedom left".
+    /// 3. Residual within tolerance: the captured count verdict
+    ///    (`OverConstrained` / `UnderConstrained`) when present,
+    ///    otherwise `Converged`. This is still a COUNT; the sketch
+    ///    bridge (`sketch_solver::solve*`) replaces it with the
+    ///    Jacobian-rank verdict, which also sees a DOF removed twice.
     pub fn solve(&mut self) -> SolverResult {
         let start_time = std::time::Instant::now();
         self.last_stats = SolveStats::default();
@@ -1095,15 +1102,18 @@ impl ConstraintSolver {
         // Determine final status with the precedence documented above.
         let status = if outcome.linear_solve_failed {
             SolverStatus::Unstable
+        } else if outcome.final_error >= self.tolerance {
+            match dof_verdict {
+                Some(over @ SolverStatus::OverConstrained { .. }) => over,
+                _ => SolverStatus::NotConverged {
+                    iterations: outcome.iterations,
+                    final_error: outcome.final_error,
+                },
+            }
         } else if let Some(verdict) = dof_verdict {
             verdict
-        } else if outcome.final_error < self.tolerance {
-            SolverStatus::Converged {
-                iterations: outcome.iterations,
-                final_error: outcome.final_error,
-            }
         } else {
-            SolverStatus::NotConverged {
+            SolverStatus::Converged {
                 iterations: outcome.iterations,
                 final_error: outcome.final_error,
             }

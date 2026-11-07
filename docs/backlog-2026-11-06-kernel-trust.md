@@ -183,7 +183,11 @@ scene while the model held all of them.
 
 ### Day 2 — solve verdict + self-intersection
 
-3. **SK-C4 Solve status from the plain count.** `constraint_solver.rs:1098`: the
+3. ✓ **SK-C4 Solve status from the plain count.** Done 2026-11-07: a residual
+   above tolerance reads NotConverged (count Over excepted, a real conflict);
+   a converged solve takes the rank verdict from `analyze_dofs`, carried as
+   `SketchSolveReport.dof`; `psketch_solve` returns violations, dof and the
+   certificate (MCP dist rebuild pending Varun). Original finding: `constraint_solver.rs:1098`: the
    DOF-count verdict outranks Converged/NotConverged, so a free point with
    `X=0` twice reads fully constrained, and a count imbalance hides divergence.
    Fix: rank veto in the solve verdict (fold `analyze_dofs` into

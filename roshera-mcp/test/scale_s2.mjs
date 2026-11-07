@@ -177,6 +177,8 @@ const table = buildTable();
   // (a29d241c, the KaTeX notation the Blackboard renders). 30 tokens of
   // headroom remain under 8000; the next resident-description growth must
   // pay for itself or re-open the budget decision.
+  // 2026-11-07: 7973 — +3 psketch_solve (SK-C4: its description states what
+  // Converged means and that violations/dof/certificate come back). 27 left.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
   const fullBill = billFor(table, table.names());
   console.log(`      token bill: minimal=${minimalBill}, full=${fullBill}`);

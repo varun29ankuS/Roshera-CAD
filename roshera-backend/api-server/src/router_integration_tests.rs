@@ -10654,3 +10654,86 @@ async fn import_step_response_carries_verdicts_not_meshes() {
         "the snapshot reads the cached verdict (names were set before certifying)"
     );
 }
+
+/// SK-C4 on the wire: a dimension edit whose solve does not converge is
+/// reverted even when the plain DOF count reads under-constrained. Two
+/// free points carry `Distance(5)` twice (4 parameters, 2 rows by count);
+/// editing one to 7 leaves no configuration that satisfies both. The
+/// solve status used to come from the count — `UnderConstrained`, which
+/// this route accepts as success — so the contradictory value was kept.
+/// The solve report also carries its rank-adjudicated DOF analysis.
+#[tokio::test]
+async fn a_dimension_edit_that_cannot_converge_is_reverted_whatever_the_count() {
+    use geometry_engine::sketch2d::{
+        Constraint, ConstraintPriority, DimensionalConstraint, EntityRef, Point2dId,
+    };
+    let state = make_test_state().await;
+    let (status, body) = dispatch(&state, json_post("/api/csketch", json!({}))).await;
+    assert!(status.is_success(), "create sketch: {status} {body}");
+    let sketch = body["id"].as_str().expect("sketch id").to_string();
+
+    let mut points = Vec::new();
+    for x in [0.0, 5.0] {
+        let (status, body) = dispatch(
+            &state,
+            json_post(
+                &format!("/api/csketch/{sketch}/point"),
+                json!({ "x": x, "y": 0.0 }),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "add point: {status} {body}");
+        let id: Uuid = serde_json::from_value(body["id"].clone()).expect("point id");
+        points.push(EntityRef::Point(Point2dId(id)));
+    }
+    let mut constraints = Vec::new();
+    for _ in 0..2 {
+        let c = Constraint::new_dimensional(
+            DimensionalConstraint::Distance(5.0),
+            points.clone(),
+            ConstraintPriority::Required,
+        );
+        let (status, body) = dispatch(
+            &state,
+            json_post(
+                &format!("/api/csketch/{sketch}/constraint"),
+                serde_json::to_value(&c).expect("constraint json"),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "add constraint: {status} {body}");
+        constraints.push(body["id"].as_str().expect("constraint id").to_string());
+    }
+
+    let (status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri(format!(
+                "/api/csketch/{sketch}/constraint/{}/value",
+                constraints[1]
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "value": 7.0 }).to_string()))
+            .expect("patch request"),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "5 and 7 for one distance cannot both hold; the edit must be \
+         reverted, not accepted as under-constrained: {status} {body}"
+    );
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(&format!("/api/csketch/{sketch}/solve"), json!({})),
+    )
+    .await;
+    assert!(status.is_success(), "solve: {status} {body}");
+    assert_eq!(
+        body["dof"]["redundant"].as_array().map(Vec::len),
+        Some(1),
+        "the reverted sketch is consistent again, and the solve report \
+         names the duplicate distance: {body}"
+    );
+}

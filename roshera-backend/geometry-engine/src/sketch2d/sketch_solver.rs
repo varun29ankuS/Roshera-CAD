@@ -244,6 +244,13 @@ pub struct SketchSolveReport {
     /// Reporting the [`EntityRef`] (not just a count) lets the UI
     /// highlight exactly which entities went unsolved.
     pub entities_skipped: Vec<SkippedEntity>,
+    /// The sketch's DOF analysis at the solved configuration — the
+    /// structural tally adjudicated by the Jacobian's rank, with the
+    /// redundant and conflicting constraints named ([`analyze_dofs`]).
+    /// Over the sketch's own constraints: a drag's temporary pull is
+    /// not part of it. `None` only on payloads recorded before SK-C4.
+    #[serde(default)]
+    pub dof: Option<DofReport>,
 }
 
 impl SketchSolveReport {
@@ -1371,15 +1378,64 @@ fn solve_internal(
     let result: SolverResult = solver.solve();
 
     apply_solver_result(sketch, &result);
+    let dof = analyze_dofs(sketch);
+    let status = rank_verdict(result.status, &result.violations, &dof);
 
     Ok(SketchSolveReport {
-        status: result.status,
+        status,
         violations: result.violations,
         solve_time_ms: result.solve_time_ms,
         entities_solved,
         constraints_solved,
         entities_skipped,
+        dof: Some(dof),
     })
+}
+
+/// The solve verdict a caller sees (SK-C4): Newton's outcome where the
+/// solve failed, the Jacobian-RANK verdict where it held.
+///
+/// `ConstraintSolver::solve` grades a converged system by COUNT, which
+/// cannot tell two DOFs removed from one DOF removed twice: a free point
+/// carrying `XCoordinate(0)` twice read `Converged` — fully constrained —
+/// while its y slid freely. The DOF report's verdict is the count
+/// adjudicated by rank (`analyze_dofs`), so once every constraint holds
+/// it decides: `UnderConstrained` and `OverConstrained` take the rank's
+/// numbers; `FullyConstrained` keeps the solver's own status. On a plain
+/// solve that is `Converged`, with its iteration count (rank fully
+/// constrained implies the count balanced). On a drag the solver's count
+/// also holds the temporary pull rows, so a drag that lands exactly on a
+/// fully constrained sketch keeps the count's word; the `dof` report
+/// beside it is the sketch's own.
+///
+/// A failed solve — `Unstable`, `NotConverged`, or a residual left on a
+/// conflicting over-constrained set (violations present) — keeps its own
+/// status: no DOF verdict may present an unsolved sketch as solved.
+fn rank_verdict(
+    solver_status: SolverStatus,
+    violations: &[(ConstraintId, f64)],
+    dof: &DofReport,
+) -> SolverStatus {
+    let held = match solver_status {
+        SolverStatus::Unstable | SolverStatus::NotConverged { .. } => false,
+        SolverStatus::Converged { .. }
+        | SolverStatus::UnderConstrained { .. }
+        | SolverStatus::OverConstrained { .. } => violations.is_empty(),
+    };
+    if !held {
+        return solver_status;
+    }
+    match dof.status {
+        DofStatus::FullyConstrained => solver_status,
+        DofStatus::UnderConstrained { dofs } => SolverStatus::UnderConstrained {
+            degrees_of_freedom: dofs,
+        },
+        DofStatus::OverConstrained {
+            conflicting_constraints,
+        } => SolverStatus::OverConstrained {
+            conflicting_constraints,
+        },
+    }
 }
 
 /// Validate the (entity, target) pair and synthesise the temporary
@@ -2934,6 +2990,7 @@ mod tests {
             entities_solved: 0,
             constraints_solved: 0,
             entities_skipped: Vec::new(),
+            dof: None,
         }
     }
 
