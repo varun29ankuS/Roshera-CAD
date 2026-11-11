@@ -48,6 +48,9 @@ const DEFAULT_EL = 20
  * explicit height on a collapsed panel is a tall empty card. The rail cannot
  * ask the DOM mid-render, so the panel reports it.
  */
+/** Longest a full render may go unrefreshed while the part list is unchanged. */
+const FULL_REFRESH_MS = 10_000
+
 export function AgentEyePanel({
   onMinimizedChange,
 }: {
@@ -81,6 +84,12 @@ export function AgentEyePanel({
   } | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const inFlight = useRef(false)
+  // The part list (and view settings) the last full render was taken for,
+  // and when. The render + perception are the heavy calls; they are skipped
+  // while the list is unchanged, with a periodic refresh as a backstop for
+  // edits that keep the same list (e.g. a parameter edit on the same part).
+  const lastSig = useRef<string | null>(null)
+  const lastFullAt = useRef(0)
 
   // In Assembly mode only the scene-shared modes are valid; fall back cleanly
   // if the user was on `dim`/`section` when they switched.
@@ -88,7 +97,7 @@ export function AgentEyePanel({
   // The assembly scope renders a composited scene (orbit camera + scene modes).
   const isSceneScope = scope === 'assembly'
 
-  const grab = useCallback(async () => {
+  const grab = useCallback(async (force = false) => {
     if (inFlight.current) return
     inFlight.current = true
     try {
@@ -124,14 +133,22 @@ export function AgentEyePanel({
 
       const partsR = await fetch(`${API_HOST}/api/agent/parts`)
       if (!partsR.ok) throw new Error(`parts ${partsR.status}`)
-      const parts = (await partsR.json()) as Array<{ id: number }>
+      const partsText = await partsR.text()
+      const parts = JSON.parse(partsText) as Array<{ id: number }>
       if (!Array.isArray(parts) || parts.length === 0) {
+        lastSig.current = null
         setPng(null)
         setDiag(null)
         setPerc(null)
         setErr('no geometry yet')
         return
       }
+      const sig = `${partsText}|${mode}|${view}`
+      if (!force && sig === lastSig.current && Date.now() - lastFullAt.current < FULL_REFRESH_MS) {
+        return
+      }
+      lastSig.current = sig
+      lastFullAt.current = Date.now()
       const id = parts.reduce((m, p) => Math.max(m, p.id), 0)
       // Feedback-as-default: the part's soundness, always shown, every poll.
       try {
@@ -183,9 +200,9 @@ export function AgentEyePanel({
 
   useEffect(() => {
     if (minimized) return
-    grab()
+    void grab(true)
     if (!live) return
-    const t = setInterval(grab, 1200)
+    const t = setInterval(() => void grab(), 1200)
     return () => clearInterval(t)
   }, [minimized, live, grab])
 
@@ -257,7 +274,7 @@ export function AgentEyePanel({
             {live ? '⏸' : '▶'}
           </button>
           <button
-            onClick={grab}
+            onClick={() => void grab(true)}
             className="rounded px-1.5 py-0.5 text-[11px] hover:bg-accent"
             title="Refresh now"
           >

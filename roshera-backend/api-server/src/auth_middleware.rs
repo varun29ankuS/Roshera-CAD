@@ -13,7 +13,7 @@ use axum::{
 use serde::Serialize;
 use session_manager::{AuthManager, Permission, PrincipalKind};
 use std::sync::{Arc, OnceLock};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Authentication error response
 #[derive(Debug, Serialize)]
@@ -474,7 +474,7 @@ pub async fn require_modify_settings(request: Request, next: Next) -> Response {
 async fn validate_jwt(auth_manager: &AuthManager, token: &str) -> Result<AuthInfo, AuthError> {
     match auth_manager.verify_token(token) {
         Ok(claims) => {
-            info!("JWT validated for user: {}", claims.sub);
+            debug!("JWT validated for user: {}", claims.sub);
 
             // Get user permissions (simplified - in real app, query from DB)
             let permissions = get_default_user_permissions();
@@ -509,7 +509,7 @@ async fn validate_api_key(
 ) -> Result<(AuthInfo, crate::agent_activity::ApiKeyIdentity), AuthError> {
     match auth_manager.verify_api_key(api_key) {
         Ok(key_info) => {
-            info!("API key validated for user: {}", key_info.user_id);
+            debug!("API key validated for user: {}", key_info.user_id);
 
             // Decode the stored permission strings back into `Permission`
             // via the one canonical codec (`Permission::from_str`,
