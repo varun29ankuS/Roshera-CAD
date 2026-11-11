@@ -164,10 +164,26 @@ scene while the model held all of them.
   same way). Owed: the full geometry-engine red-gate (reaped twice), then
   a live arm import.
 
+  2026-11-07, later: the red-gate caught the floor losing accuracy on small
+  features. A Ø2 bore in an 80 mm plate came out 2.76 mm³ high, 2.2 % of
+  the bore (`boolean_multibody`). Cause: a curved face's interior grid
+  ignored the angle limit its boundary edges honour; the 0.01 mm edge
+  length had hidden it. Fix: `curved_cdt` folds in an angle criterion, so
+  error is bounded per feature (bore now 0.018 mm³ off, as under `fine()`).
+  Gear: 50 s, 88 k triangles, 5e-5 from `fine()`. The durability tests are
+  back at ±0.01. Full red-gate green. Still owed: a live arm import.
+  Separate item for later: the reported 5e-3 mesh bound is an empirical
+  constant, too loose for aerospace; the real answer is exact per-face
+  integration.
+
 
 ### Day 1 — sketch certificate honesty
 
-1. **SK-C1 Certificate certifies a re-solved copy, not the stored sketch.**
+1. ✓ **SK-C1 Certificate certifies a re-solved copy, not the stored sketch.**
+   Done 2026-11-06 (484d96a7). Follow-ups left: no route test for the
+   revolve gate; the MCP refusal cache does not treat
+   `sketch_constraints_unsatisfied` as live state; KB playbooks go
+   constrain → certify → extrude with no solve.
    `sketch_certificate.rs:819` solves a private copy and measures residuals
    after it; `extrude_csketch` never solves (`api-server/src/csketch.rs:2092`),
    so a 10×7 rectangle carrying `Length(40)` certifies satisfied/sound and

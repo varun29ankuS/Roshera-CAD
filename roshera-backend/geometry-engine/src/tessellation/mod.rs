@@ -119,11 +119,12 @@ impl TessellationParams {
     /// larger than a millimetre it pins every curved direction at the
     /// segment cap. A 20 mm gear from the robot-arm assembly integrated
     /// over 1.7 million triangles (1006 s, debug); floored, 69 thousand
-    /// (20 s), with the volume moving 1e-4 relative — fifty times inside
-    /// the 5e-3 bound mass properties report. Chord tolerance, angle and
-    /// segment limits stay `fine()`'s: those set the accuracy, the edge
-    /// length only sets element size. (`tessellate_solid` already floors
-    /// the chord the same way.)
+    /// (20 s). Chord tolerance, angle and segment limits stay `fine()`'s.
+    /// The edge length only sets element size; the 0.02 rad angle limit,
+    /// which every curved direction honours on its boundary and in its
+    /// interior grid, bounds each feature's error relative to that feature.
+    /// (`tessellate_solid` floors the chord to the part's size, so the
+    /// chord cannot do that on a small feature of a large part.)
     pub fn mass_properties(solid: &Solid, model: &BRepModel) -> Self {
         let fine = Self::fine();
         let floor = solid_extent(solid, model) * MASS_PROPERTIES_EDGE_FLOOR;

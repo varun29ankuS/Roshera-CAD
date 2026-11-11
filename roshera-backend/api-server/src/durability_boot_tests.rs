@@ -3997,17 +3997,6 @@ pub(crate) async fn create_part(state: &AppState, uri: &str, payload: Value) -> 
         .to_string()
 }
 
-/// Whether `v` is the bored cube's volume: a 10 mm cube less a 2 mm-radius
-/// through-bore, exactly `1000 − 40π` ≈ 874.336. Its volume is integrated on
-/// the mass-properties mesh, which reports a 5e-3 relative bound, so the
-/// check is that bound around the exact value — not one mesh's reading
-/// (874.35 before the mesh's edge length scaled with part size, 874.37
-/// after). The other live parts (64, 1000) sit far outside it.
-fn is_bored_cube_volume(v: f64) -> bool {
-    let exact = 1000.0 - 40.0 * std::f64::consts::PI;
-    ((v - exact) / exact).abs() <= 5e-3
-}
-
 /// main: 10-cube A → (optionally on a side branch B) a cylinder through A →
 /// back on main a 4-cube → on main `difference(A, cylinder)`. Returns the
 /// sequence number of the boolean's first event.
@@ -4047,8 +4036,8 @@ async fn seed_cross_branch_boolean(path: &str, cylinder_on_side_branch: bool) ->
     assert_eq!(s, StatusCode::OK, "difference must apply; body = {body}");
     let volumes = live_volumes(&state).await;
     assert!(
-        volumes.iter().any(|&v| is_bored_cube_volume(v)),
-        "sanity: the bored cube is ~874.34 before the restart; got {volumes:?}"
+        volumes.iter().any(|v| (v - 874.35).abs() < 0.01),
+        "sanity: the bored cube is ~874.35 before the restart; got {volumes:?}"
     );
     branch_history(&state, timeline_engine::BranchId::main())
         .await
@@ -4103,7 +4092,7 @@ async fn a_main_boolean_on_a_side_branch_solid_is_a_typed_quarantine() {
 }
 
 /// Control: the same boolean with the cylinder built on main replays exactly
-/// (the bored cube and the 4-cube) and stays active.
+/// (874.35 and the 4-cube) and stays active.
 #[tokio::test]
 async fn a_main_boolean_on_a_main_solid_replays_exactly_and_stays_active() {
     let path = temp_db_path();
@@ -4115,7 +4104,9 @@ async fn a_main_boolean_on_a_main_solid_replays_exactly_and_stays_active() {
     assert_eq!(body["status"]["state"], "active", "body = {body}");
     let volumes = live_volumes(&state2).await;
     assert!(
-        volumes.len() == 2 && (volumes[0] - 64.0).abs() < 1e-6 && is_bored_cube_volume(volumes[1]),
+        volumes.len() == 2
+            && (volumes[0] - 64.0).abs() < 1e-6
+            && (volumes[1] - 874.35).abs() < 0.01,
         "the 4-cube and the bored cube replay exactly; got {volumes:?}"
     );
 }

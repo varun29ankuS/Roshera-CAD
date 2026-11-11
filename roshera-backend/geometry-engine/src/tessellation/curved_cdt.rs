@@ -1185,6 +1185,56 @@ fn chord_segments<S: MeshChart + ?Sized>(
     n.clamp(params.min_segments, params.max_segments)
 }
 
+/// Samples used to measure how far a parametric direction's tangent turns.
+const ANGLE_PROBE_SAMPLES: usize = 64;
+
+/// Number of segments needed so that no segment along a parametric direction
+/// turns by more than `max_angle_deviation`, the limit face-boundary edges are
+/// already sampled to. The turning is MEASURED: the angle the iso-line's
+/// tangent sweeps over the span, summed between [`ANGLE_PROBE_SAMPLES`]
+/// samples and taken at the worst cross level. A straight direction turns by
+/// zero and returns `min_segments`, so developable economy is preserved.
+fn angle_segments<S: MeshChart + ?Sized>(
+    surface: &S,
+    params: &TessellationParams,
+    along_u: bool,
+    p_lo: f64,
+    p_hi: f64,
+    cross: &[f64],
+) -> usize {
+    let span = p_hi - p_lo;
+    if !(span > 0.0) || params.max_angle_deviation <= 0.0 {
+        return params.min_segments;
+    }
+    let tangent = |p: f64, c: f64| -> Option<Vector3> {
+        let (u, v) = if along_u { (p, c) } else { (c, p) };
+        let e = surface.evaluate_full(u, v).ok()?;
+        let t = if along_u { e.du } else { e.dv };
+        let len = t.magnitude();
+        (len > 1e-12).then(|| t * (1.0 / len))
+    };
+    let mut worst_turn = 0.0_f64;
+    for &c in cross {
+        let mut turn = 0.0_f64;
+        let mut prev = tangent(p_lo, c);
+        for i in 1..=ANGLE_PROBE_SAMPLES {
+            let p = p_lo + span * (i as f64) / (ANGLE_PROBE_SAMPLES as f64);
+            let next = tangent(p, c);
+            if let (Some(a), Some(b)) = (prev, next) {
+                turn += a.dot(&b).clamp(-1.0, 1.0).acos();
+            }
+            prev = next;
+        }
+        worst_turn = worst_turn.max(turn);
+    }
+    let n = (worst_turn / params.max_angle_deviation).ceil();
+    if n.is_finite() && n > 0.0 {
+        (n as usize).clamp(params.min_segments, params.max_segments)
+    } else {
+        params.min_segments
+    }
+}
+
 fn generate_steiner_candidates<S: MeshChart + ?Sized>(
     surface: &S,
     bbox: UvBBox,
@@ -1251,6 +1301,19 @@ fn generate_steiner_candidates<S: MeshChart + ?Sized>(
     let nv_chord = chord_segments(surface, params, false, v_lo, v_hi, &[u_lo, u_mid, u_hi]);
     nu = nu.max(nu_chord).min(params.max_segments);
     nv = nv.max(nv_chord).min(params.max_segments);
+
+    // ANGLE criterion. A face's boundary edges are sampled so that no segment
+    // turns by more than `max_angle_deviation` (edge_cache); the interior grid
+    // must honour the same limit or the wall between two finely sampled
+    // boundary circles is chorded by the coarse interior rows. The angle is
+    // scale-free, so it bounds the error relative to the FEATURE: the
+    // size-floored chord and edge length alone gave a Ø2 bore in an 80 mm
+    // plate 13 interior segments against 315 on its boundary, and 2.2 % of
+    // the bore's volume went missing.
+    let nu_angle = angle_segments(surface, params, true, u_lo, u_hi, &[v_lo, v_mid, v_hi]);
+    let nv_angle = angle_segments(surface, params, false, v_lo, v_hi, &[u_lo, u_mid, u_hi]);
+    nu = nu.max(nu_angle).min(params.max_segments);
+    nv = nv.max(nv_angle).min(params.max_segments);
     if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
         eprintln!(
             "[curved-cdt]   steiner grid: bbox=({u_lo:.3},{u_hi:.3},{v_lo:.3},{v_hi:.3}) nu={nu} (chord {nu_chord}) nv={nv} (chord {nv_chord})"

@@ -2,15 +2,16 @@
 // test framework's failure mechanism; the workspace production deny stands.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-//! IMP-2: the mesh that mass properties integrate over scales with the part.
+//! IMP-2: the mesh that mass properties integrate over scales with the part,
+//! and its error stays bounded by each feature, not by the part.
 //!
-//! `fine()` carries an ABSOLUTE 0.01 mm maximum edge length. The chord
-//! tolerance was already floored to the part's size, the edge length was
-//! not, so on a 20 mm gear from the robot-arm assembly every curved face
-//! hit the 200-segment cap and the volume mesh came out at 1.7 million
-//! triangles (1006 s, debug) against 69 thousand (20 s) with the edge
-//! length floored at 0.5 % of the part — for a volume change of 1e-4
-//! relative, fifty times inside the 5e-3 bound mass properties claim.
+//! `fine()` carries an ABSOLUTE 0.01 mm maximum edge length, so on a 20 mm
+//! gear from the robot-arm assembly every curved face hit the 200-segment
+//! cap: 1.7 million triangles, 1006 s (debug). The edge length is now
+//! floored at 0.5 % of the part. That floor exposed a tessellation defect
+//! the tiny edge length had hidden: a curved face's interior grid ignored
+//! the angle limit its boundary edges honour, so a small bore in a large
+//! part was chorded coarsely between finely sampled boundary circles.
 
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
@@ -103,15 +104,45 @@ fn volume_is_integrated_on_the_size_floored_mesh() {
     );
 }
 
+/// The error a mesh puts on a feature must be bounded by the feature, not
+/// by the part. An 80 × 40 × 40 plate with one Ø2 through-bore: floored to
+/// the part's size, the bore wall's interior grid took about 13 segments
+/// around while its boundary circles took 315, and the volume came out
+/// 2.76 mm³ high, 2.2 % of the bore's own 125.7 mm³. `fine()` gives
+/// 0.018 mm³. The bound here is 0.1 % of the feature.
 #[test]
-fn the_floored_volume_keeps_the_claimed_accuracy() {
-    let (mut model, id) = bored_block();
-    let exact = 20.0_f64.powi(3) - std::f64::consts::PI * 4.0 * 4.0 * 20.0;
+fn a_small_bore_in_a_large_part_keeps_its_own_accuracy() {
+    let mut model = BRepModel::new();
+    let plate = solid(
+        TopologyBuilder::new(&mut model)
+            .create_box_3d(80.0, 40.0, 40.0)
+            .expect("plate"),
+    );
+    let bore = solid(
+        TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(
+                Point3::new(-30.0, 0.0, -30.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                1.0,
+                60.0,
+            )
+            .expect("bore"),
+    );
+    let id = boolean_operation(
+        &mut model,
+        plate,
+        bore,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("bored plate");
+    let bore_volume = std::f64::consts::PI * 40.0;
+    let exact = 80.0 * 40.0 * 40.0 - bore_volume;
     let volume = model.calculate_solid_volume(id).expect("volume");
-    let rel = (volume - exact).abs() / exact;
+    let error = (volume - exact).abs();
     assert!(
-        rel <= 5e-3,
-        "volume {volume} vs exact {exact}: relative error {rel} exceeds the \
-         5e-3 bound mass properties report"
+        error <= 1e-3 * bore_volume,
+        "volume {volume} vs exact {exact}: the {error} mm³ error is {:.3} % of the bore it comes from",
+        100.0 * error / bore_volume
     );
 }
