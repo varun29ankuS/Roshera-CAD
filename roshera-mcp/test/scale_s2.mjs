@@ -6,7 +6,7 @@
 // `npm run build`). Four groups, matching the S2 spec:
 //   (a) validation parity  — invoke(create_box, bad) === direct-call error;
 //                            invoke(create_box, good) produces the identical POST.
-//   (b) surface flip       — minimal exposes exactly 31; full exposes 109.
+//   (b) surface flip       — minimal exposes exactly 31; full exposes 111.
 //                            (S3/S4 added 2 core tools: workbench + cad_program;
 //                             the "blackboard" commit added blackboard_add_entry;
 //                             DFM S7 added 1 analysis tool: dfm_check.)
@@ -91,7 +91,7 @@ console.log("(d) HASH: TS FNV-1a-64 reproduces canonical reference vectors");
 }
 
 // ── (b) Surface flip (pure) ──────────────────────────────────────────────────
-console.log("(b) SURFACE: minimal exposes 31, full exposes 109");
+console.log("(b) SURFACE: minimal exposes 31, full exposes 111");
 const table = buildTable();
 {
   // S3/S4 added 2 core composition tools (workbench + cad_program): 90 kernel
@@ -119,8 +119,10 @@ const table = buildTable();
   // name; full table + core bench, never minimal (measured: the minimal bill
   // did not move at a3ab6b9e): 107 + 2 + 3 = 112. This pin sat stale at 111
   // for a month because no gate ran this file.
-  if (table.size === 112) pass("table holds 112 tools (107 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 112`);
+  // 112 -> 114 (2026-11-11): drawing_set_dimension + drawing_set_projection
+  // (both kernel, "drawing"): 109 + 2 + 3 = 114.
+  if (table.size === 114) pass("table holds 114 tools (109 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 114`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -147,8 +149,9 @@ const table = buildTable();
   else fail(`meta list is ${META_SURFACE.length}, expected 3`);
 
   const full = exposedNamesFor(table, "full");
-  if (full.length === 109) pass("full surface exposes exactly 109 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 109`);
+  // 109 -> 111 (2026-11-11): drawing_set_dimension + drawing_set_projection.
+  if (full.length === 111) pass("full surface exposes exactly 111 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 111`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");

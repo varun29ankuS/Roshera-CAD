@@ -170,7 +170,9 @@ console.log("(o3) ratchet floor (encodes observed reality, never aspiration)");
 // below the floor means tools were removed without this gate hearing about it;
 // growth passes and should then RAISE the floor to the new measurement.
 // Raised 111 → 112 (2026-09-24, audit Task 93): part_rename (a3ab6b9e, "core").
-const FLOOR_TOTAL = 112;
+// Raised 112 → 114 (2026-11-11): drawing_set_dimension + drawing_set_projection
+// ("drawing", experimental) — editing the part from its drawing.
+const FLOOR_TOTAL = 114;
 if (names.length >= FLOOR_TOTAL)
   pass(`registry size ${names.length} ≥ floor ${FLOOR_TOTAL}`);
 else

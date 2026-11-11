@@ -571,6 +571,7 @@ fn render_dimensions(out: &mut String, layout: &SheetLayout) {
             pd.text_anchor[1],
             &pd.label,
             pd.text_rot_deg,
+            &pd.dim_id,
         );
     }
 }
@@ -943,17 +944,18 @@ fn dim_line(out: &mut String, x1: f64, y1: f64, x2: f64, y2: f64) {
 
 /// Centered dimension label. `rot` (degrees) rotates it about its anchor
 /// — −90 for the vertical callouts so the text reads bottom-to-top.
-fn dim_text(out: &mut String, x: f64, y: f64, label: &str, rot: f64) {
+fn dim_text(out: &mut String, x: f64, y: f64, label: &str, rot: f64, dim_id: &str) {
+    let id = escape_xml(dim_id);
     if rot.abs() < 1e-6 {
         let _ = write!(
             out,
-            "  <text class=\"dim-text dim-text-c\" x=\"{x:.3}\" y=\"{y:.3}\">{}</text>\n",
+            "  <text class=\"dim-text dim-text-c\" data-dim-id=\"{id}\" x=\"{x:.3}\" y=\"{y:.3}\">{}</text>\n",
             escape_xml(label)
         );
     } else {
         let _ = write!(
             out,
-            "  <text class=\"dim-text dim-text-c\" x=\"{x:.3}\" y=\"{y:.3}\" \
+            "  <text class=\"dim-text dim-text-c\" data-dim-id=\"{id}\" x=\"{x:.3}\" y=\"{y:.3}\" \
              transform=\"rotate({rot:.1} {x:.3} {y:.3})\">{}</text>\n",
             escape_xml(label)
         );

@@ -101,6 +101,59 @@ function answerLine(a: any): string {
 }
 
 export function registerDrawingTools(server: ToolHost): void {
+  // ── drawing_set_dimension ──────────────────────────────────────────────
+  server.tool(
+    "drawing_set_dimension",
+    "EDIT THE PART FROM ITS DRAWING: set a sheet dimension (id from " +
+      "drawing_read_semantics) to a new size. The one recorded parameter that " +
+      "drives it is found by measurement, changed, and the part and sheet " +
+      "rebuild. Refused typed when none drives it (imported parts), several do, " +
+      "or the size is unreachable.",
+    {
+      drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
+      dimension_id: z.string().describe("dimension id from drawing_read_semantics"),
+      value: z.number().describe("new size (mm; degrees for an angle)"),
+    },
+    async ({ drawing_id, dimension_id, value }) => {
+      try {
+        const r = await api(
+          "POST",
+          `/api/drawings/${drawing_id}/dimensions/${encodeURIComponent(dimension_id)}`,
+          { value },
+          180_000,
+        );
+        return ok({
+          drawing_id,
+          dimension: r?.dimension ?? null,
+          driver: r?.driver ?? null,
+          sound: r?.mould?.is_sound ?? null,
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ── drawing_set_projection ─────────────────────────────────────────────
+  server.tool(
+    "drawing_set_projection",
+    "Lay a sheet out FIRST-angle (ISO; India, Europe) or THIRD-angle (ASME). " +
+      "Views, symbol and note move; dimensions and title block stay. Kept when " +
+      "the part is edited.",
+    {
+      drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
+      projection: z.enum(["first", "third"]).describe("projection method"),
+    },
+    async ({ drawing_id, projection }) => {
+      try {
+        const r = await api("PATCH", `/api/drawings/${drawing_id}/projection`, { projection });
+        return ok({ drawing_id, projection: r?.projection ?? projection, quality: r?.quality ?? null });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
   // ── drawing_read_semantics ─────────────────────────────────────────────
   server.tool(
     "drawing_read_semantics",
@@ -126,6 +179,16 @@ export function registerDrawingTools(server: ToolHost): void {
           drawing_id,
           name: drawing.name ?? null,
           views: (drawing.views ?? []).map((v: any) => v.name),
+          projection: drawing.projection ?? "third",
+          // Each dimension once (a dimension may appear in several views):
+          // the ids drawing_set_dimension edits.
+          dimensions: Array.from(
+            new Map(
+              (drawing.views ?? [])
+                .flatMap((v: any) => v.dimensions ?? [])
+                .map((d: any) => [d.id, { id: d.id, label: d.label, kind: d.kind, value: d.value }]),
+            ).values(),
+          ),
           hole_count: (drawing.hole_sites ?? []).length,
           fcf_count: (drawing.fcf_blocks ?? []).length,
           has_section: drawing.section != null,

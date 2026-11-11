@@ -165,11 +165,16 @@ export function registerIoTools(server: ToolHost) {
       // then refused 409 by the server with no way to say so: a gate the
       // caller cannot legitimately escape is a bug, not a constraint.
       acknowledge_unsound: ACK_UNSOUND,
+      projection: z
+        .enum(["first", "third"])
+        .optional()
+        .describe("first-angle (ISO) or third-angle (ASME, default)"),
     },
-    async ({ part_id, name, acknowledge_unsound }) => {
+    async ({ part_id, name, acknowledge_unsound, projection }) => {
       try {
         const params = new URLSearchParams();
         if (name) params.set("name", name);
+        if (projection) params.set("projection", projection);
         if (acknowledge_unsound === true) params.set("acknowledge_unsound", "true");
         const qs = params.toString() ? `?${params.toString()}` : "";
         const r = await api("POST", `/api/parts/${part_id}/drawing${qs}`);

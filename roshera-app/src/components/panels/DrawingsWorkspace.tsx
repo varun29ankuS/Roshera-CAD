@@ -31,7 +31,12 @@ import {
 import {
   type Drawing,
   type DrawingFormat,
+  type ProjectionAngle,
   type ProjectionType,
+  type SheetDimension,
+  DrawingRefusal,
+  setDrawingDimension,
+  setDrawingProjection,
   type SheetSize,
   addView,
   createDrawing,
@@ -179,6 +184,23 @@ export function DrawingsWorkspace() {
   // they hit "Download" on a drawing. DXF is the editable interchange
   // format; SVG stays available for the lightweight web preview.
   const [downloadFormat, setDownloadFormat] = useState<DrawingFormat>('pdf')
+
+  // ── Editing the part from the sheet ──────────────────────────────
+  // Clicking a dimension opens this editor at the cursor. Applying a new
+  // size edits the parameter that drives it, so the PART changes and the
+  // sheet regenerates. A refusal (reference-only dimension, several
+  // drivers, unreachable size) is shown in the editor, never swallowed.
+  const [dimEdit, setDimEdit] = useState<{
+    dim: SheetDimension
+    x: number
+    y: number
+    draft: string
+    busy: boolean
+    refusal: string | null
+  } | null>(null)
+  // One-line outcome of the last edit, e.g. "Ø6.00 -> 8 (radius 3 -> 4)".
+  const [editNote, setEditNote] = useState<string | null>(null)
+  const [projectionBusy, setProjectionBusy] = useState(false)
 
   // ── Zoom / pan ────────────────────────────────────────────────────
   // `zoomMode = 'fit'` makes the sheet auto-shrink to fill the canvas
@@ -554,6 +576,8 @@ export function DrawingsWorkspace() {
   const onCanvasMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     // Ignore clicks on the zoom toolbar so the buttons still work.
     if ((e.target as HTMLElement).closest('button')) return
+    // A dimension is clicked to edit it, not dragged.
+    if ((e.target as Element).closest('[data-dim-id]')) return
     if (e.button !== 0) return
     const el = canvasRef.current
     if (!el) return
@@ -585,6 +609,67 @@ export function DrawingsWorkspace() {
       window.removeEventListener('mouseup', onMouseUp)
     }
   }, [])
+
+  const onSheetClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const el = (e.target as Element).closest('[data-dim-id]')
+      if (!el || !activeDrawing) return
+      const id = el.getAttribute('data-dim-id') ?? ''
+      const dim = activeDrawing.views
+        .flatMap((v) => v.dimensions ?? [])
+        .find((d) => d.id === id)
+      if (!dim) return
+      setEditNote(null)
+      setDimEdit({
+        dim,
+        x: e.clientX,
+        y: e.clientY,
+        draft: String(Number(dim.value.toFixed(4))),
+        busy: false,
+        refusal: null,
+      })
+    },
+    [activeDrawing],
+  )
+
+  const applyDimEdit = useCallback(async () => {
+    if (!dimEdit || !activeDrawing) return
+    const value = Number(dimEdit.draft)
+    if (!Number.isFinite(value) || value <= 0) {
+      setDimEdit({ ...dimEdit, refusal: 'Enter a positive number.' })
+      return
+    }
+    setDimEdit({ ...dimEdit, busy: true, refusal: null })
+    try {
+      const r = await setDrawingDimension(activeDrawing.id, dimEdit.dim.id, value)
+      setDimEdit(null)
+      setEditNote(
+        `${dimEdit.dim.label} \u2192 ${value} (${r.driver.parameter} ` +
+          `${Number(r.driver.from_value.toFixed(4))} \u2192 ${Number(r.driver.new_value.toFixed(4))})`,
+      )
+      await refreshActive(activeDrawing.id)
+    } catch (e) {
+      const reason = e instanceof DrawingRefusal || e instanceof Error ? e.message : String(e)
+      setDimEdit((cur) => (cur ? { ...cur, busy: false, refusal: reason } : cur))
+    }
+  }, [dimEdit, activeDrawing, refreshActive])
+
+  const changeProjection = useCallback(
+    async (projection: ProjectionAngle) => {
+      if (!activeDrawing || (activeDrawing.projection ?? 'third') === projection) return
+      setProjectionBusy(true)
+      setError(null)
+      try {
+        await setDrawingProjection(activeDrawing.id, projection)
+        await refreshActive(activeDrawing.id)
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setProjectionBusy(false)
+      }
+    },
+    [activeDrawing, refreshActive],
+  )
 
   return (
     <div className="flex flex-col flex-1 min-h-0 bg-background text-foreground">
@@ -801,6 +886,37 @@ export function DrawingsWorkspace() {
             </div>
             {activeDrawing && (
               <div className="flex items-center gap-1">
+                {/* Projection method: first angle (ISO; India, Europe) or
+                    third angle (ASME). Peers hug as one segmented control. */}
+                <div
+                  role="radiogroup"
+                  aria-label="Projection"
+                  className="flex items-center rounded border border-border overflow-hidden mr-1"
+                >
+                  {(['first', 'third'] as const).map((p) => {
+                    const active = (activeDrawing.projection ?? 'third') === p
+                    return (
+                      <button
+                        key={p}
+                        type="button"
+                        role="radio"
+                        aria-checked={active}
+                        disabled={projectionBusy}
+                        onClick={() => void changeProjection(p)}
+                        title={
+                          p === 'first'
+                            ? 'First-angle projection (ISO): TOP below FRONT, RIGHT to its left'
+                            : 'Third-angle projection (ASME): TOP above FRONT, RIGHT to its right'
+                        }
+                        className={`cad-focus px-2 py-1 text-xs ${
+                          active ? 'bg-accent/30 font-medium' : 'hover:bg-accent/20'
+                        }`}
+                      >
+                        {p === 'first' ? '1st angle' : '3rd angle'}
+                      </button>
+                    )
+                  })}
+                </div>
                 <select
                   value={downloadFormat}
                   onChange={(e) => setDownloadFormat(e.target.value as DrawingFormat)}
@@ -840,7 +956,9 @@ export function DrawingsWorkspace() {
             {activeDrawing ? (
               svg ? (
                 <div
-                  className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full"
+                  className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full [&_[data-dim-id]]:cursor-pointer [&_[data-dim-id]:hover]:fill-blue-600"
+                  onClick={onSheetClick}
+                  title="Click a dimension to change the part"
                   style={{
                     width: `${displayW}px`,
                     height: `${displayH}px`,
@@ -859,6 +977,75 @@ export function DrawingsWorkspace() {
                 {drawings.length === 0
                   ? 'Create a drawing from the sidebar to get started.'
                   : 'Select a drawing from the sidebar.'}
+              </div>
+            )}
+
+            {dimEdit && (
+              <div
+                className="fixed z-50 w-64 bg-card border border-border rounded-md shadow-lg p-2 text-xs"
+                style={{ left: dimEdit.x + 8, top: dimEdit.y + 8 }}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-center justify-between mb-1">
+                  <span className="font-medium">Change {dimEdit.dim.label}</span>
+                  <button
+                    type="button"
+                    aria-label="Cancel"
+                    onClick={() => setDimEdit(null)}
+                    className="cad-focus text-muted-foreground hover:text-foreground"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+                <div className="flex items-center gap-1">
+                  <input
+                    autoFocus
+                    inputMode="decimal"
+                    value={dimEdit.draft}
+                    disabled={dimEdit.busy}
+                    onChange={(e) => setDimEdit({ ...dimEdit, draft: e.target.value, refusal: null })}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        void applyDimEdit()
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault()
+                        setDimEdit(null)
+                      }
+                    }}
+                    className="cad-focus flex-1 font-mono px-2 py-1 rounded border border-border bg-background"
+                  />
+                  <span className="text-muted-foreground">{dimEdit.dim.unit}</span>
+                  <button
+                    type="button"
+                    disabled={dimEdit.busy}
+                    onClick={() => void applyDimEdit()}
+                    className="cad-focus px-2 py-1 rounded border border-border hover:bg-accent/20"
+                  >
+                    {dimEdit.busy ? 'Rebuilding\u2026' : 'Apply'}
+                  </button>
+                </div>
+                {dimEdit.refusal && (
+                  <div className="mt-2 flex gap-1 text-red-700">
+                    <span aria-hidden>✗</span>
+                    <span>{dimEdit.refusal}</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {editNote && (
+              <div className="absolute top-3 left-3 flex items-center gap-2 bg-card border border-border rounded-md shadow-md px-2 py-1 text-xs">
+                <span aria-hidden className="text-green-700">✓</span>
+                <span className="font-mono">{editNote}</span>
+                <button
+                  type="button"
+                  aria-label="Dismiss"
+                  onClick={() => setEditNote(null)}
+                  className="cad-focus text-muted-foreground hover:text-foreground"
+                >
+                  <X size={12} />
+                </button>
               </div>
             )}
 

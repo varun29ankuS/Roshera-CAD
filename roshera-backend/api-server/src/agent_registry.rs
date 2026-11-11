@@ -1411,9 +1411,41 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "part_id": {"type": "integer", "description": "kernel part/solid id from list_parts"},
-                    "name": {"type": "string", "description": "title-block name for the sheet"}
+                    "name": {"type": "string", "description": "title-block name for the sheet"},
+                    "projection": {"type": "string", "enum": ["first", "third"], "description": "first-angle (ISO) or third-angle (ASME, default)"}
                 },
                 "required": ["part_id"]
+            }),
+        ),
+        t(
+            "drawing_set_dimension",
+            Drawing,
+            Experimental,
+            Curated,
+            "Edit the part from its drawing: set a sheet dimension to a new size; the one recorded parameter that drives it is changed and the part and sheet rebuild. Refused typed when none or several drive it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "dimension_id": {"type": "string", "description": "dimension id from drawing_read_semantics"},
+                    "value": {"type": "number", "description": "new size (mm; degrees for an angle)"}
+                },
+                "required": ["drawing_id", "dimension_id", "value"]
+            }),
+        ),
+        t(
+            "drawing_set_projection",
+            Drawing,
+            Experimental,
+            Curated,
+            "Lay a sheet out first-angle (ISO) or third-angle (ASME); kept when the part is edited.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "projection": {"type": "string", "enum": ["first", "third"], "description": "projection method"}
+                },
+                "required": ["drawing_id", "projection"]
             }),
         ),
         t(
@@ -2183,7 +2215,8 @@ mod tests {
         // classified on one side only has no row on the other. Purposes and
         // schemas are transcribed verbatim from what `describe_tool` serves,
         // which is the compiled zod contract and therefore the wire truth.
-        assert_eq!(tools.len(), 109, "expected 109 tools, got {}", tools.len());
+        // 109 -> 111 (2026-11-11): drawing_set_dimension + drawing_set_projection.
+        assert_eq!(tools.len(), 111, "expected 111 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

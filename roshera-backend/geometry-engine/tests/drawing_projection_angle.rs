@@ -280,3 +280,25 @@ fn a_sheet_without_the_standard_views_is_not_switched() {
     let after: Vec<_> = d.views.iter().map(|v| v.position_mm).collect();
     assert_eq!(before, after);
 }
+
+/// Every dimension callout in the SVG names its dimension, so a viewer can
+/// address the dimension a user clicks.
+#[test]
+fn every_dimension_callout_in_the_svg_carries_its_dimension_id() {
+    let (m, part) = plain_box();
+    let d = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let svg = render_drawing_svg(&d);
+    let callouts = svg.matches("class=\"dim-text").count();
+    assert!(callouts > 0, "the box sheet has dimension callouts");
+    let tagged = svg.matches("data-dim-id=\"d").count();
+    assert_eq!(tagged, callouts, "every callout carries data-dim-id");
+    let ids: std::collections::HashSet<String> = d
+        .views
+        .iter()
+        .flat_map(|v| v.dimensions.iter().map(|x| x.id.clone()))
+        .collect();
+    for part in svg.split("data-dim-id=\"").skip(1) {
+        let id = &part[..part.find('"').expect("closing quote")];
+        assert!(ids.contains(id), "{id} is a dimension of the drawing");
+    }
+}

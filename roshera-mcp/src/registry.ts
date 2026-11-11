@@ -222,6 +222,8 @@ const EXPERIMENTAL = new Set<string>([
   "assembly_interference",
   "drawing_read_semantics",
   "drawing_query",
+  "drawing_set_dimension",
+  "drawing_set_projection",
   "dfm_check",
   "kb_lookup",
 ]);
@@ -320,6 +322,8 @@ const BENCH_OF: Record<string, Bench> = {
   drawing_read_semantics: "drawing",
   drawing_query: "drawing",
   drawing_export_sheet: "drawing",
+  drawing_set_dimension: "drawing",
+  drawing_set_projection: "drawing",
   dimension_part: "drawing",
   gdt_datum: "drawing",
   gdt_fcf: "drawing",

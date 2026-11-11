@@ -229,6 +229,10 @@ pub struct PlacedDimension {
     pub text_rot_deg: f64,
     /// The rendered string.
     pub label: String,
+    /// The dimension's id ([`super::dimensioning::Dimension2d::id`]) — what an
+    /// edit of this callout addresses (`data-dim-id` in the SVG).
+    #[serde(default)]
+    pub dim_id: String,
     /// Index into `drawing.views`.
     pub owner_view: usize,
 }
@@ -1659,6 +1663,7 @@ pub(crate) fn place_dimensions(
         hi: f64,
         span: f64,
         label: String,
+        dim_id: String,
     }
     let mut horiz: Vec<Lin> = Vec::new();
     let mut vert: Vec<Lin> = Vec::new();
@@ -1724,6 +1729,7 @@ pub(crate) fn place_dimensions(
                 text_anchor: [ax, ay],
                 text_rot_deg: 0.0,
                 label: d.label.clone(),
+                dim_id: d.id.clone(),
                 owner_view: owner,
             });
             continue;
@@ -1735,6 +1741,7 @@ pub(crate) fn place_dimensions(
                 hi: a[0].max(b[0]),
                 span: dx,
                 label: d.label.clone(),
+                dim_id: d.id.clone(),
             });
         } else {
             vert.push(Lin {
@@ -1742,6 +1749,7 @@ pub(crate) fn place_dimensions(
                 hi: a[1].max(b[1]),
                 span: dy,
                 label: d.label.clone(),
+                dim_id: d.id.clone(),
             });
         }
     }
@@ -1783,6 +1791,7 @@ pub(crate) fn place_dimensions(
             text_anchor: [tx, ty],
             text_rot_deg: 0.0,
             label: d.label.clone(),
+            dim_id: d.dim_id.clone(),
             owner_view: owner,
         });
         level += STACK;
@@ -1816,6 +1825,7 @@ pub(crate) fn place_dimensions(
             text_anchor: [tx, ty],
             text_rot_deg: -90.0,
             label: d.label.clone(),
+            dim_id: d.dim_id.clone(),
             owner_view: owner,
         });
         level -= STACK;

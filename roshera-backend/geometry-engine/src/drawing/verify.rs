@@ -1620,6 +1620,7 @@ mod harness_invariant_tests {
             text_anchor: [span * 0.5, -1.4],
             text_rot_deg: 0.0,
             label: label.to_string(),
+            dim_id: String::new(),
             owner_view: 0,
         }
     }

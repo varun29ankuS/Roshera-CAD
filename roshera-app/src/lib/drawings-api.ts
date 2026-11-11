@@ -68,6 +68,17 @@ export interface ProjectedView {
   scale: number
   polylines: Polyline2d[]
   extent: ViewExtent
+  /** The view's dimension callouts (kernel `Dimension2d`). */
+  dimensions?: SheetDimension[]
+}
+
+/** One dimension callout on a sheet. `id` is what an edit addresses. */
+export interface SheetDimension {
+  id: string
+  kind: string
+  value: number
+  unit: string
+  label: string
 }
 
 export interface TitleBlock {
@@ -90,7 +101,13 @@ export interface Drawing {
    *  against a pre-upgrade api-server that doesn't know the field
    *  exists. Use {@link defaultTitleBlock} for a safe accessor. */
   title_block?: TitleBlock
+  /** First- or third-angle arrangement. Absent on sheets from a server
+   *  that pre-dates the choice — those are third-angle. */
+  projection?: ProjectionAngle
 }
+
+/** First-angle (ISO; India, Europe) or third-angle (ASME) projection. */
+export type ProjectionAngle = 'first' | 'third'
 
 /** Default title-block values matching the kernel's `Default` impl.
  *  Use this when a `Drawing` may have come from a server that pre-dates
@@ -279,6 +296,75 @@ export async function removeView(drawingId: string, viewId: string): Promise<voi
     method: 'DELETE',
   })
   await jsonOrThrow<unknown>(r, 'removeView')
+}
+
+/**
+ * A typed refusal from the server, carrying its plain-language reason. The
+ * drawing-edit routes refuse rather than approximate, and the reason is what
+ * a person needs to read (`error`), not the status line.
+ */
+export class DrawingRefusal extends Error {
+  readonly gate: string | null
+  constructor(message: string, gate: string | null) {
+    super(message)
+    this.name = 'DrawingRefusal'
+    this.gate = gate
+  }
+}
+
+async function jsonOrRefusal<T>(resp: Response): Promise<T> {
+  if (resp.ok) return resp.json() as Promise<T>
+  let message = `${resp.status} ${resp.statusText}`
+  let gate: string | null = null
+  try {
+    const body = await resp.json()
+    if (typeof body?.error === 'string') message = body.error
+    if (typeof body?.details?.gate === 'string') gate = body.details.gate
+  } catch {
+    /* non-JSON body: the status line is the reason */
+  }
+  throw new DrawingRefusal(message, gate)
+}
+
+/** Result of editing a sheet dimension (which edits the part). */
+export interface DimensionEditResult {
+  dimension: { id: string; from: number; to: number; sheet_value: number | null }
+  driver: { command: string; parameter: string; from_value: number; new_value: number }
+}
+
+/**
+ * Set a sheet dimension to `value`. The server finds the one recorded
+ * parameter that drives it, changes it, rebuilds the part and regenerates the
+ * sheet. Throws {@link DrawingRefusal} when it cannot (reference-only
+ * dimension, several drivers, unreachable size, or the part refused).
+ */
+export async function setDrawingDimension(
+  drawingId: string,
+  dimensionId: string,
+  value: number,
+): Promise<DimensionEditResult> {
+  const r = await fetch(
+    `${API_HOST}/api/drawings/${drawingId}/dimensions/${encodeURIComponent(dimensionId)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value }),
+    },
+  )
+  return jsonOrRefusal<DimensionEditResult>(r)
+}
+
+/** Lay a sheet out first- or third-angle (kept when the part is edited). */
+export async function setDrawingProjection(
+  drawingId: string,
+  projection: ProjectionAngle,
+): Promise<void> {
+  const r = await fetch(`${API_HOST}/api/drawings/${drawingId}/projection`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projection }),
+  })
+  await jsonOrRefusal<unknown>(r)
 }
 
 /** Fetch the rendered SVG (raw XML string). Empty drawing → envelope only. */
