@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react'
-import { FRAME_ALL } from '@/stores/scene-store'
+import { CAMERA_PRESETS, FRAME_ALL } from '@/stores/scene-store'
 import { useThree, useFrame } from '@react-three/fiber'
 import {
   OrbitControls,
@@ -184,18 +184,20 @@ export function CameraController() {
 
     const controls = controlsRef.current
 
-    // A preset is a viewing DIRECTION. Its stored position sits 30 mm from
-    // its target, which puts the camera inside anything bigger than a few
-    // centimetres, so the distance (and, for the standard views aimed at the
-    // origin, the target) comes from the model: the same fit the sketch
-    // look-at uses. An empty scene keeps the preset as written.
+    // A named view (Front, Top, Iso...) is a viewing DIRECTION. Its stored
+    // position sits 30 mm from the origin, which puts the camera inside
+    // anything bigger than a few centimetres, so its distance and target come
+    // from the model: the same fit the sketch look-at uses. Any other pose
+    // (the agent bridge's set_camera) is exact and is applied as written, as
+    // is every view of an empty scene.
     const presetTarget = new THREE.Vector3(...pendingPreset.target)
     const presetPos = new THREE.Vector3(...pendingPreset.position)
+    const isNamedView = Object.values(CAMERA_PRESETS).includes(pendingPreset)
     let endTarget = presetTarget
     let endPosition = presetPos
-    if (sceneBounds.radius > 1e-6) {
+    if (isNamedView && sceneBounds.radius > 1e-6) {
       const dir = new THREE.Vector3().subVectors(presetPos, presetTarget).normalize()
-      endTarget = presetTarget.lengthSq() < 1e-12 ? sceneBounds.center.clone() : presetTarget
+      endTarget = sceneBounds.center.clone()
       let distance = sceneBounds.radius * 2.5
       const persp = perspRef.current
       if (persp && (camera as THREE.PerspectiveCamera).isPerspectiveCamera) {
@@ -345,15 +347,19 @@ export function CameraController() {
       }
     }
 
-    // Preserve the user's current viewing direction. Fall back to a
-    // gentle isometric direction if the camera sits exactly on the
-    // existing target (no usable direction vector).
-    const dir = new THREE.Vector3()
-      .subVectors(camera.position, controls.target)
-      .normalize()
-    if (!Number.isFinite(dir.x) || dir.lengthSq() < 1e-6) {
-      dir.set(1, -1, 0.75).normalize()
-    }
+    // Framing the whole scene happens when a document opens (first load or
+    // a switch): a fresh view, so it looks from the iso direction, Z up. The
+    // camera's current direction means nothing then, and can be garbage: at
+    // boot the server's default document is framed and then the app switches
+    // to the last-used one while that first animation is still in flight.
+    // Framing one part keeps the user's direction (iso if the camera sits on
+    // its target).
+    const iso = new THREE.Vector3(1, -1, 0.75).normalize()
+    const dir =
+      pendingFrameObjectId === FRAME_ALL
+        ? iso
+        : new THREE.Vector3().subVectors(camera.position, controls.target).normalize()
+    if (!Number.isFinite(dir.x) || dir.lengthSq() < 1e-6) dir.copy(iso)
     const endPosition = center.clone().addScaledVector(dir, distance)
 
     animRef.current = {
@@ -361,7 +367,7 @@ export function CameraController() {
       startTarget: controls.target.clone(),
       endPosition,
       endTarget: center,
-      endUp: camera.up.clone(),
+      endUp: pendingFrameObjectId === FRAME_ALL ? new THREE.Vector3(0, 0, 1) : camera.up.clone(),
       progress: 0,
     }
     invalidate()

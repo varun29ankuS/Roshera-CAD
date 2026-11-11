@@ -85,6 +85,29 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : 'backend unreachable'
 }
 
+/** Where this browser remembers the document it was last working in. */
+const LAST_DOCUMENT_KEY = 'roshera.lastDocumentId'
+
+function readLastDocument(): string | null {
+  try {
+    return localStorage.getItem(LAST_DOCUMENT_KEY)
+  } catch {
+    return null
+  }
+}
+
+function writeLastDocument(id: string): void {
+  try {
+    localStorage.setItem(LAST_DOCUMENT_KEY, id)
+  } catch {
+    // Storage blocked (private window, policy): the next load simply opens
+    // whatever the server has active.
+  }
+}
+
+/** The return-to-last-document switch runs at most once per page load. */
+let restoredLastDocument = false
+
 export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
   documents: [],
   switchingId: null,
@@ -94,6 +117,21 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
     try {
       const docs = await listDocuments()
       set({ documents: docs })
+      // The server boots into its default document; reopen the one this
+      // browser was last working in, if it still exists. Once per load, so
+      // a later refresh never yanks the user out of a document they chose.
+      if (!restoredLastDocument) {
+        restoredLastDocument = true
+        const last = readLastDocument()
+        const target = last ? docs.find((d) => d.id === last) : undefined
+        if (target && !target.active) {
+          void get().switchTo(target.id)
+          return
+        }
+      }
+      // Otherwise the active document IS where this browser is working.
+      const active = docs.find((d) => d.active)
+      if (active) writeLastDocument(active.id)
     } catch {
       // Backend not reachable yet — leave the previous list (possibly
       // empty) in place; the caller decides whether to retry.
@@ -124,6 +162,7 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
       // has already committed to the new document regardless.
       const [docs] = await Promise.all([listDocuments(), refreshSceneFromServer(), syncNotebook()])
       set((state) => ({ documents: docs, switchingId: null, epoch: state.epoch + 1 }))
+      writeLastDocument(id)
       // Open the fresh session NOW if the agent was connected before the
       // switch, rather than lazily on the next message: in between, the
       // header read "no session" and the AI chip went red as if the provider
