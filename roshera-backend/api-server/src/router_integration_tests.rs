@@ -10798,3 +10798,114 @@ async fn a_dimension_edit_that_cannot_converge_is_reverted_whatever_the_count() 
          names the duplicate distance: {body}"
     );
 }
+
+/// The first dimension of `kind` reading `value` on the drawing, as
+/// `(dimension id, pid)`.
+fn drawing_dimension(
+    drawing: &serde_json::Value,
+    kind: &str,
+    value: f64,
+) -> Option<(String, String)> {
+    drawing["views"].as_array()?.iter().find_map(|v| {
+        v["dimensions"].as_array()?.iter().find_map(|d| {
+            let matches = d["kind"].as_str() == Some(kind)
+                && (d["value"].as_f64().unwrap_or(f64::NAN) - value).abs() < 1e-6;
+            if matches {
+                Some((
+                    d["id"].as_str()?.to_string(),
+                    d["pid"].as_str()?.to_string(),
+                ))
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// The value the drawing now shows for the dimension with persistent id `pid`.
+fn drawing_value_by_pid(drawing: &serde_json::Value, pid: &str) -> Option<f64> {
+    drawing["views"].as_array()?.iter().find_map(|v| {
+        v["dimensions"]
+            .as_array()?
+            .iter()
+            .find(|d| d["pid"].as_str() == Some(pid))
+            .and_then(|d| d["value"].as_f64())
+    })
+}
+
+/// Drawing-driven edit, end to end: editing the bore's Ø6 on the sheet to Ø8
+/// changes the PART (its drill radius becomes 4 through a mould) and the
+/// re-derived sheet reads Ø8.
+#[tokio::test]
+async fn editing_a_drawing_dimension_changes_the_part() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+    // The boolean's result is the most recently registered part.
+    let part_uuid = {
+        state
+            .uuid_to_local
+            .iter()
+            .max_by_key(|e| *e.value())
+            .map(|e| *e.key())
+            .expect("the bored part is registered")
+    };
+    let (cs, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    assert_eq!(
+        cs,
+        StatusCode::OK,
+        "drawing create must 200; body = {created}"
+    );
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let (dim_id, pid) = drawing_dimension(&sheet, "diameter", 6.0)
+        .expect("the Ø6 bore is dimensioned on the sheet");
+
+    let (es, edited) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/drawings/{drawing_id}/dimensions/{dim_id}"),
+            json!({ "value": 8.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(es, StatusCode::OK, "the edit must apply; body = {edited}");
+    assert_eq!(edited["driver"]["parameter"], "radius", "{edited}");
+    assert!(
+        (edited["driver"]["new_value"].as_f64().unwrap_or(0.0) - 4.0).abs() < 1e-9,
+        "{edited}"
+    );
+
+    let r = live_bore_radius(&state).await.expect("a bore face");
+    assert!(
+        (r - 4.0).abs() < 1e-6,
+        "the LIVE part's bore radius is now 4, got {r}"
+    );
+
+    let (_, after) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let shown = drawing_value_by_pid(&after, &pid).expect("the same dimension, by pid");
+    assert!(
+        (shown - 8.0).abs() < 1e-6,
+        "the sheet now reads Ø8, got {shown}"
+    );
+}
+
+/// A dimension nothing on the timeline drives is refused as reference-only,
+/// never "edited" by scaling or approximation.
+#[tokio::test]
+async fn editing_an_unknown_drawing_dimension_is_refused() {
+    let state = make_test_state().await;
+    let (s, body) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/drawings/{}/dimensions/d0", Uuid::new_v4()),
+            json!({ "value": 8.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{body}");
+}

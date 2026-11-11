@@ -37,6 +37,7 @@ mod branches;
 mod csketch;
 mod documents;
 mod documents_tests;
+mod drawing_edit;
 mod drawing_mgr;
 #[cfg(test)]
 mod drawing_ownership_tests;
@@ -11107,6 +11108,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             axum::routing::patch(drawing_mgr::update_title_block),
         )
         .route("/api/drawings/{id}/views", post(drawing_mgr::add_view))
+        .route(
+            "/api/drawings/{id}/dimensions/{dim_id}",
+            post(drawing_edit::edit_dimension),
+        )
         .route(
             "/api/drawings/{id}/views/{view_id}",
             delete(drawing_mgr::remove_view),
