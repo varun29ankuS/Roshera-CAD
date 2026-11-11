@@ -100,6 +100,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::constraint_solver::ConstraintDiagnosis;
 use super::constraints::{Constraint, ConstraintId, ConstraintType, EntityRef};
+use super::profile_contacts::{
+    profile_contacts, ContactKind, ProfileContact, UncheckedPair, PROFILE_CONTACT_TOLERANCE,
+};
 use super::sketch_solver::{ComponentDof, DofStatus};
 use super::sketch_topology::{ProfileType, SketchTopology};
 use super::sketch_validation::{SketchValidator, ValidationIssue};
@@ -517,6 +520,19 @@ pub struct SketchValidityCertificate {
     /// pre-Slice-7 payloads deserialises as empty.
     #[serde(default)]
     pub continuity: Vec<ContinuityFact>,
+    /// Contacts between profile curves other than joins: crossings,
+    /// endpoints resting on another curve, overlaps (SK-C3). Any entry makes
+    /// `self_intersection_free` false.
+    #[serde(default)]
+    pub profile_contacts: Vec<ProfileContact>,
+    /// Profile curve pairs the contact check could not decide. Never read as
+    /// free: any entry makes `self_intersection_free` false.
+    #[serde(default)]
+    pub unchecked_pairs: Vec<UncheckedPair>,
+    /// Distance below which two profile curves touch
+    /// ([`PROFILE_CONTACT_TOLERANCE`]).
+    #[serde(default)]
+    pub contact_tolerance: f64,
 }
 
 impl SketchValidityCertificate {
@@ -718,6 +734,28 @@ pub fn certify_sketch(sketch: &Sketch) -> SketchValidityCertificate {
         }
     }
 
+    let contacts = profile_contacts(sketch);
+    if !contacts.is_free() {
+        self_intersection_free = false;
+    }
+    for c in &contacts.contacts {
+        let what = match c.kind {
+            ContactKind::Crossing => "crosses",
+            ContactKind::EndOnInterior => "ends on (or is ended on by)",
+            ContactKind::Overlap => "overlaps",
+        };
+        issues.push(format!(
+            "{} {what} {} at ({:.6}, {:.6})",
+            c.first, c.second, c.point[0], c.point[1]
+        ));
+    }
+    for u in &contacts.unchecked {
+        issues.push(format!(
+            "contact between {} and {} unchecked: {}",
+            u.first, u.second, u.reason
+        ));
+    }
+
     if numeric_conflicts > 0 {
         issues.push(format!(
             "{numeric_conflicts} numerically-inconsistent constraint(s)"
@@ -753,6 +791,9 @@ pub fn certify_sketch(sketch: &Sketch) -> SketchValidityCertificate {
         entity_statuses: system.entity_statuses,
         witnesses: system.witnesses,
         continuity: continuity_facts(sketch),
+        profile_contacts: contacts.contacts,
+        unchecked_pairs: contacts.unchecked,
+        contact_tolerance: PROFILE_CONTACT_TOLERANCE,
     }
 }
 

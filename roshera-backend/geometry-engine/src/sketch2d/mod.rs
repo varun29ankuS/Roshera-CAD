@@ -68,6 +68,7 @@ pub mod inference;
 pub mod sketch_ops;
 
 // Utilities
+pub mod profile_contacts;
 pub mod sketch_topology;
 pub mod sketch_validation;
 
