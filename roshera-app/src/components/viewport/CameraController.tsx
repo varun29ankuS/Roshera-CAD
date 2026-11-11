@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react'
+import { FRAME_ALL } from '@/stores/scene-store'
 import { useThree, useFrame } from '@react-three/fiber'
 import {
   OrbitControls,
@@ -258,32 +259,36 @@ export function CameraController() {
   useEffect(() => {
     if (!pendingFrameObjectId || !controlsRef.current) return
     const controls = controlsRef.current
-    const obj = useSceneStore.getState().objects.get(pendingFrameObjectId)
-    if (!obj) {
-      setPendingFrameObject(null)
-      return
-    }
-    const vertices = obj.mesh.vertices
-    if (vertices.length === 0) {
-      setPendingFrameObject(null)
-      return
-    }
-
-    const worldMatrix = new THREE.Matrix4().compose(
-      new THREE.Vector3(...obj.position),
-      new THREE.Quaternion().setFromEuler(
-        new THREE.Euler(obj.rotation[0], obj.rotation[1], obj.rotation[2], 'XYZ'),
-      ),
-      new THREE.Vector3(...obj.scale),
-    )
+    // FRAME_ALL frames the union of every object (first load, document
+    // switch); any other id frames that one object.
+    const all = useSceneStore.getState().objects
+    const objs =
+      pendingFrameObjectId === FRAME_ALL
+        ? [...all.values()]
+        : [all.get(pendingFrameObjectId)].filter((o) => o !== undefined)
 
     const min = new THREE.Vector3(Infinity, Infinity, Infinity)
     const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity)
     const v = new THREE.Vector3()
-    for (let i = 0; i < vertices.length; i += 3) {
-      v.set(vertices[i], vertices[i + 1], vertices[i + 2]).applyMatrix4(worldMatrix)
-      min.min(v)
-      max.max(v)
+    for (const obj of objs) {
+      const vertices = obj.mesh.vertices
+      const worldMatrix = new THREE.Matrix4().compose(
+        new THREE.Vector3(...obj.position),
+        new THREE.Quaternion().setFromEuler(
+          new THREE.Euler(obj.rotation[0], obj.rotation[1], obj.rotation[2], 'XYZ'),
+        ),
+        new THREE.Vector3(...obj.scale),
+      )
+      for (let i = 0; i < vertices.length; i += 3) {
+        v.set(vertices[i], vertices[i + 1], vertices[i + 2]).applyMatrix4(worldMatrix)
+        min.min(v)
+        max.max(v)
+      }
+    }
+    if (!Number.isFinite(min.x) || !Number.isFinite(max.x)) {
+      // Nothing with geometry to frame.
+      setPendingFrameObject(null)
+      return
     }
 
     const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5)

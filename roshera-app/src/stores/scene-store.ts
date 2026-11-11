@@ -31,6 +31,9 @@ import {
 // Re-exported so consumers (panels, overlays) can import the
 // SketchShape wire type from the same module they import the rest
 // of the sketch types from.
+/** `pendingFrameObjectId` value that frames every object at once. */
+export const FRAME_ALL = '*'
+
 export type { ServerSketchShape, SketchRegion } from '@/lib/sketch-api'
 
 // ─── Selection granularity ───────────────────────────────────────────
@@ -660,6 +663,7 @@ interface SceneState {
    * geometry doesn't land off-screen. Cleared by CameraController
    * once the animation has been seeded.
    */
+  /** An object id to frame, or {@link FRAME_ALL} for the whole scene. */
   pendingFrameObjectId: string | null
 
   /** Active lens projection. See {@link CameraProjection}. */

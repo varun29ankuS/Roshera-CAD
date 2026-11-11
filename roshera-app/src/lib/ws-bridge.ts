@@ -5,7 +5,7 @@
  */
 import { wsClient, setResyncHook } from './ws-client'
 import { useWSStore } from '@/stores/ws-store'
-import { useSceneStore, type CADObject, type CADMesh, type CADMaterial, type AnalyticalGeometry } from '@/stores/scene-store'
+import { FRAME_ALL, useSceneStore, type CADObject, type CADMesh, type CADMaterial, type AnalyticalGeometry } from '@/stores/scene-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { sketchApi } from './sketch-api'
 import type {
@@ -562,8 +562,14 @@ const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
 /// several solids into the live model server-side. Cheap (one
 /// `GET /api/scene/snapshot`) and idempotent (clear + rebuild).
 export async function refreshSceneFromServer(): Promise<void> {
-  return resyncSceneFromServer()
+  // An explicit refresh is a document switch: show the new document's model.
+  await resyncSceneFromServer()
+  useSceneStore.getState().setPendingFrameObject(FRAME_ALL)
 }
+
+/** True once the first scene sync after page load has been framed. Later
+ *  syncs (WS reconnects) leave the camera where the user put it. */
+let framedFirstSync = false
 
 async function resyncSceneFromServer(): Promise<void> {
   try {
@@ -604,6 +610,12 @@ async function resyncSceneFromServer(): Promise<void> {
     console.info(
       `[ws-bridge] scene resynced after reconnect: ${converted.length} object(s)`,
     )
+    if (!framedFirstSync && converted.length > 0) {
+      // The camera's starting pose knows nothing about the model; without
+      // this a reload could open looking from inside a part.
+      framedFirstSync = true
+      scene.setPendingFrameObject(FRAME_ALL)
+    }
   } catch (err) {
     console.warn('[ws-bridge] scene resync failed (scene preserved):', err)
     useBlackboardStore
