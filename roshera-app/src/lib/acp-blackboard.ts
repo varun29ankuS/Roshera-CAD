@@ -29,6 +29,8 @@
 
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
+import { listDrawings } from '@/lib/drawings-api'
 import { useAcpPermissionStore } from '@/stores/acp-permission-store'
 import { parseCard, type CardKind } from '@/lib/blackboard-cards'
 import {
@@ -433,6 +435,10 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
     if (err && typeof err === 'object') renderedTurnFailures.add(err)
   }
 
+  // Drawings that exist before the turn: a sheet the agent makes during it is
+  // shown to the user, in the Drawing workspace, when the turn ends.
+  const drawingsBefore = await drawingIdsOrNull()
+
   try {
     let stopReason: AcpStopReason
     try {
@@ -494,6 +500,7 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
     useBlackboardStore
       .getState()
       .setLineTurnStatus(lineId, stopReason === 'cancelled' ? 'cancelled' : 'completed')
+    if (stopReason !== 'cancelled') await revealNewDrawing(drawingsBefore)
   } finally {
     unsubscribe()
     const b = useBlackboardStore.getState()
@@ -501,6 +508,28 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
     b.setAgentAttention('idle')
     b.setProcessing(false)
   }
+}
+
+// ── A drawing the agent made is shown, not just saved ───────────────
+
+async function drawingIdsOrNull(): Promise<Set<string> | null> {
+  try {
+    return new Set((await listDrawings()).map((d) => d.id))
+  } catch {
+    return null
+  }
+}
+
+/** Open the Drawing workspace on a sheet this turn created, if any. A drawing
+ *  is something to look at before it becomes a file: the person sees the sheet
+ *  in the app, and exports it from there when they are happy with it. */
+async function revealNewDrawing(before: Set<string> | null): Promise<void> {
+  if (before === null) return
+  const after = await drawingIdsOrNull()
+  if (after === null) return
+  const created = [...after].filter((id) => !before.has(id))
+  const newest = created[created.length - 1]
+  if (newest) useDocModeStore.getState().openDrawing(newest)
 }
 
 // ── Shared client lifecycle ─────────────────────────────────────────

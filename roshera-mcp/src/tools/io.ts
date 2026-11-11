@@ -189,7 +189,10 @@ export function registerIoTools(server: ToolHost) {
                 } advisory issue(s))`
               : `LAYOUT ISSUES — ${q.issues?.length ?? 0} finding(s); see quality.issues`
             : "drawing created (no quality report)",
-          note: "Open in the Drawing workspace, or drawing_export_sheet to save PDF/DXF/SVG to disk.",
+          note:
+            "The sheet opens in the user's Drawing workspace when your turn ends — that is " +
+            "where they review it. Do NOT export it to a file unless they ask for a file; " +
+            "they export from the app once they are happy with the sheet.",
         });
       } catch (e) {
         return fail(e);
@@ -200,7 +203,9 @@ export function registerIoTools(server: ToolHost) {
   server.tool(
     "drawing_export_sheet",
     "SAVE the RENDERED sheet from make_drawing to disk as a PDF/DXF/SVG FILE — " +
-      "the shop-ready sheet — and return the absolute path. For the queryable " +
+      "the shop-ready sheet — and return the absolute path. ONLY when the user " +
+      "asks for a file: a drawing is reviewed in the app first, and a request for " +
+      "a drawing is not a request for a PDF. For the queryable " +
       "semantic data (not a file) use drawing_read_semantics instead. " +
       "ENFORCED: refused while the sheet's live certificate carries stale/" +
       "dangling facts (regenerate with make_drawing — no override), on " +

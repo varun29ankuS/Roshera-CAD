@@ -53,6 +53,7 @@ import {
   type TitleBlockPatch,
 } from '@/lib/drawings-api'
 import { type PartSummary, listParts } from '@/lib/parts-api'
+import { useDocumentStore } from '@/stores/document-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 
 // Default solid id used when a part is freshly selected. Solid ids in
@@ -254,7 +255,16 @@ export function DrawingsWorkspace() {
       // a bare id: a drawing is bound to the model that produced it, and the
       // server discloses which. Only the ids are needed here, but the owner
       // is deliberately available rather than discarded at the fetch layer.
-      const entries = await listDrawings()
+      // Only this document's sheets: a drawing bound to another document
+      // cannot render against this model (the server answers 409), so
+      // listing it here only produces an error banner. Part-owned drawings
+      // carry no document id and stay listed.
+      const docs = useDocumentStore.getState()
+      if (docs.documents.length === 0) await docs.refresh()
+      const activeDoc = useDocumentStore.getState().documents.find((d) => d.active)?.id
+      const entries = (await listDrawings()).filter(
+        (e) => e.owner.kind !== 'legacy' || !activeDoc || e.owner.document_id === activeDoc,
+      )
       const ids = entries.map((e) => e.id)
       // Resolve summaries in parallel — payload is tiny (no polylines
       // would be cheaper, but the kernel's `Drawing` JSON for a fresh
