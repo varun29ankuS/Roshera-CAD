@@ -53,7 +53,7 @@ import { create } from 'zustand'
 import { createDocument, listDocuments, openDocument, renameDocument, type DocumentInfo } from '@/lib/documents-api'
 import { refreshSceneFromServer } from '@/lib/ws-bridge'
 import { syncNotebook } from '@/lib/blackboard-api'
-import { resetAcpClient } from '@/lib/acp-blackboard'
+import { establishAcpSession, getAcpSessionId, resetAcpClient } from '@/lib/acp-blackboard'
 
 export interface DocumentSwitchResult {
   success: boolean
@@ -115,6 +115,7 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
       // it here, never optimistically before the backend confirms, so the
       // next `getAcpClient()` call opens a fresh session against whatever
       // document is active by the time that call happens.
+      const hadAgentSession = getAcpSessionId() !== null
       resetAcpClient()
       // Re-hydrate the stores that own server-sourced state. A failure in
       // any one of these is reported by that primitive itself (scene sync
@@ -123,6 +124,14 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
       // has already committed to the new document regardless.
       const [docs] = await Promise.all([listDocuments(), refreshSceneFromServer(), syncNotebook()])
       set((state) => ({ documents: docs, switchingId: null, epoch: state.epoch + 1 }))
+      // Open the fresh session NOW if the agent was connected before the
+      // switch, rather than lazily on the next message: in between, the
+      // header read "no session" and the AI chip went red as if the provider
+      // had dropped, and the first prompt paid the whole startup on its own
+      // clock. Never started when no session existed — a switch must not
+      // spawn an agent the user had not connected. A failure here is the
+      // same one the next prompt would meet, and it reports itself there.
+      if (hadAgentSession) void establishAcpSession().catch(() => undefined)
       return { success: true }
     } catch (err) {
       set({ switchingId: null })

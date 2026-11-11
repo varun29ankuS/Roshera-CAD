@@ -154,7 +154,9 @@ export function TurnStatusLine() {
           title="Elapsed time, tokens moved this turn, and operations the kernel has served for it. Turns typically take 60-90 seconds."
         >
           ({elapsedLabel(elapsed)}
-          {turnTokens !== null ? ` · ${compact(turnTokens)} tokens` : ''}
+          {/* Usage arrives at turn end on most providers: "0 tokens" mid-turn
+              would read as a measurement, so the figure waits until it is one. */}
+          {turnTokens !== null && turnTokens > 0 ? ` · ${compact(turnTokens)} tokens` : ''}
           {opCount > 0 ? ` · ${opCount} op${opCount === 1 ? '' : 's'}` : ''})
         </span>
         <button

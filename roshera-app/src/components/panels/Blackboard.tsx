@@ -37,6 +37,7 @@ import {
 } from 'lucide-react'
 import { VendorMark } from '@/components/settings/vendor-marks'
 import { TurnStatusLine } from './TurnStatusLine'
+import { useDocumentStore } from '@/stores/document-store'
 
 /**
  * BLACKBOARD
@@ -117,54 +118,6 @@ function turnWeight(tokens: number): { className: string; label: string } {
   return { className: 'text-red-500', label: 'heavy turn' }
 }
 
-/**
- * How full the context window is — the number that actually predicts a turn
- * that dies mid-thought.
- *
- * `contextSize` has been in the session store since usage tracking landed and
- * has never been rendered, so the one figure a human could act on was the one
- * they could not see. Session and per-turn totals answer "what did that cost";
- * this answers "how much room is left", which is a different question and the
- * only one with a ceiling.
- *
- * A fill bar is legal here and nowhere else on this surface: the total is
- * KNOWN. A bar over a tool call's progress would be a fraction of an unknown
- * denominator, which is why none exists.
- *
- * Hue is a verdict, so it stays neutral until there is something to assert —
- * amber at 70%, red at 90%. These are context-PRESSURE bands and deliberately
- * separate from the per-turn light/moderate/heavy weights beside them, which
- * grade the turn that just finished rather than the room remaining.
- *
- * Renders nothing when the backend named no context size: an unknown ceiling
- * cannot be drawn as a full or an empty bar without asserting one.
- */
-function ContextMeter({ used, size }: { used: number | null; size: number | null }) {
-  if (used === null || size === null || size <= 0) return null
-  const frac = Math.min(1, used / size)
-  const pct = Math.round(frac * 100)
-  const tone =
-    frac >= 0.9 ? 'text-destructive' : frac >= 0.7 ? 'text-caution' : 'text-muted-foreground'
-  const fill = frac >= 0.9 ? 'bg-destructive' : frac >= 0.7 ? 'bg-caution' : 'bg-muted-foreground/50'
-  return (
-    <>
-      <span className="text-muted-foreground/40">·</span>
-      <span
-        className="inline-flex items-center gap-1.5"
-        title={`Context window ${pct}% full — ${used.toLocaleString()} of ${size.toLocaleString()} tokens. A turn that needs more room than remains fails mid-thought.`}
-      >
-        <span className={cn('font-mono tabular-nums', tone)}>ctx {pct}%</span>
-        <span
-          aria-hidden
-          className="h-1 w-10 shrink-0 overflow-hidden rounded-full bg-muted-foreground/20"
-        >
-          <span className={cn('block h-full', fill)} style={{ width: `${pct}%` }} />
-        </span>
-      </span>
-    </>
-  )
-}
-
 export function Blackboard() {
   const lines = useBlackboardStore((s) => s.lines)
   const isProcessing = useBlackboardStore((s) => s.isProcessing)
@@ -184,7 +137,6 @@ export function Blackboard() {
   const acpModel = useAcpSessionStore((s) => s.model)
   const acpTurns = useAcpSessionStore((s) => s.turns)
   const acpProvider = useAcpSessionStore((s) => s.provider)
-  const acpContextSize = useAcpSessionStore((s) => s.contextSize)
   const acpTokens = useAcpSessionStore((s) => s.tokensUsed)
   const acpLastTurnTokens = useAcpSessionStore((s) => s.lastTurnTokens)
   const acpLive = useAcpSessionStore((s) => s.live)
@@ -223,15 +175,17 @@ export function Blackboard() {
     }
   }, [])
 
+  // Checkpoints belong to a DOCUMENT: refetch on (re)connect AND on every
+  // confirmed document switch (`epoch`), exactly as Timeline.tsx does — a
+  // fetch on connect alone kept the previous document's checkpoints as empty
+  // section headers on a brand-new document.
+  const documentEpoch = useDocumentStore((s) => s.epoch)
   useEffect(() => {
     if (wsStatus === 'connected') {
-      // Data-sync fetch on (re)connect, mirroring `Timeline.tsx`'s
-      // `fetchHistory` — this project's established pattern for pulling
-      // timeline state into a component on mount/reconnect.
       // eslint-disable-next-line react-hooks/set-state-in-effect
       fetchCheckpoints()
     }
-  }, [wsStatus, fetchCheckpoints])
+  }, [wsStatus, fetchCheckpoints, documentEpoch])
 
   // Sections group lines under the checkpoint that was open when each was
   // written; within a section, consecutive machine-authored "Created …"
@@ -523,7 +477,6 @@ export function Blackboard() {
               />
             )}
             <span className="truncate font-mono">{shortModelName(acpModel)}</span>
-            {acpLive && <ContextMeter used={acpTokens} size={acpContextSize} />}
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
