@@ -509,6 +509,17 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
     // Chain-line centerlines for circular features (view-space, same frame as
     // the polylines). Drawn before dimensions so callouts sit on top.
     for cl in &view.centerlines {
+        if cl.kind == "pitch_circle" {
+            // `[cx, cy, r, _]`: a chain-line circle through the hole centres.
+            for s in &cl.segments {
+                let _ = write!(
+                    out,
+                    "    <circle class=\"centerline\" cx=\"{:.4}\" cy=\"{:.4}\" r=\"{:.4}\" />\n",
+                    s[0], s[1], s[2]
+                );
+            }
+            continue;
+        }
         for s in &cl.segments {
             let _ = write!(
                 out,

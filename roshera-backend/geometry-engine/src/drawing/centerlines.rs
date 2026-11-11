@@ -30,7 +30,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Centerline {
     /// "axis" (chain line through a side-on feature) | "center_mark" (cross at
-    /// an end-on circular feature).
+    /// an end-on circular feature) | "pitch_circle" (a bolt circle's pitch
+    /// circle on the face view; its single segment is `[cx, cy, r, 0]`).
     pub kind: String,
     /// One or more line segments `[x1, y1, x2, y2]` in view-space mm. An axis is
     /// a single segment; a centre mark is two crossed segments.

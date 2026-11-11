@@ -189,6 +189,60 @@ fn cylinder_walls(model: &BRepModel, solid_id: SolidId) -> Vec<Wall> {
     walls
 }
 
+/// True when some face of the solid other than the hole's own wall lies
+/// wholly inside the hole's circle -- a floor (flat, or a drill-point cone)
+/// closing it off. A through hole has none: every other face touching it
+/// (the faces it pierces) extends beyond its radius.
+fn hole_has_floor(model: &BRepModel, solid_id: SolidId, wall: &Wall) -> bool {
+    let Some(solid) = model.solids.get(solid_id) else {
+        return false;
+    };
+    let tol = REL_TOL * wall.radius.max(1.0) * 1e3;
+    let mut shells = vec![solid.outer_shell];
+    shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
+    for sh in shells {
+        let Some(shell) = model.shells.get(sh) else {
+            continue;
+        };
+        for &fid in &shell.faces {
+            if wall.faces.contains(&fid) {
+                continue;
+            }
+            let Some(face) = model.faces.get(fid) else {
+                continue;
+            };
+            let mut loops = vec![face.outer_loop];
+            loops.extend_from_slice(&face.inner_loops);
+            let mut any = false;
+            let mut all_inside = true;
+            for lid in loops {
+                let Some(lp) = model.loops.get(lid) else {
+                    continue;
+                };
+                for &eid in &lp.edges {
+                    let Some(edge) = model.edges.get(eid) else {
+                        continue;
+                    };
+                    for vid in [edge.start_vertex, edge.end_vertex] {
+                        if let Some(v) = model.vertices.get(vid) {
+                            any = true;
+                            if dist_to_line(v.position, wall.origin, wall.axis) > wall.radius + tol
+                            {
+                                all_inside = false;
+                            }
+                        }
+                    }
+                }
+            }
+            if any && all_inside {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Index of the world axis `a` lies along, or `None` when it is oblique.
 fn world_axis_index(a: [f64; 3]) -> Option<usize> {
     (0..3).find(|&i| a[i].abs() > 1.0 - 1e-9)
@@ -231,11 +285,6 @@ pub fn detect_round_part(
             return None;
         }
     }
-    let axial_extent = records
-        .iter()
-        .find(|d| d.kind == "extent" && d.entities.is_empty() && d.direction[ax_idx].abs() > 0.5)
-        .map(|d| d.value);
-
     let centre = outer.origin;
     let ref_dir = {
         let mut r = [0.0; 3];
@@ -311,10 +360,12 @@ pub fn detect_round_part(
             .iter()
             .find(|d| d.kind == "length" && d.entities.iter().any(|e| holes[0].contains(e)))
             .map(|d| d.value);
-        let through = match (depth, axial_extent) {
-            (Some(dp), Some(t)) => (dp - t).abs() <= 1e3 * tol,
-            _ => false,
-        };
+        // THRU means nothing closes the hole -- no floor face (flat or drill
+        // point) inside its circle. Comparing the depth with the part's
+        // overall height is wrong on any part that is not a uniform plate: a
+        // raised-face flange is 14 tall, its bolt holes go through the 12 mm
+        // body, and that comparison called them blind.
+        let through = g.iter().all(|w| !hole_has_floor(model, solid_id, w));
         let start = angles[0].0;
         let on_centreline = (start / 90.0 - (start / 90.0).round()).abs() * 90.0 <= ANGLE_TOL_DEG;
         let depth_txt = if through {
@@ -395,13 +446,43 @@ pub fn apply_round_conventions(
         })
         .collect();
 
+    // Face-view layout: the outside diameter is dimensioned below the view;
+    // every other diameter on the axis (bore, raised face, hub) and the pitch
+    // circle go in a stack to its LEFT. Four diameters stacked under the face
+    // view ran the outermost into the front view below it.
+    let side = cross(rp.axis, rp.ref_dir);
+    for d in out.iter_mut() {
+        if d.kind == "diameter"
+            && touches(d, &coaxial)
+            && (d.value - rp.outer_diameter).abs() > 1e-6
+        {
+            let station = dot(sub(d.anchor, rp.centre), rp.axis);
+            let on_axis = add(rp.centre, scale(rp.axis, station));
+            d.direction = side;
+            d.anchor = add(on_axis, scale(side, 0.5 * d.value));
+        }
+    }
+
     let Some(template) = template else {
         return out;
     };
     let mut next = out.len();
     for bc in &rp.bolt_circles {
-        let first_angle = bc.start_angle_deg.to_radians();
-        let side = cross(rp.axis, rp.ref_dir);
+        // The callout points at the RIGHT-MOST hole (ties: the LOWER one), so
+        // its leader leaves up and to the right into the open sheet beside the
+        // face view and ends near the view's mid-height. Pointing at the
+        // "first" hole sent it off the top of the sheet whenever that hole sat
+        // at 90°, and an upper-right hole at 45° climbed past the frame too.
+        let step = std::f64::consts::TAU / bc.count.max(1) as f64;
+        let first_angle = (0..bc.count)
+            .map(|k| bc.start_angle_deg.to_radians() + step * k as f64)
+            .max_by(|a, b| {
+                let key = |t: f64| t.cos() - 1e-3 * t.sin();
+                key(*a)
+                    .partial_cmp(&key(*b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0.0);
         let radial = add(
             scale(rp.ref_dir, first_angle.cos()),
             scale(side, first_angle.sin()),
@@ -429,13 +510,13 @@ pub fn apply_round_conventions(
             datum: None,
         });
         next += 1;
-        // Pitch circle: a diameter across the pitch circle along the view's
-        // own axis. The sheet inks diameters as horizontal / vertical linear
+        // Pitch circle: a diameter across the pitch circle along a view axis
+        // (the vertical one, in the left-hand stack). The sheet inks diameters as horizontal / vertical linear
         // dimensions, so an oblique span would be drawn foreshortened under
         // its full value (the first version laid it at 45° and drew a
         // "Ø60 PCD" 42 mm long). Along a world axis the extension lines land
         // on the circle's extremes and the drawn length is the PCD.
-        let pcd_dir = rp.ref_dir;
+        let pcd_dir = side;
         out.push(DimensionRecord {
             id: format!("d{next}"),
             // Its own kind: it names the same holes as the hole callout but
@@ -454,6 +535,37 @@ pub fn apply_round_conventions(
         next += 1;
     }
     out
+}
+
+/// Draw each bolt circle's PITCH CIRCLE on the face view -- the view looking
+/// along the part axis -- as a thin chain-line circle through the hole
+/// centres (ISO 128). The Ø PCD dimension's extension lines land on it; with
+/// no circle drawn they pointed at empty paper whenever no hole sat on the
+/// dimension line. Stored as a `pitch_circle` centerline whose single segment
+/// is `[cx, cy, r, 0]` in view space.
+pub fn add_pitch_circles(drawing: &mut super::types::Drawing) {
+    let Some(rp) = drawing.round_part.clone() else {
+        return;
+    };
+    for view in &mut drawing.views {
+        let Some(vd) = super::dimensioning::view_dir(&view.projection) else {
+            continue;
+        };
+        if dot(vd, rp.axis).abs() < 0.99 {
+            continue;
+        }
+        let c = super::projection::project_point(
+            view.projection,
+            crate::math::Point3::new(rp.centre[0], rp.centre[1], rp.centre[2]),
+        );
+        for bc in &rp.bolt_circles {
+            view.centerlines.push(super::centerlines::Centerline {
+                kind: "pitch_circle".to_string(),
+                segments: vec![[c[0], c[1], 0.5 * bc.pcd, 0.0]],
+                entities: bc.holes.iter().flatten().copied().collect(),
+            });
+        }
+    }
 }
 
 /// Re-measure a bolt-circle callout against the LIVE model. Returns `None`

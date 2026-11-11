@@ -194,6 +194,9 @@ pub(crate) const AR_W: f64 = 0.433; // arrowhead HALF-width: full base 0.866mm
                                     // against AR_L 2.6mm length = 3:1 (ISO 128). 0.85 was a half-width mistaken
                                     // for full width (rendered 1.53:1 — squat arrows).
 pub(crate) const TGAP: f64 = 1.4; // label sits TGAP above/beside the dim line
+/// Gap between an extension line and a label placed OUTSIDE a span too short
+/// for it: clears the outside arrowhead (~3 mm) with a little air.
+pub(crate) const AR_OUTSIDE_CLEAR: f64 = 4.0;
 
 /// Arrowhead specification: tip point and direction vector (unit, pointing
 /// AWAY from the tip — i.e. the shaft direction, not the stab direction).
@@ -565,7 +568,14 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
 
     let mut all_placed: Vec<PlacedDimension> = Vec::new();
     for (idx, view) in drawing.views.iter().enumerate() {
-        let pds = place_dimensions(view, h, idx, &tabled_face_ids);
+        let pds = place_dimensions_in(
+            view,
+            h,
+            idx,
+            &tabled_face_ids,
+            Some(frame_rect_of(drawing, h)),
+            &items,
+        );
         for pd in &pds {
             let font = DIM_TEXT_FONT_MM;
             let text_w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * font;
@@ -1676,6 +1686,30 @@ pub(crate) fn place_dimensions(
     owner: usize,
     tabled_face_ids: &std::collections::HashSet<u32>,
 ) -> Vec<PlacedDimension> {
+    place_dimensions_in(view, sheet_h, owner, tabled_face_ids, None, &[])
+}
+
+/// The drawing frame in sheet coordinates (y down).
+fn frame_rect_of(drawing: &Drawing, sheet_h: f64) -> Rect2 {
+    let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
+    Rect2 {
+        x0: ml,
+        y0: mt,
+        x1: drawing.sheet_size.width() - mr,
+        y1: sheet_h - mb,
+    }
+}
+
+/// [`place_dimensions`] with the sheet frame known, so a leader callout can
+/// keep its text on the sheet.
+pub(crate) fn place_dimensions_in(
+    view: &ProjectedView,
+    sheet_h: f64,
+    owner: usize,
+    tabled_face_ids: &std::collections::HashSet<u32>,
+    frame: Option<Rect2>,
+    obstacles: &[SheetItem],
+) -> Vec<PlacedDimension> {
     let Some(gr) = view_geometry_rect(view, sheet_h) else {
         return Vec::new();
     };
@@ -1742,35 +1776,146 @@ pub(crate) fn place_dimensions(
             let vc = [0.5 * (bbox[0] + bbox[2]), 0.5 * (bbox[1] + bbox[3])];
             let side = if centre[0] >= vc[0] { 1.0 } else { -1.0 };
             let s = std::f64::consts::FRAC_1_SQRT_2;
-            // Up (sheet y grows downward) and out, toward the hole's side.
-            let dir = [side * s, -s];
-            let edge = [centre[0] + dir[0] * r, centre[1] + dir[1] * r];
-            let past_view = if side > 0.0 {
-                (bbox[2] + STANDOFF - edge[0]) / dir[0]
-            } else {
-                (bbox[0] - STANDOFF - edge[0]) / dir[0]
+            // A qualifier in parentheses ("(1ST AT 45.0°)") goes on a second
+            // line UNDER the shoulder, the way a drafter writes a two-line
+            // callout -- one 70 mm line ran off the sheet.
+            let (main, note) = match d.label.split_once(" (") {
+                Some((m, n)) => (m.to_string(), Some(n.trim_end_matches(')').to_string())),
+                None => (d.label.clone(), None),
             };
-            let leg = past_view.max(STANDOFF);
-            let elbow = [edge[0] + dir[0] * leg, edge[1] + dir[1] * leg];
-            let text_w = d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
-            let shoulder_end = [elbow[0] + side * (text_w + 2.0), elbow[1]];
+            let width_of = |t: &str| t.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
+            let main_w = width_of(&main);
+            let note_w = note.as_deref().map(width_of).unwrap_or(0.0);
+            let text_w = main_w.max(note_w);
+
+            // Deterministic candidate search (the same discipline as the
+            // section labels): leader directions in a fixed order -- out and
+            // up on the hole's side, out and down, then the far side -- each
+            // at increasing leg lengths. The first whose text lies inside the
+            // frame and clear of every piece of ink already placed wins; if
+            // none is clear the first candidate is used and the verifier
+            // reports the overlap honestly.
+            struct Leader {
+                dir: [f64; 2],
+                edge: [f64; 2],
+                elbow: [f64; 2],
+                shoulder_end: [f64; 2],
+            }
+            let candidate = |sx: f64, sy: f64, extra: f64| -> Leader {
+                let dir = [sx * s, sy * s];
+                let edge = [centre[0] + dir[0] * r, centre[1] + dir[1] * r];
+                let past_view = if sx > 0.0 {
+                    (bbox[2] + STANDOFF - edge[0]) / dir[0]
+                } else {
+                    (bbox[0] - STANDOFF - edge[0]) / dir[0]
+                };
+                let leg = past_view.max(STANDOFF) + extra;
+                let elbow = [edge[0] + dir[0] * leg, edge[1] + dir[1] * leg];
+                let shoulder_end = [elbow[0] + sx * (text_w + 2.0), elbow[1]];
+                Leader {
+                    dir,
+                    edge,
+                    elbow,
+                    shoulder_end,
+                }
+            };
+            let text_boxes = |l: &Leader| -> Vec<Rect2> {
+                let cx = 0.5 * (l.elbow[0] + l.shoulder_end[0]);
+                let base = l.elbow[1] - TGAP;
+                let mut v = vec![Rect2 {
+                    x0: cx - 0.5 * main_w,
+                    y0: base - DIM_TEXT_FONT_MM,
+                    x1: cx + 0.5 * main_w,
+                    y1: base,
+                }];
+                if note.is_some() {
+                    let nb = l.elbow[1] + TGAP + DIM_TEXT_FONT_MM;
+                    v.push(Rect2 {
+                        x0: cx - 0.5 * note_w,
+                        y0: nb - DIM_TEXT_FONT_MM,
+                        x1: cx + 0.5 * note_w,
+                        y1: nb,
+                    });
+                }
+                v
+            };
+            let clear = |l: &Leader| -> bool {
+                text_boxes(l).iter().all(|t| {
+                    frame.map_or(true, |f| {
+                        t.x0 >= f.x0 + 1.0
+                            && t.x1 <= f.x1 - 1.0
+                            && t.y0 >= f.y0 + 1.0
+                            && t.y1 <= f.y1 - 1.0
+                    }) && !obstacles.iter().any(|it| {
+                        matches!(
+                            it.kind,
+                            SheetItemKind::ViewGeometry
+                                | SheetItemKind::ViewLabel
+                                | SheetItemKind::DimensionText
+                                | SheetItemKind::TitleBlock
+                        ) && t.intersects(&it.bbox, -0.5)
+                    })
+                })
+            };
+            let mut chosen: Option<Leader> = None;
+            'search: for (sx, sy) in [(side, -1.0), (side, 1.0), (-side, -1.0), (-side, 1.0)] {
+                for extra in [0.0, 6.0, 12.0, 18.0] {
+                    let l = candidate(sx, sy, extra);
+                    if clear(&l) {
+                        chosen = Some(l);
+                        break 'search;
+                    }
+                }
+            }
+            let l = chosen.unwrap_or_else(|| candidate(side, -1.0, 0.0));
+
             result.push(PlacedDimension {
-                line: [elbow, shoulder_end],
-                ext: [[edge, elbow], [elbow, elbow]],
+                line: [l.elbow, l.shoulder_end],
+                ext: [[l.edge, l.elbow], [l.elbow, l.elbow]],
                 arrows: [
                     // Tip on the hole edge; `dir` points away from the tip.
-                    ArrowSpec { tip: edge, dir },
                     ArrowSpec {
-                        tip: shoulder_end,
+                        tip: l.edge,
+                        dir: l.dir,
+                    },
+                    ArrowSpec {
+                        tip: l.shoulder_end,
                         dir: [0.0, 0.0],
                     },
                 ],
-                text_anchor: [0.5 * (elbow[0] + shoulder_end[0]), elbow[1] - TGAP],
+                text_anchor: [0.5 * (l.elbow[0] + l.shoulder_end[0]), l.elbow[1] - TGAP],
                 text_rot_deg: 0.0,
-                label: d.label.clone(),
+                label: main,
                 dim_id: d.id.clone(),
                 owner_view: owner,
             });
+            if let Some(note) = note {
+                // Second line: text only (degenerate geometry, like a point
+                // callout), just below the shoulder.
+                let at = [
+                    0.5 * (l.elbow[0] + l.shoulder_end[0]),
+                    l.elbow[1] + TGAP + DIM_TEXT_FONT_MM,
+                ];
+                result.push(PlacedDimension {
+                    line: [at, at],
+                    ext: [[at, at], [at, at]],
+                    arrows: [
+                        ArrowSpec {
+                            tip: at,
+                            dir: [1.0, 0.0],
+                        },
+                        ArrowSpec {
+                            tip: at,
+                            dir: [1.0, 0.0],
+                        },
+                    ],
+                    text_anchor: at,
+                    text_rot_deg: 0.0,
+                    label: note,
+                    dim_id: format!("{}-note", d.id),
+                    owner_view: owner,
+                });
+            }
             continue;
         }
 
@@ -1840,17 +1985,27 @@ pub(crate) fn place_dimensions(
         let ext_b = [[d.hi, bbox[3] + GAP], [d.hi, level + EXT]];
         // Dim line at `level`.
         let line = [[d.lo, level], [d.hi, level]];
-        // Inward arrowheads: left tip points right (+x), right tip points left (-x).
+        // A label wider than its span goes OUTSIDE, past the right extension
+        // line, with the arrows outside pointing in (ISO 129-1 §6.3) --
+        // centred, it would overrun its own arrows.
+        let text_w = d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
+        let outside = text_w > d.span;
+        // `dir` points from the tip toward the arrow's base: inside arrows
+        // have their bases inside the span, outside arrows outside it.
+        let s_in = if outside { -1.0 } else { 1.0 };
         let ar_a = ArrowSpec {
             tip: [d.lo, level],
-            dir: [1.0, 0.0],
+            dir: [s_in, 0.0],
         };
         let ar_b = ArrowSpec {
             tip: [d.hi, level],
-            dir: [-1.0, 0.0],
+            dir: [-s_in, 0.0],
         };
-        // Text centred on the span, TGAP above the dim line.
-        let tx = 0.5 * (d.lo + d.hi);
+        let tx = if outside {
+            d.hi + AR_OUTSIDE_CLEAR + 0.5 * text_w
+        } else {
+            0.5 * (d.lo + d.hi)
+        };
         let ty = level - TGAP;
         result.push(PlacedDimension {
             line,
@@ -1873,19 +2028,27 @@ pub(crate) fn place_dimensions(
         let ext_b = [[bbox[0] - GAP, d.hi], [level - EXT, d.hi]];
         // Dim line at `level`.
         let line = [[level, d.lo], [level, d.hi]];
-        // Inward arrowheads: bottom tip points down (+y), top tip points up (-y).
+        // Too short for its label: text OUTSIDE, above the top extension line,
+        // arrows outside pointing in (same rule as the horizontal stack).
+        let text_w = d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
+        let outside = text_w > d.span;
+        let s_in = if outside { -1.0 } else { 1.0 };
         let ar_a = ArrowSpec {
             tip: [level, d.lo],
-            dir: [0.0, 1.0],
+            dir: [0.0, s_in],
         };
         let ar_b = ArrowSpec {
             tip: [level, d.hi],
-            dir: [0.0, -1.0],
+            dir: [0.0, -s_in],
         };
-        // Text centred vertically, TGAP to the right of the dim line (x decreases
-        // leftward, so the text x-anchor = level − TGAP, rotated -90°).
+        // Text TGAP to the right of the dim line (x decreases leftward, so the
+        // text x-anchor = level − TGAP, rotated -90°).
         let tx = level - TGAP;
-        let ty = 0.5 * (d.lo + d.hi);
+        let ty = if outside {
+            d.lo - AR_OUTSIDE_CLEAR - 0.5 * text_w
+        } else {
+            0.5 * (d.lo + d.hi)
+        };
         result.push(PlacedDimension {
             line,
             ext: [ext_a, ext_b],

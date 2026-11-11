@@ -1095,7 +1095,17 @@ pub fn find_span_overflows(layout: &super::layout::SheetLayout) -> Vec<Dimension
         let text_w = pd.label.chars().count() as f64
             * super::layout::GLYPH_ADVANCE_EM
             * super::layout::DIM_TEXT_FONT_MM;
-        if text_w > span + SPAN_TEXT_TOL_MM {
+        // A label placed OUTSIDE the span (beyond an extension line, the
+        // ISO 129-1 answer to a span too short for its number) does not
+        // overrun its arrows. It counts as outside only when the WHOLE text
+        // run, measured along the dimension line, clears the span -- a label
+        // merely nudged off-centre is still an overflow.
+        let (ux, uy) = (-dx / span, -dy / span);
+        let along =
+            (pd.text_anchor[0] - pd.line[0][0]) * ux + (pd.text_anchor[1] - pd.line[0][1]) * uy;
+        let clear_of_span = along - 0.5 * text_w >= span - SPAN_TEXT_TOL_MM
+            || along + 0.5 * text_w <= SPAN_TEXT_TOL_MM;
+        if text_w > span + SPAN_TEXT_TOL_MM && !clear_of_span {
             out.push(DimensionSpanOverflow {
                 owner_view: pd.owner_view,
                 label: pd.label.clone(),

@@ -242,7 +242,7 @@ fn select_dimensions(mut dims: Vec<Dimension2d>) -> Vec<Dimension2d> {
 /// World-space view direction (unit vector, pointing INTO the scene) that a
 /// standard projection camera looks along. Used by `dedup_dimensions_global`
 /// to decide which view is "axial" for a diameter callout.
-fn view_dir(p: &ProjectionType) -> Option<[f64; 3]> {
+pub(crate) fn view_dir(p: &ProjectionType) -> Option<[f64; 3]> {
     match p {
         ProjectionType::Front => Some([0.0, -1.0, 0.0]),
         ProjectionType::Top => Some([0.0, 0.0, -1.0]),
@@ -726,6 +726,7 @@ pub fn standard_drawing_hlr_with_projection(
     let bore_faces = crate::readable::bore_face_ids(model, solid_id);
     attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
     drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
+    super::round_part::add_pitch_circles(&mut drawing);
 
     Ok(drawing)
 }
@@ -1394,6 +1395,7 @@ pub fn standard_drawing_auto_with_projection(
     let bore_faces = crate::readable::bore_face_ids(model, solid_id);
     attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
     drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
+    super::round_part::add_pitch_circles(&mut drawing);
 
     // ── Section view (Task 9) ─────────────────────────────────────────────────
     // When the part has internal features (bore sites populated above), add
