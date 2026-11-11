@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::hole_table::HoleSite;
 use super::svg::{format_scale, frame_margins, title_block_size};
 use super::types::{Drawing, ProjectedView};
 
@@ -539,10 +540,25 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     // anchors so the verifier sees exactly the same model the renderer
     // inks — no independent recomputation.
     //
-    // Build the tabled-face-id set once from the drawing's hole sites so
-    // `place_dimensions` can suppress position dims for tabled bores.
-    let tabled_face_ids: std::collections::HashSet<u32> = drawing
+    // Bores a round-part callout states (bolt circle, coaxial bore) are inked
+    // by that callout, not by a table row and tag: on a round part they are
+    // located by the pitch circle and the axis, not by corner offsets. Only
+    // the bores that really get a table row are "tabled" — suppressing the
+    // dimensions of a called-out bore would leave it with no ink at all.
+    let callout_faces = drawing
+        .round_part
+        .as_ref()
+        .map(|rp| rp.callout_faces())
+        .unwrap_or_default();
+    let tabled_sites: Vec<HoleSite> = drawing
         .hole_sites
+        .iter()
+        .filter(|s| !s.face_entities.iter().any(|f| callout_faces.contains(f)))
+        .cloned()
+        .collect();
+    // Build the tabled-face-id set once so `place_dimensions` can suppress
+    // position dims for tabled bores.
+    let tabled_face_ids: std::collections::HashSet<u32> = tabled_sites
         .iter()
         .flat_map(|s| s.face_entities.iter().copied())
         .collect();
@@ -586,8 +602,8 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     //   1. HoleTag items at each bore centre in the axial view.
     //   2. HoleTableBorder + HoleTableText items for the bordered table.
     let mut hole_tags: Vec<PlacedHoleTag> = Vec::new();
-    if !drawing.hole_sites.is_empty() {
-        let (tags, table_items) = place_hole_table(drawing, h, &items);
+    if !tabled_sites.is_empty() {
+        let (tags, table_items) = place_hole_table(drawing, &tabled_sites, h, &items);
         hole_tags = tags;
         items.extend(table_items);
         // Datum-origin marker: the hole table's X/Y columns measure from the
@@ -877,6 +893,7 @@ const TABLE_MARGIN: f64 = 3.0;
 /// discipline as view labels — placement never silently hides a defect).
 fn place_hole_table(
     drawing: &Drawing,
+    sites: &[HoleSite],
     sheet_h: f64,
     existing: &[SheetItem],
 ) -> (Vec<PlacedHoleTag>, Vec<SheetItem>) {
@@ -893,7 +910,6 @@ fn place_hole_table(
     // Build table column headers and compute column widths.
     // Columns: TAG · X · Y · Ø · DEPTH
     let headers = ["TAG", "X", "Y", "\u{00D8}", "DEPTH"];
-    let sites = &drawing.hole_sites;
 
     // Determine column widths from the widest content (header or data cell).
     let col_w = |col: usize| -> f64 {
@@ -1352,6 +1368,13 @@ pub(crate) fn place_cutting_plane_labels(
             at(4.0, -4.0),
             at(12.0, 4.0),
             at(12.0, -4.0),
+            // Wider side-steps: a round part stacks several centred
+            // diameter labels right where the line ends (Ø bore, PCD, OD),
+            // and a ±4 mm nudge stays inside an 11 mm label.
+            at(4.0, 8.0),
+            at(4.0, -8.0),
+            at(4.0, 12.0),
+            at(4.0, -12.0),
         ];
         let chosen = candidates
             .into_iter()
@@ -1705,6 +1728,51 @@ pub(crate) fn place_dimensions(
         let b = dim_to_sheet(view, sheet_h, d.b);
         let dx = (a[0] - b[0]).abs();
         let dy = (a[1] - b[1]).abs();
+
+        // A hole-pattern callout ("4× Ø11.00 THRU EQ SP") is far wider than
+        // one hole, so it goes on a LEADER (ISO 129-1 §8): an arrow on the
+        // hole's edge, a 45° leg out past the view, a horizontal shoulder
+        // with the text above it. Encoded in the same shape the renderer
+        // and verifier already read: the leg is `ext[0]`, the shoulder is
+        // the dimension `line` (so the label sits on a span its own width),
+        // the arrow is `arrows[0]`; `ext[1]`/`arrows[1]` are degenerate.
+        if d.kind == "hole_callout" && (dx > 1e-6 || dy > 1e-6) {
+            let centre = [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])];
+            let r = 0.5 * (a[0] - b[0]).hypot(a[1] - b[1]);
+            let vc = [0.5 * (bbox[0] + bbox[2]), 0.5 * (bbox[1] + bbox[3])];
+            let side = if centre[0] >= vc[0] { 1.0 } else { -1.0 };
+            let s = std::f64::consts::FRAC_1_SQRT_2;
+            // Up (sheet y grows downward) and out, toward the hole's side.
+            let dir = [side * s, -s];
+            let edge = [centre[0] + dir[0] * r, centre[1] + dir[1] * r];
+            let past_view = if side > 0.0 {
+                (bbox[2] + STANDOFF - edge[0]) / dir[0]
+            } else {
+                (bbox[0] - STANDOFF - edge[0]) / dir[0]
+            };
+            let leg = past_view.max(STANDOFF);
+            let elbow = [edge[0] + dir[0] * leg, edge[1] + dir[1] * leg];
+            let text_w = d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
+            let shoulder_end = [elbow[0] + side * (text_w + 2.0), elbow[1]];
+            result.push(PlacedDimension {
+                line: [elbow, shoulder_end],
+                ext: [[edge, elbow], [elbow, elbow]],
+                arrows: [
+                    // Tip on the hole edge; `dir` points away from the tip.
+                    ArrowSpec { tip: edge, dir },
+                    ArrowSpec {
+                        tip: shoulder_end,
+                        dir: [0.0, 0.0],
+                    },
+                ],
+                text_anchor: [0.5 * (elbow[0] + shoulder_end[0]), elbow[1] - TGAP],
+                text_rot_deg: 0.0,
+                label: d.label.clone(),
+                dim_id: d.id.clone(),
+                owner_view: owner,
+            });
+            continue;
+        }
 
         if d.kind == "angle" || (dx < 1e-6 && dy < 1e-6) {
             // Leader-free point/angle callout: text at (a[0]+2, a[1]-2).

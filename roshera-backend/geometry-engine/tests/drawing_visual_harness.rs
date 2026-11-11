@@ -353,11 +353,13 @@ fn section_a_a_shows_more_than_the_cut_faces() {
 
 // ── D2 / D4 regression proofs, direct to the finding ────────────────────────
 
-/// **D2**: tabled bore diameters (Ø12 ×4, Ø50) must not render as floating
-/// linear dimensions parked below a view — they are represented in the hole
-/// table instead (table-delegation, not a leader callout; see
-/// `place_dimensions`'s doc comment in `src/drawing/layout.rs` for the
-/// ruling and its justification).
+/// **D2**: every bore is stated ONCE on the sheet. A bore with a hole-table
+/// row must not also render as a floating linear dimension parked below a
+/// view (table-delegation; see `place_dimensions`'s doc comment in
+/// `src/drawing/layout.rs`). Since round parts are drawn the way a drafter
+/// draws them, this flange's bores are stated by callouts instead -- the bolt
+/// circle as `4× Ø12 THRU EQ SP` + `Ø90 PCD`, the centre bore as `Ø50` -- and
+/// then they must have NO table row. Either way: one statement per bore.
 #[test]
 fn flange_diameter_dims_are_table_delegated_not_floating() {
     let (m, part) = flange();
@@ -366,16 +368,40 @@ fn flange_diameter_dims_are_table_delegated_not_floating() {
         !drawing.hole_sites.is_empty(),
         "fixture must have hole sites, else this proves nothing"
     );
+    let callout_faces = drawing
+        .round_part
+        .as_ref()
+        .map(|rp| rp.callout_faces())
+        .unwrap_or_default();
     let layout = compute_layout(&drawing);
-    let floating_diameters: Vec<&str> = layout
-        .dimensions
+    // Bores that get a hole-table row: never also a floating Ø dimension.
+    let tabled: std::collections::HashSet<u32> = drawing
+        .hole_sites
         .iter()
-        .filter(|pd| pd.label.starts_with('\u{00d8}') || pd.label.starts_with("S\u{00d8}"))
-        .map(|pd| pd.label.as_str())
+        .filter(|s| !s.face_entities.iter().any(|f| callout_faces.contains(f)))
+        .flat_map(|s| s.face_entities.iter().copied())
+        .collect();
+    let doubled: Vec<String> = drawing
+        .views
+        .iter()
+        .flat_map(|v| v.dimensions.iter())
+        .filter(|d| d.kind == "diameter" && d.entities.iter().any(|e| tabled.contains(e)))
+        .filter(|d| layout.dimensions.iter().any(|pd| pd.dim_id == d.id))
+        .map(|d| d.label.clone())
         .collect();
     assert!(
-        floating_diameters.is_empty(),
-        "D2: tabled bore diameters must not appear as floating dims; found {floating_diameters:?}"
+        doubled.is_empty(),
+        "D2: tabled bore diameters must not appear as floating dims; found {doubled:?}"
+    );
+    // Bores stated by a callout: never also a table row (no tags, no table).
+    assert!(
+        layout
+            .hole_tags
+            .iter()
+            .all(|t| !drawing.hole_sites.iter().any(
+                |s| s.tag == t.tag && s.face_entities.iter().any(|f| callout_faces.contains(f))
+            )),
+        "D2: a called-out bore must not also carry a hole-table tag"
     );
 }
 

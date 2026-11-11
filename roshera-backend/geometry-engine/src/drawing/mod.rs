@@ -31,6 +31,7 @@ pub mod layout;
 pub mod pdf;
 pub mod projection;
 pub mod query;
+pub mod round_part;
 pub mod section_comprehension;
 pub mod section_view;
 pub mod sheet_certificate;

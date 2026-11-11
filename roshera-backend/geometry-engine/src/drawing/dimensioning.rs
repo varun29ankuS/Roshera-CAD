@@ -108,11 +108,17 @@ pub fn auto_dimensions(
     projection: ProjectionType,
 ) -> Vec<Dimension2d> {
     let mut out = Vec::new();
-    for d in extract_dimensions(model, solid_id) {
+    // A round part is dimensioned the way a drawing states it (Ø outside,
+    // bolt circle as one callout), not by the plate convention.
+    let mut records = extract_dimensions(model, solid_id);
+    if let Some(rp) = super::round_part::detect_round_part(model, solid_id, &records) {
+        records = super::round_part::apply_round_conventions(records, &rp);
+    }
+    for d in records {
         let anchor = Point3::new(d.anchor[0], d.anchor[1], d.anchor[2]);
         let dir = Vector3::new(d.direction[0], d.direction[1], d.direction[2]);
         let (p0, p1) = match d.kind.as_str() {
-            "diameter" | "radius" => (anchor, anchor - dir * d.value),
+            "diameter" | "radius" | "hole_callout" | "pcd" => (anchor, anchor - dir * d.value),
             "length" | "extent" | "position" => (
                 anchor - dir * (d.value * 0.5),
                 anchor + dir * (d.value * 0.5),
@@ -441,11 +447,13 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
                 // "dimension the hole where it shows as a circle" convention).
                 // A length dim must never prefer its axial view — there its
                 // span projects to zero and the callout is unreadable.
-                let is_axial = matches!(d.kind.as_str(), "diameter" | "radius")
-                    && match (d.axis3, vdir) {
-                        (Some(ax), Some(vd)) => dot3(ax, vd).abs() > 0.99,
-                        _ => false,
-                    };
+                let is_axial = matches!(
+                    d.kind.as_str(),
+                    "diameter" | "radius" | "hole_callout" | "pcd"
+                ) && match (d.axis3, vdir) {
+                    (Some(ax), Some(vd)) => dot3(ax, vd).abs() > 0.99,
+                    _ => false,
+                };
                 let span = d.projected_span();
                 entity_groups
                     .entry((sorted_ents, d.kind.clone(), qval))
@@ -717,6 +725,7 @@ pub fn standard_drawing_hlr_with_projection(
     let dims = extract_dimensions(model, solid_id);
     let bore_faces = crate::readable::bore_face_ids(model, solid_id);
     attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
+    drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
 
     Ok(drawing)
 }
@@ -1384,6 +1393,7 @@ pub fn standard_drawing_auto_with_projection(
     let dims = extract_dimensions(model, solid_id);
     let bore_faces = crate::readable::bore_face_ids(model, solid_id);
     attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
+    drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
 
     // ── Section view (Task 9) ─────────────────────────────────────────────────
     // When the part has internal features (bore sites populated above), add

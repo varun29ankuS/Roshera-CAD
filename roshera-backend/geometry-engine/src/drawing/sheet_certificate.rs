@@ -124,6 +124,9 @@ pub enum SheetFactKind {
     Dimension,
     /// A hole-table row.
     Hole,
+    /// A round-part bolt-circle callout (`4× Ø11 THRU EQ SP` on `Ø60 PCD`):
+    /// count, hole size, depth, pitch circle and spacing, re-measured.
+    BoltCircle,
     /// A GD&T feature control frame block.
     Fcf,
     /// A GD&T datum feature symbol.
@@ -759,6 +762,38 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
             tolerance: hole.tolerance.clone(),
             live,
         });
+    }
+
+    // ── Round-part bolt circles ───────────────────────────────────────────────
+    // The callout replaces the hole-table rows of its holes on the sheet, so
+    // it carries their claims — size and depth — plus the ones a row never
+    // made: every hole on the stated pitch circle, equally spaced, none gone.
+    if let (Some(rp), Some(solid)) = (&drawing.round_part, solid_id) {
+        for bc in &rp.bolt_circles {
+            let finding =
+                super::round_part::bolt_circle_live_check(model, solid, rp, bc, CERT_DIM_ORACLE_MM);
+            facts.push(SheetFact {
+                kind: SheetFactKind::BoltCircle,
+                owner_view: drawing.axial_view_idx,
+                label: format!("{} ON {}", bc.hole_label, bc.pcd_label),
+                value: Some(bc.pcd),
+                unit: "mm".to_string(),
+                pid: None,
+                face_ids: bc.holes.iter().flatten().copied().collect(),
+                datum: None,
+                tolerance: None,
+                live: LiveCheck {
+                    measured: None,
+                    deviation: None,
+                    verdict: if finding.is_none() {
+                        SheetVerdict::Consistent
+                    } else {
+                        SheetVerdict::Stale
+                    },
+                    detail: finding,
+                },
+            });
+        }
     }
 
     // ── FCF blocks ────────────────────────────────────────────────────────────

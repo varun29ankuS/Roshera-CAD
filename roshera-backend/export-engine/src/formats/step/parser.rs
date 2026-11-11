@@ -67,6 +67,21 @@ pub fn preprocess(input: &str) -> (String, usize) {
     (out, stripped)
 }
 
+/// Decode a STEP file's raw bytes. ISO 10303-21 says the exchange structure
+/// is 7-bit ASCII (non-ASCII text goes through `\X\` / `\X2\` escapes), but
+/// real exporters write product names in the local code page: a Turkish
+/// GrabCAD assembly carries raw Windows-1252 bytes in its part names, and a
+/// strict UTF-8 read refused the whole file over a name. Geometry is pure
+/// ASCII either way, so the file is read as UTF-8 when it is valid UTF-8 and
+/// otherwise byte-for-byte as Latin-1 — every byte becomes exactly one char,
+/// nothing is dropped, and only the spelling of a non-ASCII name can differ.
+pub fn decode_step_bytes(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => e.into_bytes().into_iter().map(char::from).collect(),
+    }
+}
+
 /// Parse a STEP exchange structure into ruststep's schema-agnostic AST.
 ///
 /// `path_hint` is used only for the error message when parsing fails;
@@ -81,6 +96,22 @@ pub fn parse_step(input: &str, path_hint: &str) -> Result<Exchange, ExportError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_file_with_code_page_names_decodes_instead_of_refusing() {
+        // "MAFSAL Ç" with Ç as the single Windows-1252 byte 0xC7: not UTF-8.
+        let mut raw = b"#1=PRODUCT('MAFSAL ".to_vec();
+        raw.push(0xC7);
+        raw.extend_from_slice(b"','',(#2));");
+        assert!(
+            String::from_utf8(raw.clone()).is_err(),
+            "fixture must be non-UTF-8"
+        );
+        let s = decode_step_bytes(raw);
+        assert_eq!(s, "#1=PRODUCT('MAFSAL \u{00C7}','',(#2));");
+        // Valid UTF-8 passes through untouched.
+        assert_eq!(decode_step_bytes("Ç".as_bytes().to_vec()), "Ç");
+    }
 
     #[test]
     fn preprocess_strips_block_comment() {

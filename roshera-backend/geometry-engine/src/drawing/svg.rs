@@ -1083,10 +1083,21 @@ fn render_middle_column(out: &mut String, drawing: &Drawing, x: f64, y: f64, w: 
     );
     // Headline baseline sits roughly 65% down the band: label clears
     // the top edge, descender clears the row divider.
-    let title = clip_to_width(&drawing.name, w - 6.0, 4.0);
+    // The headline is set at 7 mm (`.title-value`). A long name steps the
+    // font down to fit its cell, and is truncated only below the legible
+    // floor -- measured at the size it is actually drawn, so it can never run
+    // over the logo or the drawing number beside it.
+    let (title, title_font) = fit_to_width(
+        &drawing.name,
+        w - 6.0,
+        TITLE_FONT_PX,
+        TITLE_MIN_FONT_PX,
+        0.62,
+    );
     let _ = write!(
         out,
-        "    <text class=\"title-value\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
+        "    <text class=\"title-value\" x=\"{:.3}\" y=\"{:.3}\" \
+         style=\"font-size:{title_font:.2}px\">{}</text>\n",
         x + w * 0.5,
         y + title_h * 0.70,
         escape_xml(&title)
@@ -1166,10 +1177,13 @@ fn render_right_column(out: &mut String, drawing: &Drawing, x: f64, y: f64, w: f
         .filter(|s| !s.trim().is_empty())
         .cloned()
         .unwrap_or_else(|| short_drawing_id(drawing));
-    let drwg_no = clip_to_width(&drwg_no, w - 4.0, 3.6);
+    // Monospace at 5.4 mm (`.drwg-number`): every glyph is ~0.6 em wide.
+    let (drwg_no, drwg_font) =
+        fit_to_width(&drwg_no, w - 4.0, DRWG_NO_FONT_PX, DRWG_NO_MIN_FONT_PX, 0.6);
     let _ = write!(
         out,
-        "    <text class=\"drwg-number\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
+        "    <text class=\"drwg-number\" x=\"{:.3}\" y=\"{:.3}\" \
+         style=\"font-size:{drwg_font:.2}px\">{}</text>\n",
         x + w * 0.5,
         y + dwg_h * 0.72,
         escape_xml(&drwg_no)
@@ -1229,18 +1243,36 @@ fn render_cell(out: &mut String, x: f64, y: f64, h: f64, label: &str, value: &st
 /// assumes ~0.55 of the font size per glyph for proportional sans
 /// and ~0.62 for monospace — close enough for engineering text where
 /// titles and drawing numbers are short.
-fn clip_to_width(text: &str, max_width_mm: f64, font_mm: f64) -> String {
-    let avg_glyph_mm = font_mm * 0.58;
-    if avg_glyph_mm <= 0.0 {
-        return text.to_string();
+/// Title headline size (`.title-value`) and the smallest it may step down to.
+const TITLE_FONT_PX: f64 = 7.0;
+const TITLE_MIN_FONT_PX: f64 = 3.5;
+/// Drawing-number size (`.drwg-number`) and its floor.
+const DRWG_NO_FONT_PX: f64 = 5.4;
+const DRWG_NO_MIN_FONT_PX: f64 = 3.0;
+
+/// Fit `text` into `max_width_mm` at the font it is actually drawn in: keep
+/// `font_px` when it fits, else step the font down (never below `min_px`),
+/// and only then truncate with an ellipsis. `glyph_em` is the average glyph
+/// advance as a fraction of the font size (~0.62 for bold sans, 0.6 mono).
+fn fit_to_width(
+    text: &str,
+    max_width_mm: f64,
+    font_px: f64,
+    min_px: f64,
+    glyph_em: f64,
+) -> (String, f64) {
+    let chars = text.chars().count().max(1) as f64;
+    if chars * font_px * glyph_em <= max_width_mm {
+        return (text.to_string(), font_px);
     }
-    let max_chars = (max_width_mm / avg_glyph_mm).floor() as usize;
-    if text.chars().count() <= max_chars || max_chars < 4 {
-        return text.to_string();
+    let fitted = max_width_mm / (chars * glyph_em);
+    if fitted >= min_px {
+        return (text.to_string(), fitted);
     }
-    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
-    out.push('\u{2026}');
-    out
+    let max_chars = (max_width_mm / (min_px * glyph_em)).floor() as usize;
+    let mut clipped: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    clipped.push('\u{2026}');
+    (clipped, min_px)
 }
 
 // ---------------------------------------------------------------------

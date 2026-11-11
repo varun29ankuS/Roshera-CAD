@@ -5706,12 +5706,16 @@ async fn import_step_geometry(
                 ),
             ));
         }
-        tokio::fs::read_to_string(p).await.map_err(|e| {
+        // Bytes, not `read_to_string`: real exporters write part names in the
+        // local code page, and a strict UTF-8 read refused whole assemblies
+        // over a name (see `decode_step_bytes`).
+        let bytes = tokio::fs::read(p).await.map_err(|e| {
             ApiError::new(
                 ErrorCode::InvalidParameter,
                 format!("failed to read STEP file at {p:?}: {e}"),
             )
-        })?
+        })?;
+        export_engine::formats::step::parser::decode_step_bytes(bytes)
     } else {
         return Err(ApiError::missing_field(
             "content or path (STEP file text or a server-readable file location)",

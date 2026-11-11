@@ -827,6 +827,13 @@ pub struct Drawing {
     /// *general* tolerance. Defaults to ISO 2768-m (±0.1 mm) for pre-#55 sheets.
     #[serde(default)]
     pub general_tolerance: GeneralTolerance,
+    /// Round-part drafting callouts (outside diameter, coaxial bores, bolt
+    /// circles) when the part is round; `None` otherwise. Bores these callouts
+    /// state are inked by them instead of hole-table rows and tags, and the
+    /// certificate re-measures each bolt circle. `serde(default)` keeps older
+    /// sheets parsing.
+    #[serde(default)]
+    pub round_part: Option<super::round_part::RoundPartCallouts>,
 }
 
 impl Drawing {
@@ -857,6 +864,7 @@ impl Drawing {
             section: None,
             document_unit: LengthUnit::default(),
             general_tolerance: GeneralTolerance::default(),
+            round_part: None,
         }
     }
 
