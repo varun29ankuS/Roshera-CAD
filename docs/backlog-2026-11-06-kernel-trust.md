@@ -24,6 +24,7 @@ Severity: **C** the kernel can report sound/solved/inside when it is not ·
 | ✓ | SDF + `classify_point` sign from the angle-weighted pseudonormal (torus/NURBS/ruled were never counted by ray parity) | 6824778f |
 | ✓ | SK-C1 certificate describes the sketch as stored (`constraints_satisfied`, `solvable`); extrude/revolve refuse an unsatisfied sketch | 484d96a7 |
 | ✓ | SK-C2 `is_sound` requires every constraint satisfied as stored; `try_add_constraint` refuses impossible dimension values; first `Diverged` test | 9065f627 |
+| ✓ | SK-C3 every pair of profile curves (all kinds) checked for contact; extrude/revolve refuse crossings and undecided pairs | see SK-C3 below |
 
 ## Architecture — agent first, human alongside (Varun 2026-11-06)
 
@@ -210,7 +211,13 @@ scene while the model held all of them.
    `SketchSolveReport`); a count verdict never masks NotConverged.
    `psketch_solve` (`roshera-mcp/src/tools/psketch.ts:142`) returns
    `violations` + certificate; fix its "exactly" wording.
-4. **SK-C3 Self-intersection checked for polylines only.**
+4. ✓ **SK-C3 Self-intersection checked for polylines only.** Done 2026-11-11:
+   `sketch2d::profile_contacts` decides every curve pair (closed form for
+   line/arc/circle; Bernstein root isolation for ellipse and spline-vs-conic,
+   joins divided out; convex-hull subdivision for spline-vs-spline and
+   spline self-crossing); undecided pairs read unchecked. Certificate carries
+   `profile_contacts`, `unchecked_pairs`, `contact_tolerance`; extrude and
+   revolve refuse with gate `sketch_profile_contacts`. Original finding:
    `sketch_validation.rs:443`, `sketch_topology.rs:873` are polyline/stub; a
    bow-tie of four Lines certifies sound and passes the extrude gate. Fix:
    exact pairwise intersection for line/arc/circle/ellipse/spline entities

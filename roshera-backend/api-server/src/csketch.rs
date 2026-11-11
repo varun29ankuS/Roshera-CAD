@@ -484,6 +484,48 @@ fn refuse_unsatisfied_sketch(sketch: &Sketch) -> Result<(), ApiError> {
     })))
 }
 
+/// SK-C3: extrude and revolve refuse a profile whose curves touch anywhere
+/// but at their joins — a crossing, an endpoint resting on another curve, an
+/// overlap — and a profile with any curve pair the contact check could not
+/// decide. Each contact is named with both curves and the point; each
+/// undecided pair with its reason.
+fn refuse_profile_contacts(sketch: &Sketch) -> Result<(), ApiError> {
+    let cert = sketch.certify();
+    if cert.profile_contacts.is_empty() && cert.unchecked_pairs.is_empty() {
+        return Ok(());
+    }
+    let message = match (cert.profile_contacts.first(), cert.unchecked_pairs.first()) {
+        (Some(c), _) => format!(
+            "the profile touches itself away from its joins ({} contact(s); first: {} and {} \
+             at ({:.6}, {:.6})) — a solid built from it would not be valid",
+            cert.profile_contacts.len(),
+            c.first,
+            c.second,
+            c.point[0],
+            c.point[1]
+        ),
+        (None, Some(u)) => format!(
+            "the profile could not be proved free of contact ({} undecided pair(s); first: {} and \
+             {}: {})",
+            cert.unchecked_pairs.len(),
+            u.first,
+            u.second,
+            u.reason
+        ),
+        (None, None) => String::new(),
+    };
+    Err(ApiError::new(ErrorCode::InvalidParameter, message)
+        .with_hint(
+            "Move or trim the named curves so they meet only at shared endpoints.".to_string(),
+        )
+        .with_details(serde_json::json!({
+            "gate": "sketch_profile_contacts",
+            "contacts": cert.profile_contacts,
+            "unchecked": cert.unchecked_pairs,
+            "contact_tolerance": cert.contact_tolerance,
+        })))
+}
+
 fn require_sketch(state: &AppState, id: Uuid) -> Result<Arc<Sketch>, ApiError> {
     let sid = SketchId(id);
     state.csketches.get(&sid).ok_or_else(|| not_found(sid))
@@ -2172,6 +2214,7 @@ pub async fn extrude_csketch(
 
     let sketch = require_sketch(&state, id)?;
     refuse_unsatisfied_sketch(&sketch)?;
+    refuse_profile_contacts(&sketch)?;
     let tol2d = Tolerance2d::default();
     let topology = SketchTopology::analyze(&sketch, &tol2d)
         .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
@@ -2725,6 +2768,7 @@ pub async fn revolve_csketch(
 
     let sketch = require_sketch(&state, id)?;
     refuse_unsatisfied_sketch(&sketch)?;
+    refuse_profile_contacts(&sketch)?;
     let tol2d = Tolerance2d::default();
     let topology = SketchTopology::analyze(&sketch, &tol2d)
         .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;

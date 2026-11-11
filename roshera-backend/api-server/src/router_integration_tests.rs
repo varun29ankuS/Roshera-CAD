@@ -450,6 +450,67 @@ async fn csketch_extrude_refuses_a_sketch_that_violates_its_constraints() {
     );
 }
 
+/// A bow-tie: four lines that close one loop but cross at the centre.
+fn bow_tie(state: &AppState, x0: f64) -> geometry_engine::sketch2d::SketchId {
+    use geometry_engine::sketch2d::Point2d;
+    let sid = state.csketches.create();
+    let sketch = state.csketches.get(&sid).expect("sketch exists");
+    let a = sketch.add_point(Point2d::new(x0, 0.0));
+    let b = sketch.add_point(Point2d::new(x0 + 10.0, 10.0));
+    let c = sketch.add_point(Point2d::new(x0 + 10.0, 0.0));
+    let d = sketch.add_point(Point2d::new(x0, 10.0));
+    sketch.add_line(a, b).expect("a-b");
+    sketch.add_line(b, c).expect("b-c");
+    sketch.add_line(c, d).expect("c-d");
+    sketch.add_line(d, a).expect("d-a");
+    sid
+}
+
+fn assert_refused_for_contact(status: StatusCode, body: &serde_json::Value) {
+    assert!(
+        !status.is_success(),
+        "a crossing profile must not build: {status} {body}"
+    );
+    assert_eq!(body["details"]["gate"], "sketch_profile_contacts", "{body}");
+    let contacts = body["details"]["contacts"]
+        .as_array()
+        .expect("the contacts are named");
+    assert_eq!(contacts.len(), 1, "{body}");
+    assert_eq!(contacts[0]["kind"], "crossing", "{body}");
+}
+
+/// SK-C3: a profile that crosses itself must not extrude.
+#[tokio::test]
+async fn csketch_extrude_refuses_a_profile_that_crosses_itself() {
+    let state = make_test_state().await;
+    let sid = bow_tie(&state, 0.0);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/csketch/{}/extrude", sid.0))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "distance": 5.0 }).to_string()))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_refused_for_contact(status, &body);
+}
+
+/// SK-C3: nor revolve.
+#[tokio::test]
+async fn csketch_revolve_refuses_a_profile_that_crosses_itself() {
+    let state = make_test_state().await;
+    let sid = bow_tie(&state, 2.0);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/csketch/{}/revolve", sid.0))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "axis_origin": [0.0, 0.0], "axis_direction": [0.0, 1.0] }).to_string(),
+        ))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_refused_for_contact(status, &body);
+}
+
 /// Parts an imported assembly USES but could not build reach the browser:
 /// the snapshot lists each with where it sits and why, so the tree can show
 /// what is absent instead of the part vanishing without a trace.
