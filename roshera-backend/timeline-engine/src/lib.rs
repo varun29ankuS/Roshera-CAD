@@ -24,6 +24,7 @@ pub mod brep_serialization;
 pub mod cache;
 pub mod dependency_graph;
 pub mod dependency_projection;
+pub mod dimension_drive;
 pub mod entity_mapping;
 pub mod event_certificate;
 pub mod execution;
