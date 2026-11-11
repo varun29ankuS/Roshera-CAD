@@ -41,8 +41,10 @@ pub mod visibility;
 
 pub use centerlines::{centerlines, Centerline};
 pub use dimensioning::{
-    auto_dimensions, section_slot_rule, standard_drawing, standard_drawing_auto,
-    standard_drawing_hlr, visible_dimensions, CuttingPlaneLine, Dimension2d, SectionSlotRule,
+    auto_dimensions, section_slot_rule, set_projection, standard_drawing, standard_drawing_auto,
+    standard_drawing_auto_with_projection, standard_drawing_hlr,
+    standard_drawing_hlr_with_projection, visible_dimensions, CuttingPlaneLine, Dimension2d,
+    SectionSlotRule,
 };
 pub use dxf::{render_drawing_dxf, DxfRenderError};
 pub use hole_table::{build_hole_table, qualifies_for_baseline, tag_letter, HoleSite};
@@ -65,8 +67,8 @@ pub use sheet_certificate::{
 pub use svg::render_drawing_svg;
 pub use types::{
     Drawing, DrawingId, GeneralTolerance, PlacedDatumSymbol, PlacedFcfBlock, Polyline2d,
-    PolylineRole, PolylineSource, ProjectedView, ProjectedViewId, ProjectionType, SectionSemantics,
-    ShadedRaster, SheetSize, TitleBlock, ToleranceRef, ViewExtent, ViewSource,
+    PolylineRole, PolylineSource, ProjectedView, ProjectedViewId, ProjectionAngle, ProjectionType,
+    SectionSemantics, ShadedRaster, SheetSize, TitleBlock, ToleranceRef, ViewExtent, ViewSource,
 };
 pub use verify::{verify_drawing, DrawingIssue, DrawingIssueKind, DrawingQualityReport, Severity};
 pub use visibility::{is_point_hidden, project_solid_edges_visibility, ViewEdges};

@@ -263,6 +263,7 @@ pub fn rederive_part_drawing(
     model: &BRepModel,
     event: &TimelineEvent,
     id_remap: &HashMap<u64, u64>,
+    projection_switch: Option<geometry_engine::drawing::ProjectionAngle>,
 ) -> DrawingRederive {
     let Operation::Generic { parameters, .. } = &event.operation else {
         return DrawingRederive::Failed("non-Generic drawing operation".to_string());
@@ -305,13 +306,23 @@ pub fn rederive_part_drawing(
 
     // Constraint 1: re-derive FROM THE REBUILT GEOMETRY — the same pipeline the
     // live endpoint uses, never a cached sheet.
-    let mut drawing =
-        match geometry_engine::drawing::standard_drawing_auto(model, solid_id, part_uuid) {
-            Ok(d) => d,
-            Err(e) => {
-                return DrawingRederive::Failed(format!("sheet derivation failed: {e}"));
-            }
-        };
+    // The projection: a later `drawing.set_projection` wins over the one the
+    // sheet was created with; sheets recorded before the choice existed are
+    // third-angle.
+    let projection = projection_switch.unwrap_or_else(|| {
+        inner
+            .get("projection")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    });
+    let mut drawing = match geometry_engine::drawing::standard_drawing_auto_with_projection(
+        model, solid_id, part_uuid, projection,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            return DrawingRederive::Failed(format!("sheet derivation failed: {e}"));
+        }
+    };
     // Constraint 2: preserve the drawing's identity (same registry slot).
     drawing.id = geometry_engine::drawing::DrawingId(drawing_id);
 
@@ -326,6 +337,46 @@ pub fn rederive_part_drawing(
     }
 
     DrawingRederive::Rebuilt(drawing_id, Box::new(drawing))
+}
+
+/// Command recorded when a sheet's projection is switched after creation.
+pub const DRAWING_SET_PROJECTION_KIND: &str = "drawing.set_projection";
+
+/// The latest projection switch recorded for each drawing in `events`
+/// (keyed by the drawing's `drawing:<uuid>` output), in sequence order.
+pub fn projection_switches(
+    events: &[TimelineEvent],
+) -> HashMap<uuid::Uuid, geometry_engine::drawing::ProjectionAngle> {
+    let mut ordered: Vec<&TimelineEvent> = events.iter().collect();
+    ordered.sort_by_key(|e| e.sequence_number);
+    let mut out = HashMap::new();
+    for e in ordered {
+        let Operation::Generic {
+            command_type,
+            parameters,
+        } = &e.operation
+        else {
+            continue;
+        };
+        if command_type != DRAWING_SET_PROJECTION_KIND {
+            continue;
+        }
+        let inner = parameters.get("params").unwrap_or(parameters);
+        let Some(angle) = inner
+            .get("projection")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        else {
+            continue;
+        };
+        if let Some(id) = parameters
+            .get("outputs")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.iter().find_map(parse_drawing_ref))
+        {
+            out.insert(id, angle);
+        }
+    }
+    out
 }
 
 /// Identity and verbatim error of the first event a replay failed to

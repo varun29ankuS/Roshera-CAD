@@ -41,8 +41,8 @@
 use crate::dependency_projection::build_dependency_graph;
 use crate::mould::{is_param_meta, OverrideSet};
 use crate::replay::{
-    apply_event, rederive_part_drawing, AssemblyStore, DrawingRederive, DrawingStore, ReplayError,
-    ReplayOutcome,
+    apply_event, projection_switches, rederive_part_drawing, AssemblyStore, DrawingRederive,
+    DrawingStore, ReplayError, ReplayOutcome,
 };
 use crate::types::{Operation, TimelineEvent};
 use geometry_engine::primitives::topology_builder::BRepModel;
@@ -152,6 +152,20 @@ impl RebuildCertificate {
 /// Every OTHER dotted kind keeps the honest-skip → `Stale` behaviour (#31).
 const DRAWING_FROM_PART_KIND: &str = "drawing.create_from_part";
 
+/// The `drawing:<uuid>` a drawing event outputs.
+fn drawing_output_id(event: &TimelineEvent) -> Option<uuid::Uuid> {
+    let Operation::Generic { parameters, .. } = &event.operation else {
+        return None;
+    };
+    parameters
+        .get("outputs")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .find_map(|s| s.strip_prefix("drawing:"))
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+}
+
 /// A drawing (`drawing.*`) event is a non-geometry DOCUMENT feature. It gets a
 /// real, honest per-feature verdict (`Rebuilt`/`Failed`/`Dangling`), but — like
 /// a `Stale` document (#31) — it never gates GEOMETRY soundness: a broken sheet
@@ -185,6 +199,7 @@ fn replay_with_report(
     let mut assemblies = AssemblyStore::default();
     let mut drawings = DrawingStore::default();
     let mut per_event: HashMap<u64, EventResult> = HashMap::new();
+    let switches = projection_switches(events);
 
     for event in events {
         if let Operation::Generic { command_type, .. } = &event.operation {
@@ -205,7 +220,14 @@ fn replay_with_report(
         // concern, not an unsound B-Rep.
         if let Operation::Generic { command_type, .. } = &dispatched.operation {
             if command_type == DRAWING_FROM_PART_KIND {
-                let result = match rederive_part_drawing(model, dispatched, &outcome.id_remap) {
+                let switch =
+                    drawing_output_id(dispatched).and_then(|id| switches.get(&id).copied());
+                let result = match rederive_part_drawing(
+                    model,
+                    dispatched,
+                    &outcome.id_remap,
+                    switch,
+                ) {
                     DrawingRederive::Rebuilt(id, sheet) => {
                         drawings.drawings.insert(id, *sheet);
                         outcome.events_applied += 1;

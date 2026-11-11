@@ -62,8 +62,9 @@ use axum::{
 use dashmap::DashMap;
 use geometry_engine::drawing::{
     answer_query, certify_drawing, project_solid_view, render_drawing_dxf, render_drawing_pdf,
-    render_drawing_svg, standard_drawing_auto, standard_drawing_hlr, verify_drawing, Drawing,
-    DrawingAnswer, DrawingQualityReport, DrawingQuery, ProjectedViewId, ProjectionType,
+    render_drawing_svg, standard_drawing_auto_with_projection,
+    standard_drawing_hlr_with_projection, verify_drawing, Drawing, DrawingAnswer,
+    DrawingQualityReport, DrawingQuery, ProjectedViewId, ProjectionAngle, ProjectionType,
     SheetReadbackCertificate, SheetSize, TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
@@ -983,6 +984,9 @@ pub struct PartDrawingQuery {
     /// may be flawless-on-the-sheet and still be a defective B-Rep.
     #[serde(default)]
     pub acknowledge_unsound: bool,
+    /// `first` or `third` (default) angle projection.
+    #[serde(default)]
+    pub projection: Option<ProjectionAngle>,
 }
 
 /// `GET /api/parts/{id}/drawing.svg` — ONE-CALL engineering drawing of a part by
@@ -1029,6 +1033,7 @@ async fn build_standard_drawing_off_lock(
     solid_id: SolidId,
     part_uuid: Uuid,
     scale: Option<f64>,
+    projection: ProjectionAngle,
 ) -> Result<Drawing, SheetBuildError> {
     // Brief read lock: validate the solid exists, snapshot, release.
     let snap = {
@@ -1043,9 +1048,16 @@ async fn build_standard_drawing_off_lock(
         let mut owned = BRepModel::new();
         snap.restore(&mut owned);
         match scale {
-            Some(scale) => standard_drawing_hlr(&owned, solid_id, part_uuid, SheetSize::A3, scale)
-                .map_err(SheetBuildError::from_kernel),
-            None => standard_drawing_auto(&owned, solid_id, part_uuid)
+            Some(scale) => standard_drawing_hlr_with_projection(
+                &owned,
+                solid_id,
+                part_uuid,
+                SheetSize::A3,
+                scale,
+                projection,
+            )
+            .map_err(SheetBuildError::from_kernel),
+            None => standard_drawing_auto_with_projection(&owned, solid_id, part_uuid, projection)
                 .map_err(SheetBuildError::from_kernel),
         }
     })
@@ -1190,10 +1202,15 @@ async fn drawing_svg_for_solid(
     // needs its OWN live read of the model (a second, independent
     // certification pass) after `build_standard_drawing_off_lock` has
     // consumed the first clone.
-    let drawing =
-        build_standard_drawing_off_lock(model_handle.clone(), solid_id, part_uuid, q.scale)
-            .await
-            .map_err(|e| e.into_api_error(solid_id))?;
+    let drawing = build_standard_drawing_off_lock(
+        model_handle.clone(),
+        solid_id,
+        part_uuid,
+        q.scale,
+        q.projection.unwrap_or_default(),
+    )
+    .await
+    .map_err(|e| e.into_api_error(solid_id))?;
 
     // Gate 4, server-side (H1, 2026-08-15 whole-branch review): this route
     // hands out the SAME third-angle sheet with HLR + auto dimensions that
@@ -1355,16 +1372,22 @@ async fn create_part_drawing_inner(
     // "only the NEW refusal is a genuine ApiError body" carve-out this
     // function's doc already names. Every pre-existing failure keeps its exact
     // wire shape.
-    let mut drawing = build_standard_drawing_off_lock(model_handle, solid_id, part_uuid, q.scale)
-        .await
-        .map_err(|e| match e {
-            SheetBuildError::ScaleDoesNotFit { .. } | SheetBuildError::InvalidScale { .. } => {
-                e.into_api_error(solid_id).into_response()
-            }
-            SheetBuildError::SolidNotFound => StatusCode::NOT_FOUND.into_response(),
-            SheetBuildError::Kernel => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
-            SheetBuildError::TaskFailed => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        })?;
+    let mut drawing = build_standard_drawing_off_lock(
+        model_handle,
+        solid_id,
+        part_uuid,
+        q.scale,
+        q.projection.unwrap_or_default(),
+    )
+    .await
+    .map_err(|e| match e {
+        SheetBuildError::ScaleDoesNotFit { .. } | SheetBuildError::InvalidScale { .. } => {
+            e.into_api_error(solid_id).into_response()
+        }
+        SheetBuildError::SolidNotFound => StatusCode::NOT_FOUND.into_response(),
+        SheetBuildError::Kernel => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        SheetBuildError::TaskFailed => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    })?;
 
     // Name the sheet after the originating part when the caller didn't
     // supply one. The drawing title block renders this name, so a
@@ -1414,6 +1437,7 @@ async fn create_part_drawing_inner(
                             "quality_passed": quality.passed,
                             "quality_issues": quality.issues.len(),
                             "acknowledge_unsound": q.acknowledge_unsound,
+                            "projection": q.projection.unwrap_or_default(),
                         }))
                         // #32: record the source solid as an INPUT so the
                         // feature-DAG projection links the sheet downstream
@@ -2240,7 +2264,7 @@ pub async fn export_dxf(
 /// recorder already exposes, so we hang the helpers on
 /// [`RecordedOperation`] directly via a free-function wrapper rather
 /// than amending the trait (kernel ↔ api-server boundary stays sharp).
-trait RecordedOperationDrawingExt {
+pub(crate) trait RecordedOperationDrawingExt {
     fn with_input_drawing(self, uuid: Uuid) -> Self;
     fn with_output_drawing(self, uuid: Uuid) -> Self;
     fn with_output_view(self, uuid: Uuid) -> Self;
@@ -2562,9 +2586,15 @@ mod tests {
         let reader = handle.clone();
         let held = reader.read().await;
 
-        let drawing = build_standard_drawing_off_lock(handle.clone(), sid, Uuid::nil(), None)
-            .await
-            .expect("off-lock auto drawing");
+        let drawing = build_standard_drawing_off_lock(
+            handle.clone(),
+            sid,
+            Uuid::nil(),
+            None,
+            ProjectionAngle::Third,
+        )
+        .await
+        .expect("off-lock auto drawing");
         assert!(
             !drawing.views.is_empty(),
             "off-lock build produced the standard views"
@@ -2585,9 +2615,15 @@ mod tests {
         // through the off-lock helper and return a valid sheet.
         let (model, sid) = build_box_model(25.0, 25.0, 25.0);
         let handle = Arc::new(RwLock::new(model));
-        let drawing = build_standard_drawing_off_lock(handle, sid, Uuid::nil(), Some(1.0))
-            .await
-            .expect("off-lock scaled drawing");
+        let drawing = build_standard_drawing_off_lock(
+            handle,
+            sid,
+            Uuid::nil(),
+            Some(1.0),
+            ProjectionAngle::Third,
+        )
+        .await
+        .expect("off-lock scaled drawing");
         assert_eq!(drawing.sheet_size, SheetSize::A3, "scale override pins A3");
         assert!(!drawing.views.is_empty());
     }
@@ -2596,9 +2632,15 @@ mod tests {
     async fn off_lock_drawing_missing_solid_is_not_found() {
         let model = BRepModel::new();
         let handle = Arc::new(RwLock::new(model));
-        let err = build_standard_drawing_off_lock(handle, 9999, Uuid::nil(), None)
-            .await
-            .expect_err("unknown solid must be rejected");
+        let err = build_standard_drawing_off_lock(
+            handle,
+            9999,
+            Uuid::nil(),
+            None,
+            ProjectionAngle::Third,
+        )
+        .await
+        .expect_err("unknown solid must be rejected");
         assert!(
             matches!(err, SheetBuildError::SolidNotFound),
             "unknown solid must be classified SolidNotFound, got {err:?}"
@@ -2620,9 +2662,15 @@ mod tests {
     async fn off_lock_drawing_unfittable_scale_is_a_caller_error_not_a_kernel_fault() {
         let (model, sid) = build_box_model(25.0, 25.0, 25.0);
         let handle = Arc::new(RwLock::new(model));
-        let err = build_standard_drawing_off_lock(handle, sid, Uuid::nil(), Some(1000.0))
-            .await
-            .expect_err("1000:1 fits no arrangement on A3");
+        let err = build_standard_drawing_off_lock(
+            handle,
+            sid,
+            Uuid::nil(),
+            Some(1000.0),
+            ProjectionAngle::Third,
+        )
+        .await
+        .expect_err("1000:1 fits no arrangement on A3");
         let message = match &err {
             SheetBuildError::ScaleDoesNotFit {
                 message,
@@ -2685,9 +2733,15 @@ mod tests {
         for raw in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -4.0] {
             let (model, sid) = build_box_model(25.0, 25.0, 25.0);
             let handle = Arc::new(RwLock::new(model));
-            let err = build_standard_drawing_off_lock(handle, sid, Uuid::nil(), Some(raw))
-                .await
-                .expect_err("a non-ratio scale must be refused");
+            let err = build_standard_drawing_off_lock(
+                handle,
+                sid,
+                Uuid::nil(),
+                Some(raw),
+                ProjectionAngle::Third,
+            )
+            .await
+            .expect_err("a non-ratio scale must be refused");
             let message = match &err {
                 SheetBuildError::InvalidScale { message, scale } => {
                     assert_eq!(

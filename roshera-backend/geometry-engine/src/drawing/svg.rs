@@ -125,7 +125,7 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     render_title_block(&mut out, drawing, tb_x, tb_y, tb_w, tb_h);
 
     // Third-angle projection symbol — inked from the ProjectionSymbol layout item.
-    render_projection_symbol_from_layout(&mut out, &layout);
+    render_projection_symbol_from_layout(&mut out, &layout, drawing.projection);
 
     // GD&T datum symbols + FCF blocks (Task 6) — inked from DatumSymbol and
     // FcfBlock layout items.  Rendered last so callouts sit on top of all
@@ -1401,7 +1401,11 @@ fn render_zone_markers_from_layout(
 ///
 /// Placement comes from the `ProjectionSymbol` layout item's bbox centre —
 /// no independent coordinate computation.
-fn render_projection_symbol_from_layout(out: &mut String, layout: &SheetLayout) {
+fn render_projection_symbol_from_layout(
+    out: &mut String,
+    layout: &SheetLayout,
+    angle: super::types::ProjectionAngle,
+) {
     let Some(item) = layout
         .items
         .iter()
@@ -1435,14 +1439,41 @@ fn render_projection_symbol_from_layout(out: &mut String, layout: &SheetLayout) 
     let trap_y_top_small = cy - small_h * 0.5;
     let trap_y_bot_small = cy + small_h * 0.5;
 
+    // The end view (right) shows both circles solid, so it looks at the
+    // cone's SMALL end. Third angle draws a view on the side it is seen from,
+    // so the small end faces the circles; first angle draws it on the
+    // opposite side, so the LARGE end faces them.
+    let (left_top, left_bot, right_top, right_bot) = match angle {
+        super::types::ProjectionAngle::Third => (
+            trap_y_top_large,
+            trap_y_bot_large,
+            trap_y_top_small,
+            trap_y_bot_small,
+        ),
+        super::types::ProjectionAngle::First => (
+            trap_y_top_small,
+            trap_y_bot_small,
+            trap_y_top_large,
+            trap_y_bot_large,
+        ),
+    };
+    let tag = match angle {
+        super::types::ProjectionAngle::First => "first",
+        super::types::ProjectionAngle::Third => "third",
+    };
+    let _ = writeln!(
+        out,
+        "  <g class=\"projection-symbol\" data-projection=\"{tag}\">"
+    );
+
     // Trapezoid: four vertices (top-left, top-right, bottom-right, bottom-left)
     let _ = write!(
         out,
         "  <polygon class=\"proj-sym\" points=\"{:.3},{:.3} {:.3},{:.3} {:.3},{:.3} {:.3},{:.3}\" />\n",
-        trap_x0, trap_y_top_large,
-        trap_x1, trap_y_top_small,
-        trap_x1, trap_y_bot_small,
-        trap_x0, trap_y_bot_large,
+        trap_x0, left_top,
+        trap_x1, right_top,
+        trap_x1, right_bot,
+        trap_x0, left_bot,
     );
 
     // Circle pair: large circle outline + small filled circle.
@@ -1457,6 +1488,7 @@ fn render_projection_symbol_from_layout(out: &mut String, layout: &SheetLayout) 
         out,
         "  <circle class=\"proj-sym-fill\" cx=\"{circ_cx:.3}\" cy=\"{cy:.3}\" r=\"{r_inner:.3}\" />\n"
     );
+    out.push_str("  </g>\n");
 }
 
 // ---------------------------------------------------------------------

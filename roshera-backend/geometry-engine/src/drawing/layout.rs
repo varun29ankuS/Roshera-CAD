@@ -769,12 +769,12 @@ pub(crate) fn place_note_items(
 
     // Three lines, 3 mm apart, reading upward from the frame bottom.
     // y_proj is the topmost (farthest from bottom), y_bot the closest.
-    let y_proj = frame_bottom - 9.0; // "THIRD-ANGLE PROJECTION."
+    let y_proj = frame_bottom - 9.0; // the projection note
     let y_top = frame_bottom - 6.0; // unit note
     let y_bot = frame_bottom - 3.0; // tolerance note
 
     let notes = [
-        ("THIRD-ANGLE PROJECTION.", y_proj),
+        (drawing.projection.note(), y_proj),
         (drawing.unit_note.as_str(), y_top),
         (drawing.tolerance_note.as_str(), y_bot),
     ];
@@ -792,7 +792,7 @@ pub(crate) fn place_note_items(
 
 // ── Projection-symbol placement ────────────────────────────────────────────────
 
-/// Place the third-angle projection symbol as a `ProjectionSymbol` layout item.
+/// Place the projection symbol (first or third angle) as a `ProjectionSymbol` layout item.
 ///
 /// The symbol (a truncated-cone two-view glyph per ISO 128-30) is drawn in the
 /// right column of the title block between the DRAWING NO. headline and the 2×2

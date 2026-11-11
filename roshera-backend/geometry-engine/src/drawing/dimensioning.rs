@@ -602,9 +602,29 @@ pub fn standard_drawing_hlr(
     sheet: super::types::SheetSize,
     scale: f64,
 ) -> Result<super::types::Drawing, super::projection::ProjectionError> {
+    standard_drawing_hlr_with_projection(
+        model,
+        solid_id,
+        part_uuid,
+        sheet,
+        scale,
+        super::types::ProjectionAngle::Third,
+    )
+}
+
+/// [`standard_drawing_hlr`] laid out first- or third-angle.
+pub fn standard_drawing_hlr_with_projection(
+    model: &BRepModel,
+    solid_id: SolidId,
+    part_uuid: uuid::Uuid,
+    sheet: super::types::SheetSize,
+    scale: f64,
+    angle: super::types::ProjectionAngle,
+) -> Result<super::types::Drawing, super::projection::ProjectionError> {
     use super::types::{Drawing, ViewSource};
 
     let mut drawing = Drawing::new("Auto Drawing (HLR)", sheet);
+    drawing.projection = angle;
     drawing.set_unit_notes(model.document_unit());
     let source = ViewSource::Part {
         part_id: part_uuid,
@@ -647,7 +667,7 @@ pub fn standard_drawing_hlr(
     // leaves the right column and top row sized by the real views and the
     // top-right quadrant empty.
     let no_iso = super::types::ViewExtent::default();
-    let placement = place_four_view(&sheet, fe, te, re, no_iso, scale);
+    let placement = place_four_view(&sheet, fe, te, re, no_iso, scale, angle);
     // A finite, positive scale can still be too large to MEASURE against: at
     // `1e308` the guard above passes and `1e308 * 80` is `inf`, so the overrun
     // is not a number. Reporting that as a fit failure would print "by inf mm"
@@ -976,11 +996,12 @@ fn layout_four_view(
     te: super::types::ViewExtent,
     re: super::types::ViewExtent,
     ie: super::types::ViewExtent,
+    angle: super::types::ProjectionAngle,
 ) -> (f64, [[f64; 2]; 4]) {
     let scale = fill_scale_four_view(sheet, fe, te, re, ie);
     (
         scale,
-        place_four_view(sheet, fe, te, re, ie, scale).positions,
+        place_four_view(sheet, fe, te, re, ie, scale, angle).positions,
     )
 }
 
@@ -1117,6 +1138,24 @@ impl FourViewPlacement {
     }
 }
 
+/// A core view's cell centre under `angle`. `xy` is its THIRD-angle cell
+/// centre in the 2×2 core block `core = (x0, y0, x1, y1)` (sheet mm, y down).
+/// First angle reflects the block through its centre: FRONT and TOP trade
+/// rows, and the FRONT/TOP column trades sides with RIGHT/ISO — the view from
+/// above lands below FRONT, the view from the right to its left. Every view
+/// is centred in its cell and the reflection maps cells onto cells, so cell
+/// sizes, gaps and the fit are unchanged.
+fn core_cell(
+    angle: super::types::ProjectionAngle,
+    xy: (f64, f64),
+    core: (f64, f64, f64, f64),
+) -> (f64, f64) {
+    match angle {
+        super::types::ProjectionAngle::Third => xy,
+        super::types::ProjectionAngle::First => (core.0 + core.2 - xy.0, core.1 + core.3 - xy.1),
+    }
+}
+
 /// Place the four views CENTERED in the drawing area at the supplied scale:
 ///
 /// ```text
@@ -1146,6 +1185,7 @@ fn place_four_view(
     re: super::types::ViewExtent,
     ie: super::types::ViewExtent,
     scale: f64,
+    angle: super::types::ProjectionAngle,
 ) -> FourViewPlacement {
     let h = sheet.height();
     let (avail_x0, avail_y0, avail_w, avail_h) = four_view_area(sheet);
@@ -1176,12 +1216,19 @@ fn place_four_view(
         [xtl - e.min_x * scale, h - ytl - e.max_y * scale]
     };
     FourViewPlacement {
-        positions: [
-            place(left_cx, bot_cy, fe),  // FRONT  (bottom-left)
-            place(left_cx, top_cy, te),  // TOP    (top-left)
-            place(right_cx, bot_cy, re), // RIGHT  (bottom-right)
-            place(right_cx, top_cy, ie), // ISO    (top-right)
-        ],
+        // Third angle: FRONT bottom-left, TOP top-left, RIGHT bottom-right,
+        // ISO top-right. First angle reflects the block through its centre.
+        positions: {
+            let c = |x: f64, y: f64| core_cell(angle, (x, y), (gx, gy, gx + g_w, gy + g_h));
+            let ((fx, fy), (tx, ty)) = (c(left_cx, bot_cy), c(left_cx, top_cy));
+            let ((rx, ry), (ix, iy)) = (c(right_cx, bot_cy), c(right_cx, top_cy));
+            [
+                place(fx, fy, fe),
+                place(tx, ty, te),
+                place(rx, ry, re),
+                place(ix, iy, ie),
+            ]
+        },
         overflow_x_mm: overrun(g_w, avail_w),
         overflow_y_mm: overrun(g_h, avail_h - BOTTOM_DIM_SHORTFALL),
     }
@@ -1215,6 +1262,21 @@ pub fn standard_drawing_auto(
     model: &BRepModel,
     solid_id: SolidId,
     part_uuid: uuid::Uuid,
+) -> Result<super::types::Drawing, super::projection::ProjectionError> {
+    standard_drawing_auto_with_projection(
+        model,
+        solid_id,
+        part_uuid,
+        super::types::ProjectionAngle::Third,
+    )
+}
+
+/// [`standard_drawing_auto`] laid out first- or third-angle.
+pub fn standard_drawing_auto_with_projection(
+    model: &BRepModel,
+    solid_id: SolidId,
+    part_uuid: uuid::Uuid,
+    angle: super::types::ProjectionAngle,
 ) -> Result<super::types::Drawing, super::projection::ProjectionError> {
     use super::types::{Drawing, ViewSource};
 
@@ -1264,12 +1326,14 @@ pub fn standard_drawing_auto(
         .fold(0.0_f64, f64::max)
         .max(1.0);
     let sheet = pick_sheet(max_dim);
-    let (scale, positions) =
-        layout_four_view(&sheet, extents[0], extents[1], extents[2], extents[3]);
+    let (scale, positions) = layout_four_view(
+        &sheet, extents[0], extents[1], extents[2], extents[3], angle,
+    );
 
     // Pass 2 — build the placed, scaled views.
     let t_p2 = std::time::Instant::now();
     let mut drawing = Drawing::new("Auto Drawing", sheet);
+    drawing.projection = angle;
     drawing.set_unit_notes(model.document_unit());
     for (i, (proj, name, dimensioned)) in specs.iter().enumerate() {
         let t_v = std::time::Instant::now();
@@ -1403,6 +1467,39 @@ fn attach_pictorial_iso(
         return;
     }
 
+    let Some((pos, s)) = pictorial_slot(drawing, iso_unit_extent) else {
+        // No free rect even at the smallest thumbnail: leave the sheet section-
+        // only rather than force a collision (the verifier stays green either way).
+        return;
+    };
+    let Ok(mut view) = build_hlr_view(
+        model,
+        solid_id,
+        source,
+        ProjectionType::Isometric,
+        "ISOMETRIC",
+        pos,
+        s,
+        min_span,
+    ) else {
+        return;
+    };
+    // Pictorial: no dimensions (the orthographic views carry all
+    // measurement); shaded raster replaces the wireframe fill and
+    // the polylines ride on top as outlines.
+    view.dimensions.clear();
+    view.shaded_raster = shaded_iso_raster(model, solid_id, view.extent, s);
+    drawing.views.push(view);
+}
+
+/// Where the pictorial isometric of unit extent `iso_unit_extent` goes on the
+/// finished `drawing`: `(position, scale)` of the first free rect a
+/// deterministic scan finds, or `None` when none is free even at the smallest
+/// thumbnail. See [`attach_pictorial_iso`].
+fn pictorial_slot(
+    drawing: &super::types::Drawing,
+    iso_unit_extent: super::types::ViewExtent,
+) -> Option<([f64; 2], f64)> {
     let w = drawing.sheet_size.width();
     let h = drawing.sheet_size.height();
     let (ml, mr, mt, mb) = super::svg::frame_margins(&drawing.sheet_size);
@@ -1487,30 +1584,11 @@ fn attach_pictorial_iso(
                     geo_x0 - iso_unit_extent.min_x * s,
                     h - geo_y_top - iso_unit_extent.max_y * s,
                 ];
-                let Ok(mut view) = build_hlr_view(
-                    model,
-                    solid_id,
-                    source,
-                    ProjectionType::Isometric,
-                    "ISOMETRIC",
-                    pos,
-                    s,
-                    min_span,
-                ) else {
-                    return;
-                };
-                // Pictorial: no dimensions (the orthographic views carry all
-                // measurement); shaded raster replaces the wireframe fill and
-                // the polylines ride on top as outlines.
-                view.dimensions.clear();
-                view.shaded_raster = shaded_iso_raster(model, solid_id, view.extent, s);
-                drawing.views.push(view);
-                return;
+                return Some((pos, s));
             }
         }
     }
-    // No free rect even at the smallest thumbnail: leave the sheet section-
-    // only rather than force a collision (the verifier stays green either way).
+    None
 }
 
 // ── GD&T sidecar → drawing builder bridge (Task 6 fix wave) ──────────────────
@@ -2205,6 +2283,101 @@ pub enum SectionSlotRule {
     FifthSlot,
 }
 
+/// Re-place an existing sheet's orthographic group for `angle` without
+/// regenerating it: name, title block, scale, dimensions and every view's
+/// content are kept; only the placement of the 2×2 core (FRONT, TOP, RIGHT
+/// and the view in the fourth cell — the isometric, or SECTION A-A where it
+/// replaces it) changes, together with the symbol and note.
+///
+/// Every layout centres each view in its cell, with a column as wide as its
+/// widest member and a row as tall as its tallest, so the cell grid is
+/// recovered from the placed views. Switching angle reflects that grid
+/// through its centre — exactly what [`core_cell`] does when a sheet is built
+/// in the other angle, which the tests pin.
+///
+/// Refused (the sheet is left untouched) when FRONT, TOP or RIGHT is
+/// missing: there is no standard arrangement to switch.
+pub fn set_projection(
+    drawing: &mut super::types::Drawing,
+    angle: super::types::ProjectionAngle,
+) -> Result<(), String> {
+    if drawing.projection == angle {
+        return Ok(());
+    }
+    let find = |want: &dyn Fn(&super::types::ProjectedView) -> bool| -> Option<usize> {
+        drawing.views.iter().position(|v| want(v))
+    };
+    let (Some(front), Some(top), Some(right)) = (
+        find(&|v| matches!(v.projection, ProjectionType::Front)),
+        find(&|v| matches!(v.projection, ProjectionType::Top)),
+        find(&|v| matches!(v.projection, ProjectionType::Right)),
+    ) else {
+        return Err("the sheet has no FRONT/TOP/RIGHT group to arrange".to_string());
+    };
+    let iso = find(&|v| matches!(v.projection, ProjectionType::Isometric));
+    let section = find(&|v| v.name.starts_with("SECTION"));
+    // On a ReplaceIso sheet the SECTION holds the fourth cell and any
+    // isometric is a free-floating pictorial placed afterwards by a free-rect
+    // search ([`attach_pictorial_iso`]), which is re-run below.
+    let (fourth, floating_iso) = match (section_slot_rule(&drawing.sheet_size), section) {
+        (SectionSlotRule::ReplaceIso, Some(sec)) => (Some(sec), iso),
+        _ => (iso, None),
+    };
+    // Sheet-space centre (y up) and scaled size of a placed view.
+    let geom = |i: usize| -> ([f64; 2], f64, f64) {
+        let v = &drawing.views[i];
+        let e = v.extent;
+        (
+            [
+                v.position_mm[0] + v.scale * 0.5 * (e.min_x + e.max_x),
+                v.position_mm[1] + v.scale * 0.5 * (e.min_y + e.max_y),
+            ],
+            v.scale * e.width(),
+            v.scale * e.height(),
+        )
+    };
+    let (fc, fw, fh) = geom(front);
+    let (tc, tw, th) = geom(top);
+    let (rc, rw, rh) = geom(right);
+    let (iw, ih) = fourth.map(|i| (geom(i).1, geom(i).2)).unwrap_or((0.0, 0.0));
+    // Column of FRONT/TOP, column of RIGHT/fourth; row of FRONT/RIGHT, row of
+    // TOP/fourth.
+    let (wa, wb) = (fw.max(tw), rw.max(iw));
+    let (hq, hp) = (fh.max(rh), th.max(ih));
+    let (cxa, cxb, cyq, cyp) = (fc[0], rc[0], fc[1], tc[1]);
+    let x0 = (cxa - 0.5 * wa).min(cxb - 0.5 * wb);
+    let x1 = (cxa + 0.5 * wa).max(cxb + 0.5 * wb);
+    let y0 = (cyq - 0.5 * hq).min(cyp - 0.5 * hp);
+    let y1 = (cyq + 0.5 * hq).max(cyp + 0.5 * hp);
+    let moves: Vec<(usize, [f64; 2])> = [Some(front), Some(top), Some(right), fourth]
+        .into_iter()
+        .flatten()
+        .map(|i| {
+            let (c, _, _) = geom(i);
+            (i, [(x0 + x1 - c[0]) - c[0], (y0 + y1 - c[1]) - c[1]])
+        })
+        .collect();
+    for (i, d) in moves {
+        let v = &mut drawing.views[i];
+        v.position_mm[0] += d[0];
+        v.position_mm[1] += d[1];
+    }
+    drawing.projection = angle;
+    if let Some(i) = floating_iso {
+        // Re-place the pictorial exactly as a sheet built in this angle
+        // would: the same search over the re-placed sheet. Its shaded image is
+        // resampled, not re-rendered, when the slot's scale differs; when no
+        // slot is free it is dropped, as the builder leaves such a sheet.
+        let mut pictorial = drawing.views.remove(i);
+        if let Some((pos, scale)) = pictorial_slot(drawing, pictorial.extent) {
+            pictorial.position_mm = pos;
+            pictorial.scale = scale;
+            drawing.views.insert(i, pictorial);
+        }
+    }
+    Ok(())
+}
+
 /// Apply the deterministic sheet-size rule to decide the section slot.
 ///
 /// Mutation-proof: this function is the single decision gate; tests for
@@ -2253,9 +2426,10 @@ fn layout_five_view(
     re: super::types::ViewExtent,
     ie: super::types::ViewExtent,
     se: super::types::ViewExtent,
+    angle: super::types::ProjectionAngle,
 ) -> (f64, [[f64; 2]; 5]) {
-    let column = five_view_column(sheet, fe, te, re, ie, se);
-    let band = five_view_band(sheet, fe, te, re, ie, se);
+    let column = five_view_column(sheet, fe, te, re, ie, se, angle);
+    let band = five_view_band(sheet, fe, te, re, ie, se, angle);
     if band.0 >= column.0 {
         band
     } else {
@@ -2275,6 +2449,7 @@ fn five_view_column(
     re: super::types::ViewExtent,
     ie: super::types::ViewExtent,
     se: super::types::ViewExtent,
+    angle: super::types::ProjectionAngle,
 ) -> (f64, [[f64; 2]; 5]) {
     let w = sheet.width();
     let h = sheet.height();
@@ -2351,16 +2526,22 @@ fn five_view_column(
         [xtl - e.min_x * scale, h - ytl - e.max_y * scale]
     };
 
-    (
-        scale,
+    (scale, {
+        // The 2×2 core (third angle: FRONT bottom-left, TOP top-left,
+        // RIGHT bottom-centre, ISO top-centre), reflected through its own
+        // centre for first angle; SECTION keeps its right column.
+        let core = (gx, core_y0, gx + lw + HGAP + mwc, core_y0 + core_block_h);
+        let c = |x: f64, y: f64| core_cell(angle, (x, y), core);
+        let ((fx, fy), (tx, ty)) = (c(left_cx, bot_cy), c(left_cx, top_cy));
+        let ((rx, ry), (ix, iy)) = (c(mid_cx, bot_cy), c(mid_cx, top_cy));
         [
-            place(left_cx, bot_cy, fe),  // FRONT  (bottom-left)
-            place(left_cx, top_cy, te),  // TOP    (top-left)
-            place(mid_cx, bot_cy, re),   // RIGHT  (bottom-centre)
-            place(mid_cx, top_cy, ie),   // ISO    (top-centre)
-            place(right_cx, sec_cy, se), // SECTION (right column)
-        ],
-    )
+            place(fx, fy, fe),
+            place(tx, ty, te),
+            place(rx, ry, re),
+            place(ix, iy, ie),
+            place(right_cx, sec_cy, se),
+        ]
+    })
 }
 
 /// Candidate B: SECTION A-A as a full-width band ABOVE the TOP/ISO over
@@ -2386,6 +2567,7 @@ fn five_view_band(
     re: super::types::ViewExtent,
     ie: super::types::ViewExtent,
     se: super::types::ViewExtent,
+    angle: super::types::ProjectionAngle,
 ) -> (f64, [[f64; 2]; 5]) {
     let w = sheet.width();
     let h = sheet.height();
@@ -2470,16 +2652,27 @@ fn five_view_band(
         [xtl - e.min_x * scale, h - ytl - e.max_y * scale]
     };
 
-    (
-        scale,
+    (scale, {
+        // The 2×2 core under the band, reflected through its own centre
+        // for first angle; SECTION keeps its band above the core.
+        let core_y0 = gy + shc + SGAP;
+        let core = (
+            core_x0,
+            core_y0,
+            core_x0 + core_block_w,
+            core_y0 + trh + VGAP + brh,
+        );
+        let c = |x: f64, y: f64| core_cell(angle, (x, y), core);
+        let ((fx, fy), (tx, ty)) = (c(left_cx, bot_cy), c(left_cx, top_cy));
+        let ((rx, ry), (ix, iy)) = (c(right_cx, bot_cy), c(right_cx, top_cy));
         [
-            place(left_cx, bot_cy, fe),  // FRONT  (bottom-left)
-            place(left_cx, top_cy, te),  // TOP    (top-left)
-            place(right_cx, bot_cy, re), // RIGHT  (bottom-right)
-            place(right_cx, top_cy, ie), // ISO    (top-right)
-            place(band_cx, band_cy, se), // SECTION (band, above the core)
-        ],
-    )
+            place(fx, fy, fe),
+            place(tx, ty, te),
+            place(rx, ry, re),
+            place(ix, iy, ie),
+            place(band_cx, band_cy, se),
+        ]
+    })
 }
 
 /// Choose the cutting-plane normal and origin for the section cut.
@@ -2798,6 +2991,7 @@ pub(crate) fn attach_section_view(
                 top_ext,
                 right_ext,
                 section_unit.extent, // ISO slot carries section extent
+                drawing.projection,
             );
             for (i, v) in drawing.views.iter_mut().take(3).enumerate() {
                 v.scale = s;
@@ -2820,6 +3014,7 @@ pub(crate) fn attach_section_view(
                 right_ext,
                 iso_ext,
                 section_unit.extent,
+                drawing.projection,
             );
             for (i, v) in drawing.views.iter_mut().take(4).enumerate() {
                 v.scale = s;

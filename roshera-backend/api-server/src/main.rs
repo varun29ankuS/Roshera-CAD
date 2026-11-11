@@ -11113,6 +11113,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(drawing_edit::edit_dimension),
         )
         .route(
+            "/api/drawings/{id}/projection",
+            axum::routing::patch(drawing_edit::set_projection),
+        )
+        .route(
             "/api/drawings/{id}/views/{view_id}",
             delete(drawing_mgr::remove_view),
         )

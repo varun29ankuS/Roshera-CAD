@@ -10909,3 +10909,101 @@ async fn editing_an_unknown_drawing_dimension_is_refused() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "{body}");
 }
+
+/// Sheet-space centre (y up) of the view named `name` in a drawing's JSON.
+fn view_centre(drawing: &serde_json::Value, name: &str) -> [f64; 2] {
+    let v = drawing["views"]
+        .as_array()
+        .and_then(|vs| vs.iter().find(|v| v["name"] == name))
+        .unwrap_or_else(|| panic!("no {name} view"));
+    let f = |p: &serde_json::Value| p.as_f64().unwrap_or(f64::NAN);
+    let (pos, s, e) = (&v["position_mm"], f(&v["scale"]), &v["extent"]);
+    [
+        f(&pos[0]) + s * 0.5 * (f(&e["min_x"]) + f(&e["max_x"])),
+        f(&pos[1]) + s * 0.5 * (f(&e["min_y"]) + f(&e["max_y"])),
+    ]
+}
+
+async fn bored_part_with_drawing(state: &AppState, query: &str) -> String {
+    let _drill = seed_bored_box_live(state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (cs, created) = dispatch(
+        state,
+        json_post(
+            &format!("/api/parts/uuid/{part_uuid}/drawing{query}"),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        cs,
+        StatusCode::OK,
+        "drawing create must 200; body = {created}"
+    );
+    created["id"].as_str().expect("drawing id").to_string()
+}
+
+/// A drawing switched to first angle STAYS first angle when a part edit made
+/// through the drawing regenerates it — the switch is recorded, and the
+/// timeline's re-derivation honours it.
+#[tokio::test]
+async fn a_first_angle_switch_survives_editing_the_part_through_the_drawing() {
+    let state = make_test_state().await;
+    let drawing_id = bored_part_with_drawing(&state, "").await;
+
+    let (ps, switched) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/api/drawings/{drawing_id}/projection"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "projection": "first" }).to_string()))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(ps, StatusCode::OK, "{switched}");
+    assert_eq!(switched["quality"]["passed"], true, "{switched}");
+
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert_eq!(sheet["projection"], "first", "{}", sheet["projection"]);
+    let (f, t) = (view_centre(&sheet, "FRONT"), view_centre(&sheet, "TOP"));
+    assert!(t[1] < f[1], "first angle: TOP below FRONT");
+
+    let (dim_id, _pid) =
+        drawing_dimension(&sheet, "diameter", 6.0).expect("the Ø6 bore is dimensioned");
+    let (es, edited) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/drawings/{drawing_id}/dimensions/{dim_id}"),
+            json!({ "value": 8.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(es, StatusCode::OK, "{edited}");
+
+    let (_, after) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert_eq!(
+        after["projection"], "first",
+        "the regenerated sheet keeps first angle"
+    );
+    let (f, t) = (view_centre(&after, "FRONT"), view_centre(&after, "TOP"));
+    assert!(t[1] < f[1], "still TOP below FRONT after the regeneration");
+    assert!(
+        drawing_dimension(&after, "diameter", 8.0).is_some(),
+        "and it shows Ø8"
+    );
+}
+
+/// A drawing can be created first-angle directly.
+#[tokio::test]
+async fn a_drawing_can_be_created_first_angle() {
+    let state = make_test_state().await;
+    let drawing_id = bored_part_with_drawing(&state, "?projection=first").await;
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert_eq!(sheet["projection"], "first");
+}

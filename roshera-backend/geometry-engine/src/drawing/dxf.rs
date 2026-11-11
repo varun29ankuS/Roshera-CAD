@@ -927,7 +927,7 @@ fn emit_notes_strip(dxf: &mut DxfDrawing, drawing: &Drawing) {
         y2,
         2.4,
         0.0,
-        "THIRD-ANGLE PROJECTION.",
+        drawing.projection.note(),
         HorizontalTextJustification::Left,
     );
 }

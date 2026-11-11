@@ -713,6 +713,33 @@ pub struct ToleranceRef {
     pub designation: Option<String>,
 }
 
+/// Which orthographic projection method arranges a drawing's views.
+///
+/// * **Third angle** (ASME Y14.3; US): the view from above goes ABOVE the
+///   front view, the view from the right to its RIGHT.
+/// * **First angle** (ISO 5456-2 method E; India, Europe): the view from
+///   above goes BELOW the front view, the view from the right to its LEFT.
+///
+/// The views themselves are identical; only their placement, the projection
+/// symbol and the note differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionAngle {
+    First,
+    #[default]
+    Third,
+}
+
+impl ProjectionAngle {
+    /// The sheet note, e.g. `"FIRST-ANGLE PROJECTION."`.
+    pub fn note(self) -> &'static str {
+        match self {
+            ProjectionAngle::First => "FIRST-ANGLE PROJECTION.",
+            ProjectionAngle::Third => "THIRD-ANGLE PROJECTION.",
+        }
+    }
+}
+
 /// A drawing document — a collection of [`ProjectedView`]s on a single
 /// sheet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -721,6 +748,11 @@ pub struct Drawing {
     pub name: String,
     pub sheet_size: SheetSize,
     pub views: Vec<ProjectedView>,
+    /// First- or third-angle arrangement of the orthographic views, with the
+    /// matching projection symbol and note. `#[serde(default)]` reads older
+    /// sheets (all laid out third-angle) as third-angle.
+    #[serde(default)]
+    pub projection: ProjectionAngle,
     /// User-editable title-block metadata. Defaulted on creation;
     /// patched via `PATCH /api/drawings/{id}/title-block`.
     #[serde(default)]
@@ -813,6 +845,7 @@ impl Drawing {
             name: name.into(),
             sheet_size,
             views: Vec::new(),
+            projection: ProjectionAngle::default(),
             title_block: TitleBlock::default(),
             unit_note: Self::default_unit_note(),
             tolerance_note: Self::default_tolerance_note(),

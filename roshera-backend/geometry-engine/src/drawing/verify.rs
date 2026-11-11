@@ -427,7 +427,7 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     finalize(issues, utilization)
 }
 
-/// Third-angle arrangement: Top directly above Front (shared x-centre),
+/// Orthographic alignment (either angle): Top in line with Front (shared x-centre),
 /// Right directly beside Front (shared y-centre).
 ///
 /// Reads each view's geometry rect from the `layout`'s `ViewGeometry` items
@@ -466,7 +466,7 @@ fn check_alignment(
         if (fcx - tcx).abs() > ALIGN_TOL_MM {
             issues.push(warning(
                 DrawingIssueKind::ProjectionMisaligned,
-                "Top view is not vertically aligned over the Front view (third-angle)".to_string(),
+                "Top view is not vertically aligned with the Front view".to_string(),
                 None,
             ));
         }
@@ -477,8 +477,7 @@ fn check_alignment(
         if (fcy - rcy).abs() > ALIGN_TOL_MM {
             issues.push(warning(
                 DrawingIssueKind::ProjectionMisaligned,
-                "Right view is not horizontally aligned with the Front view (third-angle)"
-                    .to_string(),
+                "Right view is not horizontally aligned with the Front view".to_string(),
                 None,
             ));
         }
