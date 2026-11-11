@@ -26,7 +26,7 @@ interface CameraAnimation {
 
 // Initial camera placement — must match the previous Canvas-default
 // camera so existing scenes look identical on first paint.
-const INITIAL_POSITION: [number, number, number] = [20, 15, 20]
+const INITIAL_POSITION: [number, number, number] = [20, -20, 15]
 const INITIAL_TARGET: [number, number, number] = [0, 0, 0]
 const PERSPECTIVE_FOV = 50
 const PERSPECTIVE_NEAR = 0.1
@@ -184,18 +184,39 @@ export function CameraController() {
 
     const controls = controlsRef.current
 
+    // A preset is a viewing DIRECTION. Its stored position sits 30 mm from
+    // its target, which puts the camera inside anything bigger than a few
+    // centimetres, so the distance (and, for the standard views aimed at the
+    // origin, the target) comes from the model: the same fit the sketch
+    // look-at uses. An empty scene keeps the preset as written.
+    const presetTarget = new THREE.Vector3(...pendingPreset.target)
+    const presetPos = new THREE.Vector3(...pendingPreset.position)
+    let endTarget = presetTarget
+    let endPosition = presetPos
+    if (sceneBounds.radius > 1e-6) {
+      const dir = new THREE.Vector3().subVectors(presetPos, presetTarget).normalize()
+      endTarget = presetTarget.lengthSq() < 1e-12 ? sceneBounds.center.clone() : presetTarget
+      let distance = sceneBounds.radius * 2.5
+      const persp = perspRef.current
+      if (persp && (camera as THREE.PerspectiveCamera).isPerspectiveCamera) {
+        const fov = (persp.fov * Math.PI) / 180
+        distance = (sceneBounds.radius / Math.tan(fov / 2)) * 1.4
+      }
+      endPosition = endTarget.clone().addScaledVector(dir, distance)
+    }
+
     animRef.current = {
       startPosition: camera.position.clone(),
       startTarget: controls.target.clone(),
-      endPosition: new THREE.Vector3(...pendingPreset.position),
-      endTarget: new THREE.Vector3(...pendingPreset.target),
+      endPosition,
+      endTarget,
       endUp: new THREE.Vector3(...pendingPreset.up),
       progress: 0,
     }
     invalidate()
 
     clearPending()
-  }, [pendingPreset, camera, clearPending, invalidate])
+  }, [pendingPreset, camera, clearPending, invalidate, sceneBounds])
 
   // Sketch-plane look-at. Every CAD sketcher orients the view normal-to the
   // active sketch plane on entry so the 2D profile is face-on and EDITABLE —
@@ -331,7 +352,7 @@ export function CameraController() {
       .subVectors(camera.position, controls.target)
       .normalize()
     if (!Number.isFinite(dir.x) || dir.lengthSq() < 1e-6) {
-      dir.set(1, 0.7, 1).normalize()
+      dir.set(1, -1, 0.75).normalize()
     }
     const endPosition = center.clone().addScaledVector(dir, distance)
 

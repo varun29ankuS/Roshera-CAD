@@ -16,7 +16,7 @@ import { resolveCssVar } from '@/lib/css-color'
  * fat anti-aliased bands once the camera moves close.
  *
  * The grid lies on the active sketch plane (xy / xz / yz) when sketch
- * mode is on, and on the world XZ ground plane otherwise. Plane-local
+ * mode is on, and on the world XY ground plane (Z-up) otherwise. Plane-local
  * (px, py) coordinates are mapped onto the active plane in the vertex
  * shader via a 2x2 matrix supplied by JS, then offset by the camera's
  * projection onto the same plane so the grid feels infinite.
@@ -89,16 +89,16 @@ export function CADGrid() {
     (s) => s.gridSettings,
   )
   // Track the sketch plane only when sketch mode is active; otherwise the
-  // grid stays on the conventional XZ ground plane.
+  // grid stays on the XY ground plane (Z-up world).
   const sketchActive = useSceneStore((s) => s.sketch.active)
   const sketchPlane = useSceneStore((s) => s.sketch.plane)
   // The infinite grid shader is parametrised over the three axis-
   // aligned planes; on a custom (face-anchored) sketch plane we fall
-  // back to the XZ ground grid rather than fight the shader to track
+  // back to the XY ground grid rather than fight the shader to track
   // an arbitrarily oriented plane. The sketch overlay still renders
   // a face-aligned authoring quad on top.
   const activePlane: StandardPlane =
-    sketchActive && isStandardPlane(sketchPlane) ? sketchPlane : 'xz'
+    sketchActive && isStandardPlane(sketchPlane) ? sketchPlane : 'xy'
 
   const theme = useThemeStore((s) => s.theme)
   const { camera } = useThree()
@@ -123,11 +123,11 @@ export function CADGrid() {
   const PLANE_SIZE = 4000
 
   const uniforms = useMemo<{ [name: string]: THREE.IUniform }>(() => {
-    // Pre-seed the plane map with the XZ ground-plane mapping so the
+    // Pre-seed the plane map with the XY ground-plane mapping so the
     // very first render before useFrame ticks is already correct.
     const initialMap = new THREE.Matrix3().set(
-      PLANE_MAP.xz[0], PLANE_MAP.xz[2], 0,
-      PLANE_MAP.xz[1], PLANE_MAP.xz[3], 0,
+      PLANE_MAP.xy[0], PLANE_MAP.xy[2], 0,
+      PLANE_MAP.xy[1], PLANE_MAP.xy[3], 0,
       0, 0, 1,
     )
     return {

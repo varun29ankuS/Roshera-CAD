@@ -3637,29 +3637,20 @@ impl BRepModel {
     // defaults already present". Only user-driven mutations (visibility
     // toggle today, create/rename/delete in slice 4) emit events.
 
-    /// Toggle a datum's visibility, recording the change.
+    /// Show or hide a datum. A VIEW preference, so nothing is recorded: the
+    /// design timeline holds decisions about the part, and a few clicks on
+    /// the datums eye used to fill it with "operations recorded without a
+    /// named decision". Older logs that carry `datum_set_visibility` events
+    /// still replay (`timeline-engine` keeps the arm).
     ///
     /// Returns `Some(previous_visible)` on success, or `None` when the
-    /// datum id is unknown — matches `DatumStore::set_visible`. The event
-    /// records `kind = "datum_set_visibility"` with the datum id in
-    /// `inputs` and `{datum_id, visible, previous_visible}` in
-    /// `parameters`.
+    /// datum id is unknown — matches `DatumStore::set_visible`.
     pub fn set_datum_visibility(
         &self,
         id: crate::primitives::datum::DatumId,
         visible: bool,
     ) -> Option<bool> {
-        let previous = self.datums.set_visible(id, visible)?;
-        self.record_operation(
-            crate::operations::recorder::RecordedOperation::new("datum_set_visibility")
-                .with_parameters(serde_json::json!({
-                    "datum_id": id,
-                    "visible": visible,
-                    "previous_visible": previous,
-                }))
-                .with_input_datums([id as u64]),
-        );
-        Some(previous)
+        self.datums.set_visible(id, visible)
     }
 
     // Slice 4a: user-authored datum mediators. Each wraps the
@@ -8270,8 +8261,12 @@ mod anchor_tests {
         }
     }
 
+    /// Showing or hiding a datum is a VIEW preference, not a design
+    /// decision: it must not land in the design timeline. Recorded, a few
+    /// clicks on the datums eye produced 42 "operations recorded without a
+    /// named decision" on an empty document.
     #[test]
-    fn set_datum_visibility_records_event_when_recorder_attached() {
+    fn set_datum_visibility_changes_visibility_but_records_no_design_event() {
         let mut model = BRepModel::new();
         let recorder = Arc::new(CaptureRecorder::default());
         model.attach_recorder(Some(recorder.clone()));
@@ -8281,19 +8276,22 @@ mod anchor_tests {
             .set_datum_visibility(0, false)
             .expect("origin id 0 exists");
         assert!(prev, "origin starts visible");
+        assert_eq!(
+            model.set_datum_visibility(0, true),
+            Some(false),
+            "the toggle took effect"
+        );
 
         let events = recorder
             .events
             .lock()
             .expect("CaptureRecorder mutex poisoned")
             .clone();
-        assert_eq!(events.len(), 1, "exactly one event recorded");
-        let ev = &events[0];
-        assert_eq!(ev.kind, "datum_set_visibility");
-        assert_eq!(ev.inputs, vec!["datum:0".to_string()]);
-        assert_eq!(ev.parameters["datum_id"], 0);
-        assert_eq!(ev.parameters["visible"], false);
-        assert_eq!(ev.parameters["previous_visible"], true);
+        assert!(
+            events.is_empty(),
+            "a visibility toggle is not design history: {:?}",
+            events.iter().map(|e| e.kind.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

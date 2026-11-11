@@ -141,13 +141,15 @@ export interface CameraPreset {
 }
 
 export const CAMERA_PRESETS: Record<string, CameraPreset> = {
-  front:       { name: 'Front',       position: [0, 0, 30],  target: [0, 0, 0], up: [0, 1, 0] },
-  back:        { name: 'Back',        position: [0, 0, -30], target: [0, 0, 0], up: [0, 1, 0] },
-  top:         { name: 'Top',         position: [0, 30, 0],  target: [0, 0, 0], up: [0, 0, -1] },
-  bottom:      { name: 'Bottom',      position: [0, -30, 0], target: [0, 0, 0], up: [0, 0, 1] },
-  right:       { name: 'Right',       position: [30, 0, 0],  target: [0, 0, 0], up: [0, 1, 0] },
-  left:        { name: 'Left',        position: [-30, 0, 0], target: [0, 0, 0], up: [0, 1, 0] },
-  isometric:   { name: 'Isometric',   position: [20, 15, 20], target: [0, 0, 0], up: [0, 1, 0] },
+  // Z-up world (the kernel's convention): Front looks along +Y and sees XZ,
+  // Top looks down -Z and sees XY, Right looks along -X and sees YZ.
+  front:       { name: 'Front',       position: [0, -30, 0], target: [0, 0, 0], up: [0, 0, 1] },
+  back:        { name: 'Back',        position: [0, 30, 0],  target: [0, 0, 0], up: [0, 0, 1] },
+  top:         { name: 'Top',         position: [0, 0, 30],  target: [0, 0, 0], up: [0, 1, 0] },
+  bottom:      { name: 'Bottom',      position: [0, 0, -30], target: [0, 0, 0], up: [0, -1, 0] },
+  right:       { name: 'Right',       position: [30, 0, 0],  target: [0, 0, 0], up: [0, 0, 1] },
+  left:        { name: 'Left',        position: [-30, 0, 0], target: [0, 0, 0], up: [0, 0, 1] },
+  isometric:   { name: 'Isometric',   position: [20, -20, 15], target: [0, 0, 0], up: [0, 0, 1] },
 }
 
 // ─── Sketch session readiness ────────────────────────────────────────
@@ -222,12 +224,12 @@ function sketchCameraSetup(plane: SketchPlane): {
   preset: CameraPreset | undefined
 } {
   if (isStandardPlane(plane)) {
-    // Y-up world: Top view looks down -Y (sees XZ); Front looks down
-    // -Z (sees XY); Right looks down -X (sees YZ). Match each plane
-    // to the view that shows it face-on.
+    // Z-up world: Top looks down -Z (sees XY); Front looks along +Y
+    // (sees XZ); Right looks down -X (sees YZ). Match each plane to the
+    // view that shows it face-on.
     const standardPresetKey: Record<StandardPlane, string> = {
-      xy: 'front',
-      xz: 'top',
+      xy: 'top',
+      xz: 'front',
       yz: 'right',
     }
     const presetKey = standardPresetKey[plane]

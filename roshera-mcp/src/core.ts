@@ -8,6 +8,9 @@
 
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 // Import cycle note: gates.ts imports `api` from this module; both imports
 // are only dereferenced at call time (never during module evaluation) and
 // both are hoisted function declarations, so the ESM cycle is benign.
@@ -28,7 +31,20 @@ export const BASE = process.env.ROSHERA_URL ?? "http://localhost:8081";
 // that enforces authentication. Computed once at module load; changing
 // the key requires an MCP reconnect (`/mcp`), which restarts this
 // process and re-reads the environment.
-const API_KEY = process.env.ROSHERA_API_KEY;
+//
+// Fallback: `~/.roshera/api_key` (one line, the key), the same local-file
+// convention as `~/.roshera/openrouter_key`. `.mcp.json` is tracked in git,
+// so a key written there would be committed; the file keeps the secret out
+// of the repository while the env var still wins when set.
+function readKeyFile(): string | undefined {
+  try {
+    const key = readFileSync(join(homedir(), ".roshera", "api_key"), "utf8").trim();
+    return key.length > 0 ? key : undefined;
+  } catch {
+    return undefined;
+  }
+}
+const API_KEY = process.env.ROSHERA_API_KEY ?? readKeyFile();
 export const AUTH_HEADERS: Record<string, string> = API_KEY
   ? { Authorization: `ApiKey ${API_KEY}` }
   : {};
