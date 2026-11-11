@@ -432,19 +432,18 @@ export function durabilityNotice(
     case 'quarantined':
       return {
         tone: 'withheld',
-        // Counts what is MISSING, not what survived. `22/45 served` is the
-        // replay engine's own bookkeeping; the person's question is whether
-        // the model in front of them is all of what they asked for. And
-        // "withheld, not approximated" names a deliberate refusal, so the
-        // chip reads as the kernel keeping its promise rather than an
-        // incident — nothing here is broken.
-        label: `${status.events_total - status.events_served} of ${status.events_total} operations missing — withheld, not approximated`,
+        // Leads with what was KEPT. "N of M operations missing" read as data
+        // loss to everyone who saw it; what happened is a deliberate refusal
+        // to guess, on a document whose saved history cannot all be rebuilt.
+        label:
+          status.events_served === 0
+            ? `saved history not restored — ${status.events_total} steps set aside, not guessed`
+            : `history partly restored — ${status.events_served} of ${status.events_total} steps, the rest set aside`,
         detail:
-          `Tail withheld at boot — by design. Event #${status.first_break_sequence} ` +
-          `(${status.first_break_kind}) cannot be faithfully replayed by this kernel: ` +
-          `${status.reason}. The clean prefix (${status.events_served} of ` +
-          `${status.events_total} events) is served; everything at and after the break ` +
-          `is refused rather than approximated.`,
+          `This document's saved history could not all be rebuilt. Step #${status.first_break_sequence} ` +
+          `(${status.first_break_kind}) cannot be replayed faithfully — ${status.reason} — so it and ` +
+          `everything after it are set aside rather than guessed. The first ${status.events_served} of ` +
+          `${status.events_total} steps are restored. Start a new document for a clean slate.`,
       }
     case 'failed':
       return {

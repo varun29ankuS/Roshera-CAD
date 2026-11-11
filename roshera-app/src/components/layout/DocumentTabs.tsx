@@ -85,6 +85,9 @@ interface ContextMenuState {
   y: number
 }
 
+/** Closed documents listed in the `+` menu before "Show all". */
+const RECENT_DOCUMENTS_SHOWN = 6
+
 export function DocumentTabs() {
   const documents = useDocumentStore((s) => s.documents)
   const switchingId = useDocumentStore((s) => s.switchingId)
@@ -142,10 +145,19 @@ export function DocumentTabs() {
     () => documents.filter((d) => d.active || !closedIds.has(d.id)),
     [documents, closedIds],
   )
+  // Newest first: the document someone wants back is almost always a recent
+  // one, and the list holds every document ever made.
   const hiddenDocuments = useMemo(
-    () => documents.filter((d) => !d.active && closedIds.has(d.id)),
+    () =>
+      documents
+        .filter((d) => !d.active && closedIds.has(d.id))
+        .sort((a, b) => b.createdAt - a.createdAt),
     [documents, closedIds],
   )
+  const [showAllDocs, setShowAllDocs] = useState(false)
+  const shownDocuments = showAllDocs
+    ? hiddenDocuments
+    : hiddenDocuments.slice(0, RECENT_DOCUMENTS_SHOWN)
 
   /**
    * Names carried by more than one OPEN tab.
@@ -430,7 +442,8 @@ export function DocumentTabs() {
                 <div className="px-3 py-1 text-[11px] uppercase tracking-wide text-muted-foreground/60">
                   Open existing
                 </div>
-                {hiddenDocuments.map((doc) => (
+                <div className="max-h-[50vh] overflow-y-auto">
+                {shownDocuments.map((doc) => (
                   <button
                     key={doc.id}
                     type="button"
@@ -445,6 +458,18 @@ export function DocumentTabs() {
                     </span>
                   </button>
                 ))}
+                </div>
+                {hiddenDocuments.length > RECENT_DOCUMENTS_SHOWN && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAllDocs((v) => !v)}
+                    className="w-full text-left px-3 py-1.5 text-[11px] text-muted-foreground hover:bg-accent/40"
+                  >
+                    {showAllDocs
+                      ? 'Show recent only'
+                      : `Show all (${hiddenDocuments.length})`}
+                  </button>
+                )}
               </>
             )}
           </div>
