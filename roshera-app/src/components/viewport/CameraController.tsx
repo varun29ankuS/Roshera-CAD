@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react'
-import { CAMERA_PRESETS, FRAME_ALL } from '@/stores/scene-store'
+import { CAMERA_PRESETS, FRAME_ALL, FRAME_FIT } from '@/stores/scene-store'
 import { useThree, useFrame } from '@react-three/fiber'
 import {
   OrbitControls,
@@ -282,11 +282,11 @@ export function CameraController() {
   useEffect(() => {
     if (!pendingFrameObjectId || !controlsRef.current) return
     const controls = controlsRef.current
-    // FRAME_ALL frames the union of every object (first load, document
-    // switch); any other id frames that one object.
+    // FRAME_ALL / FRAME_FIT frame the union of every object (a document
+    // opening / a part created); any other id frames that one object.
     const all = useSceneStore.getState().objects
     const objs =
-      pendingFrameObjectId === FRAME_ALL
+      pendingFrameObjectId === FRAME_ALL || pendingFrameObjectId === FRAME_FIT
         ? [...all.values()]
         : [all.get(pendingFrameObjectId)].filter((o) => o !== undefined)
 

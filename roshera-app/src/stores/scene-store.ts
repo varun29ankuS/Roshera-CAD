@@ -31,8 +31,14 @@ import {
 // Re-exported so consumers (panels, overlays) can import the
 // SketchShape wire type from the same module they import the rest
 // of the sketch types from.
-/** `pendingFrameObjectId` value that frames every object at once. */
+/** `pendingFrameObjectId` value that frames every object at once, as a fresh
+ *  view (iso, Z up): a document opening. */
 export const FRAME_ALL = '*'
+/** `pendingFrameObjectId` value that fits every object in view from the
+ *  current direction: a part was just created. Framing the new part alone
+ *  zooms onto whatever was made last, which in an agent build is usually a
+ *  small cutter about to be consumed by a boolean. */
+export const FRAME_FIT = '*fit'
 
 export type { ServerSketchShape, SketchRegion } from '@/lib/sketch-api'
 

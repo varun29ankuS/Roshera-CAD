@@ -661,6 +661,20 @@ pub fn boolean_operation(
             vec![solid_a, solid_b],
         );
 
+        // IDENTITY: the result is the body operand A was — a disc with holes
+        // cut in it is still that disc — so it keeps A's solid id, exactly as
+        // its untouched faces keep theirs (`assign_boolean_face_pids`). Whole-
+        // part dimensions (extents) are keyed to this id; without it every
+        // overall size on a drilled part's drawing is reference-only and a
+        // drawing edit cannot trace it back to the parameter that drives it.
+        // A's id is seeded from its creation event, so it is replay-stable.
+        // The retired operand's entry is dropped first so the id resolves to
+        // the live result alone.
+        if let Some(pid) = model.solid_pid(solid_a) {
+            model.solid_pids.remove(&solid_a);
+            model.set_solid_pid(result_solid, pid);
+        }
+
         let op_kind = match operation {
             BooleanOp::Union => "boolean_union",
             BooleanOp::Intersection => "boolean_intersection",
