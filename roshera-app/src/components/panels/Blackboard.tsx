@@ -23,12 +23,10 @@ import { Button } from '@/components/ui/button'
 import {
   NotebookPen,
   Send,
-  Loader2,
   ChevronDown,
   GripHorizontal,
   Plus,
   Trash2,
-  Zap,
   Clock,
   Bot,
   User,
@@ -38,6 +36,7 @@ import {
   CircleSlash,
 } from 'lucide-react'
 import { VendorMark } from '@/components/settings/vendor-marks'
+import { TurnStatusLine } from './TurnStatusLine'
 
 /**
  * BLACKBOARD
@@ -66,6 +65,15 @@ const compactCount = new Intl.NumberFormat('en-US', { notation: 'compact', maxim
  *  honest percentage to compute — this renders the total alone, never a
  *  used/size ratio, and never clamps to 100% (that would hide the truth
  *  rather than tell it). */
+/** A model id short enough for the board's header: the provider prefix and
+ *  any `:tag` suffix dropped (`nvidia/nemotron-3:free` -> `nemotron-3`). The
+ *  full id stays in the header's tooltip. */
+function shortModelName(model: string | null | undefined): string {
+  if (!model) return '\u2014'
+  const base = model.split('/').pop() ?? model
+  return base.split(':')[0] || base
+}
+
 function formatContextUsage(used: number): string {
   return `${compactCount.format(used)} tokens`
 }
@@ -439,7 +447,7 @@ export function Blackboard() {
     // the board loses a third of its width and gains capacity.
     // pointer-events-auto: the slot around this is pass-through so the model
     // stays orbitable everywhere the panel is not.
-    <div className="pointer-events-auto flex max-h-full min-h-0 w-full max-w-[52rem] flex-col overflow-hidden rounded-lg border border-border bg-card/95">
+    <div className="pointer-events-auto flex max-h-full min-h-0 w-full max-w-[26rem] flex-col overflow-hidden rounded-2xl border border-border bg-card/95 shadow-lg">
       {/* Resize grip — a drag here overrides the attention-following split
           and STICKS until released (double-click, or the "auto" chip). */}
       <div
@@ -487,9 +495,19 @@ export function Blackboard() {
               a non-shrinking nowrap row cannot yield — it just leaves. The
               session facts are peers, so they wrap onto a second line rather
               than one of them being silently cut. */}
+          {/* One line at the board's working width: live dot, vendor mark and
+              a SHORT model name. The full model id, turns and token totals sit
+              in the tooltip — they wrapped this header into a three-line block
+              once the board stopped spanning the viewport. */}
           <span
-            className="hidden min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-muted-foreground/70 sm:flex"
-            title={acpLive ? 'Agent session live' : 'No agent session'}
+            className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground/70"
+            title={
+              acpLive
+                ? `${acpModel ?? 'agent'} \u00b7 ${acpTurns} turn${acpTurns === 1 ? '' : 's'} \u00b7 ` +
+                  `${acpLastTurnTokens !== null ? `${formatContextUsage(acpLastTurnTokens)} this turn (${turnWeight(acpLastTurnTokens).label}) \u00b7 ` : ''}` +
+                  `${formatContextUsage(acpTokens ?? 0)} session. ${TOKENS_TITLE}`
+                : 'No agent session'
+            }
           >
             <span
               className={cn(
@@ -497,65 +515,15 @@ export function Blackboard() {
                 acpLive ? 'animate-pulse bg-emerald-400' : 'bg-muted-foreground/30',
               )}
             />
-            {/* Vendor mark, drawn only when the backend actually named a
-                provider — see `acp-session-store.ts`'s `provider` doc for
-                why a defaulted logo is refused. */}
             {acpProvider && (
-              // `displayName` feeds the initials fallback for vendors with no
-              // genuine published mark. The provider id is what the backend
-              // reported, so it is the honest label here — this header has no
-              // access to the allowlist's prettier `display_name`.
               <VendorMark
                 providerId={acpProvider}
                 displayName={acpProvider}
                 className="h-3 w-3 shrink-0"
               />
             )}
-            <span className="font-mono">{acpModel ?? '—'}</span>
-            {acpLive && (
-              <>
-                <span className="text-muted-foreground/40">·</span>
-                <span>
-                  {acpTurns} turn{acpTurns === 1 ? '' : 's'}
-                </span>
-                <span className="text-muted-foreground/40">·</span>
-                {/* Turn figure first — it answers "what did THAT cost me",
-                    which is the question the bare session total kept
-                    answering wrongly. Absent until a turn completes. The
-                    bolt colours on the TURN's weight, never on a ratio to
-                    the context window (which `used` legitimately exceeds). */}
-                <span
-                  className="inline-flex items-center gap-1"
-                  title={
-                    acpLastTurnTokens !== null
-                      ? `${turnWeight(acpLastTurnTokens).label} — ${TOKENS_TITLE}`
-                      : TOKENS_TITLE
-                  }
-                >
-                  <Zap
-                    size={10}
-                    className={cn(
-                      'shrink-0',
-                      acpLastTurnTokens !== null
-                        ? turnWeight(acpLastTurnTokens).className
-                        : 'text-muted-foreground/40',
-                    )}
-                  />
-                  {acpLastTurnTokens !== null ? (
-                    <>
-                      {formatContextUsage(acpLastTurnTokens)}
-                      <span className="text-muted-foreground/50"> this turn</span>
-                      <span className="text-muted-foreground/40"> · </span>
-                    </>
-                  ) : null}
-                  <span className={acpLastTurnTokens !== null ? 'text-muted-foreground/60' : ''}>
-                    {formatContextUsage(acpTokens ?? 0)}
-                  </span>
-                  <span className="text-muted-foreground/50"> session</span>
-                </span>
-                <ContextMeter used={acpTokens} size={acpContextSize} />
-              </>
-            )}
+            <span className="truncate font-mono">{shortModelName(acpModel)}</span>
+            {acpLive && <ContextMeter used={acpTokens} size={acpContextSize} />}
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
@@ -700,14 +668,6 @@ export function Blackboard() {
               defaultCollapsed={section.checkpoint !== null && i < sections.length - 1}
             />
           ))}
-          {/* Shown only until the reply line exists — once streaming, the
-              line's own chalk cursor is the progress signal. */}
-          {isProcessing && streamingLineId === null && (
-            <div className="flex items-center gap-2 px-3 py-2">
-              <Loader2 size={14} className="animate-spin text-primary" />
-              <span className="text-xs text-muted-foreground">Thinking...</span>
-            </div>
-          )}
 
           {/* The agent is blocked on a human. These sit at the tail of the
               transcript because that is where the turn actually stopped —
@@ -726,6 +686,10 @@ export function Blackboard() {
           transcript; what it sends still lands in the notebook as a normal
           line. Never disabled mid-turn: the transport queues serially and
           the strip below makes that queue visible. */}
+      {/* What the agent is doing right now — one live line above the
+          composer, like Claude Code's status line. */}
+      <TurnStatusLine />
+
       <div className="shrink-0 border-t border-white/10 bg-white/[0.04]">
         {/* Someone watching the render rather than the transcript still has
             to learn the agent stopped and is waiting on them. */}
@@ -781,7 +745,7 @@ export function Blackboard() {
                 : 'Ask the agent — Enter sends, Shift+Enter for a new line…'
             }
             spellCheck={false}
-            className="max-h-40 min-h-8 flex-1 resize-none overflow-y-auto rounded-md border border-white/10 bg-background/40 px-2.5 py-[7px] text-xs leading-relaxed text-foreground outline-none placeholder:text-white/30 focus:border-primary/50 scrollbar-thin"
+            className="max-h-40 min-h-8 flex-1 resize-none overflow-y-auto rounded-xl border border-white/10 bg-background/40 px-2.5 py-[7px] text-xs leading-relaxed text-foreground outline-none placeholder:text-white/30 focus:border-primary/50 scrollbar-thin"
           />
           {/* A visible, labelled send control — the verb, not a paragraph
               keystroke. Disabled only by an empty draft, never by a turn
@@ -790,7 +754,7 @@ export function Blackboard() {
             type="submit"
             size="sm"
             disabled={!draft.trim()}
-            className="h-8 shrink-0 gap-1 px-2.5"
+            className="h-8 shrink-0 gap-1 rounded-xl px-2.5"
             title="Send — Enter sends, Shift+Enter for a new line, ArrowUp recalls your last prompt"
             aria-label="Send prompt"
           >

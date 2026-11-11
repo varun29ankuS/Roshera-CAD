@@ -380,7 +380,10 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
       // The handlers stay wired for a provider path that DOES emit them.
       case 'tool_call': {
         const status = update.status ?? 'pending'
-        if (status === 'pending' || status === 'in_progress') setAttention('geometry')
+        if (status === 'pending' || status === 'in_progress') {
+          setAttention('geometry')
+          useBlackboardStore.getState().setCurrentActivity(update.title ?? update.kind ?? 'tool call')
+        }
         renderToolLine(update.toolCallId, update.title ?? update.kind ?? 'tool call', status, null)
         return
       }
@@ -388,10 +391,12 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
         const status = update.status ?? 'in_progress'
         if (status === 'pending' || status === 'in_progress') {
           setAttention('geometry')
+          if (update.title) useBlackboardStore.getState().setCurrentActivity(update.title)
         } else {
           // completed / failed — the agent is back to writing/reasoning
           // unless the turn has already ended (handled in `finally` below).
           setAttention('writing')
+          useBlackboardStore.getState().setCurrentActivity(null)
         }
         const payload = extractToolPayload(update)
         renderToolLine(update.toolCallId, update.title ?? 'tool call', status, payload)

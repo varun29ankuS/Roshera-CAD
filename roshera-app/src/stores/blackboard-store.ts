@@ -220,6 +220,12 @@ interface BlackboardState {
    *  or null. While set, that line renders through the streaming path that
    *  buffers math/cards to completeness instead of typesetting per token. */
   streamingLineId: string | null
+  /** When the running turn started (ms epoch), or null between turns —
+   *  the status line's elapsed clock. */
+  turnStartedAt: number | null
+  /** The tool call running right now (its title), or null. Set from ACP
+   *  `tool_call` / `tool_call_update` frames, never guessed. */
+  currentActivity: string | null
 
   /** Append a line; returns its id. Pushes an `add` event + persists. */
   addLine: (text: string, author: LineAuthor) => string
@@ -236,6 +242,7 @@ interface BlackboardState {
   setLineTurnStatus: (id: string, status: AgentTurnStatus) => void
 
   setProcessing: (v: boolean) => void
+  setCurrentActivity: (activity: string | null) => void
   /** Simple setter for the attention state — the seam the ACP wiring will
    *  drive in a later slice. */
   setAgentAttention: (attention: AgentAttention) => void
@@ -286,6 +293,8 @@ export const useBlackboardStore = create<BlackboardState>((set) => ({
   isPanelOpen: true,
   agentAttention: 'idle',
   streamingLineId: null,
+  turnStartedAt: null,
+  currentActivity: null,
 
   addLine: (text, author) => {
     const now = Date.now()
@@ -395,7 +404,14 @@ export const useBlackboardStore = create<BlackboardState>((set) => ({
       return { lines }
     }),
 
-  setProcessing: (v) => set({ isProcessing: v }),
+  setProcessing: (v) =>
+    set((s) => ({
+      isProcessing: v,
+      // A turn's clock starts when it starts and survives re-asserts.
+      turnStartedAt: v ? (s.isProcessing && s.turnStartedAt !== null ? s.turnStartedAt : Date.now()) : null,
+      currentActivity: v ? s.currentActivity : null,
+    })),
+  setCurrentActivity: (activity) => set({ currentActivity: activity }),
   setAgentAttention: (attention) => set({ agentAttention: attention }),
   setStreamingLine: (id) => set({ streamingLineId: id }),
   togglePanel: () => set((s) => ({ isPanelOpen: !s.isPanelOpen })),

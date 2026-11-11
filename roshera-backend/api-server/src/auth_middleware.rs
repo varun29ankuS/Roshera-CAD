@@ -735,6 +735,17 @@ const POLL_PREFIXES: &[&str] = &[
     // drain the caller's Mutation budget. GET-only route; the method
     // check in `classify_request` keeps this listing safe regardless.
     "/api/acp/activity",
+    // Polled every few seconds by the Blackboard, the timeline bar, the
+    // document switcher and the sketch panel. As Mutation, one idle tab spent
+    // ~60 of the 100/min mutation budget on these GETs and two tabs exhausted
+    // it, so creating or opening a document came back 429. GET/HEAD only.
+    "/api/blackboard",
+    "/api/timeline",
+    "/api/branches",
+    "/api/durability",
+    "/api/documents",
+    "/api/document",
+    "/api/sketch",
 ];
 
 fn is_poll_prefix(path: &str) -> bool {
@@ -1220,6 +1231,48 @@ mod tests {
             RateLimitClass::Mutation,
             "a client-supplied X-Forwarded-For matching the allowlist must NOT grant the eval budget"
         );
+    }
+
+    /// The app's read-only polls must not drain the Mutation budget. With
+    /// the blackboard, timeline history/checkpoints, branches, durability,
+    /// documents and sketches classed as mutations, one idle tab spent ~60 of
+    /// the 100/min mutation budget on GETs; two tabs exhausted it, and the
+    /// user's real actions (create / open a document) came back 429. Writes on
+    /// the same paths stay Mutation.
+    #[test]
+    fn the_apps_read_only_polls_are_poll_class_and_writes_stay_mutation() {
+        let polls = [
+            "/api/blackboard",
+            "/api/timeline/history/00000000-0000-0000-0000-000000000000",
+            "/api/timeline/checkpoints",
+            "/api/branches",
+            "/api/durability/status",
+            "/api/documents",
+            "/api/document/units",
+            "/api/sketch",
+        ];
+        for path in polls {
+            let req = mk_request("GET", path, &[], None);
+            assert_eq!(
+                classify_request_with_allowlist(&req, &[]),
+                RateLimitClass::Poll,
+                "GET {path} is a read-only poll"
+            );
+        }
+        for (method, path) in [
+            ("POST", "/api/documents"),
+            ("POST", "/api/blackboard/entries"),
+            ("DELETE", "/api/blackboard"),
+            ("POST", "/api/timeline/mould"),
+            ("POST", "/api/branches"),
+        ] {
+            let req = mk_request(method, path, &[], None);
+            assert_eq!(
+                classify_request_with_allowlist(&req, &[]),
+                RateLimitClass::Mutation,
+                "{method} {path} changes state and stays Mutation"
+            );
+        }
     }
 
     /// Pins the literal task requirement end-to-end through the real

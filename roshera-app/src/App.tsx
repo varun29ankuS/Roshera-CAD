@@ -217,7 +217,7 @@ export function App() {
                   else is an instrument laid over it that the human can put
                   away. Bottom-left, clear of the tree's column, closable to a
                   pill. */}
-              <div className="pointer-events-none absolute bottom-[7.5rem] left-[15.5rem] right-[15.5rem] top-2 z-20 flex flex-col justify-end">
+              <div className="pointer-events-none absolute bottom-[7.5rem] left-[15.5rem] right-[15.5rem] top-2 z-20 flex flex-col items-start justify-end">
                 <Blackboard />
               </div>
 
