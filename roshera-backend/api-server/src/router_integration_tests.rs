@@ -11449,6 +11449,64 @@ async fn a_rescale_is_placed_clear_or_refused_and_replays() {
     );
 }
 
+/// A drawing made before an ordinary modelling step (here a second hole cut
+/// by a boolean -- live it was fillets and chamfers on a hub) is brought up
+/// to date when exported, like a drawing that regenerates when opened. The
+/// export used to refuse it as stale against the live part, for good.
+#[tokio::test]
+async fn an_export_brings_a_sheet_up_to_date_after_a_later_feature() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (_, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+
+    // A later feature: a second, smaller hole.
+    let (cs, cyl) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/cylinder",
+            json!({"center": [5.0, 5.0, -1.0], "axis": [0.0, 0.0, 1.0], "radius": 2.0, "height": 22.0}),
+        ),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "{cyl}");
+    let (bs, cut) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/boolean",
+            json!({"operation": "difference", "object_a": part_uuid.to_string(), "object_b": cyl["object"]["id"]}),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "{cut}");
+
+    let (es, body) =
+        dispatch_raw(&state, json_get(&format!("/api/drawings/{drawing_id}/svg"))).await;
+    assert_eq!(
+        es,
+        StatusCode::OK,
+        "the export brings the sheet up to date: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let holes = sheet["hole_sites"].as_array().map(Vec::len).unwrap_or(0);
+    assert_eq!(
+        holes, 2,
+        "both holes are on the exported sheet: {}",
+        sheet["hole_sites"]
+    );
+}
+
 /// Undo puts a removed view back: the sheet is rebuilt from the history at
 /// the undone position. Before, undo/redo rewound the history but never
 /// rebuilt the sheets -- the view stayed gone.

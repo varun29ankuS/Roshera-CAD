@@ -384,6 +384,25 @@ export class DrawingRefusal extends Error {
   }
 }
 
+/**
+ * The server's refusal of a sheet request, in its own words: the plain
+ * reason (`error`, without the "REFUSED:" stamp) and its gate. A bare
+ * "409 Conflict" told the engineer nothing.
+ */
+async function refusalOf(resp: Response): Promise<DrawingRefusal> {
+  let message = `${resp.status} ${resp.statusText}`
+  let gate: string | null = null
+  try {
+    const body = await resp.json()
+    if (typeof body?.error === 'string') message = body.error.replace(/^REFUSED:\s*/, '')
+    if (typeof body?.details?.gate === 'string') gate = body.details.gate
+    else if (typeof body?.error_code === 'string') gate = body.error_code
+  } catch {
+    /* non-JSON body: the status line is the reason */
+  }
+  return new DrawingRefusal(message, gate)
+}
+
 async function jsonOrRefusal<T>(resp: Response): Promise<T> {
   if (resp.ok) return resp.json() as Promise<T>
   let message = `${resp.status} ${resp.statusText}`
@@ -487,7 +506,7 @@ export async function setDrawingProjection(
 export async function fetchDrawingSvg(id: string): Promise<string> {
   const r = await fetch(`${API_HOST}/api/drawings/${id}/svg`)
   if (!r.ok) {
-    throw new Error(`fetchDrawingSvg: ${r.status} ${r.statusText}`)
+    throw await refusalOf(r)
   }
   return r.text()
 }
@@ -496,7 +515,7 @@ export async function fetchDrawingSvg(id: string): Promise<string> {
 export async function fetchDrawingPdf(id: string): Promise<Blob> {
   const r = await fetch(`${API_HOST}/api/drawings/${id}/pdf`)
   if (!r.ok) {
-    throw new Error(`fetchDrawingPdf: ${r.status} ${r.statusText}`)
+    throw await refusalOf(r)
   }
   return r.blob()
 }
@@ -505,7 +524,7 @@ export async function fetchDrawingPdf(id: string): Promise<Blob> {
 export async function fetchDrawingDxf(id: string): Promise<Blob> {
   const r = await fetch(`${API_HOST}/api/drawings/${id}/dxf`)
   if (!r.ok) {
-    throw new Error(`fetchDrawingDxf: ${r.status} ${r.statusText}`)
+    throw await refusalOf(r)
   }
   return r.blob()
 }

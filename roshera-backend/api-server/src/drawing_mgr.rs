@@ -1142,7 +1142,7 @@ pub async fn export_svg(
     Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
     let (model_handle, handle, owner) = fetch_owned_drawing_for_export(&state, id).await?;
-    let snapshot = { handle.read().await.clone() };
+    let (snapshot, measured) = sheet_brought_up_to_date(&state, id, &model_handle, &handle).await?;
 
     // Concern A (2026-08-15 closeout) — the solid-soundness gate. See
     // `refuse_unsound_solid`'s own doc for what this does and does not
@@ -1157,11 +1157,12 @@ pub async fn export_svg(
     )
     .await?;
 
-    refuse_unsound_sheet(
+    refuse_unsound_sheet_with(
         model_handle.clone(),
         SheetSubject::Drawing(id),
         snapshot.clone(),
         q.acknowledge_layout_issues,
+        measured,
     )
     .await?;
 
@@ -2028,12 +2029,35 @@ async fn refuse_unsound_sheet(
     drawing: Drawing,
     acknowledge_layout_issues: bool,
 ) -> Result<(), ApiError> {
-    let cert = certify_off_lock(model_handle, drawing)
-        .await
-        .map_err(|_| match subject {
-            SheetSubject::Drawing(id) => ApiError::sheet_uncertified(id),
-            SheetSubject::Solid(solid_id) => ApiError::sheet_uncertified_for_solid(solid_id),
-        })?;
+    refuse_unsound_sheet_with(
+        model_handle,
+        subject,
+        drawing,
+        acknowledge_layout_issues,
+        None,
+    )
+    .await
+}
+
+/// [`refuse_unsound_sheet`], reusing a certificate already measured for
+/// this exact sheet against this model (`precomputed`) instead of measuring
+/// it again.
+async fn refuse_unsound_sheet_with(
+    model_handle: Arc<RwLock<BRepModel>>,
+    subject: SheetSubject,
+    drawing: Drawing,
+    acknowledge_layout_issues: bool,
+    precomputed: Option<SheetReadbackCertificate>,
+) -> Result<(), ApiError> {
+    let cert = match precomputed {
+        Some(cert) => cert,
+        None => certify_off_lock(model_handle, drawing)
+            .await
+            .map_err(|_| match subject {
+                SheetSubject::Drawing(id) => ApiError::sheet_uncertified(id),
+                SheetSubject::Solid(solid_id) => ApiError::sheet_uncertified_for_solid(solid_id),
+            })?,
+    };
 
     if !cert.sound || cert.counts.stale > 0 || cert.counts.dangling > 0 || cert.counts.omitted > 0 {
         // Name what was found. An omission-only refusal used to read
@@ -2074,6 +2098,78 @@ async fn refuse_unsound_sheet(
     }
 
     Ok(())
+}
+
+/// The sheet as it should be NOW. A drawing is of its part, followed through
+/// every later feature (`timeline_engine::replay::with_followed_solid`), but
+/// sheets are re-derived only when the history is replayed (a dimension
+/// edit, undo, redo, a restart) -- after an ordinary modelling step (a
+/// fillet, a chamfer, a boolean) the stored sheet still shows the part as it
+/// was, and the export gate refused it as stale for good. So the export
+/// brings it up to date first, like a drawing that regenerates when opened:
+/// a sheet whose facts no longer match the live part is rebuilt from the
+/// document's history, then certified as usual.
+///
+/// Returns the sheet to export and, when it was already current, the
+/// certificate just measured for it (so the gate need not measure it again).
+async fn sheet_brought_up_to_date(
+    state: &AppState,
+    id: Uuid,
+    model_handle: &Arc<RwLock<BRepModel>>,
+    handle: &Arc<RwLock<Drawing>>,
+) -> Result<(Drawing, Option<SheetReadbackCertificate>), ApiError> {
+    let snapshot = { handle.read().await.clone() };
+    let cert = certify_off_lock(model_handle.clone(), snapshot.clone())
+        .await
+        .map_err(|_| ApiError::sheet_uncertified(id))?;
+    if cert.counts.stale == 0 && cert.counts.dangling == 0 && cert.counts.omitted == 0 {
+        return Ok((snapshot, Some(cert)));
+    }
+    let _ = state.timeline_recorder.settle().await;
+    let events = {
+        let timeline = state.timeline.read().await;
+        let live = crate::handlers::timeline::live_session_id(&timeline_engine::BranchId::main());
+        let limit = timeline
+            .get_session_position(live)
+            .map(|p| p.event_index as usize);
+        let mut all = timeline
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .unwrap_or_default();
+        all.sort_by_key(|e| e.sequence_number);
+        if let Some(limit) = limit {
+            all.truncate(limit);
+        }
+        all
+    };
+    // Rebuild THIS sheet from history, and take it only if it agrees with
+    // the live part. When the live model is not what the history replays to
+    // (a part built outside the recorded history), the rebuilt sheet
+    // describes a different solid: keeping the current sheet -- and its
+    // honest refusal -- beats replacing it with a worse one.
+    let frames = Arc::clone(&state.frames);
+    let rebuilt = tokio::task::spawn_blocking(move || {
+        timeline_engine::drawing_history::rebuild_drawings(&events, &frames)
+    })
+    .await
+    .ok()
+    .and_then(|mut r| r.drawings.remove(&id));
+    let Some(mut rebuilt) = rebuilt else {
+        return Ok((snapshot, Some(cert)));
+    };
+    // Keep what history does not carry: the date the sheet was first issued
+    // (stamped from the server clock when it was made).
+    if rebuilt.title_block.date.trim().is_empty() {
+        rebuilt.title_block.date = snapshot.title_block.date.clone();
+    }
+    stamp_issue_date(&mut rebuilt);
+    let rebuilt_cert = certify_off_lock(model_handle.clone(), rebuilt.clone())
+        .await
+        .map_err(|_| ApiError::sheet_uncertified(id))?;
+    if rebuilt_cert.counts.stale + rebuilt_cert.counts.dangling + rebuilt_cert.counts.omitted > 0 {
+        return Ok((snapshot, Some(cert)));
+    }
+    *handle.write().await = rebuilt.clone();
+    Ok((rebuilt, Some(rebuilt_cert)))
 }
 
 /// What a [`refuse_unsound_sheet`] refusal should name as its subject. See
@@ -2384,7 +2480,7 @@ pub async fn export_pdf(
     Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
     let (model_handle, handle, owner) = fetch_owned_drawing_for_export(&state, id).await?;
-    let snapshot = { handle.read().await.clone() };
+    let (snapshot, measured) = sheet_brought_up_to_date(&state, id, &model_handle, &handle).await?;
 
     // Concern A (2026-08-15 closeout) — see `export_svg`'s identical block.
     refuse_unsound_solid(
@@ -2395,11 +2491,12 @@ pub async fn export_pdf(
     )
     .await?;
 
-    refuse_unsound_sheet(
+    refuse_unsound_sheet_with(
         model_handle.clone(),
         SheetSubject::Drawing(id),
         snapshot.clone(),
         q.acknowledge_layout_issues,
+        measured,
     )
     .await?;
 
@@ -2461,7 +2558,7 @@ pub async fn export_dxf(
     Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
     let (model_handle, handle, owner) = fetch_owned_drawing_for_export(&state, id).await?;
-    let snapshot = { handle.read().await.clone() };
+    let (snapshot, measured) = sheet_brought_up_to_date(&state, id, &model_handle, &handle).await?;
 
     // Concern A (2026-08-15 closeout) — see `export_svg`'s identical block.
     refuse_unsound_solid(
@@ -2472,11 +2569,12 @@ pub async fn export_dxf(
     )
     .await?;
 
-    refuse_unsound_sheet(
+    refuse_unsound_sheet_with(
         model_handle.clone(),
         SheetSubject::Drawing(id),
         snapshot.clone(),
         q.acknowledge_layout_issues,
+        measured,
     )
     .await?;
 

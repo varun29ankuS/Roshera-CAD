@@ -96,6 +96,19 @@ Order: LAST -- after the functional gaps and the deep engineer-first UX pass
 are complete (Varun). The kernel already builds on both OSes; macOS needs a
 CI runner for the notarized build.
 
+### Collecting edge cases and bugs from pilots (Varun asked, 11-12)
+
+The document IS its event history, so every failure a pilot meets replays
+exactly -- 11-12's hub (21 events) reproduced the refused fillet, the stale
+sheet and the wrong quartic roots. Build on that:
+
+| Piece | What it does |
+|-------|--------------|
+| "Report a problem" in the app | Bundles the document's history, the kernel version, the refusal or error, the operation that failed, the engineer's note and an optional screenshot into ONE file. |
+| Automatic capture | Every refusal, caught panic (e.g. the triangulation panic), stale-sheet refusal and quarantine is logged locally with its document and sequence -- even when nobody files a report. |
+| IP stays theirs | Nothing leaves the machine without consent: the bundle is a file the pilot chooses to send. An "anonymize" option scales and perturbs dimensions while keeping topology and the failure. |
+| Bug -> test | Each bundle replays in our harness and becomes a RED test before the fix (exactly the 11-12 flow). The bundles become the regression corpus. |
+
 ## Gaps carried into the campaign
 
 - BOOL-COAX-1: an overlapping coaxial cutter through a plate+boss union certifies unsound.

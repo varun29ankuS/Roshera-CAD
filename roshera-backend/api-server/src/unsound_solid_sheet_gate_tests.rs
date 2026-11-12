@@ -150,21 +150,40 @@ async fn register_drawing_for(state: &AppState, solid_id: u32) -> Uuid {
 /// the same technique `sheet_export_gate_tests::make_a_dimension_stale`
 /// uses (duplicated: that helper is private to its module).
 async fn make_a_dimension_stale(state: &AppState, drawing_id: Uuid) {
+    // The sheet must disagree with the live part in a way regenerating it
+    // CANNOT repair. Since 2026-11-12 an export brings a stale sheet up to
+    // date from the document's history first, so tampering the stored sheet
+    // (what this helper used to do) is simply repaired. What regenerating
+    // cannot fix is a live model that has moved away from its own history:
+    // scale the part in the live model with the history recorder detached,
+    // so the sheet rebuilt from history still shows the old size.
+    use geometry_engine::drawing::types::ViewSource;
+    use geometry_engine::math::Matrix4;
+    use geometry_engine::operations::transform::{transform_solid, TransformOptions};
     let handle = state
         .drawings
         .get(&drawing_id)
-        .expect("drawing must be registered before it can be mutated");
-    let mut guard = handle.write().await;
-    let dim = guard
+        .expect("drawing must be registered before its part can drift");
+    let solid = handle
+        .read()
+        .await
         .views
-        .iter_mut()
-        .flat_map(|v| v.dimensions.iter_mut())
-        .find(|d| d.pid.is_some())
-        .expect(
-            "fixture precondition: the standard box sheet must carry at \
-             least one PID-bearing dimension",
-        );
-    dim.value += 10.0;
+        .iter()
+        .map(|v| match v.source {
+            ViewSource::Part { solid_id, .. } => solid_id,
+        })
+        .next()
+        .expect("fixture precondition: the sheet has a view of its part");
+    let mut model = state.model.write().await;
+    let recorder = model.attach_recorder(None);
+    transform_solid(
+        &mut model,
+        solid,
+        Matrix4::scale(1.5, 1.0, 1.0),
+        TransformOptions::default(),
+    )
+    .expect("scale the part outside its history");
+    let _ = model.attach_recorder(recorder);
 }
 
 fn assert_unsound_base_refusal(status: StatusCode, body: &serde_json::Value, solid_id: u32) {

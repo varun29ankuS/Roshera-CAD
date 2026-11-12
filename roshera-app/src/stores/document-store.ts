@@ -107,6 +107,15 @@ function writeLastDocument(id: string): void {
 
 /** The return-to-last-document switch runs at most once per page load. */
 let restoredLastDocument = false
+/**
+ * True from the moment the return-to-last-document switch starts until it
+ * succeeds. Meanwhile (and for the rest of the page load if it failed) the
+ * server's active document is its BOOT document, not where this browser
+ * works -- recording it as the last document would make every later load
+ * reopen the wrong one. Found 2026-11-12: after a server restart the app
+ * came back in another document twice.
+ */
+let restorePending = false
 
 export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
   documents: [],
@@ -125,13 +134,19 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
         const last = readLastDocument()
         const target = last ? docs.find((d) => d.id === last) : undefined
         if (target && !target.active) {
-          void get().switchTo(target.id)
+          restorePending = true
+          void get()
+            .switchTo(target.id)
+            .then((r) => {
+              if (r.success) restorePending = false
+            })
           return
         }
       }
-      // Otherwise the active document IS where this browser is working.
+      // Otherwise the active document IS where this browser is working --
+      // unless a return to the last document is still pending (or failed).
       const active = docs.find((d) => d.active)
-      if (active) writeLastDocument(active.id)
+      if (active && !restorePending && !get().switchingId) writeLastDocument(active.id)
     } catch {
       // Backend not reachable yet — leave the previous list (possibly
       // empty) in place; the caller decides whether to retry.
