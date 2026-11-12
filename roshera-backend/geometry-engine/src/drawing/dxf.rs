@@ -989,14 +989,9 @@ fn short_drawing_id(drawing: &Drawing) -> String {
     format!("RSH-{}", prefix.to_uppercase())
 }
 
+/// The one scale formatter (exact; shared with the SVG sheet).
 fn format_scale(scale: f64) -> String {
-    if scale >= 1.0 {
-        format!("{:.0}:1", scale)
-    } else if scale > 0.0 {
-        format!("1:{:.0}", 1.0 / scale)
-    } else {
-        "?".to_string()
-    }
+    super::svg::format_scale(scale)
 }
 
 #[cfg(test)]

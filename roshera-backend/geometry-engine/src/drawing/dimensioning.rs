@@ -1016,12 +1016,12 @@ fn shaded_iso_raster(
     })
 }
 
-/// Snap a fill scale down to the nearest preferred drafting ratio so the
-/// title block reads a clean "2:1" / "1:2" rather than "2.37:1".
+/// Snap a fill scale down to the nearest ISO 5455 recommended scale (the
+/// 1-2-5 series: 50:1 ... 2:1, 1:1, 1:2 ... 1:200), so a sheet is drawn at a
+/// scale a shop reads with a scale rule -- never 1:1.33 or 2.5:1.
 fn snap_scale(s: f64) -> f64 {
-    const LADDER: [f64; 21] = [
-        100.0, 50.0, 20.0, 10.0, 5.0, 4.0, 2.5, 2.0, 1.5, 1.0, 0.75, 0.5, 0.4, 0.25, 0.2, 0.1,
-        0.08, 0.05, 0.04, 0.02, 0.01,
+    const LADDER: [f64; 14] = [
+        50.0, 20.0, 10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002,
     ];
     for &v in LADDER.iter() {
         if s >= v - 1e-9 {
@@ -1029,6 +1029,19 @@ fn snap_scale(s: f64) -> f64 {
         }
     }
     s.max(0.005)
+}
+
+/// The next ISO A-series sheet up (A4 -> A3 -> ... -> A0); none past A0 or
+/// for a custom sheet.
+fn larger_sheet(sheet: &super::types::SheetSize) -> Option<super::types::SheetSize> {
+    use super::types::SheetSize::*;
+    match sheet {
+        A4 => Some(A3),
+        A3 => Some(A2),
+        A2 => Some(A1),
+        A1 => Some(A0),
+        A0 | Custom { .. } => None,
+    }
 }
 
 /// Pick the smallest ISO sheet whose drawing area comfortably suits a
@@ -1488,10 +1501,30 @@ pub fn standard_drawing_auto_with_projection(
         .map(|e| e.width().max(e.height()))
         .fold(0.0_f64, f64::max)
         .max(1.0);
-    let sheet = pick_sheet(max_dim);
-    let (scale, positions) = layout_four_view_gap(
+    let mut sheet = pick_sheet(max_dim);
+    let (mut scale, mut positions) = layout_four_view_gap(
         &sheet, extents[0], extents[1], extents[2], extents[3], angle, vgap, hgap,
     );
+    // Drafting practice: a part that would be reduced is drawn full size on a
+    // larger sheet when one up to two sizes up holds it at 1:1.
+    if scale < 1.0 {
+        let mut candidate = sheet;
+        for _ in 0..2 {
+            let Some(next) = larger_sheet(&candidate) else {
+                break;
+            };
+            let (s, p) = layout_four_view_gap(
+                &next, extents[0], extents[1], extents[2], extents[3], angle, vgap, hgap,
+            );
+            candidate = next;
+            if s >= 1.0 {
+                sheet = candidate;
+                scale = s;
+                positions = p;
+                break;
+            }
+        }
+    }
 
     // Pass 2 — build the placed, scaled views.
     let t_p2 = std::time::Instant::now();

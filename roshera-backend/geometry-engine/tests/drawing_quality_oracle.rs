@@ -1746,8 +1746,11 @@ fn ring_plate() -> (BRepModel, u32) {
 ///
 /// GREEN pins:
 ///   - report passes (collisions resolved via layout-consulting placement),
-///   - utilization > 0.15 (the pre-fix sheet hit 0.099; the re-solved
-///     ReplaceIso layout reaches ~0.22),
+///   - utilization > 0.11 (the pre-fix sheet hit 0.099). Was > 0.15 while
+///     the layout drew this plate at 1.5:1; since 2026-11-12 sheets use ISO
+///     5455 scales only (1.5:1 is not one), so the plate is drawn 1:1 and the
+///     same re-solved ReplaceIso layout measures 0.120 -- still clear of the
+///     pinned-by-the-discarded-iso-extent defect this guards.
 ///   - the hole-table region intersects NO DimensionText / ViewGeometry ink.
 #[test]
 fn ring_plate_sheet_passes_quality_with_utilization() {
@@ -1761,8 +1764,8 @@ fn ring_plate_sheet_passes_quality_with_utilization() {
     );
     assert!(report.passed, "issues: {:?}", report.issues);
     assert!(
-        report.sheet_utilization > 0.15,
-        "sheet utilization {:.3} must exceed 0.15 (pre-fix: 0.099)",
+        report.sheet_utilization > 0.11,
+        "sheet utilization {:.3} must exceed 0.11 (pre-fix: 0.099)",
         report.sheet_utilization
     );
 

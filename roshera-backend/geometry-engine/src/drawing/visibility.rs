@@ -794,14 +794,13 @@ impl ViewOcclusionCtx<'_> {
 /// drift from it.
 ///
 /// The classification point for each segment is the raw CHORD midpoint —
-/// correct for anything whose chord lies exactly ON the true curve (a
-/// straight edge, or a cylinder/cone generator, which IS a straight line)
-/// and safe for a planar rim curve (a circle/arc edge's chord midpoint stays
-/// coplanar with the rim, which borders a void, not solid material, so it
-/// cannot be spuriously self-occluded). It is NOT safe for a curve embedded
-/// in the MIDDLE of a solid, like a sphere's synthesized great-circle
-/// silhouette — see [`split_by_visibility_on_sphere`], which every sphere
-/// silhouette call site uses instead.
+/// correct ONLY for a chord that lies exactly on the true curve: a straight
+/// edge, or a cylinder/cone generator (a straight line). It is NOT safe for
+/// a curved edge: the chord midpoint sits inside the curve, and for the
+/// outer rim of a face that is inside the solid, so the edge reads as
+/// hidden. Real curved edges go through [`split_by_visibility_at`] with
+/// on-curve probes; a sphere's synthesized great circle through
+/// [`split_by_visibility_on_sphere`].
 fn split_by_visibility(
     p3: &[Point3],
     p2: &[[f64; 2]],
@@ -837,6 +836,28 @@ fn split_by_visibility_on_sphere(
             Err(_) => raw_mid,
         }
     })
+}
+
+/// [`split_by_visibility`] with each segment's occlusion probe given
+/// explicitly (`probes[i]` for the segment `p2[i]..p2[i + 1]`): a point on
+/// the true curve, so a curved edge is never judged at a chord midpoint that
+/// lies inside the solid.
+fn split_by_visibility_at(
+    p2: &[[f64; 2]],
+    probes: &[Point3],
+    ctx: &ViewOcclusionCtx,
+) -> Vec<(bool, Vec<[f64; 2]>)> {
+    let mut runs: Vec<(bool, Vec<[f64; 2]>)> = Vec::new();
+    for i in 0..p2.len().saturating_sub(1).min(probes.len()) {
+        let mu = 0.5 * (p2[i][0] + p2[i + 1][0]);
+        let mv = 0.5 * (p2[i][1] + p2[i + 1][1]);
+        let visible = ctx.visible(probes[i], mu, mv);
+        match runs.last_mut() {
+            Some((v, pts)) if *v == visible => pts.push(p2[i + 1]),
+            _ => runs.push((visible, vec![p2[i], p2[i + 1]])),
+        }
+    }
+    runs
 }
 
 /// Shared core of [`split_by_visibility`] / [`split_by_visibility_on_sphere`]:
@@ -1352,10 +1373,27 @@ pub(crate) fn project_solid_edges_visibility_mode(
                         continue;
                     }
 
-                    // Classify each segment, grouping consecutive same-visibility
-                    // runs into polylines — identical rule the synthesized
-                    // silhouette curves below use, via the same helper.
-                    let runs = split_by_visibility(&p3, &p2, &occ_ctx);
+                    // Classify each segment at the point ON the curve halfway
+                    // along it, not at its chord midpoint: a curved edge's chord
+                    // midpoint sits inside the curve, and for the outer rim of a
+                    // face that is inside the solid's side wall -- the line of
+                    // sight to it then crosses that wall, and an edge in plain
+                    // sight was classified hidden (a flange's top rim, seen
+                    // from the front, vanished from the sheet). For a straight
+                    // edge the two points are the same.
+                    let on_curve: Vec<Point3> = (0..p3.len().saturating_sub(1))
+                        .map(|i| {
+                            let frac = (i as f64 + 0.5) / (n - 1) as f64;
+                            curve.point_at(t0 + (t1 - t0) * frac).unwrap_or_else(|_| {
+                                Point3::new(
+                                    0.5 * (p3[i].x + p3[i + 1].x),
+                                    0.5 * (p3[i].y + p3[i + 1].y),
+                                    0.5 * (p3[i].z + p3[i + 1].z),
+                                )
+                            })
+                        })
+                        .collect();
+                    let runs = split_by_visibility_at(&p2, &on_curve, &occ_ctx);
 
                     // Analytic circle: a circular arc-edge whose circle plane
                     // faces the camera (normal ∥ view dir) projects, under the

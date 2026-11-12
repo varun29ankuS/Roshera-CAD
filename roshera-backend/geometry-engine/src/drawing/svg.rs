@@ -1406,11 +1406,17 @@ fn render_projection_symbol_from_layout(
 // Misc helpers
 // ---------------------------------------------------------------------
 
+/// A view scale as printed on the sheet -- exactly the scale drawn. It was
+/// rounded to whole numbers, so 0.75 printed as "1:1".
 pub(crate) fn format_scale(scale: f64) -> String {
+    fn trimmed(v: f64) -> String {
+        let s = format!("{v:.3}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
     if scale >= 1.0 {
-        format!("{:.0}:1", scale)
+        format!("{}:1", trimmed(scale))
     } else if scale > 0.0 {
-        format!("1:{:.0}", 1.0 / scale)
+        format!("1:{}", trimmed(1.0 / scale))
     } else {
         "?".to_string()
     }

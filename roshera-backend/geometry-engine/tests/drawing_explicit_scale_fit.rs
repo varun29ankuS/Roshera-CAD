@@ -302,7 +302,10 @@ fn the_fit_refusal_and_the_quality_verifier_never_disagree() {
 ///
 /// * a 40 mm bored plate -- A4, 1.0, the A4 ReplaceIso arrangement where
 ///   SECTION A-A displaces the isometric cell and the pictorial is re-attached;
-/// * a 150x90x60 block -- A3, 0.75, the plain four-view arrangement.
+/// * a 150x90x60 block -- the plain four-view arrangement. Re-pinned
+///   2026-11-12 on purpose: it was A3 at 0.75 (1:1.33, not an ISO 5455
+///   scale, and labelled "1:1" on the sheet); layouts now use ISO 5455 scales
+///   and draw a part full size on a larger sheet when one holds it -- A2, 1:1.
 ///
 /// Positions, not rendered SVG: `render_drawing_svg` stamps
 /// `data-view-id="{uuid}"` from `ProjectedViewId::new()`, so the bytes differ
@@ -354,15 +357,15 @@ fn the_automatic_route_is_bit_identical() {
         o => panic!("expected solid, got {o:?}"),
     };
     m2.set_event_key(None);
-    let auto2 = standard_drawing_auto(&m2, big, uuid::Uuid::nil()).expect("auto sheet (A3)");
+    let auto2 = standard_drawing_auto(&m2, big, uuid::Uuid::nil()).expect("auto sheet (A2)");
     pinned(
         &auto2,
-        SheetSize::A3,
+        SheetSize::A2,
         &[
-            ("FRONT", 0.75, 4639388799346361594, 4637468174964069548),
-            ("TOP", 0.75, 4639388799346361594, 4641944578423783424),
-            ("RIGHT", 0.75, 4643936893493313536, 4637468174964069548),
-            ("ISOMETRIC", 0.75, 4643936893493313536, 4641944578423783424),
+            ("FRONT", 1.0, 4641703466475215864, 4639710909388535922),
+            ("TOP", 1.0, 4641703466475215864, 4643844534516580352),
+            ("RIGHT", 1.0, 4645797267167510528, 4639710909388535922),
+            ("ISOMETRIC", 1.0, 4645797267167510528, 4643844534516580352),
         ],
     );
 }

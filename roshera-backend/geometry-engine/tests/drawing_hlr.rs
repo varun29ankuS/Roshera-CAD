@@ -278,3 +278,85 @@ fn dxf_carries_hidden_edges_dashed_and_honours_show_hidden() {
         .count();
     assert_eq!(dashed, fewer, "a view with hidden lines off writes none");
 }
+
+/// A flanged hub (Ø80 x 12 flange, Ø45 x 20 hub, Ø30 bore) seen from the
+/// front: the near edges of the flange top face and the hub top face are in
+/// plain sight, so they are drawn solid. They were classified hidden -- the
+/// line of sight to them runs exactly in the plane of the face they bound,
+/// and that face was counted as blocking it. Found live: the FRONT and RIGHT
+/// views had no flange top line and a broken hub top line.
+#[test]
+fn edges_seen_along_their_own_face_plane_are_visible() {
+    let mut m = BRepModel::new();
+    let flange = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 40.0, 12.0)
+        .expect("flange"));
+    let hub = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, 12.0), Vector3::Z, 22.5, 20.0)
+        .expect("hub"));
+    let body = boolean_operation(
+        &mut m,
+        flange,
+        hub,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("union");
+    let bore = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -4.0), Vector3::Z, 15.0, 40.0)
+        .expect("bore"));
+    let part = boolean_operation(
+        &mut m,
+        body,
+        bore,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("bore");
+
+    // Front: camera on +Y, so the near half of each rim has y > 0.
+    let near = |r: f64, x: f64, z: f64| Point3::new(x, (r * r - x * x).sqrt(), z);
+    for (what, p) in [
+        ("flange top rim, left of the hub", near(40.0, -31.0, 12.0)),
+        ("flange top rim, right of the hub", near(40.0, 33.0, 12.0)),
+        ("hub top rim, near its end", near(22.5, -20.0, 32.0)),
+        ("hub top rim, middle", near(22.5, 2.0, 32.0)),
+        ("flange bottom rim", near(40.0, -10.0, 0.0)),
+    ] {
+        assert!(
+            !is_point_hidden(&m, part, ProjectionType::Front, p),
+            "{what} at {p:?} is in plain sight"
+        );
+    }
+    // And the far half of the flange rim is behind the part.
+    let far = Point3::new(-31.0, -(40.0f64 * 40.0 - 31.0 * 31.0).sqrt(), 12.0);
+    assert!(is_point_hidden(&m, part, ProjectionType::Front, far));
+
+    // What the sheet draws: a visible line along the flange top (view y = 12)
+    // either side of the hub, and along the hub top (view y = 32).
+    let dwg = standard_drawing_hlr(&m, part, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("hlr");
+    let front = dwg
+        .views
+        .iter()
+        .find(|v| matches!(v.projection, ProjectionType::Front))
+        .expect("front view");
+    let covered = |y: f64, x: f64| {
+        front.polylines.iter().any(|pl| {
+            pl.points.windows(2).any(|w| {
+                let (a, b) = (w[0], w[1]);
+                (a[1] - y).abs() < 1e-6
+                    && (b[1] - y).abs() < 1e-6
+                    && x >= a[0].min(b[0]) - 1e-6
+                    && x <= a[0].max(b[0]) + 1e-6
+            })
+        })
+    };
+    for (what, y, x) in [
+        ("flange top, left", 12.0, -31.0),
+        ("flange top, right", 12.0, 33.0),
+        ("hub top, near its end", 32.0, -20.0),
+        ("hub top, middle", 32.0, 2.0),
+    ] {
+        assert!(covered(y, x), "{what}: no visible line at view ({x}, {y})");
+    }
+}

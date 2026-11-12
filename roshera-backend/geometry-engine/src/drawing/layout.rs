@@ -2127,112 +2127,143 @@ pub(crate) fn place_dimensions_routed(
                 }
                 None => true,
             };
-            let side = if fits(1.0) || !fits(-1.0) { 1.0 } else { -1.0 };
-            let elbow_x = if side > 0.0 {
-                bbox[2] + STANDOFF
-            } else {
-                bbox[0] - STANDOFF
-            };
+            let preferred = if fits(1.0) || !fits(-1.0) { 1.0 } else { -1.0 };
+            // Where the shoulder may go, in order: the preferred side one
+            // standoff out, then further out on that side, then the other
+            // side. A callout whose first side had no clear row used to be
+            // printed at the colliding nominal row (a blind-hole callout
+            // landed on "SECTION A-A (1:1)").
+            let mut shoulders: Vec<(f64, f64)> = Vec::new();
+            for sd in [preferred, -preferred] {
+                if sd != preferred && !fits(sd) {
+                    continue;
+                }
+                for out in [0.0, 12.0, 24.0] {
+                    let x = if sd > 0.0 {
+                        bbox[2] + STANDOFF + out
+                    } else {
+                        bbox[0] - STANDOFF - out
+                    };
+                    shoulders.push((sd, x));
+                }
+            }
             let row = 2.0 * DIM_TEXT_FONT_MM;
             let top = frame
                 .map(|f| f[1] + DIM_TEXT_FONT_MM + TGAP + 1.0)
                 .unwrap_or(f64::NEG_INFINITY);
             let bottom = frame.map(|f| f[3] - 1.0).unwrap_or(f64::INFINITY);
-            let nominal = (centre[1] - (elbow_x - centre[0]).abs()).max(top);
-            // The shoulder + text box for a row at `y`.
-            let text_box = |y: f64| {
-                let (x0, x1) = if side > 0.0 {
-                    (elbow_x, elbow_x + text_w + 2.0)
-                } else {
-                    (elbow_x - text_w - 2.0, elbow_x)
+            let mut placed: Option<(f64, f64, f64)> = None;
+            for &(side, elbow_x) in &shoulders {
+                let nominal = (centre[1] - (elbow_x - centre[0]).abs()).max(top);
+                // The shoulder + text box for a row at `y`.
+                let text_box = |y: f64| {
+                    let (x0, x1) = if side > 0.0 {
+                        (elbow_x, elbow_x + text_w + 2.0)
+                    } else {
+                        (elbow_x - text_w - 2.0, elbow_x)
+                    };
+                    Rect2 {
+                        x0,
+                        y0: y - TGAP - DIM_TEXT_FONT_MM,
+                        x1,
+                        y1: y + below,
+                    }
                 };
-                Rect2 {
-                    x0,
-                    y0: y - TGAP - DIM_TEXT_FONT_MM,
-                    x1,
-                    y1: y + below,
-                }
-            };
-            // The view's OTHER holes, in sheet space: a leg from this hole to
-            // its shoulder must not run through one (a countersink leader on
-            // a busy plate cut straight through a counterbore). The hole's
-            // own rings -- counterbore, countersink -- are concentric with it
-            // and are not obstacles.
-            let other_holes: Vec<([f64; 2], f64)> = view
-                .circles
-                .iter()
-                .map(|c| (dim_to_sheet(view, sheet_h, [c.cx, c.cy]), c.r * view.scale))
-                .filter(|(c, cr)| {
-                    let dist = (c[0] - centre[0]).hypot(c[1] - centre[1]);
-                    // Not concentric with this hole, and not a circle that
-                    // ENCLOSES it (a round part's own outline, a raised face):
-                    // every leg starts inside those and must cross them.
-                    dist > r + 0.5 && dist + r > *cr
-                })
-                .collect();
-            let leg_is_clear = |y: f64| {
-                let (vx, vy) = (elbow_x - centre[0], y - centre[1]);
-                let len = vx.hypot(vy).max(1e-9);
-                let tip = [centre[0] + vx / len * r, centre[1] + vy / len * r];
-                let (ux, uy) = (elbow_x - tip[0], y - tip[1]);
-                let len2 = (ux * ux + uy * uy).max(1e-12);
-                let clear_of_holes = other_holes.iter().all(|(c, cr)| {
-                    let t = (((c[0] - tip[0]) * ux + (c[1] - tip[1]) * uy) / len2).clamp(0.0, 1.0);
-                    (tip[0] + ux * t - c[0]).hypot(tip[1] + uy * t - c[1]) >= cr + 0.3
-                });
-                // Nor may it run through another view, a view title or text
-                // already placed: the mounting plate's counterbore leader was
-                // drawn straight through "SECTION A-A (1:1)". Sampled along
-                // the leg (exact enough at drafting scale, and deterministic).
-                let clear_of_ink = obstacles.iter().all(|o| {
-                    !(1..64).any(|k| {
-                        let t = k as f64 / 64.0;
-                        let x = tip[0] + ux * t;
-                        let yy = tip[1] + uy * t;
-                        x > o.x0 && x < o.x1 && yy > o.y0 && yy < o.y1
+                // The view's OTHER holes, in sheet space: a leg from this hole to
+                // its shoulder must not run through one (a countersink leader on
+                // a busy plate cut straight through a counterbore). The hole's
+                // own rings -- counterbore, countersink -- are concentric with it
+                // and are not obstacles.
+                let other_holes: Vec<([f64; 2], f64)> = view
+                    .circles
+                    .iter()
+                    .map(|c| (dim_to_sheet(view, sheet_h, [c.cx, c.cy]), c.r * view.scale))
+                    .filter(|(c, cr)| {
+                        let dist = (c[0] - centre[0]).hypot(c[1] - centre[1]);
+                        // Not concentric with this hole, and not a circle that
+                        // ENCLOSES it (a round part's own outline, a raised face):
+                        // every leg starts inside those and must cross them.
+                        dist > r + 0.5 && dist + r > *cr
                     })
-                });
-                clear_of_holes && clear_of_ink
-            };
-            let free = |y: f64| {
-                let b = text_box(y);
-                y >= top
-                    && y <= bottom
-                    && !leader_rows
-                        .iter()
-                        .any(|&(s, ly)| s == side && (ly - y).abs() < row)
-                    && !obstacles.iter().any(|o| o.intersects(&b, 0.0))
-                    && leg_is_clear(y)
-            };
-            // Nearest free row to the nominal one: up first, then down.
-            let mut ey = nominal;
-            let mut found = free(nominal);
-            for k in 1..=200 {
-                if found {
-                    break;
-                }
-                for cand in [
-                    nominal - k as f64 * 0.5 * row,
-                    nominal + k as f64 * 0.5 * row,
-                ] {
-                    if free(cand) {
-                        ey = cand;
-                        found = true;
+                    .collect();
+                let leg_is_clear = |y: f64| {
+                    let (vx, vy) = (elbow_x - centre[0], y - centre[1]);
+                    let len = vx.hypot(vy).max(1e-9);
+                    let tip = [centre[0] + vx / len * r, centre[1] + vy / len * r];
+                    let (ux, uy) = (elbow_x - tip[0], y - tip[1]);
+                    let len2 = (ux * ux + uy * uy).max(1e-12);
+                    let clear_of_holes = other_holes.iter().all(|(c, cr)| {
+                        let t =
+                            (((c[0] - tip[0]) * ux + (c[1] - tip[1]) * uy) / len2).clamp(0.0, 1.0);
+                        (tip[0] + ux * t - c[0]).hypot(tip[1] + uy * t - c[1]) >= cr + 0.3
+                    });
+                    // Nor may it run through another view, a view title or text
+                    // already placed: the mounting plate's counterbore leader was
+                    // drawn straight through "SECTION A-A (1:1)". Sampled along
+                    // the leg (exact enough at drafting scale, and deterministic).
+                    let clear_of_ink = obstacles.iter().all(|o| {
+                        !(1..64).any(|k| {
+                            let t = k as f64 / 64.0;
+                            let x = tip[0] + ux * t;
+                            let yy = tip[1] + uy * t;
+                            x > o.x0 && x < o.x1 && yy > o.y0 && yy < o.y1
+                        })
+                    });
+                    clear_of_holes && clear_of_ink
+                };
+                let free = |y: f64| {
+                    let b = text_box(y);
+                    y >= top
+                        && y <= bottom
+                        && !leader_rows
+                            .iter()
+                            .any(|&(s, ly)| s == side && (ly - y).abs() < row)
+                        && !obstacles.iter().any(|o| o.intersects(&b, 0.0))
+                        && leg_is_clear(y)
+                };
+                // Nearest free row to the nominal one: up first, then down.
+                let mut ey = nominal;
+                let mut found = free(nominal);
+                for k in 1..=200 {
+                    if found {
                         break;
                     }
+                    for cand in [
+                        nominal - k as f64 * 0.5 * row,
+                        nominal + k as f64 * 0.5 * row,
+                    ] {
+                        if free(cand) {
+                            ey = cand;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if found {
+                    placed = Some((side, elbow_x, ey));
+                    break;
                 }
             }
-            if !found {
-                // No clear row inside the frame: keep the nominal row clear of
-                // the other leaders at least.
-                ey = nominal;
-                while leader_rows
-                    .iter()
-                    .any(|&(s, y)| s == side && (y - ey).abs() < row)
-                {
-                    ey += row;
+            let (side, elbow_x, ey) = match placed {
+                Some(p) => p,
+                None => {
+                    // No clear row for any shoulder: the preferred one, at the
+                    // nominal row kept clear of the other leaders at least.
+                    // The layout check then reports the collision.
+                    let (side, elbow_x) = shoulders
+                        .first()
+                        .copied()
+                        .unwrap_or((preferred, bbox[2] + STANDOFF));
+                    let mut ey = (centre[1] - (elbow_x - centre[0]).abs()).max(top);
+                    while leader_rows
+                        .iter()
+                        .any(|&(s, y)| s == side && (y - ey).abs() < row)
+                    {
+                        ey += row;
+                    }
+                    (side, elbow_x, ey)
                 }
-            }
+            };
             leader_rows.push((side, ey));
             let elbow = [elbow_x, ey];
             let (vx, vy) = (elbow[0] - centre[0], elbow[1] - centre[1]);
