@@ -936,3 +936,66 @@ fn the_explicit_scale_route_keeps_a_clean_sheet() {
         .collect();
     assert!(errors.is_empty(), "quality gate errors: {errors:#?}");
 }
+
+/// A leader's leg runs from its hole to the shoulder without crossing any
+/// OTHER hole in the view. On the three-pattern plate the 2× Ø8 leader ran
+/// diagonally across the whole TOP view and through a counterbore -- seen on
+/// the explicit-scale sheet.
+#[test]
+fn leader_legs_do_not_cross_other_holes() {
+    use geometry_engine::drawing::dimensioning::standard_drawing_hlr;
+    use geometry_engine::drawing::layout::compute_layout;
+    use geometry_engine::drawing::types::SheetSize;
+    let mut m = BRepModel::new();
+    let mut s = plate(&mut m);
+    for (x, y) in [(-30.0, -20.0), (30.0, -20.0), (-30.0, 20.0), (30.0, 20.0)] {
+        s = counterbore(&mut m, s, x, y, 6.8);
+    }
+    for x in [-10.0, 10.0] {
+        s = countersink(&mut m, s, x, 0.0, 9.0);
+    }
+    for y in [-20.0, 20.0] {
+        s = blind(&mut m, s, 0.0, y, 12.0);
+    }
+    let auto = sheet(&m, s, "three_patterns_legs").0;
+    let explicit =
+        standard_drawing_hlr(&m, s, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("A3 at 1:1");
+    for (route, d) in [("auto", &auto), ("explicit", &explicit)] {
+        let layout = compute_layout(d);
+        let h = d.sheet_size.height();
+        let mut crossings = Vec::new();
+        for pd in &layout.dimensions {
+            let v = &d.views[pd.owner_view];
+            let Some(dim) = v.dimensions.iter().find(|x| x.id == pd.dim_id) else {
+                continue;
+            };
+            if dim.kind != "hole_callout" {
+                continue;
+            }
+            let [tip, elbow] = pd.ext[0];
+            for c in &v.circles {
+                let cx = v.position_mm[0] + c.cx * v.scale;
+                let cy = (h - v.position_mm[1]) - c.cy * v.scale;
+                let r = c.r * v.scale;
+                // The leader's own hole (and its counterbore / countersink
+                // rings): the tip sits on or inside it.
+                if (tip[0] - cx).hypot(tip[1] - cy) <= r + 0.5 {
+                    continue;
+                }
+                // Distance from the circle centre to the leg segment.
+                let (ux, uy) = (elbow[0] - tip[0], elbow[1] - tip[1]);
+                let len2 = (ux * ux + uy * uy).max(1e-12);
+                let t = (((cx - tip[0]) * ux + (cy - tip[1]) * uy) / len2).clamp(0.0, 1.0);
+                let dist = (tip[0] + ux * t - cx).hypot(tip[1] + uy * t - cy);
+                if dist < r {
+                    crossings.push(format!(
+                        "{route}: '{}' crosses a Ø{:.1} circle",
+                        pd.label,
+                        2.0 * c.r
+                    ));
+                }
+            }
+        }
+        assert!(crossings.is_empty(), "{crossings:?}");
+    }
+}

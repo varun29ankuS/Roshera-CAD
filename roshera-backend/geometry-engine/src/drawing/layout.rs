@@ -1893,6 +1893,34 @@ pub(crate) fn place_dimensions_routed(
                     y1: y + below,
                 }
             };
+            // The view's OTHER holes, in sheet space: a leg from this hole to
+            // its shoulder must not run through one (a countersink leader on
+            // a busy plate cut straight through a counterbore). The hole's
+            // own rings -- counterbore, countersink -- are concentric with it
+            // and are not obstacles.
+            let other_holes: Vec<([f64; 2], f64)> = view
+                .circles
+                .iter()
+                .map(|c| (dim_to_sheet(view, sheet_h, [c.cx, c.cy]), c.r * view.scale))
+                .filter(|(c, cr)| {
+                    let dist = (c[0] - centre[0]).hypot(c[1] - centre[1]);
+                    // Not concentric with this hole, and not a circle that
+                    // ENCLOSES it (a round part's own outline, a raised face):
+                    // every leg starts inside those and must cross them.
+                    dist > r + 0.5 && dist + r > *cr
+                })
+                .collect();
+            let leg_is_clear = |y: f64| {
+                let (vx, vy) = (elbow_x - centre[0], y - centre[1]);
+                let len = vx.hypot(vy).max(1e-9);
+                let tip = [centre[0] + vx / len * r, centre[1] + vy / len * r];
+                let (ux, uy) = (elbow_x - tip[0], y - tip[1]);
+                let len2 = (ux * ux + uy * uy).max(1e-12);
+                other_holes.iter().all(|(c, cr)| {
+                    let t = (((c[0] - tip[0]) * ux + (c[1] - tip[1]) * uy) / len2).clamp(0.0, 1.0);
+                    (tip[0] + ux * t - c[0]).hypot(tip[1] + uy * t - c[1]) >= cr + 0.3
+                })
+            };
             let free = |y: f64| {
                 let b = text_box(y);
                 y >= top
@@ -1901,6 +1929,7 @@ pub(crate) fn place_dimensions_routed(
                         .iter()
                         .any(|&(s, ly)| s == side && (ly - y).abs() < row)
                     && !obstacles.iter().any(|o| o.intersects(&b, 0.0))
+                    && leg_is_clear(y)
             };
             // Nearest free row to the nominal one: up first, then down.
             let mut ey = nominal;

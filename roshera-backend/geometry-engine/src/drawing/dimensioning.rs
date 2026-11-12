@@ -3055,7 +3055,12 @@ fn choose_section_plane(
             .iter()
             .filter_map(|s| s.world_centre)
             .collect();
-        if !centres.is_empty() {
+        // A ROUND part keeps the section through its axis -- the one that
+        // shows the bore and the raised face / hub profile. On a rotated
+        // bolt circle the row search moved it onto two bolt holes instead.
+        if let Some(rp) = &drawing.round_part {
+            origin[chosen_axis] = rp.centre[chosen_axis];
+        } else if !centres.is_empty() {
             let best_row = |axis: usize| -> (usize, f64) {
                 let n_c = centres.len() as f64;
                 let centroid = centres.iter().map(|c| c[axis]).sum::<f64>() / n_c;

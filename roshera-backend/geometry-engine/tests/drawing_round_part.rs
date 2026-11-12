@@ -457,3 +457,25 @@ fn a_sheet_that_loses_its_hole_callout_omits_the_holes() {
     );
     assert!(!cert.sound);
 }
+
+/// A round part is sectioned THROUGH ITS AXIS -- the section that shows the
+/// bore and the raised-face profile -- even when a row of bolt holes would
+/// put more holes on another plane. The row search that fixed plates moved a
+/// rotated flange's SECTION A-A off the axis onto two bolt holes.
+#[test]
+fn a_round_part_is_sectioned_through_its_axis() {
+    for start in [0.0, 45.0] {
+        let (m, s) = raised_face_flange(start);
+        let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+        let sec = d.section.as_ref().expect("section");
+        // The plane contains the part axis (Z through the origin): its origin
+        // has no offset along its own normal.
+        let off = sec.origin[0] * sec.normal[0] + sec.origin[1] * sec.normal[1];
+        assert!(
+            off.abs() < 1e-6,
+            "start {start}: section plane is {off:.3} mm off the part axis (origin {:?}, normal {:?})",
+            sec.origin,
+            sec.normal
+        );
+    }
+}
