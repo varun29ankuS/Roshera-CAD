@@ -9977,19 +9977,46 @@ pub(crate) fn is_point_inside_face(u: f64, v: f64, face: &Face, model: &BRepMode
         }
     }
 
-    // First check outer loop - point must be inside
-    if !is_point_inside_loop(u, v, face.outer_loop, face, model) {
+    let inside_at = |u: f64, v: f64| {
+        // Outer loop: the point must be inside it; inner loops (holes): it
+        // must be outside every one.
+        is_point_inside_loop(u, v, face.outer_loop, face, model)
+            && !face
+                .inner_loops
+                .iter()
+                .any(|&hole| is_point_inside_loop(u, v, hole, face, model))
+    };
+    if inside_at(u, v) {
+        return true;
+    }
+    // On a periodic surface (u + period is the same point) a loop's unwrapped
+    // polygon may sit a period away from the `(u, v)` asked about, and a point
+    // exactly on the seam read as outside its own face: a ray hitting a
+    // fillet torus at u = 0 passed straight through it.
+    let Some(surface) = model.surfaces.get(face.surface_id) else {
         return false;
-    }
-
-    // Then check inner loops (holes) - point must be outside all holes
-    for &inner_loop_id in &face.inner_loops {
-        if is_point_inside_loop(u, v, inner_loop_id, face, model) {
-            return false;
+    };
+    // A point ON the seam lies on the loop polygon's own seam edge in every
+    // image, and the winding test reads an on-edge point as outside; a seam
+    // is no boundary of a periodic face, so a hair to either side of it
+    // decides.
+    let shifts = |period: Option<f64>| -> Vec<f64> {
+        match period {
+            Some(p) if p.is_finite() && p > 0.0 => {
+                let hair = p * 1.0e-9;
+                [0.0, p, -p]
+                    .iter()
+                    .flat_map(|&k| [k, k + hair, k - hair])
+                    .collect()
+            }
+            _ => vec![0.0],
         }
-    }
-
-    true
+    };
+    let (su, sv) = (shifts(surface.period_u()), shifts(surface.period_v()));
+    su.iter()
+        .flat_map(|&du| sv.iter().map(move |&dv| (du, dv)))
+        .filter(|&(du, dv)| du != 0.0 || dv != 0.0)
+        .any(|(du, dv)| inside_at(u + du, v + dv))
 }
 
 /// Check if a point is inside a loop using winding number algorithm.

@@ -501,6 +501,10 @@ impl ParallelValidator {
                         &mut warnings,
                     );
 
+                    // Every face loop must chain: each edge, as oriented in
+                    // the loop, ends where the next one starts.
+                    Self::check_loops_chain_for_solid(model, id, solid, &mut errors);
+
                     let validation = ValidationResult {
                         is_valid: errors.is_empty(),
                         topology_valid: errors.is_empty(),
@@ -1234,6 +1238,73 @@ impl ParallelValidator {
     }
 
     /// Check for non-manifold edges in a solid
+    /// Each face loop of `solid` must be a closed chain: every edge, as the
+    /// loop orients it, ends at the vertex the next edge starts at. A blend
+    /// once built a seamed band whose seam was used the wrong way round; the
+    /// face read as valid while its (u, v) trim polygon self-intersected, so
+    /// trim membership -- ray casts, hidden lines -- failed near the seam.
+    fn check_loops_chain_for_solid(
+        model: &BRepModel,
+        solid_id: SolidId,
+        solid: &Solid,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        let mut shells = vec![solid.outer_shell];
+        shells.extend_from_slice(&solid.inner_shells);
+        for shell_id in shells {
+            let Some(shell) = model.shells.get(shell_id) else {
+                continue;
+            };
+            for &face_id in &shell.faces {
+                let Some(face) = model.faces.get(face_id) else {
+                    continue;
+                };
+                let mut loops = vec![face.outer_loop];
+                loops.extend(&face.inner_loops);
+                for loop_id in loops {
+                    let Some(lp) = model.loops.get(loop_id) else {
+                        continue;
+                    };
+                    let ends: Vec<(EdgeId, VertexId, VertexId)> = lp
+                        .edges
+                        .iter()
+                        .zip(&lp.orientations)
+                        .filter_map(|(&e, &forward)| {
+                            let ed = model.edges.get(e)?;
+                            Some(if forward {
+                                (e, ed.start_vertex, ed.end_vertex)
+                            } else {
+                                (e, ed.end_vertex, ed.start_vertex)
+                            })
+                        })
+                        .collect();
+                    if ends.len() != lp.edges.len() {
+                        continue; // a missing edge is reported elsewhere
+                    }
+                    for i in 0..ends.len() {
+                        let (e, _, end) = ends[i];
+                        let (next, start, _) = ends[(i + 1) % ends.len()];
+                        if end != start {
+                            errors.push(ValidationError::ConnectivityError {
+                                message: format!(
+                                    "loop {loop_id} of face {face_id} does not chain: edge {e} ends at vertex {end}, the next edge {next} starts at vertex {start}"
+                                ),
+                                location: EntityLocation {
+                                    solid_id: Some(solid_id),
+                                    shell_id: Some(shell_id),
+                                    face_id: Some(face_id),
+                                    loop_id: Some(loop_id),
+                                    edge_id: Some(e),
+                                    vertex_id: Some(end),
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn check_manifold_edges_for_solid(
         &self,
         model: &BRepModel,

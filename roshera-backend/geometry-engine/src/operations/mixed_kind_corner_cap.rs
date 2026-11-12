@@ -1235,6 +1235,12 @@ pub(crate) fn filter_pending_corner_errors(
                 if v_adjacent_faces.contains(&fid) && message.starts_with("Boundary edge") {
                     return false;
                 }
+                // The same deliberate opening breaks the host face's loop
+                // chain at the corner (the validator's loop-chain check);
+                // local to the V-adjacent neighbourhood, like the above.
+                if v_adjacent_faces.contains(&fid) && message.contains("does not chain") {
+                    return false;
+                }
                 // CF-β.5.2-A — the same deliberate open boundary also shows up as a
                 // non-closing boundary WALK on the host face (the face-orientation
                 // guard's chain-integrity check): the partial corner leaves the

@@ -281,42 +281,52 @@ pub fn solve_quartic(a: f64, b: f64, c: f64, d: f64, e: f64, tolerance: Toleranc
         return roots;
     }
 
-    // Ferrari's method via resolvent cubic:
-    //   8m³ + 8p·m² + (2p² - 8r)·m - q² = 0
-    // Equivalent (monic) form: m³ + p·m² + (p²/4 - r)·m - q²/8 = 0.
+    // Ferrari's method. Add 2m·(y² + p/2) + m² to both sides of
+    // (y² + p/2)² = −q·y − r + p²/4:
+    //   (y² + p/2 + m)² = 2m·y² − q·y + (m² + m·p + p²/4 − r).
+    // The right side is a perfect square when its discriminant vanishes,
+    //   q² = 8m·(m² + m·p + p²/4 − r)  ⇔  m³ + p·m² + (p²/4 − r)·m − q²/8 = 0,
+    // and then, with s = √(2m) (m > 0), it equals (s·y − q/(2s))². (This
+    // branch used s = √(2m − p) and p/2 + m/2 -- the factoring of a different
+    // resolvent -- so every quartic with q ≠ 0 came out wrong.)
     let resolvent_roots = solve_cubic(1.0, p, p * p / 4.0 - r, -q * q / 8.0, tolerance);
-
-    // Choose a resolvent root m such that 2m - p > 0 (so sqrt is real).
-    let m_opt = resolvent_roots
+    let Some(m) = resolvent_roots
         .iter()
-        .find(|&&m| 2.0 * m - p > tol)
-        .copied();
-    let m = match m_opt {
-        Some(m) => m,
-        None => return roots,
+        .copied()
+        .filter(|&m| m > 0.0 && m.is_finite())
+        .max_by(|a, b| a.total_cmp(b))
+    else {
+        return roots;
     };
-
-    // After adding m(y² + p/2) + m²/4 to (y² + p/2)², the RHS becomes
-    //   (2m - p)·y² - q·y + (m·p + m²/4 - r).
-    // If 2m - p > 0, take √(2m - p) and rewrite as (√(2m-p)·y - q/(2·√(2m-p)))².
-    let two_m_minus_p = 2.0 * m - p;
-    let s = two_m_minus_p.sqrt();
-    // Perfect-square condition gives t = q / (2s); sign is chosen so the
-    // factored quadratic pair below matches Ferrari's resolvent.
+    let s = (2.0 * m).sqrt();
     let t = q / (2.0 * s);
 
-    // (y² + p/2 + m/2)² = (s·y - t)² ⇒ y² + p/2 + m/2 = ±(s·y - t)
-    // Case +: y² - s·y + (p/2 + m/2 + t) = 0
-    // Case -: y² + s·y + (p/2 + m/2 - t) = 0
-    let half_p_plus_half_m = p * 0.5 + m * 0.5;
-    let quad1 = solve_quadratic(1.0, -s, half_p_plus_half_m + t, tolerance);
-    let quad2 = solve_quadratic(1.0, s, half_p_plus_half_m - t, tolerance);
+    // y² + p/2 + m = ±(s·y − t)
+    //   +: y² − s·y + (p/2 + m + t) = 0
+    //   −: y² + s·y + (p/2 + m − t) = 0
+    let quad1 = solve_quadratic(1.0, -s, p * 0.5 + m + t, tolerance);
+    let quad2 = solve_quadratic(1.0, s, p * 0.5 + m - t, tolerance);
 
-    for y in quad1 {
-        roots.push(y + shift);
-    }
-    for y in quad2 {
-        roots.push(y + shift);
+    // Polish each root on the original (monic) quartic: the resolvent and
+    // the square roots above lose a few digits.
+    let f = |x: f64| (((x + b) * x + c) * x + d) * x + e;
+    let df = |x: f64| ((4.0 * x + 3.0 * b) * x + 2.0 * c) * x + d;
+    let polish = |mut x: f64| {
+        for _ in 0..3 {
+            let slope = df(x);
+            if slope.abs() < f64::EPSILON {
+                break;
+            }
+            let step = f(x) / slope;
+            if !step.is_finite() {
+                break;
+            }
+            x -= step;
+        }
+        x
+    };
+    for y in quad1.into_iter().chain(quad2) {
+        roots.push(polish(y + shift));
     }
 
     // NaN-safe: drop non-finite roots before sorting; total_cmp for determinism.
@@ -1566,6 +1576,68 @@ mod tests {
         assert_eq!(roots.len(), 2); // Two double roots
         assert!((roots[0] - 1.0).abs() < 1e-10);
         assert!((roots[1] - 2.0).abs() < 1e-10);
+    }
+
+    /// Quartics with an odd term and known real roots. The Ferrari branch
+    /// mixed two parametrisations (the resolvent of one, the factoring of the
+    /// other), so every such quartic came out wrong -- found through a
+    /// ray-torus intersection on a fillet: true roots ±3, returned
+    /// -15.70 and 25.91.
+    #[test]
+    fn solve_quartic_finds_the_real_roots_of_general_quartics() {
+        fn poly(roots: &[f64], complex: Option<(f64, f64)>) -> [f64; 5] {
+            // Expand prod (x - r_i) [· (x² + b x + c)] into monic coefficients.
+            let mut c = vec![1.0];
+            let mul = |c: &Vec<f64>, f: &[f64]| {
+                let mut out = vec![0.0; c.len() + f.len() - 1];
+                for (i, a) in c.iter().enumerate() {
+                    for (j, b) in f.iter().enumerate() {
+                        out[i + j] += a * b;
+                    }
+                }
+                out
+            };
+            for &r in roots {
+                c = mul(&c, &[1.0, -r]);
+            }
+            if let Some((b, k)) = complex {
+                c = mul(&c, &[1.0, b, k]);
+            }
+            [c[0], c[1], c[2], c[3], c[4]]
+        }
+        let cases: Vec<(Vec<f64>, Option<(f64, f64)>)> = vec![
+            (vec![1.0, -2.0, 3.5, -0.25], None),
+            (vec![-3.0, 3.0], Some((-72.124_891_681_027_85, 2583.0))),
+            (vec![10.0, 0.001, -7.5, 42.0], None),
+            (vec![-1.0, 2.0], Some((2.0, 5.0))),
+        ];
+        for (expect, complex) in cases {
+            let [a, b, c, d, e] = poly(&expect, complex);
+            let got = solve_quartic(a, b, c, d, e, NORMAL_TOLERANCE);
+            let mut want = expect.clone();
+            want.sort_by(|x, y| x.total_cmp(y));
+            assert_eq!(got.len(), want.len(), "roots of {expect:?}: got {got:?}");
+            for (g, w) in got.iter().zip(&want) {
+                assert!(
+                    (g - w).abs() < 1e-8 * w.abs().max(1.0),
+                    "roots of {expect:?}: got {got:?}"
+                );
+            }
+        }
+        // The fillet's ray: x⁴ − 72.1249x³ + 2583x² + 649.124x − 23328.
+        let got = solve_quartic(
+            1.0,
+            -72.124_891_681_027_85,
+            2583.0,
+            649.124_025_129_247_5,
+            -23328.0,
+            NORMAL_TOLERANCE,
+        );
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(
+            (got[0] + 3.0).abs() < 1e-8 && (got[1] - 3.0).abs() < 1e-8,
+            "{got:?}"
+        );
     }
 
     #[test]

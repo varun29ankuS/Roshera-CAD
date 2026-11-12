@@ -363,6 +363,24 @@ pub enum FilletQuality {
 pub fn fillet_edges(
     model: &mut BRepModel,
     solid_id: SolidId,
+    edges: Vec<EdgeId>,
+    options: FilletOptions,
+) -> OperationResult<Vec<FaceId>> {
+    // All or nothing: a refused fillet leaves the model exactly as it was.
+    // The healing pass below (and any partial surgery) changes topology
+    // before the blend can refuse; left in place, that change is in the live
+    // model but in no recorded event, so the model and its replay disagree.
+    let before = crate::primitives::snapshot::ModelSnapshot::take(model);
+    let result = fillet_edges_unguarded(model, solid_id, edges, options);
+    if result.is_err() {
+        before.restore(model);
+    }
+    result
+}
+
+fn fillet_edges_unguarded(
+    model: &mut BRepModel,
+    solid_id: SolidId,
     mut edges: Vec<EdgeId>,
     options: FilletOptions,
 ) -> OperationResult<Vec<FaceId>> {
@@ -3622,10 +3640,17 @@ fn cylinder_rim_fillet(
     //   — the lateral edge is now at the higher v, so its slot flips.
     let mut blend_loop = Loop::new(0, LoopType::Outer);
     if inner {
+        // The seam runs lateral -> cap (`v_lat` to the cap vertex). After the
+        // cap rim (closed at the cap vertex) the loop goes UP the seam (cap ->
+        // lateral: reversed), back along the lateral rim, and DOWN the seam
+        // (forward). Using it forward first broke the chain -- the loop
+        // walked from the cap vertex onto an edge starting at the lateral
+        // one -- and the face's (u, v) trim polygon self-intersected: a ray
+        // near the seam passed straight through a concave hub fillet.
         blend_loop.add_edge(cap_trim_edge_id, true);
-        blend_loop.add_edge(torus_seam_edge_id, true);
-        blend_loop.add_edge(lat_trim_edge_id, false);
         blend_loop.add_edge(torus_seam_edge_id, false);
+        blend_loop.add_edge(lat_trim_edge_id, false);
+        blend_loop.add_edge(torus_seam_edge_id, true);
     } else {
         blend_loop.add_edge(lat_trim_edge_id, true);
         blend_loop.add_edge(torus_seam_edge_id, true);

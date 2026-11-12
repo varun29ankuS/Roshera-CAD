@@ -16,7 +16,7 @@
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::face::{Face, FaceId, FaceOrientation};
 use crate::primitives::solid::SolidId;
-use crate::primitives::surface::{Cone, Cylinder, Plane, Sphere, Surface};
+use crate::primitives::surface::{Cone, Cylinder, Plane, Sphere, Surface, Torus};
 use crate::primitives::topology_builder::BRepModel;
 
 /// One ray–solid intersection, fully recoverable to the B-Rep.
@@ -243,8 +243,11 @@ fn oriented_normal(surface: &dyn Surface, face: &Face, u: f64, v: f64) -> Vector
 }
 
 /// Ray-parameter candidates for the ray ∩ a face's analytic surface. Returns
-/// the (possibly two) `t` values on the INFINITE surface; the caller clips to
-/// the face trim. Non-analytic surfaces return none (handled by the mesh path).
+/// the `t` values on the INFINITE surface (up to two for a quadric, four for
+/// a torus); the caller clips to the face trim. A surface with no closed form
+/// here returns none -- and the ray then passes straight through that face.
+/// The torus case (every round-edge fillet) was missing: rays passed through
+/// fillets, so a filleted face hid nothing in a hidden-line drawing.
 fn surface_ray_ts(surface: &dyn Surface, o: Point3, d: Vector3) -> Vec<f64> {
     let any = surface.as_any();
     if let Some(pl) = any.downcast_ref::<Plane>() {
@@ -272,6 +275,27 @@ fn surface_ray_ts(surface: &dyn Surface, o: Point3, d: Vector3) -> Vec<f64> {
             dp.dot(&dp),
             2.0 * dp.dot(&wp),
             wp.dot(&wp) - cy.radius * cy.radius,
+        );
+    }
+    if let Some(to) = any.downcast_ref::<Torus>() {
+        // (|q|² + R² − r²)² = 4R²(|q|² − (q·a)²), q = (o − c) + t·d, |d| = 1:
+        // a quartic in t.
+        let a = to.axis.normalize().unwrap_or(to.axis);
+        let d = d.normalize().unwrap_or(d);
+        let w = o - to.center;
+        let (big, small) = (to.major_radius, to.minor_radius);
+        let n = w.dot(&d);
+        let o2 = w.dot(&w);
+        let k = o2 + big * big - small * small;
+        let (wa, da) = (w.dot(&a), d.dot(&a));
+        let r4 = 4.0 * big * big;
+        return crate::math::utils::solve_quartic(
+            1.0,
+            4.0 * n,
+            4.0 * n * n + 2.0 * k - r4 * (1.0 - da * da),
+            4.0 * n * k - 2.0 * r4 * (n - wa * da),
+            k * k - r4 * (o2 - wa * wa),
+            Tolerance::default(),
         );
     }
     if let Some(co) = any.downcast_ref::<Cone>() {

@@ -995,7 +995,11 @@ pub(crate) fn coalesce_smooth_cocurve_chains(
             }
         }
         // Find a 2-valent vertex whose two edges are co-curve and forward-
-        // contiguous (one ends at v, the other starts at v, at the same param).
+        // contiguous (one ends at v, the other starts at v): on the SAME curve
+        // at the same parameter, or on two arc curves of the same circle
+        // meeting at the same angle (a union leaves a hub/flange junction as
+        // 16 arcs, each its own curve object -- the junction then took no
+        // fillet).
         let mut act = None;
         for (&v, es) in &ve {
             if es.len() != 2 {
@@ -1006,9 +1010,6 @@ pub(crate) fn coalesce_smooth_cocurve_chains(
                 (Some(ea), Some(eb)) => (ea, eb),
                 _ => continue,
             };
-            if ea.curve_id != eb.curve_id {
-                continue;
-            }
             let (keep, drop) = if ea.end_vertex == v && eb.start_vertex == v {
                 (a, b)
             } else if eb.end_vertex == v && ea.start_vertex == v {
@@ -1020,18 +1021,38 @@ pub(crate) fn coalesce_smooth_cocurve_chains(
                 (Some(ek), Some(ed)) => (ek, ed),
                 _ => continue,
             };
-            if (ek.param_range.end - ed.param_range.start).abs() > 1.0e-9 {
-                continue;
-            }
-            act = Some((v, keep, drop, ed.end_vertex, ed.param_range.end));
+            let joined = if ek.curve_id == ed.curve_id {
+                if (ek.param_range.end - ed.param_range.start).abs() > 1.0e-9 {
+                    continue;
+                }
+                Join::SameCurve(ed.param_range.end)
+            } else {
+                match joined_arc(model, ek, ed) {
+                    Some(arc) => Join::NewArc(arc),
+                    None => continue,
+                }
+            };
+            act = Some((v, keep, drop, ed.end_vertex, joined));
             break;
         }
-        let Some((v, keep, drop, drop_end_v, drop_end_p)) = act else {
+        let Some((v, keep, drop, drop_end_v, joined)) = act else {
             break;
         };
-        if let Some(ek) = model.edges.get_mut(keep) {
-            ek.end_vertex = drop_end_v;
-            ek.param_range.end = drop_end_p;
+        match joined {
+            Join::SameCurve(drop_end_p) => {
+                if let Some(ek) = model.edges.get_mut(keep) {
+                    ek.end_vertex = drop_end_v;
+                    ek.param_range.end = drop_end_p;
+                }
+            }
+            Join::NewArc(arc) => {
+                let curve = model.curves.add(Box::new(arc));
+                if let Some(ek) = model.edges.get_mut(keep) {
+                    ek.end_vertex = drop_end_v;
+                    ek.curve_id = curve;
+                    ek.param_range = ParameterRange::new(0.0, 1.0);
+                }
+            }
         }
         for lid in (0..model.loops.slot_count() as u32).map(LoopId::from) {
             if let Some(lp) = model.loops.get_mut(lid) {
@@ -1045,6 +1066,80 @@ pub(crate) fn coalesce_smooth_cocurve_chains(
         merged.insert(drop, keep);
     }
     merged
+}
+
+/// How two contiguous edges become one.
+enum Join {
+    /// Both on one curve: the kept edge's range extends to this parameter.
+    SameCurve(f64),
+    /// Two arc curves of one circle: the kept edge takes this arc.
+    NewArc(crate::primitives::curve::Arc),
+}
+
+/// The single arc spanning `keep` then `drop` when both are arcs of the SAME
+/// circle (centre, radius and normal direction agree), traversed the same way
+/// and meeting at the same angle, with at most a full turn between them --
+/// else `None` (the pair is left alone).
+fn joined_arc(
+    model: &BRepModel,
+    keep: &crate::primitives::edge::Edge,
+    drop: &crate::primitives::edge::Edge,
+) -> Option<crate::primitives::curve::Arc> {
+    use crate::primitives::curve::Arc;
+    const LEN_TOL: f64 = 1.0e-7;
+    const ANG_TOL: f64 = 1.0e-7;
+    let a = model
+        .curves
+        .get(keep.curve_id)?
+        .as_any()
+        .downcast_ref::<Arc>()?;
+    let b = model
+        .curves
+        .get(drop.curve_id)?
+        .as_any()
+        .downcast_ref::<Arc>()?;
+    if (a.center - b.center).magnitude() > LEN_TOL
+        || (a.radius - b.radius).abs() > LEN_TOL
+        || a.normal.dot(&b.normal) < 1.0 - 1.0e-12
+    {
+        return None;
+    }
+    let angle = |c: &Arc, t: f64| c.start_angle + c.sweep_angle * t;
+    let (a0, a1) = (
+        angle(a, keep.param_range.start),
+        angle(a, keep.param_range.end),
+    );
+    // `b`'s angles measured in `a`'s frame: offset by the angle of b's
+    // reference axis around the shared normal.
+    let a_y = a.normal.cross(&a.x_axis);
+    let offset = b.x_axis.dot(&a_y).atan2(b.x_axis.dot(&a.x_axis));
+    let (b0, b1) = (
+        angle(b, drop.param_range.start) + offset,
+        angle(b, drop.param_range.end) + offset,
+    );
+    let (sa, sb) = (a1 - a0, b1 - b0);
+    if sa * sb <= 0.0 {
+        return None;
+    }
+    // Meet at the same angle (modulo a turn).
+    let tau = std::f64::consts::TAU;
+    let gap = (b0 - a1).rem_euclid(tau);
+    if gap > ANG_TOL && tau - gap > ANG_TOL {
+        return None;
+    }
+    let sweep = sa + sb;
+    if sweep.abs() > tau + ANG_TOL {
+        return None;
+    }
+    Arc::with_x_axis(
+        a.center,
+        a.normal,
+        a.x_axis,
+        a.radius,
+        a0,
+        sweep.clamp(-tau, tau),
+    )
+    .ok()
 }
 
 /// Resolve an edge id through the coalesce map to its final surviving edge.
