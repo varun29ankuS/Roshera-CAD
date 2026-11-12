@@ -250,6 +250,9 @@ pub(crate) async fn make_test_state_with_database(
                 as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
         instanced_assemblies: Arc::new(assembly_instances::InstancedAssemblyManager::new()),
+        frames: Arc::new(timeline_engine::frames::FrameCache::new(
+            crate::FRAME_BUDGET,
+        )),
         drawings: Arc::new(drawing_mgr::DrawingManager::with_recorder(
             timeline_recorder.clone()
                 as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
@@ -10988,6 +10991,51 @@ async fn editing_a_bore_cut_by_two_cutters_moves_both() {
         radii.iter().all(|r| (r - 4.0).abs() < 1e-6),
         "both cutters moved to r 4: {radii:?}"
     );
+}
+
+/// The timeline plays like a video: scrubbing reads stored frames. Before,
+/// every scrub step replayed the history from event 0 (4.4 s per step on the
+/// live mounting plate). The disconnection gate for `timeline_engine::frames`:
+/// the scrub ROUTE goes through the frame cache.
+#[tokio::test]
+async fn scrubbing_back_and_forward_reads_frames() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let (_, history) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    let seqs: Vec<u64> = history
+        .as_array()
+        .expect("history array")
+        .iter()
+        .filter_map(|e| e["sequence_number"].as_u64())
+        .collect();
+    let last = *seqs.iter().max().expect("a recorded history");
+    let earlier = *seqs
+        .iter()
+        .filter(|s| **s < last)
+        .max()
+        .expect("two events");
+
+    let scrub = |seq: u64| format!("/api/timeline/scrub/main/{seq}");
+    let (s1, first) = dispatch(&state, json_get(&scrub(last))).await;
+    assert_eq!(s1, StatusCode::OK, "{first}");
+    assert!(
+        first["frames"]["events_reexecuted"].as_u64().unwrap_or(0) > 0,
+        "{first}"
+    );
+    for seq in [earlier, last, earlier] {
+        let (s, body) = dispatch(&state, json_get(&scrub(seq))).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["frames"]["events_reexecuted"].as_u64(),
+            Some(0),
+            "scrubbing to {seq} must read a stored frame: {}",
+            body["frames"]
+        );
+        assert!(
+            !body["objects"].as_array().map_or(true, Vec::is_empty),
+            "the frame shows the part"
+        );
+    }
 }
 
 /// A dimension nothing on the timeline drives is refused as reference-only,

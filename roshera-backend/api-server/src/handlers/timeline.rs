@@ -720,10 +720,11 @@ async fn prepare_branch_replay(
     // `TimelineRecorder` would route every later op to whatever branch it
     // was built with. `rebuild_model_from_events` detaches it for the
     // replay and reattaches it before returning.
-    let mut model = BRepModel::new();
+    // Through the frame cache: the frames before the first changed event are
+    // reused, so an undo/redo/mould reconcile re-shoots only the suffix.
+    let (mut model, outcome, _frames) = state.frames.replay(&events);
     let recorder: Arc<dyn OperationRecorder> = state.timeline_recorder.clone();
     model.attach_recorder(Some(recorder));
-    let outcome = rebuild_model_from_events(&mut model, &events);
     Ok(PreparedReplay {
         branch,
         model,
@@ -5802,8 +5803,9 @@ pub async fn scrub_timeline(
 
     // Rebuild into a SCRATCH model — the live model handle is never
     // touched, which is the whole point of a scrub.
-    let mut scratch = geometry_engine::primitives::topology_builder::BRepModel::new();
-    let outcome = timeline_engine::replay::rebuild_model_from_events(&mut scratch, &events);
+    // Stepping through the timeline reads stored frames; only positions never
+    // shot before are replayed (and stored).
+    let (scratch, outcome, frame_stats) = state.frames.replay(&events);
 
     let tess_params = geometry_engine::tessellation::TessellationParams::default();
     let mut objects = Vec::new();
@@ -5853,6 +5855,10 @@ pub async fn scrub_timeline(
         "events_total": total,
         "events_applied": outcome.events_applied,
         "events_skipped": outcome.events_skipped,
+        "frames": {
+            "events_reused": frame_stats.events_reused,
+            "events_reexecuted": frame_stats.events_reexecuted,
+        },
         "objects": objects,
         "assemblies": assemblies,
     })))

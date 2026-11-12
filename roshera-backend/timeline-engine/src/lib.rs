@@ -28,6 +28,7 @@ pub mod dimension_drive;
 pub mod entity_mapping;
 pub mod event_certificate;
 pub mod execution;
+pub mod frames;
 pub mod incremental;
 pub mod kernel_ref;
 pub mod lineage;

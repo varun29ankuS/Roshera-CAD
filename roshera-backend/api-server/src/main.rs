@@ -137,6 +137,10 @@ use part_mgr::ActiveModel;
 // Import handlers - modules are now in separate files
 use handlers::*;
 
+/// Frames kept in memory (LRU beyond this). A dropped frame costs replay
+/// time when next needed, never correctness.
+pub(crate) const FRAME_BUDGET: usize = 512;
+
 /// Enhanced application state with all new features
 #[derive(Clone)]
 pub struct AppState {
@@ -360,6 +364,10 @@ pub struct AppState {
     /// resolve solid ids against the active model at projection time.
     /// See `drawing_mgr.rs`.
     pub drawings: Arc<drawing_mgr::DrawingManager>,
+    /// Timeline frames: the replay state after each event, shared across
+    /// requests and branches, so scrubbing reads frames and an edit re-shoots
+    /// only from the edited event (`timeline_engine::frames`).
+    pub frames: Arc<timeline_engine::frames::FrameCache>,
     /// Multi-document Part registry. Each tab in the frontend
     /// addresses a distinct `BRepModel` owned by this manager. The
     /// legacy `model` field is the implicit "active part" until the
@@ -10312,6 +10320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Drawings share the same timeline recorder so view-add /
         // view-remove events land on the active branch alongside
         // every other kernel mutation. See drawing_mgr.rs.
+        frames: Arc::new(timeline_engine::frames::FrameCache::new(FRAME_BUDGET)),
         drawings: Arc::new(drawing_mgr::DrawingManager::with_recorder(
             timeline_recorder.clone()
                 as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
