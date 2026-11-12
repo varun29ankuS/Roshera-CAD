@@ -11507,6 +11507,78 @@ async fn an_export_brings_a_sheet_up_to_date_after_a_later_feature() {
     );
 }
 
+/// A later feature that changes no printed dimension -- a fillet on a
+/// vertical edge of the bored box -- still reaches the exported sheet. The
+/// export's freshness check asked only whether the printed facts still match
+/// the part, so a sheet without the fillet passed as current (found live: an
+/// R3 hub fillet never appeared on the hub's sheet).
+#[tokio::test]
+async fn an_export_shows_a_feature_that_changes_no_dimension() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let (part_uuid, solid) = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| (*e.key(), *e.value()))
+        .expect("the bored part is registered");
+    let (_, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let (_, before) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let top_arcs = |sheet: &Value| -> usize {
+        sheet["views"]
+            .as_array()
+            .and_then(|vs| vs.iter().find(|v| v["projection"]["kind"] == "top"))
+            .map(|v| {
+                v["circles"].as_array().map(Vec::len).unwrap_or(0)
+                    + v["polylines"].as_array().map(Vec::len).unwrap_or(0)
+            })
+            .unwrap_or(0)
+    };
+
+    // Fillet one vertical edge of the box: no overall size changes.
+    let (_, picked) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/agent/parts/{solid}/select-edge"),
+            json!({"curve_kind": "line", "convexity": "convex", "direction": [0.0, 0.0, 1.0]}),
+        ),
+    )
+    .await;
+    let edge = picked["edge_id"]
+        .as_u64()
+        .or_else(|| {
+            picked["candidates"]
+                .as_array()
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+        })
+        .expect("a vertical edge");
+    let (fs, filleted) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/fillet",
+            json!({"object": part_uuid.to_string(), "edges": [edge], "radius": 2.0}),
+        ),
+    )
+    .await;
+    assert_eq!(fs, StatusCode::OK, "{filleted}");
+
+    let (es, body) =
+        dispatch_raw(&state, json_get(&format!("/api/drawings/{drawing_id}/svg"))).await;
+    assert_eq!(es, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (_, after) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert_ne!(
+        top_arcs(&after),
+        top_arcs(&before),
+        "the exported sheet's TOP view shows the fillet"
+    );
+}
+
 /// Undo puts a removed view back: the sheet is rebuilt from the history at
 /// the undone position. Before, undo/redo rewound the history but never
 /// rebuilt the sheets -- the view stayed gone.

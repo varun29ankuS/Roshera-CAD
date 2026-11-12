@@ -2105,13 +2105,19 @@ async fn refuse_unsound_sheet_with(
 /// sheets are re-derived only when the history is replayed (a dimension
 /// edit, undo, redo, a restart) -- after an ordinary modelling step (a
 /// fillet, a chamfer, a boolean) the stored sheet still shows the part as it
-/// was, and the export gate refused it as stale for good. So the export
-/// brings it up to date first, like a drawing that regenerates when opened:
-/// a sheet whose facts no longer match the live part is rebuilt from the
-/// document's history, then certified as usual.
+/// was. So every export rebuilds the sheet from the document's history first,
+/// like a drawing that regenerates when opened. The sheet cache makes that
+/// cheap when the part has not changed (the derived sheet is reused) and
+/// right when it has. Asking the sheet certificate whether the stored sheet
+/// is stale is not enough: a fillet changes the shape but no printed
+/// dimension, and a sheet without it passed as current.
 ///
-/// Returns the sheet to export and, when it was already current, the
-/// certificate just measured for it (so the gate need not measure it again).
+/// The rebuilt sheet is taken only if it certifies against the live part.
+/// When the live model is not what the history replays to (a part built
+/// outside the recorded history), the rebuilt sheet describes a different
+/// solid: the stored sheet -- and its honest refusal -- stand.
+///
+/// Returns the sheet to export and the certificate just measured for it.
 async fn sheet_brought_up_to_date(
     state: &AppState,
     id: Uuid,
@@ -2119,12 +2125,6 @@ async fn sheet_brought_up_to_date(
     handle: &Arc<RwLock<Drawing>>,
 ) -> Result<(Drawing, Option<SheetReadbackCertificate>), ApiError> {
     let snapshot = { handle.read().await.clone() };
-    let cert = certify_off_lock(model_handle.clone(), snapshot.clone())
-        .await
-        .map_err(|_| ApiError::sheet_uncertified(id))?;
-    if cert.counts.stale == 0 && cert.counts.dangling == 0 && cert.counts.omitted == 0 {
-        return Ok((snapshot, Some(cert)));
-    }
     let _ = state.timeline_recorder.settle().await;
     let events = {
         let timeline = state.timeline.read().await;
@@ -2141,11 +2141,6 @@ async fn sheet_brought_up_to_date(
         }
         all
     };
-    // Rebuild THIS sheet from history, and take it only if it agrees with
-    // the live part. When the live model is not what the history replays to
-    // (a part built outside the recorded history), the rebuilt sheet
-    // describes a different solid: keeping the current sheet -- and its
-    // honest refusal -- beats replacing it with a worse one.
     let frames = Arc::clone(&state.frames);
     let rebuilt = tokio::task::spawn_blocking(move || {
         timeline_engine::drawing_history::rebuild_drawings(&events, &frames)
@@ -2153,23 +2148,27 @@ async fn sheet_brought_up_to_date(
     .await
     .ok()
     .and_then(|mut r| r.drawings.remove(&id));
-    let Some(mut rebuilt) = rebuilt else {
-        return Ok((snapshot, Some(cert)));
-    };
-    // Keep what history does not carry: the date the sheet was first issued
-    // (stamped from the server clock when it was made).
-    if rebuilt.title_block.date.trim().is_empty() {
-        rebuilt.title_block.date = snapshot.title_block.date.clone();
+    if let Some(mut rebuilt) = rebuilt {
+        // Keep what history does not carry: the date the sheet was first
+        // issued (stamped from the server clock when it was made).
+        if rebuilt.title_block.date.trim().is_empty() {
+            rebuilt.title_block.date = snapshot.title_block.date.clone();
+        }
+        stamp_issue_date(&mut rebuilt);
+        let rebuilt_cert = certify_off_lock(model_handle.clone(), rebuilt.clone())
+            .await
+            .map_err(|_| ApiError::sheet_uncertified(id))?;
+        if rebuilt_cert.counts.stale + rebuilt_cert.counts.dangling + rebuilt_cert.counts.omitted
+            == 0
+        {
+            *handle.write().await = rebuilt.clone();
+            return Ok((rebuilt, Some(rebuilt_cert)));
+        }
     }
-    stamp_issue_date(&mut rebuilt);
-    let rebuilt_cert = certify_off_lock(model_handle.clone(), rebuilt.clone())
+    let cert = certify_off_lock(model_handle.clone(), snapshot.clone())
         .await
         .map_err(|_| ApiError::sheet_uncertified(id))?;
-    if rebuilt_cert.counts.stale + rebuilt_cert.counts.dangling + rebuilt_cert.counts.omitted > 0 {
-        return Ok((snapshot, Some(cert)));
-    }
-    *handle.write().await = rebuilt.clone();
-    Ok((rebuilt, Some(rebuilt_cert)))
+    Ok((snapshot, Some(cert)))
 }
 
 /// What a [`refuse_unsound_sheet`] refusal should name as its subject. See
