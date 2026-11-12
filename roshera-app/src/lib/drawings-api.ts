@@ -90,6 +90,12 @@ export interface TitleBlock {
   revision: string
   sheet_index: number
   sheet_count: number
+  /** ISO 7200 supplementary title (second line under the title). */
+  supplementary_title?: string
+  /** ISO 7200 approval person. Empty = FOR REVIEW. */
+  approved_by?: string
+  /** ISO 7200 document type, e.g. PART DRAWING. */
+  document_type?: string
 }
 
 export interface Drawing {
@@ -121,6 +127,9 @@ export function defaultTitleBlock(): TitleBlock {
     revision: 'A',
     sheet_index: 1,
     sheet_count: 1,
+    supplementary_title: '',
+    approved_by: '',
+    document_type: 'PART DRAWING',
   }
 }
 
@@ -140,6 +149,9 @@ export interface TitleBlockPatch {
   revision?: string
   sheet_index?: number
   sheet_count?: number
+  supplementary_title?: string
+  approved_by?: string
+  document_type?: string
 }
 
 // ── REST helpers ─────────────────────────────────────────────────────
@@ -275,8 +287,12 @@ export async function addView(
   drawingId: string,
   body: {
     name: string
-    source: ViewSource
+    /** The part to project; omit and pass `like_view` instead. */
+    source?: ViewSource
+    /** Another view of the same part as this view of the drawing. */
+    like_view?: string
     projection: ProjectionType
+    /** Omit and the kernel places the view in free space. */
     position_mm?: [number, number]
     scale?: number
   },

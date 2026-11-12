@@ -342,6 +342,18 @@ pub(crate) fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
     }
 }
 
+/// The drawing frame (the border inside the margins) in sheet millimetres,
+/// y down.
+pub fn frame_rect(sheet: &SheetSize) -> super::layout::Rect2 {
+    let (ml, mr, mt, mb) = frame_margins(sheet);
+    super::layout::Rect2 {
+        x0: ml,
+        y0: mt,
+        x1: sheet.width() - mr,
+        y1: sheet.height() - mb,
+    }
+}
+
 /// Title-block (width, height) in mm. The block grows with sheet size
 /// so it stays legible without dominating the drawing area. Heights are
 /// generous (`row_h >= 12 mm` for the TITLE band) so labels and values

@@ -284,6 +284,77 @@ pub struct SheetLayout {
 /// and `place_dimensions`. The earlier `view_sheet_bbox_arr` helper
 /// (which duplicated this logic returning `[f64;4]` instead of `Rect2`) has
 /// been removed; callers that need the array form destructure `Rect2` directly.
+/// Clearance (mm) kept around a placed view: room for its own dimensions
+/// and label, which are laid out after it is placed.
+const VIEW_PLACEMENT_CLEARANCE_MM: f64 = 14.0;
+/// Step (mm) of the candidate grid a free view position is searched on.
+const VIEW_PLACEMENT_STEP_MM: f64 = 2.5;
+
+/// Where `view` can go on `drawing`'s sheet: the `position_mm` that puts its
+/// geometry inside the frame, clear (by [`VIEW_PLACEMENT_CLEARANCE_MM`]) of
+/// every view, label, dimension, table, note and the title block already
+/// laid out -- the free spot closest to view `near` (an index into
+/// `drawing.views`), else to the sheet centre. `None` when no spot on the
+/// sheet can hold it: the caller says so; a view is never placed on top of
+/// another.
+pub fn free_view_position(
+    drawing: &Drawing,
+    view: &ProjectedView,
+    near: Option<usize>,
+) -> Option<[f64; 2]> {
+    let sheet_h = drawing.sheet_size.height();
+    // The view's footprint at position (0, 0); a position (px, py) moves it
+    // by (+px, -py) in sheet (y-down) coordinates.
+    let mut probe = view.clone();
+    probe.position_mm = [0.0, 0.0];
+    let base = view_geometry_rect(&probe, sheet_h)?;
+    let frame = super::svg::frame_rect(&drawing.sheet_size);
+    let pad = VIEW_PLACEMENT_CLEARANCE_MM;
+    let obstacles: Vec<Rect2> = compute_layout(drawing)
+        .items
+        .into_iter()
+        .filter(|i| i.kind != SheetItemKind::ZoneRef)
+        .map(|i| i.bbox)
+        .collect();
+    let target = near
+        .and_then(|i| drawing.views.get(i))
+        .and_then(|v| view_geometry_rect(v, sheet_h))
+        .map(|r| [0.5 * (r.x0 + r.x1), 0.5 * (r.y0 + r.y1)])
+        .unwrap_or([0.5 * (frame.x0 + frame.x1), 0.5 * (frame.y0 + frame.y1)]);
+
+    let (w, h) = (base.width(), base.height());
+    let mut best: Option<([f64; 2], f64)> = None;
+    let mut x0 = frame.x0 + 2.0;
+    while x0 + w <= frame.x1 - 2.0 {
+        let mut y0 = frame.y0 + 2.0;
+        while y0 + h <= frame.y1 - 2.0 {
+            let cand = Rect2 {
+                x0,
+                y0,
+                x1: x0 + w,
+                y1: y0 + h,
+            };
+            let padded = Rect2 {
+                x0: cand.x0 - pad,
+                y0: cand.y0 - pad,
+                x1: cand.x1 + pad,
+                y1: cand.y1 + pad,
+            };
+            if obstacles.iter().all(|o| !padded.intersects(o, 0.0)) {
+                let c = [0.5 * (cand.x0 + cand.x1), 0.5 * (cand.y0 + cand.y1)];
+                let d = (c[0] - target[0]).hypot(c[1] - target[1]);
+                if best.map_or(true, |(_, bd)| d < bd) {
+                    // position: shift from the base footprint to `cand`.
+                    best = Some(([x0 - base.x0, base.y0 - y0], d));
+                }
+            }
+            y0 += VIEW_PLACEMENT_STEP_MM;
+        }
+        x0 += VIEW_PLACEMENT_STEP_MM;
+    }
+    best.map(|(p, _)| p)
+}
+
 pub(crate) fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<Rect2> {
     let mut x0 = f64::INFINITY;
     let mut y0 = f64::INFINITY;

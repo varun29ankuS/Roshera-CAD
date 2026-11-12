@@ -21,25 +21,25 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Pencil, Trash2, X } from 'lucide-react'
+import { X } from 'lucide-react'
 import {
-  ContextMenu,
-  ContextMenuHeader,
-  ContextMenuItem,
-  ContextMenuSeparator,
-} from '@/components/ui/context-menu'
+  DrawingSwitcher,
+  SheetActions,
+  SheetHint,
+  TitleBlockCard,
+  ViewsBar,
+  type PartRow,
+} from '@/components/panels/drawing-overlays'
 import {
   type Drawing,
   type DrawingFormat,
   type ProjectionAngle,
-  type ProjectionType,
   type SheetDimension,
   DrawingRefusal,
   setDrawingDimension,
   setDrawingProjection,
-  type SheetSize,
   addView,
-  createDrawing,
+  createPartDrawing,
   deleteDrawing,
   downloadDrawing,
   fetchDrawingSvg,
@@ -47,43 +47,10 @@ import {
   listDrawings,
   removeView,
   renameDrawing,
-  updateTitleBlock,
-  defaultTitleBlock,
-  type TitleBlock,
-  type TitleBlockPatch,
 } from '@/lib/drawings-api'
-import { type PartSummary, listParts } from '@/lib/parts-api'
+import { useSceneStore } from '@/stores/scene-store'
 import { useDocumentStore } from '@/stores/document-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
-
-// Default solid id used when a part is freshly selected. Solid ids in
-// the kernel are u32 sequence numbers starting at 1 — the first solid
-// in any newly-created part is always 1. Users can edit the field to
-// pick a later solid if the part contains several bodies.
-const DEFAULT_SOLID_ID = 1
-
-// The UI exposes only the 6 standard orthographic + isometric presets.
-// The kernel's `custom` projection carries a 9-element rotation matrix
-// which has no good keyboard-only editor; that variant is reachable
-// only via the agent/REST surface.
-type PresetProjectionKind = Exclude<ProjectionType['kind'], 'custom'>
-
-const PROJECTION_OPTIONS: { kind: PresetProjectionKind; label: string }[] = [
-  { kind: 'front', label: 'Front' },
-  { kind: 'top', label: 'Top' },
-  { kind: 'right', label: 'Right' },
-  { kind: 'bottom', label: 'Bottom' },
-  { kind: 'left', label: 'Left' },
-  { kind: 'isometric', label: 'Isometric' },
-]
-
-const SHEET_OPTIONS: { value: SheetSize; label: string }[] = [
-  { value: 'A4', label: 'A4 (297 × 210 mm)' },
-  { value: 'A3', label: 'A3 (420 × 297 mm)' },
-  { value: 'A2', label: 'A2 (594 × 420 mm)' },
-  { value: 'A1', label: 'A1 (841 × 594 mm)' },
-  { value: 'A0', label: 'A0 (1189 × 841 mm)' },
-]
 
 // CSS pixels per millimetre at the standard 96 DPI mapping. At zoom
 // `1.0` the sheet renders at its true physical size.
@@ -126,23 +93,6 @@ interface DrawingSummary {
   name: string
 }
 
-// Suggest the next free "Roshera N" name given the names already on the
-// server. Matches `^Roshera (\d+)$` and picks `max + 1`, falling back to
-// `1` when no Roshera-N drawing exists yet. Custom names are ignored so
-// the user's renames don't pollute the auto-suggested counter.
-function suggestRosheraName(existing: { name: string }[]): string {
-  let max = 0
-  const re = /^Roshera\s+(\d+)$/
-  for (const d of existing) {
-    const m = re.exec(d.name)
-    if (m) {
-      const n = parseInt(m[1], 10)
-      if (Number.isFinite(n) && n > max) max = n
-    }
-  }
-  return `Roshera ${max + 1}`
-}
-
 /** A dimension kind in a drafter's words, for the change box. */
 const DIM_KIND_WORDS: Record<string, string> = {
   extent: 'overall size',
@@ -163,40 +113,25 @@ export function DrawingsWorkspace() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Inline rename: which drawing's name is currently being edited in the
-  // sidebar, and the draft value the user is typing.
-  const [renamingId, setRenamingId] = useState<string | null>(null)
-  const [renameDraft, setRenameDraft] = useState<string>('')
-
-  // Right-click context menu for sidebar drawing rows. `null` = closed.
-  // `x`/`y` are viewport coordinates (we render at `position: fixed`).
-  const [contextMenu, setContextMenu] = useState<{
-    id: string
+  // ── Overlay state ────────────────────────────────────────────────
+  const [titleBlockOpen, setTitleBlockOpen] = useState(false)
+  const [viewsBusy, setViewsBusy] = useState(false)
+  // The last removed view, so its removal can be undone.
+  const [removedView, setRemovedView] = useState<{
     name: string
-    x: number
-    y: number
+    projection: Drawing['views'][number]['projection']
+    position_mm: [number, number]
+    scale: number
   } | null>(null)
-
-  // ── Form state ───────────────────────────────────────────────────
-  const [newName, setNewName] = useState('Roshera 1')
-  const [newSheet, setNewSheet] = useState<SheetSize>('A3')
-  const [viewName, setViewName] = useState('Front')
-  const [viewProjection, setViewProjection] = useState<PresetProjectionKind>('front')
-  const [viewSolidId, setViewSolidId] = useState<number>(DEFAULT_SOLID_ID)
-  const [viewScale, setViewScale] = useState<number>(1.0)
-  const [viewX, setViewX] = useState<number>(50)
-  const [viewY, setViewY] = useState<number>(50)
-  // Part picker — populated from `GET /api/parts`. `viewPartId` is the
-  // durable id passed into the `ViewSource::Part` on every add-view
-  // call. Without a selection we cannot resolve a `BRepModel` server-
-  // side, so the "Add View" button is disabled.
-  const [parts, setParts] = useState<PartSummary[]>([])
-  const [viewPartId, setViewPartId] = useState<string>('')
-  // Download format selector. PDF is the default — it's the universal
-  // review/archive deliverable and what most engineers expect when
-  // they hit "Download" on a drawing. DXF is the editable interchange
-  // format; SVG stays available for the lightweight web preview.
-  const [downloadFormat, setDownloadFormat] = useState<DrawingFormat>('pdf')
+  // Parts in this document a drawing can start from (the scene's solids).
+  const sceneObjects = useSceneStore((st) => st.objects)
+  const parts: PartRow[] = useMemo(
+    () =>
+      Array.from(sceneObjects.values())
+        .filter((o) => o.objectType !== 'datum' && o.visible !== false)
+        .map((o) => ({ id: o.id, name: o.name })),
+    [sceneObjects],
+  )
 
   // ── Editing the part from the sheet ──────────────────────────────
   // Clicking a dimension opens this editor at the cursor. Applying a new
@@ -320,10 +255,6 @@ export function DrawingsWorkspace() {
           setActiveId(ids[0])
         }
       }
-      // Keep the "New Drawing" name input one ahead of the existing
-      // Roshera-N counter so the user can spam "+ New" without
-      // bumping the field by hand.
-      setNewName(suggestRosheraName(summaries))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -345,28 +276,12 @@ export function DrawingsWorkspace() {
     }
   }, [])
 
-  const refreshParts = useCallback(async () => {
-    try {
-      const ps = await listParts()
-      setParts(ps)
-      // Seed the picker with the first part if nothing is selected yet
-      // (or if the previously selected part has been deleted).
-      setViewPartId((current) => {
-        if (current && ps.some((p) => p.id === current)) return current
-        return ps[0]?.id ?? ''
-      })
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [])
-
   useEffect(() => {
     // The viewport "Create Drawing" flow stashes the new drawing id and
     // flips the workspace mode; consume it here so this mount lands on
     // that sheet instead of the first in the list.
     const pending = useDocModeStore.getState().consumePendingDrawing()
     void refreshList(pending ?? undefined)
-    void refreshParts()
     // refreshList captures activeId for the deleted-id check; we only
     // want this on mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -385,17 +300,19 @@ export function DrawingsWorkspace() {
   }, [activeId, refreshActive])
 
   // ── Mutations ────────────────────────────────────────────────────
-  const handleCreate = useCallback(async () => {
-    if (!newName.trim()) return
-    setError(null)
-    try {
-      const id = await createDrawing(newName.trim(), newSheet)
-      await refreshList()
-      setActiveId(id)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [newName, newSheet, refreshList])
+  // A drawing starts from a part: the server builds the standard sheet.
+  const handleCreateFromPart = useCallback(
+    async (part: PartRow) => {
+      setError(null)
+      try {
+        const id = await createPartDrawing(part.id, part.name)
+        await refreshList(id)
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+      }
+    },
+    [refreshList],
+  )
 
   // Commit the rename to the server, refresh the active drawing so the
   // SVG (title-block TITLE text) re-renders, and exit edit mode. On
@@ -403,8 +320,6 @@ export function DrawingsWorkspace() {
   const commitRename = useCallback(
     async (id: string, name: string) => {
       const trimmed = name.trim()
-      setRenamingId(null)
-      setRenameDraft('')
       if (!trimmed) return
       // No-op if unchanged.
       const current = drawings.find((d) => d.id === id)?.name
@@ -423,11 +338,6 @@ export function DrawingsWorkspace() {
     [drawings, activeId, refreshList, refreshActive],
   )
 
-  const beginRename = useCallback((id: string, currentName: string) => {
-    setRenamingId(id)
-    setRenameDraft(currentName)
-  }, [])
-
   const handleDelete = useCallback(
     async (id: string) => {
       if (!confirm('Delete this drawing?')) return
@@ -445,61 +355,96 @@ export function DrawingsWorkspace() {
     [activeId, refreshList],
   )
 
-  const handleAddView = useCallback(async () => {
-    if (!activeId) return
-    if (!viewName.trim()) return
-    if (!viewPartId) {
-      setError('Select a part to project before adding a view.')
+  // "Add view ▸ Left": another view of the part already on the sheet; the
+  // kernel places it in free space (or refuses when the sheet is full).
+  const handleAddLike = useCallback(
+    async (kind: 'front' | 'top' | 'right' | 'left' | 'bottom' | 'isometric', label: string) => {
+      if (!activeId || !activeDrawing) return
+      const like =
+        activeDrawing.views.find((v) => v.projection.kind === 'front') ?? activeDrawing.views[0]
+      if (!like) return
+      setError(null)
+      setViewsBusy(true)
+      try {
+        await addView(activeId, {
+          name: label.toUpperCase(),
+          like_view: like.id,
+          projection: { kind },
+        })
+        await refreshActive(activeId)
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setViewsBusy(false)
+      }
+    },
+    [activeId, activeDrawing, refreshActive],
+  )
+
+  // Remove a view, keeping what is needed to put it back exactly.
+  const handleRemoveView = useCallback(
+    async (viewId: string) => {
+      if (!activeId || !activeDrawing) return
+      const v = activeDrawing.views.find((x) => x.id === viewId)
+      if (!v) return
+      setError(null)
+      setViewsBusy(true)
+      try {
+        await removeView(activeId, viewId)
+        setRemovedView({
+          name: v.name,
+          projection: v.projection,
+          position_mm: v.position_mm,
+          scale: v.scale,
+        })
+        await refreshActive(activeId)
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setViewsBusy(false)
+      }
+    },
+    [activeId, activeDrawing, refreshActive],
+  )
+
+  const undoRemoveView = useCallback(async () => {
+    if (!activeId || !activeDrawing || !removedView) return
+    const like = activeDrawing.views[0]
+    if (!like) {
+      setError('The last view was removed; start a new drawing from the part instead.')
+      setRemovedView(null)
       return
     }
-    setError(null)
+    setViewsBusy(true)
     try {
       await addView(activeId, {
-        name: viewName.trim(),
-        source: { kind: 'part', part_id: viewPartId, solid_id: viewSolidId },
-        projection: { kind: viewProjection },
-        position_mm: [viewX, viewY],
-        scale: viewScale,
+        name: removedView.name,
+        like_view: like.id,
+        projection: removedView.projection,
+        position_mm: removedView.position_mm,
+        scale: removedView.scale,
       })
+      setRemovedView(null)
       await refreshActive(activeId)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setViewsBusy(false)
     }
-  }, [
-    activeId,
-    viewName,
-    viewPartId,
-    viewSolidId,
-    viewProjection,
-    viewX,
-    viewY,
-    viewScale,
-    refreshActive,
-  ])
+  }, [activeId, activeDrawing, removedView, refreshActive])
 
-  const handleRemoveView = useCallback(
-    async (viewId: string) => {
-      if (!activeId) return
+  const handleDownload = useCallback(
+    async (format: DrawingFormat) => {
+      if (!activeDrawing) return
       setError(null)
       try {
-        await removeView(activeId, viewId)
-        await refreshActive(activeId)
+        await downloadDrawing(activeDrawing.id, activeDrawing.name, format)
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
       }
     },
-    [activeId, refreshActive],
+    [activeDrawing],
   )
-
-  const handleDownload = useCallback(async () => {
-    if (!activeDrawing) return
-    setError(null)
-    try {
-      await downloadDrawing(activeDrawing.id, activeDrawing.name, downloadFormat)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [activeDrawing, downloadFormat])
 
   // The SVG is server-rendered & deterministic. The kernel's
   // `escape_xml` helper sanitises every text-node string, and we never
@@ -733,313 +678,122 @@ export function DrawingsWorkspace() {
   )
 
   return (
-    <div className="flex flex-col flex-1 min-h-0 bg-background text-foreground">
-      {/* Error banner — same failed-action treatment as the other
-          workspaces: cross glyph + mono message, red only because it IS
-          an error state. */}
+    <div className="relative flex-1 min-h-0 bg-background text-foreground">
+      {/* The sheet fills the window; every control is a small overlay on it. */}
+      <div
+        ref={canvasRef}
+        className="absolute inset-0 overflow-hidden bg-muted/20 cursor-grab"
+        onMouseDown={onCanvasMouseDown}
+      >
+        {activeDrawing ? (
+          svg ? (
+            <div
+              className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full [&_[data-dim-id]]:cursor-pointer [&_[data-dim-id]:hover]:fill-blue-600 [&_[data-dim-editing]]:fill-blue-700 [&_[data-dim-editing]]:font-bold"
+              onClick={onSheetClick}
+              style={{
+                width: `${displayW}px`,
+                height: `${displayH}px`,
+                transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px))`,
+                willChange: 'transform',
+              }}
+              dangerouslySetInnerHTML={svgMarkup}
+            />
+          ) : (
+            <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
+              {loading ? 'Rendering…' : ''}
+            </div>
+          )
+        ) : (
+          <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground text-center px-6">
+            {drawings.length === 0
+              ? 'No drawings yet. Open the menu at the top left and start one from a part.'
+              : 'Choose a drawing from the menu at the top left.'}
+          </div>
+        )}
+      </div>
+
+      <DrawingSwitcher
+        drawings={drawings}
+        active={activeDrawing}
+        parts={parts}
+        onSelect={setActiveId}
+        onRename={(id, name) => void commitRename(id, name)}
+        onDelete={(id) => void handleDelete(id)}
+        onCreateFromPart={(part) => void handleCreateFromPart(part)}
+      />
+      {activeDrawing && (
+        <SheetActions
+          projection={activeDrawing.projection ?? 'third'}
+          projectionBusy={projectionBusy}
+          onProjection={(pr) => void changeProjection(pr)}
+          titleBlockOpen={titleBlockOpen}
+          onToggleTitleBlock={() => setTitleBlockOpen((o) => !o)}
+          onDownload={(f) => void handleDownload(f)}
+        />
+      )}
+      {activeDrawing && titleBlockOpen && (
+        <TitleBlockCard
+          key={`${activeDrawing.id}:${JSON.stringify(activeDrawing.title_block ?? null)}`}
+          drawing={activeDrawing}
+          onUpdated={(updated) => {
+            setActiveDrawing((prev) => (prev ? { ...prev, title_block: updated } : prev))
+            void refreshActive(activeDrawing.id)
+          }}
+          onError={setError}
+          onClose={() => setTitleBlockOpen(false)}
+        />
+      )}
+      {activeDrawing && (
+        <ViewsBar
+          drawing={activeDrawing}
+          busy={viewsBusy}
+          onRemove={(id) => void handleRemoveView(id)}
+          onAdd={(kind, label) => void handleAddLike(kind, label)}
+        />
+      )}
+      {activeDrawing && svg && <SheetHint />}
+
       {error && (
         <div
           role="alert"
-          className="flex items-baseline gap-1.5 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-xs"
+          className="absolute top-14 left-1/2 -translate-x-1/2 z-30 flex items-baseline gap-1.5 max-w-[min(640px,calc(100%-24px))] rounded-md border border-destructive/30 bg-card px-3 py-2 text-xs shadow-md"
         >
           <span className="inline-flex shrink-0 translate-y-px text-red-600 dark:text-red-400">
             <X size={11} />
           </span>
-          <span className="select-text font-mono text-red-700 dark:text-red-300">{error}</span>
+          <span className="select-text text-red-700 dark:text-red-300">{error}</span>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={() => setError(null)}
+            className="cad-focus ml-1 text-muted-foreground hover:text-foreground"
+          >
+            <X size={12} />
+          </button>
         </div>
       )}
 
-      <div className="flex flex-1 min-h-0">
-        {/* ── Drawings list sidebar ───────────────────────────────── */}
-        <aside className="w-64 flex flex-col border-r border-border/60 bg-background/40">
-          <div className="px-3 py-2 border-b border-border/60">
-            <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-              Drawings
-            </div>
-          </div>
-
-          {/* New drawing form */}
-          <div className="px-3 py-2 space-y-2 border-b border-border/40">
-            <input
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              placeholder="Name"
-              className="cad-focus w-full px-2 py-1 text-xs rounded border border-border bg-background"
-            />
-            <select
-              value={typeof newSheet === 'string' ? newSheet : 'CUSTOM'}
-              onChange={(e) => setNewSheet(e.target.value as SheetSize)}
-              className="cad-focus w-full px-2 py-1 text-xs rounded border border-border bg-background"
-            >
-              {SHEET_OPTIONS.map((s) => (
-                <option key={s.label} value={s.value as string}>
-                  {s.label}
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              onClick={handleCreate}
-              className="cad-focus w-full py-1 text-xs font-medium rounded bg-primary text-primary-foreground hover:opacity-90"
-            >
-              + New Drawing
-            </button>
-          </div>
-
-          {/* Existing drawings */}
-          <div className="flex-1 min-h-0 overflow-y-auto py-1">
-            {drawings.length === 0 ? (
-              <div className="px-3 py-4 text-xs text-muted-foreground text-center">
-                No drawings in this document yet — create one above, or
-                right-click a part and choose Create Drawing.
-              </div>
-            ) : (
-              drawings.map((d) => {
-                const isActive = d.id === activeId
-                const isRenaming = renamingId === d.id
-                // Row layout — no onClick on the row itself; the
-                // activation click target is a sibling button next to
-                // the icon buttons. This removes ALL click-bubble
-                // ambiguity (the previous nested layout could swallow
-                // the icon-button clicks even with stopPropagation).
-                return (
-                  <div
-                    key={d.id}
-                    className={[
-                      'group flex items-stretch gap-0.5 text-xs',
-                      isActive
-                        ? 'bg-accent/40 text-foreground'
-                        : 'text-muted-foreground hover:bg-accent/20',
-                    ].join(' ')}
-                    onContextMenu={(e) => {
-                      e.preventDefault()
-                      setContextMenu({ id: d.id, name: d.name, x: e.clientX, y: e.clientY })
-                    }}
-                  >
-                    {isRenaming ? (
-                      // Inline rename input. Enter commits, Escape cancels.
-                      // No onBlur auto-commit: it raced with autoFocus on
-                      // mount (focus transitioning through body could fire
-                      // a stale blur immediately) AND double-fired after
-                      // Enter/Escape (the unmount blur triggered a redundant
-                      // commitRename). Explicit Enter/Escape is predictable
-                      // and matches Finder/Explorer rename UX.
-                      <input
-                        autoFocus
-                        value={renameDraft}
-                        onChange={(e) => setRenameDraft(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault()
-                            void commitRename(d.id, renameDraft)
-                          } else if (e.key === 'Escape') {
-                            e.preventDefault()
-                            setRenamingId(null)
-                            setRenameDraft('')
-                          }
-                        }}
-                        title="Press Enter to save, Esc to cancel"
-                        className="cad-focus flex-1 min-w-0 mx-3 my-0.5 px-1 py-0 text-xs rounded border border-border bg-background"
-                      />
-                    ) : (
-                      <>
-                        {/* Activation target — selects the drawing.
-                            Double-click enters rename. Single-click
-                            elsewhere does NOT trigger the icon buttons
-                            because they are siblings, not children. */}
-                        <button
-                          type="button"
-                          onClick={() => setActiveId(d.id)}
-                          onDoubleClick={() => beginRename(d.id, d.name)}
-                          title="Double-click to rename"
-                          className="cad-focus flex-1 min-w-0 px-3 py-1.5 text-left truncate"
-                        >
-                          {d.name}
-                        </button>
-                        {/* Icon button group — siblings of the
-                            activation button. `flex-shrink-0` keeps
-                            them visible regardless of name length;
-                            `opacity-60` keeps them discoverable at
-                            rest. The 24×24 click target meets the
-                            24-px MAS touch-target minimum. */}
-                        <div className="flex-shrink-0 flex items-center gap-0.5 pr-2 opacity-60 group-hover:opacity-100 transition-opacity">
-                          <button
-                            type="button"
-                            title="Rename drawing"
-                            aria-label="Rename drawing"
-                            onClick={() => beginRename(d.id, d.name)}
-                            className="cad-focus inline-flex items-center justify-center w-6 h-6 rounded text-muted-foreground hover:text-foreground hover:bg-accent/40 transition-colors"
-                          >
-                            <Pencil size={12} aria-hidden="true" />
-                          </button>
-                          <button
-                            type="button"
-                            title="Delete drawing"
-                            aria-label="Delete drawing"
-                            onClick={() => void handleDelete(d.id)}
-                            className="cad-focus inline-flex items-center justify-center w-6 h-6 rounded text-destructive hover:text-destructive hover:bg-destructive/15 transition-colors"
-                          >
-                            <Trash2 size={12} aria-hidden="true" />
-                          </button>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                )
-              })
-            )}
-          </div>
-        </aside>
-
-        {/* ── Center pane: SVG preview ─────────────────────────────── */}
-        <main className="flex-1 flex flex-col min-h-0">
-          {/* Active-drawing header. The title acts as a one-click
-              rename entry-point — clicking the displayed name swaps it
-              for an inline input, and committing flows through the
-              same `renameDrawing` PATCH the sidebar uses. The title
-              block in the SVG is regenerated from `drawing.name`, so
-              committing here re-renders the title block. */}
-          <div className="flex items-center justify-between px-4 py-2 border-b border-border/60">
-            <div className="flex items-center gap-3">
-              {activeDrawing && renamingId === activeDrawing.id ? (
-                // See sidebar input: Enter commits, Esc cancels. No onBlur
-                // auto-commit (raced with autoFocus + double-fired on
-                // Enter/Escape unmount blur).
-                <input
-                  autoFocus
-                  value={renameDraft}
-                  onChange={(e) => setRenameDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault()
-                      void commitRename(activeDrawing.id, renameDraft)
-                    } else if (e.key === 'Escape') {
-                      e.preventDefault()
-                      setRenamingId(null)
-                      setRenameDraft('')
-                    }
-                  }}
-                  title="Press Enter to save, Esc to cancel"
-                  className="cad-focus text-sm font-medium px-2 py-0.5 rounded border border-border bg-background min-w-[18ch]"
-                />
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (activeDrawing) beginRename(activeDrawing.id, activeDrawing.name)
-                  }}
-                  disabled={!activeDrawing}
-                  className="cad-focus text-sm font-medium hover:underline disabled:cursor-default disabled:no-underline"
-                  title={activeDrawing ? 'Click to rename (title-block TITLE)' : ''}
-                >
-                  {activeDrawing?.name ?? (loading ? 'Loading…' : '— no drawing selected —')}
-                </button>
-              )}
-              {activeDrawing && (
-                <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                  {typeof activeDrawing.sheet_size === 'string'
-                    ? activeDrawing.sheet_size
-                    : 'Custom'}
-                  &nbsp;·&nbsp;
-                  {activeDrawing.views.length} view{activeDrawing.views.length === 1 ? '' : 's'}
-                </span>
-              )}
-            </div>
-            {activeDrawing && (
-              <div className="flex items-center gap-1">
-                {/* Projection method: first angle (ISO; India, Europe) or
-                    third angle (ASME). Peers hug as one segmented control. */}
-                <div
-                  role="radiogroup"
-                  aria-label="Projection"
-                  className="flex items-center rounded border border-border overflow-hidden mr-1"
-                >
-                  {(['first', 'third'] as const).map((p) => {
-                    const active = (activeDrawing.projection ?? 'third') === p
-                    return (
-                      <button
-                        key={p}
-                        type="button"
-                        role="radio"
-                        aria-checked={active}
-                        disabled={projectionBusy}
-                        onClick={() => void changeProjection(p)}
-                        title={
-                          p === 'first'
-                            ? 'First-angle projection (ISO): TOP below FRONT, RIGHT to its left'
-                            : 'Third-angle projection (ASME): TOP above FRONT, RIGHT to its right'
-                        }
-                        className={`cad-focus px-2 py-1 text-xs ${
-                          active ? 'bg-accent/30 font-medium' : 'hover:bg-accent/20'
-                        }`}
-                      >
-                        {p === 'first' ? '1st angle' : '3rd angle'}
-                      </button>
-                    )
-                  })}
-                </div>
-                <select
-                  value={downloadFormat}
-                  onChange={(e) => setDownloadFormat(e.target.value as DrawingFormat)}
-                  title="Download format"
-                  className="cad-focus px-2 py-1 text-xs rounded border border-border bg-background"
-                >
-                  <option value="pdf">PDF</option>
-                  <option value="dxf">DXF</option>
-                  <option value="svg">SVG</option>
-                </select>
-                <button
-                  type="button"
-                  onClick={() => void handleDownload()}
-                  className="cad-focus px-3 py-1 text-xs rounded border border-border hover:bg-accent/20"
-                >
-                  Download
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* SVG canvas. Outer is `overflow-hidden` — pan/zoom is
-              driven by a CSS transform on the sheet, so there are no
-              scroll boundaries. The sheet is absolutely positioned at
-              the canvas centre and translated by `pan`; that lets the
-              user drag it anywhere in 2D regardless of zoom level.
-              The svg's intrinsic `width="297mm"` is overridden by CSS
-              (`[&>svg]:w-full [&>svg]:h-full`) so it scales to the
-              wrapper's pixel dimensions while keeping its `viewBox`
-              aspect.
-          */}
-          <div
-            ref={canvasRef}
-            className="flex-1 min-h-0 overflow-hidden bg-muted/20 relative cursor-grab"
-            onMouseDown={onCanvasMouseDown}
+      {removedView && (
+        <div className="absolute bottom-14 left-3 z-30 flex items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs shadow-md">
+          <span>Removed view {removedView.name}</span>
+          <button
+            type="button"
+            disabled={viewsBusy}
+            onClick={() => void undoRemoveView()}
+            className="cad-focus font-medium text-primary hover:underline"
           >
-            {activeDrawing ? (
-              svg ? (
-                <div
-                  className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full [&_[data-dim-id]]:cursor-pointer [&_[data-dim-id]:hover]:fill-blue-600 [&_[data-dim-editing]]:fill-blue-700 [&_[data-dim-editing]]:font-bold"
-                  onClick={onSheetClick}
-                  title="Click a dimension to change the part"
-                  style={{
-                    width: `${displayW}px`,
-                    height: `${displayH}px`,
-                    transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px))`,
-                    willChange: 'transform',
-                  }}
-                  dangerouslySetInnerHTML={svgMarkup}
-                />
-              ) : (
-                <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
-                  Rendering…
-                </div>
-              )
-            ) : (
-              <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground text-center px-6">
-                {drawings.length === 0
-                  ? 'Create a drawing from the sidebar to get started.'
-                  : 'Select a drawing from the sidebar.'}
-              </div>
-            )}
+            Undo
+          </button>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={() => setRemovedView(null)}
+            className="cad-focus text-muted-foreground hover:text-foreground"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      )}
 
             {dimEdit && (
               <div
@@ -1122,7 +876,7 @@ export function DrawingsWorkspace() {
             )}
 
             {editNote && (
-              <div className="absolute top-3 left-3 flex items-center gap-2 bg-card border border-border rounded-md shadow-md px-2 py-1 text-xs">
+              <div className="absolute top-14 left-3 z-20 flex items-center gap-2 bg-card border border-border rounded-md shadow-md px-2 py-1 text-xs">
                 <span aria-hidden className="text-green-700">✓</span>
                 <span className="font-mono">{editNote}</span>
                 <button
@@ -1140,7 +894,7 @@ export function DrawingsWorkspace() {
                 so the user can rescue the view if the sheet renders
                 off-screen at native physical size. */}
             {activeDrawing && (
-              <div className="absolute bottom-3 right-3 flex items-center gap-0.5 bg-card border border-border rounded-md shadow-md px-1 py-1 select-none">
+              <div className="absolute bottom-3 right-3 z-20 flex items-center gap-0.5 bg-card border border-border rounded-md shadow-md px-1 py-1 select-none">
                 <button
                   type="button"
                   onClick={zoomOut}
@@ -1184,400 +938,8 @@ export function DrawingsWorkspace() {
                 </button>
               </div>
             )}
-          </div>
 
-          {/* Views list + add-view form */}
-          {activeDrawing && (
-            <div className="border-t border-border/60 bg-background/40">
-              {/* Existing views */}
-              {activeDrawing.views.length > 0 && (
-                <div className="px-4 py-2 border-b border-border/40 flex flex-wrap gap-2">
-                  {activeDrawing.views.map((v) => (
-                    <span
-                      key={v.id}
-                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-accent/30 text-[11px]"
-                    >
-                      <span className="font-mono">{v.name}</span>
-                      <span className="text-muted-foreground">({v.projection.kind})</span>
-                      <button
-                        type="button"
-                        onClick={() => void handleRemoveView(v.id)}
-                        title="Remove view"
-                        className="cad-focus ml-1 text-destructive hover:text-destructive/80 text-[11px]"
-                      >
-                        ✕
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
-
-              {/* Title block editor — collapsed by default so it never
-                  steals attention from the sheet, but accessible in one
-                  click. All edits PATCH on blur and merge the response
-                  back into local state so the rendered SVG refreshes
-                  immediately. */}
-              <TitleBlockEditor
-                drawing={activeDrawing}
-                onUpdated={(updated) => {
-                  setActiveDrawing((prev) =>
-                    prev ? { ...prev, title_block: updated } : prev,
-                  )
-                  // Re-fetch the SVG so the live sheet preview reflects
-                  // the new title-block text. `refreshActive` is async
-                  // but we don't await it — the local state update has
-                  // already redrawn the editor; the SVG catches up on
-                  // its own.
-                  void refreshActive(activeDrawing.id)
-                }}
-                onError={setError}
-              />
-
-              {/* Add-view form */}
-              <div className="flex flex-wrap items-end gap-2 px-4 py-2">
-                <Field label="View name">
-                  <input
-                    value={viewName}
-                    onChange={(e) => setViewName(e.target.value)}
-                    className="cad-focus w-28 px-2 py-1 text-xs rounded border border-border bg-background"
-                  />
-                </Field>
-                <Field label="Projection">
-                  <select
-                    value={viewProjection}
-                    onChange={(e) =>
-                      setViewProjection(e.target.value as PresetProjectionKind)
-                    }
-                    className="cad-focus px-2 py-1 text-xs rounded border border-border bg-background"
-                  >
-                    {PROJECTION_OPTIONS.map((p) => (
-                      <option key={p.kind} value={p.kind}>
-                        {p.label}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-                <Field label="Part">
-                  <select
-                    value={viewPartId}
-                    onChange={(e) => setViewPartId(e.target.value)}
-                    onFocus={() => void refreshParts()}
-                    title="Source part — geometry is resolved server-side from the active PartManager."
-                    className="cad-focus min-w-[10rem] px-2 py-1 text-xs rounded border border-border bg-background"
-                  >
-                    {parts.length === 0 ? (
-                      <option value="">No parts</option>
-                    ) : (
-                      parts.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name} ({p.solid_count} solid{p.solid_count === 1 ? '' : 's'})
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </Field>
-                <Field label="Solid id">
-                  <input
-                    type="number"
-                    min={1}
-                    value={viewSolidId}
-                    onChange={(e) => setViewSolidId(parseInt(e.target.value, 10) || 1)}
-                    className="cad-focus w-16 px-2 py-1 text-xs rounded border border-border bg-background"
-                  />
-                </Field>
-                <Field label="Scale">
-                  <input
-                    type="number"
-                    min={0.01}
-                    step={0.1}
-                    value={viewScale}
-                    onChange={(e) => setViewScale(parseFloat(e.target.value) || 1.0)}
-                    className="cad-focus w-16 px-2 py-1 text-xs rounded border border-border bg-background"
-                  />
-                </Field>
-                <Field label="X (mm)">
-                  <input
-                    type="number"
-                    value={viewX}
-                    onChange={(e) => setViewX(parseFloat(e.target.value) || 0)}
-                    className="cad-focus w-16 px-2 py-1 text-xs rounded border border-border bg-background"
-                  />
-                </Field>
-                <Field label="Y (mm)">
-                  <input
-                    type="number"
-                    value={viewY}
-                    onChange={(e) => setViewY(parseFloat(e.target.value) || 0)}
-                    className="cad-focus w-16 px-2 py-1 text-xs rounded border border-border bg-background"
-                  />
-                </Field>
-                <button
-                  type="button"
-                  onClick={handleAddView}
-                  disabled={!viewPartId}
-                  title={viewPartId ? '' : 'Select a part first.'}
-                  className="cad-focus px-3 py-1 text-xs font-medium rounded bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  + Add View
-                </button>
-              </div>
-            </div>
-          )}
-        </main>
-      </div>
-      {/* Right-click context menu for sidebar drawing rows — the shared
-          primitive (portal, edge-flip, keyboard, dismissal). */}
-      {contextMenu && (
-        <ContextMenu
-          x={contextMenu.x}
-          y={contextMenu.y}
-          onClose={() => setContextMenu(null)}
-          aria-label="Drawing actions"
-        >
-          <ContextMenuHeader>{contextMenu.name}</ContextMenuHeader>
-          <ContextMenuSeparator />
-          <ContextMenuItem
-            onClick={() => {
-              beginRename(contextMenu.id, contextMenu.name)
-              setContextMenu(null)
-            }}
-          >
-            <Pencil size={13} />
-            Rename
-          </ContextMenuItem>
-          <ContextMenuSeparator />
-          <ContextMenuItem
-            danger
-            onClick={() => {
-              const id = contextMenu.id
-              setContextMenu(null)
-              void handleDelete(id)
-            }}
-          >
-            <Trash2 size={13} />
-            Delete
-          </ContextMenuItem>
-        </ContextMenu>
-      )}
     </div>
   )
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <label className="flex flex-col gap-0.5">
-      <span className="text-[11px] uppercase tracking-wider text-muted-foreground">{label}</span>
-      {children}
-    </label>
-  )
-}
-
-/**
- * Compact, collapsible editor for the drawing's title-block metadata.
- *
- * Strategy: maintain a local `draft` copy of the title block so users
- * can type freely. On blur, diff against the original and PATCH only
- * the changed fields. The server returns the canonical updated block,
- * which we lift back up via `onUpdated`.
- *
- * `drawing.name` and the SCALE / SIZE cells are NOT shown here — they
- * are edited elsewhere (the sidebar rename for TITLE; the sheet size
- * picker on create; per-view scale). This keeps the editor focused on
- * the cells that are *only* reachable through this surface.
- */
-function TitleBlockEditor({
-  drawing,
-  onUpdated,
-  onError,
-}: {
-  drawing: Drawing
-  onUpdated: (updated: TitleBlock) => void
-  onError: (msg: string) => void
-}) {
-  // Server truth — re-seeded when the drawing's title_block reference
-  // changes (e.g. after the user switches drawings or a PATCH lifts
-  // canonical state back up). Falls back to defaults if the api-server
-  // is pre-upgrade and doesn't ship the field yet — the editor stays
-  // visible so the user can still type values; the PATCH will land
-  // once the backend is restarted.
-  //
-  // **Critical**: memoise on `drawing.title_block` identity. Without
-  // this, the `?? defaultTitleBlock()` fallback minted a fresh object
-  // every render, the effect below fired every render, and every
-  // keystroke was immediately overwritten — input fields appeared to
-  // be read-only.
-  const original = useMemo(
-    () => drawing.title_block ?? defaultTitleBlock(),
-    [drawing.title_block],
-  )
-  const [draft, setDraft] = useState<TitleBlock>(original)
-  useEffect(() => {
-    setDraft(original)
-  }, [original])
-
-  // Diff helper: produces the smallest patch that explains the
-  // difference between `draft` and `original`. `drawing_number` is
-  // special-cased because the wire shape distinguishes "omit", "null"
-  // (clear), and "string" (set).
-  const buildPatch = useCallback((): TitleBlockPatch | null => {
-    const patch: TitleBlockPatch = {}
-    if (draft.drawn_by !== original.drawn_by) patch.drawn_by = draft.drawn_by
-    if (draft.date !== original.date) patch.date = draft.date
-    if (draft.material !== original.material) patch.material = draft.material
-    if (draft.revision !== original.revision) patch.revision = draft.revision
-    if (draft.sheet_index !== original.sheet_index) patch.sheet_index = draft.sheet_index
-    if (draft.sheet_count !== original.sheet_count) patch.sheet_count = draft.sheet_count
-    if (draft.drawing_number !== original.drawing_number) {
-      // Empty string is treated as "clear override" on the client.
-      const v = draft.drawing_number
-      patch.drawing_number = v && v.trim() !== '' ? v : null
-    }
-    return Object.keys(patch).length === 0 ? null : patch
-  }, [draft, original])
-
-  const commit = useCallback(async () => {
-    const patch = buildPatch()
-    if (!patch) return
-    try {
-      const updated = await updateTitleBlock(drawing.id, patch)
-      onUpdated(updated)
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e))
-      // Roll back to the server-known good state so the user is not
-      // left looking at edits that didn't land.
-      setDraft(original)
-    }
-  }, [buildPatch, drawing.id, onError, onUpdated, original])
-
-  // `clearDrawingNumber` is the explicit "revert to auto-derived" path.
-  const clearDrawingNumber = useCallback(() => {
-    setDraft((d) => ({ ...d, drawing_number: null }))
-  }, [])
-
-  return (
-    <details className="border-b border-border/40 group">
-      <summary className="cursor-pointer select-none px-4 py-1.5 text-[11px] uppercase tracking-wider text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors">
-        Title block
-        <span className="ml-2 text-foreground/70 normal-case tracking-normal">
-          {summariseTitleBlock(draft)}
-        </span>
-      </summary>
-      <form
-        className="flex flex-wrap items-end gap-2 px-4 pb-2 pt-1"
-        onSubmit={(e) => {
-          e.preventDefault()
-          void commit()
-        }}
-      >
-        <Field label="Drawn by">
-          <input
-            value={draft.drawn_by}
-            placeholder="—"
-            onChange={(e) => setDraft({ ...draft, drawn_by: e.target.value })}
-            onBlur={() => void commit()}
-            className="cad-focus w-28 px-2 py-1 text-xs rounded border border-border bg-background"
-          />
-        </Field>
-        <Field label="Date">
-          <input
-            value={draft.date}
-            placeholder="YYYY-MM-DD"
-            onChange={(e) => setDraft({ ...draft, date: e.target.value })}
-            onBlur={() => void commit()}
-            className="cad-focus w-28 px-2 py-1 text-xs rounded border border-border bg-background"
-          />
-        </Field>
-        <Field label="Material">
-          <input
-            value={draft.material}
-            placeholder="e.g. 6061-T6"
-            onChange={(e) => setDraft({ ...draft, material: e.target.value })}
-            onBlur={() => void commit()}
-            className="cad-focus w-32 px-2 py-1 text-xs rounded border border-border bg-background"
-          />
-        </Field>
-        <Field label="Drawing no.">
-          <div className="flex items-center gap-1">
-            <input
-              value={draft.drawing_number ?? ''}
-              placeholder="auto"
-              onChange={(e) => setDraft({ ...draft, drawing_number: e.target.value })}
-              onBlur={() => void commit()}
-              className="cad-focus w-32 px-2 py-1 text-xs rounded border border-border bg-background"
-            />
-            {draft.drawing_number !== null && (
-              <button
-                type="button"
-                onClick={() => {
-                  clearDrawingNumber()
-                  // Persist immediately so the user gets a clean "auto"
-                  // state without needing to tab out of a field that no
-                  // longer holds focus.
-                  setTimeout(() => void commit(), 0)
-                }}
-                title="Revert to auto-derived ID"
-                className="cad-focus text-[11px] text-muted-foreground hover:text-foreground px-1"
-              >
-                auto
-              </button>
-            )}
-          </div>
-        </Field>
-        <Field label="Rev">
-          <input
-            value={draft.revision}
-            placeholder="A"
-            onChange={(e) => setDraft({ ...draft, revision: e.target.value })}
-            onBlur={() => void commit()}
-            className="cad-focus w-12 px-2 py-1 text-xs rounded border border-border bg-background"
-          />
-        </Field>
-        <Field label="Sheet">
-          <div className="flex items-center gap-1">
-            <input
-              type="number"
-              min={1}
-              value={draft.sheet_index}
-              onChange={(e) =>
-                setDraft({
-                  ...draft,
-                  sheet_index: Math.max(1, parseInt(e.target.value, 10) || 1),
-                })
-              }
-              onBlur={() => void commit()}
-              className="cad-focus w-12 px-2 py-1 text-xs rounded border border-border bg-background"
-            />
-            <span className="text-[11px] text-muted-foreground">of</span>
-            <input
-              type="number"
-              min={1}
-              value={draft.sheet_count}
-              onChange={(e) =>
-                setDraft({
-                  ...draft,
-                  sheet_count: Math.max(1, parseInt(e.target.value, 10) || 1),
-                })
-              }
-              onBlur={() => void commit()}
-              className="cad-focus w-12 px-2 py-1 text-xs rounded border border-border bg-background"
-            />
-          </div>
-        </Field>
-        {/* Submit on Enter without showing a button — the form's
-            onSubmit handles it. */}
-        <button type="submit" className="sr-only">
-          Save
-        </button>
-      </form>
-    </details>
-  )
-}
-
-/** One-line summary shown next to the `<summary>` so the collapsed
- *  state still reveals who/when/material at a glance. */
-function summariseTitleBlock(tb: TitleBlock): string {
-  const drawn = tb.drawn_by.trim() || '—'
-  const date = tb.date.trim() || '—'
-  const rev = tb.revision.trim() || '—'
-  return `${drawn} · ${date} · Rev ${rev} · Sheet ${tb.sheet_index} of ${tb.sheet_count}`
-}

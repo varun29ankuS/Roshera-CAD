@@ -382,9 +382,12 @@ export function DocumentTabs() {
                       hover. The id fragment stays INLINE for ambiguous names only
                       — two tabs reading the same word, with the discriminator
                       hidden behind a hover, is worse than a little noise. */}
+                  {/* Two tabs reading the same word are told apart by WHEN
+                      they were made -- a person recognises a time, not a hex
+                      id (the full id stays in the tooltip). */}
                   {ambiguousNames.has(doc.name) && (
-                    <span className="shrink-0 font-mono text-[11px] text-muted-foreground/60">
-                      · {idFragment(doc.id)}
+                    <span className="shrink-0 text-[11px] text-muted-foreground/70">
+                      · {formatShortDate(doc.createdAt)}
                     </span>
                   )}
                 </span>

@@ -11038,6 +11038,83 @@ async fn scrubbing_back_and_forward_reads_frames() {
     }
 }
 
+/// "Add view ▸ Left" on an ordinary drawing: another view of the part
+/// already on the sheet, placed by the kernel in free space. Before, a
+/// drawing owned by the document refused every added view (the source had to
+/// name a part-tab), and the form asked for X/Y in millimetres.
+#[tokio::test]
+async fn adding_a_view_like_an_existing_one_places_itself() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (cs, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "drawing create: {created}");
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let views_before = sheet["views"].as_array().map(Vec::len).unwrap_or(0);
+    let front = sheet["views"]
+        .as_array()
+        .and_then(|vs| vs.iter().find(|v| v["projection"]["kind"] == "front"))
+        .and_then(|v| v["id"].as_str())
+        .expect("a FRONT view")
+        .to_string();
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/drawings/{drawing_id}/views"),
+            json!({ "name": "LEFT", "like_view": front, "projection": {"kind": "left"} }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add view: {body}");
+
+    // Neither a source nor a view to copy: refused by name.
+    let (bad, refusal) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/drawings/{drawing_id}/views"),
+            json!({ "name": "X", "projection": {"kind": "top"} }),
+        ),
+    )
+    .await;
+    assert!(bad.is_client_error(), "{bad} {refusal}");
+    assert!(refusal.to_string().contains("like_view"), "{refusal}");
+
+    let uuid = Uuid::parse_str(&drawing_id).expect("uuid");
+    let handle = state.drawings.get(&uuid).expect("drawing registered");
+    let drawing = handle.read().await.clone();
+    assert_eq!(drawing.views.len(), views_before + 1, "one view added");
+    let layout = geometry_engine::drawing::layout::compute_layout(&drawing);
+    let geo: Vec<_> = layout
+        .items
+        .iter()
+        .filter(|i| i.kind == geometry_engine::drawing::layout::SheetItemKind::ViewGeometry)
+        .collect();
+    let new_idx = drawing.views.len() - 1;
+    let new_rect = geo
+        .iter()
+        .find(|i| i.owner_view == Some(new_idx))
+        .expect("the new view is drawn")
+        .bbox;
+    for other in geo.iter().filter(|i| i.owner_view != Some(new_idx)) {
+        assert!(
+            !new_rect.intersects(&other.bbox, 0.0),
+            "the new view overlaps view {:?}",
+            other.owner_view
+        );
+    }
+}
+
 /// A dimension nothing on the timeline drives is refused as reference-only,
 /// never "edited" by scaling or approximation.
 #[tokio::test]

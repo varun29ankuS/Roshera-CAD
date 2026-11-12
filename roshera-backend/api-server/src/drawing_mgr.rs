@@ -451,16 +451,27 @@ pub struct AddViewRequest {
     /// [`PartManager`](crate::part_mgr::PartManager) at projection
     /// time; the resulting [`ProjectedView::source`] is stored on the
     /// view so subsequent renders and round-trips remain pinned to the
-    /// same part regardless of the active tab.
-    pub source: ViewSource,
+    /// same part regardless of the active tab. Omit it and pass
+    /// `like_view` to add another view of a part already on the sheet.
+    #[serde(default)]
+    pub source: Option<ViewSource>,
+    /// Add another view of the SAME part as this view of the drawing (the
+    /// "Add view ▸ Left" action): its source and scale are reused and the
+    /// drawing's own model is projected, so a drawing owned by a document
+    /// takes new views too.
+    #[serde(default)]
+    pub like_view: Option<Uuid>,
     /// Projection preset.
     pub projection: ProjectionType,
     /// Sheet-space placement of the view's local origin, in millimetres.
+    /// Omit it and the kernel places the view in free space near the view
+    /// it was taken from (`free_view_position`), or refuses when the sheet
+    /// has no room.
     #[serde(default)]
-    pub position_mm: [f64; 2],
-    /// View-to-sheet scale. Defaults to 1.0.
-    #[serde(default = "default_scale")]
-    pub scale: f64,
+    pub position_mm: Option<[f64; 2]>,
+    /// View-to-sheet scale. Defaults to the `like_view`'s scale, else 1.0.
+    #[serde(default)]
+    pub scale: Option<f64>,
 }
 
 fn default_scale() -> f64 {
@@ -749,7 +760,7 @@ pub async fn add_view(
             "view name must not be empty",
         ));
     }
-    if !req.scale.is_finite() || req.scale <= 0.0 {
+    if req.scale.is_some_and(|sc| !sc.is_finite() || sc <= 0.0) {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
             "scale must be a positive finite number",
@@ -760,72 +771,114 @@ pub async fn add_view(
         .get_with_owner(&id)
         .ok_or_else(|| not_found(id))?;
 
-    // Resolve the BRepModel from the durable part_id carried on the
-    // request. Doing this here keeps the view source explicit on the
-    // wire (no dependency on which tab the client happens to have
-    // active) and makes the recorded event reproducible.
-    let ViewSource::Part { part_id, .. } = req.source;
-
-    // Owner-consistency gate (drawing-ownership fix, 2026-08-16). Every
-    // view this route accepts is part-sourced BY CONTRACT — `part_id`
-    // must resolve against `PartManager` a few lines below, so it is a
-    // real `PartManager` id, never the "viewport uuid or nil" `part_id`
-    // can otherwise hold on a kernel-solid-id-keyed drawing (see the
-    // module doc). A view whose part does NOT match the drawing's OWNER
-    // would make every later owner-scoped read (certify, `/semantic`,
-    // `/certificate`, the export gates) measure this ONE view against the
-    // WRONG model — a fresh, deterministic lie this fix would otherwise
-    // have INTRODUCED, and strictly worse than the pre-fix aliasing bug:
-    // today's caller could at least reach truth by sending the right
-    // header at READ time; post-fix nothing they send at read time
-    // matters at all, so a mis-sourced view would be permanently wrong.
-    // Refused here, at the one place `part_id` is trustworthy — an
-    // existing drawing's owner is fixed at creation (see the module doc)
-    // and cannot be inferred from a view source after the fact.
-    match &owner {
-        ModelKey::Part { id: owner_part } if *owner_part != part_id => {
+    // Another view of a part already on the sheet: the source comes from the
+    // drawing itself, so the ownership rules below are satisfied by
+    // construction and the drawing's own model is projected.
+    let (source, scale, near, model_handle) = if let Some(like) = req.like_view {
+        let (like_source, like_scale, near) = {
+            let guard = handle.read().await;
+            let idx = guard
+                .views
+                .iter()
+                .position(|v| v.id.0 == like)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::SolidNotFound,
+                        format!("drawing {id} has no view {like}"),
+                    )
+                })?;
+            (guard.views[idx].source, guard.views[idx].scale, idx)
+        };
+        let model_handle = resolve_owner_model(&state, &owner).await.ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::SolidNotFound,
+                format!("the model that owns drawing {id} is not loaded"),
+            )
+            .with_hint("Open the drawing's document first.")
+        })?;
+        (
+            like_source,
+            req.scale.unwrap_or(like_scale),
+            Some(near),
+            model_handle,
+        )
+    } else {
+        let Some(source) = req.source else {
             return Err(ApiError::new(
                 ErrorCode::InvalidParameter,
-                format!(
-                    "view source names part {part_id}, but drawing {id} is \
+                "a view needs a `source`, or `like_view` naming a view already on the sheet",
+            ));
+        };
+        let req_source = source;
+        // Resolve the BRepModel from the durable part_id carried on the
+        // request. Doing this here keeps the view source explicit on the
+        // wire (no dependency on which tab the client happens to have
+        // active) and makes the recorded event reproducible.
+        let ViewSource::Part { part_id, .. } = req_source;
+
+        // Owner-consistency gate (drawing-ownership fix, 2026-08-16). Every
+        // view this route accepts is part-sourced BY CONTRACT — `part_id`
+        // must resolve against `PartManager` a few lines below, so it is a
+        // real `PartManager` id, never the "viewport uuid or nil" `part_id`
+        // can otherwise hold on a kernel-solid-id-keyed drawing (see the
+        // module doc). A view whose part does NOT match the drawing's OWNER
+        // would make every later owner-scoped read (certify, `/semantic`,
+        // `/certificate`, the export gates) measure this ONE view against the
+        // WRONG model — a fresh, deterministic lie this fix would otherwise
+        // have INTRODUCED, and strictly worse than the pre-fix aliasing bug:
+        // today's caller could at least reach truth by sending the right
+        // header at READ time; post-fix nothing they send at read time
+        // matters at all, so a mis-sourced view would be permanently wrong.
+        // Refused here, at the one place `part_id` is trustworthy — an
+        // existing drawing's owner is fixed at creation (see the module doc)
+        // and cannot be inferred from a view source after the fact.
+        match &owner {
+            ModelKey::Part { id: owner_part } if *owner_part != part_id => {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(
+                        "view source names part {part_id}, but drawing {id} is \
                      owned by part {owner_part} — a view sourced from a \
                      DIFFERENT part cannot be added to this drawing, or \
                      every later read of it would measure the wrong \
                      part's geometry"
-                ),
-            )
-            .with_hint(format!(
-                "Add this view to a drawing created under X-Roshera-Part-Id: \
+                    ),
+                )
+                .with_hint(format!(
+                    "Add this view to a drawing created under X-Roshera-Part-Id: \
                  {part_id} instead, or source the view from part \
                  {owner_part} (this drawing's owner)."
-            )));
-        }
-        ModelKey::Legacy { document_id } => {
-            return Err(ApiError::new(
-                ErrorCode::InvalidParameter,
-                format!(
-                    "drawing {id} is owned by the legacy/document model \
+                )));
+            }
+            ModelKey::Legacy { document_id } => {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(
+                        "drawing {id} is owned by the legacy/document model \
                      (document '{document_id}'), not any part-tab, but the \
                      view source names part {part_id} — a part-sourced \
                      view cannot be added to a legacy-owned drawing, or a \
                      later read would measure the wrong model"
-                ),
-            )
-            .with_hint(format!(
-                "Create the drawing itself under X-Roshera-Part-Id: \
+                    ),
+                )
+                .with_hint(format!(
+                    "Create the drawing itself under X-Roshera-Part-Id: \
                  {part_id} instead, then add this view to that drawing."
-            )));
+                )));
+            }
+            ModelKey::Part { .. } => {} // owner_part == part_id — proceed.
         }
-        ModelKey::Part { .. } => {} // owner_part == part_id — proceed.
-    }
 
-    let model_handle = state.parts.get(&part_id).ok_or_else(|| {
-        ApiError::new(
-            ErrorCode::SolidNotFound,
-            format!("part {part_id} not found"),
-        )
-        .with_hint("Create the part first or pass a known part_id.")
-    })?;
+        let model_handle = state.parts.get(&part_id).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::SolidNotFound,
+                format!("part {part_id} not found"),
+            )
+            .with_hint("Create the part first or pass a known part_id.")
+        })?;
+
+        (req_source, req.scale.unwrap_or(1.0), None, model_handle)
+    };
 
     // Project the view *outside* the drawing's lock — the projection
     // only needs a read lock on the resolved BRepModel.
@@ -833,11 +886,11 @@ pub async fn add_view(
         let model_guard = model_handle.read().await;
         project_solid_view(
             &model_guard,
-            req.source,
+            source,
             req.projection,
             req.name.clone(),
-            req.position_mm,
-            req.scale,
+            req.position_mm.unwrap_or([0.0, 0.0]),
+            scale,
         )
         .map_err(|e| match e {
             geometry_engine::drawing::ProjectionError::SolidNotFound(_) => {
@@ -846,6 +899,28 @@ pub async fn add_view(
             _ => ApiError::new(ErrorCode::KernelError, e.to_string()),
         })?
     };
+
+    // No position given: the kernel finds free space for the view near the
+    // one it was taken from, or refuses -- a view is never stacked on another.
+    let mut view = view;
+    if req.position_mm.is_none() {
+        let snapshot = handle.read().await.clone();
+        match geometry_engine::drawing::layout::free_view_position(&snapshot, &view, near) {
+            Some(p) => view.position_mm = p,
+            None => {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(
+                        "no free space on the {} sheet for view '{}' at scale {}",
+                        snapshot.sheet_size.label(),
+                        req.name,
+                        scale
+                    ),
+                )
+                .with_hint("Choose a larger sheet, a smaller scale, or remove a view."));
+            }
+        }
+    }
 
     let view_id = view.id;
     let projection = view.projection;
@@ -2959,9 +3034,11 @@ mod tests {
             "projection": {"kind": "front"},
         }))
         .unwrap();
-        assert_eq!(req.position_mm, [0.0, 0.0]);
-        assert_eq!(req.scale, 1.0);
-        match req.source {
+        // No position: the kernel places the view in free space; no scale:
+        // the like_view's scale, else 1.0 -- decided by the handler.
+        assert_eq!(req.position_mm, None);
+        assert_eq!(req.scale, None);
+        match req.source.expect("source given") {
             ViewSource::Part {
                 part_id: p,
                 solid_id,
@@ -2983,8 +3060,8 @@ mod tests {
             "scale": 2.5,
         }))
         .unwrap();
-        assert_eq!(req.position_mm, [120.5, 80.25]);
-        assert_eq!(req.scale, 2.5);
+        assert_eq!(req.position_mm, Some([120.5, 80.25]));
+        assert_eq!(req.scale, Some(2.5));
         assert_eq!(req.name, "Detail");
     }
 
@@ -2999,12 +3076,16 @@ mod tests {
     }
 
     #[test]
-    fn add_view_request_rejects_missing_source() {
-        let res: Result<AddViewRequest, _> = serde_json::from_value(serde_json::json!({
+    fn add_view_request_without_source_parses_and_the_handler_decides() {
+        // `like_view` can stand in for `source`, so the wire accepts neither;
+        // the handler refuses a request that has neither, by name (covered
+        // by `adding_a_view_like_an_existing_one_places_itself`).
+        let req: AddViewRequest = serde_json::from_value(serde_json::json!({
             "name": "x",
             "projection": {"kind": "front"},
-        }));
-        assert!(res.is_err());
+        }))
+        .unwrap();
+        assert!(req.source.is_none() && req.like_view.is_none());
     }
 
     #[test]

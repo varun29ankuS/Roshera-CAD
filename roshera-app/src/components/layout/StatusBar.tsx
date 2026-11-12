@@ -1,6 +1,7 @@
 import { useSceneStore } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { Separator } from '@/components/ui/separator'
+import { useDocModeStore } from '@/stores/doc-mode-store'
 
 export function StatusBar() {
   const objectCount = useSceneStore((s) => s.objects.size)
@@ -12,6 +13,19 @@ export function StatusBar() {
   const snapValue = useSceneStore((s) => s.snapValue)
   const lastPing = useWSStore((s) => s.lastPingMs)
   const gridSettings = useSceneStore((s) => s.gridSettings)
+  const mode = useDocModeStore((s) => s.mode)
+
+  // On a drawing the modelling state (tool, transform space, snap, grid,
+  // object count) means nothing: only the connection stays.
+  if (mode === 'drawing') {
+    return (
+      <div className="flex items-center h-6 cad-panel border-t px-3 text-[11px] text-muted-foreground">
+        <span className="uppercase tracking-wider font-medium">Drawing</span>
+        <div className="flex-1" />
+        {lastPing !== null && <span>{lastPing}ms</span>}
+      </div>
+    )
+  }
 
   return (
     <div className="flex items-center h-6 cad-panel border-t px-3 text-[11px] text-muted-foreground">
