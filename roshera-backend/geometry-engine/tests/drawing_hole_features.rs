@@ -999,3 +999,163 @@ fn leader_legs_do_not_cross_other_holes() {
         assert!(crossings.is_empty(), "{crossings:?}");
     }
 }
+
+/// A bore that runs through a plate AND a boss is ONE hole. The boss's
+/// boundary splits the bore wall into two faces; the sheet read them as two
+/// blind holes -- "A1 Ø30 ↧ 8" and "A2 Ø30 ↧ 15" -- on the live mounting
+/// plate (120 x 80 x 15, Ø40 x 8 boss, Ø30 bore through both).
+#[test]
+fn a_bore_through_plate_and_boss_is_one_through_hole() {
+    let mut m = BRepModel::new();
+    // The live build order: bore through the plate, THEN the boss, THEN the
+    // bore again through the boss -- two separate coaxial Ø30 cuts.
+    let mut s = plate(&mut m);
+    let bore = cyl(&mut m, 0.0, 0.0, -11.0, 15.0, 22.0);
+    s = cut(&mut m, s, bore);
+    let boss = cyl(&mut m, 0.0, 0.0, -18.0, 20.0, 8.0);
+    s = boolean_operation(&mut m, s, boss, BooleanOp::Union, BooleanOptions::default()).unwrap();
+    // Meets the first bore end to end (an overlapping coaxial cutter is a
+    // separate kernel defect, BOOL-COAX-1: the result certifies unsound).
+    let bore2 = cyl(&mut m, 0.0, 0.0, -19.0, 15.0, 9.0);
+    s = cut(&mut m, s, bore2);
+    let (d, svg) = sheet(&m, s, "plate_with_boss_bore");
+    let rows: Vec<(String, String)> = d
+        .hole_sites
+        .iter()
+        .filter(|h| (h.diameter_mm - 30.0).abs() < 1e-6)
+        .map(|h| (h.dia_label.clone(), h.depth_label.clone()))
+        .collect();
+    assert!(
+        rows.len() <= 1,
+        "the Ø30 bore must be ONE hole, got rows {rows:?}"
+    );
+    let stated_thru = rows.iter().any(|(_, depth)| depth == "THRU")
+        || inks(&svg, "\u{00D8}30.00 THRU")
+        || d.hole_features.as_ref().map_or(false, |hf| {
+            hf.stacks
+                .iter()
+                .any(|st| (st.diameter - 30.0).abs() < 1e-6 && st.through)
+        });
+    assert!(
+        stated_thru,
+        "the Ø30 bore goes through plate and boss: THRU; rows {rows:?}"
+    );
+}
+
+/// The live mounting plate, rebuilt: 120 x 80 x 15, a Ø40 x 8 boss under it,
+/// a Ø30 bore through both (two cuts, as the agent made it), and four Ø6.6
+/// THRU holes counterbored Ø11 x 6.5 from the top on a 100 x 60 pattern. Its
+/// sheet must state the bore once, the counterbores as one callout, and be
+/// clean: no collisions, no dimension text inside another view or on a title.
+#[test]
+fn the_live_mounting_plate_sheet_is_right_and_clean() {
+    use geometry_engine::drawing::layout::{compute_layout, SheetItemKind};
+    use geometry_engine::drawing::verify::{find_text_collisions, verify_drawing, Severity};
+    let mut m = BRepModel::new();
+    let mut s = solid(
+        TopologyBuilder::new(&mut m)
+            .create_box_3d(120.0, 80.0, 15.0)
+            .unwrap(),
+    );
+    // Box is centred: top face z = 7.5, bottom z = -7.5.
+    let bore = cyl(&mut m, 0.0, 0.0, -8.5, 15.0, 17.0);
+    s = cut(&mut m, s, bore);
+    for (x, y) in [(-50.0, -30.0), (50.0, -30.0), (-50.0, 30.0), (50.0, 30.0)] {
+        let h = cyl(&mut m, x, y, -8.5, 3.3, 17.0);
+        s = cut(&mut m, s, h);
+        let cb = cyl(&mut m, x, y, 7.5 - 6.5, 5.5, 7.5);
+        s = cut(&mut m, s, cb);
+    }
+    let boss = cyl(&mut m, 0.0, 0.0, -15.5, 20.0, 8.0);
+    s = boolean_operation(&mut m, s, boss, BooleanOp::Union, BooleanOptions::default()).unwrap();
+    let bore2 = cyl(&mut m, 0.0, 0.0, -16.5, 15.0, 9.0);
+    s = cut(&mut m, s, bore2);
+    assert!(
+        m.certify_solid(s).is_sound(),
+        "fixture must be a sound part"
+    );
+
+    let (d, svg) = sheet(&m, s, "live_mounting_plate");
+    let bore_rows = d
+        .hole_sites
+        .iter()
+        .filter(|h| (h.diameter_mm - 30.0).abs() < 1e-6)
+        .count();
+    assert!(bore_rows <= 1, "the Ø30 bore is one hole; {bore_rows} rows");
+    assert!(
+        inks(
+            &svg,
+            "4\u{00D7} \u{00D8}6.60 THRU \u{2334} \u{00D8}11.00 \u{21A7} 6.50"
+        ),
+        "the four counterbored holes are one callout"
+    );
+    let layout = compute_layout(&d);
+    let collisions = find_text_collisions(&layout);
+    assert!(collisions.is_empty(), "text collisions: {collisions:#?}");
+    let mut intrusions = Vec::new();
+    for t in layout
+        .items
+        .iter()
+        .filter(|i| i.kind == SheetItemKind::DimensionText)
+    {
+        for o in layout.items.iter().filter(|o| {
+            (o.kind == SheetItemKind::ViewGeometry && o.owner_view != t.owner_view)
+                || o.kind == SheetItemKind::ViewLabel
+        }) {
+            if t.bbox.intersects(&o.bbox, 0.2) {
+                intrusions.push(format!("{:?} on {:?} {:?}", t.text, o.kind, o.text));
+            }
+        }
+    }
+    assert!(
+        intrusions.is_empty(),
+        "dimension text intrudes: {intrusions:?}"
+    );
+    let errors: Vec<_> = verify_drawing(&d)
+        .issues
+        .into_iter()
+        .filter(|i| i.severity == Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "quality gate errors: {errors:#?}");
+    assert!(certify_drawing(&m, &d).sound, "the sheet certifies sound");
+
+    // SECTION A-A goes through the MAIN feature -- the Ø30 bore and the boss
+    // under it -- not through a column of two Ø6.6 holes. It first cut at
+    // x = -50 because two small holes outnumbered one big one.
+    let sec = d.section.as_ref().expect("section");
+    let off = sec.origin[0] * sec.normal[0] + sec.origin[1] * sec.normal[1];
+    assert!(
+        off.abs() < 1e-6,
+        "section plane {off:.1} mm off the bore axis (origin {:?}, normal {:?})",
+        sec.origin,
+        sec.normal
+    );
+
+    // No leader line runs through a view title or another view: the
+    // counterbore leader was drawn straight through "SECTION A-A (1:1)".
+    let mut through_text = Vec::new();
+    for pd in &layout.dimensions {
+        let segs = [pd.ext[0], pd.line];
+        for o in layout.items.iter().filter(|o| {
+            o.kind == SheetItemKind::ViewLabel
+                || (o.kind == SheetItemKind::ViewGeometry && Some(pd.owner_view) != o.owner_view)
+        }) {
+            let b = o.bbox;
+            for [p, q] in segs {
+                let crosses = (1..50).any(|k| {
+                    let t = k as f64 / 50.0;
+                    let x = p[0] + (q[0] - p[0]) * t;
+                    let y = p[1] + (q[1] - p[1]) * t;
+                    x > b.x0 && x < b.x1 && y > b.y0 && y < b.y1
+                });
+                if crosses {
+                    through_text.push(format!("'{}' through {:?} {:?}", pd.label, o.kind, o.text));
+                }
+            }
+        }
+    }
+    assert!(
+        through_text.is_empty(),
+        "leader lines through text/views: {through_text:?}"
+    );
+}

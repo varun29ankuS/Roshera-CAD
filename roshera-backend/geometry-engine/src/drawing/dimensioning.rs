@@ -3050,10 +3050,14 @@ fn choose_section_plane(
         // find the hole-centre coordinate that the most measured centres
         // share (ties: the one nearest the centroid), and move the plane there
         // only when it cuts more holes than the plane already chosen.
-        let centres: Vec<[f64; 3]> = drawing
+        // Each hole centre with its diameter: a line is scored by the SIZE of
+        // what it cuts, not by how many holes it crosses -- two Ø6.6 bolt
+        // holes outnumber a Ø30 bore with a boss under it, but the section a
+        // drafter draws goes through the bore.
+        let centres: Vec<([f64; 3], f64)> = drawing
             .hole_sites
             .iter()
-            .filter_map(|s| s.world_centre)
+            .filter_map(|s| s.world_centre.map(|c| (c, s.diameter_mm)))
             .collect();
         // A ROUND part keeps the section through its axis -- the one that
         // shows the bore and the raised face / hub profile. On a rotated
@@ -3061,37 +3065,47 @@ fn choose_section_plane(
         if let Some(rp) = &drawing.round_part {
             origin[chosen_axis] = rp.centre[chosen_axis];
         } else if !centres.is_empty() {
-            let best_row = |axis: usize| -> (usize, f64) {
+            // Pass THROUGH holes: the centroid of a group lands between its
+            // members whenever they are not symmetric about one of them (a
+            // 2×2 grid's centroid is the gap in the middle, and SECTION A-A
+            // then showed solid plate). For each candidate normal pick the
+            // hole-centre line that cuts the most hole diameter (ties: nearest
+            // the centroid), and move the plane there only when it cuts more
+            // than the plane already chosen.
+            let score_at = |axis: usize, coord: f64| -> f64 {
+                centres
+                    .iter()
+                    .filter(|(o, _)| (o[axis] - coord).abs() < 0.5)
+                    .map(|(_, d)| *d)
+                    .sum()
+            };
+            let best_row = |axis: usize| -> (f64, f64) {
                 let n_c = centres.len() as f64;
-                let centroid = centres.iter().map(|c| c[axis]).sum::<f64>() / n_c;
-                let mut best = (0usize, origin[axis]);
+                let centroid = centres.iter().map(|(c, _)| c[axis]).sum::<f64>() / n_c;
+                let mut best = (0.0_f64, origin[axis]);
                 let mut best_dist = f64::INFINITY;
-                for c in &centres {
+                for (c, _) in &centres {
                     let coord = c[axis];
-                    let n = centres
-                        .iter()
-                        .filter(|o| (o[axis] - coord).abs() < 0.5)
-                        .count();
+                    let score = score_at(axis, coord);
                     let dist = (coord - centroid).abs();
-                    if n > best.0 || (n == best.0 && dist < best_dist - 1e-9) {
-                        best = (n, coord);
+                    if score > best.0 + 1e-9
+                        || ((score - best.0).abs() <= 1e-9 && dist < best_dist - 1e-9)
+                    {
+                        best = (score, coord);
                         best_dist = dist;
                     }
                 }
                 best
             };
-            let current = centres
-                .iter()
-                .filter(|c| (c[chosen_axis] - origin[chosen_axis]).abs() < 0.5)
-                .count();
+            let current = score_at(chosen_axis, origin[chosen_axis]);
             let r0 = best_row(candidates[0]);
             let r1 = best_row(candidates[1]);
-            let (axis, (n, coord)) = if r1.0 > r0.0 {
+            let (axis, (score, coord)) = if r1.0 > r0.0 + 1e-9 {
                 (candidates[1], r1)
             } else {
                 (candidates[0], r0)
             };
-            if n > current {
+            if score > current + 1e-9 {
                 origin[axis] = coord;
                 chosen_axis = axis;
             }

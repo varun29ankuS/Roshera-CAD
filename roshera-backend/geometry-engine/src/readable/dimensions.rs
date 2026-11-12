@@ -816,7 +816,207 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
         }
     }
 
-    dedupe_coincident(out)
+    merge_coaxial_walls(dedupe_coincident(out))
+}
+
+/// Merge the walls of ONE hole that two separate cuts left as two faces.
+///
+/// A bore cut through a plate, and later through a boss added under it, is
+/// one hole -- but its wall is two coaxial, equal-radius cylinder faces that
+/// meet end to end, with different mid-height anchors, so
+/// [`dedupe_coincident`] (which merges seam-split faces with IDENTICAL
+/// anchors) leaves them apart. The sheet then read a Ø30 THRU bore as two
+/// blind holes ("Ø30 ↧ 8" and "Ø30 ↧ 15") on the live mounting plate.
+///
+/// Walls are merged when their diameters agree, their axes coincide, and
+/// their axial spans touch or overlap. The surviving diameter record names
+/// every face and sits at the merged span's mid-height; the merged length is
+/// the union span; position records of the absorbed faces fold into the
+/// survivor's. Different diameters (a counterbore over its drill) never
+/// merge.
+fn merge_coaxial_walls(rows: Vec<DimensionRecord>) -> Vec<DimensionRecord> {
+    const TOL: f64 = 1e-3;
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    // (row index, axis point at station 0, unit axis, span lo, span hi)
+    struct Wall {
+        dia: usize,
+        len: Option<usize>,
+        axis: [f64; 3],
+        foot: [f64; 3],
+        lo: f64,
+        hi: f64,
+    }
+    let mut walls: Vec<Wall> = Vec::new();
+    for (i, d) in rows.iter().enumerate() {
+        if d.kind != "diameter" || d.entities.is_empty() {
+            continue;
+        }
+        let Some(axis) = d.axis else { continue };
+        let n = dot(axis, axis).sqrt();
+        if n < 1e-12 {
+            continue;
+        }
+        let axis = [axis[0] / n, axis[1] / n, axis[2] / n];
+        // The anchor sits on the wall at mid-height, `value / 2` along the
+        // seam direction from the axis.
+        let r = 0.5 * d.value;
+        let on_axis = [
+            d.anchor[0] - d.direction[0] * r,
+            d.anchor[1] - d.direction[1] * r,
+            d.anchor[2] - d.direction[2] * r,
+        ];
+        let mid = dot(on_axis, axis);
+        let foot = [
+            on_axis[0] - axis[0] * mid,
+            on_axis[1] - axis[1] * mid,
+            on_axis[2] - axis[2] * mid,
+        ];
+        let len = rows
+            .iter()
+            .position(|l| l.kind == "length" && l.entities == d.entities);
+        let half = len.map(|j| 0.5 * rows[j].value).unwrap_or(0.0);
+        walls.push(Wall {
+            dia: i,
+            len,
+            axis,
+            foot,
+            lo: mid - half,
+            hi: mid + half,
+        });
+    }
+
+    // Union-find over walls that are the same hole.
+    let mut parent: Vec<usize> = (0..walls.len()).collect();
+    fn find(p: &mut Vec<usize>, i: usize) -> usize {
+        let mut r = i;
+        while p[r] != r {
+            r = p[r];
+        }
+        let mut j = i;
+        while p[j] != r {
+            let next = p[j];
+            p[j] = r;
+            j = next;
+        }
+        r
+    }
+    for a in 0..walls.len() {
+        for b in (a + 1)..walls.len() {
+            let (wa, wb) = (&walls[a], &walls[b]);
+            let same_dia = (rows[wa.dia].value - rows[wb.dia].value).abs() < TOL;
+            let parallel = dot(wa.axis, wb.axis).abs() > 1.0 - 1e-9;
+            let feet = [
+                wa.foot[0] - wb.foot[0],
+                wa.foot[1] - wb.foot[1],
+                wa.foot[2] - wb.foot[2],
+            ];
+            let same_line = dot(feet, feet).sqrt() < TOL;
+            // Spans along the SHARED axis direction (b may point the other way).
+            let s = dot(wa.axis, wb.axis).signum();
+            let (blo, bhi) = if s > 0.0 {
+                (wb.lo, wb.hi)
+            } else {
+                (-wb.hi, -wb.lo)
+            };
+            let touch = blo <= wa.hi + TOL && wa.lo <= bhi + TOL;
+            if same_dia && parallel && same_line && touch && wa.len.is_some() && wb.len.is_some() {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb {
+                    parent[rb] = ra;
+                }
+            }
+        }
+    }
+
+    let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut rows = rows;
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for w in 0..walls.len() {
+        let root = find(&mut parent, w);
+        groups.entry(root).or_default().push(w);
+    }
+    for (_, members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        let first = &walls[members[0]];
+        let axis = first.axis;
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        let mut faces: Vec<u32> = Vec::new();
+        for &w in &members {
+            let wall = &walls[w];
+            let s = dot(axis, wall.axis).signum();
+            let (wlo, whi) = if s > 0.0 {
+                (wall.lo, wall.hi)
+            } else {
+                (-wall.hi, -wall.lo)
+            };
+            lo = lo.min(wlo);
+            hi = hi.max(whi);
+            faces.extend(rows[wall.dia].entities.iter().copied());
+        }
+        faces.sort_unstable();
+        faces.dedup();
+        let mid = 0.5 * (lo + hi);
+        let survivor = members[0];
+        let (dia_i, len_i) = (walls[survivor].dia, walls[survivor].len);
+        let shift = mid - 0.5 * (walls[survivor].lo + walls[survivor].hi);
+        let moved = |p: [f64; 3]| {
+            [
+                p[0] + axis[0] * shift,
+                p[1] + axis[1] * shift,
+                p[2] + axis[2] * shift,
+            ]
+        };
+        rows[dia_i].anchor = moved(rows[dia_i].anchor);
+        rows[dia_i].entities = faces.clone();
+        if let Some(j) = len_i {
+            rows[j].anchor = moved(rows[j].anchor);
+            // Relabel in the label's own unit and precision: the label's
+            // number is the old length converted to the document unit.
+            let old_value = rows[j].value;
+            let new_value = hi - lo;
+            if let Some(num) = rows[j].label.strip_prefix("L ") {
+                if let Ok(shown) = num.trim().parse::<f64>() {
+                    let decimals = num.trim().split('.').nth(1).map_or(0, str::len);
+                    let per_mm = if old_value.abs() > 1e-12 {
+                        shown / old_value
+                    } else {
+                        1.0
+                    };
+                    rows[j].label = format!("L {:.*}", decimals, new_value * per_mm);
+                }
+            }
+            rows[j].value = new_value;
+            rows[j].entities = faces.clone();
+        }
+        for &w in &members[1..] {
+            drop.insert(walls[w].dia);
+            if let Some(j) = walls[w].len {
+                drop.insert(j);
+            }
+        }
+        // Position records of absorbed faces: fold into the survivor's.
+        let absorbed: std::collections::HashSet<u32> = members[1..]
+            .iter()
+            .flat_map(|&w| rows[walls[w].dia].entities.clone())
+            .collect();
+        for (k, r) in rows.iter().enumerate() {
+            if r.kind == "position"
+                && !r.entities.is_empty()
+                && r.entities.iter().all(|e| absorbed.contains(e))
+            {
+                drop.insert(k);
+            }
+        }
+    }
+    rows.into_iter()
+        .enumerate()
+        .filter(|(i, _)| !drop.contains(i))
+        .map(|(_, r)| r)
+        .collect()
 }
 
 #[cfg(test)]

@@ -1916,10 +1916,23 @@ pub(crate) fn place_dimensions_routed(
                 let tip = [centre[0] + vx / len * r, centre[1] + vy / len * r];
                 let (ux, uy) = (elbow_x - tip[0], y - tip[1]);
                 let len2 = (ux * ux + uy * uy).max(1e-12);
-                other_holes.iter().all(|(c, cr)| {
+                let clear_of_holes = other_holes.iter().all(|(c, cr)| {
                     let t = (((c[0] - tip[0]) * ux + (c[1] - tip[1]) * uy) / len2).clamp(0.0, 1.0);
                     (tip[0] + ux * t - c[0]).hypot(tip[1] + uy * t - c[1]) >= cr + 0.3
-                })
+                });
+                // Nor may it run through another view, a view title or text
+                // already placed: the mounting plate's counterbore leader was
+                // drawn straight through "SECTION A-A (1:1)". Sampled along
+                // the leg (exact enough at drafting scale, and deterministic).
+                let clear_of_ink = obstacles.iter().all(|o| {
+                    !(1..64).any(|k| {
+                        let t = k as f64 / 64.0;
+                        let x = tip[0] + ux * t;
+                        let yy = tip[1] + uy * t;
+                        x > o.x0 && x < o.x1 && yy > o.y0 && yy < o.y1
+                    })
+                });
+                clear_of_holes && clear_of_ink
             };
             let free = |y: f64| {
                 let b = text_box(y);
