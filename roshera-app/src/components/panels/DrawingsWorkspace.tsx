@@ -143,6 +143,18 @@ function suggestRosheraName(existing: { name: string }[]): string {
   return `Roshera ${max + 1}`
 }
 
+/** A dimension kind in a drafter's words, for the change box. */
+const DIM_KIND_WORDS: Record<string, string> = {
+  extent: 'overall size',
+  length: 'length',
+  diameter: 'diameter',
+  radius: 'radius',
+  position: 'location',
+  angle: 'angle',
+  hole_callout: 'hole',
+  pcd: 'pitch circle',
+}
+
 export function DrawingsWorkspace() {
   const [drawings, setDrawings] = useState<DrawingSummary[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
@@ -193,12 +205,25 @@ export function DrawingsWorkspace() {
   // drivers, unreachable size) is shown in the editor, never swallowed.
   const [dimEdit, setDimEdit] = useState<{
     dim: SheetDimension
+    /** The view the dimension is drawn in, e.g. "TOP". */
+    view: string
     x: number
     y: number
     draft: string
     busy: boolean
+    /** When the current request started (ms), for the elapsed counter. */
+    startedAt: number | null
     refusal: string | null
   } | null>(null)
+  // The in-flight edit request, so Stop can abandon it.
+  const dimEditAbort = useRef<AbortController | null>(null)
+  // Ticks once a second while an edit is running (drives the counter).
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    if (!dimEdit?.busy) return
+    const t = window.setInterval(() => setTick((n) => n + 1), 1000)
+    return () => window.clearInterval(t)
+  }, [dimEdit?.busy])
   // One-line outcome of the last edit, e.g. "Ø6.00 -> 8 (radius 3 -> 4)".
   const [editNote, setEditNote] = useState<string | null>(null)
   const [projectionBusy, setProjectionBusy] = useState(false)
@@ -480,6 +505,16 @@ export function DrawingsWorkspace() {
   // `escape_xml` helper sanitises every text-node string, and we never
   // splice user-supplied markup back into the payload. Safe to inline.
   const svgMarkup = useMemo(() => ({ __html: svg }), [svg])
+  // Mark the dimension being edited on the sheet, so it is clear which one
+  // the box changes.
+  const editingDimId = dimEdit?.dim.id ?? null
+  useEffect(() => {
+    const root = canvasRef.current
+    if (!root || !editingDimId) return
+    const marked = Array.from(root.querySelectorAll(`[data-dim-id="${CSS.escape(editingDimId)}"]`))
+    marked.forEach((el) => el.setAttribute('data-dim-editing', ''))
+    return () => marked.forEach((el) => el.removeAttribute('data-dim-editing'))
+  }, [editingDimId, svgMarkup])
 
   // Sheet physical dimensions + scaled display dimensions.
   const [sheetWMm, sheetHMm] = useMemo(
@@ -625,17 +660,21 @@ export function DrawingsWorkspace() {
       const el = (e.target as Element).closest('[data-dim-id]')
       if (!el || !activeDrawing) return
       const id = el.getAttribute('data-dim-id') ?? ''
-      const dim = activeDrawing.views
-        .flatMap((v) => v.dimensions ?? [])
-        .find((d) => d.id === id)
-      if (!dim) return
+      const view = activeDrawing.views.find((v) => (v.dimensions ?? []).some((d) => d.id === id))
+      const dim = view?.dimensions?.find((d) => d.id === id)
+      if (!view || !dim) return
       setEditNote(null)
+      // Keep the box on screen: 300 x 150 is its largest size.
+      const x = Math.min(e.clientX + 12, window.innerWidth - 312)
+      const y = Math.min(e.clientY + 12, window.innerHeight - 162)
       setDimEdit({
         dim,
-        x: e.clientX,
-        y: e.clientY,
+        view: view.name,
+        x,
+        y,
         draft: String(Number(dim.value.toFixed(4))),
         busy: false,
+        startedAt: null,
         refusal: null,
       })
     },
@@ -649,18 +688,30 @@ export function DrawingsWorkspace() {
       setDimEdit({ ...dimEdit, refusal: 'Enter a positive number.' })
       return
     }
-    setDimEdit({ ...dimEdit, busy: true, refusal: null })
+    const abort = new AbortController()
+    dimEditAbort.current = abort
+    setDimEdit({ ...dimEdit, busy: true, startedAt: Date.now(), refusal: null })
     try {
-      const r = await setDrawingDimension(activeDrawing.id, dimEdit.dim.id, value)
+      const r = await setDrawingDimension(activeDrawing.id, dimEdit.dim.id, value, abort.signal)
       setDimEdit(null)
+      const fmt = (n: number) => String(Number(n.toFixed(4)))
+      const steps = [r.driver.sequence, ...(r.driver.linked ?? []).map((l) => l.target_sequence)]
+      const where = steps.length > 1 ? `steps ${steps.join(' + ')}` : `step ${steps[0]}`
       setEditNote(
-        `${dimEdit.dim.label} \u2192 ${value} (${r.driver.parameter} ` +
-          `${Number(r.driver.from_value.toFixed(4))} \u2192 ${Number(r.driver.new_value.toFixed(4))})`,
+        `${dimEdit.dim.label} \u2192 ${fmt(value)}: ${r.driver.parameter} ` +
+          `${fmt(r.driver.from_value)} \u2192 ${fmt(r.driver.new_value)} (${where})`,
       )
       await refreshActive(activeDrawing.id)
     } catch (e) {
-      const reason = e instanceof DrawingRefusal || e instanceof Error ? e.message : String(e)
-      setDimEdit((cur) => (cur ? { ...cur, busy: false, refusal: reason } : cur))
+      const stopped = e instanceof DOMException && e.name === 'AbortError'
+      const reason = stopped
+        ? 'Stopped waiting. The server may still finish this edit; the sheet refreshes when you reopen it.'
+        : e instanceof DrawingRefusal || e instanceof Error
+          ? e.message
+          : String(e)
+      setDimEdit((cur) => (cur ? { ...cur, busy: false, startedAt: null, refusal: reason } : cur))
+    } finally {
+      if (dimEditAbort.current === abort) dimEditAbort.current = null
     }
   }, [dimEdit, activeDrawing, refreshActive])
 
@@ -966,7 +1017,7 @@ export function DrawingsWorkspace() {
             {activeDrawing ? (
               svg ? (
                 <div
-                  className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full [&_[data-dim-id]]:cursor-pointer [&_[data-dim-id]:hover]:fill-blue-600"
+                  className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full [&_[data-dim-id]]:cursor-pointer [&_[data-dim-id]:hover]:fill-blue-600 [&_[data-dim-editing]]:fill-blue-700 [&_[data-dim-editing]]:font-bold"
                   onClick={onSheetClick}
                   title="Click a dimension to change the part"
                   style={{
@@ -992,22 +1043,30 @@ export function DrawingsWorkspace() {
 
             {dimEdit && (
               <div
-                className="fixed z-50 w-64 bg-card border border-border rounded-md shadow-lg p-2 text-xs"
-                style={{ left: dimEdit.x + 8, top: dimEdit.y + 8 }}
+                className="fixed z-50 w-[300px] bg-card border border-border rounded-md shadow-lg p-3 text-xs"
+                style={{ left: dimEdit.x, top: dimEdit.y }}
                 onMouseDown={(e) => e.stopPropagation()}
               >
-                <div className="flex items-center justify-between mb-1">
-                  <span className="font-medium">Change {dimEdit.dim.label}</span>
+                <div className="flex items-start justify-between gap-2 mb-2">
+                  <div className="min-w-0">
+                    <div className="font-medium text-sm">Change {dimEdit.dim.label}</div>
+                    <div className="text-muted-foreground">
+                      {DIM_KIND_WORDS[dimEdit.dim.kind] ?? dimEdit.dim.kind.replace(/_/g, ' ')} · {dimEdit.view} view · edits the part
+                    </div>
+                  </div>
                   <button
                     type="button"
-                    aria-label="Cancel"
-                    onClick={() => setDimEdit(null)}
-                    className="cad-focus text-muted-foreground hover:text-foreground"
+                    aria-label="Close"
+                    onClick={() => {
+                      dimEditAbort.current?.abort()
+                      setDimEdit(null)
+                    }}
+                    className="cad-focus shrink-0 text-muted-foreground hover:text-foreground"
                   >
-                    <X size={12} />
+                    <X size={14} />
                   </button>
                 </div>
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-2">
                   <input
                     autoFocus
                     inputMode="decimal"
@@ -1020,24 +1079,42 @@ export function DrawingsWorkspace() {
                         void applyDimEdit()
                       } else if (e.key === 'Escape') {
                         e.preventDefault()
+                        dimEditAbort.current?.abort()
                         setDimEdit(null)
                       }
                     }}
-                    className="cad-focus flex-1 font-mono px-2 py-1 rounded border border-border bg-background"
+                    className="cad-focus w-28 min-w-0 font-mono px-2 py-1 rounded border border-border bg-background"
                   />
                   <span className="text-muted-foreground">{dimEdit.dim.unit}</span>
-                  <button
-                    type="button"
-                    disabled={dimEdit.busy}
-                    onClick={() => void applyDimEdit()}
-                    className="cad-focus px-2 py-1 rounded border border-border hover:bg-accent/20"
-                  >
-                    {dimEdit.busy ? 'Rebuilding\u2026' : 'Apply'}
-                  </button>
+                  {dimEdit.busy ? (
+                    <button
+                      type="button"
+                      onClick={() => dimEditAbort.current?.abort()}
+                      className="cad-focus ml-auto shrink-0 px-2 py-1 rounded border border-border hover:bg-accent/20"
+                    >
+                      Stop
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void applyDimEdit()}
+                      className="cad-focus ml-auto shrink-0 px-3 py-1 rounded bg-primary text-primary-foreground hover:opacity-90"
+                    >
+                      Apply
+                    </button>
+                  )}
                 </div>
+                {dimEdit.busy && dimEdit.startedAt !== null && (
+                  <div className="mt-2 text-muted-foreground">
+                    Rebuilding the part and its sheet\u2026{' '}
+                    <span className="font-mono">
+                      {Math.floor((Date.now() - dimEdit.startedAt) / 1000)} s
+                    </span>
+                  </div>
+                )}
                 {dimEdit.refusal && (
                   <div className="mt-2 flex gap-1 text-red-700">
-                    <span aria-hidden>✗</span>
+                    <span aria-hidden>\u2717</span>
                     <span>{dimEdit.refusal}</span>
                   </div>
                 )}

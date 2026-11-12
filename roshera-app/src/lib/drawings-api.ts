@@ -329,7 +329,16 @@ async function jsonOrRefusal<T>(resp: Response): Promise<T> {
 /** Result of editing a sheet dimension (which edits the part). */
 export interface DimensionEditResult {
   dimension: { id: string; from: number; to: number; sheet_value: number | null }
-  driver: { command: string; parameter: string; from_value: number; new_value: number }
+  driver: {
+    command: string
+    parameter: string
+    sequence: number
+    from_value: number
+    new_value: number
+    /** Other parameters of the same feature that moved with it (e.g. the
+     *  second cutter of a bore cut twice). */
+    linked?: { target_sequence: number; parameter: string; value: number }[]
+  }
 }
 
 /**
@@ -342,6 +351,7 @@ export async function setDrawingDimension(
   drawingId: string,
   dimensionId: string,
   value: number,
+  signal?: AbortSignal,
 ): Promise<DimensionEditResult> {
   const r = await fetch(
     `${API_HOST}/api/drawings/${drawingId}/dimensions/${encodeURIComponent(dimensionId)}`,
@@ -349,6 +359,7 @@ export async function setDrawingDimension(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ value }),
+      signal,
     },
   )
   return jsonOrRefusal<DimensionEditResult>(r)
