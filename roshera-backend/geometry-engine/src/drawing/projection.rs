@@ -341,6 +341,7 @@ pub fn project_solid_view(
         hidden_circles: Vec::new(),
         ellipses: Vec::new(),
         hidden_ellipses: Vec::new(),
+        show_hidden: true,
         shaded_raster: None,
         hatch_polylines: Vec::new(),
         // A plain projection carries no HLR edge lineage; the HLR sheet path

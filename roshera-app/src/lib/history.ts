@@ -19,11 +19,12 @@ const API_BASE = import.meta.env.VITE_API_URL || ''
 /** Fired on `window` after a successful undo or redo. */
 export const HISTORY_CHANGED_EVENT = 'roshera:history-changed'
 
-export async function timelineAction(action: 'undo' | 'redo'): Promise<void> {
+/** Resolves true when the server moved the history. */
+export async function timelineAction(action: 'undo' | 'redo'): Promise<boolean> {
   // The server's undo/redo needs the live session id (seeded by the WS
   // `Welcome` frame); with none yet there is nothing to undo against.
   const sessionId = useWSStore.getState().sessionId
-  if (!sessionId) return
+  if (!sessionId) return false
   const label = action === 'undo' ? 'Undo' : 'Redo'
   try {
     const resp = await fetch(`${API_BASE}/api/timeline/${action}`, {
@@ -34,16 +35,18 @@ export async function timelineAction(action: 'undo' | 'redo'): Promise<void> {
     const body = await tryReadJson(resp)
     if (!resp.ok) {
       useBlackboardStore.getState().addLine(`${label} failed: ${refusalMessage(body, resp.status)}`, 'system')
-      return
+      return false
     }
     // Expected refusals (nothing to undo) answer 200 with success: false.
     if (body && body.success === false) {
       useBlackboardStore.getState().addLine(`${label}: ${refusalMessage(body, resp.status)}`, 'system')
-      return
+      return false
     }
     window.dispatchEvent(new CustomEvent(HISTORY_CHANGED_EVENT, { detail: { action } }))
+    return true
   } catch {
     useBlackboardStore.getState().addLine(`${label} failed: backend unreachable.`, 'system')
+    return false
   }
 }
 

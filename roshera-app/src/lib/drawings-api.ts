@@ -70,6 +70,8 @@ export interface ProjectedView {
   extent: ViewExtent
   /** The view's dimension callouts (kernel `Dimension2d`). */
   dimensions?: SheetDimension[]
+  /** Hidden (occluded) edges drawn dashed; false = "hidden lines removed". */
+  show_hidden?: boolean
 }
 
 /** One dimension callout on a sheet. `id` is what an edit addresses. */
@@ -339,6 +341,27 @@ export async function removeView(drawingId: string, viewId: string): Promise<voi
     method: 'DELETE',
   })
   await jsonOrThrow<unknown>(r, 'removeView')
+}
+
+/** An engineer's display edit to one view; absent fields stay as they are. */
+export interface ViewEdit {
+  show_hidden?: boolean
+  name?: string
+  scale?: number
+}
+
+/**
+ * Change one view's display: hidden lines, name, scale. All-or-nothing; a
+ * refusal (bad scale, a name another view already has) throws
+ * `DrawingRefusal` with the reason.
+ */
+export async function updateView(drawingId: string, viewId: string, edit: ViewEdit): Promise<void> {
+  const r = await fetch(`${API_HOST}/api/drawings/${drawingId}/views/${viewId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(edit),
+  })
+  await jsonOrRefusal<unknown>(r)
 }
 
 /**

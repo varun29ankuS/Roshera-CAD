@@ -60,6 +60,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use dashmap::DashMap;
+use geometry_engine::drawing::types::{ViewEdit, ViewEditError};
 use geometry_engine::drawing::{
     answer_query, certify_drawing, project_solid_view, render_drawing_dxf, render_drawing_pdf,
     render_drawing_svg, standard_drawing_auto_with_projection,
@@ -1025,6 +1026,51 @@ pub async fn remove_view(
             .with_input_drawing(id),
     );
     Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// `PATCH /api/drawings/{id}/views/{view_id}` -- an engineer's display edit
+/// to one view: `show_hidden` (hidden lines dashed or removed), `name`,
+/// `scale`. All-or-nothing; recorded as `drawing.view.update`, so undo,
+/// restart and a dimension edit keep it.
+pub async fn update_view(
+    State(state): State<AppState>,
+    Path((id, view_id)): Path<(Uuid, Uuid)>,
+    Json(edit): Json<ViewEdit>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let view = {
+        let mut guard = handle.write().await;
+        guard
+            .edit_view(ProjectedViewId(view_id), &edit)
+            .map_err(|e| match e {
+                ViewEditError::NoSuchView(_) => ApiError::new(
+                    ErrorCode::SolidNotFound,
+                    format!("view {view_id} not found in drawing {id}"),
+                ),
+                other => ApiError::new(ErrorCode::InvalidParameter, other.to_string()),
+            })?;
+        guard
+            .views
+            .iter()
+            .find(|v| v.id.0 == view_id)
+            .map(|v| {
+                serde_json::json!({
+                    "id": view_id,
+                    "name": v.name,
+                    "scale": v.scale,
+                    "show_hidden": v.show_hidden,
+                })
+            })
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let mut params = serde_json::to_value(&edit).unwrap_or_else(|_| serde_json::json!({}));
+    params["view_id"] = serde_json::json!(view_id);
+    state.drawings.record_event(
+        RecordedOperation::new("drawing.view.update")
+            .with_parameters(params)
+            .with_input_drawing(id),
+    );
+    Ok(Json(serde_json::json!({ "success": true, "view": view })))
 }
 
 /// Shared first step of every registered-export route (`svg`/`pdf`/`dxf`,

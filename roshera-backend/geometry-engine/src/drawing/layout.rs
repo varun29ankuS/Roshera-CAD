@@ -2389,6 +2389,7 @@ mod tests {
             hidden_circles: Vec::new(),
             ellipses: Vec::new(),
             hidden_ellipses: Vec::new(),
+            show_hidden: true,
             shaded_raster: None,
             hatch_polylines: Vec::new(),
             polyline_sources: Vec::new(),

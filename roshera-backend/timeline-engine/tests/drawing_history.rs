@@ -254,3 +254,52 @@ fn a_rebuilt_sheet_keeps_the_name_it_was_created_with() {
         "Mounting plate 120 x 80 x 15"
     );
 }
+
+fn view_update(seq: u64, did: Uuid, vid: Uuid, change: serde_json::Value) -> TimelineEvent {
+    let mut params = change;
+    params["view_id"] = json!(vid);
+    generic(
+        "drawing.view.update",
+        seq,
+        json!({
+            "params": params,
+            "inputs": [format!("drawing:{did}")],
+            "outputs": []
+        }),
+    )
+}
+
+/// A view's display edits (hidden lines off, renamed, rescaled) are history:
+/// a rebuild -- restart, undo, a dimension edit -- keeps them.
+#[test]
+fn a_view_edit_survives_a_rebuild() {
+    let did = Uuid::new_v4();
+    let front = stable_view_id(did, "FRONT");
+    let top = stable_view_id(did, "TOP");
+    let mut events = plate();
+    events.extend([
+        from_part(3, 3, did),
+        view_update(4, did, front, json!({ "show_hidden": false })),
+        view_update(5, did, top, json!({ "name": "PLAN", "scale": 0.5 })),
+        mould(1, "radius", 4.0, 6),
+    ]);
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    assert!(built.issues.is_empty(), "{:?}", built.issues);
+    let d = built.drawings.get(&did).expect("rebuilt");
+    let f = d.views.iter().find(|v| v.id.0 == front).expect("FRONT");
+    assert!(!f.show_hidden, "FRONT keeps hidden lines off");
+    let t = d
+        .views
+        .iter()
+        .find(|v| v.id.0 == top)
+        .expect("the renamed view");
+    assert_eq!(t.name, "PLAN");
+    assert!((t.scale - 0.5).abs() < 1e-12);
+    assert!(
+        d.views
+            .iter()
+            .filter(|v| v.id.0 != front)
+            .all(|v| v.show_hidden),
+        "only FRONT changed"
+    );
+}

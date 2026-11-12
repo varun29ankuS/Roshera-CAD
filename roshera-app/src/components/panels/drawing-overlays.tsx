@@ -6,7 +6,8 @@
  * - top-left  : which drawing (switch, rename, delete, new from a part)
  * - top-right : how it is laid out and delivered (projection, title block,
  *               download)
- * - bottom-left: its views (remove with undo, "Add view ▸ Left")
+ * - bottom-left: its views (remove with undo, "Add view ▸ Left"); right-click
+ *               a view (on the sheet or its chip) for its menu
  *
  * Nothing here asks for an internal id or a coordinate: views are added
  * "like" a view already on the sheet and the kernel places them.
@@ -21,6 +22,7 @@ import {
   type ProjectionType,
   type TitleBlock,
   type TitleBlockPatch,
+  type ViewEdit,
   defaultTitleBlock,
   updateTitleBlock,
 } from '@/lib/drawings-api'
@@ -314,11 +316,16 @@ export function ViewsBar({
   busy,
   onRemove,
   onAdd,
+  onMenu,
+  selectedId,
 }: {
   drawing: Drawing
   busy: boolean
   onRemove: (viewId: string) => void
   onAdd: (kind: Preset, label: string) => void
+  /** Open a view's menu at a screen point. */
+  onMenu: (viewId: string, x: number, y: number) => void
+  selectedId: string | null
 }) {
   const [menu, setMenu] = useState(false)
   const close = useCallback(() => setMenu(false), [])
@@ -331,8 +338,32 @@ export function ViewsBar({
   return (
     <div className="absolute bottom-3 left-3 z-20 flex flex-wrap items-center gap-1.5 max-w-[calc(100%-260px)]">
       {drawing.views.map((v) => (
-        <span key={v.id} className={`${card} group inline-flex items-center gap-1 pl-2 pr-1 py-1 text-[11px]`}>
-          <span className="font-medium">{v.name}</span>
+        <span
+          key={v.id}
+          className={`${card} group inline-flex items-center gap-1 pl-2 pr-1 py-1 text-[11px] ${
+            selectedId === v.id ? 'ring-1 ring-sky-600' : ''
+          }`}
+          onContextMenu={(e) => {
+            e.preventDefault()
+            onMenu(v.id, e.clientX, e.clientY)
+          }}
+        >
+          <button
+            type="button"
+            title="View options (or right-click the view on the sheet)"
+            onClick={(e) => {
+              const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+              onMenu(v.id, r.left, r.top - 8)
+            }}
+            className="cad-focus font-medium hover:underline"
+          >
+            {v.name}
+          </button>
+          {v.show_hidden === false && (
+            <span className="text-muted-foreground" title="Hidden lines removed">
+              no hidden
+            </span>
+          )}
           {v.scale !== 1 && <span className="text-muted-foreground">{scaleLabel(v.scale)}</span>}
           <button
             type="button"
@@ -376,6 +407,135 @@ export function ViewsBar({
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+// ── View menu (right-click a view) ────────────────────────────────────
+
+/** The scales a drafter picks from (ISO 5455 preferred ratios). */
+const SCALES = [0.1, 0.2, 0.5, 1, 2, 5, 10]
+
+export function ViewMenu({
+  drawing,
+  viewId,
+  x,
+  y,
+  busy,
+  onClose,
+  onEdit,
+  onDelete,
+}: {
+  drawing: Drawing
+  viewId: string
+  x: number
+  y: number
+  busy: boolean
+  onClose: () => void
+  onEdit: (viewId: string, edit: ViewEdit) => void
+  onDelete: (viewId: string) => void
+}) {
+  const ref = useDismiss(true, onClose)
+  const view = drawing.views.find((v) => v.id === viewId)
+  const [renaming, setRenaming] = useState(false)
+  const [draft, setDraft] = useState(view?.name ?? '')
+  if (!view) return null
+  const hiddenShown = view.show_hidden !== false
+  // Keep the menu on screen: 224 x 230 is its largest size.
+  const left = Math.max(8, Math.min(x, window.innerWidth - 232))
+  const top = Math.max(8, Math.min(y, window.innerHeight - 238))
+  const item =
+    'cad-focus flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left hover:bg-accent/20 disabled:opacity-50'
+  return (
+    <div
+      ref={ref}
+      role="menu"
+      aria-label={`View ${view.name}`}
+      className={`${card} fixed z-40 w-56 py-1 text-xs`}
+      style={{ left, top }}
+    >
+      <div className="px-3 pb-1 pt-0.5 text-[11px] text-muted-foreground">
+        {view.name} · {scaleLabel(view.scale)}
+      </div>
+      <button
+        type="button"
+        role="menuitem"
+        disabled={busy}
+        className={item}
+        onClick={() => {
+          onEdit(view.id, { show_hidden: !hiddenShown })
+          onClose()
+        }}
+      >
+        <span>{hiddenShown ? 'Remove hidden lines' : 'Show hidden lines'}</span>
+        <span className="text-muted-foreground">{hiddenShown ? 'now dashed' : 'now removed'}</span>
+      </button>
+      <div className="px-3 py-1.5">
+        <div className="mb-1">Scale</div>
+        <div className="flex flex-wrap gap-1">
+          {SCALES.map((s) => {
+            const current = Math.abs(s - view.scale) < 1e-9
+            return (
+              <button
+                key={s}
+                type="button"
+                disabled={busy || current}
+                aria-pressed={current}
+                onClick={() => {
+                  onEdit(view.id, { scale: s })
+                  onClose()
+                }}
+                className={`cad-focus rounded border border-border px-1.5 py-0.5 text-[11px] hover:bg-accent/20 ${
+                  current ? 'bg-accent/30 font-medium' : ''
+                }`}
+              >
+                {scaleLabel(s)}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+      {renaming ? (
+        <form
+          className="flex items-center gap-1 px-3 py-1.5"
+          onSubmit={(e) => {
+            e.preventDefault()
+            const n = draft.trim()
+            if (n && n !== view.name) onEdit(view.id, { name: n })
+            onClose()
+          }}
+        >
+          <input
+            autoFocus
+            value={draft}
+            maxLength={40}
+            onChange={(e) => setDraft(e.target.value)}
+            className="cad-focus min-w-0 flex-1 rounded border border-border bg-background px-1.5 py-0.5"
+            aria-label="View name"
+          />
+          <button type="submit" className="cad-focus rounded p-0.5 hover:bg-accent/20" aria-label="Rename">
+            <Check size={12} />
+          </button>
+        </form>
+      ) : (
+        <button type="button" role="menuitem" disabled={busy} className={item} onClick={() => setRenaming(true)}>
+          <span>Rename…</span>
+        </button>
+      )}
+      <div className="my-1 border-t border-border" />
+      <button
+        type="button"
+        role="menuitem"
+        disabled={busy}
+        className={`${item} hover:text-destructive`}
+        onClick={() => {
+          onDelete(view.id)
+          onClose()
+        }}
+      >
+        <span>Delete view</span>
+        <span className="text-muted-foreground">Del</span>
+      </button>
     </div>
   )
 }

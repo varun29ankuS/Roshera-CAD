@@ -220,6 +220,42 @@ impl ViewSource {
 /// `polylines` are stored in view-space (the local 2D frame established
 /// by the projection). Sheet placement is applied at render time by
 /// translating each point by `position_mm` and scaling by `scale`.
+
+/// Longest view name an engineer may give (it is printed under the view).
+pub const VIEW_NAME_MAX_CHARS: usize = 40;
+/// Smallest and largest view scale accepted (1:100 .. 100:1).
+pub const VIEW_SCALE_MIN: f64 = 0.01;
+pub const VIEW_SCALE_MAX: f64 = 100.0;
+
+/// An engineer's display edit to one view. Absent fields stay as they are.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ViewEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_hidden: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+}
+
+/// Why a view edit was refused.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ViewEditError {
+    #[error("the edit changes nothing (give show_hidden, name or scale)")]
+    Empty,
+    #[error("view {0} is not on this sheet")]
+    NoSuchView(Uuid),
+    #[error("a view name must be 1 to 40 characters (got {0:?})")]
+    BadName(String),
+    #[error("another view on this sheet is already named {0:?}")]
+    NameTaken(String),
+    #[error("a view scale must be between 1:100 and 100:1 (got {0})")]
+    BadScale(f64),
+}
+
+fn show_hidden_default() -> bool {
+    true
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectedView {
     pub id: ProjectedViewId,
@@ -269,6 +305,12 @@ pub struct ProjectedView {
     /// Occluded analytic ellipses, drawn dashed.
     #[serde(default)]
     pub hidden_ellipses: Vec<ProjectedEllipse>,
+    /// Whether this view draws its hidden (occluded) edges dashed. `false`
+    /// is the "hidden lines removed" display an engineer picks per view; the
+    /// hidden set above is kept either way, so switching back is instant.
+    /// Older saved drawings (no field) show hidden lines.
+    #[serde(default = "show_hidden_default")]
+    pub show_hidden: bool,
     /// Deterministic shaded-solid raster for a PICTORIAL (isometric) cell.
     /// When `Some`, the SVG/PDF renderer inks this image over the view's
     /// sheet-space geometry rect INSTEAD of the wireframe polylines/circles
@@ -1012,6 +1054,52 @@ impl Drawing {
         let before = self.views.len();
         self.views.retain(|v| v.id != id);
         before != self.views.len()
+    }
+
+    /// Apply an engineer's display edit to one view: hidden lines on/off,
+    /// a new name, a new scale. All-or-nothing: an invalid field refuses the
+    /// whole edit and leaves the view as it was.
+    pub fn edit_view(&mut self, id: ProjectedViewId, edit: &ViewEdit) -> Result<(), ViewEditError> {
+        if edit.show_hidden.is_none() && edit.name.is_none() && edit.scale.is_none() {
+            return Err(ViewEditError::Empty);
+        }
+        let name = match &edit.name {
+            Some(n) => {
+                let n = n.trim();
+                if n.is_empty() || n.chars().count() > VIEW_NAME_MAX_CHARS {
+                    return Err(ViewEditError::BadName(n.to_string()));
+                }
+                if self
+                    .views
+                    .iter()
+                    .any(|v| v.id != id && v.name.eq_ignore_ascii_case(n))
+                {
+                    return Err(ViewEditError::NameTaken(n.to_string()));
+                }
+                Some(n.to_string())
+            }
+            None => None,
+        };
+        if let Some(s) = edit.scale {
+            if !s.is_finite() || !(VIEW_SCALE_MIN..=VIEW_SCALE_MAX).contains(&s) {
+                return Err(ViewEditError::BadScale(s));
+            }
+        }
+        let view = self
+            .views
+            .iter_mut()
+            .find(|v| v.id == id)
+            .ok_or(ViewEditError::NoSuchView(id.0))?;
+        if let Some(h) = edit.show_hidden {
+            view.show_hidden = h;
+        }
+        if let Some(n) = name {
+            view.name = n;
+        }
+        if let Some(s) = edit.scale {
+            view.scale = s;
+        }
+        Ok(())
     }
 
     /// Populate [`Self::unit_note`] and [`Self::tolerance_note`] from a

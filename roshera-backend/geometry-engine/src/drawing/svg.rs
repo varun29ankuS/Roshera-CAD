@@ -487,7 +487,7 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
             c.cx, c.cy, c.r
         );
     }
-    for c in &view.hidden_circles {
+    for c in hidden_if_shown(view, &view.hidden_circles) {
         let _ = write!(
             out,
             "    <circle class=\"hidden\" cx=\"{:.4}\" cy=\"{:.4}\" r=\"{:.4}\" />\n",
@@ -509,7 +509,7 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
             e.cx, e.cy, e.rx, e.ry, deg, e.cx, e.cy
         );
     }
-    for e in &view.hidden_ellipses {
+    for e in hidden_if_shown(view, &view.hidden_ellipses) {
         let deg = e.rotation.to_degrees();
         let _ = write!(
             out,
@@ -521,7 +521,7 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
 
     // Occluded edges, dashed (hidden-line removal). Drawn after the visible
     // edges so the solid outline reads on top where they coincide.
-    for pl in &view.hidden_polylines {
+    for pl in hidden_if_shown(view, &view.hidden_polylines) {
         if pl.points.len() < 2 {
             continue;
         }
@@ -1560,5 +1560,15 @@ fn render_cutting_plane(
             out,
             "  <text class=\"cutting-plane-label\" x=\"{cx:.3}\" y=\"{cy:.3}\">A</text>\n"
         );
+    }
+}
+
+/// A view's hidden set, or nothing when the engineer switched hidden lines
+/// off on that view.
+fn hidden_if_shown<'a, T>(view: &ProjectedView, set: &'a [T]) -> &'a [T] {
+    if view.show_hidden {
+        set
+    } else {
+        &[]
     }
 }

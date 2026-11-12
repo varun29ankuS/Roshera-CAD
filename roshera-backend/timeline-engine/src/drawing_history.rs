@@ -219,6 +219,35 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                     }
                 }
             }
+            "drawing.view.update" => {
+                let p = params(e);
+                let vid = p
+                    .and_then(|p| p.get("view_id"))
+                    .and_then(|v| serde_json::from_value::<Uuid>(v.clone()).ok());
+                let edit = p.and_then(|p| {
+                    serde_json::from_value::<geometry_engine::drawing::types::ViewEdit>(p.clone())
+                        .ok()
+                });
+                match (target, vid, edit) {
+                    (Some(id), Some(vid), Some(edit)) => {
+                        if let Some(d) = out.drawings.get_mut(&id) {
+                            if let Err(err) = d.edit_view(
+                                geometry_engine::drawing::types::ProjectedViewId(vid),
+                                &edit,
+                            ) {
+                                out.issues.push(format!(
+                                    "sequence {}: a view edit no longer applies: {err}",
+                                    e.sequence_number
+                                ));
+                            }
+                        }
+                    }
+                    _ => out.issues.push(format!(
+                        "sequence {}: a view edit could not be read",
+                        e.sequence_number
+                    )),
+                }
+            }
             "drawing.delete" => {
                 if let Some(id) = target {
                     out.drawings.remove(&id);

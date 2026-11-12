@@ -158,3 +158,64 @@ fn hlr_is_deterministic() {
         );
     }
 }
+
+/// An engineer can switch hidden lines off on one view ("hidden lines
+/// removed" display): that view renders no dashed edges; the other views keep
+/// theirs. The hidden set is kept on the view, so switching back needs no
+/// re-projection.
+#[test]
+fn a_view_with_hidden_lines_off_renders_none_and_others_keep_theirs() {
+    let mut m = BRepModel::new();
+    let b = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(30.0, 20.0, 16.0)
+        .expect("box"));
+    let mut d = standard_drawing_hlr(&m, b, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("hlr");
+    let with_hidden: Vec<usize> = d
+        .views
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !v.hidden_polylines.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    assert!(with_hidden.len() >= 2, "need two views with hidden edges");
+    assert!(
+        d.views.iter().all(|v| v.show_hidden),
+        "hidden lines show by default"
+    );
+
+    let off = with_hidden[0];
+    d.views[off].show_hidden = false;
+    let hidden_kept = d.views[off].hidden_polylines.len();
+    let svg = render_drawing_svg(&d);
+
+    // Count dashed polylines per view group: the switched-off view has none.
+    let dashed_total = svg.matches("polyline class=\"hidden\"").count();
+    let expected: usize = d
+        .views
+        .iter()
+        .filter(|v| v.show_hidden)
+        .map(|v| {
+            v.hidden_polylines
+                .iter()
+                .filter(|p| p.points.len() >= 2)
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        dashed_total, expected,
+        "only views showing hidden lines draw them"
+    );
+    assert!(expected > 0, "the other views still draw theirs");
+    assert_eq!(
+        d.views[off].hidden_polylines.len(),
+        hidden_kept,
+        "the hidden set is kept"
+    );
+
+    // Older saved drawings (no field) read as "show hidden".
+    let mut json = serde_json::to_value(&d.views[off]).expect("ser");
+    json.as_object_mut().expect("obj").remove("show_hidden");
+    let back: geometry_engine::drawing::types::ProjectedView =
+        serde_json::from_value(json).expect("de");
+    assert!(back.show_hidden);
+}

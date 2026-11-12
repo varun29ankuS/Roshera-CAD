@@ -20,7 +20,7 @@
  * kernel's `escape_xml()` helper sanitises).
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import {
   DrawingSwitcher,
@@ -28,6 +28,7 @@ import {
   SheetHint,
   TitleBlockCard,
   ViewsBar,
+  ViewMenu,
   type PartRow,
 } from '@/components/panels/drawing-overlays'
 import {
@@ -50,9 +51,11 @@ import {
   listDrawings,
   removeView,
   renameDrawing,
+  updateView,
+  type ViewEdit,
 } from '@/lib/drawings-api'
 import { useDocumentStore } from '@/stores/document-store'
-import { HISTORY_CHANGED_EVENT } from '@/lib/history'
+import { HISTORY_CHANGED_EVENT, timelineAction } from '@/lib/history'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 
 // CSS pixels per millimetre at the standard 96 DPI mapping. At zoom
@@ -483,30 +486,112 @@ export function DrawingsWorkspace() {
   )
 
   const undoRemoveView = useCallback(async () => {
-    if (!activeId || !activeDrawing || !removedView) return
-    const like = activeDrawing.views[0]
-    if (!like) {
-      setError('The last view was removed; start a new drawing from the part instead.')
-      setRemovedView(null)
-      return
-    }
+    if (!removedView) return
     setViewsBusy(true)
     try {
-      await addView(activeId, {
-        name: removedView.name,
-        like_view: like.id,
-        projection: removedView.projection,
-        position_mm: removedView.position_mm,
-        scale: removedView.scale,
-      })
-      setRemovedView(null)
-      await refreshActive(activeId)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      // History undo: the view comes back exactly as it was (its id, its
+      // hidden-line setting, its scale), not a fresh copy.
+      if (await timelineAction('undo')) setRemovedView(null)
+      else setError('Undo did not go through; see the Blackboard for the reason.')
     } finally {
       setViewsBusy(false)
     }
-  }, [activeId, activeDrawing, removedView, refreshActive])
+  }, [removedView])
+
+  // ── Selecting a view and its menu ──────────────────────────────────────────────
+  const [selectedViewId, setSelectedViewId] = useState<string | null>(null)
+  const [viewMenu, setViewMenu] = useState<{ viewId: string; x: number; y: number } | null>(null)
+  const closeViewMenu = useCallback(() => setViewMenu(null), [])
+  const openViewMenu = useCallback((viewId: string, x: number, y: number) => {
+    setSelectedViewId(viewId)
+    setViewMenu({ viewId, x, y })
+  }, [])
+  // A different sheet (or document) drops the selection.
+  useEffect(() => {
+    setSelectedViewId(null)
+    setViewMenu(null)
+  }, [activeId])
+
+  /** The view whose drawn box contains a screen point (smallest wins). */
+  const viewAt = useCallback((clientX: number, clientY: number): string | null => {
+    const root = canvasRef.current
+    if (!root) return null
+    let best: { id: string; area: number } | null = null
+    root.querySelectorAll('[data-view-id]').forEach((el) => {
+      const r = el.getBoundingClientRect()
+      const pad = 4
+      if (
+        clientX >= r.left - pad &&
+        clientX <= r.right + pad &&
+        clientY >= r.top - pad &&
+        clientY <= r.bottom + pad
+      ) {
+        const area = r.width * r.height
+        const id = el.getAttribute('data-view-id')
+        if (id && (!best || area < best.area)) best = { id, area }
+      }
+    })
+    return (best as { id: string; area: number } | null)?.id ?? null
+  }, [])
+
+  const handleViewEdit = useCallback(
+    async (viewId: string, edit: ViewEdit) => {
+      if (!activeId || !activeDrawing) return
+      const v = activeDrawing.views.find((x) => x.id === viewId)
+      if (!v) return
+      setError(null)
+      setViewsBusy(true)
+      try {
+        await updateView(activeId, viewId, edit)
+        await refreshActive(activeId)
+        setRemovedView(null)
+        const what =
+          edit.show_hidden === false
+            ? `Hidden lines removed on ${v.name}`
+            : edit.show_hidden === true
+              ? `Hidden lines shown on ${v.name}`
+              : edit.scale !== undefined
+                ? `${v.name} now at ${edit.scale >= 1 ? `${edit.scale}:1` : `1:${Number((1 / edit.scale).toFixed(2))}`}`
+                : `${v.name} renamed ${edit.name ?? ''}`
+        setNoteKind('done')
+        setEditNote(`${what}. Ctrl+Z undoes it.`)
+      } catch (e) {
+        setNoteKind('info')
+        setEditNote(e instanceof DrawingRefusal ? `Not changed: ${e.message}` : null)
+        if (!(e instanceof DrawingRefusal)) setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setViewsBusy(false)
+      }
+    },
+    [activeId, activeDrawing, refreshActive],
+  )
+
+  // Delete removes the selected view; Escape lets go of it. Not while the
+  // engineer types, and not while a dimension's change box is open.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!selectedViewId) return
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      if (dimEdit) return
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault()
+        const id = selectedViewId
+        setSelectedViewId(null)
+        setViewMenu(null)
+        void handleRemoveView(id)
+      } else if (e.key === 'Escape') {
+        setSelectedViewId(null)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [selectedViewId, dimEdit, handleRemoveView])
+
+  // The selected view's outline, measured off the rendered sheet (follows
+  // pan, zoom and re-renders).
+  const [selRect, setSelRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
+
 
   const handleDownload = useCallback(
     async (format: DrawingFormat) => {
@@ -556,6 +641,28 @@ export function DrawingsWorkspace() {
   const effectiveScale = zoomMode === 'fit' ? fitScale : zoom
   const displayW = Math.max(1, sheetWPx * effectiveScale)
   const displayH = Math.max(1, sheetHPx * effectiveScale)
+
+  useLayoutEffect(() => {
+    const root = canvasRef.current
+    if (!root || !selectedViewId) {
+      setSelRect(null)
+      return
+    }
+    const el = root.querySelector(`[data-view-id="${CSS.escape(selectedViewId)}"]`)
+    if (!el) {
+      setSelRect(null)
+      return
+    }
+    const r = el.getBoundingClientRect()
+    const base = root.getBoundingClientRect()
+    const pad = 4
+    setSelRect({
+      left: r.left - base.left - pad,
+      top: r.top - base.top - pad,
+      width: r.width + 2 * pad,
+      height: r.height + 2 * pad,
+    })
+  }, [selectedViewId, svgMarkup, pan, displayW, displayH])
 
   const zoomIn = useCallback(() => {
     setZoom((prev) => {
@@ -678,7 +785,14 @@ export function DrawingsWorkspace() {
   const onSheetClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       const el = (e.target as Element).closest('[data-dim-id]')
-      if (!el || !activeDrawing) return
+      if (!el) {
+        // A drag pans the sheet; only a click selects.
+        const s = panStateRef.current
+        if (Math.hypot(e.clientX - s.startX, e.clientY - s.startY) > 4) return
+        setSelectedViewId(viewAt(e.clientX, e.clientY))
+        return
+      }
+      if (!activeDrawing) return
       const id = el.getAttribute('data-dim-id') ?? ''
       const view = activeDrawing.views.find((v) => (v.dimensions ?? []).some((d) => d.id === id))
       const dim = view?.dimensions?.find((d) => d.id === id)
@@ -713,7 +827,17 @@ export function DrawingsWorkspace() {
           ),
         )
     },
-    [activeDrawing],
+    [activeDrawing, viewAt],
+  )
+
+  const onSheetContextMenu = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const id = viewAt(e.clientX, e.clientY)
+      if (!id) return
+      e.preventDefault()
+      openViewMenu(id, e.clientX, e.clientY)
+    },
+    [viewAt, openViewMenu],
   )
 
   const applyDimEdit = useCallback(async () => {
@@ -781,6 +905,7 @@ export function DrawingsWorkspace() {
             <div
               className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full [&_[data-dim-id]]:cursor-pointer [&_[data-dim-id]:hover]:fill-blue-600 [&_[data-dim-editing]]:fill-blue-700 [&_[data-dim-editing]]:font-bold"
               onClick={onSheetClick}
+              onContextMenu={onSheetContextMenu}
               style={{
                 width: `${displayW}px`,
                 height: `${displayH}px`,
@@ -840,6 +965,31 @@ export function DrawingsWorkspace() {
           busy={viewsBusy}
           onRemove={(id) => void handleRemoveView(id)}
           onAdd={(kind, label) => void handleAddLike(kind, label)}
+          onMenu={openViewMenu}
+          selectedId={selectedViewId}
+        />
+      )}
+      {selRect && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute z-10 rounded-sm border border-dashed border-sky-600"
+          style={selRect}
+        />
+      )}
+      {activeDrawing && viewMenu && (
+        <ViewMenu
+          key={`${viewMenu.viewId}:${viewMenu.x}:${viewMenu.y}`}
+          drawing={activeDrawing}
+          viewId={viewMenu.viewId}
+          x={viewMenu.x}
+          y={viewMenu.y}
+          busy={viewsBusy}
+          onClose={closeViewMenu}
+          onEdit={(id, edit) => void handleViewEdit(id, edit)}
+          onDelete={(id) => {
+            setSelectedViewId(null)
+            void handleRemoveView(id)
+          }}
         />
       )}
       {activeDrawing && svg && <SheetHint />}

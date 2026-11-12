@@ -11296,6 +11296,83 @@ async fn selecting_a_dimension_finds_its_driver_and_the_edit_reuses_it() {
     assert_eq!(third["cached"], false, "a new history is searched afresh");
 }
 
+/// An engineer switches hidden lines off on one view (and renames it): the
+/// sheet shows it, a bad edit is refused without changing anything, and the
+/// edit is history -- undo puts the view back as it was.
+#[tokio::test]
+async fn a_view_edit_applies_refuses_bad_input_and_undoes() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (_, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let front_of = |sheet: &Value| -> Value {
+        sheet["views"]
+            .as_array()
+            .and_then(|vs| vs.iter().find(|v| v["projection"]["kind"] == "front"))
+            .cloned()
+            .expect("a FRONT view")
+    };
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let front = front_of(&sheet);
+    let vid = front["id"].as_str().expect("view id").to_string();
+    assert_eq!(front["show_hidden"], true, "hidden lines show by default");
+    let patch = |body: Value| {
+        Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/api/drawings/{drawing_id}/views/{vid}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    };
+
+    let (bs, bad) = dispatch(&state, patch(json!({ "show_hidden": false, "scale": 0.0 }))).await;
+    assert_eq!(bs, StatusCode::BAD_REQUEST, "{bad}");
+    let (_, unchanged) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert_eq!(
+        front_of(&unchanged)["show_hidden"],
+        true,
+        "a refused edit changes nothing"
+    );
+
+    let (os, ok) = dispatch(&state, patch(json!({ "show_hidden": false }))).await;
+    assert_eq!(os, StatusCode::OK, "{ok}");
+    let (rs, renamed) = dispatch(&state, patch(json!({ "name": "ELEVATION" }))).await;
+    assert_eq!(rs, StatusCode::OK, "{renamed}");
+    let (_, edited) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let f = front_of(&edited);
+    assert_eq!(f["show_hidden"], false);
+    assert_eq!(f["name"], "ELEVATION");
+
+    let _ = state.timeline_recorder.settle().await;
+    let session = crate::handlers::timeline::live_session_id(&timeline_engine::BranchId::main());
+    let (us, undone) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/undo",
+            json!({ "session_id": session.to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(us, StatusCode::OK, "{undone}");
+    assert_ne!(undone["success"], false, "{undone}");
+    let (_, after) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    // Undo takes back only the rename; the sheet is rebuilt from history, so
+    // the earlier hidden-lines edit survives only if it replays.
+    let f = front_of(&after);
+    assert_eq!(f["name"], front["name"], "undo restores the name");
+    assert_eq!(f["show_hidden"], false, "the earlier edit is replayed");
+}
+
 /// Undo puts a removed view back: the sheet is rebuilt from the history at
 /// the undone position. Before, undo/redo rewound the history but never
 /// rebuilt the sheets -- the view stayed gone.

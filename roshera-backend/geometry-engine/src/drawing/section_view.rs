@@ -240,6 +240,7 @@ pub fn section_view(
         hidden_circles: Vec::new(),
         ellipses: Vec::new(),
         hidden_ellipses: Vec::new(),
+        show_hidden: true,
         shaded_raster: None,
         hatch_polylines: hatch,
         // The section outline carries no per-edge provenance (`SectionCap` has

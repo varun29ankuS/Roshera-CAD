@@ -11164,7 +11164,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/drawings/{id}/views/{view_id}",
-            delete(drawing_mgr::remove_view),
+            delete(drawing_mgr::remove_view).patch(drawing_mgr::update_view),
         )
         .route("/api/drawings/{id}/svg", get(drawing_mgr::export_svg))
         .route("/api/drawings/{id}/pdf", get(drawing_mgr::export_pdf))
