@@ -459,7 +459,11 @@ async fn replay_undo_redo(
             )),
         }));
     }
-    Ok(commit_prepared_replay(state, &mut model_guard, prepared).await)
+    let outcome = commit_prepared_replay(state, &mut model_guard, prepared).await;
+    drop(model_guard);
+    // The live model was replaced: show it in every open viewport.
+    crate::broadcast_scene_sync(state).await;
+    Ok(outcome)
 }
 
 /// After a refused undo/redo: put `session_uuid` back at the document's
@@ -910,7 +914,11 @@ async fn replay_session_to_model(
             now,
         });
     }
-    Ok(commit_prepared_replay(state, &mut model_guard, prepared).await)
+    let outcome = commit_prepared_replay(state, &mut model_guard, prepared).await;
+    drop(model_guard);
+    // The live model was replaced: show it in every open viewport.
+    crate::broadcast_scene_sync(state).await;
+    Ok(outcome)
 }
 
 /// Test-only gate between the off-lock rebuild and the swap of

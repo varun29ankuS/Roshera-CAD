@@ -11115,6 +11115,58 @@ async fn adding_a_view_like_an_existing_one_places_itself() {
     }
 }
 
+/// An edit made from the sheet reaches the 3D view. The mould changed the
+/// live model (the boss read Ø42 on the server) while the viewport kept the
+/// old mesh: the server never sent the `SceneSync` frame the app already
+/// handles. Every replay that replaces the live model now pushes one.
+#[tokio::test]
+async fn an_edit_from_the_sheet_pushes_the_new_scene_to_the_viewport() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (_, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let (dim_id, _) = drawing_dimension(&sheet, "diameter", 6.0).expect("the Ø6 bore");
+
+    let mut rx = crate::geometry_broadcaster().subscribe();
+    let (es, edited) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/drawings/{drawing_id}/dimensions/{dim_id}"),
+            json!({ "value": 8.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(es, StatusCode::OK, "{edited}");
+
+    // Frames from other tests share the broadcaster: look for OUR scene.
+    let mut synced = false;
+    while let Ok(text) = rx.try_recv() {
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if frame["type"] == "SceneSync"
+            && frame["payload"]["objects"]
+                .as_array()
+                .is_some_and(|objs| objs.iter().any(|o| o["id"] == part_uuid.to_string()))
+        {
+            synced = true;
+        }
+    }
+    assert!(
+        synced,
+        "the edit must push a SceneSync carrying the edited part"
+    );
+}
+
 /// A dimension nothing on the timeline drives is refused as reference-only,
 /// never "edited" by scaling or approximation.
 #[tokio::test]

@@ -8614,6 +8614,35 @@ static GEOMETRY_BROADCASTER: std::sync::LazyLock<broadcast::Sender<String>> =
         tx
     });
 
+/// Push the whole live scene to every connected client as one `SceneSync`
+/// frame (the app replaces its scene from it). Sent after a history replay
+/// replaces the live model -- an edit from the sheet, undo, redo, a branch
+/// switch -- so the 3D view shows what the server now holds. Before, those
+/// paths sent no geometry frame and the viewport kept the old meshes.
+pub(crate) async fn broadcast_scene_sync(state: &AppState) {
+    let model = state.model.clone().read_owned().await;
+    let local_to_uuid = state.local_to_uuid.clone();
+    let solid_colors = state.solid_colors.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        scene_snapshot_body(&model, &local_to_uuid, &solid_colors)
+    })
+    .await;
+    match built {
+        Ok(body) => {
+            let frame = serde_json::json!({
+                "type": "SceneSync",
+                "payload": { "objects": body["objects"].clone() },
+            });
+            if let Ok(text) = serde_json::to_string(&frame) {
+                let _ = GEOMETRY_BROADCASTER.send(text);
+            }
+        }
+        Err(e) => {
+            tracing::error!(target: "snapshot", error = %e, "scene sync broadcast failed");
+        }
+    }
+}
+
 /// Subscriber handle for `protocol::message_handlers::handle_websocket_connection`.
 pub fn geometry_broadcaster() -> &'static broadcast::Sender<String> {
     &GEOMETRY_BROADCASTER
