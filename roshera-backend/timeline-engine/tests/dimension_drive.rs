@@ -14,8 +14,8 @@
 use chrono::Utc;
 use serde_json::json;
 use timeline_engine::dimension_drive::{
-    measure_dimension, plan_dimension_edit, resolve_dimension_driver, DimensionEditRefusal,
-    DriveResolution,
+    measure_dimension, plan_dimension_edit, resolve_dimension_driver,
+    resolve_dimension_driver_measured, DimensionEditRefusal, DriveResolution,
 };
 use timeline_engine::mould::mould_operation;
 use timeline_engine::rebuild_certificate::certify_rebuild;
@@ -114,8 +114,11 @@ fn the_bore_diameter_is_driven_by_the_drill_radius_alone() {
     let events = plate(3.0);
     let pid = bore_diameter_pid(&events, 6.0);
     match resolve_dimension_driver(&events, &pid) {
-        DriveResolution::Driven { driver, current } => {
+        DriveResolution::Driven {
+            driver, current, ..
+        } => {
             assert_eq!(driver.target_sequence, 1, "the drill event");
+            assert!(driver.linked.is_empty(), "a single drill links nothing");
             assert_eq!(driver.parameter, "radius");
             assert!((driver.value - 3.0).abs() < 1e-12);
             assert!(
@@ -178,4 +181,103 @@ fn an_impossible_size_is_refused_not_approximated() {
         Err(DimensionEditRefusal::Unreachable { .. }) => {}
         other => panic!("an impossible size is unreachable, not approximated: {other:?}"),
     }
+}
+
+/// A document holds more than the part being edited -- an abandoned first
+/// attempt, other parts. On the live mounting plate (47 events, ~220 numbers)
+/// the planner replayed the WHOLE document once per number, regenerating the
+/// drawing each time: 100+ rebuilds of 4.4 s, minutes per edit. Only numbers
+/// on the edited part's own chain can move its dimension; only they are probed,
+/// and each probe re-executes only that chain from the frame before its event.
+#[test]
+fn only_the_parts_own_chain_is_probed() {
+    // The bored plate (seq 0-2) and an unrelated second plate (seq 3-5).
+    let mut events = plate(3.0);
+    events.extend([box20(3, 4), drill(4, 5, 2.0), difference(5, 4, 5, 6)]);
+    let pid = bore_diameter_pid(&events, 6.0);
+
+    let (resolution, stats) = resolve_dimension_driver_measured(&events, &pid);
+    match resolution {
+        DriveResolution::Driven { driver, .. } => {
+            assert_eq!(driver.target_sequence, 1, "the plate's own drill");
+            assert_eq!(driver.parameter, "radius");
+        }
+        other => panic!("expected the drill radius to drive the bore: {other:?}"),
+    }
+    // box20: width/height/depth (3); drill: base_x/y/z, radius, height (5).
+    assert_eq!(stats.parameters_total, 16, "{stats:?}");
+    assert_eq!(
+        stats.parameters_probed, 8,
+        "only the plate's chain: {stats:?}"
+    );
+    // Probes of seq 0 replay seq 0..=2 (3 events x 3 numbers); probes of
+    // seq 1 replay seq 1..=2 (2 events x 5 numbers): 19, against 8 x 6 = 48
+    // for whole-document replays.
+    assert!(stats.events_reexecuted <= 19, "{stats:?}");
+}
+
+/// A cutter at an explicit axis position and z range.
+fn cutter(seq: u64, out: u64, radius: f64, base_z: f64, height: f64) -> TimelineEvent {
+    generic(
+        "create_cylinder_3d",
+        seq,
+        json!({
+            "params": { "Create3D": {
+                "primitive_type": "cylinder",
+                "parameters": {
+                    "base_x": 0.0, "base_y": 0.0, "base_z": base_z,
+                    "axis_x": 0.0, "axis_y": 0.0, "axis_z": 1.0,
+                    "radius": radius, "height": height
+                },
+                "timestamp": 0
+            }},
+            "inputs": [], "outputs": [format!("solid:{out}")]
+        }),
+    )
+}
+
+/// One bore, two cutters: the live mounting plate's Ø30 was cut through the
+/// plate, then cut again (equal radius, same axis) through a boss. Nudging one
+/// cutter alone leaves two almost-coincident cylinders; the planner answered
+/// "undecided" after 9 minutes. The two cutters are ONE feature: they are
+/// probed and edited together, and the edit changes both.
+#[test]
+fn coaxial_equal_cutters_are_one_feature_and_move_together() {
+    // 20 mm box (z in [-10, 10]); Ø6 bore cut by two cutters that meet end to
+    // end at z = 0 (an OVERLAPPING coaxial pair is BOOL-COAX-1: unsound).
+    let events = vec![
+        box20(0, 1),
+        cutter(1, 2, 3.0, -20.0, 20.0),
+        difference(2, 1, 2, 3),
+        cutter(3, 4, 3.0, 0.0, 20.0),
+        difference(4, 3, 4, 5),
+    ];
+    let pid = bore_diameter_pid(&events, 6.0);
+    let driver = match resolve_dimension_driver(&events, &pid) {
+        DriveResolution::Driven { driver, .. } => driver,
+        other => panic!("the twin cutters are one driver: {other:?}"),
+    };
+    assert_eq!(driver.parameter, "radius");
+    let mut members: Vec<u64> = std::iter::once(driver.target_sequence)
+        .chain(driver.linked.iter().map(|l| l.target_sequence))
+        .collect();
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        vec![1, 3],
+        "both cutters' radii move together: {driver:?}"
+    );
+
+    let plan = plan_dimension_edit(&events, &pid, 8.0).expect("a plannable edit");
+    assert!((plan.new_parameter_value - 4.0).abs() < 1e-9, "{plan:?}");
+    assert!((plan.verified_value - 8.0).abs() < 1e-9, "{plan:?}");
+
+    // Committing BOTH moulds reads Ø8; committing one alone would not be the plan.
+    let mut after = events.clone();
+    after.push(mould(1, "radius", 4.0, 5));
+    after.push(mould(3, "radius", 4.0, 6));
+    let (model, cert) = certify_rebuild(&after, Some(1));
+    assert!(cert.is_sound(), "both cutters at r 4 rebuild sound");
+    let measured = measure_dimension(&model, &pid).expect("same dimension by pid");
+    assert!((measured - 8.0).abs() < 1e-9, "measured {measured}");
 }

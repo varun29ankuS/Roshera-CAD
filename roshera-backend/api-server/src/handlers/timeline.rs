@@ -2478,6 +2478,19 @@ pub struct MouldRequest {
     pub name: Option<String>,
     /// The new dimensional value.
     pub value: f64,
+    /// Parameters of the SAME feature that take the same value in the same
+    /// edit -- e.g. the second cutter of a bore cut twice. They are trialled
+    /// together and appended together: changing one alone would leave the
+    /// feature split (two almost-coincident cylinders).
+    #[serde(default)]
+    pub linked: Vec<LinkedMould>,
+}
+
+/// One linked member of a mould: an event and its parameter.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LinkedMould {
+    pub target_event_id: String,
+    pub parameter: String,
 }
 
 /// Compact per-solid summary of the rebuilt scene returned by a mould.
@@ -2638,8 +2651,58 @@ pub async fn mould_parameter(
         outputs: Default::default(),
         metadata: EventMetadata::default(),
     };
+    // Linked members of the same feature: resolved and validated like the
+    // target, appended right after it.
+    let mut linked_events: Vec<TimelineEvent> = Vec::new();
+    for (k, link) in request.linked.iter().enumerate() {
+        let resolved = Uuid::parse_str(&link.target_event_id)
+            .ok()
+            .and_then(|u| events.iter().find(|e| e.id.0 == u).map(|e| (u, e)));
+        let Some((link_uuid, link_event)) = resolved else {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": "MouldRejected",
+                    "reason": format!("no linked event {} on this branch", link.target_event_id),
+                    "kind": "UnknownTargetEvent",
+                })),
+            ));
+        };
+        let numeric = generic_parameters(&link_event.operation)
+            .map(|p| params_have_numeric(p, &link.parameter))
+            .unwrap_or(false);
+        if !numeric {
+            return Ok((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "status": "MouldRejected",
+                    "reason": format!(
+                        "linked '{}' is not a numeric dimension of event at sequence {}",
+                        link.parameter, link_event.sequence_number
+                    ),
+                    "kind": "UnknownParameter",
+                })),
+            ));
+        }
+        linked_events.push(TimelineEvent {
+            id: EventId::new(),
+            sequence_number: mould_event.sequence_number + 1 + k as u64,
+            timestamp: chrono::Utc::now(),
+            author: Author::System,
+            operation: mould_operation(
+                link_event.sequence_number,
+                Some(link_uuid),
+                &link.parameter,
+                request.value,
+            ),
+            inputs: OperationInputs::default(),
+            outputs: Default::default(),
+            metadata: EventMetadata::default(),
+        });
+    }
     let mut candidate_events = events.clone();
     candidate_events.push(mould_event.clone());
+    candidate_events.extend(linked_events.iter().cloned());
 
     // ── Pre-flight: the append cannot be undone ───────────────────────
     // Refuse — nothing appended — when a replay the mould depends on would be
@@ -2758,6 +2821,19 @@ pub async fn mould_parameter(
                 error!(target: "timeline.mould", error = %e, "mould append failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+        // The linked members, under the same write lock: no replay can see
+        // the feature half-moved.
+        for linked in &mut linked_events {
+            let lseq = timeline.reserve_sequence_number();
+            linked.sequence_number = lseq;
+            timeline
+                .add_operation_reserved(linked.operation.clone(), Author::System, branch_id, lseq)
+                .await
+                .map_err(|e| {
+                    error!(target: "timeline.mould", error = %e, "linked mould append failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        }
         seq
     };
 

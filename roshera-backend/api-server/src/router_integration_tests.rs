@@ -10894,6 +10894,102 @@ async fn editing_a_drawing_dimension_changes_the_part() {
     );
 }
 
+/// One bore, two cutters, edited from the sheet: the live mounting plate's Ø30
+/// was cut through the plate and again through a boss, with equal coaxial
+/// cutters. The edit is planned as ONE feature and committed as ONE step --
+/// both radii move -- through the real route. Before, the planner answered
+/// "undecided" (each cutter nudged alone breaks the part) after minutes.
+#[tokio::test]
+async fn editing_a_bore_cut_by_two_cutters_moves_both() {
+    let state = make_test_state().await;
+    let (_, b) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 20.0, "depth": 20.0, "height": 20.0}),
+        ),
+    )
+    .await;
+    let mut part = b["object"]["id"].as_str().expect("box id").to_string();
+    // Two equal coaxial cutters meeting end to end at z = 10 (box z in [0, 20]).
+    for (z, h) in [(-1.0, 11.0), (10.0, 11.0)] {
+        let (cs, c) = dispatch(
+            &state,
+            json_post(
+                "/api/geometry/cylinder",
+                json!({"center": [0.0, 0.0, z], "axis": [0.0, 0.0, 1.0], "radius": 3.0, "height": h}),
+            ),
+        )
+        .await;
+        assert_eq!(cs, StatusCode::OK, "cutter: {c}");
+        let cutter = c["object"]["id"].as_str().expect("cutter id").to_string();
+        let (os, o) = dispatch(
+            &state,
+            json_post(
+                "/api/geometry/boolean",
+                json!({"operation": "difference", "object_a": part, "object_b": cutter}),
+            ),
+        )
+        .await;
+        assert_eq!(os, StatusCode::OK, "cut: {o}");
+        part = o["object"]["id"]
+            .as_str()
+            .or_else(|| o["result"]["id"].as_str())
+            .map(str::to_string)
+            .unwrap_or(part);
+    }
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (cs, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "drawing create: {created}");
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let (dim_id, _pid) = drawing_dimension(&sheet, "diameter", 6.0)
+        .expect("the Ø6 bore is dimensioned on the sheet");
+
+    let (es, edited) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/drawings/{drawing_id}/dimensions/{dim_id}"),
+            json!({ "value": 8.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(es, StatusCode::OK, "the edit must apply; body = {edited}");
+    assert_eq!(
+        edited["driver"]["linked"].as_array().map(Vec::len),
+        Some(1),
+        "the second cutter moves with the first: {edited}"
+    );
+
+    // No radius-3 wall is left anywhere in the live part.
+    let model = state.model.read().await;
+    let mut radii: Vec<f64> = Vec::new();
+    for (_, face) in model.faces.iter() {
+        if let Some(surf) = model.surfaces.get(face.surface_id) {
+            if let Some(cyl) = surf
+                .as_any()
+                .downcast_ref::<geometry_engine::primitives::surface::Cylinder>()
+            {
+                radii.push(cyl.radius);
+            }
+        }
+    }
+    assert!(!radii.is_empty(), "the bore walls exist");
+    assert!(
+        radii.iter().all(|r| (r - 4.0).abs() < 1e-6),
+        "both cutters moved to r 4: {radii:?}"
+    );
+}
+
 /// A dimension nothing on the timeline drives is refused as reference-only,
 /// never "edited" by scaling or approximation.
 #[tokio::test]

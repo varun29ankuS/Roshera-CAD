@@ -304,7 +304,7 @@ fn replay_with_report(
 
 /// Re-measured soundness: replay skipped nothing, produced at least one solid,
 /// and the B-Rep validates. Honest — recomputed from geometry, never asserted.
-fn measure_is_sound(model: &BRepModel, events_skipped: usize) -> bool {
+pub(crate) fn measure_is_sound(model: &BRepModel, events_skipped: usize) -> bool {
     if events_skipped > 0 || model.solids.is_empty() {
         return false;
     }

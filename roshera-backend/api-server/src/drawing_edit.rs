@@ -166,6 +166,16 @@ pub async fn edit_dimension(
             parameter: Some(plan.driver.parameter.clone()),
             name: None,
             value: plan.new_parameter_value,
+            // Every member of the feature moves with the driver.
+            linked: plan
+                .driver
+                .linked
+                .iter()
+                .map(|l| crate::handlers::timeline::LinkedMould {
+                    target_event_id: l.target_event_id.to_string(),
+                    parameter: l.parameter.clone(),
+                })
+                .collect(),
         }),
     )
     .await
@@ -209,6 +219,7 @@ pub async fn edit_dimension(
             "from_value": plan.driver.value,
             "new_value": plan.new_parameter_value,
             "gain": plan.driver.gain,
+            "linked": plan.driver.linked,
         },
         "mould": mould,
     })))

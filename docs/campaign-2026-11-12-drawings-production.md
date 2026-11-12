@@ -38,6 +38,24 @@ clause-verified"; the kernel now holds a second ISO 2768 copy
 | People add/edit tables and company overrides (house counterbore table, default class) in the app; each edit is a timeline event (who/when/what). | A person adds an ISO 4762 counterbore table; the agent then sizes counterbores from it. |
 | Datum scheme per part is edited by a person (A/B/C faces); the kernel checks it against the Y14.5 rules and refuses an invalid one. | An invalid scheme (secondary parallel to primary) is refused by name. |
 
+## P8 — People edit the sheet to their liking (Varun, 11-12)
+
+"how can user edit the drawing to their liking ? like views and how the
+dimensioning is done"
+
+Today: add/remove views (bar under the sheet), 1st/3rd angle, title-block
+fields, and dimension VALUES (which edit the part). Missing: drag a view,
+per-view scale, move/flip/hide a dimension, add one by picking edges, choose
+baseline vs chain and the datum faces, user-drawn section line / detail
+circle, hand-placed notes, leaders, GD&T frames.
+
+Design: the auto sheet is the default; each person's change is a PINNED EDIT
+recorded as a timeline event and re-applied when the part changes, so a
+regenerated sheet keeps it. The kernel still certifies: an added dimension is
+measured from geometry; a hidden dimension that leaves a feature unspecified is
+named by the sheet certificate. Datum/baseline choice joins P4 + P7. Built
+after the frame cache (pinned edits replay on every rebuild).
+
 ## Gaps carried into the campaign
 
 - BOOL-COAX-1: an overlapping coaxial cutter through a plate+boss union certifies unsound.
