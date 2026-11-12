@@ -79,6 +79,30 @@ fn kind(e: &TimelineEvent) -> &str {
     }
 }
 
+/// The sheet-cache key of the sheet `event` (a `drawing.create_from_part`)
+/// derives from `geometry` (the effective geometry events before it) under
+/// projection `switch`. Certification and [`rebuild_drawings`] both use it,
+/// so a sheet derived by one is reused by the other.
+pub fn sheet_key(
+    geometry: &[TimelineEvent],
+    event: &TimelineEvent,
+    switch: Option<geometry_engine::drawing::ProjectionAngle>,
+) -> [u8; 32] {
+    FrameCache::derived_key(
+        &FrameCache::key_of(geometry),
+        event,
+        format!("{switch:?}").as_bytes(),
+    )
+}
+
+/// Is `event` part of the geometry a sheet is derived from (what
+/// [`rebuild_drawings`] replays): not a `param.*` override, not a document
+/// event (`drawing.*`, annotations -- anything with a dotted kind)?
+pub(crate) fn is_geometry_event(event: &TimelineEvent) -> bool {
+    let k = kind(event);
+    !is_param_meta(k) && !k.contains('.')
+}
+
 /// Rebuild every sheet `events` creates, with its recorded edits applied.
 pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> DrawingRebuild {
     let mut ordered: Vec<&TimelineEvent> = events.iter().collect();
@@ -112,11 +136,7 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                 // The derived sheet depends only on the geometry before this
                 // event, the event, and the projection switch: reuse it when
                 // all three are unchanged (an edit-only undo or redo).
-                let key = FrameCache::derived_key(
-                    &FrameCache::key_of(&geometry),
-                    e,
-                    format!("{switch:?}").as_bytes(),
-                );
+                let key = sheet_key(&geometry, e, switch);
                 let derived = match frames.sheet(&key) {
                     Some(hit) => {
                         out.stats.sheets_reused += 1;

@@ -14,9 +14,11 @@
 use chrono::Utc;
 use serde_json::json;
 use timeline_engine::dimension_drive::{
-    measure_dimension, plan_dimension_edit, plan_dimension_edit_with, resolve_dimension_driver,
+    measure_dimension, plan_dimension_edit, plan_dimension_edit_with,
+    plan_dimension_edit_with_frames, resolve_dimension_driver, resolve_dimension_driver_in,
     resolve_dimension_driver_measured, DimensionEditRefusal, DriveResolution,
 };
+use timeline_engine::frames::FrameCache;
 use timeline_engine::mould::mould_operation;
 use timeline_engine::rebuild_certificate::certify_rebuild;
 use timeline_engine::types::{Author, EventId, EventMetadata, Operation, TimelineEvent};
@@ -306,4 +308,38 @@ fn a_plan_from_a_cached_driver_equals_the_plan_from_scratch() {
         Err(DimensionEditRefusal::NotDriven { .. }) => {}
         other => panic!("{other:?}"),
     }
+}
+
+/// The server keeps the current history's replay in its frame cache. The
+/// driver search and the edit's solve start from it instead of replaying the
+/// whole history from scratch (seconds each on a real part), and answer
+/// exactly what the from-scratch path answers.
+#[test]
+fn the_search_and_the_solve_start_from_the_frame_cache() {
+    let mut events = plate(3.0);
+    events.push(mould(1, "radius", 3.5, 3));
+    let pid = bore_diameter_pid(&events, 7.0);
+    let frames = FrameCache::new(64);
+
+    let (cold, cold_stats) = resolve_dimension_driver_in(&events, &pid, &frames);
+    assert_eq!(cold_stats.geometry_events_reused, 0, "nothing cached yet");
+    let (warm, warm_stats) = resolve_dimension_driver_in(&events, &pid, &frames);
+    assert_eq!(
+        warm_stats.geometry_events_reused,
+        events.len(),
+        "the second search replays nothing"
+    );
+    let (plain, _) = resolve_dimension_driver_measured(&events, &pid);
+    assert_eq!(
+        format!("{warm:?}"),
+        format!("{plain:?}"),
+        "same answer as from scratch"
+    );
+    assert_eq!(format!("{cold:?}"), format!("{plain:?}"));
+
+    let with = plan_dimension_edit_with_frames(&events, &pid, 9.0, warm.clone(), &frames)
+        .expect("plannable");
+    let without = plan_dimension_edit_with(&events, &pid, 9.0, warm).expect("plannable");
+    assert!((with.new_parameter_value - without.new_parameter_value).abs() < 1e-12);
+    assert!((with.verified_value - 9.0).abs() < 1e-9);
 }

@@ -125,8 +125,16 @@ pub async fn dimension_driver(
         })));
     }
     let pid_for_search = pid.clone();
+    // From the frame cache: the current history is usually already shot, so
+    // only the probes cost anything.
+    let frames = std::sync::Arc::clone(&state.frames);
+    let started = std::time::Instant::now();
     let resolution = tokio::task::spawn_blocking(move || {
-        timeline_engine::dimension_drive::resolve_dimension_driver(&events, &pid_for_search)
+        timeline_engine::dimension_drive::resolve_dimension_driver_in(
+            &events,
+            &pid_for_search,
+            &frames,
+        )
     })
     .await
     .map_err(|e| {
@@ -135,6 +143,15 @@ pub async fn dimension_driver(
             format!("the driver search stopped: {e}"),
         )
     })?;
+    let (resolution, stats) = resolution;
+    tracing::info!(
+        target: "drawings.dimension_edit",
+        search_ms = started.elapsed().as_millis() as u64,
+        parameters_probed = stats.parameters_probed,
+        events_reexecuted = stats.events_reexecuted,
+        geometry_events_reused = stats.geometry_events_reused,
+        "driver search timings"
+    );
     DRIVER_CACHE.insert(key, resolution.clone());
     Ok(Json(serde_json::json!({
         "dimension": dim_id, "cached": false, "resolution": resolution,
@@ -201,6 +218,7 @@ pub async fn edit_dimension(
     };
 
     let target = req.value;
+    let started = std::time::Instant::now();
     let pid_for_plan = pid.clone();
     // A driver found when the dimension was selected, on THIS history, is
     // reused: the edit then only solves.
@@ -208,12 +226,14 @@ pub async fn edit_dimension(
         .get(&(history_key(&events), pid.clone()))
         .map(|r| r.value().clone());
     let driver_cached = cached.is_some();
+    let frames = std::sync::Arc::clone(&state.frames);
     let plan = tokio::task::spawn_blocking(move || match cached {
-        Some(resolution) => timeline_engine::dimension_drive::plan_dimension_edit_with(
+        Some(resolution) => timeline_engine::dimension_drive::plan_dimension_edit_with_frames(
             &events,
             &pid_for_plan,
             target,
             resolution,
+            &frames,
         ),
         None => plan_dimension_edit(&events, &pid_for_plan, target),
     })
@@ -264,6 +284,7 @@ pub async fn edit_dimension(
         }
     };
 
+    let planned_at = started.elapsed();
     let (status, Json(mould)) = mould_parameter(
         State(state.clone()),
         Json(MouldRequest {
@@ -304,6 +325,15 @@ pub async fn edit_dimension(
         ));
     }
 
+    // Where a sheet dimension edit spends its time (engineers wait on it).
+    tracing::info!(
+        target: "drawings.dimension_edit",
+        driver_cached,
+        plan_ms = planned_at.as_millis() as u64,
+        mould_ms = (started.elapsed() - planned_at).as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "dimension edit timings"
+    );
     // Read the regenerated sheet back: the dimension, by its persistent id.
     let shown = {
         let drawing = handle.read().await;

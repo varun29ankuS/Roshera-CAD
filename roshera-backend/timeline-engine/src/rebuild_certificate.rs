@@ -345,7 +345,135 @@ pub fn certify_rebuild_with_drawings(
 ) -> (BRepModel, RebuildCertificate, DrawingStore) {
     let mut model = BRepModel::new();
     let (outcome, per_event, drawings) = replay_with_report(&mut model, events);
+    build_certificate(events, target_sequence, model, outcome, per_event, drawings)
+}
 
+/// [`certify_rebuild`] through `frames`: the steps before the first changed
+/// event come from stored frames (their verdicts with them), so certifying an
+/// edit re-executes only what the edit changed -- and leaves its frames for
+/// the live reconcile and the next undo. Sheets it derives are taken from, or
+/// left in, the sheet cache. The certificate is the one [`certify_rebuild`]
+/// states (a test holds the two equal).
+pub fn certify_rebuild_with_frames(
+    events: &[TimelineEvent],
+    target_sequence: Option<u64>,
+    frames: &crate::frames::FrameCache,
+) -> (BRepModel, RebuildCertificate) {
+    let (model, outcome, per_event, drawings) = replay_with_report_frames(events, frames);
+    let (model, cert, _drawings) =
+        build_certificate(events, target_sequence, model, outcome, per_event, drawings);
+    (model, cert)
+}
+
+/// [`replay_with_report`] through `frames`. The whole history is replayed in
+/// the frames slice -- the same slice the live reconcile replays, so it finds
+/// these frames stored -- and every event gets exactly the verdict the full
+/// replay gives it; a `drawing.create_from_part` (a no-op there) then gets
+/// its real verdict by re-deriving its sheet against the model at its
+/// position, as the full replay does.
+fn replay_with_report_frames(
+    events: &[TimelineEvent],
+    frames: &crate::frames::FrameCache,
+) -> (
+    BRepModel,
+    ReplayOutcome,
+    HashMap<u64, EventResult>,
+    DrawingStore,
+) {
+    use crate::frames::StepVerdict;
+    let is_sheet = |e: &TimelineEvent| matches!(&e.operation, Operation::Generic { command_type, .. } if command_type == DRAWING_FROM_PART_KIND);
+    let (model, replayed, _stats, steps) = frames.replay_reporting(events);
+    let sheet_sequences: HashSet<u64> = events
+        .iter()
+        .filter(|e| is_sheet(e))
+        .map(|e| e.sequence_number)
+        .collect();
+
+    let mut outcome = ReplayOutcome::default();
+    let mut per_event: HashMap<u64, EventResult> = HashMap::new();
+    for (sequence, verdict) in steps {
+        if sheet_sequences.contains(&sequence) {
+            // Re-derived below.
+            continue;
+        }
+        let result = match verdict {
+            StepVerdict::Ok => EventResult::Ok,
+            StepVerdict::Failed(r) => {
+                outcome.events_skipped += 1;
+                EventResult::Failed(r)
+            }
+            StepVerdict::Dangling(r) => {
+                outcome.events_skipped += 1;
+                EventResult::Dangling(r)
+            }
+            StepVerdict::Stale(r) => EventResult::Stale(r),
+        };
+        per_event.insert(sequence, result);
+    }
+    outcome.id_remap = replayed.id_remap;
+    outcome.assemblies = replayed.assemblies;
+
+    // The sheets, each against the model as it stands at its position.
+    let overrides = OverrideSet::collect(events);
+    let switches = projection_switches(events);
+    let mut drawings = DrawingStore::default();
+    let mut prefix: Vec<TimelineEvent> = Vec::new();
+    let mut geometry: Vec<TimelineEvent> = Vec::new();
+    for event in events {
+        // As it replays: an edit recorded later still applies (the full replay
+        // folds every override wherever it sits). The effective event hashes
+        // to the same frame key as in the main slice, so the stored frames
+        // are reused.
+        let effective = overrides
+            .overridden_event(event)
+            .unwrap_or_else(|| event.clone());
+        if !is_sheet(event) {
+            if crate::drawing_history::is_geometry_event(event) {
+                geometry.push(effective.clone());
+            }
+            prefix.push(effective);
+            continue;
+        }
+        let overridden = overrides.overridden_event(event);
+        let dispatched = overridden.as_ref().unwrap_or(event);
+        let switch = drawing_output_id(dispatched).and_then(|id| switches.get(&id).copied());
+        let key = crate::drawing_history::sheet_key(&geometry, dispatched, switch);
+        let derived = match frames.sheet(&key) {
+            Some(hit) => DrawingRederive::Rebuilt(hit.0, Box::new(hit.1.clone())),
+            None => {
+                let (at, at_outcome, _) = frames.replay(&prefix);
+                let d = rederive_part_drawing(&at, dispatched, &at_outcome.id_remap, switch);
+                if let DrawingRederive::Rebuilt(id, sheet) = &d {
+                    frames.store_sheet(key, *id, (**sheet).clone());
+                }
+                d
+            }
+        };
+        let result = match derived {
+            DrawingRederive::Rebuilt(id, sheet) => {
+                drawings.drawings.insert(id, *sheet);
+                EventResult::Ok
+            }
+            DrawingRederive::Dangling(entity) => EventResult::Dangling(entity),
+            DrawingRederive::Failed(reason) => EventResult::Failed(reason),
+        };
+        per_event.insert(event.sequence_number, result);
+        // A no-op step in the slice; kept so later prefixes share its keys.
+        prefix.push(effective);
+    }
+    (model, outcome, per_event, drawings)
+}
+
+/// The certificate from a replay report: dirty set, per-feature verdicts,
+/// Blocked propagation, soundness.
+fn build_certificate(
+    events: &[TimelineEvent],
+    target_sequence: Option<u64>,
+    model: BRepModel,
+    outcome: ReplayOutcome,
+    per_event: HashMap<u64, EventResult>,
+    drawings: DrawingStore,
+) -> (BRepModel, RebuildCertificate, DrawingStore) {
     // Feature DAG projection — dirty set and Blocked propagation both read it.
     let graph = build_dependency_graph(events);
 

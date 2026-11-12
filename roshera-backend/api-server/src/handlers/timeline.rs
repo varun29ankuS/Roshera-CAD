@@ -2591,6 +2591,7 @@ pub async fn mould_parameter(
     State(state): State<AppState>,
     Json(request): Json<MouldRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let started = std::time::Instant::now();
     let branch_id = match request.branch_id.as_deref() {
         Some(b) => resolve_branch_ref(b)?,
         None => BranchId::main(),
@@ -2820,6 +2821,7 @@ pub async fn mould_parameter(
     // in full -- per-feature verdicts -- but without re-deriving sheets: they
     // are rebuilt from history after the live reconcile (`drawing_history`),
     // edits included. Both used to re-derive every sheet: seconds per edit.
+    let checks_from = started.elapsed();
     let base_sound = {
         let frames = std::sync::Arc::clone(&state.frames);
         let ev = events.clone();
@@ -2828,7 +2830,29 @@ pub async fn mould_parameter(
             // A failed check refuses an unsound candidate (the safe side).
             .unwrap_or(true)
     };
-    let (cand_model, cand_cert) = certify_rebuild(&candidate_events, Some(target_sequence));
+    let base_at = started.elapsed();
+    // Certified off the async workers; the sheets it derives are left in the
+    // sheet cache, so the live rebuild below reuses them.
+    let (cand_model, cand_cert) = {
+        let frames = std::sync::Arc::clone(&state.frames);
+        let ev = candidate_events.clone();
+        match tokio::task::spawn_blocking(move || {
+            timeline_engine::rebuild_certificate::certify_rebuild_with_frames(
+                &ev,
+                Some(target_sequence),
+                &frames,
+            )
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!(target: "timeline.mould", error = %e, "candidate certification task failed");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    };
+    let certified_at = started.elapsed();
 
     // Refuse only a REGRESSION: a sound baseline broken by the edit (a NEW
     // downstream failure, a dangling reference, a collapse, or a self-
@@ -2929,6 +2953,7 @@ pub async fn mould_parameter(
     // The override is appended; if the live model cannot follow it, the
     // answer says so and is never "MouldApplied" over a model that does not
     // hold the reported objects.
+    let reconcile_from = started.elapsed();
     let (events_applied, events_skipped) = match replay_session_to_model(&state, session_uuid).await
     {
         Ok(o) => (o.events_applied, o.events_skipped),
@@ -2969,6 +2994,18 @@ pub async fn mould_parameter(
     // The sheets were rebuilt from history by the live reconcile above
     // (`replay_session_to_model`), edits included.
 
+    // Where a dimension edit spends its time (engineers wait on it).
+    tracing::info!(
+        target: "timeline.mould",
+        events = candidate_events.len(),
+        prepare_ms = checks_from.as_millis() as u64,
+        baseline_ms = (base_at - checks_from).as_millis() as u64,
+        candidate_ms = (certified_at - base_at).as_millis() as u64,
+        append_ms = (reconcile_from - certified_at).as_millis() as u64,
+        reconcile_ms = (started.elapsed() - reconcile_from).as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "mould timings"
+    );
     let session_key = session_uuid.to_string();
     let _ = state
         .session_manager

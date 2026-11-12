@@ -303,19 +303,7 @@ pub fn free_view_position(
     near: Option<usize>,
 ) -> Option<[f64; 2]> {
     let sheet_h = drawing.sheet_size.height();
-    // The view's footprint at position (0, 0); a position (px, py) moves it
-    // by (+px, -py) in sheet (y-down) coordinates.
-    let mut probe = view.clone();
-    probe.position_mm = [0.0, 0.0];
-    let base = view_geometry_rect(&probe, sheet_h)?;
     let frame = super::svg::frame_rect(&drawing.sheet_size);
-    let pad = VIEW_PLACEMENT_CLEARANCE_MM;
-    let obstacles: Vec<Rect2> = compute_layout(drawing)
-        .items
-        .into_iter()
-        .filter(|i| i.kind != SheetItemKind::ZoneRef)
-        .map(|i| i.bbox)
-        .collect();
     let target = near
         .and_then(|i| drawing.views.get(i))
         .and_then(|v| view_geometry_rect(v, sheet_h))

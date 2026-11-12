@@ -422,3 +422,80 @@ fn two_rebuilds_of_one_history_are_identical() {
     let b = serde_json::to_value(b.drawings.get(&did).expect("b")).expect("json");
     assert_eq!(first_difference(&a, &b, String::new()), None);
 }
+
+/// A dimension edit first certifies the edited history (which derives its
+/// sheets) and then rebuilds the live sheets from that same history. The
+/// second must reuse the first's sheets, not derive them all again -- a
+/// dimension edit paid for every sheet twice.
+#[test]
+fn certifying_a_history_leaves_its_sheets_for_the_rebuild() {
+    let frames = FrameCache::new(64);
+    let did = Uuid::new_v4();
+    let mut events = plate();
+    events.extend([from_part(3, 3, did), mould(1, "radius", 4.0, 4)]);
+    let (_model, cert) = timeline_engine::rebuild_certificate::certify_rebuild_with_frames(
+        &events,
+        Some(1),
+        &frames,
+    );
+    assert!(cert.is_sound());
+    let rebuilt = rebuild_drawings(&events, &frames);
+    assert_eq!(
+        (rebuilt.stats.sheets_derived, rebuilt.stats.sheets_reused),
+        (0, 1),
+        "the certified sheet is reused"
+    );
+    let fresh = rebuild_drawings(&events, &FrameCache::new(64));
+    let a = serde_json::to_value(rebuilt.drawings.get(&did).expect("sheet")).expect("json");
+    let b = serde_json::to_value(fresh.drawings.get(&did).expect("sheet")).expect("json");
+    assert_eq!(
+        first_difference(&a, &b, String::new()),
+        None,
+        "and it is the same sheet"
+    );
+}
+
+/// Certifying through the frame cache states exactly the certificate the full
+/// from-scratch replay states -- every per-feature verdict, the dirty set,
+/// soundness -- cold or warm, sound history or broken.
+#[test]
+fn the_frame_certificate_is_the_full_replay_certificate() {
+    use timeline_engine::rebuild_certificate::{certify_rebuild, certify_rebuild_with_frames};
+    let did = Uuid::new_v4();
+    let mut sound = plate();
+    sound.extend([
+        from_part(3, 3, did),
+        rename(4, did, "Plate"),
+        mould(1, "radius", 4.0, 5),
+    ]);
+    // Broken: the difference names a solid that was never made, and a sheet
+    // of the (missing) result follows.
+    let broken = vec![
+        box20(0, 1),
+        drill(1, 2, 3.0),
+        difference(2, 1, 99, 3),
+        from_part(3, 3, did),
+        mould(1, "radius", 2.5, 4),
+    ];
+    for (name, events) in [("sound", &sound), ("broken", &broken)] {
+        let (full_model, full) = certify_rebuild(events, Some(1));
+        let frames = FrameCache::new(64);
+        for pass in ["cold", "warm"] {
+            let (model, cert) = certify_rebuild_with_frames(events, Some(1), &frames);
+            assert_eq!(
+                serde_json::to_value(&cert).expect("json"),
+                serde_json::to_value(&full).expect("json"),
+                "{name}/{pass}: same certificate"
+            );
+            assert_eq!(model.solids.len(), full_model.solids.len(), "{name}/{pass}");
+        }
+        // The live reconcile replays the same history through the same
+        // frames: everything certification shot is reused.
+        let (_m, _o, stats) = frames.replay(events);
+        assert_eq!(
+            stats.events_reused,
+            events.len(),
+            "{name}: the reconcile re-executes nothing"
+        );
+    }
+}

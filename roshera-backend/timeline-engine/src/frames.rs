@@ -35,8 +35,35 @@ use geometry_engine::primitives::topology_builder::BRepModel;
 use sha2::{Digest, Sha256};
 
 use crate::mould::{is_param_meta, OverrideSet};
-use crate::replay::{apply_event, AssemblyStore, ReplayFailure, ReplayOutcome};
+use crate::replay::{apply_event, AssemblyStore, ReplayError, ReplayFailure, ReplayOutcome};
 use crate::types::{Operation, TimelineEvent};
+
+/// What one replayed (non-`param.*`) event did: the rebuild certificate's
+/// per-feature input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepVerdict {
+    /// Applied.
+    Ok,
+    /// Failed for a reason other than a dangling reference.
+    Failed(String),
+    /// A reference it names no longer resolves.
+    Dangling(String),
+    /// A non-geometry document event with no replay arm.
+    Stale(String),
+}
+
+impl StepVerdict {
+    fn of(result: &Result<(), ReplayError>) -> Self {
+        match result {
+            Ok(()) => StepVerdict::Ok,
+            Err(ReplayError::DanglingReference { entity, .. }) => {
+                StepVerdict::Dangling(entity.clone())
+            }
+            Err(ReplayError::NonGeometryStale { reason, .. }) => StepVerdict::Stale(reason.clone()),
+            Err(other) => StepVerdict::Failed(other.to_string()),
+        }
+    }
+}
 
 /// The replay state after one event.
 struct Frame {
@@ -46,6 +73,8 @@ struct Frame {
     events_applied: usize,
     events_skipped: usize,
     first_failure: Option<ReplayFailure>,
+    /// `(sequence, verdict)` of every non-`param.*` event up to this one.
+    verdicts: Arc<Vec<(u64, StepVerdict)>>,
     last_used: AtomicU64,
 }
 
@@ -217,6 +246,22 @@ impl FrameCache {
     /// would on a fresh model, starting from the latest stored frame of this
     /// slice and storing a frame after each event it re-executes.
     pub fn replay(&self, events: &[TimelineEvent]) -> (BRepModel, ReplayOutcome, FrameStats) {
+        let (model, outcome, stats, _verdicts) = self.replay_reporting(events);
+        (model, outcome, stats)
+    }
+
+    /// [`FrameCache::replay`], plus the verdict of every non-`param.*` event
+    /// in `events`, in order -- reused events' verdicts come from the stored
+    /// frames, so a certificate built on them needs no full replay.
+    pub fn replay_reporting(
+        &self,
+        events: &[TimelineEvent],
+    ) -> (
+        BRepModel,
+        ReplayOutcome,
+        FrameStats,
+        Vec<(u64, StepVerdict)>,
+    ) {
         let overrides = OverrideSet::collect(events);
         let keys = Self::keys(events, &overrides);
         let mut stats = FrameStats {
@@ -232,8 +277,10 @@ impl FrameCache {
             .find_map(|(i, k)| self.frames.get(k).map(|f| (i, Arc::clone(f.value()))));
 
         let mut outcome = ReplayOutcome::default();
+        let mut verdicts: Vec<(u64, StepVerdict)> = Vec::new();
         let (mut model, mut id_remap, mut assemblies, from) = match start {
             Some((i, frame)) => {
+                verdicts = frame.verdicts.as_ref().clone();
                 frame.last_used.store(
                     self.clock.fetch_add(1, Ordering::Relaxed),
                     Ordering::Relaxed,
@@ -269,7 +316,9 @@ impl FrameCache {
             } else {
                 let overridden = overrides.overridden_event(event);
                 let dispatched = overridden.as_ref().unwrap_or(event);
-                match apply_event(&mut model, &mut assemblies, dispatched, &mut id_remap) {
+                let result = apply_event(&mut model, &mut assemblies, dispatched, &mut id_remap);
+                verdicts.push((event.sequence_number, StepVerdict::of(&result)));
+                match result {
                     Ok(()) => outcome.events_applied += 1,
                     Err(err) => {
                         tracing::warn!(
@@ -299,6 +348,7 @@ impl FrameCache {
                     events_applied: outcome.events_applied,
                     events_skipped: outcome.events_skipped,
                     first_failure: outcome.first_failure.clone(),
+                    verdicts: Arc::new(verdicts.clone()),
                     last_used: AtomicU64::new(self.clock.fetch_add(1, Ordering::Relaxed)),
                 },
             );
@@ -306,7 +356,7 @@ impl FrameCache {
         let _ = model.attach_recorder(saved_recorder);
         outcome.id_remap = id_remap;
         outcome.assemblies = assemblies;
-        (model, outcome, stats)
+        (model, outcome, stats, verdicts)
     }
 
     fn store(&self, key: [u8; 32], frame: Frame) {

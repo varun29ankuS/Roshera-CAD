@@ -31,6 +31,7 @@ use geometry_engine::readable::dimensions::extract_dimensions;
 use geometry_engine::primitives::snapshot::ModelSnapshot;
 use rayon::prelude::*;
 
+use crate::frames::FrameCache;
 use crate::lineage::{EntityRef, LineageGraph};
 use crate::mould::{is_param_meta, mould_operation, OverrideSet};
 use crate::rebuild_certificate::{certify_rebuild, measure_is_sound};
@@ -273,13 +274,26 @@ pub fn resolve_dimension_driver_measured(
     events: &[TimelineEvent],
     pid: &str,
 ) -> (DriveResolution, DriveStats) {
-    let (resolution, stats, _probe) = resolve_with_probe(events, pid);
+    let (resolution, stats, _probe) = resolve_with_probe(events, pid, None);
+    (resolution, stats)
+}
+
+/// [`resolve_dimension_driver_measured`] starting from `frames`: the opening
+/// full replay of the history reuses the cached frames (the server keeps the
+/// current history shot), so only the probes cost anything. Same answer.
+pub fn resolve_dimension_driver_in(
+    events: &[TimelineEvent],
+    pid: &str,
+    frames: &FrameCache,
+) -> (DriveResolution, DriveStats) {
+    let (resolution, stats, _probe) = resolve_with_probe(events, pid, Some(frames));
     (resolution, stats)
 }
 
 fn resolve_with_probe<'a>(
     events: &'a [TimelineEvent],
     pid: &'a str,
+    frames: Option<&FrameCache>,
 ) -> (DriveResolution, DriveStats, Option<ChainProbe<'a>>) {
     let all_params = numeric_parameters(events);
     let mut stats = DriveStats {
@@ -291,7 +305,8 @@ fn resolve_with_probe<'a>(
     // uses (no skipped geometry event, at least one solid, the B-Rep
     // validates), without re-deriving the drawings, which a dimension search
     // never reads.
-    let (model, id_remap, skipped) = geometry_replay(events);
+    let (model, id_remap, skipped, reused) = geometry_replay(events, frames);
+    stats.geometry_events_reused = reused;
     if !measure_is_sound(&model, skipped) {
         return (
             DriveResolution::Undecided {
@@ -439,7 +454,7 @@ pub fn plan_dimension_edit(
     pid: &str,
     target: f64,
 ) -> Result<DimensionEditPlan, DimensionEditRefusal> {
-    let (resolution, _stats, probe) = resolve_with_probe(events, pid);
+    let (resolution, _stats, probe) = resolve_with_probe(events, pid, None);
     solve_for(events, pid, target, resolution, probe.as_ref())
 }
 
@@ -457,14 +472,34 @@ pub fn plan_dimension_edit_with(
     if !matches!(resolution, DriveResolution::Driven { .. }) {
         return Err(DimensionEditRefusal::NotDriven { resolution });
     }
-    let probe = chain_probe_for(events, pid);
+    let probe = chain_probe_for(events, pid, None);
+    solve_for(events, pid, target, resolution, probe.as_ref())
+}
+
+/// [`plan_dimension_edit_with`] starting from `frames` (see
+/// [`resolve_dimension_driver_in`]). Same plan.
+pub fn plan_dimension_edit_with_frames(
+    events: &[TimelineEvent],
+    pid: &str,
+    target: f64,
+    resolution: DriveResolution,
+    frames: &FrameCache,
+) -> Result<DimensionEditPlan, DimensionEditRefusal> {
+    if !matches!(resolution, DriveResolution::Driven { .. }) {
+        return Err(DimensionEditRefusal::NotDriven { resolution });
+    }
+    let probe = chain_probe_for(events, pid, Some(frames));
     solve_for(events, pid, target, resolution, probe.as_ref())
 }
 
 /// The chain probe for `pid` without the driver search: one geometry replay
 /// plus the chain frames.
-fn chain_probe_for<'a>(events: &'a [TimelineEvent], pid: &'a str) -> Option<ChainProbe<'a>> {
-    let (model, id_remap, skipped) = geometry_replay(events);
+fn chain_probe_for<'a>(
+    events: &'a [TimelineEvent],
+    pid: &'a str,
+    frames: Option<&FrameCache>,
+) -> Option<ChainProbe<'a>> {
+    let (model, id_remap, skipped, _reused) = geometry_replay(events, frames);
     if !measure_is_sound(&model, skipped) {
         return None;
     }
@@ -576,6 +611,9 @@ pub struct DriveStats {
     pub events_reexecuted: usize,
     /// True when the chain shortcut was verified and used.
     pub chain_scoped: bool,
+    /// Events of the opening full replay taken from the frame cache instead
+    /// of re-executed (0 without a cache).
+    pub geometry_events_reused: usize,
 }
 
 /// The recorded entity refs (`"solid:3"`, `"sketch:…"`) an event lists under
@@ -905,7 +943,30 @@ fn probe_units(
 /// measure takes.
 fn geometry_replay(
     events: &[TimelineEvent],
-) -> (BRepModel, std::collections::HashMap<u64, u64>, usize) {
+    frames: Option<&FrameCache>,
+) -> (BRepModel, std::collections::HashMap<u64, u64>, usize, usize) {
+    if let Some(frames) = frames {
+        // The same slice `frames::geometry_sound` replays: geometry events
+        // plus the `param.*` overrides folded into them; document events
+        // (drawings, annotations) left out.
+        let geometry: Vec<TimelineEvent> = events
+            .iter()
+            .filter(|e| match &e.operation {
+                Operation::Generic { command_type, .. } => {
+                    is_param_meta(command_type) || !command_type.contains('.')
+                }
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        let (model, outcome, stats) = frames.replay(&geometry);
+        return (
+            model,
+            outcome.id_remap,
+            outcome.events_skipped,
+            stats.events_reused,
+        );
+    }
     let overrides = OverrideSet::collect(events);
     let mut model = BRepModel::new();
     let saved = model.attach_recorder(None);
@@ -930,5 +991,5 @@ fn geometry_replay(
         }
     }
     let _ = model.attach_recorder(saved);
-    (model, id_remap, skipped)
+    (model, id_remap, skipped, 0)
 }
