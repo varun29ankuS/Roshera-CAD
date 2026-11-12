@@ -200,3 +200,47 @@ fn broken_loops(m: &BRepModel) -> Vec<String> {
     }
     out
 }
+
+/// A 0.5 mm chamfer on the hub's top rim hid everything below it in the TOP
+/// view: the chamfer's cone carries explicit [0, 2π] angle limits, which read
+/// as an open sector with no u period, so its (u, v) trim polygon folded to
+/// zero area and the trim test accepted every point -- any ray from above
+/// stopped on the infinite cone. Found live: the hub's sheet showed no bolt
+/// holes and no Ø80 outline in TOP.
+#[test]
+fn a_chamfered_hub_top_hides_nothing_below_it() {
+    use geometry_engine::drawing::standard_drawing_hlr;
+    use geometry_engine::drawing::types::{ProjectionType, SheetSize};
+    let (mut m, part) = hub();
+    let top_rim = rim(&m, 22.5, 32.0);
+    chamfer_edges(
+        &mut m,
+        part,
+        top_rim,
+        ChamferOptions {
+            chamfer_type: ChamferType::EqualDistance(0.5),
+            distance1: 0.5,
+            distance2: 0.5,
+            ..Default::default()
+        },
+    )
+    .expect("a 0.5 mm chamfer on the hub top");
+    let d = standard_drawing_hlr(&m, part, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("hlr");
+    let top = d
+        .views
+        .iter()
+        .find(|v| matches!(v.projection, ProjectionType::Top))
+        .expect("top view");
+    let shows = |r: f64| top.circles.iter().any(|c| (c.r - r).abs() < 1e-6);
+    let hides = |r: f64| top.hidden_circles.iter().any(|c| (c.r - r).abs() < 1e-6);
+    assert!(
+        shows(40.0) && !hides(40.0),
+        "the Ø80 rim is seen from above: {:?} / hidden {:?}",
+        top.circles.iter().map(|c| c.r).collect::<Vec<_>>(),
+        top.hidden_circles.iter().map(|c| c.r).collect::<Vec<_>>()
+    );
+    assert!(
+        shows(22.0) && shows(22.5),
+        "the chamfer's own rims are seen"
+    );
+}

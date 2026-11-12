@@ -1937,7 +1937,16 @@ impl Surface for Cylinder {
     }
 
     fn is_closed_u(&self) -> bool {
-        self.angle_limits.is_none()
+        // Full turn either way: no limits, or limits spanning 2π. A rim
+        // chamfer's cone carries explicit [0, 2π] limits; read as an open
+        // sector, it had no u period, its (u, v) trim polygon could not be
+        // unwrapped and folded to zero area -- and the trim test then
+        // accepted every point, so a 0.5 mm chamfer band hid everything
+        // below it in a hidden-line view.
+        match self.angle_limits {
+            None => true,
+            Some(limits) => (limits[1] - limits[0] - consts::TWO_PI).abs() < 1e-9,
+        }
     }
 
     fn is_closed_v(&self) -> bool {
@@ -3276,7 +3285,16 @@ impl Surface for Cone {
     }
 
     fn is_closed_u(&self) -> bool {
-        self.angle_limits.is_none()
+        // Full turn either way: no limits, or limits spanning 2π. A rim
+        // chamfer's cone carries explicit [0, 2π] limits; read as an open
+        // sector, it had no u period, its (u, v) trim polygon could not be
+        // unwrapped and folded to zero area -- and the trim test then
+        // accepted every point, so a 0.5 mm chamfer band hid everything
+        // below it in a hidden-line view.
+        match self.angle_limits {
+            None => true,
+            Some(limits) => (limits[1] - limits[0] - consts::TWO_PI).abs() < 1e-9,
+        }
     }
 
     fn is_closed_v(&self) -> bool {
