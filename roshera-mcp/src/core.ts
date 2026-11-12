@@ -113,25 +113,22 @@ function intentHeaders(): Record<string, string> {
 let boundDocument: string | null = null;
 
 /**
- * Bind this process to its BIRTH document.
+ * Bind this process to a document -- only when one is PINNED.
  *
- * Two sources, in precedence order:
+ * `ROSHERA_DOCUMENT` is an explicit pin (read at call time, so a caller can
+ * set it programmatically before binding): every request then carries
+ * `X-Roshera-Document`, and the server files the history it records under
+ * that document. This is what parallel episodes use, each with its own part
+ * model (`ROSHERA_PART`).
  *
- *   1. `ROSHERA_DOCUMENT` — an EXPLICIT pin. Read at call time (not module
- *      load) so a caller can set it programmatically before binding. When
- *      present, NO HTTP call is made: the caller has already told us which
- *      document this process owns, and asking the server would only invite
- *      the race this branch exists to remove. This is what makes parallel
- *      episodes possible — `active` is a single global notion, so N
- *      processes discovering it concurrently all land on the SAME document.
- *   2. Active-document discovery — the original behaviour, unchanged. RAW
- *      fetch (never `api()` — `api()` itself calls `documentHeaders()`, so
- *      routing this through `api()` would be a self-referential bootstrap)
- *      of the document list; binds to whichever one is `active` right now.
- *
- * Best-effort: any failure (network, non-OK status, no active document)
- * leaves `boundDocument` null, which is LEGACY behaviour — every call goes
- * out unbound, exactly as it did before this existed.
+ * Unpinned, NOTHING is bound, and the server files history under the open
+ * document -- the same document whose model the geometry goes into. This
+ * process used to discover and bind the document that was active at
+ * startup; the geometry never followed that binding (it always goes to the
+ * open document's model), so after the engineer switched tabs the agent's
+ * parts landed in one document and their history in another. Found
+ * 2026-11-12: an agent-built hub vanished on restart and its 20 events
+ * polluted a scratch document.
  */
 export async function bindSessionDocument(): Promise<void> {
   // A whitespace-only value is NOT a document id. Treating it as one would
@@ -139,22 +136,7 @@ export async function bindSessionDocument(): Promise<void> {
   // reads as a malformed document reference (typed 400) rather than as the
   // absence the operator plainly meant.
   const pinned = process.env.ROSHERA_DOCUMENT?.trim();
-  if (pinned) {
-    boundDocument = pinned;
-    return;
-  }
-  try {
-    const res = await fetch(`${BASE}/api/documents`, {
-      headers: { ...AUTH_HEADERS },
-      signal: AbortSignal.timeout(PERCEPTION_TIMEOUT_MS),
-    });
-    if (!res.ok) return;
-    const docs = await res.json();
-    if (!Array.isArray(docs)) return;
-    boundDocument = docs.find((d: any) => d?.active)?.id ?? null;
-  } catch {
-    // swallow — unbound is legacy behaviour, never a hard failure.
-  }
+  boundDocument = pinned ? pinned : null;
 }
 
 /** The bound-document header for one backend call, or `{}` when unbound. */

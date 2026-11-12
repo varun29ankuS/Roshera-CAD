@@ -4,8 +4,13 @@
  * `bindSessionDocument` bound to whichever document the server reported as
  * `active`, a single global notion, so two MCP processes starting
  * concurrently raced for the same document. This pins the explicit override:
- * ROSHERA_DOCUMENT names the birth document directly, discovery still runs
- * when it is absent, and unbound legacy behaviour is untouched when both are.
+ * ROSHERA_DOCUMENT names the birth document directly; with no pin NOTHING is
+ * bound. (Unpinned discovery used to bind to whichever document was active
+ * at startup. Geometry ignores that binding -- it always goes to the open
+ * document's model -- so after the engineer switched tabs, an agent's parts
+ * went into the open document while their history was filed under the old
+ * one: found 2026-11-12, a hub built by the agent vanished on restart and
+ * its 20 events polluted a scratch document.)
  *
  *   npx tsc -p tsconfig.json --outDir test/.build
  *   node test/document_pin.test.mjs
@@ -68,18 +73,15 @@ check("an explicit ROSHERA_DOCUMENT pin wins, and makes no discovery call", asyn
   assert.equal(call.doc, PINNED_DOC, "the pinned id rides on the wire");
 });
 
-check("with no pin, active-document discovery still runs", async () => {
+check("with no pin, nothing is bound: model and history both follow the open document", async () => {
   seen = [];
   delete process.env.ROSHERA_DOCUMENT;
   const core = await freshCore();
   await core.bindSessionDocument();
-  assert.ok(
-    seen.some((s) => s.url === "/api/documents"),
-    "discovery must still fetch the list when nothing is pinned",
-  );
   await core.api("GET", "/api/agent/parts").catch(() => {});
   const call = seen.find((s) => s.url === "/api/agent/parts");
-  assert.equal(call.doc, ACTIVE_DOC, "falls back to the active document");
+  assert.ok(call, "the probe call reached the stub");
+  assert.equal(call.doc, null, "no document header: the server files history where the model is");
 });
 
 check("an empty pin is treated as absent, never as an empty document id", async () => {
@@ -87,10 +89,9 @@ check("an empty pin is treated as absent, never as an empty document id", async 
   process.env.ROSHERA_DOCUMENT = "   ";
   const core = await freshCore();
   await core.bindSessionDocument();
-  assert.ok(
-    seen.some((s) => s.url === "/api/documents"),
-    "whitespace is not a document id — discovery must run",
-  );
+  await core.api("GET", "/api/agent/parts").catch(() => {});
+  const call = seen.find((s) => s.url === "/api/agent/parts");
+  assert.equal(call.doc, null, "whitespace is not a document id — nothing is bound");
   delete process.env.ROSHERA_DOCUMENT;
 });
 
