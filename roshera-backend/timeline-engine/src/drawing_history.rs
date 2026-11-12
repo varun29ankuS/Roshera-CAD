@@ -23,7 +23,9 @@ use uuid::Uuid;
 
 use crate::frames::FrameCache;
 use crate::mould::{is_param_meta, OverrideSet};
-use crate::replay::{projection_switches, rederive_part_drawing, DrawingRederive};
+use crate::replay::{
+    projection_switches, rederive_part_drawing, with_followed_solid, DrawingRederive,
+};
 use crate::types::{Operation, TimelineEvent};
 
 /// The sheets a history rebuilds, and what it could not.
@@ -107,23 +109,28 @@ pub(crate) fn is_geometry_event(event: &TimelineEvent) -> bool {
 pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> DrawingRebuild {
     let mut ordered: Vec<&TimelineEvent> = events.iter().collect();
     ordered.sort_by_key(|e| e.sequence_number);
-    // The geometry as it replays: moulds folded into the events they target,
-    // document events (drawings, annotations) left out. A sheet event at
-    // history position k sees the geometry prefix that precedes it.
+    // The part as it stands NOW: the whole history's geometry, moulds folded
+    // into the events they target, document events (drawings, annotations)
+    // left out. A sheet is a sheet of its part -- the part followed through
+    // every later feature (`with_followed_solid`) -- not of the part as it
+    // stood when the sheet was made: fillets added after a drawing never
+    // reached it, and the export refused the stale sheet for good.
     let overrides = OverrideSet::collect(events);
     let switches = projection_switches(events);
-    let mut geometry: Vec<TimelineEvent> = Vec::new();
+    let geometry: Vec<TimelineEvent> = ordered
+        .iter()
+        .filter(|e| is_geometry_event(e))
+        .map(|e| {
+            overrides
+                .overridden_event(e)
+                .unwrap_or_else(|| (*e).clone())
+        })
+        .collect();
     let mut out = DrawingRebuild::default();
 
     for e in ordered {
         let k = kind(e);
-        if is_param_meta(k) {
-            continue;
-        }
-        if !k.starts_with("drawing.") {
-            if !k.contains('.') {
-                geometry.push(overrides.overridden_event(e).unwrap_or_else(|| e.clone()));
-            }
+        if is_param_meta(k) || !k.starts_with("drawing.") {
             continue;
         }
         let target = refs(e, "inputs", "drawing:")
@@ -133,10 +140,20 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
         match k {
             "drawing.create_from_part" => {
                 let switch = target.and_then(|id| switches.get(&id).copied());
-                // The derived sheet depends only on the geometry before this
-                // event, the event, and the projection switch: reuse it when
-                // all three are unchanged (an edit-only undo or redo).
-                let key = sheet_key(&geometry, e, switch);
+                let followed = match with_followed_solid(events, e) {
+                    Ok(f) => f,
+                    Err(what) => {
+                        out.issues.push(format!(
+                            "sequence {}: the sheet's part {what} was deleted",
+                            e.sequence_number
+                        ));
+                        continue;
+                    }
+                };
+                // The derived sheet depends only on the part's geometry, the
+                // event (its part followed to now), and the projection switch:
+                // reuse it when all three are unchanged (an edit-only undo).
+                let key = sheet_key(&geometry, &followed, switch);
                 let derived = match frames.sheet(&key) {
                     Some(hit) => {
                         out.stats.sheets_reused += 1;
@@ -144,7 +161,7 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                     }
                     None => {
                         let (model, outcome, _) = frames.replay(&geometry);
-                        let d = rederive_part_drawing(&model, e, &outcome.id_remap, switch);
+                        let d = rederive_part_drawing(&model, &followed, &outcome.id_remap, switch);
                         if let DrawingRederive::Rebuilt(id, sheet) = &d {
                             out.stats.sheets_derived += 1;
                             frames.store_sheet(key, *id, (**sheet).clone());
@@ -226,9 +243,24 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                     ));
                     continue;
                 };
-                // The view's part, as the geometry stands at this point:
-                // projected once per (geometry, event), reused after that.
-                let key = FrameCache::derived_key(&FrameCache::key_of(&geometry), e, &[]);
+                // The view's part as it stands now (followed through later
+                // features): projected once per (geometry, event), reused.
+                let followed = match with_followed_solid(events, e) {
+                    Ok(f) => f,
+                    Err(what) => {
+                        out.issues.push(format!(
+                            "sequence {}: an added view's part {what} was deleted",
+                            e.sequence_number
+                        ));
+                        continue;
+                    }
+                };
+                let source = params(&followed)
+                    .and_then(|p| {
+                        serde_json::from_value::<ViewSource>(p.get("source")?.clone()).ok()
+                    })
+                    .unwrap_or(source);
+                let key = FrameCache::derived_key(&FrameCache::key_of(&geometry), &followed, &[]);
                 let projected = match frames.view(&key) {
                     Some(hit) => {
                         out.stats.views_reused += 1;

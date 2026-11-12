@@ -200,6 +200,7 @@ fn replay_with_report(
     let mut drawings = DrawingStore::default();
     let mut per_event: HashMap<u64, EventResult> = HashMap::new();
     let switches = projection_switches(events);
+    let mut deferred_sheets: Vec<(u64, TimelineEvent)> = Vec::new();
 
     for event in events {
         if let Operation::Generic { command_type, .. } = &event.operation {
@@ -212,47 +213,16 @@ fn replay_with_report(
         let dispatched = overridden.as_ref().unwrap_or(event);
 
         // #32: a `drawing.create_from_part` is a non-geometry DOCUMENT event —
-        // it owns no B-Rep, so it is NOT dispatched into the model. Instead it
-        // RE-DERIVES its sheet from the geometry as it stands at this position in
-        // the (moulded) log (option a). Its outcome becomes a real per-feature
-        // verdict; a Failed/Dangling drawing does NOT taint geometry soundness
-        // (it never increments `events_skipped`) — a broken sheet is a document
-        // concern, not an unsound B-Rep.
+        // it owns no B-Rep, so it is NOT dispatched into the model. Its sheet
+        // is re-derived once the whole history has replayed: a sheet is of its
+        // part as it stands NOW (`with_followed_solid`), not as it stood at the
+        // sheet's position. Its outcome becomes a real per-feature verdict; a
+        // Failed/Dangling drawing does NOT taint geometry soundness (it never
+        // increments `events_skipped`) — a broken sheet is a document concern,
+        // not an unsound B-Rep.
         if let Operation::Generic { command_type, .. } = &dispatched.operation {
             if command_type == DRAWING_FROM_PART_KIND {
-                let switch =
-                    drawing_output_id(dispatched).and_then(|id| switches.get(&id).copied());
-                let result = match rederive_part_drawing(
-                    model,
-                    dispatched,
-                    &outcome.id_remap,
-                    switch,
-                ) {
-                    DrawingRederive::Rebuilt(id, sheet) => {
-                        drawings.drawings.insert(id, *sheet);
-                        outcome.events_applied += 1;
-                        EventResult::Ok
-                    }
-                    DrawingRederive::Dangling(entity) => {
-                        tracing::debug!(
-                            target: "timeline.rebuild_certificate",
-                            sequence = event.sequence_number,
-                            entity = %entity,
-                            "drawing source solid dangled; geometry unaffected"
-                        );
-                        EventResult::Dangling(entity)
-                    }
-                    DrawingRederive::Failed(reason) => {
-                        tracing::debug!(
-                            target: "timeline.rebuild_certificate",
-                            sequence = event.sequence_number,
-                            reason = %reason,
-                            "drawing re-derivation failed; geometry unaffected, sheet needs attention"
-                        );
-                        EventResult::Failed(reason)
-                    }
-                };
-                per_event.insert(event.sequence_number, result);
+                deferred_sheets.push((event.sequence_number, dispatched.clone()));
                 continue;
             }
         }
@@ -296,6 +266,39 @@ fn replay_with_report(
                 per_event.insert(event.sequence_number, result);
             }
         }
+    }
+    for (sequence, dispatched) in deferred_sheets {
+        let switch = drawing_output_id(&dispatched).and_then(|id| switches.get(&id).copied());
+        let derived = match crate::replay::with_followed_solid(events, &dispatched) {
+            Err(entity) => DrawingRederive::Dangling(entity),
+            Ok(followed) => rederive_part_drawing(model, &followed, &outcome.id_remap, switch),
+        };
+        let result = match derived {
+            DrawingRederive::Rebuilt(id, sheet) => {
+                drawings.drawings.insert(id, *sheet);
+                outcome.events_applied += 1;
+                EventResult::Ok
+            }
+            DrawingRederive::Dangling(entity) => {
+                tracing::debug!(
+                    target: "timeline.rebuild_certificate",
+                    sequence,
+                    entity = %entity,
+                    "drawing source solid dangled; geometry unaffected"
+                );
+                EventResult::Dangling(entity)
+            }
+            DrawingRederive::Failed(reason) => {
+                tracing::debug!(
+                    target: "timeline.rebuild_certificate",
+                    sequence,
+                    reason = %reason,
+                    "drawing re-derivation failed; geometry unaffected, sheet needs attention"
+                );
+                EventResult::Failed(reason)
+            }
+        };
+        per_event.insert(sequence, result);
     }
     outcome.assemblies = assemblies;
     let _ = model.attach_recorder(saved);
@@ -413,40 +416,41 @@ fn replay_with_report_frames(
     outcome.id_remap = replayed.id_remap;
     outcome.assemblies = replayed.assemblies;
 
-    // The sheets, each against the model as it stands at its position.
+    // The sheets: each of its part as it stands NOW -- the part followed
+    // through every later feature -- against the final model, under the same
+    // cache key the live sheet rebuild uses.
     let overrides = OverrideSet::collect(events);
     let switches = projection_switches(events);
+    let mut ordered: Vec<&TimelineEvent> = events.iter().collect();
+    ordered.sort_by_key(|e| e.sequence_number);
+    let geometry: Vec<TimelineEvent> = ordered
+        .iter()
+        .filter(|e| crate::drawing_history::is_geometry_event(e))
+        .map(|e| {
+            overrides
+                .overridden_event(e)
+                .unwrap_or_else(|| (*e).clone())
+        })
+        .collect();
     let mut drawings = DrawingStore::default();
-    let mut prefix: Vec<TimelineEvent> = Vec::new();
-    let mut geometry: Vec<TimelineEvent> = Vec::new();
-    for event in events {
-        // As it replays: an edit recorded later still applies (the full replay
-        // folds every override wherever it sits). The effective event hashes
-        // to the same frame key as in the main slice, so the stored frames
-        // are reused.
-        let effective = overrides
-            .overridden_event(event)
-            .unwrap_or_else(|| event.clone());
-        if !is_sheet(event) {
-            if crate::drawing_history::is_geometry_event(event) {
-                geometry.push(effective.clone());
-            }
-            prefix.push(effective);
-            continue;
-        }
+    for event in ordered.iter().filter(|e| is_sheet(e)) {
         let overridden = overrides.overridden_event(event);
         let dispatched = overridden.as_ref().unwrap_or(event);
         let switch = drawing_output_id(dispatched).and_then(|id| switches.get(&id).copied());
-        let key = crate::drawing_history::sheet_key(&geometry, dispatched, switch);
-        let derived = match frames.sheet(&key) {
-            Some(hit) => DrawingRederive::Rebuilt(hit.0, Box::new(hit.1.clone())),
-            None => {
-                let (at, at_outcome, _) = frames.replay(&prefix);
-                let d = rederive_part_drawing(&at, dispatched, &at_outcome.id_remap, switch);
-                if let DrawingRederive::Rebuilt(id, sheet) = &d {
-                    frames.store_sheet(key, *id, (**sheet).clone());
+        let derived = match crate::replay::with_followed_solid(events, dispatched) {
+            Err(entity) => DrawingRederive::Dangling(entity),
+            Ok(followed) => {
+                let key = crate::drawing_history::sheet_key(&geometry, &followed, switch);
+                match frames.sheet(&key) {
+                    Some(hit) => DrawingRederive::Rebuilt(hit.0, Box::new(hit.1.clone())),
+                    None => {
+                        let d = rederive_part_drawing(&model, &followed, &outcome.id_remap, switch);
+                        if let DrawingRederive::Rebuilt(id, sheet) = &d {
+                            frames.store_sheet(key, *id, (**sheet).clone());
+                        }
+                        d
+                    }
                 }
-                d
             }
         };
         let result = match derived {
@@ -458,8 +462,6 @@ fn replay_with_report_frames(
             DrawingRederive::Failed(reason) => EventResult::Failed(reason),
         };
         per_event.insert(event.sequence_number, result);
-        // A no-op step in the slice; kept so later prefixes share its keys.
-        prefix.push(effective);
     }
     (model, outcome, per_event, drawings)
 }

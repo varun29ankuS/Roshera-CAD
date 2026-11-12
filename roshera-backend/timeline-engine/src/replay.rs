@@ -339,6 +339,109 @@ pub fn rederive_part_drawing(
     DrawingRederive::Rebuilt(drawing_id, Box::new(drawing))
 }
 
+/// The recorded solid a part has become by the end of `events`, starting from
+/// recorded solid `recorded` as it stood at sequence `from_sequence`: each
+/// later geometry event that takes the part as an input and outputs other
+/// solids hands it on to its first output (a boolean consumes its operands
+/// and makes a new solid); an event that keeps it (a blend, a transform)
+/// leaves it; `delete_solid` / `clear_geometry` end it (`None`).
+///
+/// This is what lets a drawing follow its part: a sheet made before later
+/// features is a sheet OF THE PART, not of the part as it stood then.
+pub fn follow_solid(events: &[TimelineEvent], from_sequence: u64, recorded: u64) -> Option<u64> {
+    let mut later: Vec<&TimelineEvent> = events
+        .iter()
+        .filter(|e| e.sequence_number > from_sequence)
+        .collect();
+    later.sort_by_key(|e| e.sequence_number);
+    let mut current = recorded;
+    for e in later {
+        let Operation::Generic {
+            command_type,
+            parameters,
+        } = &e.operation
+        else {
+            continue;
+        };
+        if crate::mould::is_param_meta(command_type) || command_type.contains('.') {
+            continue;
+        }
+        if command_type == "clear_geometry" {
+            return None;
+        }
+        let solids = |key: &str| -> Vec<u64> {
+            parameters
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str()?.strip_prefix("solid:")?.parse::<u64>().ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if !solids("inputs").contains(&current) {
+            continue;
+        }
+        if command_type == "delete_solid" {
+            return None;
+        }
+        let outputs = solids("outputs");
+        if outputs.contains(&current) {
+            continue;
+        }
+        if let Some(&next) = outputs.first() {
+            current = next;
+        }
+    }
+    Some(current)
+}
+
+/// `event` (a `drawing.create_from_part` or `drawing.add_view`) with its
+/// recorded solid moved on to the part's current solid ([`follow_solid`]).
+/// `Err` names the solid when the part was deleted after the drawing.
+pub fn with_followed_solid(
+    events: &[TimelineEvent],
+    event: &TimelineEvent,
+) -> Result<TimelineEvent, String> {
+    let Operation::Generic { parameters, .. } = &event.operation else {
+        return Ok(event.clone());
+    };
+    let inner = parameters.get("params").unwrap_or(parameters);
+    let recorded = inner
+        .get("solid_id")
+        .and_then(|v| v.as_u64())
+        .or_else(|| inner.get("source")?.get("solid_id")?.as_u64());
+    let Some(recorded) = recorded else {
+        return Ok(event.clone());
+    };
+    let Some(now) = follow_solid(events, event.sequence_number, recorded) else {
+        return Err(format!("solid:{recorded}"));
+    };
+    if now == recorded {
+        return Ok(event.clone());
+    }
+    let mut moved = event.clone();
+    if let Operation::Generic { parameters, .. } = &mut moved.operation {
+        let inner = if parameters.get("params").is_some() {
+            &mut parameters["params"]
+        } else {
+            parameters
+        };
+        if inner.get("solid_id").is_some() {
+            inner["solid_id"] = serde_json::json!(now);
+        }
+        if inner
+            .get("source")
+            .and_then(|s| s.get("solid_id"))
+            .is_some()
+        {
+            inner["source"]["solid_id"] = serde_json::json!(now);
+        }
+    }
+    Ok(moved)
+}
+
 /// Command recorded when a sheet's projection is switched after creation.
 pub const DRAWING_SET_PROJECTION_KIND: &str = "drawing.set_projection";
 

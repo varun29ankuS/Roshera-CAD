@@ -499,3 +499,60 @@ fn the_frame_certificate_is_the_full_replay_certificate() {
         );
     }
 }
+
+fn drill_at(seq: u64, out: u64, x: f64, y: f64, radius: f64) -> TimelineEvent {
+    generic(
+        "create_cylinder_3d",
+        seq,
+        json!({
+            "params": { "Create3D": {
+                "primitive_type": "cylinder",
+                "parameters": {
+                    "base_x": x, "base_y": y, "base_z": -20.0,
+                    "axis_x": 0.0, "axis_y": 0.0, "axis_z": 1.0,
+                    "radius": radius, "height": 40.0
+                },
+                "timestamp": 0
+            }},
+            "inputs": [], "outputs": [format!("solid:{out}")]
+        }),
+    )
+}
+
+/// A drawing follows its part to the part's CURRENT state. Found live
+/// 2026-11-12: fillets and chamfers added after a hub's drawing never reached
+/// the sheet (it was re-derived from the part as it stood when the sheet was
+/// made), so the sheet stayed stale and the export refused it for good. Here
+/// a second hole is cut after the drawing: the rebuilt sheet shows both.
+#[test]
+fn a_drawing_follows_its_part_through_later_features() {
+    let did = Uuid::new_v4();
+    let mut events = plate();
+    events.extend([
+        from_part(3, 3, did),
+        drill_at(4, 4, 5.0, 5.0, 2.0),
+        difference(5, 3, 4, 5),
+    ]);
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    assert!(built.issues.is_empty(), "{:?}", built.issues);
+    let d = built.drawings.get(&did).expect("the sheet is rebuilt");
+    let diameters: Vec<f64> = d.hole_sites.iter().map(|h| h.diameter_mm).collect();
+    assert_eq!(
+        d.hole_sites.len(),
+        2,
+        "both holes are on the sheet: {diameters:?}"
+    );
+    assert!(
+        diameters.iter().any(|v| (v - 4.0).abs() < 1e-6),
+        "the later Ø4 hole: {diameters:?}"
+    );
+
+    // Certification states the same: the sheet is rebuilt, not dangling.
+    let (_m, cert) = timeline_engine::rebuild_certificate::certify_rebuild(&events, None);
+    let sheet = cert
+        .verdicts
+        .iter()
+        .find(|v| v.sequence == 3)
+        .expect("the sheet's verdict");
+    assert!(!sheet.status.is_break(), "{:?}", sheet.status);
+}
