@@ -5649,3 +5649,96 @@ async fn a_drawing_and_its_edits_survive_restart() {
         "the added view is back"
     );
 }
+
+/// A dimension edit survives a restart. The edit (a `param.mould` event) was
+/// appended straight into the in-memory timeline, bypassing the recorder's
+/// write-through: after a restart the part was back at its old size, the
+/// edit gone from the stored history (live: Ø42 -> Ø40 on the mounting plate).
+#[tokio::test]
+async fn a_dimension_edit_survives_restart() {
+    let path = temp_db_path();
+    {
+        let state = build_state(open_db(&path).await, true).await;
+        let (_, b) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({"width": 20.0, "depth": 20.0, "height": 20.0}),
+            ),
+        )
+        .await;
+        let box_uuid = b["object"]["id"].as_str().expect("box").to_string();
+        let (_, c) = dispatch(
+            &state,
+            post(
+                "/api/geometry/cylinder",
+                json!({"center": [0.0, 0.0, -1.0], "axis": [0.0, 0.0, 1.0], "radius": 3.0, "height": 22.0}),
+            ),
+        )
+        .await;
+        let cyl_uuid = c["object"]["id"].as_str().expect("cyl").to_string();
+        let (s, o) = dispatch(
+            &state,
+            post(
+                "/api/geometry/boolean",
+                json!({"operation": "difference", "object_a": box_uuid, "object_b": cyl_uuid}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{o}");
+        let solid = o["solid_id"]
+            .as_u64()
+            .or_else(|| o["object"]["solid_id"].as_u64())
+            .expect("result solid id");
+        let (_, created) = dispatch(
+            &state,
+            post(&format!("/api/parts/{solid}/drawing"), json!({})),
+        )
+        .await;
+        let drawing_id = created["id"].as_str().expect("drawing").to_string();
+        let (_, sheet) = dispatch(&state, get(&format!("/api/drawings/{drawing_id}"))).await;
+        let dim = sheet["views"]
+            .as_array()
+            .and_then(|vs| {
+                vs.iter()
+                    .flat_map(|v| v["dimensions"].as_array().cloned().unwrap_or_default())
+                    .find(|d| {
+                        d["kind"] == "diameter"
+                            && (d["value"].as_f64().unwrap_or(0.0) - 6.0).abs() < 1e-6
+                    })
+            })
+            .expect("the Ø6 bore");
+        let (es, edited) = dispatch(
+            &state,
+            post(
+                &format!(
+                    "/api/drawings/{drawing_id}/dimensions/{}",
+                    dim["id"].as_str().unwrap()
+                ),
+                json!({ "value": 8.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(es, StatusCode::OK, "{edited}");
+        let _ = flush_and_count(&state).await;
+    }
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    let model = state2.model.read().await;
+    let mut radii: Vec<f64> = Vec::new();
+    for (_, face) in model.faces.iter() {
+        if let Some(surf) = model.surfaces.get(face.surface_id) {
+            if let Some(cyl) = surf
+                .as_any()
+                .downcast_ref::<geometry_engine::primitives::surface::Cylinder>()
+            {
+                radii.push(cyl.radius);
+            }
+        }
+    }
+    assert!(!radii.is_empty(), "the bore exists after the restart");
+    assert!(
+        radii.iter().all(|r| (r - 4.0).abs() < 1e-6),
+        "the edited bore (r 4) survives the restart: {radii:?}"
+    );
+}

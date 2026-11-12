@@ -461,6 +461,42 @@ fn discarded_branch_record(
     })
 }
 
+/// Persist events a handler appended to the timeline DIRECTLY (not through
+/// the recorder, whose drain worker is the write-through): a dimension edit's
+/// `param.mould` events and a `param.name` binding. Without this they lived in
+/// memory only and a restart dropped them -- the part came back at its old
+/// size. Same store, same document rule as the recorder's sink.
+///
+/// `Ok(())` when durability is switched off: nothing was promised.
+pub(crate) async fn persist_appended(
+    state: &AppState,
+    event_ids: &[timeline_engine::EventId],
+) -> Result<(), String> {
+    if !durability_enabled() {
+        return Ok(());
+    }
+    let document_id = write_document(state).await;
+    let events: Vec<TimelineEvent> = {
+        let timeline = state.timeline.read().await;
+        event_ids
+            .iter()
+            .filter_map(|id| timeline.get_event(*id))
+            .collect()
+    };
+    if events.len() != event_ids.len() {
+        return Err("an appended event is not in the timeline".to_string());
+    }
+    for event in &events {
+        let data = to_event_data(event, &document_id)?;
+        state
+            .database
+            .save_timeline_event(&document_id, &data)
+            .await
+            .map_err(|e| format!("save_timeline_event failed: {e}"))?;
+    }
+    Ok(())
+}
+
 /// The document a write-behind from the REQUEST TASK belongs under.
 ///
 /// [`persist_branch`] and [`persist_checkpoint`] are awaited directly inside

@@ -2832,11 +2832,12 @@ pub async fn mould_parameter(
     let cand_sound = cand_cert.is_sound();
 
     // ── Commit: append the override at a reserved sequence, reconcile ─
+    let mut appended_ids: Vec<EventId> = Vec::new();
     let appended_seq = {
         let timeline = state.timeline.write().await;
         let seq = timeline.reserve_sequence_number();
         mould_event.sequence_number = seq;
-        timeline
+        let id = timeline
             .add_operation_reserved(
                 mould_event.operation.clone(),
                 Author::System,
@@ -2848,21 +2849,36 @@ pub async fn mould_parameter(
                 error!(target: "timeline.mould", error = %e, "mould append failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+        appended_ids.push(id);
         // The linked members, under the same write lock: no replay can see
         // the feature half-moved.
         for linked in &mut linked_events {
             let lseq = timeline.reserve_sequence_number();
             linked.sequence_number = lseq;
-            timeline
+            let id = timeline
                 .add_operation_reserved(linked.operation.clone(), Author::System, branch_id, lseq)
                 .await
                 .map_err(|e| {
                     error!(target: "timeline.mould", error = %e, "linked mould append failed");
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
+            appended_ids.push(id);
         }
         seq
     };
+    // Make the edit durable: these appends bypass the recorder's
+    // write-through, and a restart used to drop them.
+    if let Err(e) = crate::durability::persist_appended(&state, &appended_ids).await {
+        error!(target: "timeline.mould", error = %e, "mould not persisted");
+        return Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "MouldNotSaved",
+                "reason": format!("the edit is applied in memory but could not be saved: {e}"),
+                "kind": "NotDurable",
+            })),
+        ));
+    }
 
     // Advance the session position to include the appended override, then
     // reconcile the live model by replaying the branch (which now folds the
@@ -3554,6 +3570,10 @@ pub async fn bind_parameter_name(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?
     };
+    if let Err(e) = crate::durability::persist_appended(&state, &[event_id]).await {
+        error!(target: "timeline.mould", error = %e, "name binding not persisted");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     Ok((
         StatusCode::OK,
