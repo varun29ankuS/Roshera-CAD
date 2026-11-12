@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use geometry_engine::drawing::types::{Drawing, ProjectedView};
 use geometry_engine::primitives::snapshot::ModelSnapshot;
 use geometry_engine::primitives::topology_builder::BRepModel;
 use sha2::{Digest, Sha256};
@@ -65,6 +66,13 @@ pub struct FrameCache {
     frames: DashMap<[u8; 32], Arc<Frame>>,
     clock: AtomicU64,
     max_frames: usize,
+    /// Sheets derived from a part (hidden-line projection, dimensions),
+    /// keyed by [`FrameCache::derived_key`]: the geometry they came from and
+    /// the event that derived them. Edits are re-applied to a clone; the
+    /// stored sheet is never changed.
+    sheets: DashMap<[u8; 32], Arc<(uuid::Uuid, Drawing)>>,
+    /// Views projected for `drawing.add_view`, keyed the same way.
+    views: DashMap<[u8; 32], Arc<ProjectedView>>,
 }
 
 impl std::fmt::Debug for FrameCache {
@@ -108,7 +116,63 @@ impl FrameCache {
             frames: DashMap::new(),
             clock: AtomicU64::new(0),
             max_frames: max_frames.max(1),
+            sheets: DashMap::new(),
+            views: DashMap::new(),
         }
+    }
+
+    /// The key of the state after all of `events` (the frame key of the last
+    /// one; all-zero for none). Two slices with the same key replay to the
+    /// same model.
+    pub fn key_of(events: &[TimelineEvent]) -> [u8; 32] {
+        let overrides = OverrideSet::collect(events);
+        Self::keys(events, &overrides)
+            .last()
+            .copied()
+            .unwrap_or([0u8; 32])
+    }
+
+    /// The key of something `event` derives from the geometry `geometry_key`
+    /// (plus any `extra` input that changes the result).
+    pub fn derived_key(geometry_key: &[u8; 32], event: &TimelineEvent, extra: &[u8]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(geometry_key);
+        h.update(event.sequence_number.to_le_bytes());
+        h.update(event.id.0.as_bytes());
+        h.update(serde_json::to_vec(&event.operation).unwrap_or_default());
+        h.update(extra);
+        h.finalize().into()
+    }
+
+    /// A derived sheet stored under `key`.
+    pub fn sheet(&self, key: &[u8; 32]) -> Option<Arc<(uuid::Uuid, Drawing)>> {
+        self.sheets.get(key).map(|s| Arc::clone(s.value()))
+    }
+
+    /// Store a derived sheet. Bounded like the frames: a dropped sheet costs a
+    /// re-derivation, never correctness.
+    pub fn store_sheet(&self, key: [u8; 32], id: uuid::Uuid, sheet: Drawing) {
+        if self.sheets.len() >= self.max_frames {
+            if let Some(k) = self.sheets.iter().next().map(|kv| *kv.key()) {
+                self.sheets.remove(&k);
+            }
+        }
+        self.sheets.insert(key, Arc::new((id, sheet)));
+    }
+
+    /// A projected view stored under `key`.
+    pub fn view(&self, key: &[u8; 32]) -> Option<Arc<ProjectedView>> {
+        self.views.get(key).map(|v| Arc::clone(v.value()))
+    }
+
+    /// Store a projected view (bounded like the frames).
+    pub fn store_view(&self, key: [u8; 32], view: ProjectedView) {
+        if self.views.len() >= self.max_frames {
+            if let Some(k) = self.views.iter().next().map(|kv| *kv.key()) {
+                self.views.remove(&k);
+            }
+        }
+        self.views.insert(key, Arc::new(view));
     }
 
     /// Frames currently stored.
@@ -125,6 +189,8 @@ impl FrameCache {
     /// produces).
     pub fn clear(&self) {
         self.frames.clear();
+        self.sheets.clear();
+        self.views.clear();
     }
 
     /// The frame keys of `events`: key `i` identifies the state after events

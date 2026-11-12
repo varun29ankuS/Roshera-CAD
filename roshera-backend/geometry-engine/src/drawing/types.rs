@@ -262,6 +262,66 @@ pub enum ViewEditError {
     NoRoom { view: String, scale: String },
 }
 
+impl ProjectedView {
+    /// Put the view's line work in a canonical order, independent of the
+    /// order the model stores faces and edges in (a boolean does not produce
+    /// the same order every run). The same part then always yields the same
+    /// sheet, and the same sheet digest. Content is unchanged: only order
+    /// (and a polyline's direction) -- `polyline_sources` is reordered with
+    /// `polylines`.
+    pub fn canonicalize(&mut self) {
+        // Compare on a 1 nm grid so float noise in the last bits cannot
+        // reorder.
+        fn q(v: f64) -> i64 {
+            (v * 1e6).round() as i64
+        }
+        fn orient(pl: &mut Polyline2d) {
+            if let (Some(a), Some(b)) = (pl.points.first(), pl.points.last()) {
+                if (q(b[0]), q(b[1])) < (q(a[0]), q(a[1])) {
+                    pl.points.reverse();
+                }
+            }
+        }
+        fn key(pl: &Polyline2d) -> Vec<(i64, i64)> {
+            pl.points.iter().map(|p| (q(p[0]), q(p[1]))).collect()
+        }
+        fn sort_lines(lines: &mut [Polyline2d]) {
+            for pl in lines.iter_mut() {
+                orient(pl);
+            }
+            lines.sort_by_cached_key(key);
+        }
+        fn by_json<T: Serialize>(items: &mut [T]) {
+            items.sort_by_cached_key(|i| serde_json::to_string(i).unwrap_or_default());
+        }
+
+        if self.polyline_sources.len() == self.polylines.len() && !self.polylines.is_empty() {
+            let mut paired: Vec<(Polyline2d, PolylineSource)> = std::mem::take(&mut self.polylines)
+                .into_iter()
+                .zip(std::mem::take(&mut self.polyline_sources))
+                .collect();
+            for (pl, _) in paired.iter_mut() {
+                orient(pl);
+            }
+            paired.sort_by_cached_key(|(pl, src)| {
+                (key(pl), serde_json::to_string(src).unwrap_or_default())
+            });
+            let (lines, sources): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
+            self.polylines = lines;
+            self.polyline_sources = sources;
+        } else {
+            sort_lines(&mut self.polylines);
+        }
+        sort_lines(&mut self.hidden_polylines);
+        sort_lines(&mut self.hatch_polylines);
+        by_json(&mut self.circles);
+        by_json(&mut self.hidden_circles);
+        by_json(&mut self.ellipses);
+        by_json(&mut self.hidden_ellipses);
+        by_json(&mut self.centerlines);
+    }
+}
+
 fn show_hidden_default() -> bool {
     true
 }
@@ -1043,6 +1103,7 @@ impl Drawing {
         let did = self.id.0;
         for v in &mut self.views {
             v.id = ProjectedViewId(stable_view_id(did, &v.name));
+            v.canonicalize();
         }
     }
 

@@ -325,7 +325,7 @@ pub fn project_solid_view(
             extent.include(*p);
         }
     }
-    Ok(ProjectedView {
+    let mut view = ProjectedView {
         id: ProjectedViewId::new(),
         name: name.into(),
         projection,
@@ -348,7 +348,9 @@ pub fn project_solid_view(
         // (`dimensioning::build_hlr_view`) populates this. Empty → readback
         // refuses on these polylines rather than guessing.
         polyline_sources: Vec::new(),
-    })
+    };
+    view.canonicalize();
+    Ok(view)
 }
 
 /// Convenience accessor used by some callers (project a single 3D

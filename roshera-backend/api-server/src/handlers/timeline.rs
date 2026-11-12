@@ -393,6 +393,7 @@ async fn replay_undo_redo(
     prior_head: Option<Option<u64>>,
     op_label: &'static str,
 ) -> Result<ReplayOutcome, UndoReplayError> {
+    let started = std::time::Instant::now();
     let _ = state.timeline_recorder.settle().await;
     let (branch_id, limit) = {
         let timeline = state.timeline.read().await;
@@ -406,6 +407,7 @@ async fn replay_undo_redo(
     let prepared = prepare_branch_replay(state, branch_id, limit as usize)
         .await
         .map_err(UndoReplayError::Refused)?;
+    let prepared_at = started.elapsed();
     #[cfg(test)]
     replay_race_hook::pause(session_uuid).await;
     let mut model_guard = state.model.write().await;
@@ -459,8 +461,10 @@ async fn replay_undo_redo(
             )),
         }));
     }
+    let persisted_at = started.elapsed();
     let outcome = commit_prepared_replay(state, &mut model_guard, prepared).await;
     drop(model_guard);
+    let committed_at = started.elapsed();
     // The live model was replaced: show it in every open viewport, and
     // rebuild the sheets from the history at the new position (an undone
     // "remove view" brings the view back).
@@ -474,7 +478,21 @@ async fn replay_undo_redo(
         all.truncate(limit as usize);
         all
     };
+    let scene_at = started.elapsed();
     crate::drawing_mgr::rebuild_sheets_from_history(state, events).await;
+    // Where an undo/redo spends its time (engineers wait on it).
+    tracing::info!(
+        target: "timeline.undo_redo",
+        op = op_label,
+        events = limit,
+        prepare_ms = prepared_at.as_millis() as u64,
+        persist_ms = (persisted_at - prepared_at).as_millis() as u64,
+        commit_ms = (committed_at - persisted_at).as_millis() as u64,
+        scene_ms = (scene_at - committed_at).as_millis() as u64,
+        sheets_ms = (started.elapsed() - scene_at).as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "undo/redo timings"
+    );
     Ok(outcome)
 }
 

@@ -33,6 +33,21 @@ pub struct DrawingRebuild {
     pub drawings: HashMap<Uuid, Drawing>,
     /// Sheets or edits that could not be replayed, stated by event.
     pub issues: Vec<String>,
+    /// What was derived and what was reused (a test checks this, not a clock).
+    pub stats: RebuildStats,
+}
+
+/// Derivation work one [`rebuild_drawings`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildStats {
+    /// Sheets derived from the part (hidden lines, dimensions).
+    pub sheets_derived: usize,
+    /// Sheets taken from the cache: same geometry, same creation event.
+    pub sheets_reused: usize,
+    /// Added views projected.
+    pub views_projected: usize,
+    /// Added views taken from the cache.
+    pub views_reused: usize,
 }
 
 fn refs(e: &TimelineEvent, key: &str, kind: &str) -> Vec<Uuid> {
@@ -93,9 +108,31 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
             .next();
         match k {
             "drawing.create_from_part" => {
-                let (model, outcome, _) = frames.replay(&geometry);
                 let switch = target.and_then(|id| switches.get(&id).copied());
-                match rederive_part_drawing(&model, e, &outcome.id_remap, switch) {
+                // The derived sheet depends only on the geometry before this
+                // event, the event, and the projection switch: reuse it when
+                // all three are unchanged (an edit-only undo or redo).
+                let key = FrameCache::derived_key(
+                    &FrameCache::key_of(&geometry),
+                    e,
+                    format!("{switch:?}").as_bytes(),
+                );
+                let derived = match frames.sheet(&key) {
+                    Some(hit) => {
+                        out.stats.sheets_reused += 1;
+                        DrawingRederive::Rebuilt(hit.0, Box::new(hit.1.clone()))
+                    }
+                    None => {
+                        let (model, outcome, _) = frames.replay(&geometry);
+                        let d = rederive_part_drawing(&model, e, &outcome.id_remap, switch);
+                        if let DrawingRederive::Rebuilt(id, sheet) = &d {
+                            out.stats.sheets_derived += 1;
+                            frames.store_sheet(key, *id, (**sheet).clone());
+                        }
+                        d
+                    }
+                };
+                match derived {
                     DrawingRederive::Rebuilt(id, sheet) => {
                         let mut sheet = *sheet;
                         // The name the sheet was created with (recorded since
@@ -169,25 +206,41 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                     ));
                     continue;
                 };
-                // The view's part, as the geometry stands at this point.
-                let (model, outcome, _) = frames.replay(&geometry);
-                let ViewSource::Part { part_id, solid_id } = source;
-                let live = outcome
-                    .id_remap
-                    .get(&(solid_id as u64))
-                    .copied()
-                    .unwrap_or(solid_id as u64) as u32;
-                match project_solid_view(
-                    &model,
-                    ViewSource::Part {
-                        part_id,
-                        solid_id: live,
-                    },
-                    projection,
-                    name,
-                    position,
-                    scale,
-                ) {
+                // The view's part, as the geometry stands at this point:
+                // projected once per (geometry, event), reused after that.
+                let key = FrameCache::derived_key(&FrameCache::key_of(&geometry), e, &[]);
+                let projected = match frames.view(&key) {
+                    Some(hit) => {
+                        out.stats.views_reused += 1;
+                        Ok((*hit).clone())
+                    }
+                    None => {
+                        let (model, outcome, _) = frames.replay(&geometry);
+                        let ViewSource::Part { part_id, solid_id } = source;
+                        let live = outcome
+                            .id_remap
+                            .get(&(solid_id as u64))
+                            .copied()
+                            .unwrap_or(solid_id as u64) as u32;
+                        let r = project_solid_view(
+                            &model,
+                            ViewSource::Part {
+                                part_id,
+                                solid_id: live,
+                            },
+                            projection,
+                            name,
+                            position,
+                            scale,
+                        );
+                        if let Ok(v) = &r {
+                            out.stats.views_projected += 1;
+                            frames.store_view(key, v.clone());
+                        }
+                        r
+                    }
+                };
+                match projected {
                     Ok(mut view) => {
                         if let Some(vid) = refs(e, "outputs", "view:").into_iter().next() {
                             view.id = geometry_engine::drawing::types::ProjectedViewId(vid);

@@ -303,3 +303,122 @@ fn a_view_edit_survives_a_rebuild() {
         "only FRONT changed"
     );
 }
+
+/// Undo, redo and every sheet edit rebuild the sheets from history. The
+/// derived sheet (hidden-line projection, dimensions) depends only on the
+/// geometry it was derived from, so an edit-only change (a view edit, a
+/// rename) reuses it and re-applies the cheap edits -- 5.5 s of a 6.5 s undo
+/// was re-deriving unchanged sheets. A geometry change (a dimension edit)
+/// derives it again. Reused or derived, the sheet is the same.
+#[test]
+fn an_edit_only_change_reuses_the_derived_sheet() {
+    let frames = FrameCache::new(64);
+    let did = Uuid::new_v4();
+    let left = Uuid::new_v4();
+    let mut events = plate();
+    events.extend([
+        from_part(3, 3, did),
+        add_view(4, did, left, 3, "LEFT", "left"),
+    ]);
+    let first = rebuild_drawings(&events, &frames);
+    assert_eq!(
+        (first.stats.sheets_derived, first.stats.views_projected),
+        (1, 1)
+    );
+
+    events.push(view_update(
+        5,
+        did,
+        stable_view_id(did, "FRONT"),
+        json!({ "show_hidden": false }),
+    ));
+    let second = rebuild_drawings(&events, &frames);
+    assert_eq!(
+        (second.stats.sheets_derived, second.stats.views_projected),
+        (0, 0),
+        "nothing re-derived for an edit"
+    );
+    assert_eq!(
+        (second.stats.sheets_reused, second.stats.views_reused),
+        (1, 1)
+    );
+    let fresh = rebuild_drawings(&events, &FrameCache::new(64));
+    let a = serde_json::to_value(second.drawings.get(&did).expect("sheet")).expect("json");
+    let b = serde_json::to_value(fresh.drawings.get(&did).expect("sheet")).expect("json");
+    assert_eq!(
+        first_difference(&a, &b, String::new()),
+        None,
+        "a reused sheet is the sheet a fresh rebuild makes"
+    );
+
+    // A cached sheet is never edited in place: rebuilding again still
+    // starts from the derived sheet, not from the edited one.
+    events.pop();
+    let back = rebuild_drawings(&events, &frames);
+    assert!(
+        back.drawings
+            .get(&did)
+            .expect("sheet")
+            .views
+            .iter()
+            .all(|v| v.show_hidden),
+        "undoing the edit shows hidden lines again"
+    );
+
+    events.push(mould(1, "radius", 4.0, 5));
+    let third = rebuild_drawings(&events, &frames);
+    assert_eq!(
+        (third.stats.sheets_derived, third.stats.views_projected),
+        (1, 1),
+        "a geometry change derives the sheet again"
+    );
+}
+
+/// The JSON path of the first place two values differ, with both sides.
+fn first_difference(a: &serde_json::Value, b: &serde_json::Value, path: String) -> Option<String> {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            for k in x.keys().chain(y.keys()) {
+                let (va, vb) = (
+                    x.get(k).unwrap_or(&Value::Null),
+                    y.get(k).unwrap_or(&Value::Null),
+                );
+                if let Some(d) = first_difference(va, vb, format!("{path}.{k}")) {
+                    return Some(d);
+                }
+            }
+            None
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x
+            .iter()
+            .zip(y)
+            .enumerate()
+            .find_map(|(i, (va, vb))| first_difference(va, vb, format!("{path}[{i}]"))),
+        _ if a == b => None,
+        _ => {
+            let show = |v: &Value| v.to_string().chars().take(120).collect::<String>();
+            Some(format!("{path}: {} vs {}", show(a), show(b)))
+        }
+    }
+}
+
+/// One history, rebuilt twice from scratch, gives the same sheet bit for bit
+/// -- the sheet digest a certificate states must not change between runs.
+/// An added view's line work came out in the model's (run-dependent) edge
+/// order.
+#[test]
+fn two_rebuilds_of_one_history_are_identical() {
+    let did = Uuid::new_v4();
+    let left = Uuid::new_v4();
+    let mut events = plate();
+    events.extend([
+        from_part(3, 3, did),
+        add_view(4, did, left, 3, "LEFT", "left"),
+    ]);
+    let a = rebuild_drawings(&events, &FrameCache::new(64));
+    let b = rebuild_drawings(&events, &FrameCache::new(64));
+    let a = serde_json::to_value(a.drawings.get(&did).expect("a")).expect("json");
+    let b = serde_json::to_value(b.drawings.get(&did).expect("b")).expect("json");
+    assert_eq!(first_difference(&a, &b, String::new()), None);
+}
