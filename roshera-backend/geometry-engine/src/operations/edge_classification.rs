@@ -217,6 +217,21 @@ pub fn classify_edge(model: &BRepModel, edge_id: EdgeId) -> OperationResult<Edge
     }
 }
 
+/// Classify `edge_id` as the join between two GIVEN faces, skipping the
+/// model-wide incidence scan [`classify_edge`] performs. For a caller that has
+/// already built the incidence of one solid from its own shells (the
+/// attributed adjacency graph, `readable::adjacency`), so the dihedral is the
+/// same one [`classify_edge`] computes — there is exactly one dihedral
+/// classifier in the kernel.
+pub(crate) fn classify_face_pair(
+    model: &BRepModel,
+    edge_id: EdgeId,
+    face1_id: FaceId,
+    face2_id: FaceId,
+) -> OperationResult<EdgeClassification> {
+    classify_manifold_edge(model, edge_id, face1_id, face2_id)
+}
+
 /// Classify `edge_id` and return its typed [`DihedralClass`], or `None`
 /// for boundary / non-manifold / undefined edges. Read-only convenience
 /// over [`classify_edge`] for the topology consumers (supermaximal

@@ -432,3 +432,28 @@ fn the_pitch_circle_is_drawn_on_the_face_view() {
         );
     }
 }
+
+/// Completeness means INK: a bore counts as on the sheet only when a row that
+/// is drawn, or a callout dimension that is drawn, states it. The certificate
+/// used to accept the callout's face list (and the hidden hole-table rows
+/// underneath it) as proof, so a sheet that lost its hole callout still
+/// certified complete.
+#[test]
+fn a_sheet_that_loses_its_hole_callout_omits_the_holes() {
+    let (m, s) = flange(11.0, (0.0, -30.0));
+    let mut d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+    assert_eq!(
+        certify_drawing(&m, &d).counts.omitted,
+        0,
+        "control: complete"
+    );
+    for v in &mut d.views {
+        v.dimensions.retain(|x| x.kind != "hole_callout");
+    }
+    let cert = certify_drawing(&m, &d);
+    assert!(
+        cert.counts.omitted > 0,
+        "the four holes are no longer stated anywhere on the sheet"
+    );
+    assert!(!cert.sound);
+}

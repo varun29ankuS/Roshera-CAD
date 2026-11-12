@@ -548,11 +548,17 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     // located by the pitch circle and the axis, not by corner offsets. Only
     // the bores that really get a table row are "tabled" — suppressing the
     // dimensions of a called-out bore would leave it with no ink at all.
-    let callout_faces = drawing
+    //
+    // A hole PATTERN callout states its members' size and, with its location
+    // and pitch dimensions, their position — the same holds for its rows.
+    let mut callout_faces = drawing
         .round_part
         .as_ref()
         .map(|rp| rp.callout_faces())
         .unwrap_or_default();
+    if let Some(hf) = &drawing.hole_features {
+        callout_faces.extend(hf.callout_faces());
+    }
     let tabled_sites: Vec<HoleSite> = drawing
         .hole_sites
         .iter()
@@ -568,14 +574,55 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
 
     let mut all_placed: Vec<PlacedDimension> = Vec::new();
     for (idx, view) in drawing.views.iter().enumerate() {
-        let pds = place_dimensions_in(
-            view,
-            h,
-            idx,
-            &tabled_face_ids,
-            Some(frame_rect_of(drawing, h)),
-            &items,
-        );
+        let (fml, fmr, fmt, fmb) = frame_margins(&drawing.sheet_size);
+        let frame = [fml, fmt, drawing.sheet_size.width() - fmr, h - fmb];
+        // Other views' geometry and titles: a leader's shoulder text must not
+        // print over them.
+        // Every piece of text already placed (earlier views' dimensions) and
+        // the title block are obstacles too: a callout's second line once
+        // landed on "SECTION A-A", and a leader on a lower view can reach the
+        // title block.
+        let obstacles: Vec<Rect2> = items
+            .iter()
+            .filter(|it| {
+                (matches!(
+                    it.kind,
+                    SheetItemKind::ViewGeometry | SheetItemKind::ViewLabel
+                ) && it.owner_view != Some(idx))
+                    || matches!(
+                        it.kind,
+                        SheetItemKind::DimensionText | SheetItemKind::TitleBlock
+                    )
+            })
+            .map(|it| it.bbox)
+            .chain(
+                // Other views' centre lines are ink too, and they overshoot
+                // the outline: a section's hole axes stuck out past its
+                // geometry box and a callout was printed across them.
+                drawing
+                    .views
+                    .iter()
+                    .enumerate()
+                    .filter(|(vi, _)| *vi != idx)
+                    .flat_map(|(_, v)| {
+                        v.centerlines
+                            .iter()
+                            .filter(|c| c.kind != "pitch_circle")
+                            .flat_map(|c| c.segments.iter())
+                            .map(move |s| {
+                                let p = dim_to_sheet(v, h, [s[0], s[1]]);
+                                let q = dim_to_sheet(v, h, [s[2], s[3]]);
+                                Rect2 {
+                                    x0: p[0].min(q[0]) - 0.3,
+                                    y0: p[1].min(q[1]) - 0.3,
+                                    x1: p[0].max(q[0]) + 0.3,
+                                    y1: p[1].max(q[1]) + 0.3,
+                                }
+                            })
+                    }),
+            )
+            .collect();
+        let pds = place_dimensions_routed(view, h, idx, &tabled_face_ids, Some(frame), &obstacles);
         for pd in &pds {
             let font = DIM_TEXT_FONT_MM;
             let text_w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * font;
@@ -1686,29 +1733,37 @@ pub(crate) fn place_dimensions(
     owner: usize,
     tabled_face_ids: &std::collections::HashSet<u32>,
 ) -> Vec<PlacedDimension> {
-    place_dimensions_in(view, sheet_h, owner, tabled_face_ids, None, &[])
+    place_dimensions_in_frame(view, sheet_h, owner, tabled_face_ids, None)
 }
 
-/// The drawing frame in sheet coordinates (y down).
-fn frame_rect_of(drawing: &Drawing, sheet_h: f64) -> Rect2 {
-    let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
-    Rect2 {
-        x0: ml,
-        y0: mt,
-        x1: drawing.sheet_size.width() - mr,
-        y1: sheet_h - mb,
-    }
-}
-
-/// [`place_dimensions`] with the sheet frame known, so a leader callout can
-/// keep its text on the sheet.
-pub(crate) fn place_dimensions_in(
+/// [`place_dimensions`], knowing the drawing frame `[x0, y0, x1, y1]` (sheet
+/// mm), so a hole-callout leader is routed inside it. Both defects this
+/// guards were found by looking at a sheet: a `4× Ø6.60 THRU ⌴ Ø11.00 ↧ 6.80`
+/// callout on a left-hand hole near the frame's left edge was drawn over the
+/// border and off it, and a 45° leg from a hole near the middle of a view ran
+/// off the top of the sheet before it cleared the view's side.
+pub(crate) fn place_dimensions_in_frame(
     view: &ProjectedView,
     sheet_h: f64,
     owner: usize,
     tabled_face_ids: &std::collections::HashSet<u32>,
-    frame: Option<Rect2>,
-    obstacles: &[SheetItem],
+    frame: Option<[f64; 4]>,
+) -> Vec<PlacedDimension> {
+    place_dimensions_routed(view, sheet_h, owner, tabled_face_ids, frame, &[])
+}
+
+/// [`place_dimensions_in_frame`], also keeping each hole-callout leader's
+/// shoulder and text off `obstacles` (other views' geometry and titles): the
+/// shoulder row is moved up, then down, one text row at a time until it is
+/// clear. Found by looking: three pattern callouts on TOP printed over
+/// SECTION A-A in the next column.
+pub(crate) fn place_dimensions_routed(
+    view: &ProjectedView,
+    sheet_h: f64,
+    owner: usize,
+    tabled_face_ids: &std::collections::HashSet<u32>,
+    frame: Option<[f64; 4]>,
+    obstacles: &[Rect2],
 ) -> Vec<PlacedDimension> {
     let Some(gr) = view_geometry_rect(view, sheet_h) else {
         return Vec::new();
@@ -1744,6 +1799,8 @@ pub(crate) fn place_dimensions_in(
         .cloned()
         .collect();
     let baseline = super::hole_table::qualifies_for_baseline(&untabled_positions);
+    // Shoulder heights already taken by a leader on each side of this view.
+    let mut leader_rows: Vec<(f64, f64)> = Vec::new();
 
     for d in &view.dimensions {
         // Tabled-position / tabled-diameter suppression: skip position or
@@ -1765,17 +1822,21 @@ pub(crate) fn place_dimensions_in(
 
         // A hole-pattern callout ("4× Ø11.00 THRU EQ SP") is far wider than
         // one hole, so it goes on a LEADER (ISO 129-1 §8): an arrow on the
-        // hole's edge, a 45° leg out past the view, a horizontal shoulder
-        // with the text above it. Encoded in the same shape the renderer
-        // and verifier already read: the leg is `ext[0]`, the shoulder is
-        // the dimension `line` (so the label sits on a span its own width),
-        // the arrow is `arrows[0]`; `ext[1]`/`arrows[1]` are degenerate.
+        // hole's edge, a leg out past the view, a horizontal shoulder with
+        // the text above it. Encoded in the same shape the renderer and
+        // verifier already read: the leg is `ext[0]`, the shoulder is the
+        // dimension `line` (so the label sits on a span its own width), the
+        // arrow is `arrows[0]`; `ext[1]`/`arrows[1]` are degenerate.
+        //
+        // Routing: the shoulder goes on the view's RIGHT (the vertical
+        // dimension stack owns the left) unless it would leave the frame
+        // there; its elbow sits one standoff outside the view, risen at a
+        // nominal 45° from the hole but never above the frame's top, and a
+        // second leader on the same side takes the next free row so two
+        // callouts never overprint.
         if d.kind == "hole_callout" && (dx > 1e-6 || dy > 1e-6) {
             let centre = [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])];
             let r = 0.5 * (a[0] - b[0]).hypot(a[1] - b[1]);
-            let vc = [0.5 * (bbox[0] + bbox[2]), 0.5 * (bbox[1] + bbox[3])];
-            let side = if centre[0] >= vc[0] { 1.0 } else { -1.0 };
-            let s = std::f64::consts::FRAC_1_SQRT_2;
             // A qualifier in parentheses ("(1ST AT 45.0°)") goes on a second
             // line UNDER the shoulder, the way a drafter writes a two-line
             // callout -- one 70 mm line ran off the sheet.
@@ -1784,91 +1845,115 @@ pub(crate) fn place_dimensions_in(
                 None => (d.label.clone(), None),
             };
             let width_of = |t: &str| t.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
-            let main_w = width_of(&main);
-            let note_w = note.as_deref().map(width_of).unwrap_or(0.0);
-            let text_w = main_w.max(note_w);
-
-            // Deterministic candidate search (the same discipline as the
-            // section labels): leader directions in a fixed order -- out and
-            // up on the hole's side, out and down, then the far side -- each
-            // at increasing leg lengths. The first whose text lies inside the
-            // frame and clear of every piece of ink already placed wins; if
-            // none is clear the first candidate is used and the verifier
-            // reports the overlap honestly.
+            let text_w = note
+                .as_deref()
+                .map(width_of)
+                .unwrap_or(0.0)
+                .max(width_of(&main));
+            // Ink below the shoulder: the second line, when there is one.
+            let below = if note.is_some() {
+                TGAP + DIM_TEXT_FONT_MM
+            } else {
+                0.5
+            };
+            let need = STANDOFF + text_w + 2.0;
+            let fits = |sd: f64| match frame {
+                Some([x0, _, x1, _]) => {
+                    if sd > 0.0 {
+                        bbox[2] + need <= x1
+                    } else {
+                        bbox[0] - need >= x0
+                    }
+                }
+                None => true,
+            };
+            let side = if fits(1.0) || !fits(-1.0) { 1.0 } else { -1.0 };
+            let elbow_x = if side > 0.0 {
+                bbox[2] + STANDOFF
+            } else {
+                bbox[0] - STANDOFF
+            };
+            let row = 2.0 * DIM_TEXT_FONT_MM;
+            let top = frame
+                .map(|f| f[1] + DIM_TEXT_FONT_MM + TGAP + 1.0)
+                .unwrap_or(f64::NEG_INFINITY);
+            let bottom = frame.map(|f| f[3] - 1.0).unwrap_or(f64::INFINITY);
+            let nominal = (centre[1] - (elbow_x - centre[0]).abs()).max(top);
+            // The shoulder + text box for a row at `y`.
+            let text_box = |y: f64| {
+                let (x0, x1) = if side > 0.0 {
+                    (elbow_x, elbow_x + text_w + 2.0)
+                } else {
+                    (elbow_x - text_w - 2.0, elbow_x)
+                };
+                Rect2 {
+                    x0,
+                    y0: y - TGAP - DIM_TEXT_FONT_MM,
+                    x1,
+                    y1: y + below,
+                }
+            };
+            let free = |y: f64| {
+                let b = text_box(y);
+                y >= top
+                    && y <= bottom
+                    && !leader_rows
+                        .iter()
+                        .any(|&(s, ly)| s == side && (ly - y).abs() < row)
+                    && !obstacles.iter().any(|o| o.intersects(&b, 0.0))
+            };
+            // Nearest free row to the nominal one: up first, then down.
+            let mut ey = nominal;
+            let mut found = free(nominal);
+            for k in 1..=200 {
+                if found {
+                    break;
+                }
+                for cand in [
+                    nominal - k as f64 * 0.5 * row,
+                    nominal + k as f64 * 0.5 * row,
+                ] {
+                    if free(cand) {
+                        ey = cand;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                // No clear row inside the frame: keep the nominal row clear of
+                // the other leaders at least.
+                ey = nominal;
+                while leader_rows
+                    .iter()
+                    .any(|&(s, y)| s == side && (y - ey).abs() < row)
+                {
+                    ey += row;
+                }
+            }
+            leader_rows.push((side, ey));
+            let elbow = [elbow_x, ey];
+            let (vx, vy) = (elbow[0] - centre[0], elbow[1] - centre[1]);
+            let len = vx.hypot(vy);
+            let dir = if len > 1e-9 {
+                [vx / len, vy / len]
+            } else {
+                [side, 0.0]
+            };
+            let edge = [centre[0] + dir[0] * r, centre[1] + dir[1] * r];
+            let shoulder_end = [elbow[0] + side * (text_w + 2.0), elbow[1]];
             struct Leader {
                 dir: [f64; 2],
                 edge: [f64; 2],
                 elbow: [f64; 2],
                 shoulder_end: [f64; 2],
             }
-            let candidate = |sx: f64, sy: f64, extra: f64| -> Leader {
-                let dir = [sx * s, sy * s];
-                let edge = [centre[0] + dir[0] * r, centre[1] + dir[1] * r];
-                let past_view = if sx > 0.0 {
-                    (bbox[2] + STANDOFF - edge[0]) / dir[0]
-                } else {
-                    (bbox[0] - STANDOFF - edge[0]) / dir[0]
-                };
-                let leg = past_view.max(STANDOFF) + extra;
-                let elbow = [edge[0] + dir[0] * leg, edge[1] + dir[1] * leg];
-                let shoulder_end = [elbow[0] + sx * (text_w + 2.0), elbow[1]];
-                Leader {
-                    dir,
-                    edge,
-                    elbow,
-                    shoulder_end,
-                }
+            let l = Leader {
+                dir,
+                edge,
+                elbow,
+                shoulder_end,
             };
-            let text_boxes = |l: &Leader| -> Vec<Rect2> {
-                let cx = 0.5 * (l.elbow[0] + l.shoulder_end[0]);
-                let base = l.elbow[1] - TGAP;
-                let mut v = vec![Rect2 {
-                    x0: cx - 0.5 * main_w,
-                    y0: base - DIM_TEXT_FONT_MM,
-                    x1: cx + 0.5 * main_w,
-                    y1: base,
-                }];
-                if note.is_some() {
-                    let nb = l.elbow[1] + TGAP + DIM_TEXT_FONT_MM;
-                    v.push(Rect2 {
-                        x0: cx - 0.5 * note_w,
-                        y0: nb - DIM_TEXT_FONT_MM,
-                        x1: cx + 0.5 * note_w,
-                        y1: nb,
-                    });
-                }
-                v
-            };
-            let clear = |l: &Leader| -> bool {
-                text_boxes(l).iter().all(|t| {
-                    frame.map_or(true, |f| {
-                        t.x0 >= f.x0 + 1.0
-                            && t.x1 <= f.x1 - 1.0
-                            && t.y0 >= f.y0 + 1.0
-                            && t.y1 <= f.y1 - 1.0
-                    }) && !obstacles.iter().any(|it| {
-                        matches!(
-                            it.kind,
-                            SheetItemKind::ViewGeometry
-                                | SheetItemKind::ViewLabel
-                                | SheetItemKind::DimensionText
-                                | SheetItemKind::TitleBlock
-                        ) && t.intersects(&it.bbox, -0.5)
-                    })
-                })
-            };
-            let mut chosen: Option<Leader> = None;
-            'search: for (sx, sy) in [(side, -1.0), (side, 1.0), (-side, -1.0), (-side, 1.0)] {
-                for extra in [0.0, 6.0, 12.0, 18.0] {
-                    let l = candidate(sx, sy, extra);
-                    if clear(&l) {
-                        chosen = Some(l);
-                        break 'search;
-                    }
-                }
-            }
-            let l = chosen.unwrap_or_else(|| candidate(side, -1.0, 0.0));
-
             result.push(PlacedDimension {
                 line: [l.elbow, l.shoulder_end],
                 ext: [[l.edge, l.elbow], [l.elbow, l.elbow]],

@@ -1324,7 +1324,10 @@ fn tabled_bore_position_dims_suppressed_from_stack() {
         GeometryId::Solid(s) => s,
         o => panic!("expected solid, got {o:?}"),
     };
-    let bore_positions = [(-8.0, -8.0), (-8.0, 8.0), (8.0, -8.0), (8.0, 8.0)];
+    // One bore off-pitch ((8, 8) -> (10, 8)): an equal-pitch 2×2 grid is a
+    // rectangular PATTERN, stated by one callout with location and pitch, and
+    // this test is about bores that stay in the hole table.
+    let bore_positions = [(-8.0, -8.0), (-8.0, 8.0), (8.0, -8.0), (10.0, 8.0)];
     let mut part = plate;
     for (bx, by) in bore_positions {
         let bore = match TopologyBuilder::new(&mut m)

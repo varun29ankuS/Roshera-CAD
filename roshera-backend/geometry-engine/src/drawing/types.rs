@@ -834,6 +834,14 @@ pub struct Drawing {
     /// sheets parsing.
     #[serde(default)]
     pub round_part: Option<super::round_part::RoundPartCallouts>,
+    /// Hole stacks (through / blind / counterbored / countersunk) and the
+    /// linear / rectangular patterns among them, recognised from the solid's
+    /// geometry; `None` when the part has none. A pattern is inked as one
+    /// callout located by pitch instead of hole-table rows; a single stack's
+    /// row states the whole stack. The certificate re-measures every stack
+    /// and pattern. `serde(default)` keeps older sheets parsing.
+    #[serde(default)]
+    pub hole_features: Option<super::hole_features::HoleFeatures>,
 }
 
 impl Drawing {
@@ -865,6 +873,7 @@ impl Drawing {
             document_unit: LengthUnit::default(),
             general_tolerance: GeneralTolerance::default(),
             round_part: None,
+            hole_features: None,
         }
     }
 

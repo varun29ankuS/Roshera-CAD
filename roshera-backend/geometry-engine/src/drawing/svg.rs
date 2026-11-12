@@ -267,6 +267,13 @@ fn write_stylesheet(out: &mut String) {
     out.push_str("    .hole-table-border { fill: none; stroke: #111; stroke-width: 0.25; }\n");
     out.push_str("    .hole-table-inner { fill: none; stroke: #111; stroke-width: 0.18; }\n");
     out.push_str("    .hole-table-text { font: 500 2.6px sans-serif; fill: #111; }\n");
+    // Drafting symbols (counterbore, countersink, depth): a font stack that
+    // carries them and a size that reads, so the rest of the label stays in
+    // the sheet's sans-serif.
+    out.push_str(
+        "    .sym { font-family: 'Segoe UI Symbol', 'Cambria Math', 'DejaVu Sans', \
+         'Noto Sans Symbols 2', sans-serif; font-size: 1.3em; }\n",
+    );
     // Cutting-plane indicator (Task 9, ISO 128):
     //   - Body: chain line 0.18 mm (same as centerline tier).
     //   - Thick ends: 0.50 mm heavy segments at each tip (ISO 128 §7.3).
@@ -724,7 +731,7 @@ fn render_hole_table(out: &mut String, layout: &SheetLayout) {
             "  <text class=\"hole-table-text\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
             item.bbox.x0,
             item.bbox.y1,
-            escape_xml(text)
+            ink_text(text)
         );
     }
 }
@@ -955,20 +962,44 @@ fn dim_line(out: &mut String, x1: f64, y1: f64, x2: f64, y2: f64) {
 
 /// Centered dimension label. `rot` (degrees) rotates it about its anchor
 /// — −90 for the vertical callouts so the text reads bottom-to-top.
+/// Drafting symbols the sheet's sans-serif usually lacks: counterbore,
+/// countersink, depth.
+const DRAFTING_SYMBOLS: [char; 3] = ['\u{2334}', '\u{2335}', '\u{21A7}'];
+
+/// Escape `text` for SVG and wrap each drafting symbol in a `sym` span. The
+/// span carries a symbol-font stack and a larger size: without it the PDF
+/// renderer (usvg) set the WHOLE label in the fallback serif that has the
+/// glyph, and the counterbore / countersink marks read at about a millimetre
+/// on a 3.1 mm line.
+pub(crate) fn ink_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut buf = [0u8; 4];
+    for ch in text.chars() {
+        if DRAFTING_SYMBOLS.contains(&ch) {
+            out.push_str("<tspan class=\"sym\">");
+            out.push(ch);
+            out.push_str("</tspan>");
+        } else {
+            out.push_str(&escape_xml(ch.encode_utf8(&mut buf)));
+        }
+    }
+    out
+}
+
 fn dim_text(out: &mut String, x: f64, y: f64, label: &str, rot: f64, dim_id: &str) {
     let id = escape_xml(dim_id);
     if rot.abs() < 1e-6 {
         let _ = write!(
             out,
             "  <text class=\"dim-text dim-text-c\" data-dim-id=\"{id}\" x=\"{x:.3}\" y=\"{y:.3}\">{}</text>\n",
-            escape_xml(label)
+            ink_text(label)
         );
     } else {
         let _ = write!(
             out,
             "  <text class=\"dim-text dim-text-c\" data-dim-id=\"{id}\" x=\"{x:.3}\" y=\"{y:.3}\" \
              transform=\"rotate({rot:.1} {x:.3} {y:.3})\">{}</text>\n",
-            escape_xml(label)
+            ink_text(label)
         );
     }
 }

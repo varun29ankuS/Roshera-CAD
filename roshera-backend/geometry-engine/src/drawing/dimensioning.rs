@@ -111,15 +111,22 @@ pub fn auto_dimensions(
     // A round part is dimensioned the way a drawing states it (Ø outside,
     // bolt circle as one callout), not by the plate convention.
     let mut records = extract_dimensions(model, solid_id);
-    if let Some(rp) = super::round_part::detect_round_part(model, solid_id, &records) {
-        records = super::round_part::apply_round_conventions(records, &rp);
+    let round = super::round_part::detect_round_part(model, solid_id, &records);
+    if let Some(rp) = &round {
+        records = super::round_part::apply_round_conventions(records, rp);
+    }
+    // A drilled hole is stated as its coaxial stack (counterbore,
+    // countersink, THRU / blind), and a pattern of identical stacks as one
+    // callout located by its first member and pitch.
+    if let Some(hf) = super::hole_features::detect_hole_features(model, solid_id, round.as_ref()) {
+        records = super::hole_features::apply_hole_conventions(records, &hf, model.document_unit());
     }
     for d in records {
         let anchor = Point3::new(d.anchor[0], d.anchor[1], d.anchor[2]);
         let dir = Vector3::new(d.direction[0], d.direction[1], d.direction[2]);
         let (p0, p1) = match d.kind.as_str() {
             "diameter" | "radius" | "hole_callout" | "pcd" => (anchor, anchor - dir * d.value),
-            "length" | "extent" | "position" => (
+            "length" | "extent" | "position" | "location" | "pitch" => (
                 anchor - dir * (d.value * 0.5),
                 anchor + dir * (d.value * 0.5),
             ),
@@ -201,8 +208,14 @@ fn select_dimensions(mut dims: Vec<Dimension2d>) -> Vec<Dimension2d> {
     }
 
     // 2. Collapse near-equal (kind, value) to a single representative (0.5 mm).
+    //    A hole callout, a pitch circle, a pattern's location and its pitch
+    //    are each a distinct statement about named holes, never a contour
+    //    ring: two of them with one value (X 10 and Y 10 to the first hole of
+    //    a grid) are both needed, so they are exempt.
     let mut seen: HashSet<(String, i64)> = HashSet::new();
-    dims.retain(|d| seen.insert((d.kind.clone(), (d.value * 2.0).round() as i64)));
+    dims.retain(|d| {
+        is_feature_callout(&d.kind) || seen.insert((d.kind.clone(), (d.value * 2.0).round() as i64))
+    });
 
     // 3. Cap diameters/radii: keep the largest 3 + smallest 2 distinct (envelope
     //    + throat), drop the rest of a contour's rings.
@@ -225,18 +238,32 @@ fn select_dimensions(mut dims: Vec<Dimension2d>) -> Vec<Dimension2d> {
     }
 
     // 4. Hard per-view cap, prioritising extents (overall envelope) > diameters
-    //    > the rest, so the most informative callouts survive.
+    //    > the rest, so the most informative callouts survive. A recognised
+    //    feature's callouts are NOT subject to the cap: a hole pattern's
+    //    callout, locations and pitch are what locate its holes (they replace
+    //    the hole-table rows), so dropping one leaves a hole sized but
+    //    unplaced — or, worse, stated only in a side view.
     const MAX_PER_VIEW: usize = 8;
-    if dims.len() > MAX_PER_VIEW {
+    let (features, mut rest): (Vec<Dimension2d>, Vec<Dimension2d>) =
+        dims.into_iter().partition(|d| is_feature_callout(&d.kind));
+    if rest.len() > MAX_PER_VIEW {
         let rank = |k: &str| match k {
             "extent" | "length" => 0,
             "diameter" | "radius" => 1,
             _ => 2,
         };
-        dims.sort_by_key(|d| rank(&d.kind));
-        dims.truncate(MAX_PER_VIEW);
+        rest.sort_by_key(|d| rank(&d.kind));
+        rest.truncate(MAX_PER_VIEW);
     }
-    dims
+    rest.extend(features);
+    rest
+}
+
+/// A callout that states a recognised feature (a round part's bolt circle, a
+/// hole pattern's callout, location and pitch) -- never contour clutter, so
+/// [`select_dimensions`] neither merges nor drops it as one.
+fn is_feature_callout(kind: &str) -> bool {
+    matches!(kind, "hole_callout" | "pcd" | "location" | "pitch")
 }
 
 /// World-space view direction (unit vector, pointing INTO the scene) that a
@@ -447,9 +474,11 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
                 // "dimension the hole where it shows as a circle" convention).
                 // A length dim must never prefer its axial view — there its
                 // span projects to zero and the callout is unreadable.
+                // A hole pattern's location and pitch are dimensioned where the
+                // holes read as circles too: the view along their axis.
                 let is_axial = matches!(
                     d.kind.as_str(),
-                    "diameter" | "radius" | "hole_callout" | "pcd"
+                    "diameter" | "radius" | "hole_callout" | "pcd" | "location" | "pitch"
                 ) && match (d.axis3, vdir) {
                     (Some(ax), Some(vd)) => dot3(ax, vd).abs() > 0.99,
                     _ => false,
@@ -572,6 +601,12 @@ pub fn standard_drawing(
         drawing.add_view(view);
     }
     dedup_dimensions_global(&mut drawing);
+    // `visible_dimensions` rewrote the records into the round-part and hole
+    // conventions; record the callouts so the certificate re-measures them.
+    let dims = extract_dimensions(model, solid_id);
+    drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
+    drawing.hole_features =
+        super::hole_features::detect_hole_features(model, solid_id, drawing.round_part.as_ref());
     Ok(drawing)
 }
 
@@ -675,7 +710,34 @@ pub fn standard_drawing_hlr_with_projection(
     // leaves the right column and top row sized by the real views and the
     // top-right quadrant empty.
     let no_iso = super::types::ViewExtent::default();
-    let placement = place_four_view(&sheet, fe, te, re, no_iso, scale, angle);
+    // The gap between the view rows must hold the upper view's stack of
+    // horizontal dimensions, as on the automatic route
+    // (`dimension_band_gaps`). With the fixed gap, a plate's five hole
+    // locations under TOP ran down into FRONT -- "40.00" and "60.00" printed
+    // inside its geometry. The views are not built yet, so count from the
+    // same analytic dimension table each view is about to draw; bore
+    // diameters are left out (a table row or a callout states them, never a
+    // stacked dimension).
+    let bores = crate::readable::bore_face_ids(model, solid_id);
+    let stacked = specs
+        .iter()
+        .map(|(proj, _)| {
+            visible_dimensions(model, solid_id, *proj, min_span)
+                .iter()
+                .filter(|d| {
+                    let dx = (d.a[0] - d.b[0]).abs();
+                    let dy = (d.a[1] - d.b[1]).abs();
+                    !matches!(d.kind.as_str(), "angle" | "hole_callout")
+                        && !(d.kind == "diameter" && d.entities.iter().any(|e| bores.contains(e)))
+                        && dx >= dy
+                        && dx > 1e-6
+                })
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    let vgap = VGAP + stacked.saturating_sub(3) as f64 * super::layout::STACK;
+    let placement = place_four_view(&sheet, fe, te, re, no_iso, scale, angle, vgap, HGAP);
     // A finite, positive scale can still be too large to MEASURE against: at
     // `1e308` the guard above passes and `1e308 * 80` is `inf`, so the overrun
     // is not a number. Reporting that as a fit failure would print "by inf mm"
@@ -724,8 +786,10 @@ pub fn standard_drawing_hlr_with_projection(
     // incomplete. The fix is to table the bores, not to lower the bar.
     let dims = extract_dimensions(model, solid_id);
     let bore_faces = crate::readable::bore_face_ids(model, solid_id);
-    attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
     drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
+    drawing.hole_features =
+        super::hole_features::detect_hole_features(model, solid_id, drawing.round_part.as_ref());
+    attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
     super::round_part::add_pitch_circles(&mut drawing);
 
     Ok(drawing)
@@ -1008,11 +1072,72 @@ fn layout_four_view(
     ie: super::types::ViewExtent,
     angle: super::types::ProjectionAngle,
 ) -> (f64, [[f64; 2]; 4]) {
-    let scale = fill_scale_four_view(sheet, fe, te, re, ie);
+    layout_four_view_gap(sheet, fe, te, re, ie, angle, VGAP, HGAP)
+}
+
+/// [`layout_four_view`] with the gap between the two view rows given: the
+/// automatic route widens it past [`VGAP`] when the upper view's stacked
+/// dimension band needs more ([`dimension_band_vgap`]).
+fn layout_four_view_gap(
+    sheet: &super::types::SheetSize,
+    fe: super::types::ViewExtent,
+    te: super::types::ViewExtent,
+    re: super::types::ViewExtent,
+    ie: super::types::ViewExtent,
+    angle: super::types::ProjectionAngle,
+    vgap: f64,
+    hgap: f64,
+) -> (f64, [[f64; 2]; 4]) {
+    let scale = fill_scale_four_view(sheet, fe, te, re, ie, vgap, hgap);
     (
         scale,
-        place_four_view(sheet, fe, te, re, ie, scale, angle).positions,
+        place_four_view(sheet, fe, te, re, ie, scale, angle, vgap, hgap).positions,
     )
+}
+
+/// The gap the two view rows need so the upper view's BELOW dimension band
+/// (its horizontal dimensions, stacked [`super::layout::STACK`] apart from
+/// [`super::layout::STANDOFF`]) and the lower view's title both fit — never
+/// less than [`VGAP`] — and the gap between the view columns, which must hold
+/// a hole callout's leader; returns `(vgap, hgap)`.
+///
+/// [`VGAP`] holds two stacked dimensions. A hole pattern adds a location and
+/// a pitch per direction, a round part an OD, a bore and a PCD; with more than
+/// two the fixed gap put the third dimension on the FRONT view's title and
+/// the fourth inside FRONT's geometry (found by looking at a three-pattern
+/// plate). `views` are the orthographic views with their deduplicated
+/// dimensions; `tabled` the bore faces whose diameter the hole table states
+/// (those are not inked in the stack).
+fn dimension_band_gaps(
+    views: &[super::types::ProjectedView],
+    tabled: &std::collections::HashSet<u32>,
+) -> (f64, f64) {
+    use super::layout::STACK;
+    // The column gap is not widened for a hole callout's leader: widening it
+    // shrank a flange sheet's scale to 0.75. The leader's shoulder row is
+    // routed around the neighbouring views instead
+    // (`layout::place_dimensions_in_frame`).
+    let hgap = HGAP;
+    let stacked = |v: &super::types::ProjectedView| -> usize {
+        v.dimensions
+            .iter()
+            .filter(|d| {
+                let dx = (d.a[0] - d.b[0]).abs();
+                let dy = (d.a[1] - d.b[1]).abs();
+                !matches!(d.kind.as_str(), "angle" | "hole_callout" | "position")
+                    && !(d.kind == "diameter" && d.entities.iter().any(|e| tabled.contains(e)))
+                    && dx >= dy
+                    && dx > 1e-6
+            })
+            .count()
+    };
+    let n = views.iter().map(stacked).max().unwrap_or(0);
+    // [`VGAP`] holds THREE stacked dimensions: the third line sits at
+    // STANDOFF + 2·STACK = 27 mm below the upper view, clear of the lower
+    // view's title glyphs (a flange's OD, bore and PCD — measured on the
+    // inked sheet). Each dimension past three needs one more STACK.
+    let vgap = VGAP + n.saturating_sub(3) as f64 * STACK;
+    (vgap, hgap)
 }
 
 // Reserve dimension room on the left + bottom + between columns, and
@@ -1099,14 +1224,16 @@ fn fill_scale_four_view(
     te: super::types::ViewExtent,
     re: super::types::ViewExtent,
     ie: super::types::ViewExtent,
+    vgap: f64,
+    hgap: f64,
 ) -> f64 {
     let (_avail_x0, _avail_y0, avail_w, avail_h) = four_view_area(sheet);
     let (left_w, right_w, top_h, bot_h) = four_view_spans(fe, te, re, ie);
 
     let unit_w = (left_w + right_w).max(1e-6);
     let unit_h = (top_h + bot_h).max(1e-6);
-    let s_w = (avail_w - HGAP) / unit_w;
-    let s_h = (avail_h - VGAP) / unit_h;
+    let s_w = (avail_w - hgap) / unit_w;
+    let s_h = (avail_h - vgap) / unit_h;
     let mut scale = 0.9 * s_w.min(s_h);
     if !scale.is_finite() || scale <= 0.0 {
         scale = 1.0;
@@ -1196,6 +1323,8 @@ fn place_four_view(
     ie: super::types::ViewExtent,
     scale: f64,
     angle: super::types::ProjectionAngle,
+    vgap: f64,
+    hgap: f64,
 ) -> FourViewPlacement {
     let h = sheet.height();
     let (avail_x0, avail_y0, avail_w, avail_h) = four_view_area(sheet);
@@ -1205,16 +1334,16 @@ fn place_four_view(
     let rwc = right_w * scale;
     let trh = top_h * scale;
     let brh = bot_h * scale;
-    let g_w = lw + HGAP + rwc;
-    let g_h = trh + VGAP + brh;
+    let g_w = lw + hgap + rwc;
+    let g_h = trh + vgap + brh;
     let gx = avail_x0 + 0.5 * (avail_w - g_w);
     let gy = avail_y0 + 0.5 * (avail_h - g_h);
 
     // Cell origins (top-left, sheet coords y down).
     let left_cx = gx + 0.5 * lw;
-    let right_cx = gx + lw + HGAP + 0.5 * rwc;
+    let right_cx = gx + lw + hgap + 0.5 * rwc;
     let top_cy = gy + 0.5 * trh;
-    let bot_cy = gy + trh + VGAP + 0.5 * brh;
+    let bot_cy = gy + trh + vgap + 0.5 * brh;
 
     // A view of extent `e` centred on (cx, cy): top-left at
     // (cx − e.w·s/2, cy − e.h·s/2).
@@ -1319,10 +1448,34 @@ pub fn standard_drawing_auto_with_projection(
     // visibility raytrace is the pipeline's dominant cost. Extent-only halves it.
     let t_p1 = std::time::Instant::now();
     let mut extents = Vec::with_capacity(4);
-    for (proj, name, _) in specs {
-        let v = super::projection::project_solid_view(model, source, proj, name, [0.0, 0.0], 1.0)?;
+    let mut band_probe = Drawing::new("band probe", super::types::SheetSize::A4);
+    for (proj, name, dimensioned) in specs {
+        let mut v =
+            super::projection::project_solid_view(model, source, proj, name, [0.0, 0.0], 1.0)?;
         extents.push(v.extent);
+        if dimensioned {
+            // The dimensions each view will carry (no HLR: placement needs
+            // only how many stack, not what is visible).
+            v.dimensions = visible_dimensions(model, solid_id, proj, min_span);
+            band_probe.add_view(v);
+        }
     }
+    dedup_dimensions_global(&mut band_probe);
+    let (vgap, hgap) = {
+        let dims = extract_dimensions(model, solid_id);
+        let round = super::round_part::detect_round_part(model, solid_id, &dims);
+        let holes = super::hole_features::detect_hole_features(model, solid_id, round.as_ref());
+        let mut called_out = round.map(|r| r.callout_faces()).unwrap_or_default();
+        if let Some(h) = &holes {
+            called_out.extend(h.callout_faces());
+        }
+        let tabled: std::collections::HashSet<u32> =
+            crate::readable::bore_face_ids(model, solid_id)
+                .into_iter()
+                .filter(|f| !called_out.contains(f))
+                .collect();
+        dimension_band_gaps(&band_probe.views, &tabled)
+    };
     if prof {
         eprintln!(
             "[draw-profile] pass1_extents (project-only): {:.1} ms",
@@ -1336,8 +1489,8 @@ pub fn standard_drawing_auto_with_projection(
         .fold(0.0_f64, f64::max)
         .max(1.0);
     let sheet = pick_sheet(max_dim);
-    let (scale, positions) = layout_four_view(
-        &sheet, extents[0], extents[1], extents[2], extents[3], angle,
+    let (scale, positions) = layout_four_view_gap(
+        &sheet, extents[0], extents[1], extents[2], extents[3], angle, vgap, hgap,
     );
 
     // Pass 2 — build the placed, scaled views.
@@ -1393,8 +1546,10 @@ pub fn standard_drawing_auto_with_projection(
     let t_tail = std::time::Instant::now();
     let dims = extract_dimensions(model, solid_id);
     let bore_faces = crate::readable::bore_face_ids(model, solid_id);
-    attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
     drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
+    drawing.hole_features =
+        super::hole_features::detect_hole_features(model, solid_id, drawing.round_part.as_ref());
+    attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
     super::round_part::add_pitch_circles(&mut drawing);
 
     // ── Section view (Task 9) ─────────────────────────────────────────────────
@@ -2047,9 +2202,23 @@ fn attach_hole_table_from_dims(
     // become inert (build_hole_table only creates sites from diameter
     // records), and the axis-vote / bore-centre passes below then see bores
     // only. Non-feature records (empty entities: whole-part extents) pass.
+    //
+    // A recognised hole stack is ONE row: its counterbore wall is not a
+    // separate hole, so its diameter record does not seed a site.
+    let secondary: std::collections::HashSet<u32> = drawing
+        .hole_features
+        .as_ref()
+        .map(|hf| {
+            hf.stacks
+                .iter()
+                .flat_map(|s| s.entry_faces.iter().chain(&s.floor_faces).copied())
+                .collect()
+        })
+        .unwrap_or_default();
     let dims: Vec<crate::readable::DimensionRecord> = all_dims
         .iter()
         .filter(|d| d.kind != "diameter" || d.entities.iter().any(|e| bore_faces.contains(e)))
+        .filter(|d| d.kind != "diameter" || !d.entities.iter().any(|e| secondary.contains(e)))
         .cloned()
         .collect();
 
@@ -2058,6 +2227,14 @@ fn attach_hole_table_from_dims(
     let part_extents = whole_part_extents(&dims);
 
     let mut sites = build_hole_table(&dims, part_extents);
+    if let Some(hf) = &drawing.hole_features {
+        // The row states the whole stack, THRU/blind read from topology.
+        let mut called_out = hf.callout_faces();
+        if let Some(rp) = &drawing.round_part {
+            called_out.extend(rp.callout_faces());
+        }
+        super::hole_features::restate_hole_sites(&mut sites, hf, &called_out);
+    }
     if sites.is_empty() {
         // No cylindrical bores — no hole table.
         return;
@@ -2439,9 +2616,11 @@ fn layout_five_view(
     ie: super::types::ViewExtent,
     se: super::types::ViewExtent,
     angle: super::types::ProjectionAngle,
+    vgap: f64,
+    hgap: f64,
 ) -> (f64, [[f64; 2]; 5]) {
-    let column = five_view_column(sheet, fe, te, re, ie, se, angle);
-    let band = five_view_band(sheet, fe, te, re, ie, se, angle);
+    let column = five_view_column(sheet, fe, te, re, ie, se, angle, vgap, hgap);
+    let band = five_view_band(sheet, fe, te, re, ie, se, angle, vgap, hgap);
     if band.0 >= column.0 {
         band
     } else {
@@ -2462,6 +2641,8 @@ fn five_view_column(
     ie: super::types::ViewExtent,
     se: super::types::ViewExtent,
     angle: super::types::ProjectionAngle,
+    vgap: f64,
+    hgap: f64,
 ) -> (f64, [[f64; 2]; 5]) {
     let w = sheet.width();
     let h = sheet.height();
@@ -2470,8 +2651,6 @@ fn five_view_column(
 
     const PAD_LEFT: f64 = 22.0;
     const PAD_BOTTOM: f64 = 18.0;
-    const VGAP: f64 = 32.0;
-    const HGAP: f64 = 30.0;
 
     let avail_x0 = ml + PAD_LEFT;
     let avail_x1 = w - mr;
@@ -2501,8 +2680,8 @@ fn five_view_column(
 
     let unit_w = (left_w + mid_w + right_w).max(1e-6);
     let unit_h = core_h.max(sh).max(1e-6);
-    let s_w = (avail_w - 2.0 * HGAP) / unit_w;
-    let s_h = (avail_h - VGAP) / unit_h;
+    let s_w = (avail_w - 2.0 * hgap) / unit_w;
+    let s_h = (avail_h - vgap) / unit_h;
     let mut scale = 0.9 * s_w.min(s_h);
     if !scale.is_finite() || scale <= 0.0 {
         scale = 1.0;
@@ -2515,21 +2694,21 @@ fn five_view_column(
     let trh = core_top_h * scale;
     let brh = core_bot_h * scale;
     let shc = sh * scale;
-    let core_block_h = trh + VGAP + brh;
-    let g_w = lw + HGAP + mwc + HGAP + rwc;
+    let core_block_h = trh + vgap + brh;
+    let g_w = lw + hgap + mwc + hgap + rwc;
     let g_h = core_block_h.max(shc);
     let gx = avail_x0 + 0.5 * (avail_w - g_w);
     let gy = avail_y0 + 0.5 * (avail_h - g_h);
 
     let left_cx = gx + 0.5 * lw;
-    let mid_cx = gx + lw + HGAP + 0.5 * mwc;
-    let right_cx = gx + lw + HGAP + mwc + HGAP + 0.5 * rwc;
+    let mid_cx = gx + lw + hgap + 0.5 * mwc;
+    let right_cx = gx + lw + hgap + mwc + hgap + 0.5 * rwc;
     // The core block (Top/Iso over Front/Right) is centred vertically within
     // g_h; when Section is shorter than the core (the common case) g_h ==
     // core_block_h and this is a no-op offset.
     let core_y0 = gy + 0.5 * (g_h - core_block_h);
     let top_cy = core_y0 + 0.5 * trh;
-    let bot_cy = core_y0 + trh + VGAP + 0.5 * brh;
+    let bot_cy = core_y0 + trh + vgap + 0.5 * brh;
     let sec_cy = gy + 0.5 * g_h;
 
     let place = |cx: f64, cy: f64, e: super::types::ViewExtent| -> [f64; 2] {
@@ -2542,7 +2721,7 @@ fn five_view_column(
         // The 2×2 core (third angle: FRONT bottom-left, TOP top-left,
         // RIGHT bottom-centre, ISO top-centre), reflected through its own
         // centre for first angle; SECTION keeps its right column.
-        let core = (gx, core_y0, gx + lw + HGAP + mwc, core_y0 + core_block_h);
+        let core = (gx, core_y0, gx + lw + hgap + mwc, core_y0 + core_block_h);
         let c = |x: f64, y: f64| core_cell(angle, (x, y), core);
         let ((fx, fy), (tx, ty)) = (c(left_cx, bot_cy), c(left_cx, top_cy));
         let ((rx, ry), (ix, iy)) = (c(mid_cx, bot_cy), c(mid_cx, top_cy));
@@ -2580,6 +2759,8 @@ fn five_view_band(
     ie: super::types::ViewExtent,
     se: super::types::ViewExtent,
     angle: super::types::ProjectionAngle,
+    vgap: f64,
+    hgap: f64,
 ) -> (f64, [[f64; 2]; 5]) {
     let w = sheet.width();
     let h = sheet.height();
@@ -2588,8 +2769,6 @@ fn five_view_band(
 
     const PAD_LEFT: f64 = 22.0;
     const PAD_BOTTOM: f64 = 18.0;
-    const VGAP: f64 = 32.0;
-    const HGAP: f64 = 30.0;
     // Section-to-core gap: two view-label heights (LABEL_GAP standoff + the
     // label font, doubled for the label above the core and the label below
     // the band) plus a 2 mm margin — NOT the full `VGAP` dimension-band
@@ -2627,8 +2806,8 @@ fn five_view_band(
     // One HGAP between the two core columns; the section band, alone in its
     // own row, needs no horizontal gap partner. One VGAP (core-internal, top
     // row / bottom row) and one SGAP (core-to-band, see above).
-    let s_w = (avail_w - HGAP) / unit_w;
-    let s_h = (avail_h - VGAP - SGAP) / unit_h;
+    let s_w = (avail_w - hgap) / unit_w;
+    let s_h = (avail_h - vgap - SGAP) / unit_h;
     let mut scale = 0.9 * s_w.min(s_h);
     if !scale.is_finite() || scale <= 0.0 {
         scale = 1.0;
@@ -2641,9 +2820,9 @@ fn five_view_band(
     let brh = bot_h * scale;
     let swc = sw * scale;
     let shc = sh * scale;
-    let core_block_w = lw + HGAP + rwc;
+    let core_block_w = lw + hgap + rwc;
     let g_w = core_block_w.max(swc);
-    let g_h = shc + SGAP + trh + VGAP + brh;
+    let g_h = shc + SGAP + trh + vgap + brh;
     let gx = avail_x0 + 0.5 * (avail_w - g_w);
     let gy = avail_y0 + 0.5 * (avail_h - g_h);
 
@@ -2652,11 +2831,11 @@ fn five_view_band(
     // is a no-op offset.
     let core_x0 = gx + 0.5 * (g_w - core_block_w);
     let left_cx = core_x0 + 0.5 * lw;
-    let right_cx = core_x0 + lw + HGAP + 0.5 * rwc;
+    let right_cx = core_x0 + lw + hgap + 0.5 * rwc;
     let band_cx = gx + 0.5 * g_w;
     let band_cy = gy + 0.5 * shc;
     let top_cy = gy + shc + SGAP + 0.5 * trh;
-    let bot_cy = gy + shc + SGAP + trh + VGAP + 0.5 * brh;
+    let bot_cy = gy + shc + SGAP + trh + vgap + 0.5 * brh;
 
     let place = |cx: f64, cy: f64, e: super::types::ViewExtent| -> [f64; 2] {
         let xtl = cx - 0.5 * e.width() * scale;
@@ -2672,7 +2851,7 @@ fn five_view_band(
             core_x0,
             core_y0,
             core_x0 + core_block_w,
-            core_y0 + trh + VGAP + brh,
+            core_y0 + trh + vgap + brh,
         );
         let c = |x: f64, y: f64| core_cell(angle, (x, y), core);
         let ((fx, fy), (tx, ty)) = (c(left_cx, bot_cy), c(left_cx, top_cy));
@@ -2858,11 +3037,61 @@ fn choose_section_plane(
                 .count()
         };
         let hits = [plane_hits(candidates[0]), plane_hits(candidates[1])];
-        let chosen_axis = if hits[1] > hits[0] {
+        let mut chosen_axis = if hits[1] > hits[0] {
             candidates[1]
         } else {
             candidates[0]
         };
+
+        // Pass THROUGH a row of holes. The centroid of a group lands between
+        // its members whenever they are not symmetric about one of them -- a
+        // 2×2 grid's centroid is the gap in the middle, and SECTION A-A then
+        // showed solid plate and no hole at all. For each candidate normal,
+        // find the hole-centre coordinate that the most measured centres
+        // share (ties: the one nearest the centroid), and move the plane there
+        // only when it cuts more holes than the plane already chosen.
+        let centres: Vec<[f64; 3]> = drawing
+            .hole_sites
+            .iter()
+            .filter_map(|s| s.world_centre)
+            .collect();
+        if !centres.is_empty() {
+            let best_row = |axis: usize| -> (usize, f64) {
+                let n_c = centres.len() as f64;
+                let centroid = centres.iter().map(|c| c[axis]).sum::<f64>() / n_c;
+                let mut best = (0usize, origin[axis]);
+                let mut best_dist = f64::INFINITY;
+                for c in &centres {
+                    let coord = c[axis];
+                    let n = centres
+                        .iter()
+                        .filter(|o| (o[axis] - coord).abs() < 0.5)
+                        .count();
+                    let dist = (coord - centroid).abs();
+                    if n > best.0 || (n == best.0 && dist < best_dist - 1e-9) {
+                        best = (n, coord);
+                        best_dist = dist;
+                    }
+                }
+                best
+            };
+            let current = centres
+                .iter()
+                .filter(|c| (c[chosen_axis] - origin[chosen_axis]).abs() < 0.5)
+                .count();
+            let r0 = best_row(candidates[0]);
+            let r1 = best_row(candidates[1]);
+            let (axis, (n, coord)) = if r1.0 > r0.0 {
+                (candidates[1], r1)
+            } else {
+                (candidates[0], r0)
+            };
+            if n > current {
+                origin[axis] = coord;
+                chosen_axis = axis;
+            }
+        }
+
         return (
             Point3::new(origin[0], origin[1], origin[2]),
             world_axis(chosen_axis),
@@ -2975,6 +3204,25 @@ pub(crate) fn attach_section_view(
     };
 
     let rule = section_slot_rule(&drawing.sheet_size);
+    // The re-placement keeps the room the views' own dimension stacks need.
+    let (vgap, hgap) = {
+        let mut called_out = drawing
+            .round_part
+            .as_ref()
+            .map(|r| r.callout_faces())
+            .unwrap_or_default();
+        if let Some(h) = &drawing.hole_features {
+            called_out.extend(h.callout_faces());
+        }
+        let tabled: std::collections::HashSet<u32> = drawing
+            .hole_sites
+            .iter()
+            .flat_map(|h| h.face_entities.iter().copied())
+            .filter(|f| !called_out.contains(f))
+            .collect();
+        let n = drawing.views.len().min(3);
+        dimension_band_gaps(&drawing.views[..n], &tabled)
+    };
 
     // Compute the section view's position by running the layout solver with the
     // section extent in place of (or appended to) the ISO slot.  This guarantees
@@ -2997,13 +3245,15 @@ pub(crate) fn attach_section_view(
             let front_ext = drawing.views.first().map(|v| v.extent).unwrap_or_default();
             let top_ext = drawing.views.get(1).map(|v| v.extent).unwrap_or_default();
             let right_ext = drawing.views.get(2).map(|v| v.extent).unwrap_or_default();
-            let (s, pos) = layout_four_view(
+            let (s, pos) = layout_four_view_gap(
                 &drawing.sheet_size,
                 front_ext,
                 top_ext,
                 right_ext,
                 section_unit.extent, // ISO slot carries section extent
                 drawing.projection,
+                vgap,
+                hgap,
             );
             for (i, v) in drawing.views.iter_mut().take(3).enumerate() {
                 v.scale = s;
@@ -3027,6 +3277,8 @@ pub(crate) fn attach_section_view(
                 iso_ext,
                 section_unit.extent,
                 drawing.projection,
+                vgap,
+                hgap,
             );
             for (i, v) in drawing.views.iter_mut().take(4).enumerate() {
                 v.scale = s;

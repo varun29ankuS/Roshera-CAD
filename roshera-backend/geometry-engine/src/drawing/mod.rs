@@ -26,6 +26,7 @@
 pub mod centerlines;
 pub mod dimensioning;
 pub mod dxf;
+pub mod hole_features;
 pub mod hole_table;
 pub mod layout;
 pub mod pdf;

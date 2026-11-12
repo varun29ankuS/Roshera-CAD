@@ -519,7 +519,11 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
     // Key: (sorted entity ids, kind) → Vec<view_name>. Only for non-empty
     // entity lists (named features, not whole-part extents).
     {
-        let mut entity_key: HashMap<(Vec<u32>, String), Vec<String>> = HashMap::new();
+        // The measured DIRECTION joins the key: a feature's X and Y location
+        // (a hole pattern's first hole, an untabled bore's two offsets) are two
+        // dimensions of one feature, not one dimension inked twice.
+        type Key = (Vec<u32>, String, [i64; 3]);
+        let mut entity_key: HashMap<Key, Vec<String>> = HashMap::new();
         for v in &drawing.views {
             for d in &v.dimensions {
                 if d.entities.is_empty() {
@@ -536,13 +540,20 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
                 }
                 let mut sorted = d.entities.clone();
                 sorted.sort_unstable();
+                let qdir = d.dir3.map_or([0; 3], |v| {
+                    [
+                        (v[0].abs() * 100.0).round() as i64,
+                        (v[1].abs() * 100.0).round() as i64,
+                        (v[2].abs() * 100.0).round() as i64,
+                    ]
+                });
                 entity_key
-                    .entry((sorted, d.kind.clone()))
+                    .entry((sorted, d.kind.clone(), qdir))
                     .or_default()
                     .push(v.name.clone());
             }
         }
-        for ((_, kind), views) in &entity_key {
+        for ((_, kind, _), views) in &entity_key {
             if views.len() < 2 {
                 continue;
             }

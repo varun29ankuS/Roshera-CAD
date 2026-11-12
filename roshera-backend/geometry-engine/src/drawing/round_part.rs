@@ -60,6 +60,15 @@ pub struct BoltCircleCallout {
     pub hole_label: String,
     /// The pitch-circle callout as inked: `Ø60.00 PCD`.
     pub pcd_label: String,
+    /// The hole stack every member is (a counterbore, a countersink, a
+    /// blind hole …) when the holes are recognised stacks; the callout then
+    /// states the stack, and the live check re-measures it on every member.
+    #[serde(default)]
+    pub stack: Option<super::hole_features::HoleStack>,
+    /// Faces of the members' stacks beyond the drilled walls in
+    /// [`Self::holes`] (counterbore walls and floors, countersink cones).
+    #[serde(default)]
+    pub stack_faces: Vec<u32>,
 }
 
 /// What makes a part round, and the callouts that replace the plate
@@ -90,6 +99,7 @@ impl RoundPartCallouts {
             for h in &bc.holes {
                 s.extend(h.iter().copied());
             }
+            s.extend(bc.stack_faces.iter().copied());
         }
         s
     }
@@ -257,7 +267,22 @@ pub fn detect_round_part(
     solid_id: SolidId,
     records: &[DimensionRecord],
 ) -> Option<RoundPartCallouts> {
-    let walls = cylinder_walls(model, solid_id);
+    // A hole's coaxial stack has ONE owner: a counterbore wall is part of its
+    // hole, never a bolt circle of its own, and the bolt circle groups STACKS.
+    let stacks = super::hole_features::recognize_hole_stacks(model, solid_id);
+    let secondary: HashSet<u32> = stacks
+        .iter()
+        .flat_map(|s| s.entry_faces.iter().chain(&s.floor_faces).copied())
+        .collect();
+    let stack_of = |w: &Wall| -> Option<&super::hole_features::HoleStack> {
+        stacks
+            .iter()
+            .find(|s| w.faces.iter().any(|f| s.drill_faces.contains(f)))
+    };
+    let walls: Vec<Wall> = cylinder_walls(model, solid_id)
+        .into_iter()
+        .filter(|w| !w.faces.iter().all(|f| secondary.contains(f)))
+        .collect();
     let outer = walls.iter().filter(|w| !w.bore).max_by(|a, b| {
         a.radius
             .partial_cmp(&b.radius)
@@ -310,13 +335,20 @@ pub fn detect_round_part(
         }
     }
 
-    // Group off-axis bores by (hole radius, pitch radius).
+    // Group off-axis bores by (hole radius, pitch radius, hole stack).
     let mut groups: Vec<Vec<&Wall>> = Vec::new();
     for w in off_axis {
         let pitch = dist_to_line(w.origin, centre, axis);
+        let ws = stack_of(w);
         if let Some(g) = groups.iter_mut().find(|g| {
             let g0 = g[0];
-            (g0.radius - w.radius).abs() <= 1e3 * tol
+            let same_stack = match (stack_of(g0), ws) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.spec_mismatch(b, 1e3 * tol).is_none(),
+                _ => false,
+            };
+            same_stack
+                && (g0.radius - w.radius).abs() <= 1e3 * tol
                 && (dist_to_line(g0.origin, centre, axis) - pitch).abs() <= 1e3 * tol
         }) {
             g.push(w);
@@ -356,16 +388,30 @@ pub fn detect_round_part(
         let hole_d = 2.0 * g[0].radius;
         let pcd = 2.0 * dist_to_line(g[0].origin, centre, axis);
         let holes: Vec<Vec<u32>> = angles.iter().map(|(_, w)| w.faces.clone()).collect();
-        let depth = records
+        let stack = stack_of(g[0]).cloned();
+        let stack_faces: Vec<u32> = angles
             .iter()
-            .find(|d| d.kind == "length" && d.entities.iter().any(|e| holes[0].contains(e)))
-            .map(|d| d.value);
-        // THRU means nothing closes the hole -- no floor face (flat or drill
-        // point) inside its circle. Comparing the depth with the part's
-        // overall height is wrong on any part that is not a uniform plate: a
-        // raised-face flange is 14 tall, its bolt holes go through the 12 mm
-        // body, and that comparison called them blind.
-        let through = g.iter().all(|w| !hole_has_floor(model, solid_id, w));
+            .filter_map(|(_, w)| stack_of(w))
+            .flat_map(|s| s.entry_faces.iter().chain(&s.floor_faces).copied())
+            .collect();
+        let (depth, through) = match &stack {
+            // A recognised stack reads THRU / blind from topology.
+            Some(s) => (s.depth, s.through),
+            None => {
+                let depth = records
+                    .iter()
+                    .find(|d| d.kind == "length" && d.entities.iter().any(|e| holes[0].contains(e)))
+                    .map(|d| d.value);
+                // THRU means nothing closes the hole -- no floor face (flat or
+                // drill point) inside its circle. Comparing the depth with the
+                // part's overall height is wrong on any part that is not a
+                // uniform plate: a raised-face flange is 14 tall, its bolt
+                // holes go through the 12 mm body, and that comparison called
+                // them blind.
+                let through = g.iter().all(|w| !hole_has_floor(model, solid_id, w));
+                (depth, through)
+            }
+        };
         let start = angles[0].0;
         let on_centreline = (start / 90.0 - (start / 90.0).round()).abs() * 90.0 <= ANGLE_TOL_DEG;
         let depth_txt = if through {
@@ -376,11 +422,17 @@ pub fn detect_round_part(
                 None => String::new(),
             }
         };
-        let mut hole_label = format!("{n}\u{00D7} \u{00D8}{}", unit_fmt.format_len_bare(hole_d));
-        if !depth_txt.is_empty() {
-            hole_label.push(' ');
-            hole_label.push_str(&depth_txt);
-        }
+        let mut hole_label = match &stack {
+            Some(s) => format!("{n}\u{00D7} {}", s.label()),
+            None => {
+                let mut l = format!("{n}\u{00D7} \u{00D8}{}", unit_fmt.format_len_bare(hole_d));
+                if !depth_txt.is_empty() {
+                    l.push(' ');
+                    l.push_str(&depth_txt);
+                }
+                l
+            }
+        };
         hole_label.push_str(" EQ SP");
         if !on_centreline {
             hole_label.push_str(&format!(" (1ST AT {start:.1}\u{00B0})"));
@@ -395,6 +447,8 @@ pub fn detect_round_part(
             holes,
             hole_label,
             pcd_label: format!("\u{00D8}{} PCD", unit_fmt.format_len_bare(pcd)),
+            stack,
+            stack_faces,
         });
     }
 
@@ -425,6 +479,7 @@ pub fn apply_round_conventions(
         for h in &bc.holes {
             pattern.extend(h.iter().copied());
         }
+        pattern.extend(bc.stack_faces.iter().copied());
     }
     let touches =
         |d: &DimensionRecord, set: &HashSet<u32>| d.entities.iter().any(|e| set.contains(e));
@@ -466,7 +521,7 @@ pub fn apply_round_conventions(
     let Some(template) = template else {
         return out;
     };
-    let mut next = out.len();
+    let mut next = 0usize;
     for bc in &rp.bolt_circles {
         // The callout points at the RIGHT-MOST hole (ties: the LOWER one), so
         // its leader leaves up and to the right into the open sheet beside the
@@ -497,7 +552,7 @@ pub fn apply_round_conventions(
         // Its own kind: a pattern callout is drawn on a LEADER (the label is
         // far wider than one hole), never centred on the hole's span.
         out.push(DimensionRecord {
-            id: format!("d{next}"),
+            id: format!("rp{next}"),
             kind: "hole_callout".into(),
             value: bc.hole_diameter,
             unit: template.unit.clone(),
@@ -518,7 +573,7 @@ pub fn apply_round_conventions(
         // on the circle's extremes and the drawn length is the PCD.
         let pcd_dir = side;
         out.push(DimensionRecord {
-            id: format!("d{next}"),
+            id: format!("rp{next}"),
             // Its own kind: it names the same holes as the hole callout but
             // states their LOCATION, not their size -- not a duplicate.
             kind: "pcd".into(),
@@ -644,6 +699,26 @@ pub fn bolt_circle_live_check(
                 "the pattern has rotated: first hole at {first:.2}\u{00B0}, the sheet says {:.2}\u{00B0}",
                 bc.start_angle_deg
             ));
+        }
+    }
+    // The holes' stack (counterbore, countersink, blind floor), re-recognised
+    // on every member.
+    if let Some(sheet_stack) = &bc.stack {
+        let live = super::hole_features::recognize_hole_stacks(model, solid_id);
+        for (i, hole) in bc.holes.iter().enumerate() {
+            let Some(l) = live
+                .iter()
+                .find(|s| s.drill_faces.iter().any(|f| hole.contains(f)))
+            else {
+                return Some(format!(
+                    "hole {} is no longer a recognisable {} hole",
+                    i + 1,
+                    sheet_stack.label()
+                ));
+            };
+            if let Some(m) = sheet_stack.spec_mismatch(l, tol_mm) {
+                return Some(format!("hole {}: {m}", i + 1));
+            }
         }
     }
     if let Some(sheet_depth) = bc.depth {

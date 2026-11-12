@@ -347,6 +347,19 @@ scene while the model held all of them.
     across parts, balloons, "Create Assembly Drawing" on file/sub-assembly rows.
 37. **MERGE-1 Merge `wip/step-import` to main** — the full geometry-engine
     red-gate has passed on d1d27277; re-run it on the final head first.
+38. **BOOL-CONE-1 Box minus an overshooting cone leaves an unsound solid**
+    (found 2026-11-12 building countersink fixtures). A cone that pokes out
+    past either face of a plate leaves duplicate cone faces or an orientation
+    error; certification fails. Five constructions reproduce it: cone then
+    bore, bore then cone, and two pointed-cone variants. Only a cone cut flush
+    at both ends certifies, which is what `tests/drawing_hole_features.rs`
+    builds today. Real countersinks are modelled with an overshooting cone, so
+    this blocks countersinks the agent or an importer builds the normal way.
+39. **STEP-IMP-1 Real-world assembly import** (GrabCAD bench vice, 2026-11-11):
+    the main body ("Corp…") is missing from the import and 11 of the 13
+    imported parts are unsound (e.g. 635 open edges, 45 non-manifold on one
+    part). A Turkish-named STEP was refused outright over non-UTF-8 names
+    (fixed in 28a328f3). Robot arm and gear reducer not yet tried.
 
 ## Low (batched opportunistically, not scheduled)
 

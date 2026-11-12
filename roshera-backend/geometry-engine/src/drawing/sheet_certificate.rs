@@ -127,6 +127,13 @@ pub enum SheetFactKind {
     /// A round-part bolt-circle callout (`4× Ø11 THRU EQ SP` on `Ø60 PCD`):
     /// count, hole size, depth, pitch circle and spacing, re-measured.
     BoltCircle,
+    /// A recognised hole stack (`Ø6.60 THRU ⌴ Ø11.00 ↧ 6.80`): THRU / blind,
+    /// drill Ø, depth, counterbore / countersink sizes and angles, axis and
+    /// entry position, re-recognised and re-measured on the live model.
+    HoleStack,
+    /// A linear / rectangular hole-pattern callout (`4× Ø6.60 THRU`): every
+    /// member still the stated hole, at its first-member + pitch position.
+    HolePattern,
     /// A GD&T feature control frame block.
     Fcf,
     /// A GD&T datum feature symbol.
@@ -620,11 +627,51 @@ fn omitted_bore_facts(
     if live_bores.is_empty() {
         return Vec::new();
     }
-    let tabled: HashSet<u32> = drawing
+    // "Stated" means INKED. Bores a callout covers (bolt circle, coaxial bore,
+    // hole pattern) get no drawn table row -- their `hole_sites` entries stay
+    // as data underneath -- so for those faces only a callout DIMENSION that
+    // is actually on a view counts. A callout's face list is a claim about the
+    // sheet, not ink on it: trusting it certified a sheet that had lost its
+    // hole callout as complete.
+    let mut callout: HashSet<u32> = HashSet::new();
+    if let Some(rp) = &drawing.round_part {
+        callout.extend(rp.callout_faces());
+    }
+    if let Some(hf) = &drawing.hole_features {
+        callout.extend(hf.callout_faces());
+    }
+    let mut tabled: HashSet<u32> = drawing
         .hole_sites
         .iter()
+        .filter(|h| !h.face_entities.iter().any(|f| callout.contains(f)))
         .flat_map(|h| h.face_entities.iter().copied())
         .collect();
+    let inked_by_dimension: HashSet<u32> = drawing
+        .views
+        .iter()
+        .flat_map(|v| v.dimensions.iter())
+        .filter(|d| matches!(d.kind.as_str(), "diameter" | "hole_callout"))
+        .flat_map(|d| d.entities.iter().copied())
+        .collect();
+    tabled.extend(
+        callout
+            .iter()
+            .copied()
+            .filter(|f| inked_by_dimension.contains(f)),
+    );
+    if let Some(hf) = &drawing.hole_features {
+        // A counterbore wall is stated by its stack's row or callout, not a
+        // row of its own — but ONLY when that row or callout exists: a stack
+        // whose drilled wall is on no row and in no callout is omitted, all
+        // of it.
+        let stated: Vec<Vec<u32>> = hf
+            .stacks
+            .iter()
+            .filter(|s| s.drill_faces.iter().any(|f| tabled.contains(f)))
+            .map(|s| s.faces())
+            .collect();
+        tabled.extend(stated.into_iter().flatten());
+    }
 
     let mut out = Vec::new();
     for d in live_dims {
@@ -780,6 +827,73 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
                 unit: "mm".to_string(),
                 pid: None,
                 face_ids: bc.holes.iter().flatten().copied().collect(),
+                datum: None,
+                tolerance: None,
+                live: LiveCheck {
+                    measured: None,
+                    deviation: None,
+                    verdict: if finding.is_none() {
+                        SheetVerdict::Consistent
+                    } else {
+                        SheetVerdict::Stale
+                    },
+                    detail: finding,
+                },
+            });
+        }
+    }
+
+    // ── Hole stacks and patterns ──────────────────────────────────────────────
+    // Every stack is a claim whether a table row or a pattern callout inks it:
+    // its counterbore depth, countersink angle, THRU-ness and position are on
+    // the sheet, so each is re-recognised and re-measured on the live model.
+    if let (Some(hf), Some(solid)) = (&drawing.hole_features, solid_id) {
+        for st in &hf.stacks {
+            let finding =
+                super::hole_features::hole_stack_live_check(model, solid, st, CERT_DIM_ORACLE_MM);
+            facts.push(SheetFact {
+                kind: SheetFactKind::HoleStack,
+                owner_view: drawing.axial_view_idx,
+                label: st.label(),
+                value: Some(st.diameter),
+                unit: "mm".to_string(),
+                pid: None,
+                face_ids: st.faces(),
+                datum: None,
+                tolerance: None,
+                live: LiveCheck {
+                    measured: None,
+                    deviation: None,
+                    verdict: if finding.is_none() {
+                        SheetVerdict::Consistent
+                    } else {
+                        SheetVerdict::Stale
+                    },
+                    detail: finding,
+                },
+            });
+        }
+        for p in &hf.patterns {
+            let finding = super::hole_features::hole_pattern_live_check(
+                model,
+                solid,
+                hf,
+                p,
+                CERT_DIM_ORACLE_MM,
+            );
+            facts.push(SheetFact {
+                kind: SheetFactKind::HolePattern,
+                owner_view: drawing.axial_view_idx,
+                label: p.label.clone(),
+                value: Some(p.members.len() as f64),
+                unit: String::new(),
+                pid: None,
+                face_ids: p
+                    .members
+                    .iter()
+                    .filter_map(|&i| hf.stacks.get(i))
+                    .flat_map(|s| s.faces())
+                    .collect(),
                 datum: None,
                 tolerance: None,
                 live: LiveCheck {
@@ -1539,13 +1653,16 @@ mod tests {
         let mut part = sid(TopologyBuilder::new(&mut m)
             .create_box_3d(40.0, 40.0, 20.0)
             .expect("plate"));
-        for (i, x) in [-10.0_f64, 10.0].into_iter().enumerate() {
+        // Two DIFFERENT bores (Ø10, Ø8): two identical bores are a 2× pattern,
+        // stated by one callout rather than table rows, and this fixture
+        // exists to exercise the hole-table omission walk.
+        for (i, (x, r)) in [(-10.0_f64, 5.0_f64), (10.0, 4.0)].into_iter().enumerate() {
             // One event key per drilling: two booleans under a SHARED key mint
             // the same PID for two different result faces and the kernel's own
             // `assign_boolean_face_pids` invariant refuses the pass.
             m.set_event_key(Some(format!("twin-bore-{i}")));
             let bore = sid(TopologyBuilder::new(&mut m)
-                .create_cylinder_3d(Point3::new(x, 0.0, -20.0), Vector3::Z, 5.0, 80.0)
+                .create_cylinder_3d(Point3::new(x, 0.0, -20.0), Vector3::Z, r, 80.0)
                 .expect("bore"));
             part = boolean_operation(
                 &mut m,
