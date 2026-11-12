@@ -52,6 +52,7 @@ import {
   renameDrawing,
 } from '@/lib/drawings-api'
 import { useDocumentStore } from '@/stores/document-store'
+import { HISTORY_CHANGED_EVENT } from '@/lib/history'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 
 // CSS pixels per millimetre at the standard 96 DPI mapping. At zoom
@@ -316,6 +317,17 @@ export function DrawingsWorkspace() {
   // after load, which can finish AFTER this panel first listed sheets) must
   // reload the sheet list and the parts: otherwise the panel shows the
   // previous document's sheets and loading them fails (409).
+  // Undo / redo rewinds the history; the server rebuilds the sheets from it.
+  // Reload what this window shows.
+  useEffect(() => {
+    const onHistory = () => {
+      void refreshList(activeId ?? undefined)
+      if (activeId) void refreshActive(activeId)
+    }
+    window.addEventListener(HISTORY_CHANGED_EVENT, onHistory)
+    return () => window.removeEventListener(HISTORY_CHANGED_EVENT, onHistory)
+  }, [activeId, refreshList, refreshActive])
+
   const documentEpoch = useDocumentStore((st) => st.epoch)
   const firstEpoch = useRef(documentEpoch)
   useEffect(() => {

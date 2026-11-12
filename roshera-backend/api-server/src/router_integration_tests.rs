@@ -11296,6 +11296,63 @@ async fn selecting_a_dimension_finds_its_driver_and_the_edit_reuses_it() {
     assert_eq!(third["cached"], false, "a new history is searched afresh");
 }
 
+/// Undo puts a removed view back: the sheet is rebuilt from the history at
+/// the undone position. Before, undo/redo rewound the history but never
+/// rebuilt the sheets -- the view stayed gone.
+#[tokio::test]
+async fn undoing_a_view_removal_brings_the_view_back() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (_, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let iso = sheet["views"]
+        .as_array()
+        .and_then(|vs| vs.iter().find(|v| v["name"] == "ISOMETRIC"))
+        .and_then(|v| v["id"].as_str())
+        .expect("an ISOMETRIC view")
+        .to_string();
+    let (rs, removed) = dispatch(
+        &state,
+        crate::durability_boot_tests::del(&format!("/api/drawings/{drawing_id}/views/{iso}")),
+    )
+    .await;
+    assert!(rs.is_success(), "remove view: {removed}");
+    let has_iso = |sheet: &serde_json::Value| {
+        sheet["views"]
+            .as_array()
+            .is_some_and(|vs| vs.iter().any(|v| v["name"] == "ISOMETRIC"))
+    };
+    let (_, after_remove) =
+        dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert!(!has_iso(&after_remove), "the view is removed");
+
+    let _ = state.timeline_recorder.settle().await;
+    let session = crate::handlers::timeline::live_session_id(&timeline_engine::BranchId::main());
+    let (us, undone) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/undo",
+            json!({ "session_id": session.to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(us, StatusCode::OK, "{undone}");
+    assert_ne!(undone["success"], false, "{undone}");
+    let (_, after_undo) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert!(has_iso(&after_undo), "undo brings the ISOMETRIC view back");
+}
+
 /// A dimension nothing on the timeline drives is refused as reference-only,
 /// never "edited" by scaling or approximation.
 #[tokio::test]

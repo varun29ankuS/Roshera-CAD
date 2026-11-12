@@ -461,8 +461,20 @@ async fn replay_undo_redo(
     }
     let outcome = commit_prepared_replay(state, &mut model_guard, prepared).await;
     drop(model_guard);
-    // The live model was replaced: show it in every open viewport.
+    // The live model was replaced: show it in every open viewport, and
+    // rebuild the sheets from the history at the new position (an undone
+    // "remove view" brings the view back).
     crate::broadcast_scene_sync(state).await;
+    let events = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .unwrap_or_default();
+        all.sort_by_key(|e| e.sequence_number);
+        all.truncate(limit as usize);
+        all
+    };
+    crate::drawing_mgr::rebuild_sheets_from_history(state, events).await;
     Ok(outcome)
 }
 

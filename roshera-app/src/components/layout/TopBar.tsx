@@ -25,49 +25,11 @@ import { getDocumentUnit } from '@/lib/units-api'
 import { newDocument } from '@/lib/documents-api'
 import { runNewProject } from '@/lib/new-project'
 import { useDocumentStore } from '@/stores/document-store'
-import { refusalMessage, tryReadJson } from '@/lib/backend-refusal'
 import { UnitSelector } from '@/components/layout/UnitSelector'
+import { timelineAction } from '@/lib/history'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
-async function timelineAction(action: 'undo' | 'redo') {
-  // Backend `undo_operation` / `redo_operation` 400 without a
-  // `session_id` in the JSON body. Pull the live one from the WS
-  // store (seeded by the `Welcome` frame in `ws-bridge.ts`); if it
-  // hasn't arrived yet there is no session to undo against, so
-  // silently no-op rather than hit the backend with a malformed body.
-  const sessionId = useWSStore.getState().sessionId
-  if (!sessionId) return
-  try {
-    const resp = await fetch(`${API_BASE}/api/timeline/${action}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId }),
-    })
-    // Same defect class as `exportGeometry` below: a menubar click that
-    // silently does nothing reads as "the button is broken", not "the
-    // request failed" — post to the Blackboard so it's visible.
-    const body = await tryReadJson(resp)
-    const label = action === 'undo' ? 'Undo' : 'Redo'
-    if (!resp.ok) {
-      console.error(`[TopBar] ${action} failed:`, resp.status, body)
-      useBlackboardStore.getState().addLine(`${label} failed: ${refusalMessage(body, resp.status)}`, 'system')
-      return
-    }
-    // `undo_operation` / `redo_operation` answer HTTP 200 with
-    // `{ success: false, message }` for expected refusals (nothing to
-    // undo, session not found) — see `Timeline.tsx`'s undo/redo handler,
-    // which this mirrors. A bare `!resp.ok` check misses this shape.
-    if (body && body.success === false) {
-      useBlackboardStore.getState().addLine(`${label}: ${refusalMessage(body, resp.status)}`, 'system')
-    }
-  } catch (err) {
-    console.error(`[TopBar] ${action} threw:`, err)
-    useBlackboardStore
-      .getState()
-      .addLine(`${action === 'undo' ? 'Undo' : 'Redo'} failed: backend unreachable.`, 'system')
-  }
-}
 
 // Two-step export (POST /api/export → GET /api/download/:filename) is
 // implemented in `lib/export-api.ts` and shared with the ToolBar Export

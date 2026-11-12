@@ -22,6 +22,7 @@ import { useKeyboardShortcuts } from '@/lib/shortcuts'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
+import { installUndoRedoShortcuts } from '@/lib/history'
 import { installBackendBlackboard } from '@/lib/blackboard-api'
 import { establishAcpSession } from '@/lib/acp-blackboard'
 import { ViewportBridge } from '@/lib/viewport-bridge'
@@ -80,6 +81,12 @@ export function App() {
       initWebSocket()
       return () => teardownWebSocket()
     }
+  }, [route])
+
+  // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y, in every workspace.
+  useEffect(() => {
+    if (route !== 'workspace') return
+    return installUndoRedoShortcuts()
   }, [route])
 
   // Start the agent session when the workspace mounts, rather than

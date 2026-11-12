@@ -20,18 +20,17 @@
  *   input so the user can immediately keep typing after a wrong nav.
  */
 
+import { timelineAction } from '@/lib/history'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Search } from 'lucide-react'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import { useDocModeStore, type DocumentMode } from '@/stores/doc-mode-store'
 import { useSceneStore, CAMERA_PRESETS } from '@/stores/scene-store'
-import { useWSStore } from '@/stores/ws-store'
 import { useThemeStore } from '@/stores/theme-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { exportSceneAs } from '@/lib/export-api'
 import { newDocument } from '@/lib/documents-api'
 import { runNewProject } from '@/lib/new-project'
-import { refusalMessage, tryReadJson } from '@/lib/backend-refusal'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
@@ -92,46 +91,6 @@ function rank(cmd: Command, query: string): number {
   return Math.max(labelScore, groupScore, keywordScore)
 }
 
-// ── Side-effect helpers (mirrors of TopBar's local handlers) ────────
-//
-// Duplicating the bodies here is deliberate: TopBar's `timelineAction`
-// is a module-local closure over `useWSStore.getState()`; importing it
-// would mean exporting it, which would bloat TopBar's public surface
-// for one consumer. The bodies are 6 lines each.
-
-async function timelineAction(action: 'undo' | 'redo'): Promise<void> {
-  const sessionId = useWSStore.getState().sessionId
-  if (!sessionId) return
-  try {
-    const resp = await fetch(`${API_BASE}/api/timeline/${action}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId }),
-    })
-    // A palette command that silently does nothing on failure reads as
-    // "the command is broken" — post to the Blackboard, same convention
-    // as `runExport` below.
-    const body = await tryReadJson(resp)
-    const label = action === 'undo' ? 'Undo' : 'Redo'
-    if (!resp.ok) {
-      console.error(`[command-palette] ${action} failed:`, resp.status, body)
-      useBlackboardStore.getState().addLine(`${label} failed: ${refusalMessage(body, resp.status)}`, 'system')
-      return
-    }
-    // `undo_operation` / `redo_operation` answer HTTP 200 with
-    // `{ success: false, message }` for expected refusals — see
-    // `Timeline.tsx`'s undo/redo handler, which this mirrors. A bare
-    // `!resp.ok` check misses this shape.
-    if (body && body.success === false) {
-      useBlackboardStore.getState().addLine(`${label}: ${refusalMessage(body, resp.status)}`, 'system')
-    }
-  } catch (err) {
-    console.error(`[command-palette] ${action} threw:`, err)
-    useBlackboardStore
-      .getState()
-      .addLine(`${action === 'undo' ? 'Undo' : 'Redo'} failed: backend unreachable.`, 'system')
-  }
-}
 
 async function runExport(format: string): Promise<void> {
   const { addLine } = useBlackboardStore.getState()
