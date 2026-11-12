@@ -1,53 +1,12 @@
 import { useEffect } from 'react'
 import { invalidate } from '@react-three/fiber'
 import { useSceneStore } from '@/stores/scene-store'
-import { useWSStore } from '@/stores/ws-store'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
-import { useActionErrorStore } from '@/stores/action-error-store'
-import { tryReadJson, refusalMessage } from '@/lib/backend-refusal'
+import { timelineAction } from '@/lib/history'
 import * as THREE from 'three'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
-async function timelineAction(action: 'undo' | 'redo') {
-  // Backend `undo_operation` / `redo_operation` require a `session_id`
-  // in the JSON body — without it they 400 and the keyboard shortcut
-  // appears to do nothing. Pull the live session id from the WS store
-  // (populated by `Welcome` / `SessionUpdate` frames) and POST it.
-  const sessionId = useWSStore.getState().sessionId
-  if (!sessionId) return
-  const label = action === 'undo' ? 'Undo' : 'Redo'
-  // This runs outside any component tree (a document keydown handler),
-  // so the plain vanilla-store accessor (mirroring `useWSStore.getState()`
-  // above) is used instead of the `useActionErrorStore()` hook. Mirrors
-  // the exact refusal semantics of the Timeline.tsx toolbar buttons:
-  // undo/redo answer expected refusals ("nothing to undo") as HTTP 200
-  // with `{ success: false, message }` — see
-  // `handlers/timeline.rs::undo_operation` / `redo_operation` — while
-  // malformed input comes back as a bare non-2xx with no body.
-  const flashActionError = useActionErrorStore.getState().flash
-  try {
-    const resp = await fetch(`${API_BASE}/api/timeline/${action}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId }),
-    })
-    const body = await tryReadJson(resp)
-    if (!resp.ok) {
-      flashActionError(`${label} failed: ${refusalMessage(body, resp.status)}`)
-      return
-    }
-    if (body && body.success === false) {
-      flashActionError(`${label}: ${refusalMessage(body, resp.status)}`)
-      return
-    }
-    if (body && body.model_reconciled === false) {
-      flashActionError(`${label} applied, but the 3D model may be stale (reconciliation failed)`)
-    }
-  } catch {
-    flashActionError(`Backend unreachable — ${action} not applied`)
-  }
-}
 
 function focusSelected() {
   const state = useSceneStore.getState()
@@ -117,7 +76,7 @@ export function useKeyboardShortcuts() {
       // here for the keys it claims and let its window listener run.
       if (state.sketch.active) {
         const k = e.key.toLowerCase()
-        if (k === 'z' && ctrl) return
+        if ((k === 'z' || k === 'y') && ctrl) return
       }
 
       switch (e.key.toLowerCase()) {
@@ -126,10 +85,18 @@ export function useKeyboardShortcuts() {
           if (ctrl) {
             e.preventDefault()
             if (e.shiftKey) {
-              timelineAction('redo')
+              void timelineAction('redo')
             } else {
-              timelineAction('undo')
+              void timelineAction('undo')
             }
+          }
+          break
+
+        // Redo (the Windows convention, beside Ctrl+Shift+Z)
+        case 'y':
+          if (ctrl && !e.shiftKey) {
+            e.preventDefault()
+            void timelineAction('redo')
           }
           break
 
