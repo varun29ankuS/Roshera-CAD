@@ -55,7 +55,12 @@ function answerLine(a: any): string {
       } else if (a.designation) {
         tol = `fit ${a.designation} (numeric envelope not resolved — no fabricated limits)`;
       } else if (a.tolerance_source === "general") {
-        tol = `general ±${a.general_pm_mm}${a.general_standard ? ` (${a.general_standard})` : ""}`;
+        // Under an ISO 2768 class the value is by size; null = the standard
+        // assigns none at this size (below 0.5 mm / above 4000 mm).
+        const std = a.general_standard ? ` (${a.general_standard})` : "";
+        tol = a.general_pm_mm != null
+          ? `general ±${a.general_pm_mm}${std}`
+          : `general${std}: the standard assigns no value at this size`;
       } else {
         tol = "no tolerance";
       }
@@ -148,6 +153,36 @@ export function registerDrawingTools(server: ToolHost): void {
       try {
         const r = await api("PATCH", `/api/drawings/${drawing_id}/projection`, { projection });
         return ok({ drawing_id, projection: r?.projection ?? projection, quality: r?.quality ?? null });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ── drawing_set_title ──────────────────────────────────────────────────
+  server.tool(
+    "drawing_set_title",
+    "Fill the sheet's ISO 7200 title fields: a SHORT title (<= 30 chars), the " +
+      "detail as supplementary_title, the material (named, e.g. 'S275' -- the " +
+      "kernel then measures MASS), creator, document type, revision. Approval " +
+      "is a person's act: the sheet stays FOR REVIEW until a person approves it " +
+      "in the app. Returns the ISO 7200 gaps that remain.",
+    {
+      drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
+      title: z.string().max(30).optional().describe("short title, <= 30 characters"),
+      supplementary_title: z.string().optional().describe("detail that does not fit the title"),
+      material: z.string().optional().describe("named material, e.g. 'S275', 'Aluminium 6061-T6'"),
+      drawn_by: z.string().optional().describe("creator"),
+      document_type: z.string().optional().describe("e.g. 'PART DRAWING'"),
+      revision: z.string().max(2).optional().describe("revision index, <= 2 chars; never I or O"),
+    },
+    async ({ drawing_id, title, ...fields }) => {
+      try {
+        if (title !== undefined) {
+          await api("PATCH", `/api/drawings/${drawing_id}/rename`, { name: title });
+        }
+        const tb = await api("PATCH", `/api/drawings/${drawing_id}/title-block`, fields);
+        return ok({ drawing_id, title_block: tb ?? null });
       } catch (e) {
         return fail(e);
       }

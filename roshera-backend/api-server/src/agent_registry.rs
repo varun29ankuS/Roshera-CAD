@@ -1449,6 +1449,26 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "drawing_set_title",
+            Drawing,
+            Experimental,
+            Curated,
+            "Fill the sheet's ISO 7200 title fields (title, supplementary title, material, creator, document type, revision); approval stays a person's act.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "title": {"type": "string", "maxLength": 30, "description": "short title, <= 30 characters"},
+                    "supplementary_title": {"type": "string", "description": "detail that does not fit the title"},
+                    "material": {"type": "string", "description": "named material, e.g. 'S275', 'Aluminium 6061-T6'"},
+                    "drawn_by": {"type": "string", "description": "creator"},
+                    "document_type": {"type": "string", "description": "e.g. 'PART DRAWING'"},
+                    "revision": {"type": "string", "maxLength": 2, "description": "revision index, <= 2 chars; never I or O"}
+                },
+                "required": ["drawing_id"]
+            }),
+        ),
+        t(
             "drawing_read_semantics",
             Drawing,
             Experimental,
@@ -2216,7 +2236,8 @@ mod tests {
         // schemas are transcribed verbatim from what `describe_tool` serves,
         // which is the compiled zod contract and therefore the wire truth.
         // 109 -> 111 (2026-11-11): drawing_set_dimension + drawing_set_projection.
-        assert_eq!(tools.len(), 111, "expected 111 tools, got {}", tools.len());
+        // 111 -> 112 (2026-11-12): drawing_set_title.
+        assert_eq!(tools.len(), 112, "expected 112 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

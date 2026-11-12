@@ -43,7 +43,6 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     let w = drawing.sheet_size.width();
     let h = drawing.sheet_size.height();
     let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
-    let (tb_w, tb_h) = title_block_size(&drawing.sheet_size);
 
     let frame_x = ml;
     let frame_y = mt;
@@ -119,10 +118,8 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     // Routed through layout so text-collision invariants cover them.
     render_notes_from_layout(&mut out, &layout);
 
-    // Title block in the bottom-right corner of the frame.
-    let tb_x = frame_x + frame_w - tb_w;
-    let tb_y = frame_y + frame_h - tb_h;
-    render_title_block(&mut out, drawing, tb_x, tb_y, tb_w, tb_h);
+    // Title block in the bottom-right corner of the frame, from its cell model.
+    render_title_block(&mut out, drawing);
 
     // Third-angle projection symbol — inked from the ProjectionSymbol layout item.
     render_projection_symbol_from_layout(&mut out, &layout, drawing.projection);
@@ -134,6 +131,12 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     // The drawing is passed through to access `fcf_blocks[].leader_to` for
     // leader-line rendering (Task 6 fix wave: concern 2).
     render_gdt_annotations(&mut out, drawing, &layout);
+
+    // FOR REVIEW across the drawing area until a person approves the sheet.
+    // Inked LAST: the views paint opaque backgrounds, so a watermark under
+    // them showed as broken fragments. Faint enough that the drawing reads
+    // through it.
+    render_review_watermark(&mut out, drawing, frame_x, frame_y, frame_w, frame_h);
 
     out.push_str("</svg>\n");
     out
@@ -224,6 +227,13 @@ fn write_stylesheet(out: &mut String) {
          letter-spacing: 0.08px; }\n",
     );
     out.push_str("    .field-value { font: 500 3.6px sans-serif; fill: #111; }\n");
+    out.push_str("    .field-value-strong { font: 800 3.6px sans-serif; fill: #111; }\n");
+    out.push_str("    .title-sub { font: 500 3px sans-serif; fill: #333; text-anchor: middle; }\n");
+    // Review watermark: faint, so the drawing reads through it.
+    out.push_str(
+        "    .watermark { font: 800 40px sans-serif; fill: #000; fill-opacity: 0.05; \
+         text-anchor: middle; letter-spacing: 2px; }\n",
+    );
     out.push_str(
         "    .field-value-mono { font: 700 3.6px 'Consolas', 'Menlo', monospace; \
          fill: #111; }\n",
@@ -1031,336 +1041,149 @@ fn render_notes_from_layout(out: &mut String, layout: &SheetLayout) {
         );
     }
 }
-
 // ---------------------------------------------------------------------
 // Title block
 // ---------------------------------------------------------------------
 
-/// Render the three-column title block.
-///
-/// Layout — only two rows per column, so each cell is tall enough that
-/// labels and values never crowd each other:
-///
-/// ```text
-///   ┌──────────┬─────────────────────────────────┬──────────────────┐
-///   │          │  TITLE  (drawing name)          │  DRAWING NO.     │
-///   │   LOGO   │                                 │     (headline)   │
-///   │          ├──────────┬──────────┬───────────┼────────┬─────────┤
-///   │  ROSHERA │ DRAWN BY │   DATE   │ MATERIAL  │ SCALE  │  SIZE   │
-///   │  + mark  │          │          │           ├────────┼─────────┤
-///   │          │          │          │           │ SHEET  │   REV   │
-///   └──────────┴──────────┴──────────┴───────────┴────────┴─────────┘
-/// ```
-fn render_title_block(out: &mut String, drawing: &Drawing, x: f64, y: f64, w: f64, h: f64) {
-    let logo_w = (w * 0.18).clamp(28.0, 48.0);
-    let right_w = (w * 0.24).clamp(42.0, 60.0);
-    let mid_w = (w - logo_w - right_w).max(60.0);
-
-    let mid_x = x + logo_w;
-    let right_x = mid_x + mid_w;
-
+/// Ink the title block from its cell model ([`super::title_block`]): the
+/// same rects the DXF inks and the layout reads, so the three can no longer
+/// drift apart.
+fn render_title_block(out: &mut String, drawing: &Drawing) {
+    let tb = super::title_block::title_block_layout(drawing);
+    let o = tb.outer;
     out.push_str("  <g class=\"title-block\">\n");
-
-    // Outer rectangle (heavy).
-    let _ = write!(
+    for c in &tb.cells {
+        let r = c.rect;
+        let _ = writeln!(
+            out,
+            "    <rect class=\"titleblock-inner\" x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" />",
+            r.x0,
+            r.y0,
+            r.width(),
+            r.height()
+        );
+    }
+    let l = tb.logo;
+    let _ = writeln!(
         out,
-        "    <rect class=\"titleblock\" x=\"{x:.3}\" y=\"{y:.3}\" \
-         width=\"{w:.3}\" height=\"{h:.3}\" />\n"
+        "    <rect class=\"titleblock-inner\" x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" />",
+        l.x0,
+        l.y0,
+        l.width(),
+        l.height()
     );
-
-    // Column dividers (heavy).
-    let _ = write!(
+    // The outer border is heavy, and so is the line under the band: the band
+    // is its own block (tolerances, projection, scale), set on the record.
+    let _ = writeln!(
         out,
-        "    <line class=\"titleblock\" x1=\"{mid_x:.3}\" y1=\"{y:.3}\" \
-         x2=\"{mid_x:.3}\" y2=\"{:.3}\" />\n",
-        y + h
+        "    <rect class=\"titleblock\" x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" />",
+        o.x0,
+        o.y0,
+        o.width(),
+        o.height()
     );
-    let _ = write!(
-        out,
-        "    <line class=\"titleblock\" x1=\"{right_x:.3}\" y1=\"{y:.3}\" \
-         x2=\"{right_x:.3}\" y2=\"{:.3}\" />\n",
-        y + h
-    );
+    if let Some(band) = tb.cell("scale") {
+        let _ = writeln!(
+            out,
+            "    <line class=\"titleblock\" x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\" />",
+            o.x0, band.rect.y1, o.x1, band.rect.y1
+        );
+    }
 
-    // -------- Logo column --------
-    render_roshera_logo(out, x, y, logo_w, h);
+    render_roshera_logo(out, l.x0, l.y0, l.width(), l.height());
 
-    // -------- Middle column --------
-    render_middle_column(out, drawing, mid_x, y, mid_w, h);
-
-    // -------- Right column --------
-    render_right_column(out, drawing, right_x, y, right_w, h);
-
+    for c in &tb.cells {
+        let lb = c.label_box();
+        let _ = writeln!(
+            out,
+            "    <text class=\"field-label\" x=\"{:.3}\" y=\"{:.3}\">{}</text>",
+            lb.x0,
+            lb.y1,
+            escape_xml(c.label)
+        );
+        let class = match c.style {
+            super::title_block::CellStyle::Field => "field-value",
+            super::title_block::CellStyle::Strong => "field-value-strong",
+            super::title_block::CellStyle::Headline => "title-value",
+            super::title_block::CellStyle::Mono => "drwg-number",
+        };
+        let _ = writeln!(
+            out,
+            "    <text class=\"{class}\" x=\"{:.3}\" y=\"{:.3}\" style=\"font-size:{:.2}px\">{}</text>",
+            c.value_x,
+            c.value_baseline,
+            c.value_font_mm,
+            escape_xml(&c.value)
+        );
+        if let Some(sub) = &c.sub {
+            let _ = writeln!(
+                out,
+                "    <text class=\"title-sub\" x=\"{:.3}\" y=\"{:.3}\" style=\"font-size:{:.2}px\">{}</text>",
+                sub.x,
+                sub.baseline,
+                sub.font_mm,
+                escape_xml(&sub.text)
+            );
+        }
+    }
     out.push_str("  </g>\n");
 }
 
-fn render_middle_column(out: &mut String, drawing: &Drawing, x: f64, y: f64, w: f64, h: f64) {
-    // Two bands only — keeping cells few and tall is what makes the
-    // block read as an engineering drawing rather than a spreadsheet:
-    //   * TITLE band (55% of h): label tucked top-left, drawing name
-    //     centred as a headline. Cell is tall enough that the headline
-    //     never crowds the label.
-    //   * IDENTIFICATION band (45% of h): three equal cells —
-    //     DRAWN BY, DATE, MATERIAL. Approved/checked/finish/tolerance
-    //     are out-of-band metadata for an in-progress drawing and just
-    //     add visual noise on the sheet.
-    let title_h = h * 0.55;
-    let id_h = h - title_h;
-    let title_bot = y + title_h;
-
-    // Row separator across the middle column.
-    let _ = write!(
-        out,
-        "    <line class=\"titleblock-inner\" x1=\"{x:.3}\" y1=\"{title_bot:.3}\" \
-         x2=\"{:.3}\" y2=\"{title_bot:.3}\" />\n",
-        x + w
-    );
-
-    // -- TITLE band --
-    let _ = write!(
-        out,
-        "    <text class=\"field-label\" x=\"{:.3}\" y=\"{:.3}\">TITLE</text>\n",
-        x + 2.0,
-        y + 3.2
-    );
-    // Headline baseline sits roughly 65% down the band: label clears
-    // the top edge, descender clears the row divider.
-    // The headline is set at 7 mm (`.title-value`). A long name steps the
-    // font down to fit its cell, and is truncated only below the legible
-    // floor -- measured at the size it is actually drawn, so it can never run
-    // over the logo or the drawing number beside it.
-    let (title, title_font) = fit_to_width(
-        &drawing.name,
-        w - 6.0,
-        TITLE_FONT_PX,
-        TITLE_MIN_FONT_PX,
-        0.62,
-    );
-    let _ = write!(
-        out,
-        "    <text class=\"title-value\" x=\"{:.3}\" y=\"{:.3}\" \
-         style=\"font-size:{title_font:.2}px\">{}</text>\n",
-        x + w * 0.5,
-        y + title_h * 0.70,
-        escape_xml(&title)
-    );
-
-    // -- IDENTIFICATION band: DRAWN BY | DATE | MATERIAL --
-    let tb = &drawing.title_block;
-    let drawn_by = display_or_dash(&tb.drawn_by);
-    let date = display_or_dash(&tb.date);
-    let material = display_or_dash(&tb.material);
-    let id_cells = [
-        ("DRAWN BY", drawn_by.as_str()),
-        ("DATE", date.as_str()),
-        ("MATERIAL", material.as_str()),
-    ];
-    let cell_w = w / id_cells.len() as f64;
-    for (i, (label, value)) in id_cells.iter().enumerate() {
-        let cx = x + cell_w * i as f64;
-        if i > 0 {
-            let _ = write!(
-                out,
-                "    <line class=\"titleblock-inner\" x1=\"{cx:.3}\" y1=\"{title_bot:.3}\" \
-                 x2=\"{cx:.3}\" y2=\"{:.3}\" />\n",
-                y + h
-            );
-        }
-        render_cell(out, cx, title_bot, id_h, label, value);
+/// An unapproved sheet carries its status across the drawing area, the way a
+/// released-for-review print is marked (ISO 7200 document status). Faint, and
+/// under every other ink.
+fn render_review_watermark(
+    out: &mut String,
+    drawing: &Drawing,
+    fx: f64,
+    fy: f64,
+    fw: f64,
+    fh: f64,
+) {
+    if super::title_block::status(drawing) != "FOR REVIEW" {
+        return;
     }
-}
-
-fn render_right_column(out: &mut String, drawing: &Drawing, x: f64, y: f64, w: f64, h: f64) {
-    // Two bands:
-    //   * DRAWING NO. band (55% of h) — number reads as a headline.
-    //   * 2×2 grid (45% of h) — SCALE | SIZE on top, SHEET | REV
-    //     beneath. Four small cells of equal height instead of three
-    //     cramped rows.
-    let dwg_h = h * 0.55;
-    let grid_h = h - dwg_h;
-    let cell_h = grid_h * 0.5;
-
-    let dwg_bot = y + dwg_h;
-    let grid_mid = dwg_bot + cell_h;
-    let col_mid = x + w * 0.5;
-
-    // Horizontal separators.
-    let _ = write!(
+    let cx = fx + 0.5 * fw;
+    let cy = fy + 0.5 * fh;
+    let font = (fw.min(fh) * 0.16).max(12.0);
+    let _ = writeln!(
         out,
-        "    <line class=\"titleblock-inner\" x1=\"{x:.3}\" y1=\"{dwg_bot:.3}\" \
-         x2=\"{:.3}\" y2=\"{dwg_bot:.3}\" />\n",
-        x + w
+        "  <text class=\"watermark\" x=\"{cx:.3}\" y=\"{cy:.3}\" style=\"font-size:{font:.2}px\" \
+         transform=\"rotate(-28 {cx:.3} {cy:.3})\">FOR REVIEW</text>"
     );
-    let _ = write!(
-        out,
-        "    <line class=\"titleblock-inner\" x1=\"{x:.3}\" y1=\"{grid_mid:.3}\" \
-         x2=\"{:.3}\" y2=\"{grid_mid:.3}\" />\n",
-        x + w
-    );
-    // Vertical mid-line across the 2×2 grid.
-    let _ = write!(
-        out,
-        "    <line class=\"titleblock-inner\" x1=\"{col_mid:.3}\" y1=\"{dwg_bot:.3}\" \
-         x2=\"{col_mid:.3}\" y2=\"{:.3}\" />\n",
-        y + h
-    );
-
-    // -- DRAWING NO. headline --
-    let _ = write!(
-        out,
-        "    <text class=\"field-label\" x=\"{:.3}\" y=\"{:.3}\">DRAWING NO.</text>\n",
-        x + 2.0,
-        y + 3.2
-    );
-    let drwg_no = drawing
-        .title_block
-        .drawing_number
-        .as_ref()
-        .filter(|s| !s.trim().is_empty())
-        .cloned()
-        .unwrap_or_else(|| short_drawing_id(drawing));
-    // Monospace at 5.4 mm (`.drwg-number`): every glyph is ~0.6 em wide.
-    let (drwg_no, drwg_font) =
-        fit_to_width(&drwg_no, w - 4.0, DRWG_NO_FONT_PX, DRWG_NO_MIN_FONT_PX, 0.6);
-    let _ = write!(
-        out,
-        "    <text class=\"drwg-number\" x=\"{:.3}\" y=\"{:.3}\" \
-         style=\"font-size:{drwg_font:.2}px\">{}</text>\n",
-        x + w * 0.5,
-        y + dwg_h * 0.72,
-        escape_xml(&drwg_no)
-    );
-
-    // -- 2×2 grid --
-    let scale_label = drawing
-        .views
-        .first()
-        .map(|v| format_scale(v.scale))
-        .unwrap_or_else(|| "1:1".to_string());
-    render_cell(out, x, dwg_bot, cell_h, "SCALE", &scale_label);
-    render_cell(
-        out,
-        col_mid,
-        dwg_bot,
-        cell_h,
-        "SIZE",
-        &drawing.sheet_size.label(),
-    );
-    let tb = &drawing.title_block;
-    let sheet_label = format!(
-        "{} OF {}",
-        tb.sheet_index.max(1),
-        tb.sheet_count.max(tb.sheet_index.max(1))
-    );
-    let rev_label = display_or_dash(&tb.revision);
-    render_cell(out, x, grid_mid, cell_h, "SHEET", &sheet_label);
-    render_cell(out, col_mid, grid_mid, cell_h, "REV", &rev_label);
-}
-
-/// Render one labelled cell. The label sits at the top-left in a small
-/// engineering-drawing-style annotation; the value sits in the lower
-/// half of the cell with explicit padding so the two never crowd each
-/// other regardless of cell height.
-fn render_cell(out: &mut String, x: f64, y: f64, h: f64, label: &str, value: &str) {
-    let _ = write!(
-        out,
-        "    <text class=\"field-label\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
-        x + 1.8,
-        y + 2.8,
-        escape_xml(label),
-    );
-    // Value baseline ~70% down the cell — clear of label, clear of the
-    // bottom border.
-    let _ = write!(
-        out,
-        "    <text class=\"field-value\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
-        x + 1.8,
-        y + h * 0.78,
-        escape_xml(value),
-    );
-}
-
-/// Crude width-fit: if `text` would visually exceed `max_width_mm` at
-/// the given font size, truncate with an ellipsis. The heuristic
-/// assumes ~0.55 of the font size per glyph for proportional sans
-/// and ~0.62 for monospace — close enough for engineering text where
-/// titles and drawing numbers are short.
-/// Title headline size (`.title-value`) and the smallest it may step down to.
-const TITLE_FONT_PX: f64 = 7.0;
-const TITLE_MIN_FONT_PX: f64 = 3.5;
-/// Drawing-number size (`.drwg-number`) and its floor.
-const DRWG_NO_FONT_PX: f64 = 5.4;
-const DRWG_NO_MIN_FONT_PX: f64 = 3.0;
-
-/// Fit `text` into `max_width_mm` at the font it is actually drawn in: keep
-/// `font_px` when it fits, else step the font down (never below `min_px`),
-/// and only then truncate with an ellipsis. `glyph_em` is the average glyph
-/// advance as a fraction of the font size (~0.62 for bold sans, 0.6 mono).
-fn fit_to_width(
-    text: &str,
-    max_width_mm: f64,
-    font_px: f64,
-    min_px: f64,
-    glyph_em: f64,
-) -> (String, f64) {
-    let chars = text.chars().count().max(1) as f64;
-    if chars * font_px * glyph_em <= max_width_mm {
-        return (text.to_string(), font_px);
-    }
-    let fitted = max_width_mm / (chars * glyph_em);
-    if fitted >= min_px {
-        return (text.to_string(), fitted);
-    }
-    let max_chars = (max_width_mm / (min_px * glyph_em)).floor() as usize;
-    let mut clipped: String = text.chars().take(max_chars.saturating_sub(1)).collect();
-    clipped.push('\u{2026}');
-    (clipped, min_px)
 }
 
 // ---------------------------------------------------------------------
 // Roshera logo (pure SVG, no embedded raster)
 // ---------------------------------------------------------------------
 
-/// Render the Roshera mark + wordmark inside the logo cell.
-///
-/// Composition (top-down):
-///   * a solid square plate containing a white "R" — the mark,
-///   * "ROSHERA" wordmark below in bold uppercase with letter-spacing,
-///   * "PRECISION CAD" tagline in a smaller uppercase weight.
+/// The owner's mark in the logo cell: a solid square with a white "R", and
+/// the wordmark under it, both sized to the cell.
 fn render_roshera_logo(out: &mut String, x: f64, y: f64, w: f64, h: f64) {
     let cx = x + w * 0.5;
-
-    // Mark: a filled rounded square with a white "R" centered inside.
-    let mark_side = (h * 0.36).min(w * 0.42).max(5.0);
+    let mark_side = (h * 0.46).min(w * 0.5).max(4.0);
     let mark_x = cx - mark_side * 0.5;
     let mark_y = y + h * 0.10;
-    let _ = write!(
+    let _ = writeln!(
         out,
-        "    <rect class=\"logo-mark-fill\" x=\"{:.3}\" y=\"{:.3}\" \
-         width=\"{:.3}\" height=\"{:.3}\" rx=\"0.8\" />\n",
+        "    <rect class=\"logo-mark-fill\" x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" rx=\"0.8\" />",
         mark_x, mark_y, mark_side, mark_side
     );
-    let _ = write!(
+    let _ = writeln!(
         out,
-        "    <text class=\"logo-mark-r\" x=\"{:.3}\" y=\"{:.3}\" \
-         style=\"font-size: {:.3}px\">R</text>\n",
+        "    <text class=\"logo-mark-r\" x=\"{:.3}\" y=\"{:.3}\" style=\"font-size: {:.3}px\">R</text>",
         cx,
         mark_y + mark_side * 0.54,
         mark_side * 0.72
     );
-
-    // Wordmark.
-    let word_y = y + h * 0.66;
-    let _ = write!(
+    // "ROSHERA": 7 glyphs at ~0.72 em plus 0.15 em letter-spacing each.
+    let word_font = ((w - 5.0) / (7.0 * 1.0)).min(3.6).max(1.6);
+    let word_y = (y + h * 0.10 + mark_side + word_font * 1.25).min(y + h - 0.8);
+    let _ = writeln!(
         out,
-        "    <text class=\"logo-wordmark\" x=\"{cx:.3}\" y=\"{word_y:.3}\">ROSHERA</text>\n"
-    );
-
-    // Tagline.
-    let tag_y = y + h * 0.84;
-    let _ = write!(
-        out,
-        "    <text class=\"logo-tagline\" x=\"{cx:.3}\" y=\"{tag_y:.3}\">PRECISION CAD</text>\n"
+        "    <text class=\"logo-wordmark\" x=\"{cx:.3}\" y=\"{word_y:.3}\" \
+         style=\"font-size:{word_font:.2}px; letter-spacing:{:.2}px\">ROSHERA</text>",
+        word_font * 0.15
     );
 }
 
@@ -1571,12 +1394,6 @@ fn render_projection_symbol_from_layout(
 // Misc helpers
 // ---------------------------------------------------------------------
 
-fn short_drawing_id(drawing: &Drawing) -> String {
-    let id = drawing.id.0.to_string();
-    let prefix: String = id.chars().take(8).collect();
-    format!("RSH-{}", prefix.to_uppercase())
-}
-
 pub(crate) fn format_scale(scale: f64) -> String {
     if scale >= 1.0 {
         format!("{:.0}:1", scale)
@@ -1584,16 +1401,6 @@ pub(crate) fn format_scale(scale: f64) -> String {
         format!("1:{:.0}", 1.0 / scale)
     } else {
         "?".to_string()
-    }
-}
-
-/// Title-block helper: empty/whitespace-only strings render as an em
-/// dash so the cell never appears visually blank.
-fn display_or_dash(value: &str) -> String {
-    if value.trim().is_empty() {
-        "—".to_string()
-    } else {
-        value.to_string()
     }
 }
 

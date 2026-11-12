@@ -695,7 +695,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     // title block (near the SCALE/SIZE cells). This is a bbox item so the
     // verifier can assert its presence; the renderer inks it from the item.
     // tb_x0 / tb_y0 are already computed above.
-    let proj_sym_item = place_projection_symbol(tb_x0, tb_y0, tb_w, tb_h);
+    let proj_sym_item = place_projection_symbol(drawing);
     items.push(proj_sym_item);
 
     // ── Cutting-plane "A" label items (Task 9) ────────────────────────
@@ -871,39 +871,14 @@ pub(crate) fn place_note_items(
 
 /// Place the projection symbol (first or third angle) as a `ProjectionSymbol` layout item.
 ///
-/// The symbol (a truncated-cone two-view glyph per ISO 128-30) is drawn in the
-/// right column of the title block between the DRAWING NO. headline and the 2×2
-/// grid. The bbox covers the glyph area so the verifier can assert its presence.
-pub(crate) fn place_projection_symbol(tb_x: f64, tb_y: f64, tb_w: f64, tb_h: f64) -> SheetItem {
-    // Right column occupies the right 24% of the title block (mirrors svg.rs).
-    let right_w = (tb_w * 0.24).clamp(42.0, 60.0);
-    let right_x = tb_x + tb_w - right_w;
-
-    // Drawing-number headline: 55% of tb_h.
-    let dwg_h = tb_h * 0.55;
-    let grid_h = tb_h - dwg_h;
-    let cell_h = grid_h * 0.5;
-    // The symbol lives INSIDE the SCALE cell (left half of the SCALE|SIZE
-    // row), right-aligned against the column divider. The previous placement
-    // centred it on the divider itself, which planted the glyph across the
-    // SIZE cell and over its value text ("A4"). Right-aligning inside SCALE
-    // keeps it clear of BOTH cells' text: the SCALE label/value hug the
-    // cell's left edge (`render_cell` inks at x + 1.8), the symbol hugs the
-    // right, and the divider bounds it away from the SIZE cell entirely.
-    let col_mid = right_x + right_w * 0.5;
-    let sym_w = 11.0_f64.min(right_w * 0.5 - 4.0);
-    let sym_h = 6.5_f64.min(cell_h * 0.7);
-    let sym_cx = col_mid - 1.5 - sym_w * 0.5;
-    let sym_cy = tb_y + dwg_h + cell_h * 0.5;
-
+/// The rect is the title-block cell model's own: the symbol sits inside the
+/// PROJECTION cell, right-aligned, clear of that cell's label and value. It
+/// used to be computed here from a second copy of the title-block ratios, and
+/// the copies drifted until the glyph covered the SCALE label.
+pub(crate) fn place_projection_symbol(drawing: &Drawing) -> SheetItem {
     SheetItem {
         kind: SheetItemKind::ProjectionSymbol,
-        bbox: Rect2 {
-            x0: sym_cx - sym_w * 0.5,
-            y0: sym_cy - sym_h * 0.5,
-            x1: sym_cx + sym_w * 0.5,
-            y1: sym_cy + sym_h * 0.5,
-        },
+        bbox: super::title_block::title_block_layout(drawing).symbol,
         owner_view: None,
         text: None,
     }

@@ -224,6 +224,7 @@ const EXPERIMENTAL = new Set<string>([
   "drawing_query",
   "drawing_set_dimension",
   "drawing_set_projection",
+  "drawing_set_title",
   "dfm_check",
   "kb_lookup",
 ]);
@@ -324,6 +325,7 @@ const BENCH_OF: Record<string, Bench> = {
   drawing_export_sheet: "drawing",
   drawing_set_dimension: "drawing",
   drawing_set_projection: "drawing",
+  drawing_set_title: "drawing",
   dimension_part: "drawing",
   gdt_datum: "drawing",
   gdt_fcf: "drawing",

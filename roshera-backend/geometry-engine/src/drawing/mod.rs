@@ -37,6 +37,7 @@ pub mod section_comprehension;
 pub mod section_view;
 pub mod sheet_certificate;
 pub mod svg;
+pub mod title_block;
 pub mod types;
 pub mod verify;
 pub mod visibility;

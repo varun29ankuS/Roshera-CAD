@@ -1938,42 +1938,45 @@ fn ring_plate_datum_marker_at_table_origin() {
     assert!(svg.contains(">0,0<"), "datum origin label '0,0' inked");
 }
 
-/// (E) — the projection symbol stays inside the SCALE cell, clear of the
-/// SIZE cell and its value text.
+/// (E) — the projection symbol stays inside its own cell, clear of every
+/// other cell and of all title-block text.
 ///
-/// A4 title-block geometry (pinned literals, derived from
-/// `title_block_size(A4) = (170, 42)` and `frame_margins(A4) = (15,10,10,10)`
-/// on the 297×210 sheet): title block x ∈ [117, 287], y ∈ [158, 200]; right
-/// column width clamp(170·0.24, 42, 60) = 42 → x ∈ [245, 287]; the SCALE|SIZE
-/// divider sits at 245 + 21 = 266 and the SIZE value text ("A4") is inked
-/// from x = 267.8. Pre-fix the symbol was CENTRED on the divider
-/// (bbox 258..274) — across the SIZE text.
+/// History: the symbol was first CENTRED on the SCALE|SIZE divider (across
+/// the SIZE value "A4"), then tucked into the SCALE cell -- where it landed on
+/// the SCALE label, because its placement and the cell grid were two copies
+/// of the same ratios. The title block is now one cell model
+/// (`drawing::title_block`) and the symbol has a PROJECTION cell of its own;
+/// this asserts against that model instead of pinned literals.
 #[test]
 fn projection_symbol_clear_of_size_cell() {
     let (m, part) = ring_plate();
     let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
-    assert!(
-        matches!(dwg.sheet_size, SheetSize::A4),
-        "fixture must land on A4 for the pinned title-block literals"
-    );
     let layout = compute_layout(&dwg);
     let sym = layout
         .items
         .iter()
         .find(|it| it.kind == SheetItemKind::ProjectionSymbol)
-        .expect("projection symbol item");
-    const COL_DIVIDER_X: f64 = 266.0;
+        .expect("projection symbol item")
+        .bbox;
+    let tb = geometry_engine::drawing::title_block::title_block_layout(&dwg);
+    let own = tb.cell("projection").expect("projection cell").rect;
     assert!(
-        sym.bbox.x1 <= COL_DIVIDER_X - 0.5,
-        "symbol must stay inside the SCALE cell (left of the divider at \
-         x={COL_DIVIDER_X}); bbox x1 = {:.2}",
-        sym.bbox.x1
+        sym.x0 >= own.x0 && sym.x1 <= own.x1 && sym.y0 >= own.y0 && sym.y1 <= own.y1,
+        "symbol {sym:?} must sit inside its PROJECTION cell {own:?}"
     );
+    let size = tb.cell("size").expect("size cell");
     assert!(
-        sym.bbox.x0 >= 245.0,
-        "symbol must stay inside the right column; bbox x0 = {:.2}",
-        sym.bbox.x0
+        !sym.intersects(&size.rect, 0.0),
+        "symbol {sym:?} must stay clear of the SIZE cell {:?}",
+        size.rect
     );
+    for c in &tb.cells {
+        assert!(
+            !sym.intersects(&c.label_box(), 0.0) && !sym.intersects(&c.value_box(), 0.0),
+            "symbol {sym:?} covers the text of '{}'",
+            c.key
+        );
+    }
 }
 
 /// (G) — COVERAGE: the hole-table region × DimensionText pair fires

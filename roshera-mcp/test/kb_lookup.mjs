@@ -434,7 +434,9 @@ console.log("(2) TIER 2: playbook chunks + tool_sequence resolve against the tab
     rib: 173,
     gusset: 143,
     bearing_seat: 189,
-    flange: 174,
+    // 174 -> 372 (0d42fc2f, 2026-11-11): SPEC FIRST -- type, facing, size and
+    // class are established (or asked) before any geometry.
+    flange: 372,
     bolt_pattern: 190,
     snap_fit: 206,
   };

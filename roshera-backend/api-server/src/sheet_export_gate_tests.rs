@@ -1116,3 +1116,68 @@ async fn an_omitted_bore_is_refused_with_a_refusal_that_names_the_omission() {
         );
     }
 }
+
+// =====================================================================
+// 6. The title block states the LIVE certificate and mass (production path)
+// =====================================================================
+
+/// GET a route and return the raw body as text (the sheet routes return SVG
+/// / DXF / PDF bytes, which `dispatch` would read as JSON and drop).
+async fn get_text(state: &AppState, uri: &str) -> (StatusCode, String) {
+    use tower::ServiceExt;
+    let response = crate::build_router(state.clone())
+        .oneshot(get(uri))
+        .await
+        .expect("router must produce a response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body must read");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The disconnection gate for the title block's render-time facts: every
+/// sheet route a client is handed bytes from computes them against the live
+/// model. Without the wiring in `drawing_mgr::with_render_facts`, the kernel
+/// inks `UNVERIFIED` and a dash for MASS -- the capability built and wired to
+/// nothing.
+#[tokio::test]
+async fn sheet_routes_ink_a_fresh_certificate_stamp_and_the_measured_mass() {
+    let state = make_test_state().await;
+    let drawing_id = sound_passing_drawing(&state).await;
+
+    // The date of issue is stamped at creation, ISO 8601.
+    let (status, body) = dispatch(
+        &state,
+        crate::durability_boot_tests::patch(
+            &format!("/api/drawings/{drawing_id}/title-block"),
+            json!({ "material": "S275 structural steel" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "title-block PATCH must 200; body = {body}"
+    );
+    let date = body["date"].as_str().unwrap_or_default().to_string();
+    assert_eq!(date.len(), 10, "date of issue stamped at creation: {body}");
+    assert_eq!(&date[4..5], "-");
+
+    for (label, route) in [
+        ("svg", format!("/api/drawings/{drawing_id}/svg")),
+        ("dxf", format!("/api/drawings/{drawing_id}/dxf")),
+    ] {
+        let (status, text) = get_text(&state, &route).await;
+        assert_eq!(status, StatusCode::OK, "{label} export must 200");
+        assert!(
+            text.contains("SOUND ") && !text.contains("UNVERIFIED"),
+            "{label}: the VERIFIED cell must state the live certificate"
+        );
+        // 10 x 10 x 10 mm box of S275 at 7850 kg/m³ = 7.85 g.
+        assert!(
+            text.contains("7.8 g") || text.contains("7.9 g"),
+            "{label}: mass 7.85 g inked"
+        );
+    }
+}

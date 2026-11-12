@@ -983,16 +983,20 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
         facts.push(SheetFact {
             kind: SheetFactKind::Note,
             owner_view: None,
-            label: format!(
-                "general tolerance \u{00B1}{:.3} mm ({})",
-                drawing.general_tolerance.linear_mm,
-                if drawing.general_tolerance.standard.is_empty() {
-                    "no ISO class"
-                } else {
-                    drawing.general_tolerance.standard.as_str()
-                }
-            ),
-            value: Some(drawing.general_tolerance.linear_mm),
+            // A class is stated as the class: its values depend on size, so
+            // the fact carries no single number. Without a class, the flat
+            // value is the claim.
+            label: match drawing.general_tolerance.iso_2768_class() {
+                Some(_) => format!("general tolerance {}", drawing.general_tolerance.standard),
+                None => format!(
+                    "general tolerance \u{00B1}{:.3} mm (no ISO class)",
+                    drawing.general_tolerance.linear_mm
+                ),
+            },
+            value: match drawing.general_tolerance.iso_2768_class() {
+                Some(_) => None,
+                None => Some(drawing.general_tolerance.linear_mm),
+            },
             unit: "mm".to_string(),
             pid: None,
             face_ids: Vec::new(),

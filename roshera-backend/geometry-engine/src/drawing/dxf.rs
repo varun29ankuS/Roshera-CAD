@@ -239,29 +239,6 @@ fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
     }
 }
 
-/// Mirror of `svg.rs::title_block_size`. Kept in sync manually — both
-/// renderers must agree on the sheet template or SVG/PDF and DXF
-/// drift apart. A single shared helper would be ideal; the SVG file
-/// keeps the canonical version private today, so we duplicate
-/// here and rely on the test in `tests::title_block_dimensions_match`
-/// to catch drift.
-fn title_block_size(sheet: &SheetSize) -> (f64, f64) {
-    match sheet {
-        SheetSize::A4 => (170.0, 42.0),
-        SheetSize::A3 => (185.0, 48.0),
-        SheetSize::A2 => (200.0, 54.0),
-        SheetSize::A1 => (215.0, 60.0),
-        SheetSize::A0 => (230.0, 68.0),
-        SheetSize::Custom { width, height } => {
-            let w = *width;
-            let h = *height;
-            let bw = (w * 0.44).clamp(160.0, 240.0).min(w - 30.0).max(130.0);
-            let bh = (h * 0.13).clamp(40.0, 70.0).min(h - 30.0).max(38.0);
-            (bw, bh)
-        }
-    }
-}
-
 /// Emit every polyline in a view as an LWPOLYLINE on the view's
 /// layer. The DXF +Y-up convention matches engineering drawings —
 /// no Y-flip needed.
@@ -702,192 +679,140 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
     }
 }
 
-/// Emit the three-column title block as LINE + TEXT entities on
-/// LAYER_TITLEBLOCK / LAYER_TITLEBLOCK_TEXT.
+/// Emit the title block from its cell model ([`super::title_block`]) -- the
+/// same cells the SVG inks -- as LINE + TEXT entities on LAYER_TITLEBLOCK /
+/// LAYER_TITLEBLOCK_TEXT. The model is laid out y-down in sheet millimetres;
+/// DXF is y-up, so every y is flipped against the sheet height.
 fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
-    let sheet = &drawing.sheet_size;
-    let (_ml, mr, _mt, mb) = frame_margins(sheet);
-    let (tb_w, tb_h) = title_block_size(sheet);
-    // Title block sits in the bottom-right corner of the inner frame.
-    let frame_right = sheet.width() - mr;
-    let x0 = frame_right - tb_w;
-    let y0 = mb;
-    let x1 = frame_right;
-    let y1 = mb + tb_h;
+    use super::title_block::{title_block_layout, CellStyle};
+    let sheet_h = drawing.sheet_size.height();
+    let fy = |y: f64| sheet_h - y;
+    let tb = title_block_layout(drawing);
+    let rect = |dxf: &mut DxfDrawing, r: &super::layout::Rect2| {
+        add_rect(dxf, LAYER_TITLEBLOCK, r.x0, fy(r.y1), r.x1, fy(r.y0));
+    };
+    rect(dxf, &tb.outer);
+    rect(dxf, &tb.logo);
+    for c in &tb.cells {
+        rect(dxf, &c.rect);
+    }
+    // The owner's mark: the wordmark centred in the logo cell (DXF has no
+    // fills; the SVG's solid square mark is a raster-free nicety).
+    let l = tb.logo;
+    let word = (l.width() - 2.0).min(3.2) / (7.0 * 0.75);
+    add_text(
+        dxf,
+        LAYER_TITLEBLOCK_TEXT,
+        0.5 * (l.x0 + l.x1),
+        fy(l.y0 + 0.6 * l.height()),
+        (word * 7.0 * 0.75).clamp(1.8, 3.2),
+        0.0,
+        "ROSHERA",
+        HorizontalTextJustification::Center,
+    );
 
-    // Outer rectangle of the title block.
-    add_rect(dxf, LAYER_TITLEBLOCK, x0, y0, x1, y1);
+    for c in &tb.cells {
+        let lb = c.label_box();
+        add_text(
+            dxf,
+            LAYER_TITLEBLOCK_TEXT,
+            lb.x0,
+            fy(lb.y1),
+            super::title_block::LABEL_FONT_MM,
+            0.0,
+            c.label,
+            HorizontalTextJustification::Left,
+        );
+        // ASCII dash: DXF text is more portable without the em dash glyph.
+        let value = c.value.replace('\u{2014}', "-");
+        let justify = match c.style {
+            CellStyle::Headline | CellStyle::Mono => HorizontalTextJustification::Center,
+            CellStyle::Field | CellStyle::Strong => HorizontalTextJustification::Left,
+        };
+        add_text(
+            dxf,
+            LAYER_TITLEBLOCK_TEXT,
+            c.value_x,
+            fy(c.value_baseline),
+            c.value_font_mm,
+            0.0,
+            &value,
+            justify,
+        );
+        if let Some(sub) = &c.sub {
+            add_text(
+                dxf,
+                LAYER_TITLEBLOCK_TEXT,
+                sub.x,
+                fy(sub.baseline),
+                sub.font_mm,
+                0.0,
+                &sub.text,
+                HorizontalTextJustification::Center,
+            );
+        }
+    }
 
-    // Column layout: same ratios as the SVG renderer.
-    let logo_w = (tb_w * 0.18).clamp(28.0, 48.0);
-    let right_w = (tb_w * 0.24).clamp(42.0, 60.0);
-    let mid_w = (tb_w - logo_w - right_w).max(60.0);
-    let mid_x = x0 + logo_w;
-    let right_x = mid_x + mid_w;
-    add_line(dxf, LAYER_TITLEBLOCK, mid_x, y0, mid_x, y1);
-    add_line(dxf, LAYER_TITLEBLOCK, right_x, y0, right_x, y1);
-
-    // Middle column: TITLE band + identification band.
-    let title_h = tb_h * 0.55;
-    let title_top = y0 + title_h; // remember +Y is up
+    // The projection symbol, drawn in its cell: the truncated cone's front
+    // view (trapezoid) and its end view (two circles), oriented for the
+    // sheet's projection angle exactly as the SVG draws it.
+    let s = tb.symbol;
+    let (cx, cy) = (0.5 * (s.x0 + s.x1), 0.5 * (s.y0 + s.y1));
+    let (sw, sh) = (s.width(), s.height());
+    let gap = sw * 0.05;
+    let trap_x1 = cx - gap;
+    let trap_x0 = trap_x1 - sw * 0.45;
+    let (big, small) = (sh * 0.4, sh * 0.2);
+    let (left_half, right_half) = match drawing.projection {
+        super::types::ProjectionAngle::Third => (big, small),
+        super::types::ProjectionAngle::First => (small, big),
+    };
     add_line(
         dxf,
         LAYER_TITLEBLOCK,
-        mid_x,
-        title_top,
-        mid_x + mid_w,
-        title_top,
+        trap_x0,
+        fy(cy - left_half),
+        trap_x1,
+        fy(cy - right_half),
     );
-    // Title text — large, centred.
-    add_text(
+    add_line(
         dxf,
-        LAYER_TITLEBLOCK_TEXT,
-        mid_x + mid_w * 0.5,
-        title_top + (tb_h - title_h) * 0.50,
-        6.5,
-        0.0,
-        &drawing.name,
-        HorizontalTextJustification::Center,
+        LAYER_TITLEBLOCK,
+        trap_x1,
+        fy(cy - right_half),
+        trap_x1,
+        fy(cy + right_half),
     );
-    // Field label at the top-left of the title cell.
-    add_text(
+    add_line(
         dxf,
-        LAYER_TITLEBLOCK_TEXT,
-        mid_x + 2.0,
-        y1 - 3.6,
-        2.4,
-        0.0,
-        "TITLE",
-        HorizontalTextJustification::Left,
+        LAYER_TITLEBLOCK,
+        trap_x1,
+        fy(cy + right_half),
+        trap_x0,
+        fy(cy + left_half),
     );
-
-    // Identification cells: DRAWN BY | DATE | MATERIAL.
-    let id_h = tb_h - title_h;
-    let tb = &drawing.title_block;
-    let drawn_by = display_or_dash(&tb.drawn_by);
-    let date = display_or_dash(&tb.date);
-    let material = display_or_dash(&tb.material);
-    let id_cells = [
-        ("DRAWN BY", drawn_by.as_str()),
-        ("DATE", date.as_str()),
-        ("MATERIAL", material.as_str()),
-    ];
-    let cell_w = mid_w / id_cells.len() as f64;
-    for (i, (label, value)) in id_cells.iter().enumerate() {
-        let cx = mid_x + cell_w * i as f64;
-        if i > 0 {
-            add_line(dxf, LAYER_TITLEBLOCK, cx, y0, cx, title_top);
-        }
-        add_text(
-            dxf,
-            LAYER_TITLEBLOCK_TEXT,
-            cx + 1.8,
-            y0 + id_h - 2.8,
-            2.4,
-            0.0,
-            label,
-            HorizontalTextJustification::Left,
-        );
-        add_text(
-            dxf,
-            LAYER_TITLEBLOCK_TEXT,
-            cx + 1.8,
-            y0 + id_h * 0.30,
-            3.6,
-            0.0,
-            value,
-            HorizontalTextJustification::Left,
-        );
+    add_line(
+        dxf,
+        LAYER_TITLEBLOCK,
+        trap_x0,
+        fy(cy + left_half),
+        trap_x0,
+        fy(cy - left_half),
+    );
+    let circ_cx = cx + gap + sw * 0.225;
+    for r in [sh * 0.38, sh * 0.15] {
+        let circle = Circle {
+            center: Point::new(circ_cx, fy(cy), 0.0),
+            radius: r,
+            normal: Vector::z_axis(),
+            ..Circle::default()
+        };
+        let mut common = EntityCommon::default();
+        common.layer = LAYER_TITLEBLOCK.to_string();
+        let mut ent = Entity::new(EntityType::Circle(circle));
+        ent.common = common;
+        dxf.add_entity(ent);
     }
-
-    // Right column: DRAWING NO. headline + 2x2 grid.
-    let dwg_h = tb_h * 0.55;
-    let dwg_top = y0 + dwg_h;
-    add_line(dxf, LAYER_TITLEBLOCK, right_x, dwg_top, x1, dwg_top);
-    add_text(
-        dxf,
-        LAYER_TITLEBLOCK_TEXT,
-        right_x + 2.0,
-        y1 - 3.6,
-        2.4,
-        0.0,
-        "DRAWING NO.",
-        HorizontalTextJustification::Left,
-    );
-    let drwg_no = drawing
-        .title_block
-        .drawing_number
-        .as_ref()
-        .filter(|s| !s.trim().is_empty())
-        .cloned()
-        .unwrap_or_else(|| short_drawing_id(drawing));
-    add_text(
-        dxf,
-        LAYER_TITLEBLOCK_TEXT,
-        right_x + right_w * 0.5,
-        dwg_top + (tb_h - dwg_h) * 0.45,
-        5.4,
-        0.0,
-        &drwg_no,
-        HorizontalTextJustification::Center,
-    );
-
-    // 2x2 grid: SCALE | SIZE / SHEET | REV.
-    let cell_h = (tb_h - dwg_h) * 0.5;
-    let grid_mid = y0 + cell_h;
-    let col_mid = right_x + right_w * 0.5;
-    add_line(dxf, LAYER_TITLEBLOCK, right_x, grid_mid, x1, grid_mid);
-    add_line(dxf, LAYER_TITLEBLOCK, col_mid, y0, col_mid, dwg_top);
-
-    let scale_label = drawing
-        .views
-        .first()
-        .map(|v| format_scale(v.scale))
-        .unwrap_or_else(|| "1:1".to_string());
-    emit_grid_cell(dxf, right_x, grid_mid, cell_h, "SCALE", &scale_label);
-    emit_grid_cell(dxf, col_mid, grid_mid, cell_h, "SIZE", &sheet.label());
-    let sheet_label = format!(
-        "{} OF {}",
-        tb.sheet_index.max(1),
-        tb.sheet_count.max(tb.sheet_index.max(1))
-    );
-    let rev_label = display_or_dash(&tb.revision);
-    emit_grid_cell(dxf, right_x, y0, cell_h, "SHEET", &sheet_label);
-    emit_grid_cell(dxf, col_mid, y0, cell_h, "REV", &rev_label);
-}
-
-/// Title-block helper: empty/whitespace-only strings render as a dash
-/// so the DXF cell never appears visually blank. ASCII dash (DXF text
-/// is more portable without the em-dash glyph).
-fn display_or_dash(value: &str) -> String {
-    if value.trim().is_empty() {
-        "-".to_string()
-    } else {
-        value.to_string()
-    }
-}
-
-fn emit_grid_cell(dxf: &mut DxfDrawing, x: f64, y: f64, h: f64, label: &str, value: &str) {
-    add_text(
-        dxf,
-        LAYER_TITLEBLOCK_TEXT,
-        x + 1.8,
-        y + h - 2.8,
-        2.4,
-        0.0,
-        label,
-        HorizontalTextJustification::Left,
-    );
-    add_text(
-        dxf,
-        LAYER_TITLEBLOCK_TEXT,
-        x + 1.8,
-        y + h * 0.30,
-        3.6,
-        0.0,
-        value,
-        HorizontalTextJustification::Left,
-    );
 }
 
 fn emit_notes_strip(dxf: &mut DxfDrawing, drawing: &Drawing) {

@@ -241,7 +241,9 @@ pub fn answer_query(
                     "general".to_string(),
                     None,
                     None,
-                    Some(drawing.general_tolerance.linear_mm),
+                    // Under an ISO 2768 class the value depends on the
+                    // feature's size; `None` where the standard assigns none.
+                    drawing.general_tolerance.linear_for(value),
                     Some(drawing.general_tolerance.standard.clone()),
                 ),
             };

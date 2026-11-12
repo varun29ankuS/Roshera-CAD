@@ -79,6 +79,38 @@ use uuid::Uuid;
 
 // ── Manager ─────────────────────────────────────────────────────────
 
+/// ISO 7200 date of issue: the day the sheet was created, from the server
+/// clock, as ISO 8601 (`YYYY-MM-DD`). Left alone when the caller set one.
+fn stamp_issue_date(drawing: &mut Drawing) {
+    if drawing.title_block.date.trim().is_empty() {
+        drawing.title_block.date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    }
+}
+
+/// Measure the sheet's render-time facts against the LIVE model -- the sheet
+/// certificate's verdict + digest, and the part's mass when its material is
+/// named -- on a deep-copied snapshot, off the async workers (same discipline
+/// as [`certify_off_lock`]). Every sheet render goes through this, so the
+/// title block's VERIFIED and MASS cells state what the model is NOW.
+async fn with_render_facts(
+    model_handle: Arc<RwLock<BRepModel>>,
+    mut drawing: Drawing,
+) -> Result<Drawing, ApiError> {
+    let snap = {
+        let model = model_handle.read().await;
+        ModelSnapshot::take(&model)
+    };
+    tokio::task::spawn_blocking(move || {
+        let mut owned = BRepModel::new();
+        snap.restore(&mut owned);
+        drawing.render_facts =
+            geometry_engine::drawing::title_block::compute_render_facts(&mut owned, &drawing);
+        drawing
+    })
+    .await
+    .map_err(|_| ApiError::new(ErrorCode::KernelError, "sheet render-facts task failed"))
+}
+
 /// One registry entry: a drawing paired with the owner it was CREATED
 /// against. `owner` never changes after creation (moving a drawing
 /// between documents/parts is out of scope — see the module doc); only
@@ -143,7 +175,8 @@ impl DrawingManager {
 
     /// Allocate a fresh, empty drawing owned by `owner`. Returns its UUID.
     pub fn create(&self, name: impl Into<String>, sheet_size: SheetSize, owner: ModelKey) -> Uuid {
-        let drawing = Drawing::new(name, sheet_size);
+        let mut drawing = Drawing::new(name, sheet_size);
+        stamp_issue_date(&mut drawing);
         let id = drawing.id.0;
         self.drawings.insert(
             id,
@@ -159,7 +192,8 @@ impl DrawingManager {
     /// 3-view sheet), owned by `owner`, and return its UUID. Unlike
     /// [`create`], the views and title block are already populated by the
     /// caller — this is the one-call "right-click → drawing" path.
-    pub fn insert(&self, drawing: Drawing, owner: ModelKey) -> Uuid {
+    pub fn insert(&self, mut drawing: Drawing, owner: ModelKey) -> Uuid {
+        stamp_issue_date(&mut drawing);
         let id = drawing.id.0;
         self.drawings.insert(
             id,
@@ -376,6 +410,17 @@ pub struct UpdateTitleBlockRequest {
     pub drawing_number: Option<Option<String>>,
     #[serde(default)]
     pub revision: Option<String>,
+    /// ISO 7200 supplementary title (second line under the title).
+    #[serde(default)]
+    pub supplementary_title: Option<String>,
+    /// ISO 7200 document type, e.g. `PART DRAWING`.
+    #[serde(default)]
+    pub document_type: Option<String>,
+    /// ISO 7200 approval person. Setting it moves the sheet's status from
+    /// FOR REVIEW to APPROVED; the agent's MCP title-block tool does not send
+    /// it -- approval is a person's act.
+    #[serde(default)]
+    pub approved_by: Option<String>,
     #[serde(default)]
     pub sheet_index: Option<u32>,
     #[serde(default)]
@@ -645,6 +690,15 @@ pub async fn update_title_block(
         if let Some(v) = req.revision {
             tb.revision = v;
         }
+        if let Some(v) = req.supplementary_title {
+            tb.supplementary_title = v;
+        }
+        if let Some(v) = req.document_type {
+            tb.document_type = v;
+        }
+        if let Some(v) = req.approved_by {
+            tb.approved_by = v;
+        }
         if let Some(v) = req.sheet_index {
             tb.sheet_index = v;
         }
@@ -890,7 +944,7 @@ pub async fn export_svg(
     .await?;
 
     refuse_unsound_sheet(
-        model_handle,
+        model_handle.clone(),
         SheetSubject::Drawing(id),
         snapshot.clone(),
         q.acknowledge_layout_issues,
@@ -904,6 +958,7 @@ pub async fn export_svg(
     // out bytes that were never the bytes certified. The owned snapshot is
     // already in hand, so closing the window costs nothing and removes a
     // lock acquisition.
+    let snapshot = with_render_facts(model_handle, snapshot).await?;
     let svg = render_drawing_svg(&snapshot);
 
     // Concern C (M4, 2026-08-15 review; corrected per H2, closeout wave 2)
@@ -1241,7 +1296,7 @@ async fn drawing_svg_for_solid(
     //   - layout-quality Errors: real and applicable, and the one this route
     //     was actually missing before H1.
     refuse_unsound_sheet(
-        model_handle,
+        model_handle.clone(),
         SheetSubject::Solid(solid_id),
         drawing.clone(),
         q.acknowledge_layout_issues,
@@ -1286,6 +1341,7 @@ async fn drawing_svg_for_solid(
         );
     }
 
+    let drawing = with_render_facts(model_handle, drawing).await?;
     let svg = render_drawing_svg(&drawing);
     let content_type = if q.plain {
         "text/plain; charset=utf-8"
@@ -2118,7 +2174,7 @@ pub async fn export_pdf(
     .await?;
 
     refuse_unsound_sheet(
-        model_handle,
+        model_handle.clone(),
         SheetSubject::Drawing(id),
         snapshot.clone(),
         q.acknowledge_layout_issues,
@@ -2128,6 +2184,7 @@ pub async fn export_pdf(
     // Concern D (L2, 2026-08-15 review) — render from the certified
     // snapshot, not a second independent read of `handle`. See
     // `export_svg`'s identical comment for the race this closes.
+    let snapshot = with_render_facts(model_handle, snapshot).await?;
     let bytes = render_drawing_pdf(&snapshot)
         .map_err(|e| ApiError::new(ErrorCode::KernelError, format!("pdf render failed: {e}")))?;
     let name = snapshot.name.clone();
@@ -2194,7 +2251,7 @@ pub async fn export_dxf(
     .await?;
 
     refuse_unsound_sheet(
-        model_handle,
+        model_handle.clone(),
         SheetSubject::Drawing(id),
         snapshot.clone(),
         q.acknowledge_layout_issues,
@@ -2204,6 +2261,7 @@ pub async fn export_dxf(
     // Concern D (L2, 2026-08-15 review) — render from the certified
     // snapshot, not a second independent read of `handle`. See
     // `export_svg`'s identical comment for the race this closes.
+    let snapshot = with_render_facts(model_handle, snapshot).await?;
     let bytes = render_drawing_dxf(&snapshot)
         .map_err(|e| ApiError::new(ErrorCode::KernelError, format!("dxf render failed: {e}")))?;
     let name = snapshot.name.clone();

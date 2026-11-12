@@ -496,6 +496,24 @@ pub struct TitleBlock {
     pub sheet_index: u32,
     /// Total number of sheets. Renders as `SHEET {index} OF {count}`.
     pub sheet_count: u32,
+    /// ISO 7200 supplementary title: the detail that does not belong in the
+    /// (≤ 30 character) title, inked as a second, smaller line under it.
+    #[serde(default)]
+    pub supplementary_title: String,
+    /// ISO 7200 approval person. Empty = nobody approved the sheet, and its
+    /// status reads `FOR REVIEW` (derived, never stored). Set by a person
+    /// through the app -- the agent's title-block tool does not expose it.
+    #[serde(default)]
+    pub approved_by: String,
+    /// ISO 7200 document type, e.g. `PART DRAWING`, `ASSEMBLY DRAWING`.
+    #[serde(default = "TitleBlock::default_document_type")]
+    pub document_type: String,
+}
+
+impl TitleBlock {
+    fn default_document_type() -> String {
+        "PART DRAWING".to_string()
+    }
 }
 
 impl Default for TitleBlock {
@@ -508,8 +526,34 @@ impl Default for TitleBlock {
             revision: "A".to_string(),
             sheet_index: 1,
             sheet_count: 1,
+            supplementary_title: String::new(),
+            approved_by: String::new(),
+            document_type: Self::default_document_type(),
         }
     }
+}
+
+/// Facts measured against the LIVE model at render time and inked in the
+/// title block. Never serialised (`#[serde(skip)]` on [`Drawing`]): a stamp
+/// computed yesterday must not vouch for today's model.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RenderFacts {
+    /// Part mass in kg: kernel volume × the nominal density of the NAMED
+    /// material. `None` when the material is not named or not recognised.
+    pub mass_kg: Option<f64>,
+    /// The sheet certificate's verdict and digest. `None` = not computed
+    /// for this render; the VERIFIED cell then reads `UNVERIFIED`.
+    pub verification: Option<SheetStamp>,
+}
+
+/// The sheet certificate, as stamped in the VERIFIED cell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SheetStamp {
+    /// The certificate's `sound` verdict.
+    pub sound: bool,
+    /// First 8 hex digits of the SHA-256 over the certificate's facts in
+    /// canonical order.
+    pub digest: String,
 }
 
 // ── GD&T sheet annotations ────────────────────────────────────────────────────
@@ -638,7 +682,9 @@ pub struct SectionSemantics {
 /// millimetres regardless of the document unit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeneralTolerance {
-    /// General linear tolerance in millimetres (± this value).
+    /// Flat general linear tolerance in millimetres (± this value). Used only
+    /// when `standard` names no ISO 2768 class -- under a class the value
+    /// depends on size; read it with [`GeneralTolerance::linear_for`].
     pub linear_mm: f64,
     /// General angular tolerance in degrees (± this value).
     pub angular_deg: f64,
@@ -658,6 +704,54 @@ impl Default for GeneralTolerance {
 }
 
 impl GeneralTolerance {
+    /// The ± linear general tolerance for a feature of `nominal_mm`.
+    ///
+    /// Under an ISO 2768-1 class (`standard` = `"ISO 2768-f|m|c|v"`) the
+    /// value depends on size: ISO 2768-1:1989 Table 1, "over X up to Y" --
+    /// the same table `roshera-mcp`'s KB answers from. `None` where the
+    /// standard itself assigns no value (below 0.5 mm, above 4000 mm, and the
+    /// class-f / class-v gaps): the standard's own refusal, never filled in.
+    /// Without a class, `linear_mm` is one flat value for every size.
+    pub fn linear_for(&self, nominal_mm: f64) -> Option<f64> {
+        let Some(class) = self.iso_2768_class() else {
+            return Some(self.linear_mm);
+        };
+        // (over, up to, f, m, c, v)
+        type Row = (f64, f64, Option<f64>, f64, f64, Option<f64>);
+        const TABLE: [Row; 8] = [
+            (0.5, 3.0, Some(0.05), 0.1, 0.2, None),
+            (3.0, 6.0, Some(0.05), 0.1, 0.3, Some(0.5)),
+            (6.0, 30.0, Some(0.1), 0.2, 0.5, Some(1.0)),
+            (30.0, 120.0, Some(0.15), 0.3, 0.8, Some(1.5)),
+            (120.0, 400.0, Some(0.2), 0.5, 1.2, Some(2.5)),
+            (400.0, 1000.0, Some(0.3), 0.8, 2.0, Some(4.0)),
+            (1000.0, 2000.0, Some(0.5), 1.2, 3.0, Some(6.0)),
+            (2000.0, 4000.0, None, 2.0, 4.0, Some(8.0)),
+        ];
+        if !nominal_mm.is_finite() || nominal_mm < 0.5 {
+            return None;
+        }
+        // The first range is closed at 0.5 ("from 0.5 up to 3").
+        let row = TABLE
+            .iter()
+            .find(|r| nominal_mm > r.0 && nominal_mm <= r.1)
+            .or_else(|| (nominal_mm <= 3.0).then_some(&TABLE[0]))?;
+        match class {
+            'f' => row.2,
+            'm' => Some(row.3),
+            'c' => Some(row.4),
+            'v' => row.5,
+            _ => None,
+        }
+    }
+
+    /// The ISO 2768-1 tolerance class letter named by `standard`, if any.
+    pub fn iso_2768_class(&self) -> Option<char> {
+        let rest = self.standard.trim().strip_prefix("ISO 2768-")?;
+        let c = rest.chars().next()?.to_ascii_lowercase();
+        matches!(c, 'f' | 'm' | 'c' | 'v').then_some(c)
+    }
+
     /// The general tolerance matching the prose built by [`Drawing::set_unit_notes`]
     /// for a given document unit. Metric units carry the ISO 2768-m class
     /// (±0.1 mm linear); imperial units carry ±0.004 in (≈0.1016 mm) with no
@@ -764,7 +858,8 @@ pub struct Drawing {
     #[serde(default = "Drawing::default_unit_note")]
     pub unit_note: String,
     /// General-tolerance line rendered below the unit note, e.g.
-    /// "GENERAL TOLERANCES: LINEAR ±0.1 MM, ANGULAR ±0.5°, ISO 2768-m."
+    /// "GENERAL TOLERANCES: ISO 2768-m." -- the class alone: its values depend
+    /// on size, so a flat ± beside it would be a second, contradicting claim.
     /// Adjusted to the document unit at build time.
     #[serde(default = "Drawing::default_tolerance_note")]
     pub tolerance_note: String,
@@ -842,6 +937,10 @@ pub struct Drawing {
     /// and pattern. `serde(default)` keeps older sheets parsing.
     #[serde(default)]
     pub hole_features: Option<super::hole_features::HoleFeatures>,
+    /// Render-time facts (mass, certificate stamp) -- set on a transient copy
+    /// right before rendering, never persisted.
+    #[serde(skip)]
+    pub render_facts: RenderFacts,
 }
 
 impl Drawing {
@@ -850,8 +949,7 @@ impl Drawing {
     }
 
     fn default_tolerance_note() -> String {
-        "GENERAL TOLERANCES: LINEAR \u{00B1}0.1 MM, ANGULAR \u{00B1}0.5\u{00B0}, ISO 2768-m."
-            .to_string()
+        "GENERAL TOLERANCES: ISO 2768-m.".to_string()
     }
 
     pub fn new(name: impl Into<String>, sheet_size: SheetSize) -> Self {
@@ -874,6 +972,7 @@ impl Drawing {
             general_tolerance: GeneralTolerance::default(),
             round_part: None,
             hole_features: None,
+            render_facts: RenderFacts::default(),
         }
     }
 
@@ -905,12 +1004,9 @@ impl Drawing {
     /// MILLIMETRES / CENTIMETRES / METRES / INCHES / FEET.
     ///
     /// General-tolerance values:
-    /// - Metric (mm/cm/m): ±0.1 MM (LINEAR), ±0.5°, ISO 2768-m
+    /// - Metric (mm/cm/m): ISO 2768-m, stated as the class alone (its values
+    ///   depend on size; see [`GeneralTolerance::linear_for`]).
     /// - Imperial (in/ft): ±0.004 IN (LINEAR), ±0.5°
-    ///
-    /// The cm and m variants scale the ±0.1 mm reference:
-    /// - cm: ±0.01 CM  (0.1 mm ÷ 10)
-    /// - m:  ±0.0001 M (0.1 mm ÷ 1000)
     pub fn set_unit_notes(&mut self, unit: crate::units::LengthUnit) {
         // Structured readback sources (campaign #55 Slice 1) kept in lock-step
         // with the prose notes below.
@@ -925,18 +1021,9 @@ impl Drawing {
         };
         self.unit_note = format!("ALL DIMENSIONS IN {unit_name} UNLESS OTHERWISE STATED.");
         self.tolerance_note = match unit {
-            LengthUnit::Millimetre => {
-                "GENERAL TOLERANCES: LINEAR \u{00B1}0.1 MM, ANGULAR \u{00B1}0.5\u{00B0}, ISO 2768-m."
-                    .to_string()
-            }
-            LengthUnit::Centimetre => {
-                "GENERAL TOLERANCES: LINEAR \u{00B1}0.01 CM, ANGULAR \u{00B1}0.5\u{00B0}, ISO 2768-m."
-                    .to_string()
-            }
-            LengthUnit::Metre => {
-                "GENERAL TOLERANCES: LINEAR \u{00B1}0.0001 M, ANGULAR \u{00B1}0.5\u{00B0}, ISO 2768-m."
-                    .to_string()
-            }
+            LengthUnit::Millimetre => "GENERAL TOLERANCES: ISO 2768-m.".to_string(),
+            LengthUnit::Centimetre => "GENERAL TOLERANCES: ISO 2768-m.".to_string(),
+            LengthUnit::Metre => "GENERAL TOLERANCES: ISO 2768-m.".to_string(),
             LengthUnit::Inch => {
                 "GENERAL TOLERANCES: LINEAR \u{00B1}0.004 IN, ANGULAR \u{00B1}0.5\u{00B0}."
                     .to_string()
