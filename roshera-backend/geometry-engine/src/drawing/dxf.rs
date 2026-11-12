@@ -33,7 +33,7 @@ use std::io::Cursor;
 
 use dxf::entities::{Circle, Ellipse, Entity, EntityCommon, EntityType, Line, LwPolyline, Text};
 use dxf::enums::HorizontalTextJustification;
-use dxf::tables::Layer;
+use dxf::tables::{Layer, LineType};
 use dxf::{Color, Drawing as DxfDrawing, LwPolylineVertex, Point, Vector};
 use thiserror::Error;
 
@@ -53,6 +53,8 @@ pub enum DxfRenderError {
 // Layer name constants. Centralised so the frontend / external tooling
 // can target the same names when post-processing.
 const LAYER_FRAME: &str = "FRAME";
+/// Line type of hidden (occluded) edges.
+const LINE_TYPE_HIDDEN: &str = "HIDDEN";
 const LAYER_TITLEBLOCK: &str = "TITLEBLOCK";
 const LAYER_TITLEBLOCK_TEXT: &str = "TITLEBLOCK_TEXT";
 const LAYER_NOTES: &str = "NOTES";
@@ -122,6 +124,15 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     // resolved by suffixing with an index — AutoCAD requires layer
     // names to be unique, and two views legitimately can share a
     // label ("Detail" twice on the same sheet).
+    // ISO 128-2 type 02.1 "dashed narrow" for hidden edges: 4 mm dash, 2 mm
+    // gap -- the same pattern the SVG sheet draws.
+    let mut hidden = LineType::default();
+    hidden.name = LINE_TYPE_HIDDEN.to_string();
+    hidden.description = "ISO 128 02.1 dashed narrow __ __ __".to_string();
+    hidden.element_count = 2;
+    hidden.total_pattern_length = 6.0;
+    hidden.dash_dot_space_lengths = vec![4.0, -2.0];
+    dxf.add_line_type(hidden);
     let view_layers = assign_view_layers(&drawing.views);
     for layer_name in &view_layers {
         register_layer(&mut dxf, layer_name, ACI_BLACK);
@@ -143,6 +154,9 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     for (view, layer) in drawing.views.iter().zip(view_layers.iter()) {
         emit_view_polylines(&mut dxf, view, layer, sheet_h);
         emit_view_circles(&mut dxf, view, layer);
+        if view.show_hidden {
+            emit_view_hidden(&mut dxf, view, layer);
+        }
     }
 
     // -- View labels + dimension text from the layout ------------------
@@ -289,13 +303,8 @@ fn emit_view_polylines(
 /// polyline it has to re-fit. Same y-up, no-flip coordinate convention as
 /// [`emit_view_polylines`].
 ///
-/// Scope: only `view.circles` / `view.ellipses` (visible). `hidden_circles`
-/// / `hidden_ellipses` are left unemitted — DXF here already drops
-/// `hidden_polylines` entirely (hidden-line removal has no DXF path at all
-/// today; see this function's absence from the pre-Fix-2 code), so leaving
-/// hidden analytic conics out too is consistent with that PRE-EXISTING gap,
-/// not a new one Fix 2 introduces. Fixing DXF hidden-line output altogether
-/// is out of this fix's scope.
+/// Scope: only `view.circles` / `view.ellipses` (visible); the hidden set is
+/// written dashed by [`emit_view_hidden`].
 fn emit_view_circles(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
     let s = view.scale;
     let tx = view.position_mm[0];
@@ -334,6 +343,62 @@ fn emit_view_circles(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
         let mut ent = Entity::new(EntityType::Ellipse(ellipse));
         ent.common = common;
         dxf.add_entity(ent);
+    }
+}
+
+/// Emit a view's hidden (occluded) edges, circles and ellipses on the view's
+/// layer with line type HIDDEN, so a CAD reader shows them dashed. Same
+/// sheet-space convention as [`emit_view_polylines`] / [`emit_view_circles`].
+fn emit_view_hidden(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
+    let s = view.scale;
+    let tx = view.position_mm[0];
+    let ty = view.position_mm[1];
+    let dashed = |kind: EntityType| {
+        let mut common = EntityCommon::default();
+        common.layer = layer.to_string();
+        common.line_type_name = LINE_TYPE_HIDDEN.to_string();
+        let mut ent = Entity::new(kind);
+        ent.common = common;
+        ent
+    };
+    for poly in &view.hidden_polylines {
+        if poly.points.len() < 2 {
+            continue;
+        }
+        let mut lw = LwPolyline::default();
+        lw.vertices = poly
+            .points
+            .iter()
+            .map(|p| {
+                let mut v = LwPolylineVertex::default();
+                v.x = tx + s * p[0];
+                v.y = ty + s * p[1];
+                v
+            })
+            .collect();
+        dxf.add_entity(dashed(EntityType::LwPolyline(lw)));
+    }
+    for c in &view.hidden_circles {
+        dxf.add_entity(dashed(EntityType::Circle(Circle {
+            center: Point::new(tx + s * c.cx, ty + s * c.cy, 0.0),
+            radius: s * c.r,
+            normal: Vector::z_axis(),
+            ..Circle::default()
+        })));
+    }
+    for e in &view.hidden_ellipses {
+        let rx = s * e.rx;
+        let ry = s * e.ry;
+        if rx <= 0.0 {
+            continue;
+        }
+        dxf.add_entity(dashed(EntityType::Ellipse(Ellipse {
+            center: Point::new(tx + s * e.cx, ty + s * e.cy, 0.0),
+            major_axis: Vector::new(rx * e.rotation.cos(), rx * e.rotation.sin(), 0.0),
+            normal: Vector::z_axis(),
+            minor_axis_ratio: ry / rx,
+            ..Ellipse::default()
+        })));
     }
 }
 

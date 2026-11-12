@@ -1035,11 +1035,46 @@ pub async fn remove_view(
 pub async fn update_view(
     State(state): State<AppState>,
     Path((id, view_id)): Path<(Uuid, Uuid)>,
-    Json(edit): Json<ViewEdit>,
+    Json(mut edit): Json<ViewEdit>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let mut placement = None;
     let view = {
         let mut guard = handle.write().await;
+        // A rescale moves the view only as far as it must: same centre when
+        // the bigger footprint fits, else along its projection line, else the
+        // nearest free spot -- or no rescale at all. The placement is recorded
+        // with the edit, so the history replays it exactly.
+        if let (Some(scale), None) = (edit.scale, edit.position_mm) {
+            if scale.is_finite() && scale > 0.0 {
+                if let Some(index) = guard.views.iter().position(|v| v.id.0 == view_id) {
+                    match geometry_engine::drawing::layout::rescaled_view_position(
+                        &guard, index, scale,
+                    ) {
+                        Some(p) => {
+                            edit.position_mm = Some(p.position);
+                            placement = Some(p);
+                        }
+                        None => {
+                            let name = guard.views[index].name.clone();
+                            let label = if scale >= 1.0 {
+                                format!("{}:1", (scale * 100.0).round() / 100.0)
+                            } else {
+                                format!("1:{}", (100.0 / scale).round() / 100.0)
+                            };
+                            return Err(ApiError::new(
+                                ErrorCode::InvalidParameter,
+                                ViewEditError::NoRoom {
+                                    view: name,
+                                    scale: label,
+                                }
+                                .to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         guard
             .edit_view(ProjectedViewId(view_id), &edit)
             .map_err(|e| match e {
@@ -1070,7 +1105,12 @@ pub async fn update_view(
             .with_parameters(params)
             .with_input_drawing(id),
     );
-    Ok(Json(serde_json::json!({ "success": true, "view": view })))
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "view": view,
+        "moved": placement.is_some_and(|p| p.moved),
+        "aligned": placement.map_or(true, |p| p.aligned),
+    })))
 }
 
 /// Shared first step of every registered-export route (`svg`/`pdf`/`dxf`,

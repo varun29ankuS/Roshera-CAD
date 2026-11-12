@@ -219,3 +219,62 @@ fn a_view_with_hidden_lines_off_renders_none_and_others_keep_theirs() {
         serde_json::from_value(json).expect("de");
     assert!(back.show_hidden);
 }
+
+/// The DXF carries hidden edges as dashed line work (line type HIDDEN, ISO
+/// 128 type 02.1: 4 mm dash, 2 mm gap) on each view's layer -- and none for a
+/// view the engineer switched hidden lines off on. Before, DXF dropped hidden
+/// edges entirely, so an exported sheet lost every hidden bore.
+#[test]
+fn dxf_carries_hidden_edges_dashed_and_honours_show_hidden() {
+    let mut m = BRepModel::new();
+    let b = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(30.0, 20.0, 16.0)
+        .expect("box"));
+    let mut d = standard_drawing_hlr(&m, b, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("hlr");
+    let hidden_count = |d: &geometry_engine::drawing::types::Drawing| -> usize {
+        d.views
+            .iter()
+            .filter(|v| v.show_hidden)
+            .map(|v| {
+                v.hidden_polylines
+                    .iter()
+                    .filter(|p| p.points.len() >= 2)
+                    .count()
+                    + v.hidden_circles.len()
+                    + v.hidden_ellipses.len()
+            })
+            .sum()
+    };
+    let read = |d: &geometry_engine::drawing::types::Drawing| {
+        let bytes = geometry_engine::drawing::render_drawing_dxf(d).expect("dxf");
+        dxf::Drawing::load(&mut std::io::Cursor::new(bytes)).expect("readable DXF")
+    };
+
+    let all = hidden_count(&d);
+    assert!(all > 0, "fixture has hidden edges");
+    let file = read(&d);
+    let hidden_type = file
+        .line_types()
+        .find(|lt| lt.name == "HIDDEN")
+        .expect("a HIDDEN line type is defined");
+    assert_eq!(hidden_type.dash_dot_space_lengths, vec![4.0, -2.0]);
+    let dashed = file
+        .entities()
+        .filter(|e| e.common.line_type_name == "HIDDEN")
+        .count();
+    assert_eq!(dashed, all, "every hidden edge is written dashed");
+
+    let off = d
+        .views
+        .iter()
+        .position(|v| !v.hidden_polylines.is_empty())
+        .expect("a view with hidden edges");
+    d.views[off].show_hidden = false;
+    let fewer = hidden_count(&d);
+    assert!(fewer < all);
+    let dashed = read(&d)
+        .entities()
+        .filter(|e| e.common.line_type_name == "HIDDEN")
+        .count();
+    assert_eq!(dashed, fewer, "a view with hidden lines off writes none");
+}

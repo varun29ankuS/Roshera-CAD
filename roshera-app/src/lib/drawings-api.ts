@@ -355,13 +355,19 @@ export interface ViewEdit {
  * refusal (bad scale, a name another view already has) throws
  * `DrawingRefusal` with the reason.
  */
-export async function updateView(drawingId: string, viewId: string, edit: ViewEdit): Promise<void> {
+export async function updateView(
+  drawingId: string,
+  viewId: string,
+  edit: ViewEdit,
+): Promise<{ moved: boolean; aligned: boolean }> {
   const r = await fetch(`${API_HOST}/api/drawings/${drawingId}/views/${viewId}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(edit),
   })
-  await jsonOrRefusal<unknown>(r)
+  const body = await jsonOrRefusal<{ moved?: boolean; aligned?: boolean }>(r)
+  // A rescale moves the view only when the bigger footprint did not fit.
+  return { moved: body.moved ?? false, aligned: body.aligned ?? true }
 }
 
 /**

@@ -236,12 +236,17 @@ pub struct ViewEdit {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<f64>,
+    /// Where the view sits (`position_mm`). A rescale through the server
+    /// fills this in (see `layout::rescaled_view_position`), so the history
+    /// replays the exact placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_mm: Option<[f64; 2]>,
 }
 
 /// Why a view edit was refused.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ViewEditError {
-    #[error("the edit changes nothing (give show_hidden, name or scale)")]
+    #[error("the edit changes nothing (give show_hidden, name, scale or position_mm)")]
     Empty,
     #[error("view {0} is not on this sheet")]
     NoSuchView(Uuid),
@@ -251,6 +256,10 @@ pub enum ViewEditError {
     NameTaken(String),
     #[error("a view scale must be between 1:100 and 100:1 (got {0})")]
     BadScale(f64),
+    #[error("a view position must be finite numbers")]
+    BadPosition,
+    #[error("no room on the sheet for {view} at {scale}; pick a smaller scale or a larger sheet")]
+    NoRoom { view: String, scale: String },
 }
 
 fn show_hidden_default() -> bool {
@@ -1060,7 +1069,11 @@ impl Drawing {
     /// a new name, a new scale. All-or-nothing: an invalid field refuses the
     /// whole edit and leaves the view as it was.
     pub fn edit_view(&mut self, id: ProjectedViewId, edit: &ViewEdit) -> Result<(), ViewEditError> {
-        if edit.show_hidden.is_none() && edit.name.is_none() && edit.scale.is_none() {
+        if edit.show_hidden.is_none()
+            && edit.name.is_none()
+            && edit.scale.is_none()
+            && edit.position_mm.is_none()
+        {
             return Err(ViewEditError::Empty);
         }
         let name = match &edit.name {
@@ -1085,6 +1098,11 @@ impl Drawing {
                 return Err(ViewEditError::BadScale(s));
             }
         }
+        if let Some(p) = edit.position_mm {
+            if !p.iter().all(|c| c.is_finite()) {
+                return Err(ViewEditError::BadPosition);
+            }
+        }
         let view = self
             .views
             .iter_mut()
@@ -1098,6 +1116,9 @@ impl Drawing {
         }
         if let Some(s) = edit.scale {
             view.scale = s;
+        }
+        if let Some(p) = edit.position_mm {
+            view.position_mm = p;
         }
         Ok(())
     }

@@ -542,7 +542,7 @@ export function DrawingsWorkspace() {
       setError(null)
       setViewsBusy(true)
       try {
-        await updateView(activeId, viewId, edit)
+        const { moved, aligned } = await updateView(activeId, viewId, edit)
         await refreshActive(activeId)
         setRemovedView(null)
         const what =
@@ -551,9 +551,15 @@ export function DrawingsWorkspace() {
             : edit.show_hidden === true
               ? `Hidden lines shown on ${v.name}`
               : edit.scale !== undefined
-                ? `${v.name} now at ${edit.scale >= 1 ? `${edit.scale}:1` : `1:${Number((1 / edit.scale).toFixed(2))}`}`
+                ? `${v.name} now at ${edit.scale >= 1 ? `${edit.scale}:1` : `1:${Number((1 / edit.scale).toFixed(2))}`}${
+                    moved
+                      ? aligned
+                        ? '; moved to fit, still in line with FRONT'
+                        : '; moved to the nearest free space (no room in line with FRONT)'
+                      : ''
+                  }`
                 : `${v.name} renamed ${edit.name ?? ''}`
-        setNoteKind('done')
+        setNoteKind(moved && !aligned ? 'info' : 'done')
         setEditNote(`${what}. Ctrl+Z undoes it.`)
       } catch (e) {
         setNoteKind('info')

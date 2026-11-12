@@ -321,6 +321,27 @@ pub fn free_view_position(
         .and_then(|v| view_geometry_rect(v, sheet_h))
         .map(|r| [0.5 * (r.x0 + r.x1), 0.5 * (r.y0 + r.y1)])
         .unwrap_or([0.5 * (frame.x0 + frame.x1), 0.5 * (frame.y0 + frame.y1)]);
+    free_view_position_near(drawing, view, target)
+}
+
+/// [`free_view_position`] aimed at a sheet point (y-down mm) instead of a view.
+fn free_view_position_near(
+    drawing: &Drawing,
+    view: &ProjectedView,
+    target: [f64; 2],
+) -> Option<[f64; 2]> {
+    let sheet_h = drawing.sheet_size.height();
+    let mut probe = view.clone();
+    probe.position_mm = [0.0, 0.0];
+    let base = view_geometry_rect(&probe, sheet_h)?;
+    let frame = super::svg::frame_rect(&drawing.sheet_size);
+    let pad = VIEW_PLACEMENT_CLEARANCE_MM;
+    let obstacles: Vec<Rect2> = compute_layout(drawing)
+        .items
+        .into_iter()
+        .filter(|i| i.kind != SheetItemKind::ZoneRef)
+        .map(|i| i.bbox)
+        .collect();
 
     let (w, h) = (base.width(), base.height());
     let mut best: Option<([f64; 2], f64)> = None;
@@ -353,6 +374,105 @@ pub fn free_view_position(
         x0 += VIEW_PLACEMENT_STEP_MM;
     }
     best.map(|(p, _)| p)
+}
+
+/// Where a rescaled view goes, and how it got there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RescalePlacement {
+    /// The view's new `position_mm`.
+    pub position: [f64; 2],
+    /// `false` when the view kept its centre; `true` when it had to move.
+    pub moved: bool,
+    /// When it moved: `true` if it stayed on its projection line with FRONT.
+    pub aligned: bool,
+}
+
+/// Where view `index` goes when its scale becomes `scale`: at its current
+/// centre when the new footprint is clear there (by
+/// [`VIEW_PLACEMENT_CLEARANCE_MM`], inside the frame); otherwise on its
+/// projection line with FRONT (an orthographic child view), else the free
+/// spot nearest its old centre. `None` when nothing on the sheet holds it at
+/// that scale: the caller refuses -- a view is never put on top of another.
+pub fn rescaled_view_position(
+    drawing: &Drawing,
+    index: usize,
+    scale: f64,
+) -> Option<RescalePlacement> {
+    let sheet_h = drawing.sheet_size.height();
+    let old = view_geometry_rect(drawing.views.get(index)?, sheet_h)?;
+    let mut view = drawing.views[index].clone();
+    view.scale = scale;
+    view.position_mm = [0.0, 0.0];
+    let base = view_geometry_rect(&view, sheet_h)?;
+    // Everything else on the sheet: the view's own label and dimensions are
+    // laid out with it and so are not obstacles to it.
+    let mut rest = drawing.clone();
+    rest.views.remove(index);
+
+    // Keep the centre. A position (px, py) moves the footprint by (+px, -py)
+    // in sheet (y-down) coordinates.
+    let old_c = [0.5 * (old.x0 + old.x1), 0.5 * (old.y0 + old.y1)];
+    let base_c = [0.5 * (base.x0 + base.x1), 0.5 * (base.y0 + base.y1)];
+    let keep = [old_c[0] - base_c[0], base_c[1] - old_c[1]];
+    let kept = Rect2 {
+        x0: base.x0 + keep[0],
+        y0: base.y0 - keep[1],
+        x1: base.x1 + keep[0],
+        y1: base.y1 - keep[1],
+    };
+    if spot_is_clear(&rest, &kept) {
+        return Some(RescalePlacement {
+            position: keep,
+            moved: false,
+            aligned: true,
+        });
+    }
+    let front = rest
+        .views
+        .iter()
+        .position(|v| matches!(v.projection, super::types::ProjectionType::Front));
+    if let (Some(side), Some(parent)) = (
+        ViewSide::for_projection(view.projection, drawing.projection),
+        front,
+    ) {
+        if let Some(p) = aligned_view_position(&rest, &view, parent, side) {
+            return Some(RescalePlacement {
+                position: p,
+                moved: true,
+                aligned: true,
+            });
+        }
+    }
+    free_view_position_near(&rest, &view, old_c).map(|p| RescalePlacement {
+        position: p,
+        moved: true,
+        aligned: false,
+    })
+}
+
+/// True when `r` (sheet mm, y-down) sits inside the frame and clear, by
+/// [`VIEW_PLACEMENT_CLEARANCE_MM`], of everything laid out on `drawing`.
+fn spot_is_clear(drawing: &Drawing, r: &Rect2) -> bool {
+    let frame = super::svg::frame_rect(&drawing.sheet_size);
+    if r.x0 < frame.x0 + 2.0
+        || r.x1 > frame.x1 - 2.0
+        || r.y0 < frame.y0 + 2.0
+        || r.y1 > frame.y1 - 2.0
+    {
+        return false;
+    }
+    let pad = VIEW_PLACEMENT_CLEARANCE_MM;
+    let padded = Rect2 {
+        x0: r.x0 - pad,
+        y0: r.y0 - pad,
+        x1: r.x1 + pad,
+        y1: r.y1 + pad,
+    };
+    compute_layout(drawing)
+        .items
+        .iter()
+        .filter(|i| i.kind != SheetItemKind::ZoneRef)
+        .all(|i| !padded.intersects(&i.bbox, 0.0))
 }
 
 /// Which side of its parent view a projected view belongs on.
@@ -461,7 +581,7 @@ pub fn aligned_view_position(
     }
 }
 
-pub(crate) fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<Rect2> {
+pub fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<Rect2> {
     let mut x0 = f64::INFINITY;
     let mut y0 = f64::INFINITY;
     let mut x1 = f64::NEG_INFINITY;

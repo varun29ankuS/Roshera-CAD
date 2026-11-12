@@ -11373,6 +11373,82 @@ async fn a_view_edit_applies_refuses_bad_input_and_undoes() {
     assert_eq!(f["show_hidden"], false, "the earlier edit is replayed");
 }
 
+/// Rescaling a view never puts it on top of another: a scale with no room
+/// anywhere is refused with the reason; one that fits moves the view only as
+/// far as it must, and the placement is history (a later undo keeps it).
+#[tokio::test]
+async fn a_rescale_is_placed_clear_or_refused_and_replays() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (_, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let right_of = |sheet: &Value| -> Value {
+        sheet["views"]
+            .as_array()
+            .and_then(|vs| vs.iter().find(|v| v["projection"]["kind"] == "right"))
+            .cloned()
+            .expect("a RIGHT view")
+    };
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let vid = right_of(&sheet)["id"].as_str().expect("id").to_string();
+    let patch = |body: Value| {
+        Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/api/drawings/{drawing_id}/views/{vid}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    };
+
+    let (ns, none) = dispatch(&state, patch(json!({ "scale": 50.0 }))).await;
+    assert_eq!(ns, StatusCode::BAD_REQUEST, "{none}");
+    assert!(
+        none["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("no room")),
+        "{none}"
+    );
+
+    let (os, ok) = dispatch(&state, patch(json!({ "scale": 0.5 }))).await;
+    assert_eq!(os, StatusCode::OK, "{ok}");
+    let (_, after) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let placed = right_of(&after);
+    assert_eq!(placed["scale"], 0.5);
+
+    // A later edit, undone: the sheet is rebuilt from history and the
+    // rescale's recorded placement must come back exactly.
+    let (rs, renamed) = dispatch(&state, patch(json!({ "name": "SIDE" }))).await;
+    assert_eq!(rs, StatusCode::OK, "{renamed}");
+    let _ = state.timeline_recorder.settle().await;
+    let session = crate::handlers::timeline::live_session_id(&timeline_engine::BranchId::main());
+    let (us, undone) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/undo",
+            json!({ "session_id": session.to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(us, StatusCode::OK, "{undone}");
+    let (_, replayed) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let r = right_of(&replayed);
+    assert_eq!(r["scale"], 0.5);
+    assert_eq!(
+        r["position_mm"], placed["position_mm"],
+        "the placement replays"
+    );
+}
+
 /// Undo puts a removed view back: the sheet is rebuilt from the history at
 /// the undone position. Before, undo/redo rewound the history but never
 /// rebuilt the sheets -- the view stayed gone.
