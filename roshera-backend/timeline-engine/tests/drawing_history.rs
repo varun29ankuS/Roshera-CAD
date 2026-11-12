@@ -236,3 +236,21 @@ fn a_deleted_drawing_stays_deleted() {
     let built = rebuild_drawings(&events, &FrameCache::new(64));
     assert!(built.drawings.get(&did).is_none());
 }
+
+/// The name a sheet was created with comes back with it. The creation event
+/// did not record it, so every rebuilt sheet came back as "Auto Drawing".
+#[test]
+fn a_rebuilt_sheet_keeps_the_name_it_was_created_with() {
+    let did = Uuid::new_v4();
+    let mut created = from_part(3, 3, did);
+    if let Operation::Generic { parameters, .. } = &mut created.operation {
+        parameters["params"]["name"] = json!("Mounting plate 120 x 80 x 15");
+    }
+    let mut events = plate();
+    events.push(created);
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    assert_eq!(
+        built.drawings.get(&did).expect("rebuilt").name,
+        "Mounting plate 120 x 80 x 15"
+    );
+}

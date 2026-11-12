@@ -1573,6 +1573,7 @@ async fn create_part_drawing_inner(
     // "remove view" then still matches when the sheet is rebuilt from history.
     let mut drawing = drawing;
     drawing.stabilize_view_ids();
+    let drawing_name = drawing.name.clone();
     let drawing_id = state.drawings.insert(drawing, owner.clone());
     // L3 (2026-08-16 residuals): this route also gates on `acknowledge_
     // unsound` (`refuse_unsound_solid` above), and its event ALREADY
@@ -1597,6 +1598,9 @@ async fn create_part_drawing_inner(
                 state.drawings.record_event(
                     RecordedOperation::new("drawing.create_from_part")
                         .with_parameters(serde_json::json!({
+                            // The sheet's name, so a rebuild from history
+                            // restores it (drawing_history).
+                            "name": drawing_name,
                             "solid_id": solid_id,
                             "part_uuid": part_uuid,
                             "sheet_size": SheetSize::A3,

@@ -98,6 +98,15 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                 match rederive_part_drawing(&model, e, &outcome.id_remap, switch) {
                     DrawingRederive::Rebuilt(id, sheet) => {
                         let mut sheet = *sheet;
+                        // The name the sheet was created with (recorded since
+                        // 11-12; older events keep the derived default).
+                        if let Some(name) = params(e)
+                            .and_then(|p| p.get("name"))
+                            .and_then(Value::as_str)
+                            .filter(|n| !n.trim().is_empty())
+                        {
+                            sheet.name = name.to_string();
+                        }
                         sheet.stabilize_view_ids();
                         out.drawings.insert(id, sheet);
                     }
