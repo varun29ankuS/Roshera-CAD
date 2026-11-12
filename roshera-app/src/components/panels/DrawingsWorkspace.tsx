@@ -35,6 +35,8 @@ import {
   type DrawingFormat,
   type ProjectionAngle,
   type SheetDimension,
+  type DimensionDriverResolution,
+  getDimensionDriver,
   DrawingRefusal,
   setDrawingDimension,
   setDrawingProjection,
@@ -91,6 +93,33 @@ function sheetDimensionsMm(sheet: Drawing['sheet_size']): [number, number] {
 interface DrawingSummary {
   id: string
   name: string
+}
+
+/** What the change box says will change, before Apply. */
+function driverLine(d: DimensionDriverResolution | null): React.ReactNode {
+  if (!d) return <span className="text-muted-foreground">Finding what drives it…</span>
+  switch (d.verdict) {
+    case 'driven': {
+      const steps = [d.driver.target_sequence, ...(d.driver.linked ?? []).map((l) => l.target_sequence)]
+      const where = steps.length > 1 ? `steps ${steps.join(' + ')}` : `step ${steps[0]}`
+      return (
+        <span>
+          Changes <span className="font-medium">{d.driver.parameter}</span> ({where}, now{' '}
+          {Number(d.driver.value.toFixed(4))})
+        </span>
+      )
+    }
+    case 'reference_only':
+      return <span className="text-amber-700">Reference only: {d.reason}</span>
+    case 'ambiguous':
+      return (
+        <span className="text-amber-700">
+          Several values drive it ({d.drivers.map((x) => `${x.parameter} step ${x.target_sequence}`).join(', ')})
+        </span>
+      )
+    case 'undecided':
+      return <span className="text-amber-700">Could not tell what drives it: {d.reason}</span>
+  }
 }
 
 /** A dimension kind in a drafter's words, for the change box. */
@@ -150,6 +179,8 @@ export function DrawingsWorkspace() {
     busy: boolean
     /** When the current request started (ms), for the elapsed counter. */
     startedAt: number | null
+    /** What changes when this dimension changes; null while searching. */
+    driver: DimensionDriverResolution | null
     refusal: string | null
   } | null>(null)
   // The in-flight edit request, so Stop can abandon it.
@@ -623,8 +654,23 @@ export function DrawingsWorkspace() {
         draft: String(Number(dim.value.toFixed(4))),
         busy: false,
         startedAt: null,
+        driver: null,
         refusal: null,
       })
+      // Find what drives it now, while the new value is typed: the edit then
+      // reuses the answer and only solves.
+      const drawingId = activeDrawing.id
+      void getDimensionDriver(drawingId, dim.id)
+        .then((driver) =>
+          setDimEdit((cur) => (cur && cur.dim.id === dim.id ? { ...cur, driver } : cur)),
+        )
+        .catch(() =>
+          setDimEdit((cur) =>
+            cur && cur.dim.id === dim.id
+              ? { ...cur, driver: { verdict: 'undecided', reason: 'the server did not answer' } }
+              : cur,
+          ),
+        )
     },
     [activeDrawing],
   )
@@ -810,6 +856,7 @@ export function DrawingsWorkspace() {
                     <div className="text-muted-foreground">
                       {DIM_KIND_WORDS[dimEdit.dim.kind] ?? dimEdit.dim.kind.replace(/_/g, ' ')} · {dimEdit.view} view · edits the part
                     </div>
+                    <div className="mt-1">{driverLine(dimEdit.driver)}</div>
                   </div>
                   <button
                     type="button"

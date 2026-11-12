@@ -11155,6 +11155,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(drawing_edit::edit_dimension),
         )
         .route(
+            "/api/drawings/{id}/dimensions/{dim_id}/driver",
+            get(drawing_edit::dimension_driver),
+        )
+        .route(
             "/api/drawings/{id}/projection",
             axum::routing::patch(drawing_edit::set_projection),
         )

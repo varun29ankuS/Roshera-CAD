@@ -11215,6 +11215,66 @@ async fn a_dimension_edit_keeps_the_title_block() {
     assert_eq!(after["title_block"]["approved_by"], "V. Sharma");
 }
 
+/// Selecting a dimension finds what drives it (once, while the value is
+/// typed); the edit then reuses that answer and only solves. The answer is
+/// tied to the history it was found on.
+#[tokio::test]
+async fn selecting_a_dimension_finds_its_driver_and_the_edit_reuses_it() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (_, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let (dim_id, pid) = drawing_dimension(&sheet, "diameter", 6.0).expect("the Ø6 bore");
+
+    let route = format!("/api/drawings/{drawing_id}/dimensions/{dim_id}/driver");
+    let (s1, first) = dispatch(&state, json_get(&route)).await;
+    assert_eq!(s1, StatusCode::OK, "{first}");
+    assert_eq!(first["resolution"]["verdict"], "driven", "{first}");
+    assert_eq!(first["resolution"]["driver"]["parameter"], "radius");
+    assert_eq!(first["cached"], false);
+    let (_, second) = dispatch(&state, json_get(&route)).await;
+    assert_eq!(
+        second["cached"], true,
+        "the same history answers from the cache"
+    );
+
+    let (es, edited) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/drawings/{drawing_id}/dimensions/{dim_id}"),
+            json!({ "value": 8.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(es, StatusCode::OK, "{edited}");
+    assert_eq!(
+        edited["driver_cached"], true,
+        "the edit reused the driver: {edited}"
+    );
+    let (_, after) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let shown = drawing_value_by_pid(&after, &pid).expect("same dimension");
+    assert!(
+        (shown - 8.0).abs() < 1e-6,
+        "the edit still lands exactly: {shown}"
+    );
+
+    // The history moved (the edit appended a mould): the old answer is not
+    // reused.
+    let (_, third) = dispatch(&state, json_get(&route)).await;
+    assert_eq!(third["cached"], false, "a new history is searched afresh");
+}
+
 /// A dimension nothing on the timeline drives is refused as reference-only,
 /// never "edited" by scaling or approximation.
 #[tokio::test]

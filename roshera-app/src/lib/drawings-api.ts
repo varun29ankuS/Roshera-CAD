@@ -366,6 +366,39 @@ async function jsonOrRefusal<T>(resp: Response): Promise<T> {
   throw new DrawingRefusal(message, gate)
 }
 
+/** What changes when a sheet dimension changes (the server's driver search). */
+export type DimensionDriverResolution =
+  | {
+      verdict: 'driven'
+      current: number
+      driver: {
+        command: string
+        parameter: string
+        target_sequence: number
+        value: number
+        linked?: { target_sequence: number; parameter: string; value: number }[]
+      }
+      unchecked?: { target_sequence: number; parameter: string; reason: string }[]
+    }
+  | { verdict: 'reference_only'; current: number | null; reason: string }
+  | { verdict: 'ambiguous'; current: number; drivers: { parameter: string; target_sequence: number }[] }
+  | { verdict: 'undecided'; reason: string }
+
+/** Ask what drives a dimension. Called when the dimension is selected, so the
+ *  search runs while the new value is typed; the edit then reuses it. */
+export async function getDimensionDriver(
+  drawingId: string,
+  dimensionId: string,
+  signal?: AbortSignal,
+): Promise<DimensionDriverResolution> {
+  const r = await fetch(
+    `${API_HOST}/api/drawings/${drawingId}/dimensions/${encodeURIComponent(dimensionId)}/driver`,
+    { signal },
+  )
+  const body = await jsonOrThrow<{ resolution: DimensionDriverResolution }>(r, 'getDimensionDriver')
+  return body.resolution
+}
+
 /** Result of editing a sheet dimension (which edits the part). */
 export interface DimensionEditResult {
   dimension: { id: string; from: number; to: number; sheet_value: number | null }

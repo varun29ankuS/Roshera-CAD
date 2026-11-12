@@ -18,10 +18,10 @@ use std::sync::Arc;
 // row). It is deliberately not imported here; the lineage projection is
 // reached through `LineageGraph` / `LineageError` only.
 use timeline_engine::{
-    certify_rebuild, certify_rebuild_with_drawings, mould_operation, name_binding_operation,
-    params_have_numeric, rebuild_model_from_events, Author, BranchId, BranchPurpose, EntityId,
-    EventId, EventMetadata, LineageGraph, NameBindings, Operation, OperationInputs,
-    RebuildCertificate, ReplayOutcome, SessionId, Timeline, TimelineError, TimelineEvent,
+    certify_rebuild, mould_operation, name_binding_operation, params_have_numeric, Author,
+    BranchId, BranchPurpose, EntityId, EventId, EventMetadata, LineageGraph, NameBindings,
+    Operation, OperationInputs, RebuildCertificate, ReplayOutcome, SessionId, Timeline,
+    TimelineError, TimelineEvent,
 };
 use tracing::{error, info};
 use uuid::Uuid;
@@ -2785,19 +2785,26 @@ pub async fn mould_parameter(
         ));
     }
 
-    let (_base_model, base_cert) = certify_rebuild(&events, None);
-    // #32: `certify_rebuild_with_drawings` also RE-DERIVES every
-    // `drawing.create_from_part` sheet from the moulded geometry (option a) —
-    // off any live lock, so the heavy HLR pipeline never runs under the model
-    // write lock. The re-derived sheets reconcile the drawing registry below.
-    let (cand_model, cand_cert, cand_drawings) =
-        certify_rebuild_with_drawings(&candidate_events, Some(target_sequence));
+    // The baseline's soundness, geometry only, through the frame cache (the
+    // current history is usually already shot). The candidate is certified
+    // in full -- per-feature verdicts -- but without re-deriving sheets: they
+    // are rebuilt from history after the live reconcile (`drawing_history`),
+    // edits included. Both used to re-derive every sheet: seconds per edit.
+    let base_sound = {
+        let frames = std::sync::Arc::clone(&state.frames);
+        let ev = events.clone();
+        tokio::task::spawn_blocking(move || timeline_engine::frames::geometry_sound(&ev, &frames))
+            .await
+            // A failed check refuses an unsound candidate (the safe side).
+            .unwrap_or(true)
+    };
+    let (cand_model, cand_cert) = certify_rebuild(&candidate_events, Some(target_sequence));
 
     // Refuse only a REGRESSION: a sound baseline broken by the edit (a NEW
     // downstream failure, a dangling reference, a collapse, or a self-
     // intersection). If the baseline was already unsound the mould is not the
     // cause and is not blocked here.
-    if base_cert.is_sound() && !cand_cert.is_sound() {
+    if base_sound && !cand_cert.is_sound() {
         let reason = cand_cert
             .first_break()
             .map(|v| {
@@ -2914,9 +2921,7 @@ pub async fn mould_parameter(
     // own branch/timeline (`state.timeline`), so a drawing surfacing here
     // for the first time can only ever be that document's own.
     // The sheets were rebuilt from history by the live reconcile above
-    // (`replay_session_to_model`), edits included; `cand_drawings` (creation
-    // only) would overwrite the title block and added views.
-    let _ = &cand_drawings;
+    // (`replay_session_to_model`), edits included.
 
     let session_key = session_uuid.to_string();
     let _ = state

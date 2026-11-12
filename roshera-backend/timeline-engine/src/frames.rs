@@ -76,6 +76,25 @@ impl std::fmt::Debug for FrameCache {
     }
 }
 
+/// Does the geometry of `events` rebuild sound? The rebuild certificate's
+/// own measure (no skipped geometry event, at least one solid, the B-Rep
+/// validates), on the geometry alone -- document events (drawings,
+/// annotations) are left out, so no sheet is re-derived -- through `frames`.
+pub fn geometry_sound(events: &[TimelineEvent], frames: &FrameCache) -> bool {
+    let geometry: Vec<TimelineEvent> = events
+        .iter()
+        .filter(|e| match &e.operation {
+            Operation::Generic { command_type, .. } => {
+                is_param_meta(command_type) || !command_type.contains('.')
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    let (model, outcome, _) = frames.replay(&geometry);
+    crate::rebuild_certificate::measure_is_sound(&model, outcome.events_skipped)
+}
+
 fn copy_model(model: &BRepModel) -> BRepModel {
     let mut out = BRepModel::new();
     ModelSnapshot::take(model).restore(&mut out);

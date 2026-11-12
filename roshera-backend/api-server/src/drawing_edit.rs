@@ -47,6 +47,100 @@ fn refusal(code: ErrorCode, message: String, gate: &str, details: serde_json::Va
     ApiError::new(code, message).with_details(d)
 }
 
+/// Drivers already found, keyed by the history they were found on (event
+/// count + last event id) and the dimension's persistent id. A resolution is
+/// only ever reused on the SAME history: any new event changes the key.
+static DRIVER_CACHE: std::sync::LazyLock<
+    dashmap::DashMap<(String, String), timeline_engine::dimension_drive::DriveResolution>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+fn history_key(events: &[timeline_engine::TimelineEvent]) -> String {
+    let last = events
+        .last()
+        .map(|e| e.id.0.to_string())
+        .unwrap_or_default();
+    format!("{}:{last}", events.len())
+}
+
+/// The main branch's events, drained and in order.
+async fn main_events(state: &AppState) -> Result<Vec<timeline_engine::TimelineEvent>, ApiError> {
+    let _ = state.timeline_recorder.settle().await;
+    let timeline = state.timeline.read().await;
+    let mut all = timeline
+        .get_branch_events(&BranchId::main(), None, None)
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::KernelError,
+                format!("the history could not be read: {e}"),
+            )
+        })?;
+    all.sort_by_key(|e| e.sequence_number);
+    Ok(all)
+}
+
+/// `GET /api/drawings/{id}/dimensions/{dim_id}/driver` -- what changes when
+/// this dimension changes: the recorded parameter (and any linked members of
+/// the same feature), or why none can. The app asks when a dimension is
+/// selected, so the search runs while the new value is typed and the edit
+/// itself only solves.
+pub async fn dimension_driver(
+    State(state): State<AppState>,
+    Path((id, dim_id)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let handle = state.drawings.get(&id).ok_or_else(|| {
+        ApiError::new(ErrorCode::SolidNotFound, format!("drawing {id} not found"))
+    })?;
+    let pid = {
+        let drawing = handle.read().await;
+        drawing
+            .views
+            .iter()
+            .flat_map(|v| v.dimensions.iter())
+            .find(|d| d.id == dim_id)
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::SolidNotFound,
+                    format!("drawing {id} has no dimension {dim_id}"),
+                )
+            })?
+            .pid
+            .clone()
+    };
+    let Some(pid) = pid else {
+        return Ok(Json(serde_json::json!({
+            "dimension": dim_id,
+            "cached": false,
+            "resolution": {
+                "verdict": "reference_only",
+                "current": null,
+                "reason": "this dimension has no persistent identity; it is reference-only",
+            },
+        })));
+    };
+    let events = main_events(&state).await?;
+    let key = (history_key(&events), pid.clone());
+    if let Some(hit) = DRIVER_CACHE.get(&key) {
+        return Ok(Json(serde_json::json!({
+            "dimension": dim_id, "cached": true, "resolution": hit.value().clone(),
+        })));
+    }
+    let pid_for_search = pid.clone();
+    let resolution = tokio::task::spawn_blocking(move || {
+        timeline_engine::dimension_drive::resolve_dimension_driver(&events, &pid_for_search)
+    })
+    .await
+    .map_err(|e| {
+        ApiError::new(
+            ErrorCode::KernelError,
+            format!("the driver search stopped: {e}"),
+        )
+    })?;
+    DRIVER_CACHE.insert(key, resolution.clone());
+    Ok(Json(serde_json::json!({
+        "dimension": dim_id, "cached": false, "resolution": resolution,
+    })))
+}
+
 /// `POST /api/drawings/{id}/dimensions/{dim_id}` — set a dimension's size by
 /// editing the parameter that drives it.
 pub async fn edit_dimension(
@@ -108,15 +202,28 @@ pub async fn edit_dimension(
 
     let target = req.value;
     let pid_for_plan = pid.clone();
-    let plan =
-        tokio::task::spawn_blocking(move || plan_dimension_edit(&events, &pid_for_plan, target))
-            .await
-            .map_err(|e| {
-                ApiError::new(
-                    ErrorCode::KernelError,
-                    format!("the edit planner stopped: {e}"),
-                )
-            })?;
+    // A driver found when the dimension was selected, on THIS history, is
+    // reused: the edit then only solves.
+    let cached = DRIVER_CACHE
+        .get(&(history_key(&events), pid.clone()))
+        .map(|r| r.value().clone());
+    let driver_cached = cached.is_some();
+    let plan = tokio::task::spawn_blocking(move || match cached {
+        Some(resolution) => timeline_engine::dimension_drive::plan_dimension_edit_with(
+            &events,
+            &pid_for_plan,
+            target,
+            resolution,
+        ),
+        None => plan_dimension_edit(&events, &pid_for_plan, target),
+    })
+    .await
+    .map_err(|e| {
+        ApiError::new(
+            ErrorCode::KernelError,
+            format!("the edit planner stopped: {e}"),
+        )
+    })?;
 
     let plan = match plan {
         Ok(plan) => plan,
@@ -222,6 +329,7 @@ pub async fn edit_dimension(
             "linked": plan.driver.linked,
         },
         "mould": mould,
+        "driver_cached": driver_cached,
     })))
 }
 

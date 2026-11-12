@@ -440,6 +440,55 @@ pub fn plan_dimension_edit(
     target: f64,
 ) -> Result<DimensionEditPlan, DimensionEditRefusal> {
     let (resolution, _stats, probe) = resolve_with_probe(events, pid);
+    solve_for(events, pid, target, resolution, probe.as_ref())
+}
+
+/// [`plan_dimension_edit`] from a driver already found by
+/// [`resolve_dimension_driver`] on the SAME `events` -- the expensive search
+/// runs once (when a dimension is selected, while its new value is typed) and
+/// the edit only solves. The caller keys its cache on the history it resolved
+/// against; a stale resolution is never passed here.
+pub fn plan_dimension_edit_with(
+    events: &[TimelineEvent],
+    pid: &str,
+    target: f64,
+    resolution: DriveResolution,
+) -> Result<DimensionEditPlan, DimensionEditRefusal> {
+    if !matches!(resolution, DriveResolution::Driven { .. }) {
+        return Err(DimensionEditRefusal::NotDriven { resolution });
+    }
+    let probe = chain_probe_for(events, pid);
+    solve_for(events, pid, target, resolution, probe.as_ref())
+}
+
+/// The chain probe for `pid` without the driver search: one geometry replay
+/// plus the chain frames.
+fn chain_probe_for<'a>(events: &'a [TimelineEvent], pid: &'a str) -> Option<ChainProbe<'a>> {
+    let (model, id_remap, skipped) = geometry_replay(events);
+    if !measure_is_sound(&model, skipped) {
+        return None;
+    }
+    let current = measure_dimension(&model, pid)?;
+    let all_params = numeric_parameters(events);
+    let solid = recorded_solid_of(events, &model, &id_remap, pid)?;
+    let chain = chain_sequences(events, solid)?;
+    let frame_at: std::collections::BTreeSet<u64> = all_params
+        .iter()
+        .filter(|p| chain.contains(&p.0))
+        .map(|p| p.0)
+        .collect();
+    ChainProbe::build(events, &chain, &frame_at, pid, current)
+}
+
+/// Secant steps on the driver (and its linked members) until a replay
+/// re-measures `target`.
+fn solve_for(
+    events: &[TimelineEvent],
+    pid: &str,
+    target: f64,
+    resolution: DriveResolution,
+    probe: Option<&ChainProbe<'_>>,
+) -> Result<DimensionEditPlan, DimensionEditRefusal> {
     let DriveResolution::Driven {
         driver, current, ..
     } = &resolution
@@ -472,7 +521,7 @@ pub fn plan_dimension_edit(
             )
         }))
         .collect();
-        let step = match &probe {
+        let step = match probe {
             Some(p) => p.reading(&settings),
             None => reading_with(events, &settings, pid),
         };

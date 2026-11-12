@@ -14,7 +14,7 @@
 use chrono::Utc;
 use serde_json::json;
 use timeline_engine::dimension_drive::{
-    measure_dimension, plan_dimension_edit, resolve_dimension_driver,
+    measure_dimension, plan_dimension_edit, plan_dimension_edit_with, resolve_dimension_driver,
     resolve_dimension_driver_measured, DimensionEditRefusal, DriveResolution,
 };
 use timeline_engine::mould::mould_operation;
@@ -280,4 +280,30 @@ fn coaxial_equal_cutters_are_one_feature_and_move_together() {
     assert!(cert.is_sound(), "both cutters at r 4 rebuild sound");
     let measured = measure_dimension(&model, &pid).expect("same dimension by pid");
     assert!((measured - 8.0).abs() < 1e-9, "measured {measured}");
+}
+
+/// The driver search runs once, when a dimension is selected; the edit then
+/// only solves. A plan from the cached driver equals the plan made from
+/// scratch -- and does no search (it is the same answer, not a shortcut).
+#[test]
+fn a_plan_from_a_cached_driver_equals_the_plan_from_scratch() {
+    let events = plate(3.0);
+    let pid = bore_diameter_pid(&events, 6.0);
+    let resolution = resolve_dimension_driver(&events, &pid);
+    let from_cache = plan_dimension_edit_with(&events, &pid, 8.0, resolution).expect("plannable");
+    let from_scratch = plan_dimension_edit(&events, &pid, 8.0).expect("plannable");
+    assert_eq!(from_cache, from_scratch);
+    // A cached verdict that is not "driven" is refused, never solved.
+    match plan_dimension_edit_with(
+        &events,
+        &pid,
+        8.0,
+        DriveResolution::ReferenceOnly {
+            current: 6.0,
+            reason: "x".into(),
+        },
+    ) {
+        Err(DimensionEditRefusal::NotDriven { .. }) => {}
+        other => panic!("{other:?}"),
+    }
 }
