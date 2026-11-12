@@ -241,6 +241,30 @@ export async function createPartDrawing(
   return id
 }
 
+/** A solid in the active document that a drawing can start from. */
+export interface DocumentPart {
+  /** Kernel solid id. */
+  id: number
+  name: string
+}
+
+/** The active document's parts, from the server (not the viewport's scene
+ *  store, which is empty when the app opens straight into the Drawing
+ *  workspace). */
+export async function listDocumentParts(): Promise<DocumentPart[]> {
+  const r = await fetch(`${API_HOST}/api/agent/parts`)
+  const rows = await jsonOrThrow<{ id: number; name: string }[]>(r, 'listDocumentParts')
+  return rows.map((p) => ({ id: p.id, name: p.name }))
+}
+
+/** Build the standard sheet for kernel solid `solidId` and register it. */
+export async function createSolidDrawing(solidId: number, name?: string): Promise<string> {
+  const qs = name && name.trim() ? `?name=${encodeURIComponent(name.trim())}` : ''
+  const r = await fetch(`${API_HOST}/api/parts/${solidId}/drawing${qs}`, { method: 'POST' })
+  const { id } = await jsonOrThrow<{ id: string }>(r, 'createSolidDrawing')
+  return id
+}
+
 /** Delete a drawing. The server returns 404 on unknown ids. */
 export async function deleteDrawing(id: string): Promise<void> {
   const r = await fetch(`${API_HOST}/api/drawings/${id}`, { method: 'DELETE' })

@@ -39,7 +39,8 @@ import {
   setDrawingDimension,
   setDrawingProjection,
   addView,
-  createPartDrawing,
+  createSolidDrawing,
+  listDocumentParts,
   deleteDrawing,
   downloadDrawing,
   fetchDrawingSvg,
@@ -48,7 +49,6 @@ import {
   removeView,
   renameDrawing,
 } from '@/lib/drawings-api'
-import { useSceneStore } from '@/stores/scene-store'
 import { useDocumentStore } from '@/stores/document-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 
@@ -123,15 +123,17 @@ export function DrawingsWorkspace() {
     position_mm: [number, number]
     scale: number
   } | null>(null)
-  // Parts in this document a drawing can start from (the scene's solids).
-  const sceneObjects = useSceneStore((st) => st.objects)
-  const parts: PartRow[] = useMemo(
-    () =>
-      Array.from(sceneObjects.values())
-        .filter((o) => o.objectType !== 'datum' && o.visible !== false)
-        .map((o) => ({ id: o.id, name: o.name })),
-    [sceneObjects],
-  )
+  // Parts in this document a drawing can start from, asked of the server.
+  const [parts, setParts] = useState<PartRow[]>([])
+  const refreshParts = useCallback(async () => {
+    try {
+      const ps = await listDocumentParts()
+      setParts(ps.map((p) => ({ id: String(p.id), name: p.name })))
+    } catch {
+      // The menu then says there are no parts; the server is unreachable.
+      setParts([])
+    }
+  }, [])
 
   // ── Editing the part from the sheet ──────────────────────────────
   // Clicking a dimension opens this editor at the cursor. Applying a new
@@ -282,6 +284,7 @@ export function DrawingsWorkspace() {
     // that sheet instead of the first in the list.
     const pending = useDocModeStore.getState().consumePendingDrawing()
     void refreshList(pending ?? undefined)
+    void refreshParts()
     // refreshList captures activeId for the deleted-id check; we only
     // want this on mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -305,7 +308,7 @@ export function DrawingsWorkspace() {
     async (part: PartRow) => {
       setError(null)
       try {
-        const id = await createPartDrawing(part.id, part.name)
+        const id = await createSolidDrawing(Number(part.id), part.name)
         await refreshList(id)
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
@@ -860,7 +863,7 @@ export function DrawingsWorkspace() {
                 </div>
                 {dimEdit.busy && dimEdit.startedAt !== null && (
                   <div className="mt-2 text-muted-foreground">
-                    Rebuilding the part and its sheet\u2026{' '}
+                    Rebuilding the part and its sheet…{' '}
                     <span className="font-mono">
                       {Math.floor((Date.now() - dimEdit.startedAt) / 1000)} s
                     </span>
@@ -868,7 +871,7 @@ export function DrawingsWorkspace() {
                 )}
                 {dimEdit.refusal && (
                   <div className="mt-2 flex gap-1 text-red-700">
-                    <span aria-hidden>\u2717</span>
+                    <span aria-hidden>✗</span>
                     <span>{dimEdit.refusal}</span>
                   </div>
                 )}
