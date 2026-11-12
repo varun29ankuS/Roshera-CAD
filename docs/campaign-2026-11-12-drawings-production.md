@@ -56,6 +56,46 @@ measured from geometry; a hidden dimension that leaves a feature unspecified is
 named by the sheet certificate. Datum/baseline choice joins P4 + P7. Built
 after the frame cache (pinned edits replay on every rebuild).
 
+## Deep UX pass -- engineer-first (Varun, 11-12)
+
+"I want this to be really close to original CAD softwares.. so people can
+adopt ... the ui and ux has to cater to the engineers .. not the other way
+around." / "The ai button and the whole ux of selecting a model/ and the ui
+has to improve drastically too."
+
+After the functional gaps close. Each workflow is benchmarked against how
+SolidWorks / NX / Onshape / Fusion do it, then rebuilt:
+
+| Workflow | Known problems today |
+|----------|----------------------|
+| AI button + agent panel | Button and panel feel bolted on; model/provider choice is unclear; 70-120 s turns with little feedback; chat focus leaks keys to viewport shortcuts. |
+| Choosing a model | Selection flow unclear (which model, what it costs, what it is good at). |
+| Drawing window | Reworked 11-12 (overlays); still: no drag of views, no per-view scale, hole-table rows not editable, view placement not projection-correct. |
+| Dimension change | Reworked 11-12 (context, progress, Stop); edit still ~45 s. |
+| Timeline | Must play like a video (frames landed 11-12); the movie UI (chapters left, scrubber bottom) is designed, not built. |
+| Modelling | Feature edit, sketch, select-a-face-and-build: not yet reviewed against CAD conventions. |
+
+## Pilot app (Varun, 11-12): desktop app for Windows AND macOS -- after the work is complete
+
+"we have to build this into an app... I have to run pilots." Decided: a
+desktop app for Windows and macOS, not hosted web -- part files stay on the
+engineer's machine (manufacturers' IP), internet only for the AI agent.
+Varun: "we will do that only after we complete the work.. and apps would have
+to be both windows and mac". Tauri covers both from one codebase.
+
+| Step | Done when |
+|------|-----------|
+| Shell: Tauri (Rust, same toolchain) hosting the built frontend; the release `api-server` runs as a sidecar on a free local port, started/stopped with the app. | Double-click opens Roshera with no terminal, no Node, no cargo. |
+| Data lives in the platform's app-data folder (`%APPDATA%\Roshera` on Windows, `~/Library/Application Support/Roshera` on macOS); nothing written next to the app. | Uninstall/reinstall keeps the engineer's work. |
+| First run: a setup screen for the AI provider key (stored in the OS keychain (Windows Credential Manager / macOS Keychain)), with the app fully usable without it (modelling, drawings, STEP). | A pilot without a key still models and draws. |
+| Shipped config: auth on, no `ROSHERA_DEV_INSECURE`, no dev keys in the bundle. | A scan of the installer finds no secrets. |
+| Installers: signed MSI/NSIS for Windows; signed + notarized .dmg for macOS (Apple Silicon and Intel); auto-update from a release feed. | A pilot on either OS gets fixes without reinstalling. |
+| Crash + error reporting to a local log the engineer can send us (opt-in upload). | A pilot problem arrives with its log. |
+
+Order: LAST -- after the functional gaps and the deep engineer-first UX pass
+are complete (Varun). The kernel already builds on both OSes; macOS needs a
+CI runner for the notarized build.
+
 ## Gaps carried into the campaign
 
 - BOOL-COAX-1: an overlapping coaxial cutter through a plate+boss union certifies unsound.

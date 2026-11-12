@@ -79,6 +79,37 @@ use uuid::Uuid;
 
 // ── Manager ─────────────────────────────────────────────────────────
 
+/// Rebuild every sheet `events` records -- each re-derived from the part as it
+/// stands at its position in the history, then its recorded edits (rename,
+/// title block, views added and removed, delete) applied in order -- and land
+/// them in the registry under the active document. Called at boot and after
+/// every replay that replaces the live model (edit, undo, redo, switch), so a
+/// restart keeps the sheets and a dimension edit keeps their title block and
+/// added views (`timeline_engine::drawing_history`).
+pub(crate) async fn rebuild_sheets_from_history(
+    state: &AppState,
+    events: Vec<timeline_engine::TimelineEvent>,
+) {
+    let frames = Arc::clone(&state.frames);
+    let built = tokio::task::spawn_blocking(move || {
+        timeline_engine::drawing_history::rebuild_drawings(&events, &frames)
+    })
+    .await;
+    match built {
+        Ok(rebuild) => {
+            for issue in &rebuild.issues {
+                tracing::warn!(target: "drawings", "{issue}");
+            }
+            let document_id = state.active_document.read().await.clone();
+            state.drawings.reconcile_from_replay(
+                rebuild.drawings,
+                crate::part_mgr::ModelKey::Legacy { document_id },
+            );
+        }
+        Err(e) => tracing::error!(target: "drawings", error = %e, "sheet rebuild task failed"),
+    }
+}
+
 /// ISO 7200 date of issue: the day the sheet was created, from the server
 /// clock, as ISO 8601 (`YYYY-MM-DD`). Left alone when the caller set one.
 fn stamp_issue_date(drawing: &mut Drawing) {
@@ -1538,6 +1569,10 @@ async fn create_part_drawing_inner(
     // outline, sheet utilization).
     let quality = verify_drawing(&drawing);
 
+    // Stable view ids (derived from the drawing id + view name): a recorded
+    // "remove view" then still matches when the sheet is rebuilt from history.
+    let mut drawing = drawing;
+    drawing.stabilize_view_ids();
     let drawing_id = state.drawings.insert(drawing, owner.clone());
     // L3 (2026-08-16 residuals): this route also gates on `acknowledge_
     // unsound` (`refuse_unsound_solid` above), and its event ALREADY

@@ -11167,6 +11167,54 @@ async fn an_edit_from_the_sheet_pushes_the_new_scene_to_the_viewport() {
     );
 }
 
+/// A dimension edit rebuilds the part and its sheets -- and keeps what the
+/// engineer typed into the title block. Before, the edit's reconcile
+/// replaced the sheet with a fresh derivation: material and approval gone.
+#[tokio::test]
+async fn a_dimension_edit_keeps_the_title_block() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (_, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let (ts, tb) = dispatch(
+        &state,
+        crate::durability_boot_tests::patch(
+            &format!("/api/drawings/{drawing_id}/title-block"),
+            json!({ "material": "S275", "approved_by": "V. Sharma" }),
+        ),
+    )
+    .await;
+    assert_eq!(ts, StatusCode::OK, "{tb}");
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let (dim_id, _) = drawing_dimension(&sheet, "diameter", 6.0).expect("the Ø6 bore");
+    let (es, edited) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/drawings/{drawing_id}/dimensions/{dim_id}"),
+            json!({ "value": 8.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(es, StatusCode::OK, "{edited}");
+    let (_, after) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert_eq!(
+        after["title_block"]["material"], "S275",
+        "{}",
+        after["title_block"]
+    );
+    assert_eq!(after["title_block"]["approved_by"], "V. Sharma");
+}
+
 /// A dimension nothing on the timeline drives is refused as reference-only,
 /// never "edited" by scaling or approximation.
 #[tokio::test]

@@ -916,8 +916,19 @@ async fn replay_session_to_model(
     }
     let outcome = commit_prepared_replay(state, &mut model_guard, prepared).await;
     drop(model_guard);
-    // The live model was replaced: show it in every open viewport.
+    // The live model was replaced: show it in every open viewport, and
+    // rebuild the sheets from the same history position.
     crate::broadcast_scene_sync(state).await;
+    let events = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .unwrap_or_default();
+        all.sort_by_key(|e| e.sequence_number);
+        all.truncate(limit);
+        all
+    };
+    crate::drawing_mgr::rebuild_sheets_from_history(state, events).await;
     Ok(outcome)
 }
 
@@ -2902,15 +2913,10 @@ pub async fn mould_parameter(
     // part-scoping input at all, replaying the CURRENTLY ACTIVE document's
     // own branch/timeline (`state.timeline`), so a drawing surfacing here
     // for the first time can only ever be that document's own.
-    {
-        let mould_document_id = state.active_document.read().await.clone();
-        state.drawings.reconcile_from_replay(
-            cand_drawings.drawings,
-            crate::part_mgr::ModelKey::Legacy {
-                document_id: mould_document_id,
-            },
-        );
-    }
+    // The sheets were rebuilt from history by the live reconcile above
+    // (`replay_session_to_model`), edits included; `cand_drawings` (creation
+    // only) would overwrite the title block and added views.
+    let _ = &cand_drawings;
 
     let session_key = session_uuid.to_string();
     let _ = state

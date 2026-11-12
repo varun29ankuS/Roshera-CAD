@@ -943,6 +943,15 @@ pub struct Drawing {
     pub render_facts: RenderFacts,
 }
 
+/// A view's stable identity: derived from its drawing and its name, so the
+/// same view of a re-derived sheet gets the same id. A sheet rebuilt from its
+/// history (restart, undo, a dimension edit) can then replay "remove view X"
+/// -- random ids changed on every derivation and the removal could never be
+/// matched.
+pub fn stable_view_id(drawing: Uuid, view_name: &str) -> Uuid {
+    Uuid::new_v5(&drawing, view_name.as_bytes())
+}
+
 impl Drawing {
     fn default_unit_note() -> String {
         "ALL DIMENSIONS IN MILLIMETRES UNLESS OTHERWISE STATED.".to_string()
@@ -973,6 +982,16 @@ impl Drawing {
             round_part: None,
             hole_features: None,
             render_facts: RenderFacts::default(),
+        }
+    }
+
+    /// Give every view its [`stable_view_id`] (derived from this drawing's
+    /// id and the view's name). Called wherever a sheet is derived from a
+    /// part -- live and on replay -- so recorded view ids stay valid.
+    pub fn stabilize_view_ids(&mut self) {
+        let did = self.id.0;
+        for v in &mut self.views {
+            v.id = ProjectedViewId(stable_view_id(did, &v.name));
         }
     }
 

@@ -5573,3 +5573,79 @@ async fn duplicate_sequence_rows_are_a_typed_quarantine_never_a_silent_pick() {
         "the break is at the duplicated sequence; body = {body}"
     );
 }
+
+/// A drawing survives a restart, with its edits. Before, the history recorded
+/// the sheet's creation, its title block and its added views, but boot rebuilt
+/// only the geometry: after a restart the part was back and every sheet was
+/// gone.
+#[tokio::test]
+async fn a_drawing_and_its_edits_survive_restart() {
+    let path = temp_db_path();
+    let (drawing_id, total) = {
+        let state = build_state(open_db(&path).await, true).await;
+        let (s, b) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({"width": 40.0, "depth": 30.0, "height": 10.0}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "box: {b}");
+        let solid = b["solid_id"].as_u64().expect("solid id");
+        let (s, created) = dispatch(
+            &state,
+            post(&format!("/api/parts/{solid}/drawing"), json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "drawing: {created}");
+        let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+        let (s, b) = dispatch(
+            &state,
+            patch(
+                &format!("/api/drawings/{drawing_id}/title-block"),
+                json!({ "material": "S275", "approved_by": "V. Sharma" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "title block: {b}");
+        let (_, sheet) = dispatch(&state, get(&format!("/api/drawings/{drawing_id}"))).await;
+        let front = sheet["views"]
+            .as_array()
+            .and_then(|vs| vs.iter().find(|v| v["projection"]["kind"] == "front"))
+            .and_then(|v| v["id"].as_str())
+            .expect("FRONT")
+            .to_string();
+        let (s, b) = dispatch(
+            &state,
+            post(
+                &format!("/api/drawings/{drawing_id}/views"),
+                json!({ "name": "LEFT", "like_view": front, "projection": {"kind": "left"} }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "add view: {b}");
+        (drawing_id, flush_and_count(&state).await)
+    };
+    assert!(total > 0);
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    let (s, sheet) = dispatch(&state2, get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the sheet is back after the restart: {sheet}"
+    );
+    assert_eq!(
+        sheet["title_block"]["material"], "S275",
+        "{}",
+        sheet["title_block"]
+    );
+    assert_eq!(sheet["title_block"]["approved_by"], "V. Sharma");
+    assert!(
+        sheet["views"]
+            .as_array()
+            .is_some_and(|vs| vs.iter().any(|v| v["name"] == "LEFT")),
+        "the added view is back"
+    );
+}

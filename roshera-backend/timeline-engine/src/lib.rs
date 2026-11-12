@@ -25,6 +25,7 @@ pub mod cache;
 pub mod dependency_graph;
 pub mod dependency_projection;
 pub mod dimension_drive;
+pub mod drawing_history;
 pub mod entity_mapping;
 pub mod event_certificate;
 pub mod execution;

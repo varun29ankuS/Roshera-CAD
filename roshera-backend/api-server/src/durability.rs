@@ -1399,6 +1399,10 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     //    replay `id_remap`.
     restore_side_channels(state, &served, &id_remap).await;
 
+    // 10. The sheets: rebuilt from their recorded history (creation + edits),
+    //     so a restart no longer loses every drawing.
+    crate::drawing_mgr::rebuild_sheets_from_history(state, served.clone()).await;
+
     status
 }
 
