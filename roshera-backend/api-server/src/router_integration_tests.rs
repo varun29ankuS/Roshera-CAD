@@ -11077,6 +11077,9 @@ async fn adding_a_view_like_an_existing_one_places_itself() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "add view: {body}");
+    let aligned = body["aligned"]
+        .as_bool()
+        .expect("the response says whether it is aligned");
 
     // Neither a source nor a view to copy: refused by name.
     let (bad, refusal) = dispatch(
@@ -11111,6 +11114,24 @@ async fn adding_a_view_like_an_existing_one_places_itself() {
             !new_rect.intersects(&other.bbox, 0.0),
             "the new view overlaps view {:?}",
             other.owner_view
+        );
+    }
+    if aligned {
+        // Third angle (the default): LEFT on FRONT's row, to its left.
+        let fi = drawing
+            .views
+            .iter()
+            .position(|v| v.projection == geometry_engine::drawing::types::ProjectionType::Front)
+            .expect("FRONT");
+        let front = geo
+            .iter()
+            .find(|i| i.owner_view == Some(fi))
+            .expect("front geometry")
+            .bbox;
+        assert!(new_rect.x1 < front.x0, "aligned LEFT is left of FRONT");
+        assert!(
+            ((new_rect.y0 + new_rect.y1) - (front.y0 + front.y1)).abs() < 1e-6,
+            "aligned LEFT is on FRONT's row"
         );
     }
 }

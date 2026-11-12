@@ -400,11 +400,16 @@ export function DrawingsWorkspace() {
       setError(null)
       setViewsBusy(true)
       try {
-        await addView(activeId, {
+        const { aligned } = await addView(activeId, {
           name: label.toUpperCase(),
           like_view: like.id,
           projection: { kind },
         })
+        if (!aligned && kind !== 'isometric') {
+          setEditNote(
+            `No room ${label === 'Left' || label === 'Right' ? 'beside' : 'above or below'} ${like.name} for ${label.toUpperCase()}; placed in the nearest free space. A larger sheet keeps views aligned.`,
+          )
+        }
         await refreshActive(activeId)
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))

@@ -512,6 +512,10 @@ fn default_scale() -> f64 {
 #[derive(Debug, Clone, Serialize)]
 pub struct AddViewResponse {
     pub view_id: Uuid,
+    /// True when the view sits where the projection convention puts it
+    /// (aligned with the view it was taken from); false when that line had
+    /// no room and the nearest free spot was used.
+    pub aligned: bool,
 }
 
 /// Query parameters accepted by every sheet-export route
@@ -934,9 +938,24 @@ pub async fn add_view(
     // No position given: the kernel finds free space for the view near the
     // one it was taken from, or refuses -- a view is never stacked on another.
     let mut view = view;
+    // Whether the view sits where the projection convention puts it.
+    let mut aligned = req.position_mm.is_some();
     if req.position_mm.is_none() {
         let snapshot = handle.read().await.clone();
-        match geometry_engine::drawing::layout::free_view_position(&snapshot, &view, near) {
+        // Projection convention first: third angle puts LEFT to the left of
+        // the view it was taken from, on its row (first angle mirrors it);
+        // only when that line has no room does the nearest free spot do.
+        let aligned_pos = near.and_then(|parent| {
+            let side = geometry_engine::drawing::layout::ViewSide::for_projection(
+                req.projection,
+                snapshot.projection,
+            )?;
+            geometry_engine::drawing::layout::aligned_view_position(&snapshot, &view, parent, side)
+        });
+        aligned = aligned_pos.is_some();
+        match aligned_pos.or_else(|| {
+            geometry_engine::drawing::layout::free_view_position(&snapshot, &view, near)
+        }) {
             Some(p) => view.position_mm = p,
             None => {
                 return Err(ApiError::new(
@@ -979,7 +998,10 @@ pub async fn add_view(
             .with_output_view(view_id.0),
     );
 
-    Ok(Json(AddViewResponse { view_id: view_id.0 }))
+    Ok(Json(AddViewResponse {
+        view_id: view_id.0,
+        aligned,
+    }))
 }
 
 pub async fn remove_view(
@@ -3131,6 +3153,7 @@ mod tests {
     fn add_view_response_serializes_uuid() {
         let resp = AddViewResponse {
             view_id: Uuid::nil(),
+            aligned: false,
         };
         let v = serde_json::to_value(resp).unwrap();
         assert_eq!(

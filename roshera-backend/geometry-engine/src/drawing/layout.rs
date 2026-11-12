@@ -355,6 +355,112 @@ pub fn free_view_position(
     best.map(|(p, _)| p)
 }
 
+/// Which side of its parent view a projected view belongs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewSide {
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
+impl ViewSide {
+    /// Where a view of `kind` goes relative to FRONT under `angle`: third
+    /// angle draws a view on the side it is seen from (LEFT to the left, TOP
+    /// above); first angle on the opposite side. `None` for views with no
+    /// orthographic place (front, isometric, custom).
+    pub fn for_projection(
+        kind: super::types::ProjectionType,
+        angle: super::types::ProjectionAngle,
+    ) -> Option<Self> {
+        use super::types::{ProjectionAngle as A, ProjectionType as P};
+        let third = match kind {
+            P::Left => ViewSide::Left,
+            P::Right => ViewSide::Right,
+            P::Top => ViewSide::Above,
+            P::Bottom => ViewSide::Below,
+            _ => return None,
+        };
+        Some(match angle {
+            A::Third => third,
+            A::First => match third {
+                ViewSide::Left => ViewSide::Right,
+                ViewSide::Right => ViewSide::Left,
+                ViewSide::Above => ViewSide::Below,
+                ViewSide::Below => ViewSide::Above,
+            },
+        })
+    }
+}
+
+/// The `position_mm` that puts `view` on the `side` of view `parent`,
+/// ALIGNED with it (same row for left/right, same column for above/below)
+/// as orthographic projection requires, in the nearest free spot along that
+/// line -- clear of everything laid out, inside the frame. `None` when that
+/// line has no room; the caller then falls back to [`free_view_position`]
+/// and says so.
+pub fn aligned_view_position(
+    drawing: &Drawing,
+    view: &ProjectedView,
+    parent: usize,
+    side: ViewSide,
+) -> Option<[f64; 2]> {
+    let sheet_h = drawing.sheet_size.height();
+    let mut probe = view.clone();
+    probe.position_mm = [0.0, 0.0];
+    let base = view_geometry_rect(&probe, sheet_h)?;
+    let anchor = view_geometry_rect(drawing.views.get(parent)?, sheet_h)?;
+    let frame = super::svg::frame_rect(&drawing.sheet_size);
+    let pad = VIEW_PLACEMENT_CLEARANCE_MM;
+    let obstacles: Vec<Rect2> = compute_layout(drawing)
+        .items
+        .into_iter()
+        .filter(|i| i.kind != SheetItemKind::ZoneRef)
+        .map(|i| i.bbox)
+        .collect();
+    let (w, h) = (base.width(), base.height());
+    let (acx, acy) = (0.5 * (anchor.x0 + anchor.x1), 0.5 * (anchor.y0 + anchor.y1));
+    let free = |x0: f64, y0: f64| -> bool {
+        let r = Rect2 {
+            x0,
+            y0,
+            x1: x0 + w,
+            y1: y0 + h,
+        };
+        r.x0 >= frame.x0 + 2.0
+            && r.x1 <= frame.x1 - 2.0
+            && r.y0 >= frame.y0 + 2.0
+            && r.y1 <= frame.y1 - 2.0
+            && obstacles.iter().all(|o| {
+                !Rect2 {
+                    x0: r.x0 - pad,
+                    y0: r.y0 - pad,
+                    x1: r.x1 + pad,
+                    y1: r.y1 + pad,
+                }
+                .intersects(o, 0.0)
+            })
+    };
+    // Walk outward from the parent along the alignment line.
+    let mut k = 0usize;
+    loop {
+        let step = k as f64 * VIEW_PLACEMENT_STEP_MM;
+        let (x0, y0) = match side {
+            ViewSide::Left => (anchor.x0 - pad - w - step, acy - 0.5 * h),
+            ViewSide::Right => (anchor.x1 + pad + step, acy - 0.5 * h),
+            ViewSide::Above => (acx - 0.5 * w, anchor.y0 - pad - h - step),
+            ViewSide::Below => (acx - 0.5 * w, anchor.y1 + pad + step),
+        };
+        if x0 < frame.x0 || x0 + w > frame.x1 || y0 < frame.y0 || y0 + h > frame.y1 {
+            return None;
+        }
+        if free(x0, y0) {
+            return Some([x0 - base.x0, base.y0 - y0]);
+        }
+        k += 1;
+    }
+}
+
 pub(crate) fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<Rect2> {
     let mut x0 = f64::INFINITY;
     let mut y0 = f64::INFINITY;

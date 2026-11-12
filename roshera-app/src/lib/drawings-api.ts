@@ -320,14 +320,17 @@ export async function addView(
     position_mm?: [number, number]
     scale?: number
   },
-): Promise<string> {
+): Promise<{ viewId: string; aligned: boolean }> {
   const r = await fetch(`${API_HOST}/api/drawings/${drawingId}/views`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  const { view_id } = await jsonOrThrow<{ view_id: string }>(r, 'addView')
-  return view_id
+  const { view_id, aligned } = await jsonOrThrow<{ view_id: string; aligned?: boolean }>(
+    r,
+    'addView',
+  )
+  return { viewId: view_id, aligned: aligned ?? true }
 }
 
 /** Remove a view from a drawing. */
