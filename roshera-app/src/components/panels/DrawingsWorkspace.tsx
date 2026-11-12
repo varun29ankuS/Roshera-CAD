@@ -194,6 +194,9 @@ export function DrawingsWorkspace() {
   }, [dimEdit?.busy])
   // One-line outcome of the last edit, e.g. "Ø6.00 -> 8 (radius 3 -> 4)".
   const [editNote, setEditNote] = useState<string | null>(null)
+  // A note is either a confirmation (✓) or information the engineer should
+  // read (ⓘ) -- a fallback is not a success.
+  const [noteKind, setNoteKind] = useState<'done' | 'info'>('done')
   const [projectionBusy, setProjectionBusy] = useState(false)
 
   // ── Zoom / pan ────────────────────────────────────────────────────
@@ -309,6 +312,24 @@ export function DrawingsWorkspace() {
     }
   }, [])
 
+  // A document switch (including the app reopening the last document right
+  // after load, which can finish AFTER this panel first listed sheets) must
+  // reload the sheet list and the parts: otherwise the panel shows the
+  // previous document's sheets and loading them fails (409).
+  const documentEpoch = useDocumentStore((st) => st.epoch)
+  const firstEpoch = useRef(documentEpoch)
+  useEffect(() => {
+    if (documentEpoch === firstEpoch.current) return
+    setActiveId(null)
+    setActiveDrawing(null)
+    setSvg('')
+    setError(null)
+    void refreshList()
+    void refreshParts()
+    // Only a change of document triggers this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [documentEpoch])
+
   useEffect(() => {
     // The viewport "Create Drawing" flow stashes the new drawing id and
     // flips the workspace mode; consume it here so this mount lands on
@@ -405,7 +426,10 @@ export function DrawingsWorkspace() {
           like_view: like.id,
           projection: { kind },
         })
+        // The view is back (or new): the last removal's Undo no longer applies.
+        setRemovedView(null)
         if (!aligned && kind !== 'isometric') {
+          setNoteKind('info')
           setEditNote(
             `No room ${label === 'Left' || label === 'Right' ? 'beside' : 'above or below'} ${like.name} for ${label.toUpperCase()}; placed in the nearest free space. A larger sheet keeps views aligned.`,
           )
@@ -693,6 +717,7 @@ export function DrawingsWorkspace() {
     try {
       const r = await setDrawingDimension(activeDrawing.id, dimEdit.dim.id, value, abort.signal)
       setDimEdit(null)
+      setNoteKind('done')
       const fmt = (n: number) => String(Number(n.toFixed(4)))
       const steps = [r.driver.sequence, ...(r.driver.linked ?? []).map((l) => l.target_sequence)]
       const where = steps.length > 1 ? `steps ${steps.join(' + ')}` : `step ${steps[0]}`
@@ -932,7 +957,9 @@ export function DrawingsWorkspace() {
 
             {editNote && (
               <div className="absolute top-14 left-3 z-20 flex items-center gap-2 bg-card border border-border rounded-md shadow-md px-2 py-1 text-xs">
-                <span aria-hidden className="text-green-700">✓</span>
+                <span aria-hidden className={noteKind === 'done' ? 'text-green-700' : 'text-sky-700'}>
+                  {noteKind === 'done' ? '✓' : 'ⓘ'}
+                </span>
                 <span className="font-mono">{editNote}</span>
                 <button
                   type="button"
