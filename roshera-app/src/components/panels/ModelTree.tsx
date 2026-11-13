@@ -1099,7 +1099,7 @@ export function ModelTree({
   }, [])
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div className="flex min-h-0 flex-col">
       {/* Consolidated header chip.
           ─ Outer area is the expand/collapse toggle (one click target
             mirrors the previous single-mode behaviour).

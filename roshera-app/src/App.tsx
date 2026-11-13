@@ -183,7 +183,9 @@ export function App() {
                   // of behind a slab. No blur: blur over a CAD viewport smears
                   // the one thing the app exists to show, and the point here is
                   // to see the geometry, not a frosted version of it.
-                  'absolute bottom-2 left-2 top-2 z-10 flex flex-col overflow-hidden rounded border border-border/70 bg-card/40 transition-[width] duration-200',
+                  // A card only as tall as its features (the approved mockup),
+                  // capped above the floating history; a long tree scrolls.
+                  'absolute left-2 top-2 z-10 flex max-h-[calc(100%-7.5rem)] flex-col overflow-hidden rounded-lg border border-border/70 bg-card/90 shadow-sm transition-[width] duration-200',
                   browserOpen ? 'w-56' : 'w-10',
                 )}
               >
