@@ -6,9 +6,11 @@ import {
   FileDown,
   FileUp,
   ToolIcons,
+  type IconProps,
   type LucideIcon,
 } from '@/components/ui/icons'
 import { useExtrudeStore } from '@/stores/extrude-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useSceneStore, type TransformTool } from '@/stores/scene-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { processBlackboardMessage } from '@/lib/ai-client'
@@ -1082,18 +1084,6 @@ function toggleSectionViewWithFeedback() {
 }
 
 /**
- * Placeholder for modify ops that don't yet have a direct REST
- * endpoint. Tells the user the feature is pending instead of routing
- * through the NLP pipeline (which 5xxs without `ANTHROPIC_API_KEY`)
- * and surfacing a confusing "Failed to reach backend" error.
- */
-function notYetWired(feature: string, reason?: string) {
-  const { addLine } = useBlackboardStore.getState()
-  const tail = reason ? ` — ${reason}` : ''
-  addLine(`${feature} isn't wired up yet${tail}. Coming in a later update.`, 'system')
-}
-
-/**
  * Export the current selection (or whole scene if nothing is selected)
  * directly via `POST /api/export`. Bypasses the NLP pipeline so a
  * missing `ANTHROPIC_API_KEY` (which 5xxs the AI command path) can't
@@ -1118,8 +1108,62 @@ async function sendDirectExport(format: string) {
 
 // ─── Flyout group — pure CSS hover, no timers ────────────────────
 
-function FlyoutGroup({ group, openId, onToggle }: {
+/** One entry of the rail: a heading, a tool, or a tool with variants. */
+type RailEntry =
+  | { kind: 'cap'; label: string }
+  | { kind: 'tool'; item: ToolItem }
+  | { kind: 'group'; group: ToolGroup; label: string }
+
+const RAIL_BUTTON =
+  'cad-focus relative flex w-[52px] shrink-0 flex-col items-center gap-px rounded-md py-[3px] transition-colors cursor-pointer'
+
+/** A tool on the rail: its icon and name; amber when it is the active tool. */
+function RailTool({ item }: { item: ToolItem }) {
+  return (
+    <button
+      type="button"
+      onClick={item.action}
+      title={item.shortcut ? `${item.label} · ${item.shortcut}` : item.label}
+      aria-label={item.label}
+      aria-pressed={item.active || undefined}
+      className={cn(
+        RAIL_BUTTON,
+        item.active ? 'bg-[var(--cad-selected-wash)] text-foreground' : 'text-foreground/85 hover:bg-accent',
+      )}
+    >
+      <item.icon size={22} />
+      <span className="w-full truncate text-center text-[10.5px] leading-tight">{item.label}</span>
+    </button>
+  )
+}
+
+/** DFM: a part checked against a process's rules (drawn in the tool icons'
+ *  style: yellow body, ink outline, a green tick). */
+function DfmIcon({ size = 24, className }: IconProps) {
+  return (
+    <svg width={Number(size)} height={Number(size)} viewBox="0 0 28 28" className={className} aria-hidden="true">
+      <rect x="5" y="7" width="18" height="14" rx="2" fill="#F2A516" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M9 11h10M9 14h7M9 17h5" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="21" cy="20" r="4" fill="#3A9B5C" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M19.3 20l1.2 1.2 2.2-2.4" fill="none" stroke="#fff" strokeWidth="1.2" />
+    </svg>
+  )
+}
+
+/** Drawing: a sheet with a view and a title block. */
+function DrawingIcon({ size = 24, className }: IconProps) {
+  return (
+    <svg width={Number(size)} height={Number(size)} viewBox="0 0 28 28" className={className} aria-hidden="true">
+      <rect x="5" y="4" width="18" height="20" rx="1.5" fill="#fff" stroke="currentColor" strokeWidth="1.4" />
+      <rect x="8" y="8" width="7" height="6" fill="#F2A516" stroke="currentColor" strokeWidth="1" />
+      <path d="M8 18h12M17 9h3M17 12h3" stroke="currentColor" strokeWidth="1.2" />
+    </svg>
+  )
+}
+
+function FlyoutGroup({ group, label, openId, onToggle }: {
   group: ToolGroup
+  label: string
   openId: string | null
   onToggle: (id: string) => void
 }) {
@@ -1139,31 +1183,22 @@ function FlyoutGroup({ group, openId, onToggle }: {
     <div className="relative">
       <button
         ref={triggerRef}
+        type="button"
         onClick={() => onToggle(group.id)}
         className={cn(
-          // w-16, not w-14: at the 11px type floor 'Operations' and
-          // 'Manufacturing' no longer fit 56px and were ellipsising away their
-          // own meaning. Widening the rail by 8px is cheaper than abbreviating
-          // every label to fit a number nobody chose deliberately.
-          'cad-focus w-16 py-2 flex flex-col items-center justify-center rounded-lg transition-colors cursor-pointer gap-1',
-          anyActive && !isOpen && 'bg-primary/20 text-primary',
+          RAIL_BUTTON,
           isOpen && 'bg-accent text-foreground',
-          !anyActive && !isOpen && 'text-muted-foreground hover:text-foreground hover:bg-accent',
+          anyActive && !isOpen && 'bg-[var(--cad-selected-wash)] text-foreground',
+          !anyActive && !isOpen && 'text-foreground/85 hover:bg-accent',
         )}
         title={group.tooltip}
         aria-label={group.tooltip}
         aria-expanded={isOpen}
       >
-        <group.icon size={32} />
-        {/* The rail is 56px and the label is derived by taking the tooltip's
-            first word, which is fine for "Transform" and "Create" and clips
- "Manufacturing" mid-word. Deriving a label by splitting a sentence
-            is the fragile part — it works until a word is long — so the label
-            truncates with an ellipsis instead of being cut off at the paint,
-            and the full text stays on `title`/`aria-label` above. */}
-        <span className="w-full truncate text-center text-[11px] leading-none tracking-wide">
-          {group.tooltip.split(' ')[0]}
-        </span>
+        <group.icon size={22} />
+        <span className="w-full truncate text-center text-[10.5px] leading-tight">{label}</span>
+        {/* Variants inside: the small corner mark, as CAD toolbars show it. */}
+        <span aria-hidden className="absolute right-1 top-1 text-[8px] leading-none text-muted-foreground">▸</span>
       </button>
 
       {/* Portal to body so Three.js canvas cannot intercept pointer events */}
@@ -1216,6 +1251,8 @@ export function ToolBar() {
   const selectionMode = useSceneStore((s) => s.selectionMode)
   const setSelectionMode = useSceneStore((s) => s.setSelectionMode)
   const selectedIds = useSceneStore((s) => s.selectedIds)
+  const docMode = useDocModeStore((s) => s.mode)
+  const setDocMode = useDocModeStore((s) => s.setMode)
   const showDimensions = useSceneStore((s) => s.showDimensions)
   const toggleDimensions = useSceneStore((s) => s.toggleDimensions)
   const [openId, setOpenId] = useState<string | null>(null)
@@ -1278,240 +1315,213 @@ export function ToolBar() {
     return () => document.removeEventListener('pointerdown', onPointerDown, true)
   }, [openId])
 
-  const groups: ToolGroup[] = [
-    // 1. Pointer / Transform / Selection — the core interaction
-    {
-      id: 'interact',
-      icon: MousePointer2,
-      tooltip: 'Transform & Selection',
-      sections: [
-        {
-          label: 'Transform',
-          items: [
-            { icon: MousePointer2, label: 'Select', shortcut: 'V', active: activeTool === 'select', action: () => handleToolChange('select') },
-            { icon: ToolIcons.translate, label: 'Translate', shortcut: 'G', active: activeTool === 'translate', action: () => handleToolChange('translate') },
-            { icon: ToolIcons.rotate, label: 'Rotate', shortcut: 'R', active: activeTool === 'rotate', action: () => handleToolChange('rotate') },
-            { icon: ToolIcons.mirror, label: 'Mirror', action: () => sendDirectMirror('xy') },
-          ],
-        },
-        {
-          label: 'Selection Mode',
-          items: [
-            { icon: ToolIcons.selectObject, label: 'Object', shortcut: '1', active: selectionMode === 'object', action: () => setSelectionMode('object') },
-            { icon: ToolIcons.selectFace, label: 'Face', shortcut: '2', active: selectionMode === 'face', action: () => setSelectionMode('face') },
-            { icon: ToolIcons.selectEdge, label: 'Edge', shortcut: '3', active: selectionMode === 'edge', action: () => setSelectionMode('edge') },
-            { icon: ToolIcons.selectVertex, label: 'Vertex', shortcut: '4', active: selectionMode === 'vertex', action: () => setSelectionMode('vertex') },
-          ],
-        },
-      ],
-    },
-
-    // 2. Create — primitives + sketch
-    {
-      id: 'create',
-      icon: ToolIcons.box,
-      tooltip: 'Create Geometry',
-      sections: [
-        {
-          label: 'Primitives',
-          items: [
-            { icon: ToolIcons.box, label: 'Box', action: () => sendDirectGeometry('box', { width: 10, height: 10, depth: 10 }) },
-            { icon: ToolIcons.sphere, label: 'Sphere', action: () => sendDirectGeometry('sphere', { radius: 5 }) },
-            { icon: ToolIcons.cylinder, label: 'Cylinder', action: () => sendDirectGeometry('cylinder', { radius: 5, height: 10 }) },
-            { icon: ToolIcons.cone, label: 'Cone', action: () => sendDirectGeometry('cone', { radius: 5, height: 10 }) },
-            { icon: ToolIcons.torus, label: 'Torus', action: () => sendDirectGeometry('torus', { major_radius: 8, minor_radius: 2 }) },
-          ],
-        },
-        {
-          label: 'Sketch',
-          items: [
-            { icon: ToolIcons.sketch, label: 'New Sketch', shortcut: 'K', action: () => useSceneStore.getState().enterSketch('xy', 'polyline') },
-            { icon: ToolIcons.polyline, label: 'Polyline', action: () => useSceneStore.getState().enterSketch('xy', 'polyline') },
-            { icon: ToolIcons.rectangle, label: 'Rectangle', action: () => useSceneStore.getState().enterSketch('xy', 'rectangle') },
-            { icon: ToolIcons.circle, label: 'Circle', action: () => useSceneStore.getState().enterSketch('xy', 'circle') },
-          ],
-        },
-      ],
-    },
-
-    // 3. Operations — extrude, revolve, booleans
-    {
-      id: 'operations',
+  // THE RAIL (Varun 2026-11-13, the approved mockup): the tools themselves
+  // under small headings, not six category buttons that each had to be
+  // opened. A tool with variants opens a fly-out (▸). Only tools that work
+  // are listed; the "isn't wired up yet" entries (Revolve, Loft, Sweep,
+  // Hole, Thread, Rib, Offset, Split, Draft, Rectangular pattern, Copy) are
+  // gone until they are built.
+  const selectGroup: ToolGroup = {
+    id: 'interact',
+    icon: MousePointer2,
+    tooltip: 'Select, move and rotate; what a click picks',
+    sections: [
+      {
+        label: 'Tool',
+        items: [
+          { icon: MousePointer2, label: 'Select', shortcut: 'V', active: activeTool === 'select', action: () => handleToolChange('select') },
+          { icon: ToolIcons.translate, label: 'Move', shortcut: 'G', active: activeTool === 'translate', action: () => handleToolChange('translate') },
+          { icon: ToolIcons.rotate, label: 'Rotate', shortcut: 'R', active: activeTool === 'rotate', action: () => handleToolChange('rotate') },
+        ],
+      },
+      {
+        label: 'Pick',
+        items: [
+          { icon: ToolIcons.selectObject, label: 'Part', shortcut: '1', active: selectionMode === 'object', action: () => setSelectionMode('object') },
+          { icon: ToolIcons.selectFace, label: 'Face', shortcut: '2', active: selectionMode === 'face', action: () => setSelectionMode('face') },
+          { icon: ToolIcons.selectEdge, label: 'Edge', shortcut: '3', active: selectionMode === 'edge', action: () => setSelectionMode('edge') },
+          { icon: ToolIcons.selectVertex, label: 'Vertex', shortcut: '4', active: selectionMode === 'vertex', action: () => setSelectionMode('vertex') },
+        ],
+      },
+    ],
+  }
+  const filletGroup: ToolGroup = {
+    id: 'fillet',
+    icon: ToolIcons.fillet,
+    tooltip: 'Fillet: round edges',
+    sections: [
+      {
+        label: 'Fillet',
+        items: [
+          { icon: ToolIcons.fillet, label: 'Fillet', action: () => openModify('fillet') },
+          { icon: ToolIcons.fillet, label: 'Per-edge radii', action: () => openModify('fillet-variable') },
+          { icon: ToolIcons.fillet, label: 'Linear start → end', action: () => openModify('fillet-linear') },
+          { icon: ToolIcons.fillet, label: 'Per-station', action: () => openModify('fillet-stations') },
+        ],
+      },
+    ],
+  }
+  const patternGroup: ToolGroup = {
+    id: 'pattern',
+    icon: ToolIcons.circularPattern,
+    tooltip: 'Pattern and mirror',
+    sections: [
+      {
+        label: 'Pattern',
+        items: [
+          { icon: ToolIcons.circularPattern, label: 'Circular pattern', action: () => sendDirectCircularPattern('z', 6) },
+          { icon: ToolIcons.linearPattern, label: 'Linear pattern', action: () => sendDirectLinearPattern('x', 15, 3) },
+          { icon: ToolIcons.mirror, label: 'Mirror', action: () => sendDirectMirror('xy') },
+        ],
+      },
+    ],
+  }
+  const booleanGroup: ToolGroup = {
+    id: 'boolean',
+    icon: ToolIcons.union,
+    tooltip: 'Combine parts',
+    sections: [
+      {
+        label: 'Boolean',
+        items: [
+          { icon: ToolIcons.union, label: 'Union', action: () => sendDirectBoolean('union') },
+          { icon: ToolIcons.subtract, label: 'Subtract', action: () => sendDirectBoolean('difference') },
+          { icon: ToolIcons.intersect, label: 'Intersect', action: () => sendDirectBoolean('intersection') },
+        ],
+      },
+    ],
+  }
+  const createGroup: ToolGroup = {
+    id: 'create',
+    icon: ToolIcons.box,
+    tooltip: 'Create a primitive or start a sketch shape',
+    sections: [
+      {
+        label: 'Primitives',
+        items: [
+          { icon: ToolIcons.box, label: 'Box', action: () => sendDirectGeometry('box', { width: 10, height: 10, depth: 10 }) },
+          { icon: ToolIcons.cylinder, label: 'Cylinder', action: () => sendDirectGeometry('cylinder', { radius: 5, height: 10 }) },
+          { icon: ToolIcons.sphere, label: 'Sphere', action: () => sendDirectGeometry('sphere', { radius: 5 }) },
+          { icon: ToolIcons.cone, label: 'Cone', action: () => sendDirectGeometry('cone', { radius: 5, height: 10 }) },
+          { icon: ToolIcons.torus, label: 'Torus', action: () => sendDirectGeometry('torus', { major_radius: 8, minor_radius: 2 }) },
+        ],
+      },
+      {
+        label: 'Sketch shape',
+        items: [
+          { icon: ToolIcons.polyline, label: 'Polyline', action: () => useSceneStore.getState().enterSketch('xy', 'polyline') },
+          { icon: ToolIcons.rectangle, label: 'Rectangle', action: () => useSceneStore.getState().enterSketch('xy', 'rectangle') },
+          { icon: ToolIcons.circle, label: 'Circle', action: () => useSceneStore.getState().enterSketch('xy', 'circle') },
+        ],
+      },
+    ],
+  }
+  const inspectGroup: ToolGroup = {
+    id: 'inspect',
+    icon: ToolIcons.massProperties,
+    tooltip: 'Inspect the part',
+    sections: [
+      {
+        label: 'Inspect',
+        items: [
+          {
+            icon: ToolIcons.measure,
+            label: 'Dimensions',
+            active: (() => {
+              // The toggle acts on the single selected object. Show active
+              // when exactly one object is selected and its dimensions are on.
+              const [singleId] = selectedIds.size === 1 ? Array.from(selectedIds) : [undefined]
+              return singleId !== undefined && showDimensions.has(singleId)
+            })(),
+            action: () => {
+              const ids = Array.from(useSceneStore.getState().selectedIds)
+              if (ids.length !== 1) {
+                useBlackboardStore.getState().addLine('Select exactly one object before toggling Dimensions.', 'system')
+                return
+              }
+              toggleDimensions(ids[0])
+            },
+          },
+          { icon: Ruler, label: 'Distance (bounds)', action: () => sendDirectMeasureDistance() },
+          { icon: ToolIcons.massProperties, label: 'Mass properties', action: () => sendDirectMassProperties() },
+          { icon: ToolIcons.interference, label: 'Interference', action: () => sendDirectInterference() },
+        ],
+      },
+    ],
+  }
+  const exportGroup: ToolGroup = {
+    id: 'export',
+    icon: FileDown,
+    tooltip: 'Export or import',
+    sections: [
+      {
+        label: 'Export',
+        items: [
+          { icon: FileDown, label: 'STEP', action: () => sendDirectExport('STEP') },
+          { icon: FileDown, label: 'STL', action: () => sendDirectExport('STL') },
+          { icon: FileDown, label: 'OBJ', action: () => sendDirectExport('OBJ') },
+          { icon: FileDown, label: 'ROS (Roshera)', action: () => sendDirectExport('ROS') },
+        ],
+      },
+      {
+        label: 'Import',
+        items: [
+          // Opens the StepImportDropzone's native file picker (which also
+          // accepts drag-and-drop onto the viewport).
+          { icon: FileUp, label: 'STEP', action: () => window.dispatchEvent(new CustomEvent('roshera:open-step-import')) },
+        ],
+      },
+    ],
+  }
+  const tool = (item: ToolItem): RailEntry => ({ kind: 'tool', item })
+  const flyout = (group: ToolGroup, label: string): RailEntry => ({ kind: 'group', group, label })
+  const rail: RailEntry[] = [
+    flyout(selectGroup, 'Select'),
+    { kind: 'cap', label: 'MODEL' },
+    tool({ icon: ToolIcons.sketch, label: 'Sketch', shortcut: 'K', action: () => useSceneStore.getState().enterSketch('xy', 'polyline') }),
+    tool({
       icon: ToolIcons.extrude,
-      tooltip: 'Operations',
-      sections: [
-        {
-          label: 'Solid',
-          items: [
-            {
-              icon: ToolIcons.extrude,
-              label: 'Extrude',
-              // Pick a face, type a distance (ExtrudePanel); a sketch still
-              // extrudes from Sketch → Finish.
-              action: () => {
-                useSceneStore.getState().setSelectionMode('face')
-                useExtrudeStore.getState().setOpen(true)
-              },
-            },
-            { icon: ToolIcons.revolve, label: 'Revolve', action: () => notYetWired('Revolve') },
-            { icon: ToolIcons.loft, label: 'Loft', action: () => notYetWired('Loft') },
-            { icon: ToolIcons.sweep, label: 'Sweep', action: () => notYetWired('Sweep') },
-          ],
-        },
-        {
-          label: 'Boolean',
-          items: [
-            { icon: ToolIcons.union, label: 'Union', action: () => sendDirectBoolean('union') },
-            { icon: ToolIcons.intersect, label: 'Intersect', action: () => sendDirectBoolean('intersection') },
-            { icon: ToolIcons.subtract, label: 'Subtract', action: () => sendDirectBoolean('difference') },
-          ],
-        },
-      ],
-    },
-
-    // 4. Modify — fillet, chamfer, shell, pattern
-    {
-      id: 'modify',
-      icon: ToolIcons.fillet,
-      tooltip: 'Modify & Pattern',
-      sections: [
-        {
-          label: 'Modify',
-          items: [
-            {
-              icon: ToolIcons.fillet,
-              label: 'Fillet',
-              action: () => openModify('fillet'),
-            },
-            {
-              icon: ToolIcons.fillet,
-              label: 'Fillet (per-edge radii)',
-              action: () => openModify('fillet-variable'),
-            },
-            {
-              icon: ToolIcons.fillet,
-              label: 'Fillet (linear start→end)',
-              action: () => openModify('fillet-linear'),
-            },
-            {
-              icon: ToolIcons.fillet,
-              label: 'Fillet (per-station)',
-              action: () => openModify('fillet-stations'),
-            },
-            {
-              icon: ToolIcons.chamfer,
-              label: 'Chamfer',
-              action: () => openModify('chamfer'),
-            },
-            {
-              icon: ToolIcons.shell,
-              label: 'Shell',
-              action: () => openModify('shell'),
-            },
-            { icon: ToolIcons.offset, label: 'Offset', action: () => notYetWired('Offset', 'needs face-selection UX') },
-            { icon: ToolIcons.split, label: 'Split', action: () => notYetWired('Split') },
-            { icon: ToolIcons.draft, label: 'Draft', action: () => notYetWired('Draft', 'needs face-selection UX') },
-          ],
-        },
-        {
-          label: 'Pattern',
-          items: [
-            { icon: ToolIcons.linearPattern, label: 'Linear Pattern', action: () => sendDirectLinearPattern('x', 15, 3) },
-            { icon: ToolIcons.circularPattern, label: 'Circular Pattern', action: () => sendDirectCircularPattern('z', 6) },
-            { icon: ToolIcons.rectangularPattern, label: 'Rectangular', action: () => notYetWired('Rectangular Pattern') },
-            { icon: ToolIcons.copy, label: 'Copy', action: () => notYetWired('Copy') },
-          ],
-        },
-      ],
-    },
-
-    // 5. Manufacturing
-    {
-      id: 'mfg',
-      icon: ToolIcons.hole,
-      tooltip: 'Manufacturing & Analyze',
-      sections: [
-        {
-          label: 'Manufacturing',
-          items: [
-            { icon: ToolIcons.hole, label: 'Hole', action: () => notYetWired('Hole') },
-            { icon: ToolIcons.thread, label: 'Thread', action: () => notYetWired('Thread') },
-            { icon: ToolIcons.rib, label: 'Rib', action: () => notYetWired('Rib') },
-          ],
-        },
-        {
-          label: 'Analyze',
-          items: [
-            {
-              icon: ToolIcons.measure,
-              label: 'Dimensions',
-              active: (() => {
-                // The toggle acts on the single selected object. Show active
-                // when exactly one object is selected and its dimensions are on.
-                const [singleId] = selectedIds.size === 1
-                  ? Array.from(selectedIds)
-                  : [undefined]
-                return singleId !== undefined && showDimensions.has(singleId)
-              })(),
-              action: () => {
-                const ids = Array.from(useSceneStore.getState().selectedIds)
-                if (ids.length !== 1) {
-                  useBlackboardStore
-                    .getState()
-                    .addLine('Select exactly one object before toggling Dimensions.', 'system')
-                  return
-                }
-                toggleDimensions(ids[0])
-              },
-            },
-            { icon: ToolIcons.measure, label: 'Measure', action: () => sendDirectMeasureFaces() },
-            { icon: Ruler, label: 'Measure Distance (bounds)', action: () => sendDirectMeasureDistance() },
-            { icon: ToolIcons.massProperties, label: 'Mass Properties', action: () => sendDirectMassProperties() },
-            { icon: ToolIcons.section, label: 'Section View', action: () => toggleSectionViewWithFeedback() },
-            { icon: ToolIcons.interference, label: 'Interference', action: () => sendDirectInterference() },
-          ],
-        },
-      ],
-    },
-
-    // 6. Export
-    {
-      id: 'export',
-      icon: FileDown,
-      tooltip: 'Export',
-      sections: [
-        {
-          label: 'Export',
-          items: [
-            { icon: FileDown, label: 'ROS (Roshera)', action: () => sendDirectExport('ROS') },
-            { icon: FileDown, label: 'STEP', action: () => sendDirectExport('STEP') },
-            { icon: FileDown, label: 'STL', action: () => sendDirectExport('STL') },
-            { icon: FileDown, label: 'OBJ', action: () => sendDirectExport('OBJ') },
-          ],
-        },
-        {
-          label: 'Import',
-          items: [
-            // Opens the StepImportDropzone's native file picker (which also
-            // accepts drag-and-drop onto the viewport). Lives here under Export
-            // rather than as a floating overlay button.
-            {
-              icon: FileUp,
-              label: 'STEP',
-              action: () => window.dispatchEvent(new CustomEvent('roshera:open-step-import')),
-            },
-          ],
-        },
-      ],
-    },
+      label: 'Extrude',
+      // Pick a face, type a distance (ExtrudePanel); a sketch still extrudes
+      // from Sketch → Finish.
+      action: () => {
+        useSceneStore.getState().setSelectionMode('face')
+        useExtrudeStore.getState().setOpen(true)
+      },
+    }),
+    flyout(filletGroup, 'Fillet'),
+    tool({ icon: ToolIcons.chamfer, label: 'Chamfer', action: () => openModify('chamfer') }),
+    tool({ icon: ToolIcons.shell, label: 'Shell', action: () => openModify('shell') }),
+    flyout(patternGroup, 'Pattern'),
+    flyout(booleanGroup, 'Boolean'),
+    flyout(createGroup, 'Create'),
+    { kind: 'cap', label: 'CHECK' },
+    tool({ icon: ToolIcons.measure, label: 'Measure', shortcut: 'M', action: () => sendDirectMeasureFaces() }),
+    tool({ icon: ToolIcons.section, label: 'Section', action: () => toggleSectionViewWithFeedback() }),
+    flyout(inspectGroup, 'Inspect'),
+    { kind: 'cap', label: 'MAKE' },
+    tool({ icon: DfmIcon, label: 'DFM', active: docMode === 'dfm', action: () => setDocMode('dfm') }),
+    tool({ icon: DrawingIcon, label: 'Drawing', action: () => setDocMode('drawing') }),
+    flyout(exportGroup, 'Export'),
   ]
 
   return (
     <>
-      <div ref={toolbarRef} className="flex flex-col items-center w-16 cad-panel border-r py-2 gap-1 overflow-visible">
-        {groups.map((group) => (
-          <FlyoutGroup key={group.id} group={group} openId={openId} onToggle={handleToggle} />
-        ))}
+      <div ref={toolbarRef} className="flex w-[60px] flex-col items-center border-r border-border bg-background">
+        {/* The tools scroll on a short window; AI stays pinned at the foot. */}
+        <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-px overflow-y-auto py-1 [scrollbar-width:none]">
+        {rail.map((entry, i) =>
+          entry.kind === 'cap' ? (
+            <span key={`cap-${entry.label}`} className="mt-1.5 text-[10px] font-medium tracking-[0.08em] text-muted-foreground">
+              {entry.label}
+            </span>
+          ) : entry.kind === 'tool' ? (
+            <RailTool key={`tool-${entry.item.label}-${i}`} item={entry.item} />
+          ) : (
+            <FlyoutGroup key={entry.group.id} group={entry.group} label={entry.label} openId={openId} onToggle={handleToggle} />
+          ),
+        )}
+        </div>
         {/* The agent surface sits at the foot of the rail, separated: it
             configures who Roshera talks to rather than acting on geometry. */}
         <div className="mt-auto pt-2 w-full flex justify-center border-t border-border/60">
