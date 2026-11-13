@@ -1,3 +1,4 @@
+import { useCursorStore } from '@/stores/cursor-store'
 import { memo, useRef, useMemo, useCallback, useEffect, type ComponentRef } from 'react'
 import { Edges } from '@react-three/drei'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
@@ -338,6 +339,13 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
   const handlePointerMove = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
       if (sketchActive) return
+      // The status bar's cursor readout: the point on the part and its face.
+      useCursorStore.getState().setHit({
+        objectId: object.id,
+        point: e.point.toArray() as [number, number, number],
+        // Only a real kernel face id -- never the triangle-index fallback.
+        faceId: typeof e.faceIndex === 'number' ? object.mesh.faceIds?.[e.faceIndex] : undefined,
+      })
       if (selectionMode === 'object') return
       e.stopPropagation()
       const triangleIndex = e.faceIndex ?? 0
@@ -358,10 +366,11 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
         index: elementIndex,
       })
     },
-    [sketchActive, selectionMode, object.id, setHoveredSubElement, resolveFaceId],
+    [sketchActive, selectionMode, object.id, object.mesh.faceIds, setHoveredSubElement, resolveFaceId],
   )
 
   const handlePointerOut = useCallback(() => {
+    useCursorStore.getState().setHit(null)
     if (sketchActive) return
     setHovered(null)
     setHoveredSubElement(null)
