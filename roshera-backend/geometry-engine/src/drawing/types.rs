@@ -778,6 +778,14 @@ pub struct PlacedFcfBlock {
     /// sheets. `#[serde(default)]` keeps older serialized drawings parsing.
     #[serde(default)]
     pub annotation_index: Option<usize>,
+    /// Stable id of the inked annotation when it was authored as a recorded
+    /// design event (`gdt_annotation_create`). Unlike `annotation_index`, it
+    /// does not shift when another annotation on the feature is deleted, so
+    /// the sheet certificate compares this ink with exactly the frame the
+    /// model now carries under that id. `None` for annotations attached
+    /// without an id and on older sheets.
+    #[serde(default)]
+    pub annotation_id: Option<String>,
 }
 
 impl PlacedFcfBlock {

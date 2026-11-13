@@ -472,33 +472,267 @@ fn hole_live_check(site: &HoleSite, live_dims: &[DimensionRecord]) -> LiveCheck 
     }
 }
 
-/// Live-check a PID-anchored annotation (FCF / datum symbol): does the feature
-/// still resolve to a live face? This is the sheet-side analogue of
-/// `DatumResolution::{Live, Dangling}` — the GD&T tolerance VERDICT itself is
-/// bound in Slice 4; here we certify the provenance link.
-fn pid_resolve_check(model: &BRepModel, feature_pid: &Option<String>) -> LiveCheck {
-    match feature_pid {
-        None => LiveCheck {
-            measured: None,
-            deviation: None,
-            verdict: SheetVerdict::Unprovenanced,
-            detail: None,
-        },
-        Some(hex) => {
-            let resolved = parse_pid(hex).and_then(|p| model.face_by_pid(p));
-            let verdict = if resolved.is_some() {
-                SheetVerdict::Consistent
-            } else {
-                SheetVerdict::Dangling
-            };
-            LiveCheck {
-                measured: None,
-                deviation: None,
-                verdict,
-                detail: None,
+/// A non-numeric live check carrying `verdict` and an optional reason.
+fn annotation_check(verdict: SheetVerdict, detail: Option<String>) -> LiveCheck {
+    LiveCheck {
+        measured: None,
+        deviation: None,
+        verdict,
+        detail,
+    }
+}
+
+/// The text a sheet inks for an FCF, as one line (`⏥ 0.05 A`).
+fn ink_text(ink: &super::dimensioning::FcfInk) -> String {
+    let mut s = ink.glyph.clone();
+    s.push(' ');
+    s.push_str(&ink.tolerance);
+    for d in &ink.datums {
+        s.push(' ');
+        s.push_str(d);
+    }
+    s
+}
+
+/// Live-check an FCF block against the annotation the model carries NOW.
+///
+/// The provenance link alone is not enough: a frame whose tolerance was edited
+/// (or that was deleted) still names a live face, and a sheet still showing
+/// the old value would read "consistent". So the block's ink is compared with
+/// the ink of the live annotation it names — by its stable `annotation_id`
+/// when it carries one, else by its position on the feature — through the
+/// same renderer the sheet was built with ([`super::dimensioning::fcf_ink`]):
+///
+/// * no provenance → `unprovenanced`;
+/// * the feature face is gone → `dangling`;
+/// * the model no longer carries the frame, or it moved to another feature,
+///   or its ink differs (tolerance, characteristic, datums, modifier) →
+///   `stale`, naming the difference;
+/// * otherwise `consistent`.
+fn fcf_live_check(model: &BRepModel, block: &super::types::PlacedFcfBlock) -> LiveCheck {
+    let Some(pid) = block.feature_pid.as_deref().and_then(parse_pid) else {
+        return annotation_check(SheetVerdict::Unprovenanced, None);
+    };
+    if model.face_by_pid(pid).is_none() {
+        return annotation_check(SheetVerdict::Dangling, None);
+    }
+    let gone = || {
+        annotation_check(
+            SheetVerdict::Stale,
+            Some(format!(
+                "sheet {}: the model no longer carries this frame",
+                block.full_text()
+            )),
+        )
+    };
+    let annotation = match &block.annotation_id {
+        Some(id) => match model.gdt.identified(id) {
+            None => return gone(),
+            Some((home, _)) if home.feature != pid => {
+                return annotation_check(
+                    SheetVerdict::Stale,
+                    Some(format!(
+                        "sheet {}: the frame now controls another feature",
+                        block.full_text()
+                    )),
+                )
             }
+            Some((_, a)) => a,
+        },
+        None => match block.annotation_index {
+            None => {
+                return annotation_check(
+                    SheetVerdict::Unprovenanced,
+                    Some(
+                        "the sheet does not say which of the feature's annotations it inks".into(),
+                    ),
+                )
+            }
+            Some(i) => match model.gdt.annotations(pid).get(i) {
+                None => return gone(),
+                Some(a) => a,
+            },
+        },
+    };
+    let ink = super::dimensioning::fcf_ink(annotation, model.document_unit());
+    let same = ink.glyph == block.characteristic_glyph
+        && ink.tolerance == block.tolerance_text
+        && ink.datums == block.datum_labels;
+    if same {
+        annotation_check(SheetVerdict::Consistent, None)
+    } else {
+        annotation_check(
+            SheetVerdict::Stale,
+            Some(format!(
+                "sheet {}, model {}",
+                block.full_text(),
+                ink_text(&ink)
+            )),
+        )
+    }
+}
+
+/// Live-check a datum feature symbol: its face must still exist (else
+/// `dangling`), and the part must still designate that letter on that feature
+/// (else `stale` — a deleted or re-targeted datum the sheet still shows).
+fn datum_symbol_live_check(
+    model: &BRepModel,
+    solid: Option<SolidId>,
+    symbol: &super::types::PlacedDatumSymbol,
+) -> LiveCheck {
+    let Some(pid) = symbol.feature_pid.as_deref().and_then(parse_pid) else {
+        return annotation_check(SheetVerdict::Unprovenanced, None);
+    };
+    if model.face_by_pid(pid).is_none() {
+        return annotation_check(SheetVerdict::Dangling, None);
+    }
+    let datum = solid
+        .and_then(|s| model.drf.get(&s))
+        .and_then(|f| f.datum_by_label(&symbol.label));
+    match datum {
+        None => annotation_check(
+            SheetVerdict::Stale,
+            Some(format!(
+                "the part no longer designates datum {}",
+                symbol.label
+            )),
+        ),
+        Some(d) if d.feature != pid => annotation_check(
+            SheetVerdict::Stale,
+            Some(format!(
+                "datum {} is now designated on another feature",
+                symbol.label
+            )),
+        ),
+        Some(_) => annotation_check(SheetVerdict::Consistent, None),
+    }
+}
+
+/// The live-side walk for GD&T: every datum feature and annotation the drawn
+/// part carries that the sheet does not show.
+///
+/// * A datum or identified annotation whose feature face no longer exists
+///   cannot be placed on a sheet, and the part still names it: a typed
+///   `dangling` fact (the sheet is not sound while the part refers to a
+///   feature it no longer has — delete or re-target it).
+/// * One whose feature is live but which the sheet does not ink is `omitted`
+///   (e.g. a frame authored after the sheet was built).
+///
+/// Annotations attached without an id (the legacy sidecar path) are walked on
+/// the part's live faces only: a dangling one cannot be attributed to a part.
+fn gdt_live_side_facts(
+    solid_id: Option<SolidId>,
+    model: &BRepModel,
+    drawing: &Drawing,
+) -> Vec<SheetFact> {
+    use crate::gdt::edit::pid_hex;
+    let Some(solid) = solid_id else {
+        return Vec::new();
+    };
+    let unit = model.document_unit();
+    let fact =
+        |kind: SheetFactKind, label: String, pid: String, verdict, detail: String| SheetFact {
+            kind,
+            owner_view: None,
+            label,
+            value: None,
+            unit: String::new(),
+            pid: Some(pid),
+            face_ids: Vec::new(),
+            datum: None,
+            tolerance: None,
+            live: annotation_check(verdict, Some(detail)),
+        };
+    let missing = |live: bool| {
+        if live {
+            (
+                SheetVerdict::Omitted,
+                "the part carries it; the sheet does not show it",
+            )
+        } else {
+            (
+                SheetVerdict::Dangling,
+                "its feature no longer exists on the part; delete or re-target it",
+            )
+        }
+    };
+    let mut out = Vec::new();
+
+    if let Some(frame) = model.drf.get(&solid) {
+        for d in &frame.datums {
+            let hex = pid_hex(d.feature);
+            let shown = drawing
+                .datum_symbols
+                .iter()
+                .any(|s| s.label == d.label && s.feature_pid.as_deref() == Some(hex.as_str()));
+            if shown {
+                continue;
+            }
+            let (verdict, why) = missing(model.face_by_pid(d.feature).is_some());
+            out.push(fact(
+                SheetFactKind::DatumSymbol,
+                format!("datum {}", d.label),
+                hex,
+                verdict,
+                why.to_string(),
+            ));
         }
     }
+
+    for (id, home) in model.gdt.identified_of(solid) {
+        if drawing
+            .fcf_blocks
+            .iter()
+            .any(|b| b.annotation_id.as_deref() == Some(id.as_str()))
+        {
+            continue;
+        }
+        let Some((_, annotation)) = model.gdt.identified(&id) else {
+            continue;
+        };
+        let ink = super::dimensioning::fcf_ink(annotation, unit);
+        let (verdict, why) = missing(model.face_by_pid(home.feature).is_some());
+        out.push(fact(
+            SheetFactKind::Fcf,
+            ink_text(&ink),
+            pid_hex(home.feature),
+            verdict,
+            format!("annotation {id}: {why}"),
+        ));
+    }
+
+    let faces: std::collections::HashSet<u32> = crate::gdt::drf::solid_face_ids(model, solid)
+        .into_iter()
+        .collect();
+    for (feature, list) in model.gdt.iter() {
+        if !model
+            .face_by_pid(feature)
+            .is_some_and(|f| faces.contains(&f))
+        {
+            continue;
+        }
+        let hex = pid_hex(feature);
+        for (i, annotation) in list.iter().enumerate() {
+            if model.gdt.annotation_id(feature, i).is_some() {
+                continue;
+            }
+            let shown = drawing.fcf_blocks.iter().any(|b| {
+                b.feature_pid.as_deref() == Some(hex.as_str()) && b.annotation_index == Some(i)
+            });
+            if shown {
+                continue;
+            }
+            let ink = super::dimensioning::fcf_ink(annotation, unit);
+            out.push(fact(
+                SheetFactKind::Fcf,
+                ink_text(&ink),
+                hex.clone(),
+                SheetVerdict::Omitted,
+                "the part carries it; the sheet does not show it".to_string(),
+            ));
+        }
+    }
+    out
 }
 
 /// Live diameter of a bore from its (analytic) cylindrical face — `2·radius`,
@@ -912,7 +1146,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
 
     // ── FCF blocks ────────────────────────────────────────────────────────────
     for fcf in &drawing.fcf_blocks {
-        let live = pid_resolve_check(model, &fcf.feature_pid);
+        let live = fcf_live_check(model, fcf);
         facts.push(SheetFact {
             kind: SheetFactKind::Fcf,
             owner_view: Some(fcf.owner_view),
@@ -929,7 +1163,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
 
     // ── Datum symbols ─────────────────────────────────────────────────────────
     for ds in &drawing.datum_symbols {
-        let live = pid_resolve_check(model, &ds.feature_pid);
+        let live = datum_symbol_live_check(model, solid_id, ds);
         facts.push(SheetFact {
             kind: SheetFactKind::DatumSymbol,
             owner_view: Some(ds.owner_view),
@@ -976,6 +1210,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
 
     // ── LIVE-SIDE WALK: what the model has and the sheet does not ─────────────
     facts.extend(omitted_bore_facts(solid_id, model, drawing, &live_dims));
+    facts.extend(gdt_live_side_facts(solid_id, model, drawing));
 
     // ── Structured note: document unit + general tolerance ────────────────────
     {
@@ -1787,6 +2022,125 @@ mod tests {
             cert.unsound_facts()
                 .any(|f| f.kind == SheetFactKind::Omitted),
             "the omission must reach the facts-a-reader-must-not-trust list"
+        );
+    }
+
+    /// A sheet showing GD&T the model no longer carries is not sound, and a
+    /// frame authored after the sheet is reported omitted. Written with the
+    /// content check (the check it guards replaced one that asked only "does
+    /// the face still exist", which a tolerance edit leaves true); a mutation
+    /// run disabling the ink comparison is still owed.
+    #[test]
+    fn a_sheet_showing_gdt_the_model_no_longer_has_is_not_sound() {
+        use crate::drawing::dimensioning::standard_drawing_auto;
+        use crate::gdt::model::{Annotation, FeatureControlFrame, GeometricCharacteristic};
+        use crate::gdt::FeatureTarget;
+        use crate::primitives::surface::Plane;
+
+        let mut m = BRepModel::new();
+        m.set_event_key(Some("gdt-plate".into()));
+        let s = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(40.0, 30.0, 10.0)
+            .expect("box"));
+        m.set_event_key(None);
+        let along = |m: &BRepModel, nz: f64| {
+            crate::gdt::drf::solid_face_ids(m, s)
+                .into_iter()
+                .find(|&f| {
+                    let face = m.faces.get(f).expect("face");
+                    m.surfaces
+                        .get(face.surface_id)
+                        .and_then(|x| x.as_any().downcast_ref::<Plane>())
+                        .is_some_and(|p| (p.normal * face.orientation.sign()).z * nz > 0.99)
+                })
+                .expect("a face along Z")
+        };
+        let (bottom, top) = (along(&m, -1.0), along(&m, 1.0));
+        m.gdt_designate_datum(s, "A", FeatureTarget::Face(bottom))
+            .expect("datum A");
+        let par = |t: f64| {
+            Annotation::Geometric(FeatureControlFrame::orientation(
+                GeometricCharacteristic::Parallelism,
+                t,
+                "A",
+            ))
+        };
+        m.gdt_create_annotation(s, "par", FeatureTarget::Face(top), par(0.05))
+            .expect("frame");
+        let verdicts = |c: &SheetReadbackCertificate, k: SheetFactKind| -> Vec<SheetVerdict> {
+            c.facts
+                .iter()
+                .filter(|f| f.kind == k)
+                .map(|f| f.live.verdict)
+                .collect()
+        };
+
+        let sheet = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+        let fresh = certify_drawing(&m, &sheet);
+        assert_eq!(
+            verdicts(&fresh, SheetFactKind::Fcf),
+            vec![SheetVerdict::Consistent]
+        );
+        assert_eq!(
+            verdicts(&fresh, SheetFactKind::DatumSymbol),
+            vec![SheetVerdict::Consistent]
+        );
+        assert!(fresh.sound, "a fresh sheet is true of its model");
+
+        m.gdt_update_annotation(s, "par", None, par(0.02))
+            .expect("tolerance edit");
+        let edited = certify_drawing(&m, &sheet);
+        assert_eq!(
+            verdicts(&edited, SheetFactKind::Fcf),
+            vec![SheetVerdict::Stale]
+        );
+        let detail = edited
+            .facts
+            .iter()
+            .find(|f| f.kind == SheetFactKind::Fcf)
+            .and_then(|f| f.live.detail.clone())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("0.05") && detail.contains("0.02"),
+            "the stale fact names both values: {detail:?}"
+        );
+        assert!(!edited.sound);
+
+        let rebuilt = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("rebuilt");
+        assert!(
+            certify_drawing(&m, &rebuilt).sound,
+            "the rebuilt sheet is true again"
+        );
+
+        m.gdt_delete_annotation(s, "par").expect("frame delete");
+        m.gdt_delete_datum(s, "A").expect("datum delete");
+        let gone = certify_drawing(&m, &rebuilt);
+        assert_eq!(
+            verdicts(&gone, SheetFactKind::Fcf),
+            vec![SheetVerdict::Stale]
+        );
+        assert_eq!(
+            verdicts(&gone, SheetFactKind::DatumSymbol),
+            vec![SheetVerdict::Stale]
+        );
+
+        m.gdt_create_annotation(
+            s,
+            "flat",
+            FeatureTarget::Face(top),
+            Annotation::Geometric(FeatureControlFrame::form(
+                GeometricCharacteristic::Flatness,
+                0.1,
+            )),
+        )
+        .expect("a later frame");
+        let later = certify_drawing(&m, &rebuilt);
+        assert!(
+            later
+                .facts
+                .iter()
+                .any(|f| f.kind == SheetFactKind::Fcf && f.live.verdict == SheetVerdict::Omitted),
+            "a frame the part carries and the sheet does not show is omitted"
         );
     }
 }

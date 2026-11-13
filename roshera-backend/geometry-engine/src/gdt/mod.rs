@@ -35,17 +35,22 @@
 //! - ISO 1101:2017, *Geometrical tolerancing*.
 
 pub mod drf;
+pub mod edit;
 pub mod fit;
 pub mod model;
 pub mod sidecar;
 pub mod verify;
 
-pub use drf::{designate_datum, resolve_datum, DatumReferenceFrame, DatumResolution, GdtError};
+pub use drf::{
+    datum_feature_of, designate_datum, resolve_datum, DatumReferenceFrame, DatumResolution,
+    GdtError,
+};
+pub use edit::{validate_annotation, validate_frame, FeatureTarget, GdtEditError};
 pub use model::{
     Annotation, Datum, DatumKind, DatumRef, DimensionalTolerance, FeatureControlFrame, FitClass,
     GeometricCharacteristic, MaterialModifier, ToleranceBound,
 };
-pub use sidecar::GdtSidecar;
+pub use sidecar::{AnnotationHome, GdtSidecar};
 pub use verify::{
     evaluate, Conformance, ConformanceResult, Conforms, DatumStatus, ResolvedFrame, Verdict,
 };

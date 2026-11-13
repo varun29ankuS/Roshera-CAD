@@ -998,6 +998,28 @@ fn evaluate_fcf(
     let name = fcf.characteristic.mnemonic();
     let tol = fcf.tolerance_value;
 
+    // Every measurement below is regardless-of-feature-size: none of them
+    // computes the bonus tolerance an MMC / LMC modifier grants (on the
+    // tolerance) or the datum shift it allows (on a datum reference). An
+    // RFS verdict on such a frame would be a different requirement's answer,
+    // so it is declined, not approximated.
+    use crate::gdt::model::MaterialModifier;
+    let modified = fcf.modifier != MaterialModifier::Rfs
+        || fcf
+            .datum_refs
+            .iter()
+            .any(|d| d.modifier != MaterialModifier::Rfs);
+    if modified {
+        return Verdict::not_evaluable(
+            name,
+            tol,
+            concat!(
+                "material-condition modifiers (MMC / LMC) are not measured: the kernel ",
+                "evaluates regardless of feature size only"
+            ),
+        );
+    }
+
     match fcf.characteristic {
         // Datum-free form family on a face: wire the EXISTING form path
         // through (one copy of the math; `verify_form_on_face` measures both

@@ -349,6 +349,22 @@ pub fn boolean_operation(
         lifecycle::validate_can_apply(model, OpSpec::Boolean { solid_a, solid_b })?;
     }
 
+    // GD&T pre-flight: the result is ONE part, and a part's datum letters
+    // name one feature each. Two operands that both carry datum `A` cannot be
+    // joined without the kernel choosing which `A` the frames mean — refused,
+    // naming the letters, before anything is touched.
+    let conflicts = crate::gdt::edit::datum_letter_conflicts(model, solid_a, solid_b);
+    if !conflicts.is_empty() {
+        return Err(OperationError::InvalidInput {
+            parameter: "datum letters".to_string(),
+            expected: "operands whose datum features carry different letters".to_string(),
+            received: format!(
+                "both operands designate datum {} — delete or re-letter one first",
+                conflicts.join(", ")
+            ),
+        });
+    }
+
     // F2-δ rollback wrapper — boolean is the canonical example of an
     // op that can leave a half-split shell behind on a coplanar-face
     // degeneracy. The snapshot ensures the input solids are intact
@@ -710,6 +726,14 @@ pub fn boolean_operation(
         if solid_b != result_solid {
             model.solids.remove(solid_b);
         }
+
+        // The part follows its solid: the operands' GD&T (datum reference
+        // frames, annotation ownership) moves to the result, as
+        // `timeline-engine`'s `follow_solid` hands a drawing on to the first
+        // output. Inside the rollback closure, so a later failure restores it
+        // with the snapshot. Datums on faces the cut consumed stay in the
+        // frame and resolve dangling — never dropped.
+        model.hand_on_gdt(&[solid_a, solid_b], result_solid);
 
         // Drop the operand husk shells and the operand-only faces/loops/
         // edges/vertices they alone still reach (Fix B). The result re-

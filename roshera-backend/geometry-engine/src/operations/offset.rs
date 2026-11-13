@@ -378,6 +378,9 @@ fn offset_solid_body(
     if hollow_id != solid_id {
         model.solids.remove(solid_id);
         deleted_solids.push(solid_id as u64);
+        // The part follows its solid (as across a boolean): its GD&T moves
+        // to the hollow. Exterior faces the hollow keeps keep their datums.
+        model.hand_on_gdt(&[solid_id], hollow_id);
     }
     let pruned = crate::operations::delete::prune_boolean_orphan_topology(model)?;
     let pruned_refs: Vec<String> = {

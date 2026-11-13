@@ -1681,9 +1681,8 @@ pub fn standard_drawing_auto_with_projection(
     // ── GD&T sidecar bridge (Task 6 fix wave) ────────────────────────────────
     // Iterate the model's DRF (datum designations) and GDT sidecar
     // (annotations) for this solid and auto-populate datum_symbols +
-    // fcf_blocks.  Dangling PIDs (face consumed by a later operation) are
-    // silently skipped — "stored annotations only, dangling targets skipped"
-    // per the spec.
+    // fcf_blocks.  Dangling PIDs (face consumed by a later operation) are not
+    // placed; the sheet certificate reports them as typed `dangling` facts.
     attach_gdt_annotations(model, solid_id, &mut drawing);
 
     // ── Tolerance binding (campaign #55 Slice 4) ──────────────────────────────
@@ -1946,10 +1945,13 @@ fn best_view_for_plane_normal(
 ///
 /// # Contract (spec §4 "stored annotations only")
 ///
-/// * **Dangling targets** (a PID that no longer maps to a live face) are
-///   SKIPPED silently.  A dangling datum produces no `PlacedDatumSymbol`;
-///   a dangling annotation produces no `PlacedFcfBlock`.  No error is
-///   surfaced — the sheet is silent on features whose geometry was consumed.
+/// * **Dangling targets** (a PID that no longer maps to a live face) are not
+///   placed: there is no geometry to put the symbol or leader on.  A dangling
+///   datum produces no `PlacedDatumSymbol`; a dangling annotation produces no
+///   `PlacedFcfBlock`.  They are NOT dropped from the record: the sheet
+///   certificate's live-side walk (`certify_drawing`) reports each one the
+///   part still carries as a typed `dangling` fact, so the sheet is not sound
+///   while the part names a feature it no longer has.
 /// * **Leader targets** (`PlacedFcfBlock::leader_to`) are set to the
 ///   feature face's surface origin projected into the chosen view's sheet
 ///   space.  This gives the SVG renderer a concrete target to draw the
@@ -1969,15 +1971,12 @@ pub(crate) fn attach_gdt_annotations(
 ) {
     use super::types::{PlacedDatumSymbol, PlacedFcfBlock};
     use crate::gdt::drf::{resolve_datum, DatumResolution};
-    use crate::gdt::model::Annotation;
     use crate::primitives::surface::{Cylinder, Plane};
 
     // ISO 1101 §7.2: tolerances inside FCF cells are bare numbers — no unit
-    // suffix.  Route through the canonical `format_gdt_tolerance` which shares
-    // the same conversion/precision core as `format_len`, differing only in
-    // suffix omission.  The sheet's title-block unit note governs the unit.
+    // suffix (see `fcf_ink`).  The sheet's title-block unit note governs the
+    // unit.
     let doc_unit = model.document_unit();
-    let fmt_tol = |v: f64| doc_unit.format_gdt_tolerance(v);
 
     let sheet_h = drawing.sheet_size.height();
 
@@ -2108,33 +2107,11 @@ pub(crate) fn attach_gdt_annotations(
 
         // Build one PlacedFcfBlock per annotation on this feature.
         for (annotation_index, ann) in annotations.iter().enumerate() {
-            let (glyph, tol_text, datum_labels) = match ann {
-                Annotation::Geometric(fcf) => {
-                    let glyph = fcf.characteristic.iso_glyph().to_string();
-                    let tol_text = fmt_tol(fcf.tolerance_value);
-                    let labels: Vec<String> =
-                        fcf.datum_refs.iter().map(|d| d.label.clone()).collect();
-                    (glyph, tol_text, labels)
-                }
-                Annotation::Dimensional(dim_tol) => {
-                    // Dimensional tolerances: render as ±-value or limits.
-                    // No glyph for size tolerances; use an empty string.
-                    let tol_text = match &dim_tol.bound {
-                        crate::gdt::model::ToleranceBound::PlusMinus { plus, minus } => {
-                            if (plus - minus).abs() < 1e-9 {
-                                format!("\u{00B1}{}", fmt_tol(*plus))
-                            } else {
-                                format!("+{}/\u{2212}{}", fmt_tol(*plus), fmt_tol(*minus))
-                            }
-                        }
-                        crate::gdt::model::ToleranceBound::Limits { upper, lower } => {
-                            format!("{}/{}", fmt_tol(*upper), fmt_tol(*lower))
-                        }
-                        crate::gdt::model::ToleranceBound::Fit(fc) => fc.designation.clone(),
-                    };
-                    (String::new(), tol_text, Vec::new())
-                }
-            };
+            let FcfInk {
+                glyph,
+                tolerance: tol_text,
+                datums: datum_labels,
+            } = fcf_ink(ann, doc_unit);
 
             // The anchor (top-left of the FCF frame) is placed 8 mm outside the
             // leader target, in the direction of the datum feature's normal
@@ -2175,7 +2152,75 @@ pub(crate) fn attach_gdt_annotations(
                 // readback can trace the ink to the kernel's live GD&T verdict.
                 feature_pid: Some(format!("{:032x}", feature_pid.as_u128())),
                 annotation_index: Some(annotation_index),
+                annotation_id: model
+                    .gdt
+                    .annotation_id(feature_pid, annotation_index)
+                    .map(str::to_string),
             });
+        }
+    }
+}
+
+/// What a sheet inks for one GD&T annotation: the characteristic glyph, the
+/// tolerance compartment, the datum compartments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FcfInk {
+    pub glyph: String,
+    pub tolerance: String,
+    pub datums: Vec<String>,
+}
+
+/// The ink for `annotation` in `unit` — the ONE rendering both
+/// [`attach_gdt_annotations`] (building the sheet) and the sheet certificate
+/// (checking an existing sheet against the model) use, so "the sheet shows
+/// what the model carries" is a string comparison, not two renderers agreeing
+/// by luck.
+///
+/// ISO 1101 §7.2: tolerances inside FCF cells are bare numbers (no unit
+/// suffix; the title-block unit note governs). A material-condition modifier
+/// follows its value as the circled letter (Ⓜ / Ⓛ); RFS carries no symbol.
+pub(crate) fn fcf_ink(
+    annotation: &crate::gdt::model::Annotation,
+    unit: crate::units::LengthUnit,
+) -> FcfInk {
+    use crate::gdt::model::{Annotation, MaterialModifier, ToleranceBound};
+    let fmt_tol = |v: f64| unit.format_gdt_tolerance(v);
+    let modifier = |m: MaterialModifier| match m {
+        MaterialModifier::Rfs => "",
+        MaterialModifier::Mmc => " \u{24C2}",
+        MaterialModifier::Lmc => " \u{24C1}",
+    };
+    match annotation {
+        Annotation::Geometric(fcf) => FcfInk {
+            glyph: fcf.characteristic.iso_glyph().to_string(),
+            tolerance: format!("{}{}", fmt_tol(fcf.tolerance_value), modifier(fcf.modifier)),
+            datums: fcf
+                .datum_refs
+                .iter()
+                .map(|d| format!("{}{}", d.label, modifier(d.modifier)))
+                .collect(),
+        },
+        Annotation::Dimensional(dim_tol) => {
+            // Dimensional tolerances: render as ±-value or limits. No glyph
+            // for size tolerances.
+            let tolerance = match &dim_tol.bound {
+                ToleranceBound::PlusMinus { plus, minus } => {
+                    if (plus - minus).abs() < 1e-9 {
+                        format!("\u{00B1}{}", fmt_tol(*plus))
+                    } else {
+                        format!("+{}/\u{2212}{}", fmt_tol(*plus), fmt_tol(*minus))
+                    }
+                }
+                ToleranceBound::Limits { upper, lower } => {
+                    format!("{}/{}", fmt_tol(*upper), fmt_tol(*lower))
+                }
+                ToleranceBound::Fit(fc) => fc.designation.clone(),
+            };
+            FcfInk {
+                glyph: String::new(),
+                tolerance,
+                datums: Vec::new(),
+            }
         }
     }
 }

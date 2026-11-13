@@ -1690,6 +1690,23 @@ fn dispatch_generic(
                 .map_err(|e| kernel_err(kind, &e))
         }
 
+        // GD&T edits (`/api/agent/parts/{id}/datums*`, `/fcf*`,
+        // `/size-tolerance`): datum features and tolerance annotations live
+        // on the model, so each event re-runs the mediator that recorded it —
+        // validation included — against the part as it stands at this point
+        // of the history. The part is the recorded solid followed through the
+        // replay's remap; the feature is named by persistent id.
+        "gdt_datum_designate"
+        | "gdt_datum_update"
+        | "gdt_datum_delete"
+        | "gdt_annotation_create"
+        | "gdt_annotation_update"
+        | "gdt_annotation_delete" => {
+            let solid_raw = num_field(inner, "solid_id", kind)? as u64;
+            let solid = remap_id(solid_raw, id_remap) as SolidId;
+            replay_gdt(model, kind, inner, solid)
+        }
+
         // `POST /api/agent/parts/{id}/reanchor`: the geometry move is the
         // `transform_solid` event `anchor_solid` recorded just before this
         // one, so this arm restores ONLY the anchor (datum + applied local
@@ -2600,6 +2617,116 @@ fn kernel_err<E: std::fmt::Display>(kind: &str, e: &E) -> ReplayError {
 /// falls through to [`ReplayError::UnknownKind`]. (`param.*` metadata kinds
 /// never reach a fallback — they are folded out before dispatch by
 /// [`crate::mould::is_param_meta`].)
+/// Replay one recorded GD&T edit on `solid` through the kernel mediator that
+/// recorded it (`geometry_engine::gdt::edit`).
+///
+/// The feature is resolved by its recorded persistent id. A face that resolves
+/// is re-validated exactly as the live edit was (membership, surface kind,
+/// frame rules); one that does not resolve at this point of the history (an
+/// upstream edit removed it) keeps the recorded decision on that persistent id
+/// — it is then reported DANGLING, never dropped and never re-attached to
+/// another face.
+fn replay_gdt(
+    model: &mut BRepModel,
+    kind: &str,
+    inner: &Value,
+    solid: SolidId,
+) -> Result<(), ReplayError> {
+    use geometry_engine::gdt::edit::{datum_kind_name, parse_datum_kind, parse_pid_hex};
+    use geometry_engine::gdt::model::Annotation;
+    use geometry_engine::gdt::FeatureTarget;
+
+    let invalid = |reason: String| ReplayError::InvalidParameters {
+        kind: kind.to_string(),
+        reason,
+    };
+    let recorded_kind = inner
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(parse_datum_kind);
+    let target = |model: &BRepModel| -> Result<FeatureTarget, ReplayError> {
+        let hex = str_field(inner, "feature_pid", kind)?;
+        let feature = parse_pid_hex(hex)
+            .ok_or_else(|| invalid(format!("`feature_pid` {hex:?} is not a persistent id")))?;
+        Ok(match model.face_by_pid(feature) {
+            Some(face) => FeatureTarget::Face(face),
+            None => FeatureTarget::Recorded {
+                feature,
+                kind: recorded_kind,
+            },
+        })
+    };
+    let annotation = || -> Result<Annotation, ReplayError> {
+        let raw = inner
+            .get("annotation")
+            .cloned()
+            .ok_or_else(|| invalid("missing `annotation`".to_string()))?;
+        serde_json::from_value(raw).map_err(|e| invalid(format!("malformed `annotation`: {e}")))
+    };
+    let same_kind = |designated: geometry_engine::gdt::DatumKind| match recorded_kind {
+        Some(k) if k != designated => Err(ReplayError::KernelError {
+            kind: kind.to_string(),
+            message: format!(
+                "replay designated a {} datum where the history recorded a {}",
+                datum_kind_name(designated),
+                datum_kind_name(k)
+            ),
+        }),
+        _ => Ok(()),
+    };
+
+    match kind {
+        "gdt_datum_designate" => {
+            let label = str_field(inner, "label", kind)?;
+            let t = target(model)?;
+            let datum = model
+                .gdt_designate_datum(solid, label, t)
+                .map_err(|e| kernel_err(kind, &e))?;
+            same_kind(datum.kind)
+        }
+        "gdt_datum_update" => {
+            let label = str_field(inner, "label", kind)?;
+            let new_label = str_field(inner, "new_label", kind)?;
+            let t = target(model)?;
+            let datum = model
+                .gdt_update_datum(solid, label, Some(new_label), Some(t))
+                .map_err(|e| kernel_err(kind, &e))?;
+            same_kind(datum.kind)
+        }
+        "gdt_datum_delete" => {
+            let label = str_field(inner, "label", kind)?;
+            model
+                .gdt_delete_datum(solid, label)
+                .map(|_| ())
+                .map_err(|e| kernel_err(kind, &e))
+        }
+        "gdt_annotation_create" => {
+            let id = str_field(inner, "annotation_id", kind)?;
+            let t = target(model)?;
+            model
+                .gdt_create_annotation(solid, id, t, annotation()?)
+                .map(|_| ())
+                .map_err(|e| kernel_err(kind, &e))
+        }
+        "gdt_annotation_update" => {
+            let id = str_field(inner, "annotation_id", kind)?;
+            let t = target(model)?;
+            model
+                .gdt_update_annotation(solid, id, Some(t), annotation()?)
+                .map(|_| ())
+                .map_err(|e| kernel_err(kind, &e))
+        }
+        "gdt_annotation_delete" => {
+            let id = str_field(inner, "annotation_id", kind)?;
+            model
+                .gdt_delete_annotation(solid, id)
+                .map(|_| ())
+                .map_err(|e| kernel_err(kind, &e))
+        }
+        other => Err(ReplayError::UnknownKind(other.to_string())),
+    }
+}
+
 fn fallback_error(kind: &str) -> ReplayError {
     if kind.contains('.') {
         ReplayError::NonGeometryStale {
@@ -3452,6 +3579,127 @@ mod tests {
 
     fn only_solid(m: &BRepModel) -> SolidId {
         m.solids.iter().next().map(|(id, _)| id).expect("one solid")
+    }
+
+    /// The planar face of `solid` whose outward normal points along `nz`·Z.
+    fn face_along_z(m: &BRepModel, solid: SolidId, nz: f64) -> FaceId {
+        use geometry_engine::primitives::surface::Plane;
+        let s = m.solids.get(solid).expect("solid");
+        let shell = m.shells.get(s.outer_shell).expect("shell");
+        shell
+            .faces
+            .iter()
+            .copied()
+            .find(|&f| {
+                let face = m.faces.get(f).expect("face");
+                m.surfaces
+                    .get(face.surface_id)
+                    .and_then(|s| s.as_any().downcast_ref::<Plane>())
+                    .is_some_and(|p| (p.normal * face.orientation.sign()).z * nz > 0.99)
+            })
+            .expect("a face along Z")
+    }
+
+    fn gdt_event(kind: &str, seq: u64, params: Value) -> TimelineEvent {
+        let mut e = mk_event(
+            kind,
+            serde_json::json!({ "params": params, "inputs": [], "outputs": [] }),
+        );
+        e.sequence_number = seq;
+        e
+    }
+
+    /// GD&T edits replay into the model through the mediators that recorded
+    /// them — so a prefix replay (what undo does) holds the earlier state —
+    /// and a history without any GD&T event replays exactly as before.
+    /// Written with the `gdt_*` arms (no separate RED run: before them the
+    /// GD&T vocabulary it uses did not exist); the end-to-end RED is the
+    /// restart / undo tests in `api-server` `gdt_history_tests`.
+    #[test]
+    fn gdt_edits_replay_into_the_model_and_a_history_without_them_is_unchanged() {
+        use geometry_engine::gdt::edit::pid_hex;
+        use geometry_engine::gdt::model::Annotation;
+
+        let base = vec![box_event(10.0, 1)];
+        let mut plain = BRepModel::new();
+        let out = rebuild_model_from_events(&mut plain, &base);
+        assert_eq!(out.events_skipped, 0);
+        assert!(plain.drf.is_empty() && plain.gdt.is_empty());
+        let s = only_solid(&plain);
+        let bottom = plain.face_pid(face_along_z(&plain, s, -1.0)).expect("pid");
+        let top = plain.face_pid(face_along_z(&plain, s, 1.0)).expect("pid");
+
+        let parallel = |tol: f64| {
+            serde_json::to_value(Annotation::Geometric(
+                geometry_engine::gdt::model::FeatureControlFrame::orientation(
+                    geometry_engine::gdt::model::GeometricCharacteristic::Parallelism,
+                    tol,
+                    "A",
+                ),
+            ))
+            .expect("annotation json")
+        };
+        let mut history = base.clone();
+        history.push(gdt_event(
+            "gdt_datum_designate",
+            2,
+            serde_json::json!({ "solid_id": 0, "label": "A",
+                                "feature_pid": pid_hex(bottom), "kind": "plane" }),
+        ));
+        history.push(gdt_event(
+            "gdt_annotation_create",
+            3,
+            serde_json::json!({ "solid_id": 0, "annotation_id": "par",
+                                "feature_pid": pid_hex(top), "annotation": parallel(0.05) }),
+        ));
+        history.push(gdt_event(
+            "gdt_annotation_update",
+            4,
+            serde_json::json!({ "solid_id": 0, "annotation_id": "par",
+                                "feature_pid": pid_hex(top), "annotation": parallel(0.02) }),
+        ));
+        // A designation recorded on a feature that does not exist at this
+        // point of the history is kept, dangling — not dropped, not moved.
+        let ghost = geometry_engine::primitives::persistent_id::PersistentId::root(b"gone");
+        history.push(gdt_event(
+            "gdt_datum_designate",
+            5,
+            serde_json::json!({ "solid_id": 0, "label": "B",
+                                "feature_pid": pid_hex(ghost), "kind": "plane" }),
+        ));
+
+        let tolerance = |m: &BRepModel| match m.gdt.identified("par") {
+            Some((_, Annotation::Geometric(f))) => Some(f.tolerance_value),
+            _ => None,
+        };
+        let mut m = BRepModel::new();
+        let out = rebuild_model_from_events(&mut m, &history);
+        assert_eq!(out.events_skipped, 0, "{:?}", out.first_failure);
+        let s = only_solid(&m);
+        let frame = m.drf.get(&s).expect("the part's datum frame");
+        let labels: Vec<&str> = frame.datums.iter().map(|d| d.label.as_str()).collect();
+        assert_eq!(labels, vec!["A", "B"]);
+        assert!(matches!(
+            geometry_engine::gdt::resolve_datum(&m, s, &frame.datums[1]),
+            geometry_engine::gdt::DatumResolution::Dangling
+        ));
+        assert_eq!(tolerance(&m), Some(0.02));
+
+        // Undo replays the prefix: the edit is taken back.
+        let mut undone = BRepModel::new();
+        rebuild_model_from_events(&mut undone, &history[..3]);
+        assert_eq!(tolerance(&undone), Some(0.05));
+
+        // The history without GD&T events: the same model as before.
+        let mut again = BRepModel::new();
+        rebuild_model_from_events(&mut again, &base);
+        assert!(again.drf.is_empty() && again.gdt.is_empty());
+        assert_eq!(again.faces.len(), plain.faces.len());
+        assert_eq!(
+            again.face_pid(face_along_z(&again, only_solid(&again), 1.0)),
+            Some(top),
+            "persistent ids are unchanged"
+        );
     }
 
     fn max_abs_x(m: &BRepModel) -> f64 {

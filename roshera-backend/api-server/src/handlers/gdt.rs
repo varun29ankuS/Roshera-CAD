@@ -2,26 +2,32 @@
 //!
 //! ## Endpoints
 //!
-//! | Method | Path                                    | Purpose                         |
-//! |--------|-----------------------------------------|---------------------------------|
-//! | POST   | `/api/agent/parts/{id}/datums`          | Designate a datum feature       |
-//! | GET    | `/api/agent/parts/{id}/datums`          | List DRF with resolution status |
-//! | POST   | `/api/agent/parts/{id}/fcf`             | Author an FCF + evaluate        |
-//! | GET    | `/api/agent/parts/{id}/gdt`             | All datums + annotations, live  |
+//! | Method | Path                                                  | Purpose                         |
+//! |--------|-------------------------------------------------------|---------------------------------|
+//! | POST   | `/api/agent/parts/{id}/datums`                        | Designate a datum feature       |
+//! | GET    | `/api/agent/parts/{id}/datums`                        | List DRF with resolution status |
+//! | PATCH  | `/api/agent/parts/{id}/datums/{label}`                | Re-letter / re-target a datum   |
+//! | DELETE | `/api/agent/parts/{id}/datums/{label}`                | Delete a datum feature          |
+//! | POST   | `/api/agent/parts/{id}/fcf`                           | Author an FCF + evaluate        |
+//! | PATCH  | `/api/agent/parts/{id}/fcf/{annotation_id}`           | Edit an FCF + evaluate          |
+//! | DELETE | `/api/agent/parts/{id}/fcf/{annotation_id}`           | Delete an FCF                   |
+//! | POST   | `/api/agent/parts/{id}/size-tolerance`                | Author a size tolerance         |
+//! | DELETE | `/api/agent/parts/{id}/size-tolerance/{annotation_id}`| Delete a size tolerance         |
+//! | GET    | `/api/agent/parts/{id}/gdt`                           | All datums + annotations, live  |
 //!
-//! ## Persistence honesty (HONESTY DOC — ledger-mandated)
+//! ## Persistence (founder decision 2026-11-13)
 //!
-//! The DRF and annotation sidecar ARE stored on the `BRepModel` in its
-//! `drf` and `gdt` fields respectively, in-process for the server's
-//! lifetime. They ARE **NOT** persisted to the timeline (`SerializedBRep`
-//! covers only the SoA topology stores and the PID sidecar; the DRF and
-//! GDT sidecars are excluded). A server restart clears all GD&T state.
-//! Every response from this module includes `"persistence": "session"` so
-//! clients cannot assume durability across restarts.
+//! Every edit is a recorded design event (`gdt_datum_designate`,
+//! `gdt_datum_update`, `gdt_datum_delete`, `gdt_annotation_create`,
+//! `gdt_annotation_update`, `gdt_annotation_delete`), made through the kernel
+//! mediators in `geometry_engine::gdt::edit` — which validate, then mutate,
+//! then record, and record nothing on a refusal. The timeline replays the
+//! same mediators, so GD&T is undoable, survives a restart, and is re-derived
+//! by every sheet rebuild. Every response says `"persistence": "timeline"`.
 //!
 //! ## Lock discipline
 //!
-//! `POST /datums` and `POST /fcf` mutate the model → write lock.
+//! `POST` / `PATCH` / `DELETE` mutate the model → write lock.
 //! `GET /datums` and `GET /gdt` use a read lock: re-evaluation is
 //! read-only on the geometry (`verify::evaluate` borrows `&BRepModel`,
 //! and `document_unit()` is `&self`). No guard is held across an
@@ -43,9 +49,11 @@ use axum::{
 };
 use geometry_engine::gdt::model::{
     Annotation, DatumRef, DimensionalTolerance, FeatureControlFrame, GeometricCharacteristic,
+    MaterialModifier,
 };
 use geometry_engine::gdt::{
-    designate_datum, evaluate, resolve_datum, DatumReferenceFrame, DatumResolution, GdtError,
+    evaluate, resolve_datum, DatumReferenceFrame, DatumResolution, FeatureTarget, GdtEditError,
+    GdtError,
 };
 use geometry_engine::primitives::face::FaceId;
 use geometry_engine::primitives::solid::SolidId;
@@ -134,6 +142,11 @@ pub struct FcfRequest {
     /// Basic dimensions `[x, y]` mm relative to the DRF origin.
     /// Required for `"position"`.
     pub basic: Option<[f64; 2]>,
+    /// Material-condition modifier on the tolerance: `"rfs"` (default),
+    /// `"mmc"`, `"lmc"`. The kernel measures RFS only: a frame with MMC / LMC
+    /// is stored and inked, and its verdict is `not_evaluable`.
+    #[serde(default)]
+    pub modifier: Option<String>,
 }
 
 /// Wire representation of a conformance verdict.
@@ -192,8 +205,13 @@ pub struct DatumStatusWire {
 #[derive(Debug, Serialize)]
 pub struct FcfResponse {
     pub part_id: u32,
+    /// Stable id of the recorded frame — the handle `PATCH` / `DELETE
+    /// /api/agent/parts/{id}/fcf/{annotation_id}` take.
+    pub annotation_id: String,
     /// Hex-encoded PersistentId of the target face.
     pub annotation_pid: String,
+    /// `"rfs"` | `"mmc"` | `"lmc"`.
+    pub modifier: &'static str,
     pub verdict: VerdictWire,
     /// See HONESTY DOC.
     pub persistence: &'static str,
@@ -202,8 +220,19 @@ pub struct FcfResponse {
 /// Per-annotation entry in the `GET /gdt` response.
 #[derive(Debug, Serialize)]
 pub struct AnnotationWire {
+    /// Stable id of a recorded annotation (`PATCH` / `DELETE` take it);
+    /// `None` for one attached without an id.
+    pub annotation_id: Option<String>,
+    /// `"geometric"` (a feature control frame) | `"dimensional"` (a size
+    /// tolerance).
+    pub kind: &'static str,
+    /// `"live"` when the feature face exists, `"dangling"` when it was
+    /// consumed — the annotation is kept and named, never dropped.
+    pub status: &'static str,
     /// Hex-encoded PersistentId of the annotated feature.
     pub feature_pid: String,
+    /// `"rfs"` | `"mmc"` | `"lmc"` for a frame; `None` for a size tolerance.
+    pub modifier: Option<&'static str>,
     pub verdict: VerdictWire,
     /// Live-resolved kernel face id for the annotated feature.
     ///
@@ -553,106 +582,295 @@ fn datums_to_wire(
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// What every GD&T response says about durability: each edit is a recorded
+/// design event, replayed by undo / redo / restart / every sheet rebuild.
+pub(crate) const PERSISTENCE: &str = "timeline";
+
+type Refusal = (StatusCode, Json<serde_json::Value>);
+
+fn refusal(status: StatusCode, code: &str, message: String) -> Refusal {
+    (
+        status,
+        Json(serde_json::json!({ "error": code, "message": message })),
+    )
+}
+
+fn solid_not_found(id: u32) -> Refusal {
+    refusal(
+        StatusCode::NOT_FOUND,
+        "solid_not_found",
+        format!("part {id} does not exist"),
+    )
+}
+
+/// The typed refusal for a datum-level [`GdtError`].
+pub(crate) fn datum_refusal(err: GdtError) -> Refusal {
+    match err {
+        GdtError::DuplicateLabel { solid, label } => refusal(
+            StatusCode::CONFLICT,
+            "duplicate_label",
+            format!(
+                "datum label '{label}' is already designated for part {solid}; choose a \
+                 different label (e.g. B, C) or remove the existing designation"
+            ),
+        ),
+        GdtError::UnsupportedSurfaceKind { kind } => refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "non_qualifying_surface",
+            format!(
+                "surface kind '{kind}' cannot establish a datum under ASME Y14.5; designate a \
+                 planar face (→ datum plane) or a cylindrical face (→ datum axis)"
+            ),
+        ),
+        GdtError::FaceHasNoPersistentId { face } => refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "face_has_no_persistent_id",
+            format!(
+                "face {face} has no PersistentId — the datum cannot be pinned durably; \
+                 rebuild the solid with an event key assigned so all faces receive PIDs"
+            ),
+        ),
+        GdtError::FaceNotInSolid { solid, face } => refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "face_not_in_solid",
+            format!("face {face} is not a member of part {solid}"),
+        ),
+        GdtError::UnknownSolid { solid } => solid_not_found(solid),
+        GdtError::EmptyLabel => refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "empty_label",
+            "a datum label cannot be empty".to_string(),
+        ),
+        GdtError::UnknownDatum { solid, label } => refusal(
+            StatusCode::NOT_FOUND,
+            "datum_not_found",
+            format!("datum '{label}' is not designated on part {solid}"),
+        ),
+        GdtError::DatumReferenced {
+            solid,
+            label,
+            annotations,
+        } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "datum_referenced",
+                "message": format!(
+                    "datum '{label}' on part {solid} is referenced by {} frame(s); edit or \
+                     delete those frames first, so none is left naming a datum the part no \
+                     longer has",
+                    annotations.len()
+                ),
+                "annotations": annotations,
+            })),
+        ),
+    }
+}
+
+/// The typed refusal for an annotation edit.
+pub(crate) fn edit_refusal(err: GdtEditError) -> Refusal {
+    let message = err.to_string();
+    let (status, code) = match &err {
+        GdtEditError::Datum(inner) => return datum_refusal(inner.clone()),
+        GdtEditError::NonPositiveTolerance { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "non_positive_tolerance")
+        }
+        GdtEditError::DatumRefsNotAllowed { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "datum_refs_not_allowed")
+        }
+        GdtEditError::DatumRefsRequired { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "datum_refs_required")
+        }
+        GdtEditError::TooManyDatumRefs { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "too_many_datum_refs")
+        }
+        GdtEditError::RepeatedDatumRef { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "repeated_datum_ref")
+        }
+        // Same code the authoring route used before edits were recorded.
+        GdtEditError::DatumNotDesignated { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "datum_label_not_in_drf")
+        }
+        GdtEditError::NonFiniteBasic { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "non_finite_basic")
+        }
+        GdtEditError::InvalidSizeTolerance { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "invalid_size_tolerance")
+        }
+        GdtEditError::UnknownAnnotation { .. } => (StatusCode::NOT_FOUND, "annotation_not_found"),
+        GdtEditError::DuplicateAnnotationId { .. } => {
+            (StatusCode::CONFLICT, "duplicate_annotation_id")
+        }
+        GdtEditError::AnnotationNotOnPart { .. } => {
+            (StatusCode::NOT_FOUND, "annotation_not_on_part")
+        }
+        GdtEditError::KindMismatch { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "annotation_kind_mismatch")
+        }
+    };
+    refusal(status, code, message)
+}
+
+fn datum_kind_wire(kind: geometry_engine::gdt::DatumKind) -> &'static str {
+    geometry_engine::gdt::edit::datum_kind_name(kind)
+}
+
+/// Parse a tolerance modifier from the wire: `"rfs"` (default), `"mmc"`,
+/// `"lmc"`.
+fn parse_modifier(s: &str) -> Option<MaterialModifier> {
+    match s.to_ascii_lowercase().as_str() {
+        "rfs" => Some(MaterialModifier::Rfs),
+        "mmc" => Some(MaterialModifier::Mmc),
+        "lmc" => Some(MaterialModifier::Lmc),
+        _ => None,
+    }
+}
+
+fn modifier_wire(m: MaterialModifier) -> &'static str {
+    match m {
+        MaterialModifier::Rfs => "rfs",
+        MaterialModifier::Mmc => "mmc",
+        MaterialModifier::Lmc => "lmc",
+    }
+}
+
+fn unknown_characteristic(name: &str) -> Refusal {
+    refusal(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unknown_characteristic",
+        format!(
+            "characteristic '{name}' is not supported; supported values: \
+             flatness, perpendicularity, parallelism, position"
+        ),
+    )
+}
+
+fn unknown_modifier(name: &str) -> Refusal {
+    refusal(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unknown_modifier",
+        format!("modifier '{name}' is not one of rfs, mmc, lmc"),
+    )
+}
+
+/// The datum wire shape for a single (just-edited) datum.
+fn datum_response(
+    id: u32,
+    datum: &geometry_engine::gdt::Datum,
+    face_id: Option<FaceId>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "success": true,
+        "part_id": id,
+        "label": datum.label,
+        "kind": datum_kind_wire(datum.kind),
+        "persistent_id": format!("{:032x}", datum.feature.as_u128()),
+        "face_id": face_id,
+        "persistence": PERSISTENCE,
+    })
+}
+
 /// `POST /api/agent/parts/{id}/datums` — designate a face as a datum feature.
 ///
 /// Body: `{ "label": "A", "face_id": 17 }` or `{ "label": "A", "selector": {...} }`.
+/// Recorded as `gdt_datum_designate` (undoable, survives a restart).
 ///
 /// ## Response codes
 /// - 200 OK: designation succeeded.
 /// - 404: solid `{id}` not found.
 /// - 409 Conflict: `label` is already designated in this solid's DRF.
 /// - 422 Unprocessable: non-qualifying surface (not Plane/Cylinder), face has
-///   no PersistentId, face not in solid, selector not found/ambiguous, or
-///   missing target.
+///   no PersistentId, face not in solid, selector not found/ambiguous, empty
+///   label, or missing target.
 pub async fn designate_datum_handler(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Json(req): Json<DesignateDatumRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, Refusal> {
     let solid = id as SolidId;
-
     let mut model = model_handle.write().await;
-
-    // 404 when the solid doesn't exist.
     if model.solids.get(solid).is_none() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "solid_not_found",
-                "message": format!("part {id} does not exist"),
-            })),
-        ));
+        return Err(solid_not_found(id));
     }
-
-    // Resolve the target face (direct or by selector).
     let face_id = resolve_target_face(&mut model, solid, req.face_id, req.selector.as_ref())?;
+    let datum = model
+        .gdt_designate_datum(solid, &req.label, FeatureTarget::Face(face_id))
+        .map_err(datum_refusal)?;
+    Ok(Json(datum_response(id, &datum, Some(face_id))))
+}
 
-    // Delegate to the kernel designator.
-    match designate_datum(&mut model, solid, &req.label, face_id) {
-        Ok(datum) => {
-            let pid = format!("{:032x}", datum.feature.as_u128());
-            let kind_str = match datum.kind {
-                geometry_engine::gdt::DatumKind::Plane => "plane",
-                geometry_engine::gdt::DatumKind::Axis => "axis",
-                geometry_engine::gdt::DatumKind::Point => "point",
-            };
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "part_id": id,
-                "label": datum.label,
-                "kind": kind_str,
-                "persistent_id": pid,
-                "face_id": face_id,
-                "persistence": "session",
-            })))
-        }
-        Err(GdtError::DuplicateLabel { .. }) => Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "duplicate_label",
-                "message": format!(
-                    "datum label '{}' is already designated for part {id}; \
-                     choose a different label (e.g. B, C) or remove the existing designation",
-                    req.label
-                ),
-            })),
-        )),
-        Err(GdtError::UnsupportedSurfaceKind { kind }) => Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "non_qualifying_surface",
-                "message": format!(
-                    "surface kind '{kind}' cannot establish a datum under ASME Y14.5; \
-                     designate a planar face (→ datum plane) or a cylindrical face (→ datum axis)"
-                ),
-            })),
-        )),
-        Err(GdtError::FaceHasNoPersistentId { face }) => Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "face_has_no_persistent_id",
-                "message": format!(
-                    "face {face} has no PersistentId — the datum cannot be pinned durably; \
-                     rebuild the solid with an event key assigned so all faces receive PIDs"
-                ),
-            })),
-        )),
-        Err(GdtError::FaceNotInSolid { solid, face }) => Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "face_not_in_solid",
-                "message": format!("face {face} is not a member of part {solid}"),
-            })),
-        )),
-        Err(GdtError::UnknownSolid { solid }) => Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "solid_not_found",
-                "message": format!("part {solid} does not exist"),
-            })),
-        )),
+/// Request body for `PATCH /api/agent/parts/{id}/datums/{label}`: re-letter
+/// the datum (`label`) and/or move it to another face (`face_id` or
+/// `selector`). Omitted fields keep their value.
+#[derive(Debug, Deserialize)]
+pub struct UpdateDatumRequest {
+    pub label: Option<String>,
+    pub face_id: Option<u32>,
+    pub selector: Option<serde_json::Value>,
+}
+
+/// `PATCH /api/agent/parts/{id}/datums/{label}` — edit a datum feature.
+/// Recorded as `gdt_datum_update`.
+///
+/// - 200: the datum as it now stands.
+/// - 404: part or datum not found.
+/// - 409: the new letter is taken (`duplicate_label`), or a frame references
+///   the datum being re-lettered (`datum_referenced`, naming the frames).
+/// - 422: the new face cannot establish a datum.
+pub async fn update_datum_handler(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((id, label)): Path<(u32, String)>,
+    Json(req): Json<UpdateDatumRequest>,
+) -> Result<Json<serde_json::Value>, Refusal> {
+    let solid = id as SolidId;
+    let mut model = model_handle.write().await;
+    if model.solids.get(solid).is_none() {
+        return Err(solid_not_found(id));
     }
+    let target = if req.face_id.is_some() || req.selector.is_some() {
+        Some(FeatureTarget::Face(resolve_target_face(
+            &mut model,
+            solid,
+            req.face_id,
+            req.selector.as_ref(),
+        )?))
+    } else {
+        None
+    };
+    let datum = model
+        .gdt_update_datum(solid, &label, req.label.as_deref(), target)
+        .map_err(datum_refusal)?;
+    let face = model.face_by_pid(datum.feature);
+    Ok(Json(datum_response(id, &datum, face)))
+}
+
+/// `DELETE /api/agent/parts/{id}/datums/{label}` — delete a datum feature.
+/// Recorded as `gdt_datum_delete`.
+///
+/// - 200: deleted.
+/// - 404: part or datum not found.
+/// - 409 `datum_referenced`: a frame references the datum (named in
+///   `annotations`); edit or delete those frames first.
+pub async fn delete_datum_handler(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((id, label)): Path<(u32, String)>,
+) -> Result<Json<serde_json::Value>, Refusal> {
+    let solid = id as SolidId;
+    let mut model = model_handle.write().await;
+    if model.solids.get(solid).is_none() {
+        return Err(solid_not_found(id));
+    }
+    let datum = model
+        .gdt_delete_datum(solid, &label)
+        .map_err(datum_refusal)?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "part_id": id,
+        "label": datum.label,
+        "persistence": PERSISTENCE,
+    })))
 }
 
 /// `GET /api/agent/parts/{id}/datums` — list the DRF with per-datum resolution
@@ -678,15 +896,80 @@ pub async fn list_datums_handler(
     Ok(Json(DatumListResponse {
         part_id: id,
         datums,
-        persistence: "session",
+        persistence: PERSISTENCE,
     }))
 }
 
-/// `POST /api/agent/parts/{id}/fcf` — store an FCF annotation on the target
-/// face and return its immediate evaluation verdict.
+/// Evaluate `annotation` on `feature` for `solid` NOW: a verdict on the live
+/// face, or an honest `not_evaluable` naming the dangling feature.
+fn verdict_now(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    solid: SolidId,
+    feature: geometry_engine::primitives::persistent_id::PersistentId,
+    annotation: &Annotation,
+) -> VerdictWire {
+    let drf = drf_for_solid(model, solid);
+    let raw = match model.face_by_pid(feature) {
+        Some(face) => evaluate(model, solid, face, annotation, &drf),
+        None => dangling_verdict(model, solid, feature, annotation, &drf),
+    };
+    verdict_to_wire(raw, model.document_unit())
+}
+
+/// The verdict of an annotation whose feature face no longer exists: the
+/// characteristic mnemonic and the live status of each datum it references,
+/// `not_evaluable` with the dangling feature named.
+fn dangling_verdict(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    solid: SolidId,
+    feature: geometry_engine::primitives::persistent_id::PersistentId,
+    annotation: &Annotation,
+    drf: &DatumReferenceFrame,
+) -> geometry_engine::gdt::Verdict {
+    let (characteristic, tolerance_mm, datum_status) = match annotation {
+        Annotation::Geometric(fcf) => {
+            let statuses: Vec<geometry_engine::gdt::DatumStatus> = fcf
+                .datum_refs
+                .iter()
+                .filter_map(|dr| {
+                    drf.datum_by_label(&dr.label)
+                        .map(|datum| geometry_engine::gdt::DatumStatus {
+                            label: dr.label.clone(),
+                            resolution: resolve_datum(model, solid, datum),
+                        })
+                })
+                .collect();
+            (
+                fcf.characteristic.mnemonic().to_string(),
+                fcf.tolerance_value,
+                statuses,
+            )
+        }
+        Annotation::Dimensional(_) => (annotation.kind_label().to_string(), 0.0, Vec::new()),
+    };
+    geometry_engine::gdt::Verdict {
+        characteristic,
+        tolerance_mm,
+        measured_mm: None,
+        conforms: geometry_engine::gdt::Conforms::NotEvaluable {
+            reason: format!(
+                "feature PID {:032x} is dangling — its source face no longer exists",
+                feature.as_u128()
+            ),
+        },
+        fit_residual_mm: None,
+        datum_status,
+        frame: None,
+    }
+}
+
+/// `POST /api/agent/parts/{id}/fcf` — author a feature control frame on the
+/// target face and return its immediate evaluation verdict.
 ///
-/// The annotation is keyed by the target face's PersistentId in the kernel's
-/// GDT sidecar. It is re-evaluated on every `GET /gdt` call.
+/// Recorded as `gdt_annotation_create` under a fresh `annotation_id` — the
+/// handle `PATCH` / `DELETE /fcf/{annotation_id}` take. The frame is keyed by
+/// the target face's PersistentId, so it follows the face through later
+/// features. Re-evaluated on every `GET /gdt` call.
 ///
 /// ## Notes on `"position"` and missing `basic`
 ///
@@ -698,89 +981,36 @@ pub async fn list_datums_handler(
 /// ## Response codes
 /// - 200 OK: FCF stored, verdict returned.
 /// - 404: solid `{id}` not found.
-/// - 422: unknown characteristic, datum label not in DRF, face has no PID,
-///   selector not found.
+/// - 422: unknown characteristic / modifier, any ASME Y14.5 frame rule
+///   (`non_positive_tolerance`, `datum_refs_not_allowed`,
+///   `datum_refs_required`, `too_many_datum_refs`, `repeated_datum_ref`,
+///   `datum_label_not_in_drf`, `non_finite_basic`), face has no PID, selector
+///   not found.
 pub async fn author_fcf_handler(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Json(req): Json<FcfRequest>,
-) -> Result<Json<FcfResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<FcfResponse>, Refusal> {
     let solid = id as SolidId;
-
-    // Parse the characteristic before taking the write lock.
-    let characteristic = parse_characteristic(&req.characteristic).ok_or_else(|| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "unknown_characteristic",
-                "message": format!(
-                    "characteristic '{}' is not supported; supported values: \
-                     flatness, perpendicularity, parallelism, position",
-                    req.characteristic
-                ),
-            })),
-        )
-    })?;
+    let characteristic = parse_characteristic(&req.characteristic)
+        .ok_or_else(|| unknown_characteristic(&req.characteristic))?;
+    let modifier = match req.modifier.as_deref() {
+        None => MaterialModifier::Rfs,
+        Some(m) => parse_modifier(m).ok_or_else(|| unknown_modifier(m))?,
+    };
 
     let mut model = model_handle.write().await;
-
-    // 404 when solid is absent.
     if model.solids.get(solid).is_none() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "solid_not_found",
-                "message": format!("part {id} does not exist"),
-            })),
-        ));
+        return Err(solid_not_found(id));
     }
-
-    // Validate that every datum_ref label is in the DRF before storing.
-    // This 422 prevents storing an un-evaluable FCF that references a
-    // label that was never designated — the caller must fix the DRF first.
-    {
-        let drf = drf_for_solid(&model, solid);
-        for label in &req.datum_refs {
-            if drf.datum_by_label(label).is_none() {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({
-                        "error": "datum_label_not_in_drf",
-                        "message": format!(
-                            "datum label '{}' has not been designated for part {id}; \
-                             use POST /api/agent/parts/{id}/datums to designate it first",
-                            label
-                        ),
-                    })),
-                ));
-            }
-        }
-    }
-
-    // Resolve the target face.
     let face_id = resolve_target_face(&mut model, solid, req.face_id, req.selector.as_ref())?;
 
-    // The target face must have a PersistentId — the annotation is keyed by PID.
-    let pid = model.face_pid(face_id).ok_or_else(|| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "face_has_no_persistent_id",
-                "message": format!(
-                    "face {face_id} has no PersistentId — the annotation cannot be durably \
-                     keyed; rebuild the solid with an event key assigned so all faces receive PIDs"
-                ),
-            })),
-        )
-    })?;
-
-    // Build the FCF.
     let fcf = FeatureControlFrame {
         characteristic,
         tolerance_value: req.tolerance_mm,
         diametral_zone: characteristic == GeometricCharacteristic::Position,
-        modifier: geometry_engine::gdt::model::MaterialModifier::Rfs,
+        modifier,
         datum_refs: req
             .datum_refs
             .iter()
@@ -788,25 +1018,195 @@ pub async fn author_fcf_handler(
             .collect(),
         basic: req.basic,
     };
-
-    // Store the annotation in the GDT sidecar (keyed by PID).
-    let annotation = Annotation::Geometric(fcf.clone());
-    model.gdt.attach(pid, annotation.clone());
-
-    // Evaluate immediately against the live DRF.
-    let drf = drf_for_solid(&model, solid);
-    let verdict_raw = evaluate(&model, solid, face_id, &annotation, &drf);
-    let doc_unit = model.document_unit();
-    let verdict = verdict_to_wire(verdict_raw, doc_unit);
-
-    let pid_str = format!("{:032x}", pid.as_u128());
+    let annotation_id = uuid::Uuid::new_v4().to_string();
+    let annotation = Annotation::Geometric(fcf);
+    let pid = model
+        .gdt_create_annotation(
+            solid,
+            &annotation_id,
+            FeatureTarget::Face(face_id),
+            annotation.clone(),
+        )
+        .map_err(edit_refusal)?;
+    let verdict = verdict_now(&model, solid, pid, &annotation);
 
     Ok(Json(FcfResponse {
         part_id: id,
-        annotation_pid: pid_str,
+        annotation_id,
+        annotation_pid: format!("{:032x}", pid.as_u128()),
+        modifier: modifier_wire(modifier),
         verdict,
-        persistence: "session",
+        persistence: PERSISTENCE,
     }))
+}
+
+/// Request body for `PATCH /api/agent/parts/{id}/fcf/{annotation_id}`. Every
+/// field is optional; an omitted one keeps the frame's current value. The
+/// edited frame is validated as a whole (the same rules as authoring).
+#[derive(Debug, Deserialize)]
+pub struct FcfPatchRequest {
+    pub characteristic: Option<String>,
+    pub tolerance_mm: Option<f64>,
+    pub datum_refs: Option<Vec<String>>,
+    /// `"rfs"` | `"mmc"` | `"lmc"`.
+    pub modifier: Option<String>,
+    pub basic: Option<[f64; 2]>,
+    /// Move the frame to another face: exactly one of `face_id` / `selector`.
+    pub face_id: Option<u32>,
+    pub selector: Option<serde_json::Value>,
+}
+
+/// `PATCH /api/agent/parts/{id}/fcf/{annotation_id}` — edit a feature control
+/// frame (tolerance, characteristic, datum references, modifier, basic
+/// dimensions, or the face it controls). Recorded as `gdt_annotation_update`
+/// with the frame's full new state; the next sheet rebuild shows it, and a
+/// sheet still showing the old frame certifies `stale`.
+///
+/// - 200: the edited frame and its verdict.
+/// - 404: part not found (`solid_not_found`), no such annotation
+///   (`annotation_not_found`), or it belongs to another part
+///   (`annotation_not_on_part`).
+/// - 422: the edited frame breaks a frame rule (codes as for `POST /fcf`), the
+///   annotation is a size tolerance (`annotation_kind_mismatch`), unknown
+///   characteristic / modifier, or the new face cannot be resolved.
+pub async fn update_fcf_handler(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((id, annotation_id)): Path<(u32, String)>,
+    Json(req): Json<FcfPatchRequest>,
+) -> Result<Json<FcfResponse>, Refusal> {
+    let solid = id as SolidId;
+    let characteristic = match req.characteristic.as_deref() {
+        None => None,
+        Some(c) => Some(parse_characteristic(c).ok_or_else(|| unknown_characteristic(c))?),
+    };
+    let modifier = match req.modifier.as_deref() {
+        None => None,
+        Some(m) => Some(parse_modifier(m).ok_or_else(|| unknown_modifier(m))?),
+    };
+
+    let mut model = model_handle.write().await;
+    if model.solids.get(solid).is_none() {
+        return Err(solid_not_found(id));
+    }
+    let current = match model.gdt.identified(&annotation_id) {
+        None => {
+            return Err(edit_refusal(GdtEditError::UnknownAnnotation {
+                id: annotation_id,
+            }))
+        }
+        Some((home, _)) if home.solid != solid => {
+            return Err(edit_refusal(GdtEditError::AnnotationNotOnPart {
+                id: annotation_id,
+                owner: home.solid,
+                solid,
+            }))
+        }
+        Some((_, Annotation::Geometric(fcf))) => fcf.clone(),
+        Some((_, Annotation::Dimensional(_))) => {
+            return Err(edit_refusal(GdtEditError::KindMismatch {
+                id: annotation_id,
+                expected: "geometric",
+                found: "dimensional",
+            }))
+        }
+    };
+    let target = if req.face_id.is_some() || req.selector.is_some() {
+        Some(FeatureTarget::Face(resolve_target_face(
+            &mut model,
+            solid,
+            req.face_id,
+            req.selector.as_ref(),
+        )?))
+    } else {
+        None
+    };
+
+    let mut fcf = current;
+    if let Some(c) = characteristic {
+        fcf.characteristic = c;
+        fcf.diametral_zone = c == GeometricCharacteristic::Position;
+    }
+    if let Some(t) = req.tolerance_mm {
+        fcf.tolerance_value = t;
+    }
+    if let Some(refs) = &req.datum_refs {
+        fcf.datum_refs = refs.iter().map(|l| DatumRef::new(l.as_str())).collect();
+    }
+    if let Some(m) = modifier {
+        fcf.modifier = m;
+    }
+    if let Some(b) = req.basic {
+        fcf.basic = Some(b);
+    }
+    let modifier_now = fcf.modifier;
+    let annotation = Annotation::Geometric(fcf);
+    let pid = model
+        .gdt_update_annotation(solid, &annotation_id, target, annotation.clone())
+        .map_err(edit_refusal)?;
+    let verdict = verdict_now(&model, solid, pid, &annotation);
+
+    Ok(Json(FcfResponse {
+        part_id: id,
+        annotation_id,
+        annotation_pid: format!("{:032x}", pid.as_u128()),
+        modifier: modifier_wire(modifier_now),
+        verdict,
+        persistence: PERSISTENCE,
+    }))
+}
+
+/// Delete identified annotation `annotation_id` of `kind` from part `id`.
+async fn delete_annotation_of_kind(
+    model_handle: &std::sync::Arc<
+        tokio::sync::RwLock<geometry_engine::primitives::topology_builder::BRepModel>,
+    >,
+    id: u32,
+    annotation_id: String,
+    kind: &'static str,
+) -> Result<Json<serde_json::Value>, Refusal> {
+    let solid = id as SolidId;
+    let mut model = model_handle.write().await;
+    if model.solids.get(solid).is_none() {
+        return Err(solid_not_found(id));
+    }
+    if let Some((home, annotation)) = model.gdt.identified(&annotation_id) {
+        let found = match annotation {
+            Annotation::Geometric(_) => "geometric",
+            Annotation::Dimensional(_) => "dimensional",
+        };
+        if home.solid == solid && found != kind {
+            return Err(edit_refusal(GdtEditError::KindMismatch {
+                id: annotation_id,
+                expected: kind,
+                found,
+            }));
+        }
+    }
+    model
+        .gdt_delete_annotation(solid, &annotation_id)
+        .map_err(edit_refusal)?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "part_id": id,
+        "annotation_id": annotation_id,
+        "persistence": PERSISTENCE,
+    })))
+}
+
+/// `DELETE /api/agent/parts/{id}/fcf/{annotation_id}` — delete a feature
+/// control frame. Recorded as `gdt_annotation_delete`.
+///
+/// - 200: deleted.
+/// - 404: part / annotation not found, or the annotation is another part's.
+/// - 422 `annotation_kind_mismatch`: the id names a size tolerance (use
+///   `DELETE /size-tolerance/{annotation_id}`).
+pub async fn delete_fcf_handler(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((id, annotation_id)): Path<(u32, String)>,
+) -> Result<Json<serde_json::Value>, Refusal> {
+    delete_annotation_of_kind(&model_handle, id, annotation_id, "geometric").await
 }
 
 /// Request body for `POST /api/agent/parts/{id}/size-tolerance`.
@@ -841,6 +1241,9 @@ pub struct SizeToleranceRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct SizeToleranceResponse {
     pub part_id: u32,
+    /// Stable id of the recorded tolerance (`DELETE
+    /// /size-tolerance/{annotation_id}`).
+    pub annotation_id: String,
     /// Hex-encoded PersistentId of the toleranced feature.
     pub annotation_pid: String,
     /// `plus_minus` | `limits` | `fit`.
@@ -855,17 +1258,19 @@ pub struct SizeToleranceResponse {
 /// tolerance to a feature face's PersistentId in the GD&T sidecar. This is what
 /// campaign #55 Slice 4 joins to the sheet's diameter callouts + hole rows, so a
 /// certified drawing readback answers "the toleranced diameter" with limits +
-/// provenance (or an honest fit-designation-without-limits).
+/// provenance (or an honest fit-designation-without-limits). Recorded as
+/// `gdt_annotation_create`.
 ///
 /// - 200 OK: tolerance stored.
 /// - 404: solid not found.
-/// - 422: no bound specified, face has no PID, or selector not found.
+/// - 422: no bound specified, non-finite / inverted bounds
+///   (`invalid_size_tolerance`), face has no PID, or selector not found.
 pub async fn author_size_tolerance_handler(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Json(req): Json<SizeToleranceRequest>,
-) -> Result<Json<SizeToleranceResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<SizeToleranceResponse>, Refusal> {
     let solid = id as SolidId;
 
     // Build the tolerance bound from whichever fields were supplied.
@@ -887,49 +1292,49 @@ pub async fn author_size_tolerance_handler(
             "plus_minus",
         )
     } else {
-        return Err((
+        return Err(refusal(
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "no_bound_specified",
-                "message": "specify one of: fit, (lower+upper), (plus+minus), or plus_minus",
-            })),
+            "no_bound_specified",
+            "specify one of: fit, (lower+upper), (plus+minus), or plus_minus".to_string(),
         ));
     };
 
     let mut model = model_handle.write().await;
     if model.solids.get(solid).is_none() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "solid_not_found",
-                "message": format!("part {id} does not exist"),
-            })),
-        ));
+        return Err(solid_not_found(id));
     }
-
     let face_id = resolve_target_face(&mut model, solid, req.face_id, req.selector.as_ref())?;
-    let pid = model.face_pid(face_id).ok_or_else(|| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "face_has_no_persistent_id",
-                "message": format!(
-                    "face {face_id} has no PersistentId — the tolerance cannot be durably keyed"
-                ),
-            })),
-        )
-    })?;
-
     let limits = tol.limit_range().map(|(lo, hi)| [lo, hi]);
-    model.gdt.attach(pid, Annotation::Dimensional(tol));
+    let annotation_id = uuid::Uuid::new_v4().to_string();
+    let pid = model
+        .gdt_create_annotation(
+            solid,
+            &annotation_id,
+            FeatureTarget::Face(face_id),
+            Annotation::Dimensional(tol),
+        )
+        .map_err(edit_refusal)?;
 
     Ok(Json(SizeToleranceResponse {
         part_id: id,
+        annotation_id,
         annotation_pid: format!("{:032x}", pid.as_u128()),
         kind: kind.to_string(),
         limits,
-        persistence: "session",
+        persistence: PERSISTENCE,
     }))
+}
+
+/// `DELETE /api/agent/parts/{id}/size-tolerance/{annotation_id}` — delete a
+/// size tolerance. Recorded as `gdt_annotation_delete`. Codes as for
+/// `DELETE /fcf/{annotation_id}` (an FCF id here is
+/// `annotation_kind_mismatch`).
+pub async fn delete_size_tolerance_handler(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((id, annotation_id)): Path<(u32, String)>,
+) -> Result<Json<serde_json::Value>, Refusal> {
+    delete_annotation_of_kind(&model_handle, id, annotation_id, "dimensional").await
 }
 
 /// `GET /api/agent/parts/{id}/gdt` — all datums + annotations, re-evaluated
@@ -938,25 +1343,18 @@ pub async fn author_size_tolerance_handler(
 /// ## Solid scoping
 ///
 /// The GDT sidecar is model-wide (keyed by PID), so the handler filters
-/// annotations to the requested solid: an annotation whose feature face
-/// resolves to a DIFFERENT solid is skipped — part 1's response never
-/// carries part 2's annotations. Annotations whose PID no longer resolves
-/// to any face (dangling) cannot be attributed to a solid, so they are
-/// reported on every solid's response with an honest `"not_evaluable"`
-/// dangling reason rather than silently dropped.
-///
-/// ## Annotation storage is append-only
-///
-/// `GdtSidecar::attach` pushes onto a `Vec<Annotation>` per PID; a face can
-/// carry several FCFs (e.g. flatness + perpendicularity). There is no
-/// partial-remove API — only `clear_feature`, which drops ALL annotations
-/// on a face.
+/// annotations to the requested solid:
+/// * a recorded (identified) annotation is the part's when the part OWNS it —
+///   ownership follows the part across a boolean, so a frame whose face was
+///   consumed is still reported, `"status": "dangling"`, on the part that
+///   carries it and on no other;
+/// * an annotation attached without an id is the part's when its face is on
+///   the part; a dangling one cannot be attributed to a solid, so it is
+///   reported on every solid's response with an honest `"not_evaluable"`
+///   dangling reason rather than silently dropped.
 ///
 /// Dangling datums are reported honestly (`"status": "dangling"`). Annotations
 /// on dangling-datum faces evaluate as `"not_evaluable"`.
-///
-/// The `"persistence": "session"` field documents that GD&T state does not
-/// survive a server restart — clients must not assume durability.
 pub async fn get_gdt_handler(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -973,80 +1371,39 @@ pub async fn get_gdt_handler(
     let datums = datums_to_wire(&model, solid, &drf);
     let doc_unit = model.document_unit();
 
-    // Re-evaluate every annotation stored on faces that belong to this solid.
-    // The GDT sidecar is keyed by PID — we iterate it and resolve PID → FaceId
-    // at call time, reporting dangling for any feature whose face is gone.
-    //
-    // Solid scoping (review S-1): the sidecar is model-wide, so skip
-    // annotations whose face resolves to a DIFFERENT solid. Dangling PIDs
-    // (face gone) cannot be attributed to a solid; they are kept and
-    // reported honestly.
     let this_solid_faces = solid_face_ids(&model, solid);
     let mut annotations: Vec<AnnotationWire> = Vec::new();
     for (feature_pid, ann_list) in model.gdt.iter() {
         let pid_str = format!("{:032x}", feature_pid.as_u128());
-        // Resolve PID → FaceId. If the face no longer exists, every annotation
-        // on it is not_evaluable with a dangling reason.
         let face_opt = model.face_by_pid(feature_pid);
-
-        // Foreign-solid annotation: the face exists but belongs to another
-        // solid — not part of this response.
-        if let Some(fid) = face_opt {
-            if !this_solid_faces.contains(&fid) {
-                continue;
-            }
-        }
-
-        // Resolve anchor_mm and target_face_id once per PID (shared by all
-        // annotations on the same face — they all reference the same feature).
         let (target_face_id, anchor_mm) = resolve_annotation_anchor(&model, feature_pid);
 
-        for ann in ann_list {
-            let verdict_raw = if let Some(fid) = face_opt {
-                evaluate(&model, solid, fid, ann, &drf)
-            } else {
-                // Face is gone — produce a NotEvaluable verdict honestly.
-                // I-1 fix: for Geometric annotations use the characteristic
-                // mnemonic (e.g. "FLATNESS") rather than ann.kind_label()
-                // ("geometric"), and resolve datum statuses through the live DRF
-                // — datum refs can still be live even when the target face is gone.
-                let (characteristic, tolerance_mm, datum_status) = match ann {
-                    Annotation::Geometric(fcf) => {
-                        let name = fcf.characteristic.mnemonic().to_string();
-                        let tol = fcf.tolerance_value;
-                        let statuses: Vec<geometry_engine::gdt::DatumStatus> = fcf
-                            .datum_refs
-                            .iter()
-                            .filter_map(|dr| {
-                                drf.datum_by_label(&dr.label).map(|datum| {
-                                    geometry_engine::gdt::DatumStatus {
-                                        label: dr.label.clone(),
-                                        resolution: resolve_datum(&model, solid, datum),
-                                    }
-                                })
-                            })
-                            .collect();
-                        (name, tol, statuses)
-                    }
-                    Annotation::Dimensional(_) => (ann.kind_label().to_string(), 0.0, Vec::new()),
-                };
-                geometry_engine::gdt::Verdict {
-                    characteristic,
-                    tolerance_mm,
-                    measured_mm: None,
-                    conforms: geometry_engine::gdt::Conforms::NotEvaluable {
-                        reason: format!(
-                            "feature PID {} is dangling — its source face no longer exists",
-                            pid_str
-                        ),
-                    },
-                    fit_residual_mm: None,
-                    datum_status,
-                    frame: None,
-                }
+        for (index, ann) in ann_list.iter().enumerate() {
+            let annotation_id = model.gdt.annotation_id(feature_pid, index);
+            let ours = match annotation_id.and_then(|aid| model.gdt.identified(aid)) {
+                Some((home, _)) => home.solid == solid,
+                None => face_opt.is_none_or(|fid| this_solid_faces.contains(&fid)),
+            };
+            if !ours {
+                continue;
+            }
+            let verdict_raw = match face_opt {
+                Some(fid) => evaluate(&model, solid, fid, ann, &drf),
+                None => dangling_verdict(&model, solid, feature_pid, ann, &drf),
             };
             annotations.push(AnnotationWire {
+                annotation_id: annotation_id.map(str::to_string),
+                kind: ann.kind_label(),
+                status: if face_opt.is_some() {
+                    "live"
+                } else {
+                    "dangling"
+                },
                 feature_pid: pid_str.clone(),
+                modifier: match ann {
+                    Annotation::Geometric(fcf) => Some(modifier_wire(fcf.modifier)),
+                    Annotation::Dimensional(_) => None,
+                },
                 verdict: verdict_to_wire(verdict_raw, doc_unit),
                 target_face_id,
                 anchor_mm,
@@ -1058,7 +1415,7 @@ pub async fn get_gdt_handler(
         part_id: id,
         datums,
         annotations,
-        persistence: "session",
+        persistence: PERSISTENCE,
     }))
 }
 
@@ -1069,6 +1426,7 @@ pub async fn get_gdt_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geometry_engine::gdt::designate_datum;
     use geometry_engine::gdt::model::{DatumKind, FeatureControlFrame, GeometricCharacteristic};
     use geometry_engine::math::{Point3, Vector3};
     use geometry_engine::primitives::persistent_id::PersistentId;
@@ -1476,19 +1834,24 @@ mod tests {
 
     // ── Unit tests: GET /gdt shape includes persistence field ────────────────
 
+    /// Re-baselined 2026-11-13 (was `..._is_session`, pinning `"session"`):
+    /// GD&T edits became recorded timeline events (founder decision
+    /// 2026-11-13), so the honest durability claim is now `"timeline"` — the
+    /// state is replayed by undo / restart. `gdt_history_tests` proves the
+    /// claim end to end (restart, undo, redo).
     #[test]
-    fn gdt_response_persistence_field_is_session() {
+    fn gdt_response_persistence_field_is_timeline() {
         let resp = GdtResponse {
             part_id: 0,
             datums: Vec::new(),
             annotations: Vec::new(),
-            persistence: "session",
+            persistence: PERSISTENCE,
         };
         let json = serde_json::to_value(&resp).expect("must serialize");
         assert_eq!(
             json.get("persistence").and_then(|v| v.as_str()),
-            Some("session"),
-            "persistence field must be 'session'"
+            Some("timeline"),
+            "persistence field must be 'timeline'"
         );
     }
 
@@ -1681,6 +2044,10 @@ mod tests {
     fn annotation_wire_serialises_new_fields() {
         use geometry_engine::units::LengthUnit;
         let wire = AnnotationWire {
+            annotation_id: None,
+            kind: "geometric",
+            status: "dangling",
+            modifier: Some("rfs"),
             feature_pid: "deadbeef".to_string(),
             verdict: VerdictWire {
                 characteristic: "flatness".to_string(),

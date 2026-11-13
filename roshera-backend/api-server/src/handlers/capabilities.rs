@@ -50,7 +50,7 @@ fn build_capabilities(ai_configured: bool) -> Value {
     json!({
         "kernel": "roshera-geometry-engine",
         "kernel_version": env!("CARGO_PKG_VERSION"),
-        "discovery_version": "1.0.8",
+        "discovery_version": "1.0.9",
         "runtime": {
             "ai_configured": ai_configured,
         },
@@ -376,6 +376,15 @@ fn endpoints() -> Value {
             "get":    "GET    /api/branches/{id}",
             "delete": "DELETE /api/branches/{id}",
             "merge":  "POST   /api/branches/{id}/merge"
+        },
+        "gdt": {
+            "datums":           "GET /api/agent/parts/{id}/datums, POST /api/agent/parts/{id}/datums",
+            "datum_edit":       "PATCH /api/agent/parts/{id}/datums/{label}, DELETE /api/agent/parts/{id}/datums/{label}",
+            "fcf":              "POST /api/agent/parts/{id}/fcf",
+            "fcf_edit":         "PATCH /api/agent/parts/{id}/fcf/{annotation_id}, DELETE /api/agent/parts/{id}/fcf/{annotation_id}",
+            "size_tolerance":   "POST /api/agent/parts/{id}/size-tolerance, DELETE /api/agent/parts/{id}/size-tolerance/{annotation_id}",
+            "all":              "GET /api/agent/parts/{id}/gdt",
+            "persistence":      "timeline: every edit is a recorded event (undo/redo, restart, sheet rebuild)"
         },
         "export": "POST /api/export"
     })

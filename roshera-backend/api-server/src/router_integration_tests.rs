@@ -4201,7 +4201,7 @@ fn gdt_get(solid_id: SolidId) -> Request<Body> {
 // ── designate_datum happy path ───────────────────────────────────────
 
 /// Designating a +Z planar face as datum "A" must return 200 with
-/// `success: true`, `kind: "plane"`, and `persistence: "session"`.
+/// `success: true`, `kind: "plane"`, and `persistence: "timeline"`.
 ///
 /// This is the GREEN side of the RED-first pair: the kernel designator
 /// accepts a planar face, assigns a PID-pinned datum, and the handler
@@ -4228,9 +4228,12 @@ async fn gdt_designate_plate_face_returns_200() {
         body["kind"], "plane",
         "a +Z planar face must yield kind = plane; body = {body}"
     );
+    // Re-baselined 2026-11-13 (was "session"): GD&T edits are recorded
+    // timeline events now (founder decision 2026-11-13), replayed by undo
+    // and restart — proven end to end in `gdt_history_tests`.
     assert_eq!(
-        body["persistence"], "session",
-        "persistence must be 'session'; body = {body}"
+        body["persistence"], "timeline",
+        "persistence must be 'timeline'; body = {body}"
     );
     assert!(
         body["persistent_id"]
@@ -4338,7 +4341,7 @@ async fn gdt_designate_sphere_face_returns_422() {
 
 /// Authoring a flatness FCF on a perfect planar face must return 200
 /// with `verdict.conforms == "in_spec"`, a formatted tolerance label,
-/// and `persistence: "session"`.
+/// and `persistence: "timeline"`.
 ///
 /// A primitive box face is analytically flat (form error = 0), so any
 /// positive tolerance → InSpec. This confirms the evaluate→wire path
@@ -4369,9 +4372,12 @@ async fn gdt_fcf_flatness_happy_path_returns_in_spec() {
         body["verdict"]["conforms"], "in_spec",
         "verdict.conforms must be 'in_spec'; body = {body}"
     );
+    // Re-baselined 2026-11-13 (was "session"): GD&T edits are recorded
+    // timeline events now (founder decision 2026-11-13), replayed by undo
+    // and restart — proven end to end in `gdt_history_tests`.
     assert_eq!(
-        body["persistence"], "session",
-        "persistence must be 'session'; body = {body}"
+        body["persistence"], "timeline",
+        "persistence must be 'timeline'; body = {body}"
     );
     // tolerance_label must be formatted (e.g. "0.05mm").
     let tol_label = body["verdict"]["tolerance_label"]
@@ -4543,7 +4549,7 @@ async fn gdt_fcf_position_without_basic_returns_200_not_evaluable() {
 
 /// `GET /api/agent/parts/{id}/gdt` must return 200 with a JSON object
 /// containing `datums`, `annotations`, `part_id`, and
-/// `persistence: "session"`.
+/// `persistence: "timeline"`.
 ///
 /// We designate one datum and author one flatness FCF before the GET so
 /// the response carries non-empty arrays — pinning both the datums and
@@ -4580,9 +4586,12 @@ async fn gdt_get_gdt_shape_includes_persistence_and_arrays() {
         StatusCode::OK,
         "GET /gdt must return 200; body = {body}"
     );
+    // Re-baselined 2026-11-13 (was "session"): GD&T edits are recorded
+    // timeline events now (founder decision 2026-11-13), replayed by undo
+    // and restart — proven end to end in `gdt_history_tests`.
     assert_eq!(
-        body["persistence"], "session",
-        "persistence must be 'session'; body = {body}"
+        body["persistence"], "timeline",
+        "persistence must be 'timeline'; body = {body}"
     );
     assert_eq!(
         body["part_id"].as_u64(),
@@ -4727,7 +4736,7 @@ async fn gdt_get_gdt_scopes_annotations_to_requested_solid() {
 /// `GET /api/agent/parts/{id}/datums` end-to-end: after designating
 /// datum "A" on the top face, the response must carry `part_id`, a
 /// one-element `datums` array with label/kind/live resolution, and
-/// `persistence: "session"`.
+/// `persistence: "timeline"`.
 #[tokio::test]
 async fn gdt_get_datums_shape_includes_persistence_end_to_end() {
     let state = make_test_state().await;
@@ -4744,9 +4753,12 @@ async fn gdt_get_datums_shape_includes_persistence_end_to_end() {
         StatusCode::OK,
         "GET /datums must return 200; body = {body}"
     );
+    // Re-baselined 2026-11-13 (was "session"): GD&T edits are recorded
+    // timeline events now (founder decision 2026-11-13), replayed by undo
+    // and restart — proven end to end in `gdt_history_tests`.
     assert_eq!(
-        body["persistence"], "session",
-        "persistence must be 'session' end-to-end; body = {body}"
+        body["persistence"], "timeline",
+        "persistence must be 'timeline' end-to-end; body = {body}"
     );
     assert_eq!(
         body["part_id"].as_u64(),

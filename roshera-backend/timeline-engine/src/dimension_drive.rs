@@ -172,9 +172,13 @@ fn numeric_parameters(events: &[TimelineEvent]) -> Vec<(u64, Uuid, String, Strin
         else {
             continue;
         };
+        // GD&T edits (`gdt_*`) carry tolerance zones and basic dimensions,
+        // not geometry: no tolerance drives a measured dimension of the part,
+        // so none is offered as one to mould.
         if is_param_meta(command_type)
             || command_type.starts_with("drawing.")
             || command_type.starts_with("gdt.")
+            || command_type.starts_with("gdt_")
         {
             continue;
         }

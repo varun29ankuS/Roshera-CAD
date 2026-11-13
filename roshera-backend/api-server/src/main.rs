@@ -55,6 +55,8 @@ mod frame;
 #[cfg(test)]
 mod gate3_drift_set_equality_tests;
 #[cfg(test)]
+mod gdt_history_tests;
+#[cfg(test)]
 mod geometry_routes_coverage_tests;
 mod goose_acp;
 mod handlers;
@@ -11524,9 +11526,19 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/agent/parts/{id}/datums",
             post(handlers::gdt::designate_datum_handler).get(handlers::gdt::list_datums_handler),
         )
+        // Edits are recorded design events (`gdt_*`): undoable, durable,
+        // re-derived by every sheet rebuild (founder decision 2026-11-13).
+        .route(
+            "/api/agent/parts/{id}/datums/{label}",
+            patch(handlers::gdt::update_datum_handler).delete(handlers::gdt::delete_datum_handler),
+        )
         .route(
             "/api/agent/parts/{id}/fcf",
             post(handlers::gdt::author_fcf_handler),
+        )
+        .route(
+            "/api/agent/parts/{id}/fcf/{annotation_id}",
+            patch(handlers::gdt::update_fcf_handler).delete(handlers::gdt::delete_fcf_handler),
         )
         // Dimensional (size) tolerance authoring (campaign #55 Slice 4): binds a
         // ±/limits/fit tolerance to a feature so the sheet readback answers "the
@@ -11534,6 +11546,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/agent/parts/{id}/size-tolerance",
             post(handlers::gdt::author_size_tolerance_handler),
+        )
+        .route(
+            "/api/agent/parts/{id}/size-tolerance/{annotation_id}",
+            delete(handlers::gdt::delete_size_tolerance_handler),
         )
         .route(
             "/api/agent/parts/{id}/gdt",

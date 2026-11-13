@@ -72,6 +72,27 @@ pub enum GdtError {
     /// The specified solid does not exist in the model.
     #[error("solid {solid} does not exist in the model")]
     UnknownSolid { solid: SolidId },
+
+    /// A datum letter must name something: an empty or blank label is
+    /// refused.
+    #[error("a datum label cannot be empty")]
+    EmptyLabel,
+
+    /// No datum with this label is designated on the solid.
+    #[error("datum '{label}' is not designated on solid {solid}")]
+    UnknownDatum { solid: SolidId, label: String },
+
+    /// The datum is referenced by feature control frames, so deleting or
+    /// re-lettering it would leave those frames naming a datum the part no
+    /// longer has. Edit or delete the frames first.
+    #[error(
+        "datum '{label}' on solid {solid} is referenced by {annotations:?}; edit or delete those frames first"
+    )]
+    DatumReferenced {
+        solid: SolidId,
+        label: String,
+        annotations: Vec<String>,
+    },
 }
 
 /// The result of resolving a [`Datum`] at the current model state.
@@ -180,6 +201,42 @@ pub fn designate_datum(
     label: &str,
     face: FaceId,
 ) -> Result<Datum, GdtError> {
+    // 1-4. The face must be a datum-qualifying feature of the solid.
+    let (pid, kind) = datum_feature_of(model, solid, face)?;
+
+    // 5. Label must be unique within this solid's DRF. Checked before the
+    // frame entry is touched, so a refusal leaves the model as it was.
+    if model
+        .drf
+        .get(&solid)
+        .is_some_and(|f| f.datum_by_label(label).is_some())
+    {
+        return Err(GdtError::DuplicateLabel {
+            solid,
+            label: label.to_string(),
+        });
+    }
+
+    // 6. Append and return.
+    let datum = Datum::new(label, kind, pid);
+    model
+        .drf
+        .entry(solid)
+        .or_default()
+        .datums
+        .push(datum.clone());
+    Ok(datum)
+}
+
+/// The persistent id and datum kind a face of `solid` would establish, or the
+/// typed reason it cannot: steps 1-4 of [`designate_datum`] (solid exists, face
+/// is a member, face carries a persistent id, surface is a plane or a
+/// cylinder). Changes nothing.
+pub fn datum_feature_of(
+    model: &BRepModel,
+    solid: SolidId,
+    face: FaceId,
+) -> Result<(crate::primitives::persistent_id::PersistentId, DatumKind), GdtError> {
     // 1. Solid must exist.
     if model.solids.get(solid).is_none() {
         return Err(GdtError::UnknownSolid { solid });
@@ -219,19 +276,7 @@ pub fn designate_datum(
         }
     };
 
-    // 5. Label must be unique within this solid's DRF.
-    let drf = model.drf.entry(solid).or_default();
-    if drf.datum_by_label(label).is_some() {
-        return Err(GdtError::DuplicateLabel {
-            solid,
-            label: label.to_string(),
-        });
-    }
-
-    // 6. Append and return.
-    let datum = Datum::new(label, kind, pid);
-    drf.datums.push(datum.clone());
-    Ok(datum)
+    Ok((pid, kind))
 }
 
 /// Resolve a [`Datum`] to its current live geometry, or report
