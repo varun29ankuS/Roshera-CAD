@@ -53,10 +53,14 @@ const FULL_REFRESH_MS = 10_000
 
 export function AgentEyePanel({
   onMinimizedChange,
+  defaultMinimized = false,
 }: {
   onMinimizedChange?: (minimized: boolean) => void
+  /** Start folded to its header (the Part workspace keeps the corner for
+   *  the model; the agent's view opens on demand). */
+  defaultMinimized?: boolean
 } = {}) {
-  const [minimized, setMinimizedState] = useState(false)
+  const [minimized, setMinimizedState] = useState(defaultMinimized)
   const setMinimized = useCallback(
     (next: boolean) => {
       setMinimizedState(next)

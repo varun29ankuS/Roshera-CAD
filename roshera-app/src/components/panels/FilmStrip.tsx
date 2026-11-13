@@ -219,7 +219,7 @@ export function FilmStrip({
   const stop = () => setPlaying(false)
 
   return (
-    <div className="flex min-w-0 flex-1 items-center gap-1 pl-2">
+    <div className="flex min-w-0 items-center gap-1 pl-2">
       <div className="flex shrink-0 items-center gap-0.5" role="group" aria-label="Transport">
         <TransportButton
           label="To the start"
@@ -315,7 +315,7 @@ export function FilmStrip({
           stop()
           show(next)
         }}
-        className="relative min-w-0 flex-1 cursor-grab touch-none select-none overflow-x-auto rounded-md outline-none focus-visible:ring-1 focus-visible:ring-ring active:cursor-grabbing [scrollbar-width:thin]"
+        className="relative min-w-0 cursor-grab touch-none select-none overflow-x-auto rounded-md outline-none focus-visible:ring-1 focus-visible:ring-ring active:cursor-grabbing [scrollbar-width:thin]"
       >
         <ol aria-hidden className="relative flex items-end gap-2 px-3 pb-1 pt-2">
           {chapters.map((c, i) => {

@@ -39,7 +39,8 @@ export function GizmoNav() {
   return (
     <>
       <ManualSceneRender active={!hasOutlineTarget} />
-      <GizmoHelper alignment="top-right" margin={[72, 72]} renderPriority={2}>
+      {/* Left of the docked Blackboard (w-80 = 320 px + its 8 px gap). */}
+      <GizmoHelper alignment="top-right" margin={[72 + 336, 72]} renderPriority={2}>
         <GizmoViewport
           axisColors={['#e74c3c', '#2ecc71', '#3498db']}
           labelColor="#000000"

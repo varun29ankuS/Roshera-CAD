@@ -209,7 +209,7 @@ export function App() {
                   conversation lost a third of its column to a panel that is
                   empty most of the time. */}
               {hasSelection && (
-                <div className="absolute right-2 top-2 z-10 flex max-h-[45%] w-56 flex-col overflow-hidden rounded border border-border bg-card/95">
+                <div className="absolute right-[21rem] top-2 z-10 flex max-h-[45%] w-56 flex-col overflow-hidden rounded border border-border bg-card/95">
                   <PropertiesPanel />
                 </div>
               )}
@@ -217,8 +217,8 @@ export function App() {
               {/* Agent Eye: a RENDER of the part, which makes it an instrument
                   of the model rather than of the dialogue. Bottom-right, out of
                   the tree's corner, and it keeps its own collapse. */}
-              <div className="absolute bottom-2 right-2 z-10 flex w-56 flex-col overflow-hidden rounded border border-border bg-card/95">
-                <AgentEyePanel />
+              <div className="absolute bottom-24 right-[21rem] z-10 flex w-56 flex-col overflow-hidden rounded border border-border bg-card/95">
+                <AgentEyePanel defaultMinimized />
               </div>
 
               {/* The Blackboard is an overlay too. It has now been a floating
@@ -227,13 +227,9 @@ export function App() {
                   else is an instrument laid over it that the human can put
                   away. Bottom-left, clear of the tree's column, closable to a
                   pill. */}
-              <div
-                className={cn(
-                  'pointer-events-none absolute bottom-[7.5rem] right-[15.5rem] top-2 z-20 flex flex-col items-start justify-end',
-                  docMode === 'dfm' ? 'left-[19rem]' : 'left-[15.5rem]',
-                )}
-              >
-                <Blackboard />
+              {/* Docked on the right, full height (Varun 2026-11-13). */}
+              <div className="pointer-events-none absolute bottom-2 right-2 top-2 z-20 flex w-80 flex-col items-end justify-start">
+                <Blackboard docked />
               </div>
 
               {/* The timeline is an overlay as well, starting to the RIGHT of
@@ -245,13 +241,18 @@ export function App() {
                   let the model read through it rather than stamping a slab over
                   the geometry. No blur — blur smears the one thing the app
                   exists to show. */}
+              {/* Floating, centred between the tree and the agent, only as wide
+                  as its steps (Varun 2026-11-13: "why does the timeline have
+                  to be completely from left to right?"). */}
               <div
                 className={cn(
-                  'pointer-events-auto absolute bottom-2 right-[15.5rem] z-20 overflow-hidden rounded-lg border border-border/70 bg-card/45',
+                  'pointer-events-none absolute bottom-2 right-[21rem] z-20 flex justify-center',
                   docMode === 'dfm' ? 'left-[19rem]' : 'left-[15.5rem]',
                 )}
               >
-                <Timeline />
+                <div className="pointer-events-auto max-w-full overflow-hidden rounded-xl border border-border/70 bg-card/90 shadow-md">
+                  <Timeline />
+                </div>
               </div>
             </div>
 

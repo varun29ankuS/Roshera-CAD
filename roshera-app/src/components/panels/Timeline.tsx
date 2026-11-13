@@ -1633,24 +1633,52 @@ export function Timeline() {
         </div>
       )}
 
-      {/* Controls row: title + glyph actions, grouping toggle, branch chip */}
-      <div className="flex items-center gap-2 px-3 py-1.5">
-        <div className="flex items-center gap-0.5 shrink-0 text-[13px]">
-          <button
-            type="button"
-            onClick={toggleCollapsed}
-            title={bodyCollapsed ? 'Expand timeline' : 'Collapse timeline'}
-            aria-label={bodyCollapsed ? 'Expand timeline' : 'Collapse timeline'}
-            aria-expanded={!bodyCollapsed}
-            className="text-foreground/55 hover:text-foreground transition-colors text-[11px] leading-none px-0.5"
-          >
-            {bodyCollapsed ? '▸' : '▾'}
-          </button>
-          <span className="text-foreground/80 mr-1">timeline</span>
+      {/* ONE ROW (Varun 2026-11-13, the approved mockup: "why does the
+          timeline have to be completely from left to right?"). The history
+          floats over the viewport and is only as wide as its steps: the
+          picture strip with its transport, then the history actions, the
+          map and the branch. A named decision (checkpoint) rides above it
+          when one exists; with none there is nothing to say, so no line. */}
+      {!bodyCollapsed && checkpoints.length > 0 && (
+        <div className="flex border-b border-border/40">
+          <DecisionRail
+            checkpoints={checkpoints}
+            eventCount={events.length}
+            onOpen={() => setGraphOpen(true)}
+          />
+        </div>
+      )}
+      <div className="flex min-w-0 items-center gap-1 py-1 pr-1.5">
+        {bodyCollapsed ? (
+          <span className="px-3 text-[12px] font-medium text-foreground/80">History</span>
+        ) : chapterState.chapters.length > 0 ? (
+          <FilmStrip
+            chapters={chapterState.chapters}
+            onFrameContextMenu={(e, anchor) => {
+              const event = events.find((ev) => ev.sequence_number === anchor)
+              if (event) handleEventContextMenu(e, event)
+            }}
+          />
+        ) : (
+          <div className="min-w-0 max-w-[36rem]">
+            <RecentOpsStrip
+              events={events}
+              now={now}
+              onContextMenu={handleEventContextMenu}
+              loading={loading}
+              durability={durability}
+              onOpenMap={() => setGraphOpen(true)}
+            />
+          </div>
+        )}
+
+        <span aria-hidden className="mx-1 h-8 w-px shrink-0 bg-border/60" />
+
+        <div className="flex shrink-0 items-center gap-0.5 text-[13px]">
           <HeaderButton onClick={handleUndo} title="Undo (Ctrl+Z)" ariaLabel="Undo">↶</HeaderButton>
           <HeaderButton onClick={handleRedo} title="Redo (Ctrl+Shift+Z)" ariaLabel="Redo">↷</HeaderButton>
-          <HeaderButton onClick={handleCheckpoint} title="Checkpoint" ariaLabel="Create checkpoint">◈</HeaderButton>
-          <HeaderButton onClick={handleBranch} title="Branch" ariaLabel="Create branch">⑂</HeaderButton>
+          <HeaderButton onClick={handleCheckpoint} title="Checkpoint: name this point in the history" ariaLabel="Create checkpoint">◈</HeaderButton>
+          <HeaderButton onClick={handleBranch} title="Branch: try something without touching main" ariaLabel="Create branch">⑂</HeaderButton>
           <HeaderButton
             onClick={handleMerge}
             title={
@@ -1663,80 +1691,46 @@ export function Timeline() {
           >⊕</HeaderButton>
         </div>
 
-        <span className="text-muted-foreground/40 shrink-0 text-[13px]">│</span>
-
-        {/* Position: the ambient "where am I" the odometer-strip owed and
-            never gave — branch + total. The map (below) is where
-            structure lives now; this is scale, not detail.
-            ★ Deliberately NOT claiming "at head" / "N back" here: tested
-            live against undo — neither `history`'s event count nor
-            `/api/branches`' `event_count` changes when undo moves the
-            live model backward (verified: both stayed 68 across an
-            undo). There is no passive endpoint exposing replay position,
-            only `can_redo` inside the redo call's OWN response (a
-            side-effecting probe, not a status read) — so this doesn't
-            assert a position it cannot actually observe. */}
-        <span
-          className="shrink-0 text-[11px] text-muted-foreground/80 whitespace-nowrap"
-          title="Active branch and its total recorded operations"
-        >
-          <span className="text-foreground/70">{activeBranchLabel}</span>
-          {' · '}
-          {events.length} op{events.length === 1 ? '' : 's'}
-        </span>
-
-        {/* Durability disclosure — non-null exactly when the boot
-            outcome withheld or lost history (quarantine/failure) or
-            persistence is off. The short label is readable in place;
-            the full account (break sequence, kind, reason) is on
-            hover. Amber-dashed = withheld-by-design, red = log
-            unreadable — the card-chrome tri-state language. */}
         {(() => {
           const notice = durabilityNotice(durability)
           return notice ? <DurabilityChip notice={notice} /> : null
         })()}
 
-        <div className="flex-1" />
+        <div className="flex shrink-0 flex-col items-stretch gap-0.5">
+          {/* Map: the same history grouped by structure (TimelineGraph). */}
+          <button
+            type="button"
+            onClick={() => setGraphOpen(true)}
+            title="Open the history as a map: features, their links and branches"
+            className="rounded px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+          >
+            Map
+          </button>
+          {/* Branch chip: opens the branch graph. */}
+          <button
+            type="button"
+            onClick={() => setOverviewExpanded((v) => !v)}
+            title={`Branch ${activeBranchLabel} · ${events.length} recorded step${events.length === 1 ? '' : 's'}${
+              otherBranchCount > 0 ? ` · ${otherBranchCount} other branch${otherBranchCount === 1 ? '' : 'es'}` : ''
+            }`}
+            className="flex items-center gap-1.5 rounded px-2 py-0.5 text-[11px] hover:bg-accent/40"
+          >
+            <span aria-hidden className="inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: '#2ecc71' }} />
+            <span className="font-medium text-foreground/90">{activeBranchLabel}</span>
+            {otherBranchCount > 0 && <span className="text-foreground/50">+{otherBranchCount}</span>}
+            <span className="text-foreground/60">{overviewExpanded ? '▴' : '▾'}</span>
+          </button>
+        </div>
 
-        {/* Map view toggle — a second, independent view of the SAME
-            history as the strip below, grouped by structure instead of
-            scrubbed by time. See TimelineGraph.tsx for what it groups by
-            today and why it doesn't color by certificate yet. */}
         <button
           type="button"
-          onClick={() => setGraphOpen(true)}
-          title="Open the timeline as a map — grouped by part, not raw ops"
-          className="shrink-0 flex items-center gap-1 px-2 py-1 rounded text-[12px] text-muted-foreground hover:text-foreground hover:bg-accent/40 transition-colors"
+          onClick={toggleCollapsed}
+          title={bodyCollapsed ? 'Show the history pictures' : 'Fold the history to one line'}
+          aria-label={bodyCollapsed ? 'Expand history' : 'Collapse history'}
+          aria-expanded={!bodyCollapsed}
+          className="shrink-0 rounded px-1 text-[11px] leading-none text-foreground/55 hover:text-foreground"
         >
-          <span aria-hidden>🗺</span>
-          <span>map</span>
-        </button>
-
-        {/* Branch chip + expand/collapse toggle for the branch graph. */}
-        <button
-          type="button"
-          onClick={() => setOverviewExpanded((v) => !v)}
-          title={
-            overviewExpanded
-              ? 'Hide branch graph'
-              : `Show branch graph (${branches.length} branch${branches.length === 1 ? '' : 'es'})`
-          }
-          className="shrink-0 flex items-center gap-1.5 px-2 py-1 rounded text-[12px] hover:bg-accent/40 transition-colors"
-        >
-          <span
-            aria-hidden
-            className="inline-block w-1.5 h-1.5 rounded-full"
-            style={{ backgroundColor: '#2ecc71' }}
-          />
-          <span className="text-foreground/90 font-medium">
-            {activeBranchLabel}
-          </span>
-          {otherBranchCount > 0 && (
-            <span className="text-foreground/50">+{otherBranchCount}</span>
-          )}
-          <span className="text-foreground/60 ml-0.5">
-            {overviewExpanded ? '▴' : '▾'}
-          </span>
+          {bodyCollapsed ? '▴' : '▾'}
         </button>
       </div>
 
@@ -1755,54 +1749,6 @@ export function Timeline() {
           >
             ✕
           </button>
-        </div>
-      )}
-
-      {/* Recent-ops strip: ambient "what just happened", last few ops only.
-          Full history moved to the map — this never grows past a glance.
-          Above it, the DECISION rail: named intents (checkpoints) when any
-          exist, and the honest "N ops without a named decision" line when
-          work happened but nobody declared what it was for. */}
-      {!bodyCollapsed && (
-        // ONE machine strip, not two stacked ones. The decision rail and the
-        // ops ribbon are two granularities of the same fact stream — what was
-        // DECIDED, and what was DONE — and stacking them made two time-shaped
-        // rows compete over which was authoritative.
-        //
-        // The decision zone keeps its own space and its own hairline rather
-        // than collapsing into a marker on the ribbon: it is the record of
-        // what the agent decided, which is the thing this product exists to
-        // keep, and a glyph cannot carry a sentence of declared intent.
-        <div className="flex items-stretch overflow-hidden border-t border-border/40">
-          <DecisionRail
-            checkpoints={checkpoints}
-            eventCount={events.length}
-            onOpen={() => setGraphOpen(true)}
-          />
-          <div aria-hidden className="w-px shrink-0 self-stretch bg-border/40" />
-          {/* The film strip -- a picture of the part after each feature --
-              once there are features; the ops strip keeps the honest empty
-              and boot-failure states. */}
-          {chapterState.chapters.length > 0 ? (
-            <div className="flex min-w-0 flex-1 flex-col">
-            <FilmStrip
-              chapters={chapterState.chapters}
-              onFrameContextMenu={(e, anchor) => {
-                const event = events.find((ev) => ev.sequence_number === anchor)
-                if (event) handleEventContextMenu(e, event)
-              }}
-            />
-            </div>
-          ) : (
-            <RecentOpsStrip
-              events={events}
-              now={now}
-              onContextMenu={handleEventContextMenu}
-              loading={loading}
-              durability={durability}
-              onOpenMap={() => setGraphOpen(true)}
-            />
-          )}
         </div>
       )}
 

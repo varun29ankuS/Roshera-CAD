@@ -149,7 +149,13 @@ function ModelPicker({
   )
 }
 
-export function Blackboard() {
+/**
+ * `docked`: the Blackboard as a full-height column on the right of the
+ * viewport (Varun 2026-11-13: "I like it be docked to the right side"). The
+ * conversation fills the column; floating, its height follows the agent's
+ * attention instead.
+ */
+export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
   const lines = useBlackboardStore((s) => s.lines)
   const isProcessing = useBlackboardStore((s) => s.isProcessing)
   const isPanelOpen = useBlackboardStore((s) => s.isPanelOpen)
@@ -443,7 +449,12 @@ export function Blackboard() {
     // the board loses a third of its width and gains capacity.
     // pointer-events-auto: the slot around this is pass-through so the model
     // stays orbitable everywhere the panel is not.
-    <div className="pointer-events-auto flex max-h-full min-h-0 w-full max-w-[26rem] flex-col overflow-hidden rounded-2xl border border-border bg-card/95 shadow-lg">
+    <div
+      className={cn(
+        'pointer-events-auto flex min-h-0 w-full flex-col overflow-hidden border border-border bg-card/95',
+        docked ? 'h-full rounded-xl shadow-md' : 'max-h-full max-w-[26rem] rounded-2xl shadow-lg',
+      )}
+    >
       {/* Resize grip — a drag here overrides the attention-following split
           and STICKS until released (double-click, or the "auto" chip). */}
       <div
@@ -585,7 +596,9 @@ export function Blackboard() {
         ref={scrollRef}
         className="flex-1 overflow-y-auto min-h-0 scrollbar-thin"
         style={
-          overrideHeight !== null
+          docked
+            ? undefined
+            : overrideHeight !== null
             ? { height: `${overrideHeight}px`, maxHeight: '80vh' }
             : {
                 maxHeight: attentionMaxHeight,
