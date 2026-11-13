@@ -1,8 +1,8 @@
 /**
  * Document-mode store.
  *
- * Roshera supports three top-level document types — Part, Assembly,
- * Drawing — and the user picks one at the start of every session
+ * The workspaces are listed once, in `lib/workspaces.ts` (Part,
+ * Assembly, Drawing today), and shown as tabs in the top bar
  * (mirrors mainstream parametric CAD). The chosen mode decides
  * which toolset, which panels, and which workspace layout are
  * presented; the kernel itself is mode-agnostic.
@@ -22,25 +22,23 @@
  */
 
 import { create } from 'zustand'
+import { parseWorkspace, type WorkspaceId } from '@/lib/workspaces'
 
-export type DocumentMode = 'part' | 'assembly' | 'drawing'
+export type DocumentMode = WorkspaceId
 
 const STORAGE_KEY = 'roshera_document_mode'
 
 /** Parse `window.location.hash` for an explicit mode override. */
 function modeFromHash(): DocumentMode | null {
   if (typeof window === 'undefined') return null
-  const h = window.location.hash.replace(/^#\/?/, '').toLowerCase()
-  if (h === 'part' || h === 'assembly' || h === 'drawing') return h
-  return null
+  return parseWorkspace(window.location.hash.replace(/^#\/?/, ''))
 }
 
 /** Read the persisted mode from localStorage, if any. */
 function modeFromStorage(): DocumentMode | null {
   if (typeof window === 'undefined') return null
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY)
-    if (raw === 'part' || raw === 'assembly' || raw === 'drawing') return raw
+    return parseWorkspace(window.localStorage.getItem(STORAGE_KEY))
   } catch {
     // localStorage disabled (private mode, sandboxed iframe) — fall
     // through and start at the chooser, no error to the user.

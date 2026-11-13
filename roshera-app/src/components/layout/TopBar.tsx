@@ -14,7 +14,9 @@ import {
 import { useSceneStore, CAMERA_PRESETS } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { useThemeStore } from '@/stores/theme-store'
-import { useDocModeStore, type DocumentMode } from '@/stores/doc-mode-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
+import { WORKSPACES } from '@/lib/workspaces'
+import { cn } from '@/lib/utils'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import { useUnitsStore } from '@/stores/units-store'
 import { Badge } from '@/components/ui/badge'
@@ -50,19 +52,6 @@ async function exportGeometry(format: string) {
     addLine(`Export failed: ${result.error ?? 'unknown error'}`, 'system')
   }
 }
-
-// Workspace switcher. Mirrors the standard CAD File-menu pattern: the user
-// is *always* in a workspace; the chip on the right of the TopBar names
-// the current one and the dropdown lets you switch. All three modes
-// (Modeling / Assembly / Drawing) are exposed now that the Assembly
-// workspace ships the mate editor + outliner shell.
-const WORKSPACE_LABELS: Record<DocumentMode, string> = {
-  part: 'Modeling',
-  assembly: 'Assembly',
-  drawing: 'Drawing',
-}
-
-const WORKSPACE_CHOICES: DocumentMode[] = ['part', 'assembly', 'drawing']
 
 export function TopBar() {
   const clearScene = useSceneStore((s) => s.clearScene)
@@ -159,9 +148,7 @@ export function TopBar() {
   return (
     <div className="flex items-center h-9 cad-panel border-b px-1">
       <div className="flex items-center gap-1.5 px-2">
-        <div className="w-4 h-4 rounded-sm bg-primary flex items-center justify-center">
-          <span className="text-[11px] font-bold text-primary-foreground">R</span>
-        </div>
+        <img src="/logo.png" alt="" width={16} height={16} className="h-4 w-4" />
         <span className="text-xs font-semibold tracking-tight text-foreground">
           Roshera CAD
         </span>
@@ -297,6 +284,33 @@ export function TopBar() {
         </MenubarMenu>
       </Menubar>
 
+      {/* Workspaces as tabs, beside the menus (Varun 2026-11-13, the
+          approved mockup): the engineer always sees which workspace they
+          are in and reaches any other in one click. The list is
+          lib/workspaces.ts -- one source for these tabs, the command
+          palette and the saved choice. */}
+      <nav
+        aria-label="Workspaces"
+        className="ml-2 flex items-center gap-px rounded-md bg-muted/70 p-0.5"
+      >
+        {WORKSPACES.map((w) => (
+          <button
+            key={w.id}
+            type="button"
+            onClick={() => setDocMode(w.id)}
+            aria-current={docMode === w.id ? 'page' : undefined}
+            className={cn(
+              'cad-focus h-6 rounded px-2.5 text-xs transition-colors',
+              docMode === w.id
+                ? 'bg-background font-semibold text-foreground shadow-sm'
+                : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {w.label}
+          </button>
+        ))}
+      </nav>
+
       <div className="flex-1" />
 
       <div className="flex items-center gap-2 px-2">
@@ -327,34 +341,6 @@ export function TopBar() {
             in the new unit; the frontend performs zero conversion math. */}
         <UnitSelector />
 
-        {/* Workspace switcher. Tucked into the right-side TopBar so
-            it is reachable from anywhere but never competes with the
-            primary File/Edit/View menus for attention. The dropdown
-            renders every workspace the app currently ships — Modeling,
-            Assembly, and Drawing. */}
-        <Menubar className="border-none bg-transparent h-7 px-0">
-          <MenubarMenu>
-            <MenubarTrigger
-              className="text-xs px-2 py-0.5 h-6 gap-1"
-              title="Switch workspace"
-            >
-              <span className="text-muted-foreground">Workspace:</span>
-              <span className="font-medium">{WORKSPACE_LABELS[docMode]}</span>
-              <span className="text-muted-foreground text-[11px]">▾</span>
-            </MenubarTrigger>
-            <MenubarContent align="end">
-              {WORKSPACE_CHOICES.map((m) => (
-                <MenubarItem
-                  key={m}
-                  onClick={() => setDocMode(m)}
-                  className={docMode === m ? 'bg-accent' : ''}
-                >
-                  {WORKSPACE_LABELS[m]}
-                </MenubarItem>
-              ))}
-            </MenubarContent>
-          </MenubarMenu>
-        </Menubar>
 
         {/* AI provider settings. Opens the modal that renders the
             server-owned provider allowlist (allowlist.rs) and lets the

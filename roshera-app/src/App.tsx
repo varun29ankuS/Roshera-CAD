@@ -140,12 +140,11 @@ export function App() {
   return (
     <div className="flex flex-col h-screen w-screen bg-background text-foreground select-none">
       <ViewportBridge />
-      {/* The active workspace (Modeling / Drawing / future Assembly) is
-          chosen from the right-side switcher in `TopBar`. We never
-          present the three as equal sibling tabs because they aren't —
-          Modeling is the dominant mode; Drawing is derived; Assembly
-          combines existing parts. Treating them as a top-level tab
-          strip implied otherwise. */}
+      {/* The active workspace is chosen from the tabs in `TopBar`
+          (lib/workspaces.ts lists them). They were a drop-down, kept
+          apart from the menus because Modeling dominates; Varun
+          (2026-11-13) chose tabs, as in mainstream CAD, so the
+          engineer always sees where they are. */}
       <TopBar />
       <DocumentTabs />
       <div className="flex flex-1 min-h-0">

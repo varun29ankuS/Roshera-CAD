@@ -26,7 +26,8 @@ import {
   Search,
 } from '@/components/ui/icons'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
-import { useDocModeStore, type DocumentMode } from '@/stores/doc-mode-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
+import { WORKSPACES } from '@/lib/workspaces'
 import { useSceneStore, CAMERA_PRESETS } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
@@ -145,18 +146,13 @@ export function CommandPalette() {
     const cmds: Command[] = []
 
     // Workspace switch
-    const workspaceLabels: Record<DocumentMode, string> = {
-      part: 'Modeling',
-      drawing: 'Drawing',
-      assembly: 'Assembly',
-    }
-    for (const mode of ['part', 'assembly', 'drawing'] as DocumentMode[]) {
+    for (const w of WORKSPACES) {
       cmds.push({
-        id: `workspace.${mode}`,
-        label: `Switch to ${workspaceLabels[mode]}`,
+        id: `workspace.${w.id}`,
+        label: `Switch to ${w.label}`,
         group: 'Workspace',
-        keywords: ['mode', 'workspace', mode],
-        run: () => setDocMode(mode),
+        keywords: ['mode', 'workspace', w.id, w.label.toLowerCase()],
+        run: () => setDocMode(w.id),
       })
     }
 

@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { keepCameraPose, keptCameraPose } from '@/lib/camera-memory'
 import { CAMERA_PRESETS, FRAME_ALL, FRAME_FIT } from '@/stores/scene-store'
 import { useThree, useFrame } from '@react-three/fiber'
 import {
@@ -121,6 +122,42 @@ export function CameraController() {
   // before the per-frame refinement (above) tightens `near` for precision.
   const farProp = Math.max(maxDistance * 4, PERSPECTIVE_FAR)
   const nearProp = Math.max(farProp * 1e-5, PERSPECTIVE_NEAR)
+
+  // Return to the view the user left. Switching workspace unmounts this
+  // viewport; a fresh camera starts at INITIAL_POSITION, 30 mm from the
+  // origin -- inside any real part -- and nothing re-frames it, so the
+  // pose is kept on the way out and put back on the way in (both
+  // cameras, so a projection toggle afterwards stays seamless).
+  useLayoutEffect(() => {
+    const controls = controlsRef.current
+    const pose = keptCameraPose()
+    if (controls && pose) {
+      for (const cam of [perspRef.current, orthoRef.current]) {
+        if (!cam) continue
+        cam.position.set(...pose.position)
+        cam.up.set(...pose.up)
+        if (cam instanceof THREE.OrthographicCamera) cam.zoom = pose.zoom
+        cam.lookAt(...pose.target)
+        cam.updateProjectionMatrix()
+      }
+      ;(controls.target as THREE.Vector3).set(...pose.target)
+      controls.update()
+      invalidate()
+    }
+    const persp = perspRef.current
+    const ortho = orthoRef.current
+    return () => {
+      const live = useSceneStore.getState().cameraProjection === 'orthographic' ? ortho : persp
+      const t = controls?.target as THREE.Vector3 | undefined
+      if (!live || !t) return
+      keepCameraPose({
+        position: [live.position.x, live.position.y, live.position.z],
+        target: [t.x, t.y, t.z],
+        up: [live.up.x, live.up.y, live.up.z],
+        zoom: ortho?.zoom ?? 1,
+      })
+    }
+  }, [invalidate])
 
   // When the projection toggles, copy the outgoing camera's transform
   // onto the incoming one so the swap is visually seamless. Runs once
