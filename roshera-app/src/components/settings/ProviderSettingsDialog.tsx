@@ -16,7 +16,6 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
-import { Claim } from '@/components/panels/cards/card-chrome'
 import { VendorMark } from '@/components/settings/vendor-marks'
 import {
   deleteProvider,
@@ -39,7 +38,6 @@ import {
 } from '@/lib/acp-blackboard'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { useAgentUiStore } from '@/stores/agent-ui-store'
-import { useBlackboardStore } from '@/stores/blackboard-store'
 
 /** `GET /api/ai/provider`'s `cli` object is keyed by CLI, not by provider
  *  id (`ai_provider_config::detect_claude_cli` / `detect_codex_cli`). */
@@ -178,9 +176,9 @@ interface ConnectFlow {
 
 const MODE_LABELS: Record<CredentialMode, string> = {
   api_key: 'API key',
-  oauth_profile: 'OAuth profile',
+  oauth_profile: 'Signed-in command line',
   workload_identity: 'Workload identity',
-  subscription_cli: 'Max/Pro subscription',
+  subscription_cli: 'Subscription (Max / Pro)',
 }
 
 // Short form for the one-line "connected" readout at the top of the dialog.
@@ -197,7 +195,13 @@ const MODE_SHORT_LABELS: Record<CredentialMode, string> = {
 // key and a Max subscription don't necessarily serve the same set), so the
 // caption under the control says so explicitly and every value still goes
 // through the backend's live validation before it is treated as active.
-const CUSTOM_MODEL = '__custom__'
+/** Claude's three models, as buttons: name and what each is for. */
+const CLAUDE_MODELS: { value: string; label: string; hint: string }[] = [
+  { value: 'opus', label: 'Opus', hint: 'most capable' },
+  { value: 'sonnet', label: 'Sonnet', hint: 'balanced' },
+  { value: 'haiku', label: 'Haiku', hint: 'fastest' },
+]
+
 const MODEL_PRESETS: { value: string; label: string }[] = [
   { value: '', label: "default (provider's choice)" },
   { value: 'opus', label: 'opus' },
@@ -294,15 +298,10 @@ function modeStatus(
 }
 
 /**
- * The AI button on the left rail, and the AI setup dialog it owns.
- *
- * The button opens the agent's window -- the Blackboard -- not setup
- * (Varun 2026-11-13: the AI button is the agent; setup moves out of the
- * way). Opening it also starts a saved provider's agent if none is running
- * ("clicking ai should start it"); setup appears only when it is needed:
- * nothing saved yet, or the start failed (the dialog then shows which step
- * failed and why). Setup is otherwise reached from the model chip in the
- * Blackboard's header (`useAgentUiStore.openSettings`).
+ * The AI button on the left rail, and the AI pop-up it opens. Opening it
+ * also starts a saved provider's agent if none is running ("clicking ai
+ * should start it"). The model chip in the Blackboard's header opens the
+ * same pop-up (`useAgentUiStore.openSettings`).
  */
 export function AgentButton() {
   const [open, setOpen] = useState(false)
@@ -556,31 +555,6 @@ export function AgentButton() {
     [],
   )
 
-  /** The rail button: toggle the agent's window; on opening, make sure the
-   *  agent runs. Setup shows only when nothing is saved or the start fails. */
-  async function onRailClick() {
-    const board = useBlackboardStore.getState()
-    if (board.isPanelOpen) {
-      board.setPanel(false)
-      return
-    }
-    board.setPanel(true)
-    if (useAcpSessionStore.getState().live) return
-    const res = await getProviderStatus()
-    if (!res.ok || !res.data.active) {
-      openDialog()
-      return
-    }
-    setState({ phase: 'ready', data: res.data })
-    const active = res.data.active
-    setSelectedProviderId(active.provider)
-    setSelectedMode(active.mode as CredentialMode)
-    applyModel(active.model ?? '')
-    await runConnect({ save: false, provider: active.provider, mode: active.mode as CredentialMode })
-    // runConnect leaves its failure on the dialog's step rows: show them.
-    if (!useAcpSessionStore.getState().live) setOpen(true)
-  }
-
   /** Opens the dialog and fetches fresh state — invoked from the trigger
    *  button's `onClick`, i.e. a real user event, not an Effect.
    *  `autoStart: true` is Varun's "clicking ai should start it": if the
@@ -812,7 +786,6 @@ export function AgentButton() {
   const discoveredModels: DiscoveredModel[] | null =
     discovery?.phase === 'success' && discovery.apiKey === apiKey ? discovery.models : null
 
-  const modelSelectValue = modelCustom ? CUSTOM_MODEL : model
   // Green is reserved for the model that is ACTIVE — currently saved and in
   // use for this exact provider+mode — never for whatever is merely
   // highlighted while browsing. `null` when the panel open right now isn't
@@ -825,7 +798,7 @@ export function AgentButton() {
   return (
     <>
       <button
-        onClick={() => void onRailClick()}
+        onClick={openDialog}
         className={cn(
           // Matches FlyoutGroup's trigger exactly so it reads as a rail item
           // rather than a logo dropped into the column.
@@ -834,12 +807,8 @@ export function AgentButton() {
           // are currentColor-derived, so one class drives the whole mark.
           providerServing ? 'text-emerald-500' : 'text-rose-400',
         )}
-        title={
-          providerServing
-            ? 'AI — open or close the agent (running)'
-            : 'AI — open the agent (not running yet)'
-        }
-        aria-label={providerServing ? 'AI agent (running)' : 'AI agent (not running)'}
+        title={providerServing ? 'AI — running' : 'AI — not running yet'}
+        aria-label={providerServing ? 'AI settings (running)' : 'AI settings (not running)'}
       >
         {/* A chip, not a glyph: nothing to interpret, nothing to date. The
             border carries connection state so the mark never claims more
@@ -859,13 +828,8 @@ export function AgentButton() {
       <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            AI provider
-          </DialogTitle>
-          <DialogDescription>
-            Pick a provider by its mark, then choose how Roshera authenticates. Only
-            server-allowlisted providers and modes are ever offered here.
-          </DialogDescription>
+          <DialogTitle className="flex items-center gap-2">AI</DialogTitle>
+          <DialogDescription>Which AI runs the agent, and how it signs in.</DialogDescription>
         </DialogHeader>
 
         {state.phase === 'loading' && (
@@ -935,13 +899,11 @@ export function AgentButton() {
                   </span>
                   <span className="text-muted-foreground">
                     · {MODE_SHORT_LABELS[data.active.mode as CredentialMode] ?? data.active.mode}
-                    {' · model: '}
-                    {data.active.model ? data.active.model : 'default'}
-                    {data.active.model && data.active.model_verified === false && ' (unverified)'}
-                    {data.active.model && data.active.model_verified === true && ' (verified)'}
+                    {' · '}
+                    {data.active.model ? data.active.model : 'default model'}
                   </span>
                   <span className={acpLive ? 'text-emerald-500' : 'text-caution'}>
-                    · {acpLive ? 'agent running' : 'agent not started'}
+                    · {acpLive ? 'running' : 'not started'}
                   </span>
                 </span>
                 <div className="flex shrink-0 items-center gap-1.5">
@@ -1047,24 +1009,6 @@ export function AgentButton() {
                 contract: amber "not asserted" (the boot fallback may or
                 may not hold a credential — the backend hasn't claimed
                 either), never a guessed tick or cross. */}
-            <div className="flex flex-col gap-1 rounded-md border border-border/60 bg-background/40 px-3 py-2">
-              {data.active === null && (
-                <Claim status={null} detail="the server uses its start-up default">
-                  Agent — no provider saved yet
-                </Claim>
-              )}
-              <Claim
-                status={data.ai_configured}
-                detail={
-                  data.ai_configured
-                    ? 'ready'
-                    : 'need an API key or a sign-in; the agent works without them'
-                }
-              >
-                One-shot commands
-              </Claim>
-            </div>
-
             {/* Vendor marks — the primary control, sized to say so: the
                 clearly largest thing in the dialog, in their own brand
                 colours (vendor-marks.tsx), with real clear-space so a
@@ -1134,7 +1078,9 @@ export function AgentButton() {
             {selectedProvider && (
               <div className="rounded-md border border-border/60 bg-background/40 p-3">
                 <div className="mb-2 space-y-1">
-                  {selectedProvider.modes.map((entry) => {
+                  {selectedProvider.modes
+                    .filter((entry) => entry.wiring.status === 'wired')
+                    .map((entry) => {
                     const active = selectedMode === entry.mode
                     const state = modeWireState(data, entry, selectedProvider)
                     const disabled = state === 'unavailable'
@@ -1306,14 +1252,10 @@ export function AgentButton() {
                             </span>
                           )}
                         </div>
-                        <p className="text-[11px] text-muted-foreground">
-                          Asks the vendor&apos;s own model-listing endpoint what it actually
-                          serves — never a stored or guessed list.
-                        </p>
                       </div>
                     )}
 
-                    {selectedMode === 'subscription_cli' && (
+                    {selectedMode === 'subscription_cli' && !alreadyConsentedToThisMode && (
                       <label
                         className="flex items-start gap-2 text-[11px] text-muted-foreground"
                         title="Spawns a local CLI process on this machine and uses your own subscription login — only coherent when the backend and this browser share a machine."
@@ -1324,7 +1266,7 @@ export function AgentButton() {
                           checked={consent}
                           onChange={(e) => setConsent(e.target.checked)}
                         />
-                        I understand this spawns a local CLI process on this machine
+                        OK to run the Claude command line on this computer
                       </label>
                     )}
 
@@ -1387,75 +1329,70 @@ export function AgentButton() {
                             </option>
                           ))}
                         </select>
+                      ) : selectedProviderId === 'anthropic' && !modelCustom ? (
+                        <div className="grid grid-cols-3 gap-1.5" role="radiogroup" aria-label="Model">
+                          {CLAUDE_MODELS.map((m) => {
+                            const chosen = model === m.value
+                            const running = activeModelValue === m.value && acpLive
+                            return (
+                              <button
+                                key={m.value}
+                                type="button"
+                                role="radio"
+                                aria-checked={chosen}
+                                onClick={() => applyModel(m.value)}
+                                className={cn(
+                                  'flex flex-col items-start rounded-md border px-2 py-1.5 text-left transition-colors',
+                                  chosen
+                                    ? 'border-primary/60 bg-primary/10'
+                                    : 'border-border hover:bg-accent/30',
+                                )}
+                              >
+                                <span className="text-xs font-medium">{m.label}</span>
+                                <span className="text-[11px] text-muted-foreground">
+                                  {running ? (
+                                    <span className="text-emerald-500">● running</span>
+                                  ) : (
+                                    m.hint
+                                  )}
+                                </span>
+                              </button>
+                            )
+                          })}
+                        </div>
                       ) : (
-                        <select
-                          id="provider-model-select"
-                          value={modelSelectValue}
-                          onChange={(e) => {
-                            const v = e.target.value
-                            if (v === CUSTOM_MODEL) {
-                              setModelCustom(true)
-                              setTestResult(null)
-                              return
-                            }
-                            setModelCustom(false)
-                            setModel(v)
-                            setTestResult(null)
-                          }}
-                          className="cad-focus h-7 rounded border border-border/60 bg-background/40 px-1.5 text-[11px] text-foreground/90 hover:bg-accent/30"
-                        >
-                          {MODEL_PRESETS.map((p) => (
-                            <option key={p.value || 'default'} value={p.value}>
-                              {p.label}
-                            </option>
-                          ))}
-                          <option value={CUSTOM_MODEL}>Custom…</option>
-                        </select>
-                      )}
-                      {/* What is actually saved and in use for THIS
-                          provider+mode — independent of whatever the
-                          dropdown above currently shows. Absent entirely
-                          when this panel isn't the active configuration at
-                          all (nothing here is running, so no green claim
-                          to make). */}
-                      {activeModelValue !== null && (
-                        <p className="text-[11px] font-medium text-emerald-500">
-                          Active: {activeModelValue ? activeModelValue : "provider's default"}
-                          {activeModelValue &&
-                            selectedMode === 'subscription_cli' &&
-                            data.active?.model_verified === false && (
-                              <span className="ml-1 font-normal text-emerald-500/80">
-                                (unverified — not checked without spawning the CLI)
-                              </span>
-                            )}
-                        </p>
-                      )}
-                      {!discoveredModels && modelCustom && (
                         <Input
+                          id="provider-model-select"
                           value={model}
                           onChange={(e) => {
                             setModel(e.target.value)
+                            setModelCustom(true)
                             setTestResult(null)
                           }}
-                          placeholder="exact model id"
+                          placeholder="model id"
                           className="h-7 text-[11px]"
                           autoComplete="off"
                         />
                       )}
-                      <p className="text-[11px] text-muted-foreground">
-                        {discoveredModels
-                          ? discoveredModels.length > 0
-                            ? "The vendor's own model list — not a suggestion."
-                            : 'The vendor returned zero models for this key.'
-                          : selectedMode === 'subscription_cli'
-                            ? 'Suggestions — availability depends on your plan; applied at session start, not checked here.'
-                            : 'Suggestions — availability depends on your plan; the exact name is validated on save.'}
-                      </p>
+                      {selectedProviderId === 'anthropic' && !discoveredModels && (
+                        <button
+                          type="button"
+                          onClick={() => (modelCustom ? applyModel('sonnet') : setModelCustom(true))}
+                          className="self-start text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                        >
+                          {modelCustom ? 'Back to the three models' : 'Another model…'}
+                        </button>
+                      )}
+                      {selectedMode === 'subscription_cli' && model !== (activeModelValue ?? '') && (
+                        <p className="text-[11px] text-muted-foreground">
+                          Takes effect when the agent restarts.
+                        </p>
+                      )}
                     </div>
 
                     {saveError && <p className="text-[11px] text-red-400">{saveError}</p>}
 
-                    <div className="flex justify-end">
+                    <div className={cn('flex justify-end', isConfigured && !saving && 'hidden')}>
                       <Button
                         size="sm"
                         className="h-7 px-3 text-[11px]"
