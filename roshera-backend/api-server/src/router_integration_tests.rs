@@ -199,6 +199,7 @@ pub(crate) async fn make_test_state_with_database(
     ));
 
     AppState {
+        undo_redo_gate: Arc::new(tokio::sync::Mutex::new(())),
         model: model.clone(),
         solids: Arc::new(RwLock::new(HashMap::new())),
         uuid_to_local: Arc::new(DashMap::new()),

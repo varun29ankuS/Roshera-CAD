@@ -276,6 +276,10 @@ pub struct AppState {
     /// kernel operations are recorded against. The same Arc is also
     /// attached to the `BRepModel` as `Arc<dyn OperationRecorder>`.
     pub timeline_recorder: Arc<timeline_engine::TimelineRecorder>,
+    /// Undo and redo of this document run one at a time, decision through
+    /// swap. Two at once (a double-pressed Ctrl+Z) both decided from the same
+    /// applied head and both answered success for the same step.
+    pub undo_redo_gate: Arc<tokio::sync::Mutex<()>>,
     // `branch_manager` (timeline-engine `BranchManager`) was removed in the
     // one-lane collapse (2026-07-31): it was a parallel, broken branch model
     // (never seeded `main`, so every create through it 500'd). The one
@@ -10292,6 +10296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create application state
     let state = AppState {
+        undo_redo_gate: Arc::new(tokio::sync::Mutex::new(())),
         model: model.clone(),
         solids: Arc::new(RwLock::new(HashMap::new())),
         uuid_to_local: Arc::new(DashMap::new()),

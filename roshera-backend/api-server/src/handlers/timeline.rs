@@ -4227,6 +4227,9 @@ pub async fn perform_undo(
     state: &AppState,
     session_uuid: Uuid,
 ) -> Result<UndoRedoOutcome, UndoRedoError> {
+    // One undo/redo at a time: a second waits, then steps from where the
+    // first left the document (see `AppState::undo_redo_gate`).
+    let _one_at_a_time = state.undo_redo_gate.lock().await;
     // The recorder bridge appends every kernel op under `Author::System`
     // and never updates `session_positions`, so a session's pointer is
     // absent (freshly connected) or behind (ops recorded since it moved).
@@ -4270,6 +4273,9 @@ pub async fn perform_redo(
     state: &AppState,
     session_uuid: Uuid,
 ) -> Result<UndoRedoOutcome, UndoRedoError> {
+    // One undo/redo at a time: a second waits, then steps from where the
+    // first left the document (see `AppState::undo_redo_gate`).
+    let _one_at_a_time = state.undo_redo_gate.lock().await;
     // Same seeding as the undo path — without a session position at the
     // document's applied head, redo would fail with `SessionNotFound` or
     // redo from the wrong place.

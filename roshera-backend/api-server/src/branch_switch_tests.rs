@@ -1528,3 +1528,50 @@ async fn a_ws_execute_operation_does_not_block_undo_on_main() {
     );
     server.abort();
 }
+
+/// Two undos at once (a double-pressed Ctrl+Z; found live 2026-11-12, both
+/// answered success at the same position): undo B runs whole while undo A
+/// sits between its decision and its rebuild. Each undo that answers
+/// success must have stepped back its OWN operation: two successes name two
+/// different events, and the document stands two operations back.
+#[tokio::test]
+async fn two_concurrent_undos_each_step_back_one_operation() {
+    let path = temp_db_path();
+    let state = build_state(open_db(&path).await, true).await;
+    create_cube(&state, 10.0).await;
+    create_cube(&state, 3.0).await;
+    create_cube(&state, 2.0).await;
+    settle(&state).await;
+    let session = Uuid::new_v4();
+    let (decided, proceed) = crate::handlers::timeline::replay_race_hook::install_decided(session);
+    let undo = |s: AppState| async move {
+        dispatch(
+            &s,
+            post(
+                "/api/timeline/undo",
+                json!({ "session_id": session.to_string() }),
+            ),
+        )
+        .await
+    };
+    let a = tokio::spawn(undo(state.clone()));
+    decided.notified().await;
+    let b = tokio::spawn(undo(state.clone()));
+    // Let B run as far as it can while A is held at its decision.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    proceed.notify_one();
+    let (sa, body_a) = a.await.expect("undo A finishes");
+    let (sb, body_b) = b.await.expect("undo B finishes");
+    assert_eq!((sa, sb), (StatusCode::OK, StatusCode::OK));
+    let successes = [&body_a, &body_b]
+        .iter()
+        .filter(|b| b["success"] == true)
+        .count();
+    assert!(successes >= 1, "a = {body_a}, b = {body_b}");
+    if successes == 2 {
+        assert_ne!(
+            body_a["event_id"], body_b["event_id"],
+            "two successful undos stepped back the same operation"
+        );
+    }
+}
