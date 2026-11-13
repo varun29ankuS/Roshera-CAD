@@ -645,9 +645,12 @@ impl BRepModel {
             .map(|l| l.edges.clone())
             .unwrap_or_default();
 
-        // Adjacent faces are tracked on `Face::adjacent_faces` keyed by
-        // shared edge.
-        let neighbour_face_ids: Vec<u32> = face_clone.adjacent_faces.values().copied().collect();
+        // Each hole's edge ids, in loop order.
+        let inner_loop_edge_ids: Vec<Vec<u32>> = face_clone
+            .inner_loops
+            .iter()
+            .filter_map(|&lid| self.loops.get(lid).map(|l| l.edges.clone()))
+            .collect();
 
         // Find host solid by scanning shells. O(N · F) on first call
         // but face-querying is rare and the model has hundreds of
@@ -660,6 +663,41 @@ impl BRepModel {
                 None
             }
         });
+
+        // The faces of the host solid that share an edge with this one,
+        // read from the topology itself. (`Face::adjacent_faces` is a cache
+        // no modelling operation keeps, so it read empty on every part.)
+        let own_edges: std::collections::HashSet<u32> = std::iter::once(face_clone.outer_loop)
+            .chain(face_clone.inner_loops.iter().copied())
+            .filter_map(|lid| self.loops.get(lid))
+            .flat_map(|l| l.edges.iter().copied())
+            .collect();
+        let mut neighbour_face_ids: Vec<u32> = Vec::new();
+        if let Some(solid) = host_solid.and_then(|sid| self.solids.get(sid)) {
+            let shells = std::iter::once(solid.outer_shell)
+                .chain(solid.inner_shells.iter().copied())
+                .chain(solid.peer_shells.iter().copied());
+            for sh in shells {
+                let Some(shell) = self.shells.get(sh) else {
+                    continue;
+                };
+                for &other in &shell.faces {
+                    if other == face_id || neighbour_face_ids.contains(&other) {
+                        continue;
+                    }
+                    let Some(f) = self.faces.get(other) else {
+                        continue;
+                    };
+                    let shares = std::iter::once(f.outer_loop)
+                        .chain(f.inner_loops.iter().copied())
+                        .filter_map(|lid| self.loops.get(lid))
+                        .any(|l| l.edges.iter().any(|e| own_edges.contains(e)));
+                    if shares {
+                        neighbour_face_ids.push(other);
+                    }
+                }
+            }
+        }
 
         // Principal curvatures at the face's parametric midpoint —
         // the cheapest faithful "how curved is this face" signal
@@ -723,6 +761,7 @@ impl BRepModel {
             surface_type,
             area,
             edge_ids,
+            inner_loop_edge_ids,
             neighbour_face_ids,
             principal_curvatures,
         })

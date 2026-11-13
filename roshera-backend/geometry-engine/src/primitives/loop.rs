@@ -191,11 +191,6 @@ impl Loop {
     ) -> MathResult<&LoopStats> {
         if self.cached_stats.is_none() {
             let vertices = self.vertices_cached(edge_store)?;
-            if vertices.len() < 3 {
-                return Err(MathError::InvalidParameter(
-                    "Loop has fewer than 3 vertices".to_string(),
-                ));
-            }
 
             // Calculate perimeter
             let mut perimeter = 0.0;
@@ -208,9 +203,9 @@ impl Loop {
                 perimeter += edge.compute_arc_length(curve_store, Tolerance::default())?;
             }
 
-            // Calculate area and centroid using shoelace formula
+            // Area and centroid of the region the loop's CURVES bound.
             let (area, centroid) =
-                self.compute_area_and_centroid(&vertices, vertex_store, normal)?;
+                self.compute_area_and_centroid(edge_store, curve_store, normal)?;
 
             // Calculate bounding box
             let (bbox_min, bbox_max) = self.compute_bbox(&vertices, vertex_store)?;
@@ -242,23 +237,26 @@ impl Loop {
             .expect("cached_stats populated above when None"))
     }
 
-    /// Compute area and centroid efficiently
+    /// Area and centroid of the planar region the loop bounds, integrated
+    /// along its edges' CURVES (Green's theorem), not the polygon of its
+    /// vertices: a hole made of three arcs has three vertices, and their
+    /// triangle (11.69 for a Ø6 hole) is not the hole (28.27); a hole made
+    /// of one closed circle has one vertex and no polygon at all.
+    ///
+    /// Each curved edge is split into sub-intervals; on each, the boundary is
+    /// replaced by the quadratic through its ends and midpoint, whose
+    /// `½∮(u dv − v du)` is exact (`A×B + A×C + B×C/3` for `A + Bs + Cs²`),
+    /// so the area converges as h⁴. Straight edges are one exact interval.
+    /// The loop is projected onto the coordinate plane closest to `normal`
+    /// ("drop the dominant component"), which preserves an axis-aligned
+    /// face's area exactly.
     fn compute_area_and_centroid(
         &self,
-        vertices: &[VertexId],
-        vertex_store: &VertexStore,
+        edge_store: &EdgeStore,
+        curve_store: &CurveStore,
         normal: &Vector3,
     ) -> MathResult<(f64, Point3)> {
-        let n = vertices.len();
-
-        // Pick the coordinate plane whose normal axis is closest to the
-        // loop's normal — this is the standard "drop the dominant
-        // component" trick that preserves planar area exactly. The
-        // dropped axis is recorded so we can lift the 2D centroid back
-        // to 3D using the loop vertices' shared coordinate along that
-        // axis (any planar polygon has a single value there modulo
-        // floating-point noise; we average over the vertices for
-        // robustness against curved-loop sampling).
+        const CURVED_INTERVALS: usize = 32;
         let abs_normal = normal.abs();
         let (u_idx, v_idx, dropped_idx) =
             if abs_normal.x >= abs_normal.y && abs_normal.x >= abs_normal.z {
@@ -268,67 +266,91 @@ impl Loop {
             } else {
                 (0, 1, 2) // XY plane (drop Z)
             };
+        let coords = |p: Point3| [p.x, p.y, p.z];
+        let cross = |a: [f64; 2], b: [f64; 2]| a[0] * b[1] - a[1] * b[0];
 
         let mut area = 0.0;
-        let mut cx = 0.0;
-        let mut cy = 0.0;
-        let mut dropped_sum = 0.0;
+        // The polyline through every sample, in loop order, for the centroid.
+        let mut ring: Vec<[f64; 3]> = Vec::new();
+        for (i, &edge_id) in self.edges.iter().enumerate() {
+            let edge = edge_store
+                .get(edge_id)
+                .ok_or(MathError::InvalidParameter("Edge not found".to_string()))?;
+            let curve = curve_store
+                .get(edge.curve_id)
+                .ok_or(MathError::InvalidParameter("Invalid curve ID".to_string()))?;
+            let forward = self.orientations.get(i).copied().unwrap_or(true);
+            let intervals = if curve.is_linear(Tolerance::default()) {
+                1
+            } else {
+                CURVED_INTERVALS
+            };
+            let at = |s: f64| -> MathResult<[f64; 3]> {
+                let t = if forward { s } else { 1.0 - s };
+                edge.evaluate(t, curve_store).map(coords)
+            };
+            for k in 0..intervals {
+                let s0 = k as f64 / intervals as f64;
+                let s1 = (k + 1) as f64 / intervals as f64;
+                let p0 = at(s0)?;
+                let pm = at(0.5 * (s0 + s1))?;
+                let p1 = at(s1)?;
+                let flat = |p: [f64; 3]| [p[u_idx], p[v_idx]];
+                let (q0, qm, q1) = (flat(p0), flat(pm), flat(p1));
+                // P(s) = A + B s + C s², through q0, qm, q1 at s = 0, ½, 1.
+                let a = q0;
+                let b = [
+                    -3.0 * q0[0] + 4.0 * qm[0] - q1[0],
+                    -3.0 * q0[1] + 4.0 * qm[1] - q1[1],
+                ];
+                let c = [
+                    2.0 * q0[0] - 4.0 * qm[0] + 2.0 * q1[0],
+                    2.0 * q0[1] - 4.0 * qm[1] + 2.0 * q1[1],
+                ];
+                area += 0.5 * (cross(a, b) + cross(a, c) + cross(b, c) / 3.0);
+                ring.push(p0);
+                if intervals > 1 {
+                    ring.push(pm);
+                }
+            }
+        }
+        let n = ring.len();
+        if n == 0 {
+            return Err(MathError::InvalidParameter("Loop has no edges".to_string()));
+        }
+        let dropped_avg = ring.iter().map(|p| p[dropped_idx]).sum::<f64>() / n as f64;
 
+        // Centroid of the sample polygon (its area converges as h², ample
+        // for a centroid; the reported AREA is the quadratic integral above).
+        let (mut poly_area, mut cx, mut cy) = (0.0, 0.0, 0.0);
         for i in 0..n {
-            let v1 = vertex_store
-                .get(vertices[i])
-                .ok_or(MathError::InvalidParameter("Vertex not found".to_string()))?;
-            let v2 = vertex_store
-                .get(vertices[(i + 1) % n])
-                .ok_or(MathError::InvalidParameter("Vertex not found".to_string()))?;
-
-            let p1 = v1.position;
-            let p2 = v2.position;
-            dropped_sum += p1[dropped_idx];
-
-            let u1 = p1[u_idx];
-            let v1 = p1[v_idx];
-            let u2 = p2[u_idx];
-            let v2 = p2[v_idx];
-
+            let (p1, p2) = (ring[i], ring[(i + 1) % n]);
+            let (u1, v1, u2, v2) = (p1[u_idx], p1[v_idx], p2[u_idx], p2[v_idx]);
             let a = u1 * v2 - u2 * v1;
-            area += a;
+            poly_area += a;
             cx += (u1 + u2) * a;
             cy += (v1 + v2) * a;
         }
-
-        area *= 0.5;
+        poly_area *= 0.5;
         let area_abs = area.abs();
-        let dropped_avg = dropped_sum / n as f64;
-
-        if area_abs < consts::EPSILON {
-            // Degenerate loop, use simple average
-            let mut sum = Vector3::ZERO;
-            for &vid in vertices {
-                let v = vertex_store
-                    .get(vid)
-                    .ok_or(MathError::InvalidParameter("Vertex not found".to_string()))?;
-                sum.x += v.position[0];
-                sum.y += v.position[1];
-                sum.z += v.position[2];
+        if area_abs < consts::EPSILON || poly_area.abs() < consts::EPSILON {
+            // Degenerate loop: the average of its samples.
+            let mut sum = [0.0; 3];
+            for p in &ring {
+                for k in 0..3 {
+                    sum[k] += p[k];
+                }
             }
-            let centroid = Point3::new(sum.x / n as f64, sum.y / n as f64, sum.z / n as f64);
-            Ok((0.0, centroid))
-        } else {
-            cx /= 6.0 * area;
-            cy /= 6.0 * area;
-
-            // Reconstruct 3D centroid: place the in-plane (cx, cy) on
-            // the (u_idx, v_idx) axes and the loop's shared
-            // dropped-axis value on the remaining one.
-            let mut coords = [0.0; 3];
-            coords[u_idx] = cx;
-            coords[v_idx] = cy;
-            coords[dropped_idx] = dropped_avg;
-            let centroid = Point3::new(coords[0], coords[1], coords[2]);
-
-            Ok((area_abs, centroid))
+            let centroid = Point3::new(sum[0] / n as f64, sum[1] / n as f64, sum[2] / n as f64);
+            return Ok((0.0, centroid));
         }
+        cx /= 6.0 * poly_area;
+        cy /= 6.0 * poly_area;
+        let mut c = [0.0; 3];
+        c[u_idx] = cx;
+        c[v_idx] = cy;
+        c[dropped_idx] = dropped_avg;
+        Ok((area_abs, Point3::new(c[0], c[1], c[2])))
     }
 
     /// Compute bounding box

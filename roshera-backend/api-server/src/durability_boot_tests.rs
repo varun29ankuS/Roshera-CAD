@@ -4939,10 +4939,29 @@ async fn datum_history_survives_restart() {
         json!(total),
         "body = {body}"
     );
+    // Show/hide is a view preference, not design history (bcdfb2d6,
+    // 2026-11-11: a few clicks on the datums eye filed 42 unnamed
+    // operations). So a restart keeps every datum's id, name and frame, and
+    // the Origin hidden live comes back at its default, visible.
+    let without_visibility = |frames: Vec<DatumFrame>| {
+        frames
+            .into_iter()
+            .map(|(id, name, _, frame)| (id, name, frame))
+            .collect::<Vec<_>>()
+    };
+    let rebuilt = datum_frames(&state2).await;
     assert_eq!(
-        datum_frames(&state2).await,
-        datums_before,
-        "the rebuilt datum store must equal the live one"
+        without_visibility(rebuilt.clone()),
+        without_visibility(datums_before.clone()),
+        "the rebuilt datum store must hold the live one's datums and frames"
+    );
+    assert!(
+        datums_before.iter().any(|d| d.0 == 0 && !d.2),
+        "fixture: the Origin was hidden live"
+    );
+    assert!(
+        rebuilt.iter().any(|d| d.0 == 0 && d.2),
+        "visibility is not history: the Origin is visible again after a restart"
     );
 }
 

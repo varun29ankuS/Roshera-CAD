@@ -257,6 +257,9 @@ pub struct FaceReport {
     pub area: Option<f64>,
     /// Edge ids of the outer-loop boundary, in loop order.
     pub edge_ids: Vec<u32>,
+    /// Edge ids of each inner loop (each hole in the face), in loop order.
+    #[serde(default)]
+    pub inner_loop_edge_ids: Vec<Vec<u32>>,
     /// Adjacent face ids sharing an edge with this face. Order is
     /// kernel-internal hash-map order — agents should treat this as a
     /// set, not a sequence.
