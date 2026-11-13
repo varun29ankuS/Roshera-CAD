@@ -827,8 +827,12 @@ pub fn evaluate(
     build_direction: [f64; 3],
 ) -> Result<DfmReport, DfmError> {
     let dir = Vector3::new(build_direction[0], build_direction[1], build_direction[2]);
+    // The face the part is printed ON is not an overhang: it rests on the
+    // build plate (found on the hub flange, 2026-11-13: its flat bottom read
+    // as a 90° overhang).
+    let off_bed = faces_off_the_bed(model, solid_id, faces, dir);
     let overhang = evaluate_overhang(
-        faces,
+        &off_bed,
         dir,
         &model.faces,
         &model.loops,
@@ -854,6 +858,69 @@ pub fn evaluate(
         },
         vec![overhang, min_wall, min_bore, trapped_volume],
     ))
+}
+
+/// `faces` without the ones resting on the build plate: a PLANAR face whose
+/// outward normal points straight against `build_direction`, lying at the
+/// solid's lowest point along it. Every other downward face -- a bridge, a
+/// shelf, the underside of a cap -- stays in, so a real overhang is never
+/// dropped.
+///
+/// The lowest point is read off the solid's tessellation, whose vertices
+/// lie ON its surfaces (curved faces included), so a curved face reaching
+/// below a flat bottom keeps that bottom off the bed. A planar face's own
+/// vertices lie exactly on its plane, so the bed face matches the lowest
+/// point to rounding; the tolerance is relative to the part's height.
+/// When the direction or the tessellation is unusable, nothing is
+/// exempted -- the rule then judges every face, as before.
+fn faces_off_the_bed(
+    model: &BRepModel,
+    solid_id: SolidId,
+    faces: &[FaceId],
+    build_direction: Vector3,
+) -> Vec<FaceId> {
+    use crate::primitives::surface::{Plane, SurfaceType};
+    let Ok(up) = build_direction.normalize() else {
+        return faces.to_vec();
+    };
+    let Some(solid) = model.solids.get(solid_id) else {
+        return faces.to_vec();
+    };
+    let mesh = crate::tessellation::tessellate_solid(
+        solid,
+        model,
+        &crate::tessellation::TessellationParams::default(),
+    );
+    let heights = mesh
+        .vertices
+        .iter()
+        .map(|v| v.position.x * up.x + v.position.y * up.y + v.position.z * up.z);
+    let (lowest, highest) = heights.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), h| {
+        (lo.min(h), hi.max(h))
+    });
+    if !lowest.is_finite() || !highest.is_finite() {
+        return faces.to_vec();
+    }
+    let tolerance = 1e-7 * (highest - lowest).max(1.0);
+
+    let on_bed = |face_id: FaceId| -> bool {
+        let Some(face) = model.faces.get(face_id) else {
+            return false;
+        };
+        let Some(surface) = model.surfaces.get(face.surface_id) else {
+            return false;
+        };
+        if surface.surface_type() != SurfaceType::Plane {
+            return false;
+        }
+        let Some(plane) = surface.as_any().downcast_ref::<Plane>() else {
+            return false;
+        };
+        let facing = face.orientation.sign() * plane.normal.dot(&up);
+        let height = plane.origin.x * up.x + plane.origin.y * up.y + plane.origin.z * up.z;
+        facing <= -1.0 + 1e-9 && (height - lowest).abs() <= tolerance
+    };
+    faces.iter().copied().filter(|&f| !on_bed(f)).collect()
 }
 
 #[cfg(test)]
