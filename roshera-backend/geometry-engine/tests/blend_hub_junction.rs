@@ -298,3 +298,63 @@ fn the_junction_fillet_draws_as_quarter_arcs_from_the_front() {
         );
     }
 }
+
+/// A blended cylinder is dimensioned to the design's sharp corners, as a
+/// drafter does: the hub is 20 high (flange top to hub top) whether or not
+/// an R3 fillet and a 0.5 chamfer round its ends. The face's own trimmed
+/// height (15 → 31.5 = 16.5) was printed instead.
+#[test]
+fn a_blended_hub_is_dimensioned_to_its_sharp_corners() {
+    use geometry_engine::primitives::surface::Cylinder;
+    use geometry_engine::readable::dimensions::extract_dimensions;
+    let (mut m, part) = hub();
+    // Chamfer first, then the fillet (the order the live hub was built in;
+    // the other order is its own defect, see below).
+    let top_rim = rim(&m, 22.5, 32.0);
+    chamfer_edges(
+        &mut m,
+        part,
+        top_rim,
+        ChamferOptions {
+            chamfer_type: ChamferType::EqualDistance(0.5),
+            distance1: 0.5,
+            distance2: 0.5,
+            ..Default::default()
+        },
+    )
+    .expect("0.5 chamfer on the hub top");
+    let junction = rim(&m, 22.5, 12.0);
+    fillet_edges(
+        &mut m,
+        part,
+        junction,
+        FilletOptions {
+            fillet_type: FilletType::Constant(3.0),
+            radius: 3.0,
+            ..Default::default()
+        },
+    )
+    .expect("R3 junction fillet");
+    let hub_face = m
+        .faces
+        .iter()
+        .find(|(_, f)| {
+            m.surfaces.get(f.surface_id).is_some_and(|s| {
+                s.as_any()
+                    .downcast_ref::<Cylinder>()
+                    .is_some_and(|c| (c.radius - 22.5).abs() < 1e-9)
+            })
+        })
+        .map(|(id, _)| id)
+        .expect("the hub's cylinder face");
+    let dims = extract_dimensions(&m, part);
+    let length = dims
+        .iter()
+        .find(|d| d.kind == "length" && d.entities == vec![hub_face])
+        .map(|d| d.value)
+        .expect("the hub's length dimension");
+    assert!(
+        (length - 20.0).abs() < 1e-6,
+        "hub height {length}, expected 20"
+    );
+}

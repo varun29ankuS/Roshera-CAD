@@ -456,6 +456,128 @@ fn face_axial_extent(
     }
 }
 
+/// The faces bordering each edge of `solid_id`.
+fn edge_faces_of(model: &BRepModel, solid_id: SolidId) -> std::collections::HashMap<u32, Vec<u32>> {
+    let mut map: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    let Some(solid) = model.solids.get(solid_id) else {
+        return map;
+    };
+    let mut shells = vec![solid.outer_shell];
+    shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
+    for sh in shells {
+        let Some(shell) = model.shells.get(sh) else {
+            continue;
+        };
+        for &fid in &shell.faces {
+            let Some(face) = model.faces.get(fid) else {
+                continue;
+            };
+            for lid in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+                if let Some(lp) = model.loops.get(lid) {
+                    for &e in &lp.edges {
+                        let faces = map.entry(e).or_default();
+                        if !faces.contains(&fid) {
+                            faces.push(fid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// The edges of `face`'s loops (each once).
+fn face_edges(model: &BRepModel, face: &Face) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    for lid in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+        if let Some(lp) = model.loops.get(lid) {
+            for &e in &lp.edges {
+                if !out.contains(&e) {
+                    out.push(e);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A cylinder face's axial extent `(lo, hi)` (from its trim edges) carried to
+/// the design's SHARP corners: where an end rim meets a blend -- a fillet
+/// (torus) or a chamfer (cone) -- the end moves across the blend to the plane
+/// square to the axis beyond it. An end with no blend, or a blend with no
+/// such plane beyond it, keeps its trimmed station.
+fn sharp_axial_extent(
+    model: &BRepModel,
+    solid_id: SolidId,
+    face_id: u32,
+    face: &Face,
+    origin: Point3,
+    axis: Vector3,
+    (lo, hi): (f64, f64),
+) -> (f64, f64) {
+    use crate::primitives::surface::{Plane, Torus};
+    let edge_faces = edge_faces_of(model, solid_id);
+    let station = |p: Point3| (p - origin).dot(&axis);
+    let is_blend = |fid: u32| {
+        model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))
+            .is_some_and(|s| {
+                s.as_any().downcast_ref::<Torus>().is_some()
+                    || s.as_any().downcast_ref::<Cone>().is_some()
+            })
+    };
+    let square_plane_station = |fid: u32| -> Option<f64> {
+        let surface = model.surfaces.get(model.faces.get(fid)?.surface_id)?;
+        let plane = surface.as_any().downcast_ref::<Plane>()?;
+        let n = plane.normal.normalize().ok()?;
+        (n.dot(&axis).abs() > 1.0 - 1e-9).then(|| station(plane.origin))
+    };
+    let (mut slo, mut shi) = (lo, hi);
+    for e in face_edges(model, face) {
+        let Some(neighbours) = edge_faces.get(&e) else {
+            continue;
+        };
+        // A seam borders only this face.
+        let Some(&blend) = neighbours.iter().find(|&&f| f != face_id) else {
+            continue;
+        };
+        if !is_blend(blend) {
+            continue;
+        }
+        let Some(rim_station) = model
+            .edges
+            .get(e)
+            .and_then(|ed| model.vertices.get(ed.start_vertex))
+            .map(|v| station(Point3::new(v.position[0], v.position[1], v.position[2])))
+        else {
+            continue;
+        };
+        let Some(blend_face) = model.faces.get(blend) else {
+            continue;
+        };
+        let beyond = face_edges(model, blend_face)
+            .into_iter()
+            .filter(|&e2| e2 != e)
+            .filter_map(|e2| edge_faces.get(&e2))
+            .flat_map(|fs| fs.iter().copied())
+            .filter(|&f| f != blend && f != face_id)
+            .find_map(square_plane_station);
+        let Some(sharp) = beyond else {
+            continue;
+        };
+        if (rim_station - lo).abs() <= (rim_station - hi).abs() {
+            slo = slo.min(sharp);
+        } else {
+            shi = shi.max(sharp);
+        }
+    }
+    (slo, shi)
+}
+
 /// Quantise a `f64` anchor/direction component for coincident-row dedupe.
 ///
 /// `scale` determines the resolution: 0.01 for values (mm), 0.1 for anchors,
@@ -640,7 +762,13 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     pid: feature_dim_pid(model, &[fid], "diameter"),
                     datum: None,
                 });
-                let length = (hi - lo).abs();
+                // Length to the design's sharp corners: an end rounded by a
+                // fillet or cut by a chamfer is carried across the blend to
+                // the plane beyond it (a filleted, chamfered hub is 20 high,
+                // not its trimmed face's 16.5).
+                let (slo, shi) =
+                    sharp_axial_extent(model, solid_id, fid, face, cyl.origin, axis, (lo, hi));
+                let length = (shi - slo).abs();
                 if length > 1e-9 {
                     out.push(DimensionRecord {
                         id: id(),
