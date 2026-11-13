@@ -22,7 +22,7 @@ import { createPartDrawing } from '@/lib/drawings-api'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
 import { CreateDatumDialog } from '@/components/panels/CreateDatumDialog'
-import { FeatureTreeBody } from '@/components/panels/FeatureTree'
+import { ChapterList } from '@/components/panels/ChapterList'
 import { AssemblyBrowser } from '@/components/panels/AssemblyBrowser'
 import { buildAssemblyTree } from '@/lib/assembly-tree'
 
@@ -1264,7 +1264,7 @@ export function ModelTree({
       )}
       {expanded && mode === 'features' && (
         <ScrollArea id="browser-tree" className="flex-1 min-h-0">
-          <FeatureTreeBody />
+          <ChapterList />
         </ScrollArea>
       )}
       {menu && (

@@ -23,6 +23,8 @@ import {
   authorTextClass,
 } from '@/lib/timeline-events'
 import { DecisionRail, DurabilityChip } from './TimelineDecisions'
+import { FilmStrip } from './FilmStrip'
+import { useChapters } from '@/hooks/use-chapters'
 
 // Graph ("map") view — a second, toggleable view alongside this strip
 // (see vault Research/2026-07-31-ui-pass-spec.md §3). Lazy-loaded: it
@@ -971,6 +973,7 @@ export function Timeline() {
   const checkpointInputRef = useRef<HTMLInputElement | null>(null)
   const wsStatus = useWSStore((s) => s.status)
 
+  const chapterState = useChapters('main')
   const handleEventContextMenu = useCallback(
     (e: React.MouseEvent, event: EventSummary) => {
       e.preventDefault()
@@ -1777,14 +1780,27 @@ export function Timeline() {
             onOpen={() => setGraphOpen(true)}
           />
           <div aria-hidden className="w-px shrink-0 self-stretch bg-border/40" />
-          <RecentOpsStrip
-            events={events}
-            now={now}
-            onContextMenu={handleEventContextMenu}
-            loading={loading}
-            durability={durability}
-            onOpenMap={() => setGraphOpen(true)}
-          />
+          {/* The film strip -- a picture of the part after each feature --
+              once there are features; the ops strip keeps the honest empty
+              and boot-failure states. */}
+          {chapterState.chapters.length > 0 ? (
+            <FilmStrip
+              chapters={chapterState.chapters}
+              onFrameContextMenu={(e, anchor) => {
+                const event = events.find((ev) => ev.sequence_number === anchor)
+                if (event) handleEventContextMenu(e, event)
+              }}
+            />
+          ) : (
+            <RecentOpsStrip
+              events={events}
+              now={now}
+              onContextMenu={handleEventContextMenu}
+              loading={loading}
+              durability={durability}
+              onOpenMap={() => setGraphOpen(true)}
+            />
+          )}
         </div>
       )}
 
