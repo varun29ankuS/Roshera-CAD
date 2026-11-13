@@ -160,6 +160,45 @@ pub fn measure_dimension(model: &BRepModel, pid: &str) -> Option<f64> {
     })
 }
 
+/// A recorded number an edit can change: what a mould targets, and its
+/// value NOW (the latest `param.mould` override, else the recorded value).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EditableParameter {
+    /// Sequence of the step carrying it.
+    pub sequence: u64,
+    /// Id of that step -- what `POST /api/timeline/mould` targets.
+    pub event_id: Uuid,
+    /// The step's command (e.g. `create_cylinder_3d`, `fillet_edges`).
+    pub command: String,
+    /// The parameter's key in the recorded step (e.g. `radius`).
+    pub key: String,
+    /// Its value now.
+    pub value: f64,
+    /// True when an edit has changed it from the recorded value.
+    pub edited: bool,
+}
+
+/// Every size an edit can change in `events`, by the same rule the mould and
+/// the drawing's dimension drive use (numeric, not an id, a timestamp or a
+/// direction component), each with its current value.
+pub fn editable_parameters(events: &[TimelineEvent]) -> Vec<EditableParameter> {
+    let overrides = OverrideSet::collect(events);
+    numeric_parameters(events)
+        .into_iter()
+        .map(|(sequence, event_id, command, key, recorded)| {
+            let now = overrides.value_for(sequence, &key);
+            EditableParameter {
+                sequence,
+                event_id,
+                command,
+                value: now.unwrap_or(recorded),
+                edited: now.is_some(),
+                key,
+            }
+        })
+        .collect()
+}
+
 /// Every `(sequence, event id, command, key, recorded value)` a mould could
 /// edit on a geometry event.
 fn numeric_parameters(events: &[TimelineEvent]) -> Vec<(u64, Uuid, String, String, f64)> {

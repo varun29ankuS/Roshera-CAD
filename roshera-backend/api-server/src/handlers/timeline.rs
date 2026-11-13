@@ -2577,6 +2577,32 @@ fn summarize_solids(model: &BRepModel) -> Vec<MouldObjectSummary> {
     out
 }
 
+/// `GET /api/timeline/parameters/{branch_id}` -- every size an edit can
+/// change in the branch's applied history (undone steps left out), each
+/// with the step it belongs to, its value NOW (edits applied) and whether it
+/// was edited. The app's feature edit panel reads it; a value is changed
+/// with `POST /api/timeline/mould` on the listed `event_id` + `key`.
+pub async fn get_editable_parameters(
+    State(state): State<AppState>,
+    Path(branch_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _ = state.timeline_recorder.settle().await;
+    let branch_id = resolve_branch_ref(&branch_id)?;
+    let events = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        let applied = timeline
+            .applied_count(&branch_id)
+            .map_err(|_| StatusCode::NOT_FOUND)? as usize;
+        all.truncate(applied);
+        all
+    };
+    let parameters = timeline_engine::dimension_drive::editable_parameters(&events);
+    Ok(Json(serde_json::json!({ "parameters": parameters })))
+}
+
 /// `POST /api/timeline/mould` — edit a recorded parameter and re-derive
 /// (#64 Parametric-DAG, Slices 2-3).
 ///

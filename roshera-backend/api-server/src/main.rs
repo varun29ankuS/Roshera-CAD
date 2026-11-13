@@ -11713,6 +11713,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         // #64 Slice 3: bind a stable NAME to a recorded (event, parameter) so a
         // mould can target it by name. Appended `param.name` event, latest-wins.
+        // Every size an edit can change, with its value now (the feature edit
+        // panel; Varun 2026-11-13).
+        .route(
+            "/api/timeline/parameters/{branch_id}",
+            get(crate::handlers::timeline::get_editable_parameters),
+        )
         .route(
             "/api/timeline/parameter-name",
             post(crate::handlers::timeline::bind_parameter_name),

@@ -12196,3 +12196,72 @@ async fn a_step_travels_as_binary_with_the_same_meshes() {
     }
     assert_eq!(at, bin.len(), "nothing left over");
 }
+
+/// Editing a feature (Varun 2026-11-13: "why am I not able to edit a feature
+/// as I select it?") starts from knowing its sizes. The history lists, per
+/// step, every recorded number an edit can change -- the same rule the
+/// kernel's mould uses -- with its value NOW: after an edit, the edited
+/// value, marked edited. Ids and directions are not sizes and are not listed.
+#[tokio::test]
+async fn the_history_lists_each_steps_editable_sizes_with_their_current_values() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+
+    let (s, body) = dispatch(&state, json_get("/api/timeline/parameters/main")).await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    let params = body["parameters"]
+        .as_array()
+        .expect("parameters array")
+        .clone();
+    let find = |list: &[serde_json::Value], cmd_part: &str, key: &str| {
+        list.iter()
+            .find(|p| {
+                p["command"].as_str().is_some_and(|c| c.contains(cmd_part)) && p["key"] == key
+            })
+            .cloned()
+    };
+    let radius = find(&params, "cylinder", "radius").expect("the drill's radius is editable");
+    assert_eq!(radius["value"], 3.0, "{radius}");
+    assert_eq!(radius["edited"], false, "{radius}");
+    assert!(
+        radius["event_id"].is_string() && radius["sequence"].is_u64(),
+        "{radius}"
+    );
+    let width = find(&params, "box", "width").expect("the box's width is editable");
+    assert_eq!(width["value"], 20.0, "{width}");
+    for p in &params {
+        let k = p["key"].as_str().unwrap_or_default();
+        assert!(
+            !["solid_id", "solid_a", "solid_b", "timestamp"].contains(&k)
+                && !k.starts_with("axis_")
+                && !k.starts_with("direction_"),
+            "not a size: {p}"
+        );
+    }
+
+    let (ms, mbody) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/mould",
+            json!({
+                "target_event_id": radius["event_id"],
+                "parameter": "radius",
+                "value": 2.5,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(ms, StatusCode::OK, "mould; body = {mbody}");
+
+    let (_, body) = dispatch(&state, json_get("/api/timeline/parameters/main")).await;
+    let params = body["parameters"]
+        .as_array()
+        .expect("parameters array")
+        .clone();
+    let radius = find(&params, "cylinder", "radius").expect("still listed after the edit");
+    assert_eq!(
+        radius["value"], 2.5,
+        "the value now, not the recorded one: {radius}"
+    );
+    assert_eq!(radius["edited"], true, "{radius}");
+}
