@@ -3234,6 +3234,26 @@ pub async fn get_frame_picture(
         all
     };
     let size = q.size.unwrap_or(256).clamp(32, 1024);
+    // Kept with the step's frame, per size: a revisit is a lookup.
+    let geometry_key = timeline_engine::frames::FrameCache::key_of(&prefix);
+    let pkey = timeline_engine::frames::FrameCache::presentation_key(
+        &geometry_key,
+        &format!("picture-v1-iso-{size}"),
+    );
+    if let Some(png) = state.frames.presentation(&pkey) {
+        return Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, "image/png"),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+                (
+                    axum::http::HeaderName::from_static("x-roshera-frame-cache"),
+                    "hit",
+                ),
+            ],
+            png.as_ref().clone(),
+        )
+            .into_response());
+    }
     let frames = state.frames.clone();
     let png = tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
         let (model, _outcome, _stats) = frames.replay(&prefix);
@@ -3263,7 +3283,8 @@ pub async fn get_frame_picture(
             key_light,
             &opts,
         )?;
-        frame.to_png().ok()
+        let png = frame.to_png().ok()?;
+        Some(frames.store_presentation(pkey, png).as_ref().clone())
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -3272,6 +3293,10 @@ pub async fn get_frame_picture(
         [
             (axum::http::header::CONTENT_TYPE, "image/png"),
             (axum::http::header::CACHE_CONTROL, "no-store"),
+            (
+                axum::http::HeaderName::from_static("x-roshera-frame-cache"),
+                "miss",
+            ),
         ],
         png,
     )
@@ -6095,7 +6120,7 @@ pub async fn list_checkpoints(State(state): State<AppState>) -> Json<Vec<Checkpo
 pub async fn scrub_timeline(
     State(state): State<AppState>,
     Path((branch_ref, sequence)): Path<(String, u64)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
     // Drain in-flight recorder ops so "as of event N" is exact even
     // for events recorded microseconds ago.
     let _ = state.timeline_recorder.settle().await;
@@ -6112,67 +6137,120 @@ pub async fn scrub_timeline(
         (total, all)
     };
 
-    // Rebuild into a SCRATCH model — the live model handle is never
-    // touched, which is the whole point of a scrub.
-    // Stepping through the timeline reads stored frames; only positions never
-    // shot before are replayed (and stored).
-    let (scratch, outcome, frame_stats) = state.frames.replay(&events);
-
-    let tess_params = geometry_engine::tessellation::TessellationParams::default();
-    let mut objects = Vec::new();
-    for (solid_id, solid) in scratch.solids.iter() {
-        let mesh = geometry_engine::tessellation::tessellate_solid(solid, &scratch, &tess_params);
-        if mesh.triangles.is_empty() {
-            continue;
-        }
-        let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&mesh);
-        objects.push(serde_json::json!({
-            // Synthetic id: scrub views are ephemeral and own no UUID
-            // mappings in the live registry.
-            "id": format!("scrub:{}", solid_id),
-            "name": format!("solid {} @ event {}", solid_id, sequence),
-            "mesh": {
-                "vertices": vertices,
-                "indices":  indices,
-                "normals":  normals,
-                "face_ids": face_ids,
-            },
-            "analytical_geometry": serde_json::Value::Null,
-            "transform": serde_json::Value::Null,
-        }));
-    }
-
-    // Assembly documents as of this event — replay rebuilds them alongside
-    // the scratch model (assemblies are event-sourced, kinematic-assembly
-    // campaign Slice 1). Compact projection; the full assembly scrub
-    // surface is campaign Slice 6.
-    let assemblies: Vec<serde_json::Value> = outcome
-        .assemblies
-        .assemblies
-        .values()
-        .map(|a| {
+    // A step's meshes are kept with its frame (`presentation_key` of the
+    // prefix's frame key): sliding back and forth re-reads them instead of
+    // re-replaying, re-tessellating and re-encoding the part on every visit.
+    let geometry_key = timeline_engine::frames::FrameCache::key_of(&events);
+    let pkey = timeline_engine::frames::FrameCache::presentation_key(&geometry_key, "scrub-v1");
+    let prefix_len = events.len();
+    let (fragment, frames_json) = match state.frames.presentation(&pkey) {
+        Some(bytes) => (
+            bytes,
             serde_json::json!({
-                "id": a.id,
-                "name": a.name,
-                "instance_count": a.instance_count(),
-                "unique_part_count": a.unique_part_count(),
+                "events_reused": prefix_len,
+                "events_reexecuted": 0,
+                "step_cached": true,
+            }),
+        ),
+        None => {
+            // Rebuild into a SCRATCH model — the live model handle is never
+            // touched, which is the whole point of a scrub. Stepping through
+            // the timeline reads stored frames; only positions never shot
+            // before are replayed (and stored).
+            let frames = state.frames.clone();
+            let (bytes, frames_json) = tokio::task::spawn_blocking(move || {
+                let (scratch, outcome, frame_stats) = frames.replay(&events);
+                let tess_params = geometry_engine::tessellation::TessellationParams::default();
+                let mut objects = Vec::new();
+                for (solid_id, solid) in scratch.solids.iter() {
+                    let mesh = geometry_engine::tessellation::tessellate_solid(
+                        solid,
+                        &scratch,
+                        &tess_params,
+                    );
+                    if mesh.triangles.is_empty() {
+                        continue;
+                    }
+                    let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&mesh);
+                    objects.push(serde_json::json!({
+                        // Synthetic id: scrub views are ephemeral and own no
+                        // UUID mappings in the live registry.
+                        "id": format!("scrub:{}", solid_id),
+                        "name": format!("solid {} @ event {}", solid_id, sequence),
+                        "mesh": {
+                            "vertices": vertices,
+                            "indices":  indices,
+                            "normals":  normals,
+                            "face_ids": face_ids,
+                        },
+                        "analytical_geometry": serde_json::Value::Null,
+                        "transform": serde_json::Value::Null,
+                    }));
+                }
+                // Assembly documents as of this event — replay rebuilds them
+                // alongside the scratch model (assemblies are event-sourced,
+                // kinematic-assembly campaign Slice 1). Compact projection.
+                let assemblies: Vec<serde_json::Value> = outcome
+                    .assemblies
+                    .assemblies
+                    .values()
+                    .map(|a| {
+                        serde_json::json!({
+                            "id": a.id,
+                            "name": a.name,
+                            "instance_count": a.instance_count(),
+                            "unique_part_count": a.unique_part_count(),
+                        })
+                    })
+                    .collect();
+                // The step's own part of the answer, stored as the JSON
+                // members it contributes (no surrounding braces), so a cached
+                // visit splices it in without decoding it.
+                let whole = serde_json::to_vec(&serde_json::json!({
+                    "events_applied": outcome.events_applied,
+                    "events_skipped": outcome.events_skipped,
+                    "objects": objects,
+                    "assemblies": assemblies,
+                }))
+                .unwrap_or_else(|_| b"{}".to_vec());
+                let members = whole
+                    .get(1..whole.len().saturating_sub(1))
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default();
+                let bytes = frames.store_presentation(pkey, members);
+                let frames_json = serde_json::json!({
+                    "events_reused": frame_stats.events_reused,
+                    "events_reexecuted": frame_stats.events_reexecuted,
+                    "step_cached": false,
+                });
+                (bytes, frames_json)
             })
-        })
-        .collect();
-
-    Ok(Json(serde_json::json!({
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            (bytes, frames_json)
+        }
+    };
+    let head = serde_json::to_vec(&serde_json::json!({
         "branch": branch_ref,
         "at_sequence": sequence,
         "events_total": total,
-        "events_applied": outcome.events_applied,
-        "events_skipped": outcome.events_skipped,
-        "frames": {
-            "events_reused": frame_stats.events_reused,
-            "events_reexecuted": frame_stats.events_reexecuted,
-        },
-        "objects": objects,
-        "assemblies": assemblies,
-    })))
+        "frames": frames_json,
+    }))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // `head` is a JSON object: open it, add the step's members, close it.
+    let mut out = Vec::with_capacity(head.len() + fragment.len() + 2);
+    out.extend_from_slice(head.get(..head.len().saturating_sub(1)).unwrap_or_default());
+    if !fragment.is_empty() {
+        out.push(b',');
+        out.extend_from_slice(&fragment);
+    }
+    out.push(b'}');
+    use axum::response::IntoResponse;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        out,
+    )
+        .into_response())
 }
 
 #[cfg(test)]

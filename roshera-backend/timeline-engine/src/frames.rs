@@ -102,6 +102,11 @@ pub struct FrameCache {
     sheets: DashMap<[u8; 32], Arc<(uuid::Uuid, Drawing)>>,
     /// Views projected for `drawing.add_view`, keyed the same way.
     views: DashMap<[u8; 32], Arc<ProjectedView>>,
+    /// Bytes derived from a frame for display -- a step's serialized meshes,
+    /// its picture -- keyed by [`FrameCache::presentation_key`]. Sliding back
+    /// and forth through the history re-reads these instead of re-tessellating
+    /// and re-encoding the part on every visit.
+    presentations: DashMap<[u8; 32], Arc<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for FrameCache {
@@ -147,6 +152,7 @@ impl FrameCache {
             max_frames: max_frames.max(1),
             sheets: DashMap::new(),
             views: DashMap::new(),
+            presentations: DashMap::new(),
         }
     }
 
@@ -204,6 +210,35 @@ impl FrameCache {
         self.views.insert(key, Arc::new(view));
     }
 
+    /// The key of a presentation of the state `geometry_key` (from
+    /// [`FrameCache::key_of`]): `what` names the presentation and everything
+    /// that changes it (format version, image size, ...).
+    pub fn presentation_key(geometry_key: &[u8; 32], what: &str) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"presentation ");
+        h.update(geometry_key);
+        h.update(what.as_bytes());
+        h.finalize().into()
+    }
+
+    /// Presentation bytes stored under `key`.
+    pub fn presentation(&self, key: &[u8; 32]) -> Option<Arc<Vec<u8>>> {
+        self.presentations.get(key).map(|b| Arc::clone(b.value()))
+    }
+
+    /// Store presentation bytes (bounded like the frames: a dropped entry
+    /// costs a re-render, never correctness).
+    pub fn store_presentation(&self, key: [u8; 32], bytes: Vec<u8>) -> Arc<Vec<u8>> {
+        if self.presentations.len() >= self.max_frames {
+            if let Some(k) = self.presentations.iter().next().map(|kv| *kv.key()) {
+                self.presentations.remove(&k);
+            }
+        }
+        let bytes = Arc::new(bytes);
+        self.presentations.insert(key, Arc::clone(&bytes));
+        bytes
+    }
+
     /// Frames currently stored.
     pub fn len(&self) -> usize {
         self.frames.len()
@@ -220,6 +255,7 @@ impl FrameCache {
         self.frames.clear();
         self.sheets.clear();
         self.views.clear();
+        self.presentations.clear();
     }
 
     /// The frame keys of `events`: key `i` identifies the state after events

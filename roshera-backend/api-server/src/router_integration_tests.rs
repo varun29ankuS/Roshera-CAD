@@ -12026,3 +12026,88 @@ async fn the_film_strip_pictures_the_part_as_it_stood_at_each_chapter() {
     let (s, _) = picture(9_999).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "a step the branch does not have");
 }
+
+/// Sliding through the history revisits steps over and over (Varun
+/// 2026-11-13: a video-style slider). A step's meshes and picture are kept
+/// with its frame: the second visit is served from the cache with exactly
+/// the same content, and a step keeps showing ITS state after the part has
+/// moved on -- a cache never serves another step's geometry.
+#[tokio::test]
+async fn a_revisited_step_is_served_from_the_frame_cache_unchanged() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+    let (_, body) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    let box_step = body["chapters"][0]["anchor"].as_u64().expect("box anchor");
+
+    let (s1, first) = dispatch(
+        &state,
+        json_get(&format!("/api/timeline/scrub/main/{box_step}")),
+    )
+    .await;
+    let (s2, second) = dispatch(
+        &state,
+        json_get(&format!("/api/timeline/scrub/main/{box_step}")),
+    )
+    .await;
+    assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(
+        first["frames"]["step_cached"], false,
+        "first visit renders; {}",
+        first["frames"]
+    );
+    assert_eq!(
+        second["frames"]["step_cached"], true,
+        "second visit is cached; {}",
+        second["frames"]
+    );
+    assert_eq!(
+        first["objects"], second["objects"],
+        "the same meshes either way"
+    );
+    assert!(first["objects"].as_array().is_some_and(|o| !o.is_empty()));
+
+    let picture = |seq: u64| {
+        let state = state.clone();
+        async move {
+            let response = build_router(state)
+                .oneshot(json_get(&format!(
+                    "/api/timeline/frame/main/{seq}/picture?size=96"
+                )))
+                .await
+                .expect("router answers");
+            let cached = response
+                .headers()
+                .get("x-roshera-frame-cache")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("bytes");
+            (cached, bytes.to_vec())
+        }
+    };
+    let (c1, p1) = picture(box_step).await;
+    let (c2, p2) = picture(box_step).await;
+    assert_eq!((c1.as_deref(), c2.as_deref()), (Some("miss"), Some("hit")));
+    assert_eq!(p1, p2, "the same picture either way");
+
+    // The part moves on: the box's step still shows the box alone.
+    let (s, _) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 5.0, "depth": 5.0, "height": 5.0}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, again) = dispatch(
+        &state,
+        json_get(&format!("/api/timeline/scrub/main/{box_step}")),
+    )
+    .await;
+    assert_eq!(
+        again["objects"], first["objects"],
+        "a step keeps showing its own state"
+    );
+}
