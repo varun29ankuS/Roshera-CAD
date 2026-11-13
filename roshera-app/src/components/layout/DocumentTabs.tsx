@@ -91,7 +91,11 @@ interface ContextMenuState {
 /** Closed documents listed in the `+` menu before "Show all". */
 const RECENT_DOCUMENTS_SHOWN = 6
 
-export function DocumentTabs() {
+/**
+ * `inline`: the tabs sit in the middle of the top bar (the approved mockup)
+ * instead of on a row of their own.
+ */
+export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
   const documents = useDocumentStore((s) => s.documents)
   const switchingId = useDocumentStore((s) => s.switchingId)
   const refresh = useDocumentStore((s) => s.refresh)
@@ -306,7 +310,12 @@ export function DocumentTabs() {
   if (documents.length === 0) return null
 
   return (
-    <div className="flex items-center gap-0.5 h-11 px-1.5 border-b border-border bg-card/60 shrink-0">
+    <div
+      className={cn(
+        'flex shrink-0 items-center gap-0.5',
+        inline ? 'h-8 min-w-0 max-w-full' : 'h-11 border-b border-border bg-card/60 px-1.5',
+      )}
+    >
       {/* Scrollable region for the tabs ONLY. `overflow-x-auto` on this
           element implicitly computes `overflow-y: auto` too (a CSS
           coupling gotcha — you cannot set only one axis to non-visible),

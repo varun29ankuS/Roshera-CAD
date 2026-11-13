@@ -16,6 +16,7 @@ import { useWSStore } from '@/stores/ws-store'
 import { useThemeStore } from '@/stores/theme-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { WORKSPACES } from '@/lib/workspaces'
+import { DocumentTabs } from '@/components/layout/DocumentTabs'
 import { cn } from '@/lib/utils'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import { useUnitsStore } from '@/stores/units-store'
@@ -311,7 +312,10 @@ export function TopBar() {
         ))}
       </nav>
 
-      <div className="flex-1" />
+      {/* The open documents, in the middle of the one top row. */}
+      <div className="flex min-w-0 flex-1 justify-center px-2">
+        <DocumentTabs inline />
+      </div>
 
       <div className="flex items-center gap-2 px-2">
         {/* Command palette trigger. The hotkey lives in
