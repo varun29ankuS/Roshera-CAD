@@ -2,22 +2,11 @@ import { GizmoHelper, GizmoViewcube } from '@react-three/drei'
 import { useFrame, type ThreeEvent } from '@react-three/fiber'
 import { useSceneStore } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
+import { cubePreset } from '@/lib/view-cube'
 
 /** The cube's faces in drei's order (+X, −X, +Y, −Y, +Z, −Z), named for the
  *  kernel's Z-up world: +Y is the back, +Z the top. */
 const Z_UP_FACES = ['Right', 'Left', 'Back', 'Front', 'Top', 'Bottom']
-
-/** The app's camera preset for the cube face (or edge / corner) clicked:
- *  its dominant axis. The presets carry the right up-vector for a Z-up
- *  world; drei's own click tween assumes Y-up and degenerates on Top. */
-function presetForNormal(n: { x: number; y: number; z: number }): string {
-  const ax = Math.abs(n.x)
-  const ay = Math.abs(n.y)
-  const az = Math.abs(n.z)
-  if (az >= ax && az >= ay) return n.z > 0 ? 'top' : 'bottom'
-  if (ax >= ay) return n.x > 0 ? 'right' : 'left'
-  return n.y > 0 ? 'back' : 'front'
-}
 
 /**
  * Render-priority dance — the long version, because this has bitten us
@@ -55,7 +44,8 @@ export function GizmoNav() {
   const dark = useThemeStore((s) => s.theme) === 'dark'
   const onFace = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation()
-    if (e.face) setCameraPreset(presetForNormal(e.face.normal))
+    // The app's preset (drei's own tween assumes Y-up and degenerates on Top).
+    if (e.face) setCameraPreset(cubePreset(e.object.position, e.face.normal))
     return null
   }
   return (

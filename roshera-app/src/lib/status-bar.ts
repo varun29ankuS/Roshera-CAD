@@ -28,3 +28,10 @@ export function soundLabel(s: { loaded: boolean; sound: boolean }): { text: stri
   if (!s.loaded) return { text: 'history unread', tone: 'muted' }
   return s.sound ? { text: '✓ sound', tone: 'positive' } : { text: '✗ not sound', tone: 'negative' }
 }
+
+/** Whether `self` is the nearest object under the cursor. A pointer event
+ *  reaches every mesh the ray crosses, nearest first, unless one stops it;
+ *  only the nearest may report, or a part behind overwrites the readout. */
+export function isNearestHit(intersections: readonly { eventObject: unknown }[], self: unknown): boolean {
+  return intersections.length > 0 && intersections[0].eventObject === self
+}

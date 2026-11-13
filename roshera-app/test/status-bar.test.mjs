@@ -21,3 +21,13 @@ test('the history verdict: sound, not sound, or unknown when unread', () => {
   assert.deepEqual(soundLabel({ loaded: true, sound: false }), { text: '✗ not sound', tone: 'negative' })
   assert.deepEqual(soundLabel({ loaded: false, sound: true }), { text: 'history unread', tone: 'muted' })
 })
+
+test('only the nearest part under the cursor reports (a part behind never overwrites it)', async () => {
+  const { isNearestHit } = await import('../src/lib/status-bar.ts')
+  const front = { id: 'front' }
+  const back = { id: 'back' }
+  const intersections = [{ eventObject: front }, { eventObject: back }]
+  assert.equal(isNearestHit(intersections, front), true)
+  assert.equal(isNearestHit(intersections, back), false)
+  assert.equal(isNearestHit([], front), false)
+})

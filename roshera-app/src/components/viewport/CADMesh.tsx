@@ -1,4 +1,5 @@
 import { useCursorStore } from '@/stores/cursor-store'
+import { isNearestHit } from '@/lib/status-bar'
 import { memo, useRef, useMemo, useCallback, useEffect, type ComponentRef } from 'react'
 import { Edges } from '@react-three/drei'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
@@ -339,8 +340,10 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
   const handlePointerMove = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
       if (sketchActive) return
-      // The status bar's cursor readout: the point on the part and its face.
-      useCursorStore.getState().setHit({
+      // The status bar's cursor readout: the point on the part and its face
+      // -- from the nearest part only (this event reaches every part the ray
+      // crosses when nothing stops it, as in Part pick mode).
+      if (isNearestHit(e.intersections, e.eventObject)) useCursorStore.getState().setHit({
         objectId: object.id,
         point: e.point.toArray() as [number, number, number],
         // Only a real kernel face id -- never the triangle-index fallback.
