@@ -358,3 +358,43 @@ fn a_blended_hub_is_dimensioned_to_its_sharp_corners() {
         "hub height {length}, expected 20"
     );
 }
+
+/// The two blends on the hub's cylinder in either order: an R3 fillet at its
+/// foot, then a 0.5 chamfer on its top rim. The chamfer was refused -- "edge
+/// lies 6.59 off face's Cylinder surface" -- while chamfer-then-fillet
+/// worked.
+#[test]
+fn a_chamfer_after_a_fillet_on_the_same_cylinder() {
+    let (mut m, part) = hub();
+    let junction = rim(&m, 22.5, 12.0);
+    fillet_edges(
+        &mut m,
+        part,
+        junction,
+        FilletOptions {
+            fillet_type: FilletType::Constant(3.0),
+            radius: 3.0,
+            ..Default::default()
+        },
+    )
+    .expect("R3 junction fillet");
+    let top_rim = rim(&m, 22.5, 32.0);
+    chamfer_edges(
+        &mut m,
+        part,
+        top_rim,
+        ChamferOptions {
+            chamfer_type: ChamferType::EqualDistance(0.5),
+            distance1: 0.5,
+            distance2: 0.5,
+            ..Default::default()
+        },
+    )
+    .expect("0.5 chamfer on the hub top after the fillet");
+    let cert = m.certify_solid(part);
+    assert!(
+        cert.brep_valid && cert.watertight && cert.manifold,
+        "{cert:?}"
+    );
+    assert_eq!(broken_loops(&m), Vec::<String>::new());
+}

@@ -1310,9 +1310,24 @@ fn create_closed_edge_chamfer(
     };
 
     let axis = cylinder.axis;
-    let ref_dir = cylinder.ref_dir;
     let big_r = cylinder.radius;
     let origin = cylinder.origin;
+    // θ = 0 of the chamfer is where the rim's seam vertex actually IS, not
+    // the surface's stored `ref_dir`: a surface rebuilt by an earlier blend
+    // (an R3 fillet at the cylinder's other end) carries a fresh ref_dir a
+    // quarter turn from the seam, and the new seam, trim circles and cone
+    // all landed off the existing seam ("edge lies 6.59 off face's Cylinder
+    // surface"). The surface's ref_dir is only the fallback for a vertex on
+    // the axis, which a rim of a finite-radius cylinder never has.
+    let ref_dir = model
+        .edges
+        .get(rim_edge_id)
+        .and_then(|e| model.vertices.get_position(e.start_vertex))
+        .and_then(|p| {
+            let r = Point3::new(p[0], p[1], p[2]) - origin;
+            (r - axis * r.dot(&axis)).normalize().ok()
+        })
+        .unwrap_or(cylinder.ref_dir);
     let height_limits = cylinder.height_limits.ok_or_else(|| {
         OperationError::InvalidGeometry(
             "Closed-edge chamfer requires a finite cylinder (height_limits set)".to_string(),
