@@ -12111,3 +12111,88 @@ async fn a_revisited_step_is_served_from_the_frame_cache_unchanged() {
         "a step keeps showing its own state"
     );
 }
+
+/// Heavy parts: a step's meshes travel as binary (`?format=bin`, magic
+/// `RSCB` v1) -- the same numbers as the JSON answer, read in place by the
+/// app instead of parsed from text; kept with the step's frame like the rest.
+#[tokio::test]
+async fn a_step_travels_as_binary_with_the_same_meshes() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+    let (_, body) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    let seq = body["chapters"][1]["anchor"].as_u64().expect("hole anchor");
+    let (_, json) = dispatch(&state, json_get(&format!("/api/timeline/scrub/main/{seq}"))).await;
+
+    let fetch = |state: AppState| async move {
+        let response = build_router(state)
+            .oneshot(json_get(&format!(
+                "/api/timeline/scrub/main/{seq}?format=bin"
+            )))
+            .await
+            .expect("router answers");
+        let cached = response
+            .headers()
+            .get("x-roshera-frame-cache")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        (cached, bytes.to_vec())
+    };
+    let (c1, bin) = fetch(state.clone()).await;
+    let (c2, again) = fetch(state.clone()).await;
+    assert_eq!((c1.as_deref(), c2.as_deref()), (Some("miss"), Some("hit")));
+    assert_eq!(bin, again);
+
+    assert_eq!(&bin[..4], b"RSCB");
+    let u32_at = |o: usize| u32::from_le_bytes([bin[o], bin[o + 1], bin[o + 2], bin[o + 3]]);
+    assert_eq!(u32_at(4), 1, "version");
+    let json_len = u32_at(8) as usize;
+    let header: Value = serde_json::from_slice(&bin[12..12 + json_len]).expect("header json");
+    let mut at = (12 + json_len).div_ceil(4) * 4;
+    let objects = header["objects"].as_array().expect("objects");
+    let want = json["objects"].as_array().expect("json objects");
+    assert_eq!(objects.len(), want.len());
+    for (o, w) in objects.iter().zip(want) {
+        assert_eq!(o["id"], w["id"]);
+        let mut read_f32 = |n: usize| {
+            let v: Vec<f64> = (0..n)
+                .map(|k| {
+                    f32::from_le_bytes(bin[at + 4 * k..at + 4 * k + 4].try_into().expect("4"))
+                        as f64
+                })
+                .collect();
+            at += 4 * n;
+            v
+        };
+        let nv = o["nv"].as_u64().expect("nv") as usize;
+        let vertices = read_f32(nv);
+        // Compared at the meshes' own precision (f32): the JSON form writes
+        // each f32 in its shortest decimal, which reads back as a slightly
+        // different f64.
+        let want_v: Vec<f64> = w["mesh"]["vertices"]
+            .as_array()
+            .expect("v")
+            .iter()
+            .filter_map(Value::as_f64)
+            .map(|x| x as f32 as f64)
+            .collect();
+        assert_eq!(vertices, want_v, "the same vertices");
+        let ni = o["ni"].as_u64().expect("ni") as usize;
+        let indices: Vec<u64> = (0..ni).map(|k| u32_at(at + 4 * k) as u64).collect();
+        at += 4 * ni;
+        let want_i: Vec<u64> = w["mesh"]["indices"]
+            .as_array()
+            .expect("i")
+            .iter()
+            .filter_map(Value::as_u64)
+            .collect();
+        assert_eq!(indices, want_i, "the same indices");
+        let nn = o["nn"].as_u64().expect("nn") as usize;
+        at += 4 * nn;
+        let nf = o["nf"].as_u64().expect("nf") as usize;
+        at += 4 * nf;
+    }
+    assert_eq!(at, bin.len(), "nothing left over");
+}

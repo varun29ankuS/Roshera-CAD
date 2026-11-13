@@ -6117,9 +6117,68 @@ pub async fn list_checkpoints(State(state): State<AppState>) -> Json<Vec<Checkpo
 /// `GET /api/timeline/scrub/{branch_id}/{sequence}` — rebuild the
 /// scene as of event `sequence` (inclusive) on `branch_id`, in a
 /// scratch model, and return it snapshot-shaped. Mutates nothing.
+/// Query for [`scrub_timeline`]: `format=bin` for the binary answer.
+#[derive(Deserialize, Default)]
+pub struct ScrubQuery {
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// The binary form of a step's meshes (`RSCB` v1, little-endian): the magic
+/// `RSCB`, a u32 version (1), a u32 length and that many bytes of JSON
+/// (`{"at_sequence", "objects": [{"id", "name", "nv", "ni", "nn", "nf"}]}`),
+/// zero padding to a 4-byte boundary, then per object in order its vertices
+/// (f32 × nv), indices (u32 × ni), normals (f32 × nn) and face ids (u32 × nf).
+/// The app reads the arrays in place -- no text to parse -- which for a
+/// 3 MB step is most of the cost of showing it.
+fn scrub_binary(
+    sequence: u64,
+    meshes: &[(String, String, Vec<f32>, Vec<u32>, Vec<f32>, Vec<u32>)],
+) -> Vec<u8> {
+    let header = serde_json::json!({
+        "at_sequence": sequence,
+        "objects": meshes
+            .iter()
+            .map(|(id, name, v, i, n, f)| serde_json::json!({
+                "id": id, "name": name,
+                "nv": v.len(), "ni": i.len(), "nn": n.len(), "nf": f.len(),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let json = serde_json::to_vec(&header).unwrap_or_default();
+    let arrays: usize = meshes
+        .iter()
+        .map(|(_, _, v, i, n, f)| 4 * (v.len() + i.len() + n.len() + f.len()))
+        .sum();
+    let mut out = Vec::with_capacity(16 + json.len() + arrays);
+    out.extend_from_slice(b"RSCB");
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    out.extend_from_slice(&json);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    for (_, _, v, i, n, f) in meshes {
+        for x in v {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        for x in i {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        for x in n {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        for x in f {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    out
+}
+
 pub async fn scrub_timeline(
     State(state): State<AppState>,
     Path((branch_ref, sequence)): Path<(String, u64)>,
+    Query(q): Query<ScrubQuery>,
 ) -> Result<axum::response::Response, StatusCode> {
     // Drain in-flight recorder ops so "as of event N" is exact even
     // for events recorded microseconds ago.
@@ -6141,6 +6200,61 @@ pub async fn scrub_timeline(
     // prefix's frame key): sliding back and forth re-reads them instead of
     // re-replaying, re-tessellating and re-encoding the part on every visit.
     let geometry_key = timeline_engine::frames::FrameCache::key_of(&events);
+
+    // Binary: the same meshes as raw arrays, kept with the frame.
+    if q.format.as_deref() == Some("bin") {
+        use axum::response::IntoResponse;
+        let bkey =
+            timeline_engine::frames::FrameCache::presentation_key(&geometry_key, "scrub-bin-v1");
+        let (bytes, cache) = match state.frames.presentation(&bkey) {
+            Some(b) => (b, "hit"),
+            None => {
+                let frames = state.frames.clone();
+                let b = tokio::task::spawn_blocking(move || {
+                    let (scratch, _outcome, _stats) = frames.replay(&events);
+                    let tess = geometry_engine::tessellation::TessellationParams::default();
+                    let meshes: Vec<(String, String, Vec<f32>, Vec<u32>, Vec<f32>, Vec<u32>)> =
+                        scratch
+                            .solids
+                            .iter()
+                            .filter_map(|(solid_id, solid)| {
+                                let mesh = geometry_engine::tessellation::tessellate_solid(
+                                    solid, &scratch, &tess,
+                                );
+                                if mesh.triangles.is_empty() {
+                                    return None;
+                                }
+                                let (v, i, n, f) = crate::flatten_tri_mesh(&mesh);
+                                Some((
+                                    format!("scrub:{solid_id}"),
+                                    format!("solid {solid_id} @ event {sequence}"),
+                                    v,
+                                    i,
+                                    n,
+                                    f,
+                                ))
+                            })
+                            .collect();
+                    frames.store_presentation(bkey, scrub_binary(sequence, &meshes))
+                })
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                (b, "miss")
+            }
+        };
+        return Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+                (
+                    axum::http::HeaderName::from_static("x-roshera-frame-cache"),
+                    cache,
+                ),
+            ],
+            bytes.as_ref().clone(),
+        )
+            .into_response());
+    }
+
     let pkey = timeline_engine::frames::FrameCache::presentation_key(&geometry_key, "scrub-v1");
     let prefix_len = events.len();
     let (fragment, frames_json) = match state.frames.presentation(&pkey) {
