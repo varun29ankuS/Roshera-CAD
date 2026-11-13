@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use geometry_engine::drawing::projection::project_solid_view;
+use geometry_engine::drawing::added_view;
 use geometry_engine::drawing::types::{Drawing, ProjectionType, TitleBlock, ViewSource};
 use serde_json::Value;
 use uuid::Uuid;
@@ -274,7 +274,7 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                             .get(&(solid_id as u64))
                             .copied()
                             .unwrap_or(solid_id as u64) as u32;
-                        let r = project_solid_view(
+                        let r = added_view(
                             &model,
                             ViewSource::Part {
                                 part_id,

@@ -359,6 +359,320 @@ fn a_blended_hub_is_dimensioned_to_its_sharp_corners() {
     );
 }
 
+/// The hub with a `chamfer` mm equal-distance chamfer on its top rim, then an
+/// R`fillet` junction fillet (the order the live hub was built in).
+fn blended_hub(chamfer: f64, fillet: f64) -> (BRepModel, SolidId) {
+    let (mut m, part) = hub();
+    let top_rim = rim(&m, 22.5, 32.0);
+    chamfer_edges(
+        &mut m,
+        part,
+        top_rim,
+        ChamferOptions {
+            chamfer_type: ChamferType::EqualDistance(chamfer),
+            distance1: chamfer,
+            distance2: chamfer,
+            ..Default::default()
+        },
+    )
+    .expect("chamfer on the hub top");
+    let junction = rim(&m, 22.5, 12.0);
+    fillet_edges(
+        &mut m,
+        part,
+        junction,
+        FilletOptions {
+            fillet_type: FilletType::Constant(fillet),
+            radius: fillet,
+            ..Default::default()
+        },
+    )
+    .expect("junction fillet");
+    (m, part)
+}
+
+/// Face ids of the solid whose surface satisfies `pred`, sorted.
+fn faces_where(
+    m: &BRepModel,
+    pred: impl Fn(&dyn geometry_engine::primitives::surface::Surface) -> bool,
+) -> Vec<u32> {
+    let mut out: Vec<u32> = m
+        .faces
+        .iter()
+        .filter(|(_, f)| m.surfaces.get(f.surface_id).is_some_and(|s| pred(s)))
+        .map(|(id, _)| id)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+fn torus_faces(m: &BRepModel) -> Vec<u32> {
+    use geometry_engine::primitives::surface::Torus;
+    faces_where(m, |s| s.as_any().downcast_ref::<Torus>().is_some())
+}
+
+fn cone_faces(m: &BRepModel) -> Vec<u32> {
+    use geometry_engine::primitives::surface::Cone;
+    faces_where(m, |s| s.as_any().downcast_ref::<Cone>().is_some())
+}
+
+/// A drafter calls each blend out where it shows in profile: "R3" on the
+/// junction fillet and "0.5 × 45°" on the hub's top chamfer, each on a leader
+/// whose arrow touches the blend, in FRONT (where the fillet is an arc and the
+/// chamfer a line). Each callout names its blend face and a durable id, so
+/// the sheet certificate re-measures it like any other dimension. Found live
+/// 2026-11-12: the hub's sheet carried no callout for either blend.
+#[test]
+fn a_blended_hub_sheet_calls_out_its_fillet_and_its_chamfer() {
+    use geometry_engine::drawing::layout::compute_layout;
+    use geometry_engine::drawing::types::ProjectionType;
+    use geometry_engine::drawing::{
+        certify_drawing, standard_drawing_auto, standard_drawing_hlr, SheetFactKind, SheetVerdict,
+    };
+    let (m, part) = blended_hub(0.5, 3.0);
+    let tori = torus_faces(&m);
+    let cones = cone_faces(&m);
+    assert!(
+        !tori.is_empty() && !cones.is_empty(),
+        "fixture: a fillet and a chamfer"
+    );
+    let auto = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("auto sheet");
+    let hlr = standard_drawing_hlr(
+        &m,
+        part,
+        uuid::Uuid::nil(),
+        geometry_engine::drawing::types::SheetSize::A3,
+        1.0,
+    )
+    .expect("hlr sheet");
+    for (route, d) in [("auto", &auto), ("hlr", &hlr)] {
+        let all: Vec<(String, String, String)> = d
+            .views
+            .iter()
+            .flat_map(|v| {
+                v.dimensions
+                    .iter()
+                    .map(move |x| (v.name.clone(), x.kind.clone(), x.label.clone()))
+            })
+            .collect();
+        let (vi, front) = d
+            .views
+            .iter()
+            .enumerate()
+            .find(|(_, v)| matches!(v.projection, ProjectionType::Front))
+            .expect("front view");
+        let fillet = front
+            .dimensions
+            .iter()
+            .find(|x| x.label == "R3.00")
+            .unwrap_or_else(|| panic!("{route}: no R3 callout in FRONT; the sheet shows {all:?}"));
+        assert_eq!(
+            fillet.entities, tori,
+            "{route}: R3 names the fillet face(s)"
+        );
+        assert!(fillet.pid.is_some(), "{route}: R3 carries a durable id");
+        // Its point lies on the fillet's profile arc: radius 3 about the tube
+        // centre (25.5, 15) beside the hub, inside the quarter between the hub
+        // wall and the flange top.
+        let p = fillet.a;
+        assert!(
+            ((p[0] - 25.5).hypot(p[1] - 15.0) - 3.0).abs() < 1e-6 && p[0] < 25.5 && p[1] < 15.0,
+            "{route}: the R3 leader point {p:?} is not on the fillet's arc"
+        );
+        let chamfer = front
+            .dimensions
+            .iter()
+            .find(|x| x.label == "0.50 × 45°")
+            .unwrap_or_else(|| {
+                panic!("{route}: no 0.50 × 45° callout in FRONT; the sheet shows {all:?}")
+            });
+        assert_eq!(
+            chamfer.entities, cones,
+            "{route}: the chamfer names its cone"
+        );
+        assert!(
+            chamfer.pid.is_some(),
+            "{route}: the chamfer carries a durable id"
+        );
+        // On the chamfer's line, from (22.5, 31.5) to (22, 32).
+        let q = chamfer.a;
+        assert!(
+            ((q[0] - 22.5) + (q[1] - 31.5)).abs() < 1e-6 && q[0] < 22.5 && q[0] > 22.0,
+            "{route}: the chamfer leader point {q:?} is not on the chamfer"
+        );
+        // The chamfer cone states the chamfer, not a 45° angle and a diameter.
+        assert!(
+            !d.views.iter().flat_map(|v| v.dimensions.iter()).any(|x| {
+                matches!(x.kind.as_str(), "angle" | "diameter")
+                    && x.entities.iter().any(|e| cones.contains(e))
+            }),
+            "{route}: the chamfer cone is also stated as an angle or diameter: {all:?}"
+        );
+        // Each callout is inked once, on a leader whose arrow touches it.
+        let layout = compute_layout(d);
+        for (callout, label) in [(fillet, "R3.00"), (chamfer, "0.50 × 45°")] {
+            let inked: Vec<_> = layout
+                .dimensions
+                .iter()
+                .filter(|pd| pd.label == label)
+                .collect();
+            assert_eq!(
+                inked.len(),
+                1,
+                "{route}: {label} inked {} times",
+                inked.len()
+            );
+            let tip = inked[0].arrows[0].tip;
+            let want = [
+                front.position_mm[0] + callout.a[0] * front.scale,
+                (d.sheet_size.height() - front.position_mm[1]) - callout.a[1] * front.scale,
+            ];
+            assert!(
+                (tip[0] - want[0]).hypot(tip[1] - want[1]) < 1e-6,
+                "{route}: {label}'s arrow at {tip:?}, not on the blend at {want:?}"
+            );
+            let leg = inked[0].ext[0];
+            assert!(
+                (leg[1][0] - leg[0][0]).hypot(leg[1][1] - leg[0][1]) > 1.0,
+                "{route}: {label} has no leader leg"
+            );
+            assert_eq!(inked[0].owner_view, vi, "{route}: {label} belongs to FRONT");
+        }
+        // Certified like any other dimension.
+        let cert = certify_drawing(&m, d);
+        for label in ["R3.00", "0.50 × 45°"] {
+            let fact = cert
+                .facts
+                .iter()
+                .find(|f| f.kind == SheetFactKind::Dimension && f.label == label)
+                .unwrap_or_else(|| panic!("{route}: no certificate fact for {label}"));
+            assert_eq!(
+                fact.live.verdict,
+                SheetVerdict::Consistent,
+                "{route}: {label}: {fact:?}"
+            );
+        }
+        assert!(
+            cert.sound,
+            "{route}: {:?}",
+            cert.unsound_facts().collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The callouts are re-measured, not parroted: the R3 / 0.5 sheet certified
+/// against the same hub blended R4 / 0.8 reads both callouts STALE (the
+/// blend faces keep their durable ids across the size change, so this is the
+/// value check speaking, not a lost reference).
+#[test]
+fn a_blend_callout_goes_stale_when_the_blend_changes_size() {
+    use geometry_engine::drawing::{
+        certify_drawing, standard_drawing_hlr, types::SheetSize, SheetFactKind, SheetVerdict,
+    };
+    let (m3, part3) = blended_hub(0.5, 3.0);
+    let (m4, part4) = blended_hub(0.8, 4.0);
+    assert_eq!(part3, part4, "fixture: same solid id");
+    let pids = |m: &BRepModel, faces: Vec<u32>| -> Vec<_> {
+        faces.into_iter().map(|f| m.face_pid(f)).collect()
+    };
+    assert_eq!(
+        pids(&m3, torus_faces(&m3)),
+        pids(&m4, torus_faces(&m4)),
+        "fixture: the fillet keeps its durable id across a radius change"
+    );
+    assert_eq!(
+        pids(&m3, cone_faces(&m3)),
+        pids(&m4, cone_faces(&m4)),
+        "fixture: the chamfer keeps its durable id across a size change"
+    );
+    let sheet =
+        standard_drawing_hlr(&m3, part3, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("R3 sheet");
+    let cert = certify_drawing(&m4, &sheet);
+    for (label, live) in [("R3.00", 4.0), ("0.50 × 45°", 0.8)] {
+        let fact = cert
+            .facts
+            .iter()
+            .find(|f| f.kind == SheetFactKind::Dimension && f.label == label)
+            .unwrap_or_else(|| panic!("no certificate fact for {label}"));
+        assert_eq!(fact.live.verdict, SheetVerdict::Stale, "{label}: {fact:?}");
+        let measured = fact.live.measured.expect("re-measured");
+        assert!(
+            (measured - live).abs() < 1e-6,
+            "{label}: re-measured {measured}, the model's blend is {live}"
+        );
+    }
+    assert!(!cert.sound);
+}
+
+/// Rim rounds are called out one per rim: R1 on the flange's top and bottom
+/// outer rims are two blends of one size, each with its own "R1.00" on the
+/// arc it names -- not merged into one, and not dropped as a repeat of the
+/// other's value.
+#[test]
+fn each_rim_round_gets_its_own_radius_callout() {
+    use geometry_engine::drawing::types::{ProjectionType, SheetSize};
+    use geometry_engine::drawing::{certify_drawing, standard_drawing_hlr, SheetVerdict};
+    let (mut m, part) = blended_hub(0.5, 3.0);
+    for z in [12.0, 0.0] {
+        let outer = rim(&m, 40.0, z);
+        fillet_edges(
+            &mut m,
+            part,
+            outer,
+            FilletOptions {
+                fillet_type: FilletType::Constant(1.0),
+                radius: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("R1 on the flange rim at z = {z}: {e:?}"));
+    }
+    let d = standard_drawing_hlr(&m, part, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("hlr");
+    let front = d
+        .views
+        .iter()
+        .find(|v| matches!(v.projection, ProjectionType::Front))
+        .expect("front view");
+    let r1: Vec<_> = front
+        .dimensions
+        .iter()
+        .filter(|x| x.label == "R1.00")
+        .collect();
+    assert_eq!(
+        r1.len(),
+        2,
+        "two R1 callouts in FRONT: {:?}",
+        front
+            .dimensions
+            .iter()
+            .map(|x| x.label.clone())
+            .collect::<Vec<_>>()
+    );
+    // Each on its own rim's arc: tube centres (39, 11) and (39, 1).
+    for (cz, x) in [(11.0, 0usize), (1.0, 1)] {
+        let hit = r1
+            .iter()
+            .any(|c| ((c.a[0] - 39.0).hypot(c.a[1] - cz) - 1.0).abs() < 1e-6);
+        assert!(
+            hit,
+            "callout {x}: no R1 on the arc about (39, {cz}): {r1:?}"
+        );
+    }
+    assert_ne!(r1[0].entities, r1[1].entities, "each names its own rim");
+    let cert = certify_drawing(&m, &d);
+    assert!(
+        cert.facts
+            .iter()
+            .filter(|f| f.label == "R1.00")
+            .all(|f| f.live.verdict == SheetVerdict::Consistent),
+        "{:?}",
+        cert.facts
+            .iter()
+            .filter(|f| f.label == "R1.00")
+            .collect::<Vec<_>>()
+    );
+}
+
 /// The two blends on the hub's cylinder in either order: an R3 fillet at its
 /// foot, then a 0.5 chamfer on its top rim. The chamfer was refused -- "edge
 /// lies 6.59 off face's Cylinder surface" -- while chamfer-then-fillet
@@ -397,4 +711,45 @@ fn a_chamfer_after_a_fillet_on_the_same_cylinder() {
         "{cert:?}"
     );
     assert_eq!(broken_loops(&m), Vec::<String>::new());
+}
+
+/// The callouts' leaders keep the sheet readable: a fully blended hub (R3
+/// junction, 0.5 chamfer, R1 on both flange rims) passes the layout quality
+/// gate on both sheet routes, and the exported SVG inks every callout.
+#[test]
+fn a_blended_hub_sheet_passes_the_layout_gate_with_its_callouts() {
+    use geometry_engine::drawing::types::SheetSize;
+    use geometry_engine::drawing::{
+        render_drawing_svg, standard_drawing_auto, standard_drawing_hlr, verify_drawing, Severity,
+    };
+    let (mut m, part) = blended_hub(0.5, 3.0);
+    for z in [12.0, 0.0] {
+        let outer = rim(&m, 40.0, z);
+        fillet_edges(
+            &mut m,
+            part,
+            outer,
+            FilletOptions {
+                fillet_type: FilletType::Constant(1.0),
+                radius: 1.0,
+                ..Default::default()
+            },
+        )
+        .expect("R1 flange rim");
+    }
+    let auto = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("auto");
+    let hlr = standard_drawing_hlr(&m, part, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("hlr");
+    for (route, d) in [("auto", &auto), ("hlr", &hlr)] {
+        let report = verify_drawing(d);
+        let errors: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| i.severity == Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "{route}: {errors:#?}");
+        let svg = render_drawing_svg(d);
+        for label in ["R3.00", "R1.00", "0.50 × 45°"] {
+            assert!(svg.contains(label), "{route}: the SVG has no {label}");
+        }
+    }
 }

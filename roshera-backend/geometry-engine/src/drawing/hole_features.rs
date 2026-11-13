@@ -1060,7 +1060,11 @@ pub fn apply_hole_conventions(
     let mut out: Vec<DimensionRecord> = records
         .into_iter()
         .filter(|d| {
-            if matches!(d.kind.as_str(), "length" | "angle") && touches(d, &stated) {
+            // A countersink is geometrically a chamfer of its drill's rim;
+            // its stack states it, so it gets no chamfer callout of its own.
+            if matches!(d.kind.as_str(), "length" | "angle" | "chamfer" | "fillet")
+                && touches(d, &stated)
+            {
                 return false;
             }
             if matches!(d.kind.as_str(), "diameter" | "position") && touches(d, &secondary) {

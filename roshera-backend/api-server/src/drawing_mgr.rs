@@ -62,7 +62,7 @@ use axum::{
 use dashmap::DashMap;
 use geometry_engine::drawing::types::{ViewEdit, ViewEditError};
 use geometry_engine::drawing::{
-    answer_query, certify_drawing, project_solid_view, render_drawing_dxf, render_drawing_pdf,
+    added_view, answer_query, certify_drawing, render_drawing_dxf, render_drawing_pdf,
     render_drawing_svg, standard_drawing_auto_with_projection,
     standard_drawing_hlr_with_projection, verify_drawing, Drawing, DrawingAnswer,
     DrawingQualityReport, DrawingQuery, ProjectedViewId, ProjectionAngle, ProjectionType,
@@ -916,11 +916,12 @@ pub async fn add_view(
         (req_source, req.scale.unwrap_or(1.0), None, model_handle)
     };
 
-    // Project the view *outside* the drawing's lock — the projection
+    // Project the view *outside* the drawing's lock, through the same
+    // hidden-line pipeline as the sheet's own views -- the projection
     // only needs a read lock on the resolved BRepModel.
     let view = {
         let model_guard = model_handle.read().await;
-        project_solid_view(
+        added_view(
             &model_guard,
             source,
             req.projection,

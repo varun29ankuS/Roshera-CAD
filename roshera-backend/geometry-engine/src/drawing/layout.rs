@@ -2094,9 +2094,21 @@ pub(crate) fn place_dimensions_routed(
         // nominal 45° from the hole but never above the frame's top, and a
         // second leader on the same side takes the next free row so two
         // callouts never overprint.
-        if d.kind == "hole_callout" && (dx > 1e-6 || dy > 1e-6) {
-            let centre = [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])];
-            let r = 0.5 * (a[0] - b[0]).hypot(a[1] - b[1]);
+        //
+        // A blend callout ("R3.00", "0.50 × 45°") takes the same leader, its
+        // arrow on the blend's profile point `a`: the leader routing below
+        // treats it as a hole of radius zero centred there.
+        let leader = if d.kind == "hole_callout" && (dx > 1e-6 || dy > 1e-6) {
+            Some((
+                [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])],
+                0.5 * (a[0] - b[0]).hypot(a[1] - b[1]),
+            ))
+        } else if crate::drawing::dimensioning::is_blend_callout(&d.kind) {
+            Some((a, 0.0))
+        } else {
+            None
+        };
+        if let Some((centre, r)) = leader {
             // A qualifier in parentheses ("(1ST AT 45.0°)") goes on a second
             // line UNDER the shoulder, the way a drafter writes a two-line
             // callout -- one 70 mm line ran off the sheet.

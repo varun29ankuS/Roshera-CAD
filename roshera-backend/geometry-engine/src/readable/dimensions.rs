@@ -123,12 +123,16 @@ pub struct DimensionRecord {
     /// Stable within one extraction (`"d0"`, `"d1"`, …) — the handle a future
     /// `set_dimension` (mould) edits.
     pub id: String,
-    /// "diameter" | "radius" | "length" | "angle" | "extent".
+    /// "diameter" | "radius" | "length" | "angle" | "extent" | "position", or
+    /// a blend: "fillet" (value = the radius; `anchor` on its profile arc,
+    /// `direction` from the tube centre to it) | "chamfer" (an equal-leg
+    /// chamfer; value = the leg; `anchor` on its profile line).
     pub kind: String,
     pub value: f64,
     /// "mm" for lengths, "deg" for angles.
     pub unit: String,
-    /// Human label, e.g. "Ø20.00", "L 40.00", "X 110.00", "∠ 30.0°".
+    /// Human label, e.g. "Ø20.00", "L 40.00", "X 110.00", "∠ 30.0°", "R3.00",
+    /// "0.50 × 45°".
     pub label: String,
     /// Face ids the dimension spans (empty for the whole-part extents).
     pub entities: Vec<u32>,
@@ -944,7 +948,490 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
         }
     }
 
+    // ── Blends: a fillet's radius, a chamfer's size ───────────────────────────
+    // After every per-face record so a blended part's earlier ids keep their
+    // numbers.
+    for b in blend_records(model, solid_id) {
+        let (kind, label) = match b.kind {
+            BlendKind::Fillet => ("fillet", format!("R{}", unit.format_len_bare(b.value))),
+            BlendKind::Chamfer => (
+                "chamfer",
+                format!("{} \u{00D7} 45\u{00B0}", unit.format_len_bare(b.value)),
+            ),
+        };
+        out.push(DimensionRecord {
+            id: id(),
+            kind: kind.into(),
+            value: b.value,
+            unit: unit_suffix.into(),
+            label,
+            pid: feature_dim_pid(model, &b.faces, kind),
+            entities: b.faces,
+            anchor: b.anchor,
+            direction: b.direction,
+            axis: Some(b.axis),
+            datum: None,
+        });
+    }
+
     merge_coaxial_walls(dedupe_coincident(out))
+}
+
+/// Geometric agreement required of a blend's rims with its own surface (and
+/// with the faces it joins), in model millimetres. A rim that misses its
+/// surface by more than this is not the blend this module describes, and the
+/// face gets no callout rather than an approximate one.
+const BLEND_GEOM_TOL: f64 = 1e-6;
+
+/// Which blend a face is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlendKind {
+    /// A torus band: its tube radius is the fillet radius.
+    Fillet,
+    /// A cone between a coaxial cylinder and a plane square to the axis, with
+    /// equal legs: the leg is the chamfer size.
+    Chamfer,
+}
+
+/// One blend callout: every face of one fillet (or chamfer), its size, and a
+/// world point on its profile where a drawing's leader touches it.
+#[derive(Debug, Clone)]
+struct BlendCallout {
+    kind: BlendKind,
+    /// Fillet radius, or the chamfer's (equal) leg.
+    value: f64,
+    /// Every face of the blend, sorted.
+    faces: Vec<u32>,
+    /// A point ON the blend's profile, at an azimuth the blend covers, picked
+    /// so the profile reads in a standard view: the profile plane holds the
+    /// axis and the first of world X, Z, Y that is most square to it.
+    anchor: [f64; 3],
+    /// Unit direction in that profile plane: from the fillet's tube centre to
+    /// the anchor, or square to the chamfer's line, away from the material
+    /// edge. A view reads the profile when this and the axis are both square
+    /// to its viewing direction.
+    direction: [f64; 3],
+    /// The blend's (unit) axis of revolution.
+    axis: [f64; 3],
+}
+
+/// A blend face's profile about its axis of revolution: the two rims as
+/// `(station along the axis, radius)`, by increasing station, and the
+/// azimuth interval the face covers.
+struct Profile {
+    rims: [(f64, f64); 2],
+    /// `None` when the face goes all the way round; else `(start, length)` in
+    /// radians, counter-clockwise from `start`, in the frame of [`radial_frame`].
+    covers: Option<(f64, f64)>,
+}
+
+/// `(u, w)`: the radial frame about `axis` in which azimuth 0 is `u`, the
+/// first of world X, Z, Y that is most square to the axis.
+fn radial_frame(axis: Vector3) -> Option<(Vector3, Vector3)> {
+    let mut best: Option<(f64, Vector3)> = None;
+    for e in [Vector3::X, Vector3::Z, Vector3::Y] {
+        let perp = e - axis * e.dot(&axis);
+        let n = perp.magnitude();
+        // Strictly larger only: ties keep the earlier world axis.
+        if best.map_or(true, |(bn, _)| n > bn + BLEND_GEOM_TOL) {
+            best = Some((n, perp));
+        }
+    }
+    let u = best?.1.normalize().ok()?;
+    let w = axis.cross(&u).normalize().ok()?;
+    Some((u, w))
+}
+
+/// Read `face`'s profile about the axis line `(origin, axis)` off its trim
+/// edges: every sampled boundary point is a `(station, radius)` pair, and a
+/// blend's profile runs between its lowest-station rim and its highest. Each
+/// rim must be one circle (all its samples at one radius) or the face is not
+/// a band of revolution and has no profile.
+fn blend_profile(
+    model: &BRepModel,
+    face: &Face,
+    origin: Point3,
+    axis: Vector3,
+    (u, w): (Vector3, Vector3),
+) -> Option<Profile> {
+    const SAMPLES: usize = 32;
+    let mut pts: Vec<(f64, f64, f64)> = Vec::new(); // (station, radius, azimuth)
+    for lid in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+        let Some(lp) = model.loops.get(lid) else {
+            continue;
+        };
+        for &eid in &lp.edges {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let r = edge.param_range;
+            for k in 0..=SAMPLES {
+                let t = r.start + (r.end - r.start) * (k as f64 / SAMPLES as f64);
+                let Ok(p) = curve.point_at(t) else { continue };
+                let d = p - origin;
+                let s = d.dot(&axis);
+                let radial = d - axis * s;
+                pts.push((s, radial.magnitude(), radial.dot(&w).atan2(radial.dot(&u))));
+            }
+        }
+    }
+    if pts.is_empty() {
+        return None;
+    }
+    let s_lo = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+    let s_hi = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+    if s_hi - s_lo <= BLEND_GEOM_TOL {
+        return None;
+    }
+    let rim = |s: f64| -> Option<f64> {
+        let radii: Vec<f64> = pts
+            .iter()
+            .filter(|p| (p.0 - s).abs() <= BLEND_GEOM_TOL)
+            .map(|p| p.1)
+            .collect();
+        let lo = radii.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = radii.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (hi - lo <= BLEND_GEOM_TOL).then_some(0.5 * (lo + hi))
+    };
+    let rims = [(s_lo, rim(s_lo)?), (s_hi, rim(s_hi)?)];
+
+    // Azimuth coverage: the complement of the widest gap between samples.
+    // A face that goes round leaves no gap wider than its own sampling.
+    let mut az: Vec<f64> = pts
+        .iter()
+        .filter(|p| p.1 > BLEND_GEOM_TOL)
+        .map(|p| p.2)
+        .collect();
+    az.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut covers = None;
+    if let (Some(&first), Some(&last)) = (az.first(), az.last()) {
+        let tau = std::f64::consts::TAU;
+        let (mut gap, mut gap_end) = (first + tau - last, first);
+        for pair in az.windows(2) {
+            if pair[1] - pair[0] > gap {
+                gap = pair[1] - pair[0];
+                gap_end = pair[1];
+            }
+        }
+        // Twice one edge's sampling step of a full turn: any wider gap is
+        // azimuth the face does not reach.
+        if gap > 2.0 * tau / SAMPLES as f64 {
+            covers = Some((gap_end, tau - gap));
+        }
+    }
+    Some(Profile { rims, covers })
+}
+
+/// Is azimuth 0 inside `covers`?
+fn covers_zero(covers: Option<(f64, f64)>) -> bool {
+    match covers {
+        None => true,
+        Some((start, len)) => {
+            let tau = std::f64::consts::TAU;
+            (0.0 - start).rem_euclid(tau) <= len
+        }
+    }
+}
+
+/// The fillets and equal-leg chamfers of `solid_id`, one callout per blend
+/// (a blend split into several faces is one callout naming them all).
+///
+/// - A **fillet** is a torus face (tube radius below its centre-circle
+///   radius) bordering at least two faces that are not part of the same
+///   torus, whose two rims both lie on the tube -- its radius is the tube
+///   radius.
+/// - A **chamfer** is a cone face bordering only a coaxial cylinder, a plane
+///   square to the axis and (when split) itself: one rim on the cylinder, the
+///   other in the plane. Its legs are read off those rims and must agree with
+///   the cone's half-angle; only an EQUAL-leg chamfer is called out, because
+///   a sheet fact carries one number and an unequal chamfer states two. An
+///   unequal chamfer keeps its cone's angle and diameter rows.
+///
+/// A face that matches neither exactly gets no callout -- never an
+/// approximate one.
+fn blend_records(model: &BRepModel, solid_id: SolidId) -> Vec<BlendCallout> {
+    use crate::primitives::surface::{Plane, Torus};
+
+    let Some(solid) = model.solids.get(solid_id) else {
+        return Vec::new();
+    };
+    let edge_faces = edge_faces_of(model, solid_id);
+    let neighbours = |fid: u32, face: &Face| -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for e in face_edges(model, face) {
+            for &f in edge_faces.get(&e).map(Vec::as_slice).unwrap_or(&[]) {
+                if f != fid && !out.contains(&f) {
+                    out.push(f);
+                }
+            }
+        }
+        out
+    };
+    let surface_of = |fid: u32| {
+        model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))
+    };
+    let on_axis_line = |p: Point3, origin: Point3, axis: Vector3| {
+        let d = p - origin;
+        (d - axis * d.dot(&axis)).magnitude() <= BLEND_GEOM_TOL
+    };
+    let parallel = |a: Vector3, b: Vector3| a.dot(&b).abs() > 1.0 - 1e-9;
+
+    // (kind, value, axis, origin, profile rims, faces with their coverage)
+    struct Group {
+        kind: BlendKind,
+        value: f64,
+        axis: Vector3,
+        origin: Point3,
+        frame: (Vector3, Vector3),
+        rims: [(f64, f64); 2],
+        /// The profile point (station, radius) the leader touches, and the
+        /// profile direction stored as `direction`.
+        point: (f64, f64),
+        dir: (f64, f64),
+        faces: Vec<(u32, Option<(f64, f64)>)>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let same_rims = |a: &[(f64, f64); 2], b: &[(f64, f64); 2]| {
+        a.iter().zip(b.iter()).all(|(x, y)| {
+            (x.0 - y.0).abs() <= BLEND_GEOM_TOL && (x.1 - y.1).abs() <= BLEND_GEOM_TOL
+        })
+    };
+
+    let mut shells = vec![solid.outer_shell];
+    shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
+    for sh in shells {
+        let Some(shell) = model.shells.get(sh) else {
+            continue;
+        };
+        for &fid in &shell.faces {
+            let Some(face) = model.faces.get(fid) else {
+                continue;
+            };
+            let Some(surface) = model.surfaces.get(face.surface_id) else {
+                continue;
+            };
+            let any = surface.as_any();
+            let candidate = if let Some(t) = any.downcast_ref::<Torus>() {
+                let Ok(axis) = t.axis.normalize() else {
+                    continue;
+                };
+                if !(t.minor_radius > 0.0 && t.minor_radius < t.major_radius) {
+                    continue;
+                }
+                let sibling = |f: u32| {
+                    surface_of(f)
+                        .and_then(|s| s.as_any().downcast_ref::<Torus>())
+                        .is_some_and(|o| {
+                            parallel(o.axis, axis)
+                                && (o.center - t.center).magnitude() <= BLEND_GEOM_TOL
+                                && (o.major_radius - t.major_radius).abs() <= BLEND_GEOM_TOL
+                                && (o.minor_radius - t.minor_radius).abs() <= BLEND_GEOM_TOL
+                        })
+                };
+                let joined = neighbours(fid, face)
+                    .into_iter()
+                    .filter(|&f| !sibling(f))
+                    .count();
+                if joined < 2 {
+                    continue;
+                }
+                let Some(frame) = radial_frame(axis) else {
+                    continue;
+                };
+                let Some(profile) = blend_profile(model, face, t.center, axis, frame) else {
+                    continue;
+                };
+                // Both rims on the tube, whose centre is (0, major) in profile.
+                let r = t.minor_radius;
+                let tube = (0.0, t.major_radius);
+                let on_tube = |p: (f64, f64)| {
+                    ((p.0 - tube.0).hypot(p.1 - tube.1) - r).abs() <= BLEND_GEOM_TOL
+                };
+                if !profile.rims.iter().all(|&p| on_tube(p)) {
+                    continue;
+                }
+                // The profile arc's midpoint: from the tube centre toward the
+                // chord's midpoint, one radius out (a fillet is the minor arc).
+                let m = (
+                    0.5 * (profile.rims[0].0 + profile.rims[1].0) - tube.0,
+                    0.5 * (profile.rims[0].1 + profile.rims[1].1) - tube.1,
+                );
+                let ml = m.0.hypot(m.1);
+                if ml <= BLEND_GEOM_TOL {
+                    continue;
+                }
+                let dir = (m.0 / ml, m.1 / ml);
+                Some((
+                    BlendKind::Fillet,
+                    r,
+                    axis,
+                    t.center,
+                    frame,
+                    profile,
+                    (tube.0 + r * dir.0, tube.1 + r * dir.1),
+                    dir,
+                ))
+            } else if let Some(c) = any.downcast_ref::<Cone>() {
+                let Ok(axis) = c.axis.normalize() else {
+                    continue;
+                };
+                let mut cylinder: Option<f64> = None; // its radius
+                let mut plane: Option<f64> = None; // its station
+                let mut other = false;
+                for f in neighbours(fid, face) {
+                    let Some(s) = surface_of(f) else {
+                        other = true;
+                        continue;
+                    };
+                    let s = s.as_any();
+                    if let Some(cy) = s.downcast_ref::<Cylinder>() {
+                        if parallel(cy.axis, axis) && on_axis_line(cy.origin, c.apex, axis) {
+                            cylinder = Some(cy.radius);
+                            continue;
+                        }
+                    } else if let Some(pl) = s.downcast_ref::<Plane>() {
+                        if parallel(pl.normal, axis) {
+                            plane = Some((pl.origin - c.apex).dot(&axis));
+                            continue;
+                        }
+                    } else if let Some(o) = s.downcast_ref::<Cone>() {
+                        let same = parallel(o.axis, axis)
+                            && (o.apex - c.apex).magnitude() <= BLEND_GEOM_TOL
+                            && (o.half_angle - c.half_angle).abs() <= 1e-9;
+                        if same {
+                            continue;
+                        }
+                    }
+                    other = true;
+                }
+                let (Some(cyl_r), Some(plane_s), false) = (cylinder, plane, other) else {
+                    continue;
+                };
+                let Some(frame) = radial_frame(axis) else {
+                    continue;
+                };
+                let Some(profile) = blend_profile(model, face, c.apex, axis, frame) else {
+                    continue;
+                };
+                // One rim on the cylinder, the other in the plane.
+                let [p0, p1] = profile.rims;
+                let (on_cyl, in_plane) = if (p0.1 - cyl_r).abs() <= BLEND_GEOM_TOL
+                    && (p1.0 - plane_s).abs() <= BLEND_GEOM_TOL
+                {
+                    (p0, p1)
+                } else if (p1.1 - cyl_r).abs() <= BLEND_GEOM_TOL
+                    && (p0.0 - plane_s).abs() <= BLEND_GEOM_TOL
+                {
+                    (p1, p0)
+                } else {
+                    continue;
+                };
+                let axial = (in_plane.0 - on_cyl.0).abs();
+                let radial = (in_plane.1 - on_cyl.1).abs();
+                // The legs are the cone's own: radial = axial · tan(half-angle).
+                if (radial - axial * c.half_angle.tan()).abs() > BLEND_GEOM_TOL
+                    || (axial - radial).abs() > BLEND_GEOM_TOL
+                {
+                    continue;
+                }
+                let mid = (0.5 * (on_cyl.0 + in_plane.0), 0.5 * (on_cyl.1 + in_plane.1));
+                // Square to the chamfer's line, away from the sharp corner
+                // it replaced (in_plane.0, on_cyl.1).
+                let line = (in_plane.0 - on_cyl.0, in_plane.1 - on_cyl.1);
+                let ll = line.0.hypot(line.1);
+                let mut n = (-line.1 / ll, line.0 / ll);
+                let corner = (in_plane.0 - mid.0, on_cyl.1 - mid.1);
+                if n.0 * corner.0 + n.1 * corner.1 > 0.0 {
+                    n = (-n.0, -n.1);
+                }
+                Some((
+                    BlendKind::Chamfer,
+                    axial,
+                    axis,
+                    c.apex,
+                    frame,
+                    profile,
+                    mid,
+                    n,
+                ))
+            } else {
+                None
+            };
+            let Some((kind, value, axis, origin, frame, profile, point, dir)) = candidate else {
+                continue;
+            };
+            // One blend split into faces: same kind, size, axis line, rims.
+            let existing = groups.iter_mut().find(|g| {
+                g.kind == kind
+                    && (g.value - value).abs() <= BLEND_GEOM_TOL
+                    && parallel(g.axis, axis)
+                    && on_axis_line(origin, g.origin, g.axis)
+                    && {
+                        // Stations are relative to each surface's own origin
+                        // and axis sense; restate them in the group's.
+                        let sense = g.axis.dot(&axis).signum();
+                        let shift = (origin - g.origin).dot(&g.axis);
+                        let mut rims = profile.rims.map(|(s, r)| (s * sense + shift, r));
+                        rims.sort_by(|a, b| {
+                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        same_rims(&rims, &g.rims)
+                    }
+            });
+            match existing {
+                Some(g) => g.faces.push((fid, profile.covers)),
+                None => groups.push(Group {
+                    kind,
+                    value,
+                    axis,
+                    origin,
+                    frame,
+                    rims: profile.rims,
+                    point,
+                    dir,
+                    faces: vec![(fid, profile.covers)],
+                }),
+            }
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|g| {
+            // Azimuth 0 when the blend reaches it, else the middle of the
+            // first face's reach (the frame is shared by the group: its axis
+            // and origin are the first face's).
+            let theta = if g.faces.iter().any(|f| covers_zero(f.1)) {
+                0.0
+            } else {
+                g.faces
+                    .first()
+                    .and_then(|f| f.1)
+                    .map_or(0.0, |(start, len)| start + 0.5 * len)
+            };
+            let (u0, w0) = g.frame;
+            let u = u0 * theta.cos() + w0 * theta.sin();
+            let anchor = g.origin + g.axis * g.point.0 + u * g.point.1;
+            let direction = g.axis * g.dir.0 + u * g.dir.1;
+            let mut faces: Vec<u32> = g.faces.iter().map(|f| f.0).collect();
+            faces.sort_unstable();
+            BlendCallout {
+                kind: g.kind,
+                value: g.value,
+                faces,
+                anchor: [anchor.x, anchor.y, anchor.z],
+                direction: [direction.x, direction.y, direction.z],
+                axis: [g.axis.x, g.axis.y, g.axis.z],
+            }
+        })
+        .collect()
 }
 
 /// Merge the walls of ONE hole that two separate cuts left as two faces.

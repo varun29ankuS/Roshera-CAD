@@ -710,3 +710,138 @@ async fn get_drawing_discloses_the_owner_for_a_legacy_owned_drawing() {
         "single fetch must disclose the owning document's id; body = {body}"
     );
 }
+
+// =====================================================================
+// 4. AN ADDED VIEW IS DRAWN LIKE THE SHEET'S OWN
+// =====================================================================
+
+/// A 20 mm box with a Ø6 bore down Z, seeded straight into `part_id`'s model.
+async fn bored_box_in_part(state: &AppState, part_id: Uuid) -> u32 {
+    use geometry_engine::math::Vector3;
+    use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+    let handle = state.parts.get(&part_id).expect("part exists");
+    let mut guard = handle.write().await;
+    let model: &mut BRepModel = &mut guard;
+    let solid = |g: GeometryId| match g {
+        GeometryId::Solid(id) => id,
+        other => panic!("expected solid, got {other:?}"),
+    };
+    let block = solid(
+        TopologyBuilder::new(model)
+            .create_box_3d(20.0, 20.0, 20.0)
+            .expect("box"),
+    );
+    let drill = solid(
+        TopologyBuilder::new(model)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, -20.0), Vector3::Z, 3.0, 40.0)
+            .expect("drill"),
+    );
+    boolean_operation(
+        model,
+        block,
+        drill,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("bore")
+}
+
+/// Every element serialized, sorted: line work compared as a set.
+fn bag<T: serde::Serialize>(items: &[T]) -> Vec<String> {
+    let mut out: Vec<String> = items
+        .iter()
+        .map(|i| serde_json::to_string(i).expect("serializes"))
+        .collect();
+    out.sort();
+    out
+}
+
+/// `POST /api/drawings/{id}/views` draws the view hidden-line removed, its
+/// occluded edges dashed and its circular features centre-lined -- exactly
+/// as the kernel's standard sheet draws that projection. It drew a bare
+/// wireframe (every edge solid, no hidden set, no centre lines).
+#[tokio::test]
+async fn an_added_view_is_drawn_with_hidden_lines_and_centre_lines() {
+    let state = make_test_state().await;
+    let part = create_part(&state, "bored block").await;
+    let sid = bored_box_in_part(&state, part).await;
+    let (status, body) = dispatch(
+        &state,
+        post_with_header(
+            "/api/drawings".to_string(),
+            PART_HEADER,
+            &part.to_string(),
+            empty_drawing_request("bored block"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "drawing create; body = {body}");
+    let drawing_id =
+        Uuid::parse_str(body["id"].as_str().expect("drawing id")).expect("drawing id parses");
+    let (status, body) = dispatch(
+        &state,
+        post(
+            &format!("/api/drawings/{drawing_id}/views"),
+            json!({
+                "name": "SIDE",
+                "source": { "kind": "part", "part_id": part, "solid_id": sid },
+                "projection": { "kind": "right" },
+                "position_mm": [150.0, 100.0],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add view; body = {body}");
+
+    let added = {
+        let handle = state.drawings.get(&drawing_id).expect("drawing stored");
+        let guard = handle.read().await;
+        guard
+            .views
+            .iter()
+            .find(|v| v.name == "SIDE")
+            .cloned()
+            .expect("the added view")
+    };
+    // The oracle is put in canonical order (and polyline direction) the way
+    // every stored or rebuilt sheet's views are; content is unchanged.
+    let mut own = {
+        let handle = state.parts.get(&part).expect("part");
+        let model = handle.read().await;
+        geometry_engine::drawing::standard_drawing_hlr(
+            &model,
+            sid,
+            part,
+            geometry_engine::drawing::SheetSize::A3,
+            1.0,
+        )
+        .expect("standard sheet")
+        .views
+        .into_iter()
+        .find(|v| v.name == "RIGHT")
+        .expect("the standard RIGHT")
+    };
+    own.canonicalize();
+    assert!(
+        !own.hidden_polylines.is_empty() && !own.centerlines.is_empty(),
+        "fixture: the bore is hidden from the side, with its axis drawn"
+    );
+    assert_eq!(bag(&added.polylines), bag(&own.polylines), "visible edges");
+    assert_eq!(
+        bag(&added.hidden_polylines),
+        bag(&own.hidden_polylines),
+        "hidden edges"
+    );
+    assert_eq!(bag(&added.circles), bag(&own.circles), "circles");
+    assert_eq!(
+        bag(&added.hidden_circles),
+        bag(&own.hidden_circles),
+        "hidden circles"
+    );
+    assert_eq!(
+        bag(&added.centerlines),
+        bag(&own.centerlines),
+        "centre lines"
+    );
+    assert!(added.show_hidden, "hidden lines are shown dashed");
+}

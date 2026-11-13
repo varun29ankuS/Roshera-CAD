@@ -31,11 +31,13 @@ fn draw_profile_enabled() -> bool {
 pub struct Dimension2d {
     /// Stable id carried from the analytic record (the mould handle).
     pub id: String,
-    /// "diameter" | "radius" | "length" | "angle" | "extent".
+    /// "diameter" | "radius" | "length" | "angle" | "extent", the feature
+    /// callouts (see `is_feature_callout`), or a blend callout ("fillet" |
+    /// "chamfer", see `is_blend_callout`).
     pub kind: String,
     pub value: f64,
     pub unit: String,
-    /// Drawing label, e.g. "Ø20.00", "40.00", "∠30.0°".
+    /// Drawing label, e.g. "Ø20.00", "40.00", "∠30.0°", "R3.00", "0.50 × 45°".
     pub label: String,
     /// View-space endpoints of the measured span. For an angle (no linear
     /// span) `a == b` at the feature anchor.
@@ -121,6 +123,18 @@ pub fn auto_dimensions(
     if let Some(hf) = super::hole_features::detect_hole_features(model, solid_id, round.as_ref()) {
         records = super::hole_features::apply_hole_conventions(records, &hf, model.document_unit());
     }
+    // A chamfer's cone is stated by its chamfer callout ("0.50 × 45°"), not
+    // also as a 45° angle and a diameter of the cone.
+    let chamfered: std::collections::HashSet<u32> = records
+        .iter()
+        .filter(|d| d.kind == "chamfer")
+        .flat_map(|d| d.entities.iter().copied())
+        .collect();
+    records.retain(|d| {
+        !(matches!(d.kind.as_str(), "angle" | "diameter")
+            && !d.entities.is_empty()
+            && d.entities.iter().all(|e| chamfered.contains(e)))
+    });
     for d in records {
         let anchor = Point3::new(d.anchor[0], d.anchor[1], d.anchor[2]);
         let dir = Vector3::new(d.direction[0], d.direction[1], d.direction[2]);
@@ -171,7 +185,12 @@ pub fn visible_dimensions(
 ) -> Vec<Dimension2d> {
     let mut dims: Vec<Dimension2d> = auto_dimensions(model, solid_id, projection)
         .into_iter()
-        .filter(|d| d.kind == "angle" || d.projected_span() >= min_span)
+        .filter(|d| {
+            if is_blend_callout(&d.kind) {
+                return shows_blend_profile(d, &projection);
+            }
+            d.kind == "angle" || d.projected_span() >= min_span
+        })
         .collect();
     // Drawing convention: a linear dimension shows just its value — strip the
     // analytic axis tag ("X 80.00" → "80.00"). Ø (diameter), R (radius) and
@@ -263,7 +282,29 @@ fn select_dimensions(mut dims: Vec<Dimension2d>) -> Vec<Dimension2d> {
 /// hole pattern's callout, location and pitch) -- never contour clutter, so
 /// [`select_dimensions`] neither merges nor drops it as one.
 fn is_feature_callout(kind: &str) -> bool {
-    matches!(kind, "hole_callout" | "pcd" | "location" | "pitch")
+    matches!(kind, "hole_callout" | "pcd" | "location" | "pitch") || is_blend_callout(kind)
+}
+
+/// A blend callout -- a fillet's "R3.00" or a chamfer's "0.50 × 45°" -- is a
+/// point callout on a leader: its `a` (== `b`) is a point on the blend's
+/// profile where the arrow touches it. It brackets no interval, so it is
+/// never stacked, never counted in a dimension band, and never merged with a
+/// same-valued blend elsewhere on the part.
+pub(crate) fn is_blend_callout(kind: &str) -> bool {
+    matches!(kind, "fillet" | "chamfer")
+}
+
+/// Does this view show the blend in PROFILE -- the fillet as an arc, the
+/// chamfer as a line -- at the callout's own point? Only a standard view
+/// looking square to both the blend's axis and its profile plane does (the
+/// record puts that plane on a world axis); there the point lies on the
+/// view's outline. Anywhere else (along the axis the blend is a ring of
+/// circles; a pictorial is not dimensioned) the callout is not drawn.
+fn shows_blend_profile(d: &Dimension2d, projection: &ProjectionType) -> bool {
+    let (Some(vd), Some(axis), Some(dir)) = (view_dir(projection), d.axis3, d.dir3) else {
+        return false;
+    };
+    dot3(axis, vd).abs() < 1e-6 && dot3(dir, vd).abs() < 1e-6
 }
 
 /// World-space view direction (unit vector, pointing INTO the scene) that a
@@ -890,6 +931,54 @@ fn build_hlr_view(
     scale: f64,
     min_span: f64,
 ) -> Result<super::types::ProjectedView, super::projection::ProjectionError> {
+    let mut view = hlr_view_geometry(model, solid_id, source, proj, name, pos, scale)?;
+    view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
+    Ok(view)
+}
+
+/// A view ADDED to an existing sheet (`POST /api/drawings/{id}/views`, and
+/// the timeline replay of that event): drawn exactly as the sheet's own views
+/// are -- hidden-line removed with occluded edges dashed, true circles and
+/// ellipses, per-edge lineage, centre lines -- not as the bare wireframe
+/// [`super::projection::project_solid_view`] gives. An isometric is the
+/// sheet's pictorial: every edge solid, with the shaded raster the sheet's own
+/// isometric carries.
+///
+/// It carries NO dimensions. A sheet's dimensions are deduplicated across its
+/// views when it is made ([`dedup_dimensions_global`]), so each feature is
+/// stated once, where it reads best; an added view re-deriving them would
+/// state every feature a second time.
+pub fn added_view(
+    model: &BRepModel,
+    source: super::types::ViewSource,
+    proj: ProjectionType,
+    name: impl Into<String>,
+    pos: [f64; 2],
+    scale: f64,
+) -> Result<super::types::ProjectedView, super::projection::ProjectionError> {
+    let solid_id = match source {
+        super::types::ViewSource::Part { solid_id, .. } => solid_id,
+    };
+    let name: String = name.into();
+    let mut view = hlr_view_geometry(model, solid_id, source, proj, &name, pos, scale)?;
+    if matches!(proj, ProjectionType::Isometric) {
+        view.shaded_raster = shaded_iso_raster(model, solid_id, view.extent, scale);
+    }
+    view.canonicalize();
+    Ok(view)
+}
+
+/// The line work of one HLR view (everything [`build_hlr_view`] draws except
+/// the dimensions).
+fn hlr_view_geometry(
+    model: &BRepModel,
+    solid_id: SolidId,
+    source: super::types::ViewSource,
+    proj: ProjectionType,
+    name: &str,
+    pos: [f64; 2],
+    scale: f64,
+) -> Result<super::types::ProjectedView, super::projection::ProjectionError> {
     use super::projection::{project_solid_view, DEFAULT_CURVE_SAMPLES};
     use super::visibility::project_solid_edges_visibility_occ;
 
@@ -937,7 +1026,6 @@ fn build_hlr_view(
         view.ellipses = select_ellipses(edges.ellipses);
         view.hidden_ellipses = select_ellipses(edges.hidden_ellipses);
     }
-    view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
     view.centerlines = super::centerlines::centerlines(model, solid_id, proj);
     Ok(view)
 }

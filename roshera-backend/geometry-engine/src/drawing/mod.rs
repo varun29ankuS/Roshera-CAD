@@ -44,8 +44,8 @@ pub mod visibility;
 
 pub use centerlines::{centerlines, Centerline};
 pub use dimensioning::{
-    auto_dimensions, section_slot_rule, set_projection, standard_drawing, standard_drawing_auto,
-    standard_drawing_auto_with_projection, standard_drawing_hlr,
+    added_view, auto_dimensions, section_slot_rule, set_projection, standard_drawing,
+    standard_drawing_auto, standard_drawing_auto_with_projection, standard_drawing_hlr,
     standard_drawing_hlr_with_projection, visible_dimensions, CuttingPlaneLine, Dimension2d,
     SectionSlotRule,
 };

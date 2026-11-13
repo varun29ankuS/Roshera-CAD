@@ -556,3 +556,87 @@ fn a_drawing_follows_its_part_through_later_features() {
         .expect("the sheet's verdict");
     assert!(!sheet.status.is_break(), "{:?}", sheet.status);
 }
+
+/// Every element of `items`, serialized, in sorted order: view line work
+/// compared as a set (the HLR circle de-clutter groups through a hash map, so
+/// its order is not part of the claim).
+fn bag<T: serde::Serialize>(items: &[T]) -> Vec<String> {
+    let mut out: Vec<String> = items
+        .iter()
+        .map(|i| serde_json::to_string(i).expect("serializes"))
+        .collect();
+    out.sort();
+    out
+}
+
+/// A view added to a sheet is drawn the way the sheet's own views are:
+/// hidden-line removed, occluded edges dashed, centre lines on its circular
+/// features. It was a bare wireframe -- every edge solid, no hidden set, no
+/// centre lines -- because the replay (and the live handler) projected it
+/// with the plain edge projector instead of the HLR pipeline. Pinned on the
+/// rebuilt sheet, where every export now reads it: an added RIGHT view of the
+/// bored plate must classify its edges exactly as the sheet's own RIGHT does.
+#[test]
+fn an_added_view_gets_the_same_hidden_line_treatment_as_the_sheets_own() {
+    let did = Uuid::new_v4();
+    let side = Uuid::new_v4();
+    let left = Uuid::new_v4();
+    let mut events = plate();
+    events.extend([
+        from_part(3, 3, did),
+        add_view(4, did, side, 3, "SIDE", "right"),
+        add_view(5, did, left, 3, "LEFT", "left"),
+    ]);
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    assert!(built.issues.is_empty(), "{:?}", built.issues);
+    let d = built.drawings.get(&did).expect("rebuilt");
+    let own = d
+        .views
+        .iter()
+        .find(|v| v.name == "RIGHT")
+        .expect("the sheet's RIGHT");
+    let added = d.views.iter().find(|v| v.id.0 == side).expect("SIDE");
+    // The bore is behind the plate's side wall: hidden, dashed.
+    assert!(
+        !own.hidden_polylines.is_empty() && !own.centerlines.is_empty(),
+        "fixture: the sheet's RIGHT shows the bore hidden, with its axis"
+    );
+    assert_eq!(bag(&added.polylines), bag(&own.polylines), "visible edges");
+    assert_eq!(
+        bag(&added.polyline_sources),
+        bag(&own.polyline_sources),
+        "visible edge lineage"
+    );
+    assert_eq!(
+        bag(&added.hidden_polylines),
+        bag(&own.hidden_polylines),
+        "hidden edges"
+    );
+    assert_eq!(bag(&added.circles), bag(&own.circles), "circles");
+    assert_eq!(
+        bag(&added.hidden_circles),
+        bag(&own.hidden_circles),
+        "hidden circles"
+    );
+    assert_eq!(bag(&added.ellipses), bag(&own.ellipses), "ellipses");
+    assert_eq!(
+        bag(&added.hidden_ellipses),
+        bag(&own.hidden_ellipses),
+        "hidden ellipses"
+    );
+    assert_eq!(
+        bag(&added.centerlines),
+        bag(&own.centerlines),
+        "centre lines"
+    );
+    // A projection the sheet does not have gets the same treatment.
+    let lv = d.views.iter().find(|v| v.id.0 == left).expect("LEFT");
+    assert!(
+        !lv.hidden_polylines.is_empty(),
+        "LEFT shows the bore hidden"
+    );
+    assert!(!lv.centerlines.is_empty(), "LEFT draws the bore's axis");
+    // An added view states no dimensions of its own: the sheet's are
+    // deduplicated across its views when it is made.
+    assert!(added.dimensions.is_empty() && lv.dimensions.is_empty());
+}
