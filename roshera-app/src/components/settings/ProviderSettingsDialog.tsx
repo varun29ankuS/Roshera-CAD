@@ -38,6 +38,8 @@ import {
   resetAcpClient,
 } from '@/lib/acp-blackboard'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
+import { useAgentUiStore } from '@/stores/agent-ui-store'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 
 /** `GET /api/ai/provider`'s `cli` object is keyed by CLI, not by provider
  *  id (`ai_provider_config::detect_claude_cli` / `detect_codex_cli`). */
@@ -47,10 +49,11 @@ const CLI_KEY_FOR_PROVIDER: Record<string, 'claude' | 'codex'> = {
 }
 
 /**
- * AI PROVIDER SETTINGS — trigger button + dialog
- * ================================================
- * Self-contained: `<ProviderSettingsButton />` is the only export TopBar's
- * right cluster needs. Renders the server-owned provider allowlist
+ * AI BUTTON + AI SETUP DIALOG
+ * ===========================
+ * Self-contained: `<AgentButton />` is the only export the left rail
+ * needs; the Blackboard's model chip opens the dialog through
+ * `useAgentUiStore.openSettings`. Renders the server-owned provider allowlist
  * (`ai-integration/src/providers/allowlist.rs`, mirrored verbatim in
  * `lib/provider-api.ts`) and lets the user select and configure a mode.
  *
@@ -290,9 +293,30 @@ function modeStatus(
   return { text: 'from environment', state }
 }
 
-export function ProviderSettingsButton() {
+/**
+ * The AI button on the left rail, and the AI setup dialog it owns.
+ *
+ * The button opens the agent's window -- the Blackboard -- not setup
+ * (Varun 2026-11-13: the AI button is the agent; setup moves out of the
+ * way). Opening it also starts a saved provider's agent if none is running
+ * ("clicking ai should start it"); setup appears only when it is needed:
+ * nothing saved yet, or the start failed (the dialog then shows which step
+ * failed and why). Setup is otherwise reached from the model chip in the
+ * Blackboard's header (`useAgentUiStore.openSettings`).
+ */
+export function AgentButton() {
   const [open, setOpen] = useState(false)
-  const [state, setState] = useState<LoadState>({ phase: 'loading' })
+  const [state, setStateRaw] = useState<LoadState>({ phase: 'loading' })
+  /** Every status load also tells the Blackboard's chip what is saved. */
+  const setState = (next: LoadState) => {
+    setStateRaw(next)
+    if (next.phase === 'ready') {
+      const a = next.data.active
+      useAgentUiStore
+        .getState()
+        .setConfigured(a ? { provider: a.provider, model: a.model ?? null } : null)
+    }
+  }
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null)
   const [selectedMode, setSelectedMode] = useState<CredentialMode | null>(null)
   const [apiKey, setApiKey] = useState('')
@@ -523,6 +547,40 @@ export function ProviderSettingsButton() {
     })
   }, [])
 
+  const openDialogRef = useRef<() => void>(() => {})
+  useEffect(
+    () =>
+      useAgentUiStore.subscribe((s, prev) => {
+        if (s.settingsRequests !== prev.settingsRequests) openDialogRef.current()
+      }),
+    [],
+  )
+
+  /** The rail button: toggle the agent's window; on opening, make sure the
+   *  agent runs. Setup shows only when nothing is saved or the start fails. */
+  async function onRailClick() {
+    const board = useBlackboardStore.getState()
+    if (board.isPanelOpen) {
+      board.setPanel(false)
+      return
+    }
+    board.setPanel(true)
+    if (useAcpSessionStore.getState().live) return
+    const res = await getProviderStatus()
+    if (!res.ok || !res.data.active) {
+      openDialog()
+      return
+    }
+    setState({ phase: 'ready', data: res.data })
+    const active = res.data.active
+    setSelectedProviderId(active.provider)
+    setSelectedMode(active.mode as CredentialMode)
+    applyModel(active.model ?? '')
+    await runConnect({ save: false, provider: active.provider, mode: active.mode as CredentialMode })
+    // runConnect leaves its failure on the dialog's step rows: show them.
+    if (!useAcpSessionStore.getState().live) setOpen(true)
+  }
+
   /** Opens the dialog and fetches fresh state — invoked from the trigger
    *  button's `onClick`, i.e. a real user event, not an Effect.
    *  `autoStart: true` is Varun's "clicking ai should start it": if the
@@ -544,6 +602,9 @@ export function ProviderSettingsButton() {
     setConnectFlow(null)
     load({ autoStart: true })
   }
+  useEffect(() => {
+    openDialogRef.current = openDialog
+  })
 
   const data = state.phase === 'ready' ? state.data : null
   const selectedProvider: AllowlistedProvider | undefined = data?.allowlist.find(
@@ -764,7 +825,7 @@ export function ProviderSettingsButton() {
   return (
     <>
       <button
-        onClick={openDialog}
+        onClick={() => void onRailClick()}
         className={cn(
           // Matches FlyoutGroup's trigger exactly so it reads as a rail item
           // rather than a logo dropped into the column.
@@ -774,13 +835,11 @@ export function ProviderSettingsButton() {
           providerServing ? 'text-emerald-500' : 'text-rose-400',
         )}
         title={
-          providerServing ? 'AI provider — connected' : 'AI provider — not connected yet'
-        }
-        aria-label={
           providerServing
-            ? 'AI provider settings (connected)'
-            : 'AI provider settings (not connected)'
+            ? 'AI — open or close the agent (running)'
+            : 'AI — open the agent (not running yet)'
         }
+        aria-label={providerServing ? 'AI agent (running)' : 'AI agent (not running)'}
       >
         {/* A chip, not a glyph: nothing to interpret, nothing to date. The
             border carries connection state so the mark never claims more
@@ -990,19 +1049,19 @@ export function ProviderSettingsButton() {
                 either), never a guessed tick or cross. */}
             <div className="flex flex-col gap-1 rounded-md border border-border/60 bg-background/40 px-3 py-2">
               {data.active === null && (
-                <Claim status={null} detail="whatever the backend resolved at boot">
-                  Agent surface (/acp) — no saved provider
+                <Claim status={null} detail="the server uses its start-up default">
+                  Agent — no provider saved yet
                 </Claim>
               )}
               <Claim
                 status={data.ai_configured}
                 detail={
                   data.ai_configured
-                    ? 'native provider registered'
-                    : 'needs an API key or OAuth credential — tool_use is not carried over the CLI transport'
+                    ? 'ready'
+                    : 'need an API key or a sign-in; the agent works without them'
                 }
               >
-                REST surface (/api/ai/command)
+                One-shot commands
               </Claim>
             </div>
 

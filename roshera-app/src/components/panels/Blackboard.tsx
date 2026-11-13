@@ -36,6 +36,8 @@ import {
   CircleSlash,
 } from '@/components/ui/icons'
 import { VendorMark } from '@/components/settings/vendor-marks'
+import { useAgentUiStore } from '@/stores/agent-ui-store'
+import { agentChip } from '@/lib/agent-chip'
 import { TurnStatusLine } from './TurnStatusLine'
 import { useDocumentStore } from '@/stores/document-store'
 
@@ -66,15 +68,6 @@ const compactCount = new Intl.NumberFormat('en-US', { notation: 'compact', maxim
  *  honest percentage to compute — this renders the total alone, never a
  *  used/size ratio, and never clamps to 100% (that would hide the truth
  *  rather than tell it). */
-/** A model id short enough for the board's header: the provider prefix and
- *  any `:tag` suffix dropped (`nvidia/nemotron-3:free` -> `nemotron-3`). The
- *  full id stays in the header's tooltip. */
-function shortModelName(model: string | null | undefined): string {
-  if (!model) return '\u2014'
-  const base = model.split('/').pop() ?? model
-  return base.split(':')[0] || base
-}
-
 function formatContextUsage(used: number): string {
   return `${compactCount.format(used)} tokens`
 }
@@ -140,6 +133,16 @@ export function Blackboard() {
   const acpTokens = useAcpSessionStore((s) => s.tokensUsed)
   const acpLastTurnTokens = useAcpSessionStore((s) => s.lastTurnTokens)
   const acpLive = useAcpSessionStore((s) => s.live)
+  const configured = useAgentUiStore((s) => s.configured)
+  const openSettings = useAgentUiStore((s) => s.openSettings)
+  // A running session names what is really running; before one starts,
+  // the chip names what is saved.
+  const chipProvider = acpLive ? acpProvider : (configured?.provider ?? null)
+  const chip = agentChip({
+    provider: chipProvider,
+    model: acpLive ? acpModel : (configured?.model ?? null),
+    live: acpLive,
+  })
 
   // ── Checkpoint sections ─────────────────────────────────────────────
   //
@@ -453,8 +456,19 @@ export function Blackboard() {
               a SHORT model name. The full model id, turns and token totals sit
               in the tooltip — they wrapped this header into a three-line block
               once the board stopped spanning the viewport. */}
-          <span
-            className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground/70"
+          {/* The agent chip: which AI drives the agent, and the way into its
+              setup (Varun 2026-11-13: setup moves out of the way, reached
+              from a chip). Live dot, vendor mark, "Claude · Sonnet" and a
+              caret; the full model id, turns and tokens stay in the
+              tooltip. With nothing saved it reads "Set up AI". */}
+          <button
+            type="button"
+            onClick={openSettings}
+            className={cn(
+              'flex min-w-0 items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[11px] transition-colors hover:bg-accent',
+              chip.state === 'setup' ? 'text-caution' : 'text-muted-foreground',
+            )}
+            aria-label={`AI setup — ${chip.label}`}
             title={
               acpLive
                 ? `${acpModel ?? 'agent'} \u00b7 ${acpTurns} turn${acpTurns === 1 ? '' : 's'} \u00b7 ` +
@@ -466,18 +480,23 @@ export function Blackboard() {
             <span
               className={cn(
                 'h-1.5 w-1.5 shrink-0 rounded-full',
-                acpLive ? 'animate-pulse bg-emerald-400' : 'bg-muted-foreground/30',
+                acpLive
+                  ? 'animate-pulse bg-emerald-400'
+                  : chip.state === 'setup'
+                    ? 'bg-caution-wash'
+                    : 'bg-muted-foreground/30',
               )}
             />
-            {acpProvider && (
+            {chipProvider && (
               <VendorMark
-                providerId={acpProvider}
-                displayName={acpProvider}
+                providerId={chipProvider}
+                displayName={chipProvider}
                 className="h-3 w-3 shrink-0"
               />
             )}
-            <span className="truncate font-mono">{shortModelName(acpModel)}</span>
-          </span>
+            <span className="truncate">{chip.label}</span>
+            <ChevronDown size={11} className="shrink-0 opacity-60" aria-hidden />
+          </button>
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
           {overrideHeight !== null && (
