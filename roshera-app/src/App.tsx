@@ -10,6 +10,7 @@ import { Blackboard } from '@/components/panels/Blackboard'
 import { ModelTree } from '@/components/panels/ModelTree'
 import { DfmPanel } from '@/components/panels/DfmPanel'
 import { ExtrudePanel } from '@/components/panels/ExtrudePanel'
+import { FeatureEditPanel } from '@/components/panels/FeatureEditPanel'
 import { Timeline } from '@/components/panels/Timeline'
 import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
 import { AssemblyWorkspace } from '@/components/panels/AssemblyWorkspace'
@@ -178,22 +179,26 @@ export function App() {
               <CADViewport />
               <StepImportDropzone />
 
+              {/* The left column: the tree card, and under it the selected
+                  feature's sizes to edit (the approved mockup). Both only as
+                  tall as their content, capped above the floating history. */}
               <div
                 className={cn(
-                  // Transparent, so the model reads THROUGH the tree instead
-                  // of behind a slab. No blur: blur over a CAD viewport smears
-                  // the one thing the app exists to show, and the point here is
-                  // to see the geometry, not a frosted version of it.
-                  // A card only as tall as its features (the approved mockup),
-                  // capped above the floating history; a long tree scrolls.
-                  'absolute left-2 top-2 z-10 flex max-h-[calc(100%-7.5rem)] flex-col overflow-hidden rounded-lg border border-border/70 bg-card/90 shadow-sm transition-[width] duration-200',
+                  'pointer-events-none absolute left-2 top-2 z-10 flex max-h-[calc(100%-7.5rem)] flex-col gap-2 transition-[width] duration-200',
                   browserOpen ? 'w-56' : 'w-10',
                 )}
               >
-                <ModelTree
+                <div className="pointer-events-auto flex min-h-0 flex-col overflow-hidden rounded-lg border border-border/70 bg-card/90 shadow-sm">
+                  <ModelTree
                   expanded={browserOpen}
                   onToggle={() => setBrowserOpen((open) => !open)}
                 />
+                </div>
+                {browserOpen && (
+                  <div className="pointer-events-auto shrink-0">
+                    <FeatureEditPanel />
+                  </div>
+                )}
               </div>
 
               {/* A feature tool's panel (Extrude), top centre over the model. */}
