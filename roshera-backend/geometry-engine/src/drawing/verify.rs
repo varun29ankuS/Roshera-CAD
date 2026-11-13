@@ -131,17 +131,55 @@ impl DrawingQualityReport {
 // ── Rect2 helpers used only by this module ────────────────────────────
 
 /// True when `inner` is fully inside `outer` (allowing `tol` mm of overhang).
-fn rect_contains(outer: &Rect2, inner: &Rect2, tol: f64) -> bool {
+pub(crate) fn rect_contains(outer: &Rect2, inner: &Rect2, tol: f64) -> bool {
     inner.x0 >= outer.x0 - tol
         && inner.x1 <= outer.x1 + tol
         && inner.y0 >= outer.y0 - tol
         && inner.y1 <= outer.y1 + tol
 }
 
+/// The sheet area a view occupies: its geometry `geo` (sheet mm) plus, for a
+/// dimensioned view, the band its dimensions render in -- they are offset
+/// LEFT of and BELOW the view (see `svg::render_dimensions`), so a callout
+/// that would run off the sheet or into a neighbour is part of the view.
+/// The isometric (no dimensions) is its bare silhouette. The one definition
+/// both [`verify_drawing`] and a view drag (`Drawing::edit_view`) police.
+pub(crate) fn view_footprint(view: &super::types::ProjectedView, geo: Rect2) -> Rect2 {
+    if view.dimensions.is_empty() {
+        geo
+    } else {
+        Rect2 {
+            x0: geo.x0 - DIM_MARGIN_MM,
+            y0: geo.y0,
+            x1: geo.x1,
+            y1: geo.y1 + DIM_MARGIN_MM,
+        }
+    }
+}
+
+/// How far a view of `kind` sits off its projection line with FRONT, in sheet
+/// mm, measured between geometry centres: TOP and BOTTOM share FRONT's column
+/// (the x-centres), LEFT and RIGHT share its row (the y-centres). `None` for
+/// a view with no projection line (front, isometric, custom).
+pub fn projection_line_offset(kind: &ProjectionType, front: &Rect2, view: &Rect2) -> Option<f64> {
+    let cx = |r: &Rect2| 0.5 * (r.x0 + r.x1);
+    let cy = |r: &Rect2| 0.5 * (r.y0 + r.y1);
+    match kind {
+        ProjectionType::Top | ProjectionType::Bottom => Some((cx(front) - cx(view)).abs()),
+        ProjectionType::Left | ProjectionType::Right => Some((cy(front) - cy(view)).abs()),
+        _ => None,
+    }
+}
+
+/// True when a view `offset` mm off its projection line reads as on it.
+pub fn on_projection_line(offset: f64) -> bool {
+    offset <= ALIGN_TOL_MM
+}
+
 // ── Tunables (all millimetres) ──────────────────────────────────────
 
 /// Slack allowed before two rects count as overlapping / out of bounds.
-const SLACK_MM: f64 = 0.5;
+pub(crate) const SLACK_MM: f64 = 0.5;
 /// Dimension band reserved to the left of and below a dimensioned view —
 /// matches the standoff + stacking + text in `svg::render_dimensions`.
 /// `pub(crate)`: the pictorial-isometric free-space search
@@ -237,21 +275,9 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
 
         if let Some(r) = geo {
             ink_area += r.area();
-            // Dimensions render offset LEFT of and BELOW the view (see
-            // svg::render_dimensions), so the space they occupy is part of
-            // the view's footprint. Account for it on dimensioned views so
-            // a callout that would run off-sheet or into a neighbour is
-            // caught; the isometric (no dims) uses its bare silhouette.
-            let footprint = if v.dimensions.is_empty() {
-                r
-            } else {
-                Rect2 {
-                    x0: r.x0 - DIM_MARGIN_MM,
-                    y0: r.y0,
-                    x1: r.x1,
-                    y1: r.y1 + DIM_MARGIN_MM,
-                }
-            };
+            // Dimensions render offset LEFT of and BELOW the view, so the
+            // space they occupy is part of the view's footprint.
+            let footprint = view_footprint(v, r);
             if !rect_contains(&frame, &footprint, SLACK_MM) {
                 issues.push(error(
                     DrawingIssueKind::ViewOutsideFrame,
@@ -427,8 +453,8 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     finalize(issues, utilization)
 }
 
-/// Orthographic alignment (either angle): Top in line with Front (shared x-centre),
-/// Right directly beside Front (shared y-centre).
+/// Orthographic alignment (either angle): Top and Bottom in line with Front
+/// (shared x-centre), Right and Left directly beside Front (shared y-centre).
 ///
 /// Reads each view's geometry rect from the `layout`'s `ViewGeometry` items
 /// (keyed by `owner_view` index into `drawing.views`) — no independent
@@ -456,28 +482,38 @@ fn check_alignment(
             })
     };
 
-    let front = rect_of(|p| matches!(p, ProjectionType::Front));
-    let top = rect_of(|p| matches!(p, ProjectionType::Top));
-    let right = rect_of(|p| matches!(p, ProjectionType::Right));
-
-    if let (Some(f), Some(t)) = (front, top) {
-        let fcx = 0.5 * (f.x0 + f.x1);
-        let tcx = 0.5 * (t.x0 + t.x1);
-        if (fcx - tcx).abs() > ALIGN_TOL_MM {
+    let Some(front) = rect_of(|p| matches!(p, ProjectionType::Front)) else {
+        return;
+    };
+    // TOP and BOTTOM share FRONT's column; LEFT and RIGHT share its row.
+    let checks: [(ProjectionType, fn(&ProjectionType) -> bool, &str); 4] = [
+        (
+            ProjectionType::Top,
+            |p| matches!(p, ProjectionType::Top),
+            "Top view is not vertically aligned with the Front view",
+        ),
+        (
+            ProjectionType::Bottom,
+            |p| matches!(p, ProjectionType::Bottom),
+            "Bottom view is not vertically aligned with the Front view",
+        ),
+        (
+            ProjectionType::Right,
+            |p| matches!(p, ProjectionType::Right),
+            "Right view is not horizontally aligned with the Front view",
+        ),
+        (
+            ProjectionType::Left,
+            |p| matches!(p, ProjectionType::Left),
+            "Left view is not horizontally aligned with the Front view",
+        ),
+    ];
+    for (kind, want, message) in checks {
+        let Some(r) = rect_of(want) else { continue };
+        if projection_line_offset(&kind, &front, &r).is_some_and(|o| !on_projection_line(o)) {
             issues.push(warning(
                 DrawingIssueKind::ProjectionMisaligned,
-                "Top view is not vertically aligned with the Front view".to_string(),
-                None,
-            ));
-        }
-    }
-    if let (Some(f), Some(r)) = (front, right) {
-        let fcy = 0.5 * (f.y0 + f.y1);
-        let rcy = 0.5 * (r.y0 + r.y1);
-        if (fcy - rcy).abs() > ALIGN_TOL_MM {
-            issues.push(warning(
-                DrawingIssueKind::ProjectionMisaligned,
-                "Right view is not horizontally aligned with the Front view".to_string(),
+                message.to_string(),
                 None,
             ));
         }

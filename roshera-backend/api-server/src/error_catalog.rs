@@ -308,6 +308,16 @@ pub enum ErrorCode {
     /// Unresolvable` already applies one level down. See
     /// `drawing_mgr.rs`'s module doc for the full per-route ruling.
     DrawingOwnerUnresolvable,
+    /// **Drawing view placement refused.** A view dragged on a sheet would
+    /// overlap another view, run past the drawing frame, sit on the title
+    /// block (its dimensions included -- the footprint the sheet's quality
+    /// check certifies), or cross to the wrong side of the view it is
+    /// projected from. Nothing on the sheet changed. Mapped to HTTP 409:
+    /// the request is well-formed, the SHEET has no room for it there.
+    /// `details` carries `gate` (`"view_placement"`), `reason`
+    /// (`overlaps` | `off_sheet` | `title_block` | `wrong_side`),
+    /// `drawing_id`, `view_id`, and for `overlaps` the `other` view's name.
+    ViewPlacementRefused,
 
     // ── Idempotency layer ─────────────────────────────────────────
     /// `Idempotency-Key` header was sent with an empty value.
@@ -564,7 +574,8 @@ impl ErrorCode {
             | ErrorCode::UnsoundBase
             | ErrorCode::SheetUnsound
             | ErrorCode::SheetQuality
-            | ErrorCode::DrawingOwnerUnresolvable => StatusCode::CONFLICT,
+            | ErrorCode::DrawingOwnerUnresolvable
+            | ErrorCode::ViewPlacementRefused => StatusCode::CONFLICT,
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
             // Well-formed request, semantically unacceptable value —
@@ -690,6 +701,8 @@ impl ErrorCode {
             // reactivating the owner earns the identical refusal, exactly
             // like the two sheet gates above.
             | ErrorCode::DrawingOwnerUnresolvable
+            // The same drop on the same sheet earns the same refusal.
+            | ErrorCode::ViewPlacementRefused
             | ErrorCode::PermissionDenied
             | ErrorCode::MethodNotAllowed => false,
 
@@ -741,6 +754,7 @@ impl ErrorCode {
             ErrorCode::SheetUnsound => "sheet_unsound",
             ErrorCode::SheetQuality => "sheet_quality",
             ErrorCode::DrawingOwnerUnresolvable => "drawing_owner_unresolvable",
+            ErrorCode::ViewPlacementRefused => "view_placement_refused",
             ErrorCode::IdempotencyKeyEmpty => "idempotency_key_empty",
             ErrorCode::IdempotencyKeyTooLong => "idempotency_key_too_long",
             ErrorCode::IdempotencyKeyReused => "idempotency_key_reused",
@@ -800,6 +814,7 @@ impl ErrorCode {
             ErrorCode::SheetUnsound,
             ErrorCode::SheetQuality,
             ErrorCode::DrawingOwnerUnresolvable,
+            ErrorCode::ViewPlacementRefused,
             ErrorCode::IdempotencyKeyEmpty,
             ErrorCode::IdempotencyKeyTooLong,
             ErrorCode::IdempotencyKeyReused,

@@ -333,12 +333,29 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                     serde_json::from_value::<geometry_engine::drawing::types::ViewEdit>(p.clone())
                         .ok()
                 });
-                match (target, vid, edit) {
-                    (Some(id), Some(vid), Some(edit)) => {
+                // A drag records where it put every view it moved (`moves`:
+                // the dragged view and the views FRONT carried), resolved by
+                // the kernel when it was made; replay puts them exactly
+                // there, checked as the live drag was. An edit recorded
+                // before drags were resolved has no `moves` and applies as
+                // it always did.
+                let moves = match p.and_then(|p| p.get("moves")) {
+                    None => Ok(None),
+                    Some(m) => serde_json::from_value::<
+                        Vec<geometry_engine::drawing::types::ViewMove>,
+                    >(m.clone())
+                    .map(Some),
+                };
+                match (target, vid, edit, moves) {
+                    (Some(id), Some(vid), Some(mut edit), Ok(moves)) => {
+                        if moves.is_some() {
+                            edit.position_mm = None;
+                        }
                         if let Some(d) = out.drawings.get_mut(&id) {
-                            if let Err(err) = d.edit_view(
+                            if let Err(err) = d.apply_view_edit(
                                 geometry_engine::drawing::types::ProjectedViewId(vid),
                                 &edit,
+                                moves.as_deref(),
                             ) {
                                 out.issues.push(format!(
                                     "sequence {}: a view edit no longer applies: {err}",

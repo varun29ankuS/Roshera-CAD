@@ -640,3 +640,216 @@ fn an_added_view_gets_the_same_hidden_line_treatment_as_the_sheets_own() {
     // deduplicated across its views when it is made.
     assert!(added.dimensions.is_empty() && lv.dimensions.is_empty());
 }
+
+// ── Dragged views (2026-11-13) ───────────────────────────────────────────────
+
+/// Sheet-space (y-down) centre of a view's geometry.
+fn centre(
+    d: &geometry_engine::drawing::types::Drawing,
+    v: &geometry_engine::drawing::types::ProjectedView,
+) -> [f64; 2] {
+    let r = geometry_engine::drawing::layout::view_geometry_rect(v, d.sheet_size.height())
+        .expect("geometry");
+    [0.5 * (r.x0 + r.x1), 0.5 * (r.y0 + r.y1)]
+}
+
+fn positions(d: &geometry_engine::drawing::types::Drawing) -> Vec<(String, [f64; 2])> {
+    d.views
+        .iter()
+        .map(|v| (v.name.clone(), v.position_mm))
+        .collect()
+}
+
+/// A drag of FRONT recorded the way the live server records it: the kernel
+/// resolves the drag on the sheet as it stands, and the event carries the
+/// resolved place of the dragged view and of every view it carried.
+fn recorded_front_drag(
+    seq: u64,
+    did: Uuid,
+    sheet: &geometry_engine::drawing::types::Drawing,
+    delta: [f64; 2],
+) -> (
+    TimelineEvent,
+    Vec<geometry_engine::drawing::types::ViewMove>,
+) {
+    use geometry_engine::drawing::types::ViewEdit;
+    let front = sheet
+        .views
+        .iter()
+        .find(|v| v.name == "FRONT")
+        .expect("FRONT");
+    let mut live = sheet.clone();
+    let moves = live
+        .edit_view(
+            front.id,
+            &ViewEdit {
+                position_mm: Some([
+                    front.position_mm[0] + delta[0],
+                    front.position_mm[1] + delta[1],
+                ]),
+                ..ViewEdit::default()
+            },
+        )
+        .expect("the drag fits on the live sheet");
+    let event = view_update(
+        seq,
+        did,
+        front.id.0,
+        json!({ "position_mm": moves[0].position_mm, "moves": moves }),
+    );
+    (event, moves)
+}
+
+/// A drag of FRONT moves the views projected from it in ONE recorded event;
+/// a rebuild (restart, undo, a later edit) puts every view exactly where the
+/// drag did, and two rebuilds agree bit for bit.
+#[test]
+fn a_front_drag_with_its_views_survives_a_rebuild_identically() {
+    let did = Uuid::new_v4();
+    let mut events = plate();
+    events.push(from_part(3, 3, did));
+    let derived = rebuild_drawings(&events, &FrameCache::new(64));
+    let sheet = derived.drawings.get(&did).expect("derived sheet").clone();
+    let (drag, moves) = recorded_front_drag(4, did, &sheet, [-10.0, -5.0]);
+    assert!(
+        moves.len() >= 3,
+        "FRONT carries TOP and RIGHT: {} moves",
+        moves.len()
+    );
+    events.push(drag);
+
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    assert!(built.issues.is_empty(), "{:?}", built.issues);
+    let d = built.drawings.get(&did).expect("rebuilt");
+    for m in &moves {
+        let v = d
+            .views
+            .iter()
+            .find(|v| v.id.0 == m.view_id)
+            .expect("moved view");
+        assert_eq!(
+            v.position_mm, m.position_mm,
+            "{} is where the drag put it",
+            v.name
+        );
+    }
+    for v in &sheet.views {
+        if !moves.iter().any(|m| m.view_id == v.id.0) {
+            let now = d.views.iter().find(|w| w.id == v.id).expect("view");
+            assert_eq!(now.position_mm, v.position_mm, "{} did not move", v.name);
+        }
+    }
+    let again = rebuild_drawings(&events, &FrameCache::new(64));
+    let a = serde_json::to_value(d).expect("json");
+    let b = serde_json::to_value(again.drawings.get(&did).expect("again")).expect("json");
+    assert_eq!(first_difference(&a, &b, String::new()), None);
+}
+
+/// Undoing the drag (dropping its event) puts every view back -- FRONT and
+/// the views it carried -- in one step.
+#[test]
+fn undoing_a_front_drag_restores_every_view() {
+    let frames = FrameCache::new(64);
+    let did = Uuid::new_v4();
+    let mut events = plate();
+    events.push(from_part(3, 3, did));
+    let derived = rebuild_drawings(&events, &frames);
+    let sheet = derived.drawings.get(&did).expect("derived sheet").clone();
+    let (drag, _moves) = recorded_front_drag(4, did, &sheet, [-10.0, -5.0]);
+    events.push(drag);
+    let moved = rebuild_drawings(&events, &frames);
+    assert_ne!(
+        positions(moved.drawings.get(&did).expect("moved")),
+        positions(&sheet),
+        "the drag moved the sheet"
+    );
+    events.pop();
+    let undone = rebuild_drawings(&events, &frames);
+    assert!(undone.issues.is_empty(), "{:?}", undone.issues);
+    assert_eq!(
+        positions(undone.drawings.get(&did).expect("undone")),
+        positions(&sheet),
+        "every view is back"
+    );
+}
+
+/// A move recorded before drags were resolved (only `position_mm`, no
+/// `moves`) replays exactly as it always did: the view goes where it was
+/// put, nothing is carried, nothing is refused -- even a placement a live
+/// drag now refuses.
+#[test]
+fn a_view_move_recorded_before_drags_were_resolved_replays_unchanged() {
+    let did = Uuid::new_v4();
+    let mut events = plate();
+    events.push(from_part(3, 3, did));
+    let derived = rebuild_drawings(&events, &FrameCache::new(64));
+    let sheet = derived.drawings.get(&did).expect("derived sheet").clone();
+    let iso = sheet
+        .views
+        .iter()
+        .find(|v| v.name == "ISOMETRIC")
+        .expect("ISOMETRIC")
+        .clone();
+    let front = sheet
+        .views
+        .iter()
+        .find(|v| v.name == "FRONT")
+        .expect("FRONT")
+        .clone();
+    let (ci, cf) = (centre(&sheet, &iso), centre(&sheet, &front));
+    let onto_front = [
+        iso.position_mm[0] + (cf[0] - ci[0]),
+        iso.position_mm[1] - (cf[1] - ci[1]),
+    ];
+    let front_to = [front.position_mm[0] - 10.0, front.position_mm[1]];
+    events.extend([
+        view_update(4, did, iso.id.0, json!({ "position_mm": onto_front })),
+        view_update(5, did, front.id.0, json!({ "position_mm": front_to })),
+    ]);
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    assert!(built.issues.is_empty(), "{:?}", built.issues);
+    let d = built.drawings.get(&did).expect("rebuilt");
+    let at = |name: &str| {
+        d.views
+            .iter()
+            .find(|v| v.name == name)
+            .expect("view")
+            .position_mm
+    };
+    assert_eq!(at("ISOMETRIC"), onto_front, "placed exactly as recorded");
+    assert_eq!(at("FRONT"), front_to);
+    let top_was = sheet
+        .views
+        .iter()
+        .find(|v| v.name == "TOP")
+        .expect("TOP")
+        .position_mm;
+    assert_eq!(at("TOP"), top_was, "an old FRONT move carries nothing");
+}
+
+/// A drag, then a dimension edit that re-derives the sheet: the recorded
+/// move is applied again to the new sheet, checked as the live drag was.
+/// Measured: on this plate (Ø6 -> Ø8 bore) the move still fits and every
+/// view the drag placed is where the drag put it.
+#[test]
+fn a_front_drag_survives_a_later_dimension_edit() {
+    let did = Uuid::new_v4();
+    let mut events = plate();
+    events.push(from_part(3, 3, did));
+    let derived = rebuild_drawings(&events, &FrameCache::new(64));
+    let sheet = derived.drawings.get(&did).expect("derived sheet").clone();
+    let (drag, moves) = recorded_front_drag(4, did, &sheet, [-10.0, -5.0]);
+    events.push(drag);
+    events.push(mould(1, "radius", 4.0, 5));
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    assert!(built.issues.is_empty(), "{:?}", built.issues);
+    let d = built.drawings.get(&did).expect("rebuilt");
+    for m in &moves {
+        let v = d
+            .views
+            .iter()
+            .find(|v| v.id.0 == m.view_id)
+            .expect("moved view");
+        assert_eq!(v.position_mm, m.position_mm, "{} keeps its drag", v.name);
+    }
+}

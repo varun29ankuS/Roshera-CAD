@@ -356,23 +356,47 @@ export interface ViewEdit {
 /**
  * Change one view's display: hidden lines, name, scale, position.
  * All-or-nothing; a refusal (bad scale, a name another view already has, a
- * non-finite position) throws `DrawingRefusal` with the reason. `moved` /
- * `aligned` describe where a RESCALE had to put the view; an explicit
- * `position_mm` is applied as given and reports neither.
+ * non-finite position, a drop onto another view, the title block or past the
+ * frame) throws `DrawingRefusal` with the reason. A drag is resolved by the
+ * kernel: a projected view stays on its line from FRONT (`projected` when the
+ * off-line part was dropped) and FRONT carries its views (`movedViews`, the
+ * dragged view first). `position` is where the view actually went. `moved`
+ * says a RESCALE had to move the view; `aligned` is MEASURED after the edit
+ * -- `null` for a view with no projection line (isometric, custom).
  */
+export interface ViewEditResult {
+  moved: boolean
+  aligned: boolean | null
+  position: [number, number] | null
+  projected: boolean
+  movedViews: { id: string; name: string; position_mm: [number, number] }[]
+}
+
 export async function updateView(
   drawingId: string,
   viewId: string,
   edit: ViewEdit,
-): Promise<{ moved: boolean; aligned: boolean }> {
+): Promise<ViewEditResult> {
   const r = await fetch(`${API_HOST}/api/drawings/${drawingId}/views/${viewId}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(edit),
   })
-  const body = await jsonOrRefusal<{ moved?: boolean; aligned?: boolean }>(r)
-  // A rescale moves the view only when the bigger footprint did not fit.
-  return { moved: body.moved ?? false, aligned: body.aligned ?? true }
+  const body = await jsonOrRefusal<{
+    moved?: boolean
+    aligned?: boolean | null
+    projected?: boolean
+    view?: { position_mm?: [number, number] }
+    moved_views?: { id: string; name: string; position_mm: [number, number] }[]
+  }>(r)
+  return {
+    // A rescale moves the view only when the bigger footprint did not fit.
+    moved: body.moved ?? false,
+    aligned: body.aligned ?? null,
+    position: body.view?.position_mm ?? null,
+    projected: body.projected ?? false,
+    movedViews: body.moved_views ?? [],
+  }
 }
 
 /**

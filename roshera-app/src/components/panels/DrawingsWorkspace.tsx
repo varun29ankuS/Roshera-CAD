@@ -554,7 +554,7 @@ export function DrawingsWorkspace() {
       setError(null)
       setViewsBusy(true)
       try {
-        const { moved, aligned } = await updateView(activeId, viewId, edit)
+        const { moved, aligned, position } = await updateView(activeId, viewId, edit)
         await refreshActive(activeId)
         setRemovedView(null)
         const what =
@@ -565,15 +565,17 @@ export function DrawingsWorkspace() {
               : edit.scale !== undefined
                 ? `${v.name} now at ${edit.scale >= 1 ? `${edit.scale}:1` : `1:${Number((1 / edit.scale).toFixed(2))}`}${
                     moved
-                      ? aligned
-                        ? '; moved to fit, still in line with FRONT'
-                        : '; moved to the nearest free space (no room in line with FRONT)'
+                      ? aligned === false
+                        ? '; moved to the nearest free space (no room in line with FRONT)'
+                        : aligned
+                          ? '; moved to fit, still in line with FRONT'
+                          : '; moved to fit'
                       : ''
                   }`
                 : edit.position_mm !== undefined
-                  ? describeMove(v.name, v.position_mm, edit.position_mm)
+                  ? describeMove(v.name, v.position_mm, position ?? edit.position_mm)
                   : `${v.name} renamed ${edit.name ?? ''}`
-        setNoteKind(moved && !aligned ? 'info' : 'done')
+        setNoteKind(moved && aligned === false ? 'info' : 'done')
         setEditNote(`${what}. Ctrl+Z undoes it.`)
       } catch (e) {
         setNoteKind('info')
@@ -808,10 +810,16 @@ export function DrawingsWorkspace() {
         // The before-check must answer before the move is sent, or it could
         // read the moved sheet and hide what the move broke.
         const had = before ? await before : null
-        await updateView(drawingId, viewId, edit)
+        const result = await updateView(drawingId, viewId, edit)
         setRemovedView(null)
         await refreshActive(drawingId)
-        const moved = describeMove(v.name, from, edit.position_mm)
+        // Where the kernel actually put it: a projected view keeps to its
+        // line from FRONT, and FRONT carries the views in line with it.
+        const carried = result.movedViews.slice(1).map((m) => m.name)
+        const moved =
+          describeMove(v.name, from, result.position ?? edit.position_mm) +
+          (result.projected ? ' (kept in line with FRONT)' : '') +
+          (carried.length ? `, carrying ${carried.join(', ')}` : '')
         const now = await getDrawingQuality(drawingId).catch(() => null)
         if (!now) {
           setNoteKind('info')

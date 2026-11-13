@@ -60,7 +60,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use dashmap::DashMap;
-use geometry_engine::drawing::types::{ViewEdit, ViewEditError};
+use geometry_engine::drawing::types::{ViewEdit, ViewEditError, ViewMove};
 use geometry_engine::drawing::{
     added_view, answer_query, certify_drawing, render_drawing_dxf, render_drawing_pdf,
     render_drawing_svg, standard_drawing_auto_with_projection,
@@ -1029,89 +1029,168 @@ pub async fn remove_view(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
-/// `PATCH /api/drawings/{id}/views/{view_id}` -- an engineer's display edit
-/// to one view: `show_hidden` (hidden lines dashed or removed), `name`,
-/// `scale`. All-or-nothing; recorded as `drawing.view.update`, so undo,
+/// `PATCH /api/drawings/{id}/views/{view_id}` -- an engineer's edit to one
+/// view: `show_hidden` (hidden lines dashed or removed), `name`, `scale`,
+/// `position_mm`. All-or-nothing; recorded as `drawing.view.update`, so undo,
 /// restart and a dimension edit keep it.
+///
+/// A `position_mm` is a drag, resolved by the kernel (`Drawing::edit_view`):
+/// a view projected from FRONT stays on its projection line, FRONT carries
+/// the views on its lines, and a drop onto another view, the title block or
+/// past the frame is refused ([`ErrorCode::ViewPlacementRefused`], 409). The
+/// response gives where the view really went (`view.position_mm`), what was
+/// asked (`requested_position_mm`), whether the drag's off-line part was
+/// dropped (`projected`), and every view the move placed (`moved_views`,
+/// the dragged view first). The event records every resolved place
+/// (`moves`), so replay puts each view exactly there -- one undo step.
+///
+/// `aligned` is MEASURED after the edit: `true`/`false` for a view with a
+/// projection line (FRONT: all its projected views on theirs), `null` for a
+/// view without one (an isometric).
 pub async fn update_view(
     State(state): State<AppState>,
     Path((id, view_id)): Path<(Uuid, Uuid)>,
-    Json(mut edit): Json<ViewEdit>,
+    Json(edit): Json<ViewEdit>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
     let mut placement = None;
-    let view = {
+    // What the history records: the edit with its placement resolved.
+    let mut recorded = edit.clone();
+    let mut moves: Option<Vec<ViewMove>> = None;
+    let (view, aligned, moved_views) = {
         let mut guard = handle.write().await;
-        // A rescale moves the view only as far as it must: same centre when
-        // the bigger footprint fits, else along its projection line, else the
-        // nearest free spot -- or no rescale at all. The placement is recorded
-        // with the edit, so the history replays it exactly.
-        if let (Some(scale), None) = (edit.scale, edit.position_mm) {
-            if scale.is_finite() && scale > 0.0 {
-                if let Some(index) = guard.views.iter().position(|v| v.id.0 == view_id) {
-                    match geometry_engine::drawing::layout::rescaled_view_position(
-                        &guard, index, scale,
-                    ) {
-                        Some(p) => {
-                            edit.position_mm = Some(p.position);
-                            placement = Some(p);
-                        }
-                        None => {
-                            let name = guard.views[index].name.clone();
-                            let label = if scale >= 1.0 {
-                                format!("{}:1", (scale * 100.0).round() / 100.0)
-                            } else {
-                                format!("1:{}", (100.0 / scale).round() / 100.0)
-                            };
-                            return Err(ApiError::new(
-                                ErrorCode::InvalidParameter,
-                                ViewEditError::NoRoom {
-                                    view: name,
-                                    scale: label,
-                                }
-                                .to_string(),
-                            ));
+        if edit.position_mm.is_some() {
+            let resolved = guard
+                .edit_view(ProjectedViewId(view_id), &edit)
+                .map_err(|e| view_edit_refusal(id, view_id, e))?;
+            recorded.position_mm = resolved
+                .iter()
+                .find(|m| m.view_id == view_id)
+                .map(|m| m.position_mm);
+            moves = Some(resolved);
+        } else {
+            // A rescale moves the view only as far as it must: same centre
+            // when the bigger footprint fits, else along its projection line,
+            // else the nearest free spot -- or no rescale at all. The
+            // placement is recorded with the edit, so the history replays it
+            // exactly.
+            if let Some(scale) = edit.scale {
+                if scale.is_finite() && scale > 0.0 {
+                    if let Some(index) = guard.views.iter().position(|v| v.id.0 == view_id) {
+                        match geometry_engine::drawing::layout::rescaled_view_position(
+                            &guard, index, scale,
+                        ) {
+                            Some(p) => {
+                                recorded.position_mm = Some(p.position);
+                                placement = Some(p);
+                            }
+                            None => {
+                                let name = guard.views[index].name.clone();
+                                let label = if scale >= 1.0 {
+                                    format!("{}:1", (scale * 100.0).round() / 100.0)
+                                } else {
+                                    format!("1:{}", (100.0 / scale).round() / 100.0)
+                                };
+                                return Err(ApiError::new(
+                                    ErrorCode::InvalidParameter,
+                                    ViewEditError::NoRoom {
+                                        view: name,
+                                        scale: label,
+                                    }
+                                    .to_string(),
+                                ));
+                            }
                         }
                     }
                 }
             }
+            guard
+                .apply_view_edit(ProjectedViewId(view_id), &recorded, None)
+                .map_err(|e| view_edit_refusal(id, view_id, e))?;
         }
-        guard
-            .edit_view(ProjectedViewId(view_id), &edit)
-            .map_err(|e| match e {
-                ViewEditError::NoSuchView(_) => ApiError::new(
-                    ErrorCode::SolidNotFound,
-                    format!("view {view_id} not found in drawing {id}"),
-                ),
-                other => ApiError::new(ErrorCode::InvalidParameter, other.to_string()),
-            })?;
-        guard
-            .views
-            .iter()
-            .find(|v| v.id.0 == view_id)
-            .map(|v| {
+        let index = guard.views.iter().position(|v| v.id.0 == view_id);
+        let aligned =
+            index.and_then(|i| geometry_engine::drawing::layout::view_alignment(&guard, i));
+        let view = index
+            .map(|i| {
+                let v = &guard.views[i];
                 serde_json::json!({
                     "id": view_id,
                     "name": v.name,
                     "scale": v.scale,
                     "show_hidden": v.show_hidden,
+                    "position_mm": v.position_mm,
                 })
             })
-            .unwrap_or(serde_json::Value::Null)
+            .unwrap_or(serde_json::Value::Null);
+        let moved_views: Vec<serde_json::Value> = moves
+            .iter()
+            .flatten()
+            .filter_map(|m| {
+                guard.views.iter().find(|v| v.id.0 == m.view_id).map(|v| {
+                    serde_json::json!({
+                        "id": m.view_id,
+                        "name": v.name,
+                        "position_mm": m.position_mm,
+                    })
+                })
+            })
+            .collect();
+        (view, aligned, moved_views)
     };
-    let mut params = serde_json::to_value(&edit).unwrap_or_else(|_| serde_json::json!({}));
+    let mut params = serde_json::to_value(&recorded).unwrap_or_else(|_| serde_json::json!({}));
     params["view_id"] = serde_json::json!(view_id);
+    if let Some(m) = &moves {
+        params["moves"] = serde_json::json!(m);
+    }
     state.drawings.record_event(
         RecordedOperation::new("drawing.view.update")
             .with_parameters(params)
             .with_input_drawing(id),
     );
+    let projected = matches!(
+        (edit.position_mm, recorded.position_mm),
+        (Some(asked), Some(went)) if asked != went
+    );
     Ok(Json(serde_json::json!({
         "success": true,
         "view": view,
         "moved": placement.is_some_and(|p| p.moved),
-        "aligned": placement.map_or(true, |p| p.aligned),
+        "aligned": aligned,
+        "requested_position_mm": edit.position_mm,
+        "projected": projected,
+        "moved_views": moved_views,
     })))
+}
+
+/// A refused view edit on the wire. A drop the sheet has no room for (an
+/// overlap, past the frame, on the title block, the wrong side of FRONT) is
+/// [`ErrorCode::ViewPlacementRefused`] with the kernel's reason; a missing
+/// view is not-found; any other bad field is an invalid parameter.
+fn view_edit_refusal(drawing: Uuid, view: Uuid, e: ViewEditError) -> ApiError {
+    let reason = match &e {
+        ViewEditError::NoSuchView(_) => {
+            return ApiError::new(
+                ErrorCode::SolidNotFound,
+                format!("view {view} not found in drawing {drawing}"),
+            )
+        }
+        ViewEditError::Overlaps { .. } => "overlaps",
+        ViewEditError::OffSheet { .. } => "off_sheet",
+        ViewEditError::OverlapsTitleBlock { .. } => "title_block",
+        ViewEditError::WrongSide { .. } => "wrong_side",
+        _ => return ApiError::new(ErrorCode::InvalidParameter, e.to_string()),
+    };
+    let mut details = serde_json::json!({
+        "gate": "view_placement",
+        "reason": reason,
+        "drawing_id": drawing,
+        "view_id": view,
+    });
+    if let ViewEditError::Overlaps { other, .. } = &e {
+        details["other"] = serde_json::json!(other);
+    }
+    ApiError::new(ErrorCode::ViewPlacementRefused, e.to_string()).with_details(details)
 }
 
 /// Shared first step of every registered-export route (`svg`/`pdf`/`dxf`,

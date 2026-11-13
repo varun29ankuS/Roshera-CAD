@@ -11450,6 +11450,164 @@ async fn a_rescale_is_placed_clear_or_refused_and_replays() {
     );
 }
 
+/// Dragging a view on the sheet behaves like established CAD, end to end:
+/// a drop onto another view is refused with a typed 409 and the sheet is
+/// unchanged; TOP keeps FRONT's column whatever the drag's sideways part and
+/// the response says where it really went; FRONT carries its projected views
+/// in one recorded step, which one undo takes back; `aligned` is measured
+/// (an isometric has no projection line: `null`).
+#[tokio::test]
+async fn dragging_a_view_is_resolved_refused_or_recorded() {
+    use geometry_engine::drawing::layout::view_geometry_rect;
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (_, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let uuid = Uuid::parse_str(&drawing_id).expect("uuid");
+    let sheet = |state: &AppState| {
+        let handle = state.drawings.get(&uuid).expect("drawing registered");
+        async move { handle.read().await.clone() }
+    };
+    let d0 = sheet(&state).await;
+    let h = d0.sheet_size.height();
+    let view = |d: &geometry_engine::drawing::types::Drawing, kind: &str| {
+        d.views
+            .iter()
+            .find(|v| serde_json::to_value(v.projection).expect("kind")["kind"] == kind)
+            .cloned()
+            .unwrap_or_else(|| panic!("a {kind} view"))
+    };
+    let centre = |v: &geometry_engine::drawing::types::ProjectedView| {
+        let r = view_geometry_rect(v, h).expect("geometry");
+        [0.5 * (r.x0 + r.x1), 0.5 * (r.y0 + r.y1)]
+    };
+    let positions = |d: &geometry_engine::drawing::types::Drawing| {
+        d.views
+            .iter()
+            .map(|v| (v.name.clone(), v.position_mm))
+            .collect::<Vec<_>>()
+    };
+    let patch = |vid: Uuid, body: Value| {
+        Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/api/drawings/{drawing_id}/views/{vid}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    };
+    let (front, top, iso) = (view(&d0, "front"), view(&d0, "top"), view(&d0, "isometric"));
+
+    // 1. The isometric dropped on FRONT: a typed refusal, nothing moves.
+    let (ci, cf) = (centre(&iso), centre(&front));
+    let onto_front = [
+        iso.position_mm[0] + (cf[0] - ci[0]),
+        iso.position_mm[1] - (cf[1] - ci[1]),
+    ];
+    let (s, refused) = dispatch(
+        &state,
+        patch(iso.id.0, json!({ "position_mm": onto_front })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error_code"], "view_placement_refused", "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("overlap") && e.contains("FRONT")),
+        "a human reason naming the view in the way: {refused}"
+    );
+    assert_eq!(refused["details"]["reason"], "overlaps", "{refused}");
+    assert_eq!(
+        positions(&sheet(&state).await),
+        positions(&d0),
+        "nothing moved"
+    );
+
+    // 2. TOP dragged up 3 and sideways 7: it stays in FRONT's column, and
+    //    the response reports where it went.
+    let asked = [top.position_mm[0] + 7.0, top.position_mm[1] + 3.0];
+    let (s, moved) = dispatch(&state, patch(top.id.0, json!({ "position_mm": asked }))).await;
+    assert_eq!(s, StatusCode::OK, "{moved}");
+    let d1 = sheet(&state).await;
+    let t1 = view(&d1, "top");
+    assert!(
+        (centre(&t1)[0] - centre(&front)[0]).abs() < 1e-9,
+        "TOP keeps FRONT's column"
+    );
+    assert_eq!(
+        moved["view"]["position_mm"],
+        json!(t1.position_mm),
+        "the response gives the resolved place: {moved}"
+    );
+    assert_eq!(moved["requested_position_mm"], json!(asked), "{moved}");
+    assert_eq!(
+        moved["projected"], true,
+        "the sideways part was dropped: {moved}"
+    );
+    assert_eq!(moved["aligned"], true, "measured on its line: {moved}");
+
+    // 3. FRONT dragged: TOP and RIGHT come with it, in one step.
+    let d_before_front = d1.clone();
+    let delta = [-4.0, -3.0];
+    let to = [
+        front.position_mm[0] + delta[0],
+        front.position_mm[1] + delta[1],
+    ];
+    let (s, carried) = dispatch(&state, patch(front.id.0, json!({ "position_mm": to }))).await;
+    assert_eq!(s, StatusCode::OK, "{carried}");
+    let d2 = sheet(&state).await;
+    for kind in ["top", "right"] {
+        let was = view(&d_before_front, kind).position_mm;
+        assert_eq!(
+            view(&d2, kind).position_mm,
+            [was[0] + delta[0], was[1] + delta[1]],
+            "{kind} moves with FRONT"
+        );
+    }
+    let listed = carried["moved_views"].as_array().expect("moved_views");
+    assert_eq!(listed.len(), 3, "FRONT, TOP, RIGHT: {carried}");
+    assert_eq!(listed[0]["id"], json!(front.id.0), "the dragged view first");
+    assert_eq!(carried["aligned"], true, "FRONT's views are on their lines");
+
+    // One undo takes the whole FRONT move back.
+    let _ = state.timeline_recorder.settle().await;
+    let session = crate::handlers::timeline::live_session_id(&timeline_engine::BranchId::main());
+    let (us, undone) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/undo",
+            json!({ "session_id": session.to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(us, StatusCode::OK, "{undone}");
+    assert_eq!(
+        positions(&sheet(&state).await),
+        positions(&d_before_front),
+        "undo restores FRONT and the views it carried"
+    );
+
+    // 4. The isometric has no projection line: `aligned` is not claimed.
+    let p = iso.position_mm;
+    let (s, nudged) = dispatch(
+        &state,
+        patch(iso.id.0, json!({ "position_mm": [p[0] + 1.0, p[1]] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{nudged}");
+    assert!(nudged["aligned"].is_null(), "{nudged}");
+}
+
 /// A drawing made before an ordinary modelling step (here a second hole cut
 /// by a boolean -- live it was fillets and chamfers on a hub) is brought up
 /// to date when exported, like a drawing that regenerates when opened. The

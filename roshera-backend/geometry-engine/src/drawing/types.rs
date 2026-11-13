@@ -236,9 +236,10 @@ pub struct ViewEdit {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<f64>,
-    /// Where the view sits (`position_mm`). A rescale through the server
-    /// fills this in (see `layout::rescaled_view_position`), so the history
-    /// replays the exact placement.
+    /// Where the view sits (`position_mm`). Given to [`Drawing::edit_view`]
+    /// it is a drag, resolved and checked there. A rescale through the
+    /// server fills this in (see `layout::rescaled_view_position`), so the
+    /// history replays the exact placement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position_mm: Option<[f64; 2]>,
 }
@@ -260,6 +261,39 @@ pub enum ViewEditError {
     BadPosition,
     #[error("no room on the sheet for {view} at {scale}; pick a smaller scale or a larger sheet")]
     NoRoom { view: String, scale: String },
+    /// A drop that would put a view (with its dimensions) on another view.
+    #[error("{view} would overlap {other} there (dimensions included); drop it in free space")]
+    Overlaps { view: String, other: String },
+    /// A drop that would put a view (with its dimensions) past the frame.
+    #[error("{view} would run past the drawing frame there (dimensions included)")]
+    OffSheet { view: String },
+    /// A drop that would put a view (with its dimensions) on the title block.
+    #[error("{view} would overlap the title block there (dimensions included)")]
+    OverlapsTitleBlock { view: String },
+    /// A projected view dragged along its line past its parent: the
+    /// projection convention puts it on one side only.
+    #[error("{view} belongs {side} {parent} in {angle}-angle projection; it moves only along its projection line on that side")]
+    WrongSide {
+        view: String,
+        parent: String,
+        side: &'static str,
+        angle: &'static str,
+    },
+    /// One move gives the same view two positions.
+    #[error("view {0} is given two positions in one move")]
+    RepeatedView(Uuid),
+    /// A recorded move that does not place the view it was made on.
+    #[error("the recorded move does not place view {0}")]
+    MoveMissesView(Uuid),
+}
+
+/// Where one view went in a move: the resolved `position_mm` of the dragged
+/// view, or of a view it carried (FRONT carries the views projected from it).
+/// A recorded drag stores every one, so the history replays the move exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ViewMove {
+    pub view_id: Uuid,
+    pub position_mm: [f64; 2],
 }
 
 impl ProjectedView {
@@ -1126,10 +1160,128 @@ impl Drawing {
         before != self.views.len()
     }
 
-    /// Apply an engineer's display edit to one view: hidden lines on/off,
-    /// a new name, a new scale. All-or-nothing: an invalid field refuses the
-    /// whole edit and leaves the view as it was.
-    pub fn edit_view(&mut self, id: ProjectedViewId, edit: &ViewEdit) -> Result<(), ViewEditError> {
+    /// Apply an engineer's edit to one view: hidden lines on/off, a new name,
+    /// a new scale, a new place on the sheet. All-or-nothing: an invalid
+    /// field refuses the whole edit and leaves the sheet as it was.
+    ///
+    /// A `position_mm` is a DRAG, resolved as established CAD does
+    /// (`layout::resolve_view_drag`): a view projected from FRONT that is on
+    /// its projection line stays on it (the off-axis part of the drag is
+    /// ignored, and it may not cross to FRONT's other side); FRONT carries
+    /// the views on its lines by the same amount. Every moved view must then
+    /// sit clear of every other view, the title block and the frame, its
+    /// dimensions included -- the rule `verify_drawing` certifies -- or the
+    /// whole move is refused. Returns where every moved view went (the
+    /// dragged view first); empty when nothing moved. Record those: replay
+    /// applies them with [`Self::apply_view_edit`].
+    ///
+    /// Without a `position_mm` the edit is applied as given.
+    pub fn edit_view(
+        &mut self,
+        id: ProjectedViewId,
+        edit: &ViewEdit,
+    ) -> Result<Vec<ViewMove>, ViewEditError> {
+        let Some(requested) = edit.position_mm else {
+            self.edit_view_verbatim(id, edit)?;
+            return Ok(Vec::new());
+        };
+        if !requested.iter().all(|c| c.is_finite()) {
+            return Err(ViewEditError::BadPosition);
+        }
+        let mut probe = self.clone();
+        probe.apply_display_fields(id, edit)?;
+        let index = probe
+            .views
+            .iter()
+            .position(|v| v.id == id)
+            .ok_or(ViewEditError::NoSuchView(id.0))?;
+        let moves = super::layout::resolve_view_drag(&probe, index, requested)?;
+        probe.apply_moves_checked(&moves)?;
+        *self = probe;
+        Ok(moves)
+    }
+
+    /// Apply an edit whose placement is already resolved -- a recorded one,
+    /// or a rescale the server placed with `layout::rescaled_view_position`.
+    /// With `moves` (a drag recorded from [`Self::edit_view`]) the display
+    /// fields apply and every view goes exactly where the move put it,
+    /// checked as a live drag is: a move that no longer fits (the part grew)
+    /// is refused whole and the sheet stays as it was. Without `moves` the
+    /// edit applies as given: that is how every edit recorded before drags
+    /// were resolved replays, unchanged.
+    pub fn apply_view_edit(
+        &mut self,
+        id: ProjectedViewId,
+        edit: &ViewEdit,
+        moves: Option<&[ViewMove]>,
+    ) -> Result<(), ViewEditError> {
+        let Some(moves) = moves else {
+            return self.edit_view_verbatim(id, edit);
+        };
+        if !moves.iter().any(|m| m.view_id == id.0) {
+            return Err(ViewEditError::MoveMissesView(id.0));
+        }
+        let mut probe = self.clone();
+        probe.apply_display_fields(id, edit)?;
+        probe.apply_moves_checked(moves)?;
+        *self = probe;
+        Ok(())
+    }
+
+    /// The non-placement fields of `edit` (hidden lines, name, scale), if it
+    /// names any.
+    fn apply_display_fields(
+        &mut self,
+        id: ProjectedViewId,
+        edit: &ViewEdit,
+    ) -> Result<(), ViewEditError> {
+        let display = ViewEdit {
+            position_mm: None,
+            ..edit.clone()
+        };
+        if display == ViewEdit::default() {
+            if self.views.iter().any(|v| v.id == id) {
+                return Ok(());
+            }
+            return Err(ViewEditError::NoSuchView(id.0));
+        }
+        self.edit_view_verbatim(id, &display)
+    }
+
+    /// Put each moved view where `moves` says, then refuse unless every moved
+    /// view (with its dimensions) is inside the frame and clear of the title
+    /// block and of every view that did not move. Views moved together keep
+    /// their spacing (FRONT carries its views rigidly), so they are not
+    /// checked against each other. Leaves `self` partly moved on refusal:
+    /// callers apply it to a probe.
+    fn apply_moves_checked(&mut self, moves: &[ViewMove]) -> Result<(), ViewEditError> {
+        let mut moved: Vec<usize> = Vec::with_capacity(moves.len());
+        for m in moves {
+            if !m.position_mm.iter().all(|c| c.is_finite()) {
+                return Err(ViewEditError::BadPosition);
+            }
+            let i = self
+                .views
+                .iter()
+                .position(|v| v.id.0 == m.view_id)
+                .ok_or(ViewEditError::NoSuchView(m.view_id))?;
+            if moved.contains(&i) {
+                return Err(ViewEditError::RepeatedView(m.view_id));
+            }
+            moved.push(i);
+            self.views[i].position_mm = m.position_mm;
+        }
+        super::layout::check_moved_views(self, &moved)
+    }
+
+    /// The edit applied exactly as given, placement included (only finite
+    /// numbers are checked) -- the behaviour of every edit recorded before
+    /// drags were resolved.
+    fn edit_view_verbatim(
+        &mut self,
+        id: ProjectedViewId,
+        edit: &ViewEdit,
+    ) -> Result<(), ViewEditError> {
         if edit.show_hidden.is_none()
             && edit.name.is_none()
             && edit.scale.is_none()

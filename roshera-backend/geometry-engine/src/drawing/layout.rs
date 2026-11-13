@@ -569,6 +569,208 @@ pub fn aligned_view_position(
     }
 }
 
+/// The title block's rect (sheet mm, y-down): bottom-right of the frame,
+/// where `svg::render_title_block` draws it.
+fn title_block_rect(sheet: &super::types::SheetSize) -> Rect2 {
+    let (ml, mr, mt, mb) = frame_margins(sheet);
+    let (tb_w, tb_h) = title_block_size(sheet);
+    let frame_w = (sheet.width() - ml - mr).max(0.0);
+    let frame_h = (sheet.height() - mt - mb).max(0.0);
+    let x0 = ml + frame_w - tb_w;
+    let y0 = mt + frame_h - tb_h;
+    Rect2 {
+        x0,
+        y0,
+        x1: x0 + tb_w,
+        y1: y0 + tb_h,
+    }
+}
+
+/// The view every orthographic view is projected from: the first FRONT.
+fn parent_front(drawing: &Drawing) -> Option<usize> {
+    drawing
+        .views
+        .iter()
+        .position(|v| matches!(v.projection, super::types::ProjectionType::Front))
+}
+
+/// Whether view `index` is on its projection line with FRONT, MEASURED on the
+/// sheet as `verify_drawing` measures it (geometry centres, within the
+/// sheet check's tolerance). For a TOP/BOTTOM/LEFT/RIGHT view: is it on its
+/// line. For FRONT: are all the views projected from it on theirs. `None`
+/// when there is no line to be on (an isometric or custom view, no FRONT on
+/// the sheet, FRONT with no projected views, or a view with no geometry).
+pub fn view_alignment(drawing: &Drawing, index: usize) -> Option<bool> {
+    let parent = parent_front(drawing)?;
+    let sheet_h = drawing.sheet_size.height();
+    let front = view_geometry_rect(drawing.views.get(parent)?, sheet_h)?;
+    let offset = |v: &ProjectedView| -> Option<f64> {
+        let r = view_geometry_rect(v, sheet_h)?;
+        super::verify::projection_line_offset(&v.projection, &front, &r)
+    };
+    if index == parent {
+        let offsets: Vec<Option<f64>> = drawing
+            .views
+            .iter()
+            .filter(|v| ViewSide::for_projection(v.projection, drawing.projection).is_some())
+            .map(offset)
+            .collect();
+        if offsets.is_empty() {
+            return None;
+        }
+        return Some(
+            offsets
+                .iter()
+                .all(|o| o.is_some_and(super::verify::on_projection_line)),
+        );
+    }
+    offset(drawing.views.get(index)?).map(super::verify::on_projection_line)
+}
+
+/// Resolve a drag of view `index` to `requested` (`position_mm`) the way
+/// established CAD does, returning where every moved view goes (the dragged
+/// view first). Nothing is checked for room here --
+/// [`check_moved_views`] does that over the whole move.
+///
+/// - A TOP/BOTTOM/LEFT/RIGHT view on its projection line with FRONT stays on
+///   it: TOP and BOTTOM keep FRONT's column and move only up and down, LEFT
+///   and RIGHT keep its row and move only sideways -- the off-axis part of
+///   the drag is ignored, not refused. It may not cross to FRONT's other
+///   side: the projection convention puts it on one side only, and on the
+///   other it reads as the opposite view ([`ViewEditError::WrongSide`]).
+/// - FRONT carries every view on its projection lines by the same amount, so
+///   they stay on them: one move, one undo step.
+/// - Any other view -- an isometric, a custom view, a projected view already
+///   off its line (a rescale with no room on the line put it there and said
+///   so) -- goes where it is dropped.
+pub(crate) fn resolve_view_drag(
+    drawing: &Drawing,
+    index: usize,
+    requested: [f64; 2],
+) -> Result<Vec<super::types::ViewMove>, super::types::ViewEditError> {
+    use super::types::{ProjectionAngle, ViewEditError, ViewMove};
+    let view = drawing.views.get(index).ok_or(ViewEditError::BadPosition)?;
+    let own = |p: [f64; 2]| ViewMove {
+        view_id: view.id.0,
+        position_mm: p,
+    };
+    let Some(parent) = parent_front(drawing) else {
+        return Ok(vec![own(requested)]);
+    };
+    let sheet_h = drawing.sheet_size.height();
+
+    if index == parent {
+        let delta = [
+            requested[0] - view.position_mm[0],
+            requested[1] - view.position_mm[1],
+        ];
+        let mut moves = vec![own(requested)];
+        for (j, v) in drawing.views.iter().enumerate() {
+            if j != parent
+                && ViewSide::for_projection(v.projection, drawing.projection).is_some()
+                && view_alignment(drawing, j) == Some(true)
+            {
+                moves.push(ViewMove {
+                    view_id: v.id.0,
+                    position_mm: [v.position_mm[0] + delta[0], v.position_mm[1] + delta[1]],
+                });
+            }
+        }
+        return Ok(moves);
+    }
+
+    let Some(side) = ViewSide::for_projection(view.projection, drawing.projection) else {
+        return Ok(vec![own(requested)]);
+    };
+    if view_alignment(drawing, index) != Some(true) {
+        return Ok(vec![own(requested)]);
+    }
+    let front_view = &drawing.views[parent];
+    let (Some(front), Some(_)) = (
+        view_geometry_rect(front_view, sheet_h),
+        view_geometry_rect(view, sheet_h),
+    ) else {
+        return Ok(vec![own(requested)]);
+    };
+    let mut probe = view.clone();
+    probe.position_mm = requested;
+    let Some(at) = view_geometry_rect(&probe, sheet_h) else {
+        return Ok(vec![own(requested)]);
+    };
+    let (fcx, fcy) = (0.5 * (front.x0 + front.x1), 0.5 * (front.y0 + front.y1));
+    let (cx, cy) = (0.5 * (at.x0 + at.x1), 0.5 * (at.y0 + at.y1));
+    // `position_mm` y runs UP the sheet; the sheet's y runs down.
+    let (resolved, centre) = match side {
+        ViewSide::Above | ViewSide::Below => ([requested[0] + (fcx - cx), requested[1]], [fcx, cy]),
+        ViewSide::Left | ViewSide::Right => ([requested[0], requested[1] - (fcy - cy)], [cx, fcy]),
+    };
+    let on_its_side = match side {
+        ViewSide::Above => centre[1] < fcy,
+        ViewSide::Below => centre[1] > fcy,
+        ViewSide::Left => centre[0] < fcx,
+        ViewSide::Right => centre[0] > fcx,
+    };
+    if !on_its_side {
+        return Err(ViewEditError::WrongSide {
+            view: view.name.clone(),
+            parent: front_view.name.clone(),
+            side: match side {
+                ViewSide::Above => "above",
+                ViewSide::Below => "below",
+                ViewSide::Left => "left of",
+                ViewSide::Right => "right of",
+            },
+            angle: match drawing.projection {
+                ProjectionAngle::Third => "third",
+                ProjectionAngle::First => "first",
+            },
+        });
+    }
+    Ok(vec![own(resolved)])
+}
+
+/// Refuse unless every view in `moved` (indices into `drawing.views`, already
+/// at their new places) sits, with its dimensions, inside the frame, clear of
+/// the title block and clear of every view NOT in `moved` -- the footprint
+/// and slack `verify_drawing` certifies the sheet with, so a move is refused
+/// exactly when it would make the sheet's own check report an overlap.
+/// Views in `moved` are not checked against each other: they moved together
+/// by one translation (FRONT and the views it carries) and kept their
+/// spacing. A view with no geometry has no footprint and is never in the way.
+pub(crate) fn check_moved_views(
+    drawing: &Drawing,
+    moved: &[usize],
+) -> Result<(), super::types::ViewEditError> {
+    use super::types::ViewEditError;
+    use super::verify::{rect_contains, view_footprint, SLACK_MM};
+    let sheet_h = drawing.sheet_size.height();
+    let frame = super::verify::frame_rect(&drawing.sheet_size);
+    let title_block = title_block_rect(&drawing.sheet_size);
+    let footprint = |i: usize| -> Option<Rect2> {
+        let v = drawing.views.get(i)?;
+        view_geometry_rect(v, sheet_h).map(|g| view_footprint(v, g))
+    };
+    for &i in moved {
+        let Some(fp) = footprint(i) else { continue };
+        let name = drawing.views[i].name.clone();
+        if !rect_contains(&frame, &fp, SLACK_MM) {
+            return Err(ViewEditError::OffSheet { view: name });
+        }
+        if fp.intersects(&title_block, SLACK_MM) {
+            return Err(ViewEditError::OverlapsTitleBlock { view: name });
+        }
+        for j in (0..drawing.views.len()).filter(|j| !moved.contains(j)) {
+            if footprint(j).is_some_and(|o| fp.intersects(&o, SLACK_MM)) {
+                return Err(ViewEditError::Overlaps {
+                    view: name,
+                    other: drawing.views[j].name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<Rect2> {
     let mut x0 = f64::INFINITY;
     let mut y0 = f64::INFINITY;
@@ -781,24 +983,15 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     let w = drawing.sheet_size.width();
     let h = drawing.sheet_size.height();
     let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
-    let (tb_w, tb_h) = title_block_size(&drawing.sheet_size);
     let frame_w = (w - ml - mr).max(0.0);
     let frame_h = (h - mt - mb).max(0.0);
 
     let mut items: Vec<SheetItem> = Vec::new();
 
     // ── TitleBlock ────────────────────────────────────────────────────────
-    // Bottom-right of the frame, matching render_title_block's positioning.
-    let tb_x0 = ml + frame_w - tb_w;
-    let tb_y0 = mt + frame_h - tb_h;
     items.push(SheetItem {
         kind: SheetItemKind::TitleBlock,
-        bbox: Rect2 {
-            x0: tb_x0,
-            y0: tb_y0,
-            x1: tb_x0 + tb_w,
-            y1: tb_y0 + tb_h,
-        },
+        bbox: title_block_rect(&drawing.sheet_size),
         owner_view: None,
         text: None,
     });
