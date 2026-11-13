@@ -1,5 +1,11 @@
 import katex from 'katex'
-import { Check, CircleSlash, PenLine, ShieldCheck, X } from 'lucide-react'
+import {
+  Check,
+  CircleSlash,
+  PenLine,
+  ShieldCheck,
+  X,
+} from '@/components/ui/icons'
 import type { FcfCard as FcfCardData } from '@/lib/blackboard-cards'
 import {
   characteristicSymbol,

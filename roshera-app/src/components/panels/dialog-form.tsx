@@ -14,7 +14,9 @@
  */
 
 import type { ReactNode } from 'react'
-import { X } from 'lucide-react'
+import {
+  X,
+} from '@/components/ui/icons'
 import { Input } from '@/components/ui/input'
 
 /**

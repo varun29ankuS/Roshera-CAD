@@ -23,7 +23,12 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { X, ChevronUp, ChevronDown, MousePointerClick } from 'lucide-react'
+import {
+  X,
+  ChevronUp,
+  ChevronDown,
+  MousePointerClick,
+} from '@/components/ui/icons'
 import { Button } from '@/components/ui/button'
 import { useSceneStore, type SelectionMode } from '@/stores/scene-store'
 import { cn } from '@/lib/utils'

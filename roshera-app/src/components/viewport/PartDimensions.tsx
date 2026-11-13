@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Html, Line } from '@react-three/drei'
 import * as THREE from 'three'
-import { X } from 'lucide-react'
+import {
+  X,
+} from '@/components/ui/icons'
 import { useSceneStore, type PinnedMeasurement } from '@/stores/scene-store'
 import type { DatumDescriptor } from '@/lib/measure-api'
 import { usePartDimensions, type DimensionRow } from './use-part-dimensions'

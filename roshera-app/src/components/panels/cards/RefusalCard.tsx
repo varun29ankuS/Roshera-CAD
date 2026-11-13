@@ -1,4 +1,10 @@
-import { ArrowRight, Ban, CircleSlash, Lightbulb, RotateCw } from 'lucide-react'
+import {
+  ArrowRight,
+  Ban,
+  CircleSlash,
+  Lightbulb,
+  RotateCw,
+} from '@/components/ui/icons'
 import type { RefusalCard as RefusalCardData } from '@/lib/blackboard-cards'
 import { CardShell, Chip } from './card-chrome'
 

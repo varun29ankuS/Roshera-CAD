@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ArrowLeft, Pause, Play, RotateCcw } from 'lucide-react'
+import {
+  ArrowLeft,
+  Pause,
+  Play,
+  RotateCcw,
+} from '@/components/ui/icons'
 import { Blackboard } from '@/components/panels/Blackboard'
 import { MessageMarkdown } from '@/components/panels/MessageMarkdown'
 import { StreamingLineText } from '@/components/panels/StreamingLineText'

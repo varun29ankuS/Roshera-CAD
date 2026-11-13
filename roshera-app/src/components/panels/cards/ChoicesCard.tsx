@@ -1,5 +1,7 @@
 import { useContext } from 'react'
-import { CircleHelp } from 'lucide-react'
+import {
+  CircleHelp,
+} from '@/components/ui/icons'
 import type { ChoicesCard as ChoicesCardData } from '@/lib/blackboard-cards'
 import { useTurnQueue } from '@/lib/blackboard-composer'
 import { CardShell, Chip } from './card-chrome'

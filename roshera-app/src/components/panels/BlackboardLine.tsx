@@ -20,7 +20,15 @@ import {
 import { RevealContext } from './cards/reveal-context'
 import { CardActionsContext, type CardActions } from './cards/card-actions-context'
 import { DetectedChoicesCard } from './cards/DetectedChoicesCard'
-import { Bot, User, Wrench, Trash2, Check, X, CircleSlash } from 'lucide-react'
+import {
+  Bot,
+  User,
+  Wrench,
+  Trash2,
+  Check,
+  X,
+  CircleSlash,
+} from '@/components/ui/icons'
 import type { AgentTurnStatus } from '@/stores/blackboard-store'
 
 interface Props {

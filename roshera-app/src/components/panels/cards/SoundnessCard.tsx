@@ -1,5 +1,8 @@
 import type { ComponentType } from 'react'
-import { Droplet, ShieldCheck } from 'lucide-react'
+import {
+  Droplet,
+  ShieldCheck,
+} from '@/components/ui/icons'
 import type { SoundnessCard as SoundnessCardData } from '@/lib/blackboard-cards'
 import { CardShell, Chip, Claim, ClaimBadge, KV, type CardAccent } from './card-chrome'
 import { eulerGenus, fmtNum } from './format'

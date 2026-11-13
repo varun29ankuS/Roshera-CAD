@@ -1,5 +1,12 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Eye, EyeOff, Trash2, Pencil, Plus, FileText } from 'lucide-react'
+import {
+  Eye,
+  EyeOff,
+  Trash2,
+  Pencil,
+  Plus,
+  FileText,
+} from '@/components/ui/icons'
 import {
   ContextMenu,
   ContextMenuHeader,
@@ -615,7 +622,6 @@ function buildLocalNode(
     children: children.length > 0 ? children : undefined,
   }
 }
-
 
 // ─── Solid classification (what KIND of thing is this row?) ─────────
 //

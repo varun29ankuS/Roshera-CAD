@@ -28,7 +28,12 @@
  */
 import { useMemo, useState } from 'react'
 import { StatusPill } from '@/components/ui/status-pill'
-import { ChevronDown, ChevronRight, Clock, Ruler } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  Ruler,
+} from '@/components/ui/icons'
 import { cn } from '@/lib/utils'
 import {
   type CheckpointSummary,

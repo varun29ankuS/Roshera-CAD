@@ -18,7 +18,9 @@
  */
 
 import { useEffect, useMemo, useState } from 'react'
-import { Square } from 'lucide-react'
+import {
+  Square,
+} from '@/components/ui/icons'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { useObservedTurnActivity } from '@/lib/agent-activity'

@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react'
-import { Tag, AlertTriangle, Check, X } from 'lucide-react'
+import {
+  Tag,
+  AlertTriangle,
+  Check,
+  X,
+} from '@/components/ui/icons'
 import { useSceneStore } from '@/stores/scene-store'
 import { usePartLabels } from './use-part-labels'
 import { labelText, type Label, type LabelKind } from '@/lib/labels-api'

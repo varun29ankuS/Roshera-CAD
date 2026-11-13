@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
-import { ArrowLeft, CircleSlash, RefreshCw, X } from 'lucide-react'
+import {
+  ArrowLeft,
+  CircleSlash,
+  RefreshCw,
+  X,
+} from '@/components/ui/icons'
 import { cn } from '@/lib/utils'
 import type { CheckpointSummary, EventSummary } from '@/lib/timeline-events'
 import {

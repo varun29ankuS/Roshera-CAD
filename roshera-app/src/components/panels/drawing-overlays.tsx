@@ -14,7 +14,14 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Check, ChevronDown, Pencil, Plus, Trash2, X } from 'lucide-react'
+import {
+  Check,
+  ChevronDown,
+  Pencil,
+  Plus,
+  Trash2,
+  X,
+} from '@/components/ui/icons'
 import {
   type Drawing,
   type DrawingFormat,

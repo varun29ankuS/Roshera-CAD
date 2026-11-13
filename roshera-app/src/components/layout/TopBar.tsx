@@ -18,7 +18,10 @@ import { useDocModeStore, type DocumentMode } from '@/stores/doc-mode-store'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import { useUnitsStore } from '@/stores/units-store'
 import { Badge } from '@/components/ui/badge'
-import { Sun, Moon } from 'lucide-react'
+import {
+  Sun,
+  Moon,
+} from '@/components/ui/icons'
 import { exportSceneAs } from '@/lib/export-api'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { getDocumentUnit } from '@/lib/units-api'
@@ -29,7 +32,6 @@ import { UnitSelector } from '@/components/layout/UnitSelector'
 import { timelineAction } from '@/lib/history'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
-
 
 // Two-step export (POST /api/export → GET /api/download/:filename) is
 // implemented in `lib/export-api.ts` and shared with the ToolBar Export

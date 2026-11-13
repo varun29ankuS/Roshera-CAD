@@ -1,4 +1,6 @@
-import { GitMerge } from 'lucide-react'
+import {
+  GitMerge,
+} from '@/components/ui/icons'
 import type {
   MergeCard as MergeCardData,
   MergeConflictWitness,

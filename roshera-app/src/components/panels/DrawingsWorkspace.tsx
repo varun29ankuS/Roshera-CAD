@@ -21,7 +21,9 @@
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { X } from 'lucide-react'
+import {
+  X,
+} from '@/components/ui/icons'
 import {
   DrawingSwitcher,
   SheetActions,
@@ -613,7 +615,6 @@ export function DrawingsWorkspace() {
   // The selected view's outline, measured off the rendered sheet (follows
   // pan, zoom and re-renders).
   const [selRect, setSelRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
-
 
   const handleDownload = useCallback(
     async (format: DrawingFormat) => {

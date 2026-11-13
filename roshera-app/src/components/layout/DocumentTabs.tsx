@@ -25,7 +25,10 @@
  * anything, and the wording below must never imply otherwise.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Plus, X } from 'lucide-react'
+import {
+  Plus,
+  X,
+} from '@/components/ui/icons'
 import { ContextMenu, ContextMenuItem } from '@/components/ui/context-menu'
 import { cn } from '@/lib/utils'
 import { type DocumentInfo } from '@/lib/documents-api'

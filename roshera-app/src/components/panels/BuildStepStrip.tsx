@@ -1,5 +1,9 @@
 import { useState } from 'react'
-import { ChevronDown, ChevronRight, Wrench } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronRight,
+  Wrench,
+} from '@/components/ui/icons'
 import type { BlackboardLine as Line } from '@/stores/blackboard-store'
 import { buildStepBreadcrumb, groupBuildStepsByName } from '@/lib/blackboard-groups'
 import { BlackboardLine } from './BlackboardLine'

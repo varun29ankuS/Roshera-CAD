@@ -1,4 +1,6 @@
-import { Loader2 } from 'lucide-react'
+import {
+  Loader2,
+} from '@/components/ui/icons'
 import type { DemoEntry } from '@/lib/demo-types'
 
 interface DemoCardProps {

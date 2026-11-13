@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { CheckCircle2, Loader2, Terminal, XCircle } from 'lucide-react'
+import {
+  CheckCircle2,
+  Loader2,
+  Terminal,
+  XCircle,
+} from '@/components/ui/icons'
 import {
   Dialog,
   DialogContent,

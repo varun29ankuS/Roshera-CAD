@@ -22,18 +22,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   PenTool,
-  RectangleHorizontal,
-  Circle as CircleIcon,
   Ruler,
   Undo2,
   Trash2,
   Check,
   X,
-  Scissors,
-  RotateCw,
-  Dot,
-  Minus,
-} from 'lucide-react'
+  ToolIcons,
+} from '@/components/ui/icons'
 import {
   isStandardPlane,
   useSceneStore,
@@ -73,9 +68,9 @@ const TOOL_OPTIONS: Array<{
   label: string
   icon: typeof PenTool
 }> = [
-  { value: 'polyline', label: 'Polyline', icon: PenTool },
-  { value: 'rectangle', label: 'Rectangle', icon: RectangleHorizontal },
-  { value: 'circle', label: 'Circle', icon: CircleIcon },
+  { value: 'polyline', label: 'Polyline', icon: ToolIcons.polyline },
+  { value: 'rectangle', label: 'Rectangle', icon: ToolIcons.rectangle },
+  { value: 'circle', label: 'Circle', icon: ToolIcons.circle },
 ]
 
 /**
@@ -92,9 +87,9 @@ const CSKETCH_TOOL_OPTIONS: Array<{
   label: string
   icon: typeof PenTool
 }> = [
-  { value: 'point', label: 'Point', icon: Dot },
-  { value: 'line', label: 'Line', icon: Minus },
-  { value: 'circle', label: 'Circle', icon: CircleIcon },
+  { value: 'point', label: 'Point', icon: ToolIcons.point },
+  { value: 'line', label: 'Line', icon: ToolIcons.line },
+  { value: 'circle', label: 'Circle', icon: ToolIcons.circle },
 ]
 
 /**
@@ -113,9 +108,9 @@ const FINISH_OP_OPTIONS: Array<{
   icon: typeof PenTool
   title: string
 }> = [
-  { value: 'extrude', label: 'Extrude', icon: Check, title: 'Pull the profile along the plane normal' },
-  { value: 'extrude_cut', label: 'Cut', icon: Scissors, title: 'Pull the profile and subtract it from a target body' },
-  { value: 'revolve', label: 'Revolve', icon: RotateCw, title: 'Spin the profile around an axis' },
+  { value: 'extrude', label: 'Extrude', icon: ToolIcons.extrude, title: 'Pull the profile along the plane normal' },
+  { value: 'extrude_cut', label: 'Cut', icon: ToolIcons.subtract, title: 'Pull the profile and subtract it from a target body' },
+  { value: 'revolve', label: 'Revolve', icon: ToolIcons.revolve, title: 'Spin the profile around an axis' },
 ]
 
 export function SketchPanel() {

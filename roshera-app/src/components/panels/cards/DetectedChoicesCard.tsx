@@ -1,5 +1,7 @@
 import { useContext, useState } from 'react'
-import { ListChecks } from 'lucide-react'
+import {
+  ListChecks,
+} from '@/components/ui/icons'
 import type { DetectedChoiceSet } from '@/lib/blackboard-cards'
 import { useTurnQueue } from '@/lib/blackboard-composer'
 import { CardShell, Chip } from './card-chrome'

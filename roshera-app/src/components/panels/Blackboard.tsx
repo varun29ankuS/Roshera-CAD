@@ -34,7 +34,7 @@ import {
   Check,
   X,
   CircleSlash,
-} from 'lucide-react'
+} from '@/components/ui/icons'
 import { VendorMark } from '@/components/settings/vendor-marks'
 import { TurnStatusLine } from './TurnStatusLine'
 import { useDocumentStore } from '@/stores/document-store'

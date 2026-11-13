@@ -84,7 +84,9 @@ import {
   type ReactFlowInstance,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { X } from 'lucide-react'
+import {
+  X,
+} from '@/components/ui/icons'
 import { cn } from '@/lib/utils'
 import { useThemeStore } from '@/stores/theme-store'
 import {

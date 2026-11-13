@@ -16,7 +16,12 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Check, CircleSlash, Trash2, X } from 'lucide-react'
+import {
+  Check,
+  CircleSlash,
+  Trash2,
+  X,
+} from '@/components/ui/icons'
 import * as THREE from 'three'
 import {
   deleteAssembly,

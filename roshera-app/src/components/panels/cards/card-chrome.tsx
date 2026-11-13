@@ -1,5 +1,9 @@
 import type { ComponentType, ReactNode } from 'react'
-import { Check, CircleSlash, X } from 'lucide-react'
+import {
+  Check,
+  CircleSlash,
+  X,
+} from '@/components/ui/icons'
 import { cn } from '@/lib/utils'
 import { ChalkReveal } from './ChalkReveal'
 

@@ -1,4 +1,9 @@
-import { Check, CircleSlash, FlaskConical, X } from 'lucide-react'
+import {
+  Check,
+  CircleSlash,
+  FlaskConical,
+  X,
+} from '@/components/ui/icons'
 import type {
   DfmCard as DfmCardData,
   DfmCardValue,

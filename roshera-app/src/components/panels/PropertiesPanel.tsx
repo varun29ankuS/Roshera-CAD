@@ -2,7 +2,14 @@ import { useState } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
-import { Box, Eye, EyeOff, Lock, Unlock, Ruler } from 'lucide-react'
+import {
+  Box,
+  Eye,
+  EyeOff,
+  Lock,
+  Unlock,
+  Ruler,
+} from '@/components/ui/icons'
 
 export function PropertiesPanel() {
   const selectedIds = useSceneStore((s) => s.selectedIds)

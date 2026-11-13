@@ -1,5 +1,8 @@
 import { useState } from 'react'
-import { ChevronDown, ChevronRight } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronRight,
+} from '@/components/ui/icons'
 import { cn } from '@/lib/utils'
 import type { BlackboardSection as BlackboardSectionData } from '@/lib/blackboard-groups'
 import { BlackboardLine } from './BlackboardLine'

@@ -9,7 +9,10 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { Eye, EyeOff } from 'lucide-react'
+import {
+  Eye,
+  EyeOff,
+} from '@/components/ui/icons'
 import { isAuthRequired, login, onAuthChange } from '@/lib/auth'
 
 /**

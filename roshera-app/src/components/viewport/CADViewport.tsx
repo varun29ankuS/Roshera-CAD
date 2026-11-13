@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
-import { Box, Grid3x3, Ruler, SquareDashed, Tags } from 'lucide-react'
+import {
+  Box,
+  Grid3x3,
+  Ruler,
+  SquareDashed,
+  Tags,
+} from '@/components/ui/icons'
 import { CADGrid } from './CADGrid'
 import { GizmoNav } from './GizmoNav'
 import { SceneLighting } from './SceneLighting'

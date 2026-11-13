@@ -1,5 +1,11 @@
 import { useCallback } from 'react'
-import { Eye, EyeOff, FileText, PenTool, Trash2 } from 'lucide-react'
+import {
+  Eye,
+  EyeOff,
+  FileText,
+  PenTool,
+  Trash2,
+} from '@/components/ui/icons'
 import {
   ContextMenu,
   ContextMenuItem,

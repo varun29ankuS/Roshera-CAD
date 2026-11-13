@@ -2,46 +2,12 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { createPortal } from 'react-dom'
 import {
   MousePointer2,
-  Move3d,
-  RotateCw,
-  Box,
-  Circle,
-  Cylinder,
-  Triangle,
-  Minus,
-  Hexagon,
-  Disc,
-  ArrowUpFromLine,
-  RefreshCcw,
-  Layers,
-  Scissors,
-  Combine,
-  Diff,
-  SquaresIntersect,
-  PenTool,
-  PencilRuler,
-  DraftingCompass,
   Ruler,
-  Grid3x3,
-  Copy,
-  FlipHorizontal,
-  Wrench,
-  Pipette,
-  Eye,
   FileDown,
   FileUp,
-  CircleDot,
-  Torus,
-  Component,
-  Orbit,
-  ScanLine,
-  Grip,
-  Hash,
-  Workflow,
-  RectangleHorizontal,
-  SquareDashedBottom,
+  ToolIcons,
   type LucideIcon,
-} from 'lucide-react'
+} from '@/components/ui/icons'
 import { useSceneStore, type TransformTool } from '@/stores/scene-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { processBlackboardMessage } from '@/lib/ai-client'
@@ -1187,7 +1153,7 @@ function FlyoutGroup({ group, openId, onToggle }: {
         aria-label={group.tooltip}
         aria-expanded={isOpen}
       >
-        <group.icon size={22} strokeWidth={1.5} />
+        <group.icon size={32} />
         {/* The rail is 56px and the label is derived by taking the tooltip's
             first word, which is fine for "Transform" and "Create" and clips
  "Manufacturing" mid-word. Deriving a label by splitting a sentence
@@ -1224,7 +1190,7 @@ function FlyoutGroup({ group, openId, onToggle }: {
                       : 'text-foreground/80 hover:bg-accent hover:text-foreground',
                   )}
                 >
-                  <item.icon size={14} strokeWidth={1.5} className="shrink-0" />
+                  <item.icon size={22} className="shrink-0" />
                   <span className="flex-1 text-left">{item.label}</span>
                   {item.shortcut && (
                     <span className="text-[11px] text-muted-foreground/50 font-mono">{item.shortcut}</span>
@@ -1322,18 +1288,18 @@ export function ToolBar() {
           label: 'Transform',
           items: [
             { icon: MousePointer2, label: 'Select', shortcut: 'V', active: activeTool === 'select', action: () => handleToolChange('select') },
-            { icon: Move3d, label: 'Translate', shortcut: 'G', active: activeTool === 'translate', action: () => handleToolChange('translate') },
-            { icon: RotateCw, label: 'Rotate', shortcut: 'R', active: activeTool === 'rotate', action: () => handleToolChange('rotate') },
-            { icon: FlipHorizontal, label: 'Mirror', action: () => sendDirectMirror('xy') },
+            { icon: ToolIcons.translate, label: 'Translate', shortcut: 'G', active: activeTool === 'translate', action: () => handleToolChange('translate') },
+            { icon: ToolIcons.rotate, label: 'Rotate', shortcut: 'R', active: activeTool === 'rotate', action: () => handleToolChange('rotate') },
+            { icon: ToolIcons.mirror, label: 'Mirror', action: () => sendDirectMirror('xy') },
           ],
         },
         {
           label: 'Selection Mode',
           items: [
-            { icon: Box, label: 'Object', shortcut: '1', active: selectionMode === 'object', action: () => setSelectionMode('object') },
-            { icon: Triangle, label: 'Face', shortcut: '2', active: selectionMode === 'face', action: () => setSelectionMode('face') },
-            { icon: Minus, label: 'Edge', shortcut: '3', active: selectionMode === 'edge', action: () => setSelectionMode('edge') },
-            { icon: CircleDot, label: 'Vertex', shortcut: '4', active: selectionMode === 'vertex', action: () => setSelectionMode('vertex') },
+            { icon: ToolIcons.selectObject, label: 'Object', shortcut: '1', active: selectionMode === 'object', action: () => setSelectionMode('object') },
+            { icon: ToolIcons.selectFace, label: 'Face', shortcut: '2', active: selectionMode === 'face', action: () => setSelectionMode('face') },
+            { icon: ToolIcons.selectEdge, label: 'Edge', shortcut: '3', active: selectionMode === 'edge', action: () => setSelectionMode('edge') },
+            { icon: ToolIcons.selectVertex, label: 'Vertex', shortcut: '4', active: selectionMode === 'vertex', action: () => setSelectionMode('vertex') },
           ],
         },
       ],
@@ -1342,26 +1308,26 @@ export function ToolBar() {
     // 2. Create — primitives + sketch
     {
       id: 'create',
-      icon: Box,
+      icon: ToolIcons.box,
       tooltip: 'Create Geometry',
       sections: [
         {
           label: 'Primitives',
           items: [
-            { icon: Box, label: 'Box', action: () => sendDirectGeometry('box', { width: 10, height: 10, depth: 10 }) },
-            { icon: Circle, label: 'Sphere', action: () => sendDirectGeometry('sphere', { radius: 5 }) },
-            { icon: Cylinder, label: 'Cylinder', action: () => sendDirectGeometry('cylinder', { radius: 5, height: 10 }) },
-            { icon: Triangle, label: 'Cone', action: () => sendDirectGeometry('cone', { radius: 5, height: 10 }) },
-            { icon: Torus, label: 'Torus', action: () => sendDirectGeometry('torus', { major_radius: 8, minor_radius: 2 }) },
+            { icon: ToolIcons.box, label: 'Box', action: () => sendDirectGeometry('box', { width: 10, height: 10, depth: 10 }) },
+            { icon: ToolIcons.sphere, label: 'Sphere', action: () => sendDirectGeometry('sphere', { radius: 5 }) },
+            { icon: ToolIcons.cylinder, label: 'Cylinder', action: () => sendDirectGeometry('cylinder', { radius: 5, height: 10 }) },
+            { icon: ToolIcons.cone, label: 'Cone', action: () => sendDirectGeometry('cone', { radius: 5, height: 10 }) },
+            { icon: ToolIcons.torus, label: 'Torus', action: () => sendDirectGeometry('torus', { major_radius: 8, minor_radius: 2 }) },
           ],
         },
         {
           label: 'Sketch',
           items: [
-            { icon: PenTool, label: 'New Sketch', shortcut: 'K', action: () => useSceneStore.getState().enterSketch('xy', 'polyline') },
-            { icon: PenTool, label: 'Polyline', action: () => useSceneStore.getState().enterSketch('xy', 'polyline') },
-            { icon: RectangleHorizontal, label: 'Rectangle', action: () => useSceneStore.getState().enterSketch('xy', 'rectangle') },
-            { icon: Circle, label: 'Circle', action: () => useSceneStore.getState().enterSketch('xy', 'circle') },
+            { icon: ToolIcons.sketch, label: 'New Sketch', shortcut: 'K', action: () => useSceneStore.getState().enterSketch('xy', 'polyline') },
+            { icon: ToolIcons.polyline, label: 'Polyline', action: () => useSceneStore.getState().enterSketch('xy', 'polyline') },
+            { icon: ToolIcons.rectangle, label: 'Rectangle', action: () => useSceneStore.getState().enterSketch('xy', 'rectangle') },
+            { icon: ToolIcons.circle, label: 'Circle', action: () => useSceneStore.getState().enterSketch('xy', 'circle') },
           ],
         },
       ],
@@ -1370,24 +1336,24 @@ export function ToolBar() {
     // 3. Operations — extrude, revolve, booleans
     {
       id: 'operations',
-      icon: ArrowUpFromLine,
+      icon: ToolIcons.extrude,
       tooltip: 'Operations',
       sections: [
         {
           label: 'Solid',
           items: [
-            { icon: ArrowUpFromLine, label: 'Extrude', action: () => notYetWired('Extrude', 'use Sketch → Finish → Extrude flow') },
-            { icon: RefreshCcw, label: 'Revolve', action: () => notYetWired('Revolve') },
-            { icon: Layers, label: 'Loft', action: () => notYetWired('Loft') },
-            { icon: Workflow, label: 'Sweep', action: () => notYetWired('Sweep') },
+            { icon: ToolIcons.extrude, label: 'Extrude', action: () => notYetWired('Extrude', 'use Sketch → Finish → Extrude flow') },
+            { icon: ToolIcons.revolve, label: 'Revolve', action: () => notYetWired('Revolve') },
+            { icon: ToolIcons.loft, label: 'Loft', action: () => notYetWired('Loft') },
+            { icon: ToolIcons.sweep, label: 'Sweep', action: () => notYetWired('Sweep') },
           ],
         },
         {
           label: 'Boolean',
           items: [
-            { icon: Combine, label: 'Union', action: () => sendDirectBoolean('union') },
-            { icon: SquaresIntersect, label: 'Intersect', action: () => sendDirectBoolean('intersection') },
-            { icon: Diff, label: 'Subtract', action: () => sendDirectBoolean('difference') },
+            { icon: ToolIcons.union, label: 'Union', action: () => sendDirectBoolean('union') },
+            { icon: ToolIcons.intersect, label: 'Intersect', action: () => sendDirectBoolean('intersection') },
+            { icon: ToolIcons.subtract, label: 'Subtract', action: () => sendDirectBoolean('difference') },
           ],
         },
       ],
@@ -1396,54 +1362,54 @@ export function ToolBar() {
     // 4. Modify — fillet, chamfer, shell, pattern
     {
       id: 'modify',
-      icon: Disc,
+      icon: ToolIcons.fillet,
       tooltip: 'Modify & Pattern',
       sections: [
         {
           label: 'Modify',
           items: [
             {
-              icon: Disc,
+              icon: ToolIcons.fillet,
               label: 'Fillet',
               action: () => openModify('fillet'),
             },
             {
-              icon: Disc,
+              icon: ToolIcons.fillet,
               label: 'Fillet (per-edge radii)',
               action: () => openModify('fillet-variable'),
             },
             {
-              icon: Disc,
+              icon: ToolIcons.fillet,
               label: 'Fillet (linear start→end)',
               action: () => openModify('fillet-linear'),
             },
             {
-              icon: Disc,
+              icon: ToolIcons.fillet,
               label: 'Fillet (per-station)',
               action: () => openModify('fillet-stations'),
             },
             {
-              icon: Hexagon,
+              icon: ToolIcons.chamfer,
               label: 'Chamfer',
               action: () => openModify('chamfer'),
             },
             {
-              icon: SquareDashedBottom,
+              icon: ToolIcons.shell,
               label: 'Shell',
               action: () => openModify('shell'),
             },
-            { icon: ScanLine, label: 'Offset', action: () => notYetWired('Offset', 'needs face-selection UX') },
-            { icon: Scissors, label: 'Split', action: () => notYetWired('Split') },
-            { icon: Orbit, label: 'Draft', action: () => notYetWired('Draft', 'needs face-selection UX') },
+            { icon: ToolIcons.offset, label: 'Offset', action: () => notYetWired('Offset', 'needs face-selection UX') },
+            { icon: ToolIcons.split, label: 'Split', action: () => notYetWired('Split') },
+            { icon: ToolIcons.draft, label: 'Draft', action: () => notYetWired('Draft', 'needs face-selection UX') },
           ],
         },
         {
           label: 'Pattern',
           items: [
-            { icon: Grid3x3, label: 'Linear Pattern', action: () => sendDirectLinearPattern('x', 15, 3) },
-            { icon: Orbit, label: 'Circular Pattern', action: () => sendDirectCircularPattern('z', 6) },
-            { icon: Hash, label: 'Rectangular', action: () => notYetWired('Rectangular Pattern') },
-            { icon: Copy, label: 'Copy', action: () => notYetWired('Copy') },
+            { icon: ToolIcons.linearPattern, label: 'Linear Pattern', action: () => sendDirectLinearPattern('x', 15, 3) },
+            { icon: ToolIcons.circularPattern, label: 'Circular Pattern', action: () => sendDirectCircularPattern('z', 6) },
+            { icon: ToolIcons.rectangularPattern, label: 'Rectangular', action: () => notYetWired('Rectangular Pattern') },
+            { icon: ToolIcons.copy, label: 'Copy', action: () => notYetWired('Copy') },
           ],
         },
       ],
@@ -1452,22 +1418,22 @@ export function ToolBar() {
     // 5. Manufacturing
     {
       id: 'mfg',
-      icon: Wrench,
+      icon: ToolIcons.hole,
       tooltip: 'Manufacturing & Analyze',
       sections: [
         {
           label: 'Manufacturing',
           items: [
-            { icon: CircleDot, label: 'Hole', action: () => notYetWired('Hole') },
-            { icon: Grip, label: 'Thread', action: () => notYetWired('Thread') },
-            { icon: Component, label: 'Rib', action: () => notYetWired('Rib') },
+            { icon: ToolIcons.hole, label: 'Hole', action: () => notYetWired('Hole') },
+            { icon: ToolIcons.thread, label: 'Thread', action: () => notYetWired('Thread') },
+            { icon: ToolIcons.rib, label: 'Rib', action: () => notYetWired('Rib') },
           ],
         },
         {
           label: 'Analyze',
           items: [
             {
-              icon: PencilRuler,
+              icon: ToolIcons.measure,
               label: 'Dimensions',
               active: (() => {
                 // The toggle acts on the single selected object. Show active
@@ -1488,11 +1454,11 @@ export function ToolBar() {
                 toggleDimensions(ids[0])
               },
             },
-            { icon: DraftingCompass, label: 'Measure', action: () => sendDirectMeasureFaces() },
+            { icon: ToolIcons.measure, label: 'Measure', action: () => sendDirectMeasureFaces() },
             { icon: Ruler, label: 'Measure Distance (bounds)', action: () => sendDirectMeasureDistance() },
-            { icon: Pipette, label: 'Mass Properties', action: () => sendDirectMassProperties() },
-            { icon: Eye, label: 'Section View', action: () => toggleSectionViewWithFeedback() },
-            { icon: Wrench, label: 'Interference', action: () => sendDirectInterference() },
+            { icon: ToolIcons.massProperties, label: 'Mass Properties', action: () => sendDirectMassProperties() },
+            { icon: ToolIcons.section, label: 'Section View', action: () => toggleSectionViewWithFeedback() },
+            { icon: ToolIcons.interference, label: 'Interference', action: () => sendDirectInterference() },
           ],
         },
       ],

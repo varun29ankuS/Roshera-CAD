@@ -1,7 +1,12 @@
 import { useMemo } from 'react'
 import { Html } from '@react-three/drei'
 import * as THREE from 'three'
-import { Tag, AlertTriangle, Check, X } from 'lucide-react'
+import {
+  Tag,
+  AlertTriangle,
+  Check,
+  X,
+} from '@/components/ui/icons'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
 import { usePartLabels } from './use-part-labels'
 import { labelText, type Label } from '@/lib/labels-api'

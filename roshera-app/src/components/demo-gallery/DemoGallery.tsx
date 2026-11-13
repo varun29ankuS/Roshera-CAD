@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useState, useCallback } from 'react'
-import { ArrowLeft, AlertTriangle, RefreshCw } from 'lucide-react'
+import {
+  ArrowLeft,
+  AlertTriangle,
+  RefreshCw,
+} from '@/components/ui/icons'
 import { CADViewport } from '@/components/viewport/CADViewport'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Button } from '@/components/ui/button'

@@ -22,7 +22,9 @@
 
 import { timelineAction } from '@/lib/history'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Search } from 'lucide-react'
+import {
+  Search,
+} from '@/components/ui/icons'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import { useDocModeStore, type DocumentMode } from '@/stores/doc-mode-store'
 import { useSceneStore, CAMERA_PRESETS } from '@/stores/scene-store'
@@ -90,7 +92,6 @@ function rank(cmd: Command, query: string): number {
     : 0
   return Math.max(labelScore, groupScore, keywordScore)
 }
-
 
 async function runExport(format: string): Promise<void> {
   const { addLine } = useBlackboardStore.getState()
