@@ -750,14 +750,186 @@ fn is_parameterization_seam(
     let Some(surface) = model.surfaces.get(face.surface_id) else {
         return false;
     };
-    surface
-        .as_any()
-        .downcast_ref::<crate::primitives::surface::Cylinder>()
+    let any = surface.as_any();
+    any.downcast_ref::<crate::primitives::surface::Cylinder>()
         .is_some()
-        || surface
-            .as_any()
+        || any
             .downcast_ref::<crate::primitives::surface::Cone>()
             .is_some()
+        // A round-edge fillet's torus band: its seam is the tube's
+        // cross-section at u = 0 -- a quarter arc that, facing the camera,
+        // was drawn (and closed into a full circle) though it is no edge of
+        // the part. The true outline is synthesized below.
+        || any
+            .downcast_ref::<crate::primitives::surface::Torus>()
+            .is_some()
+}
+
+/// The outline of a torus face (a round-edge fillet) in this view: where its
+/// normal turns perpendicular to the view direction `w`.
+///
+/// * Looking ACROSS the axis (FRONT / RIGHT of an upright fillet): the tube's
+///   cross-sections at the two azimuths whose radial direction is
+///   perpendicular to `w`, over the face's own `v` range -- the quarter arcs a
+///   drafter draws at each side of a filleted hub.
+/// * Looking ALONG the axis (TOP): the tube's equators `v = 0, π` -- drawn
+///   only when strictly inside the face; at the face's own boundary they are
+///   its rim edges, already drawn.
+/// * Any other view: no closed form here, nothing synthesized (the oblique
+///   pictorial is shaded, not wireframed).
+///
+/// Directions come from the surface's own `point_at`, so the torus's
+/// orientation convention cannot mislead them.
+#[allow(clippy::too_many_arguments)]
+fn synth_torus_silhouette(
+    model: &BRepModel,
+    face_id: FaceId,
+    face: &Face,
+    torus: &crate::primitives::surface::Torus,
+    surface: &dyn crate::primitives::surface::Surface,
+    vm: &Matrix4,
+    w: Vector3,
+    samples_per_curve: usize,
+    ctx: &ViewOcclusionCtx,
+    out: &mut ViewEdges,
+) {
+    let Some([u0, u1, v0, v1]) = torus.param_limits else {
+        return;
+    };
+    let axis = torus.axis.normalize().unwrap_or(torus.axis);
+    let wa = w.dot(&axis);
+    const TOL: f64 = 1e-9;
+    let tau = std::f64::consts::TAU;
+    let u_in_face = |u: f64| {
+        let span = u1 - u0;
+        span >= tau - 1e-9 || (u - u0).rem_euclid(tau) <= span + 1e-9
+    };
+    let n = samples_per_curve.clamp(8, 64);
+    if wa.abs() < TOL {
+        // Radial direction at azimuth u: e(u) = cos u · e(0) + sin u · e(π/2).
+        let radial = |u: f64| -> Option<Vector3> {
+            let p = surface.point_at(u, 0.5 * (v0 + v1)).ok()?;
+            let r = p - torus.center;
+            (r - axis * r.dot(&axis)).normalize().ok()
+        };
+        let (Some(e0), Some(e90)) = (radial(0.0), radial(std::f64::consts::FRAC_PI_2)) else {
+            return;
+        };
+        // e(u)·w = A cos u + B sin u = 0.
+        let (a, b) = (e0.dot(&w), e90.dot(&w));
+        let u_a = (-a).atan2(b);
+        for u in [u_a, u_a + std::f64::consts::PI] {
+            let u = u.rem_euclid(tau);
+            if u_in_face(u) {
+                emit_param_silhouette(
+                    model,
+                    face_id,
+                    face,
+                    surface,
+                    vm,
+                    |t| (u, v0 + (v1 - v0) * t),
+                    n,
+                    ctx,
+                    out,
+                );
+            }
+        }
+    } else if (1.0 - wa.abs()) < TOL {
+        for v in [0.0, std::f64::consts::PI] {
+            let inside =
+                (v - v0).rem_euclid(tau) > 1e-6 && (v1 - v0) - (v - v0).rem_euclid(tau) > 1e-6;
+            if inside {
+                emit_param_silhouette(
+                    model,
+                    face_id,
+                    face,
+                    surface,
+                    vm,
+                    |t| (u0 + (u1 - u0) * t, v),
+                    n.max(48),
+                    ctx,
+                    out,
+                );
+            }
+        }
+    }
+}
+
+/// Emit an outline curve `t -> (u, v)`, `t ∈ [0, 1]`, of `surface` (sampled
+/// at `n` points): the parts that lie on the face, each segment classified
+/// visible or hidden at the point ON the curve halfway along it (a chord
+/// midpoint of a curved outline can lie inside the solid).
+#[allow(clippy::too_many_arguments)]
+fn emit_param_silhouette(
+    model: &BRepModel,
+    face_id: FaceId,
+    face: &Face,
+    surface: &dyn crate::primitives::surface::Surface,
+    vm: &Matrix4,
+    uv: impl Fn(f64) -> (f64, f64),
+    n: usize,
+    ctx: &ViewOcclusionCtx,
+    out: &mut ViewEdges,
+) {
+    let n = n.max(2);
+    let at = |t: f64| -> Option<(Point3, [f64; 2], bool)> {
+        let (u, v) = uv(t);
+        let p = surface.point_at(u, v).ok()?;
+        // The trim is probed a hair inside the curve's span: an end sample
+        // lies exactly on the face's own boundary, where membership is a
+        // coin flip (a fillet outline lost its last segment). The drawn
+        // point stays exact.
+        let (pu, pv) = uv(t.clamp(1e-6, 1.0 - 1e-6));
+        let on_face = crate::tessellation::surface::point_inside_face_uv(pu, pv, face, model);
+        let q = vm.transform_point(&p);
+        Some((p, [q.x, q.y], on_face))
+    };
+    let mut runs: Vec<Vec<(f64, [f64; 2])>> = Vec::new();
+    let mut current: Vec<(f64, [f64; 2])> = Vec::new();
+    for i in 0..n {
+        let t = i as f64 / (n - 1) as f64;
+        match at(t) {
+            Some((_, q, true)) => current.push((t, q)),
+            _ => {
+                if current.len() >= 2 {
+                    runs.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+        }
+    }
+    if current.len() >= 2 {
+        runs.push(current);
+    }
+    for run in runs {
+        let p2: Vec<[f64; 2]> = run.iter().map(|(_, q)| *q).collect();
+        let probes: Vec<Point3> = run
+            .windows(2)
+            .filter_map(|w| at(0.5 * (w[0].0 + w[1].0)).map(|(p, _, _)| p))
+            .collect();
+        if probes.len() != p2.len() - 1 {
+            continue;
+        }
+        for (visible, pts) in split_by_visibility_at(&p2, &probes, ctx) {
+            let pl = Polyline2d::from_points(pts);
+            if pl.points.len() < 2 {
+                continue;
+            }
+            let source = super::types::PolylineSource {
+                edge_id: None,
+                face_ids: vec![face_id],
+                role: super::types::PolylineRole::Silhouette,
+            };
+            if visible {
+                out.visible.push(pl);
+                out.visible_sources.push(source);
+            } else {
+                out.hidden.push(pl);
+                out.hidden_sources.push(source);
+            }
+        }
+    }
 }
 
 /// Bundled occlusion-classification context, shared by the real-edge walk
@@ -1339,7 +1511,7 @@ pub(crate) fn project_solid_edges_visibility_mode(
                     // `is_parameterization_seam`'s doc comment for the ruling);
                     // the true silhouette is synthesized separately below,
                     // regardless of whether it coincides with this seam.
-                    if is_linear && is_parameterization_seam(model, *edge_id, &edge_faces) {
+                    if is_parameterization_seam(model, *edge_id, &edge_faces) {
                         continue;
                     }
                     let n = if is_linear {
@@ -1557,6 +1729,25 @@ pub(crate) fn project_solid_edges_visibility_mode(
                 samples_per_curve,
                 &occ_ctx,
                 &mut circle_groups,
+            );
+            continue;
+        }
+
+        if let Some(torus) = surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Torus>()
+        {
+            synth_torus_silhouette(
+                model,
+                *face_id,
+                face,
+                torus,
+                surface,
+                &vm,
+                w,
+                samples_per_curve,
+                &occ_ctx,
+                &mut out,
             );
             continue;
         }

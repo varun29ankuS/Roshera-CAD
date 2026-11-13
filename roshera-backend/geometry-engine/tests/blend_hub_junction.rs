@@ -244,3 +244,57 @@ fn a_chamfered_hub_top_hides_nothing_below_it() {
         "the chamfer's own rims are seen"
     );
 }
+
+/// The R3 junction fillet seen from the front is drawn as a drafter draws
+/// it: a quarter arc on each side of the hub (the fillet's outline), not a
+/// full circle. Found live: FRONT showed a small full circle at the hub's
+/// base -- the torus's seam (a quarter arc facing the camera) drawn and
+/// closed into a circle, with no outline synthesized for the torus at all.
+#[test]
+fn the_junction_fillet_draws_as_quarter_arcs_from_the_front() {
+    use geometry_engine::drawing::standard_drawing_hlr;
+    use geometry_engine::drawing::types::{ProjectionType, SheetSize};
+    let (mut m, part) = hub();
+    let junction = rim(&m, 22.5, 12.0);
+    fillet_edges(
+        &mut m,
+        part,
+        junction,
+        FilletOptions {
+            fillet_type: FilletType::Constant(3.0),
+            radius: 3.0,
+            ..Default::default()
+        },
+    )
+    .expect("R3 junction fillet");
+    let d = standard_drawing_hlr(&m, part, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("hlr");
+    let front = d
+        .views
+        .iter()
+        .find(|v| matches!(v.projection, ProjectionType::Front))
+        .expect("front view");
+    assert!(
+        front.circles.iter().all(|c| (c.r - 3.0).abs() > 1e-6),
+        "no full circle of the fillet radius: {:?}",
+        front.circles.iter().map(|c| c.r).collect::<Vec<_>>()
+    );
+    // A quarter arc of radius 3 about each tube centre (±25.5, 15).
+    for cx in [-25.5_f64, 25.5] {
+        let on_arc = |p: &[f64; 2]| ((p[0] - cx).hypot(p[1] - 15.0) - 3.0).abs() < 1e-6;
+        let arc = front
+            .polylines
+            .iter()
+            .find(|pl| pl.points.len() >= 3 && pl.points.iter().all(on_arc));
+        let arc = arc.unwrap_or_else(|| panic!("no fillet outline arc about ({cx}, 15)"));
+        let angle = |p: &[f64; 2]| (p[1] - 15.0).atan2(p[0] - cx);
+        let (a0, a1) = (
+            angle(&arc.points[0]),
+            angle(arc.points.last().expect("end")),
+        );
+        let sweep = (a1 - a0).abs().min(std::f64::consts::TAU - (a1 - a0).abs());
+        assert!(
+            (sweep - std::f64::consts::FRAC_PI_2).abs() < 1e-6,
+            "the outline about ({cx}, 15) is a quarter arc, sweep {sweep}"
+        );
+    }
+}
