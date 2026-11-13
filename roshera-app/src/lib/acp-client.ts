@@ -474,7 +474,7 @@ export class AcpClient {
     return this._currentModel
   }
 
-  /** The provider id backing this session (`anthropic`, `kimi`, …) as
+  /** The provider id backing this session (`anthropic`, `mistral`, …) as
    *  reported by `GET /api/acp/config`, or `null` before the first
    *  `newSession()` resolves it or when the backend named none. Drives the
    *  header's vendor mark ONLY — a null draws no logo rather than a

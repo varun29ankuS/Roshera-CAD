@@ -62,7 +62,7 @@ pub struct ProviderConfigRequest {
 enum Validated {
     ApiKey {
         /// The allowlisted provider this key was validated for
-        /// ("anthropic", "xai", "mistral", "glm", "kimi", ...) — needed
+        /// ("anthropic", "xai", "mistral", "deepseek", ...) — needed
         /// because, unlike every other `Validated` variant, `api_key`
         /// mode is now wired for more than one provider and `put_provider`
         /// must persist and repin the one actually requested, never a
@@ -740,8 +740,8 @@ async fn validate_request(payload: &ProviderConfigRequest) -> Result<Validated, 
 
 /// `anthropic`'s `api_key` mode is checked live against Anthropic's own
 /// `/v1/models` before it is ever persisted (`ClaudeProvider::validate_credential`).
-/// The other allowlisted `api_key` vendors (`xai`, `mistral`, `glm`,
-/// `kimi`) have no vetted synchronous credential-check client in this
+/// The other allowlisted `api_key` vendors (`xai`, `mistral`,
+/// `deepseek`, `openrouter`) have no vetted synchronous credential-check client in this
 /// build — `ai-integration` has no native HTTP client for any of them,
 /// and building an unverified one here (this server has no real key or
 /// network access to prove it against) would risk exactly the "silent
@@ -915,7 +915,7 @@ mod tests {
     }
 
     // --- validate_api_key: the generalized-provider path — xai/mistral/
-    //     glm/kimi accept an api_key without a network probe (no vetted
+    //     deepseek accept an api_key without a network probe (no vetted
     //     synchronous credential-check client exists for them), anthropic
     //     is unaffected. Network-free: these never reach ClaudeProvider. ---
 
@@ -947,12 +947,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_request_accepts_mistral_glm_kimi_api_key_flagging_an_explicit_model_unverified(
+    async fn validate_request_accepts_mistral_deepseek_api_key_flagging_an_explicit_model_unverified(
     ) {
         for (id, model_name) in [
             ("mistral", "mistral-medium-latest"),
-            ("glm", "glm-4.6"),
-            ("kimi", "kimi-k2-turbo-preview"),
+            ("deepseek", "deepseek-chat"),
         ] {
             let mut payload = request(id, "api_key");
             payload.api_key = Some(format!("fake-{id}-key"));

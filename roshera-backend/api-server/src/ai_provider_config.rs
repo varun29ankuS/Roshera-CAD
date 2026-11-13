@@ -964,7 +964,7 @@ pub async fn verify_subscription_cli_model(
 // through its declarative-provider system (`crates/goose/src/config/
 // declarative_providers.rs`, wired at `providers/init.rs:220`, bundled
 // JSON at `crates/goose-providers/src/declarative/definitions/
-// {mistral,zhipu,moonshot}.json`) — plus `xai`, a hand-written native
+// mistral.json`) — plus `xai`, a hand-written native
 // provider registered the same way in `providers/init.rs` — only need
 // two things: the API key available where each provider's own
 // credential resolution looks for it, and `active_provider` pinned to
@@ -1011,32 +1011,6 @@ fn goose_declarative_provider_for(
     match roshera_provider_id {
         "xai" => Some(("xai", "XAI_API_KEY", None)),
         "mistral" => Some(("mistral", "MISTRAL_API_KEY", None)),
-        // Roshera's allowlist id is "glm" (the model family users type);
-        // goose's own declarative-provider name for the same vendor is
-        // "zhipu" (`zhipu.json`'s `"name"` field) — these are
-        // deliberately different strings, not a typo.
-        "glm" => Some(("zhipu", "ZHIPU_API_KEY", None)),
-        // Roshera's "kimi" is goose's "moonshot"
-        // (`moonshot.json`) — distinct from `kimi_code`, an unrelated
-        // OAuth-device-flow CLI product goose separately supports that
-        // this module does not touch.
-        "kimi" => Some(("moonshot", "MOONSHOT_API_KEY", None)),
-        // Unlike xai/mistral/glm/kimi, Sarvam has no goose-bundled
-        // declarative provider. Instead its definition is a custom-provider
-        // JSON at `state/goose-root/config/custom_providers/sarvam.json`,
-        // which `declarative_providers.rs::register_declarative_providers`
-        // loads and registers into the same `ProviderRegistry` as the
-        // bundled vendors, keyed by the same `name` field. Roshera's
-        // allowlist id and goose's provider name are therefore identical
-        // (`sarvam` -> `sarvam`) — not a rename like glm -> zhipu, just the
-        // same string reused because there was never a second name to
-        // reconcile.
-        // `sarvam-105b` is the ONLY chat model `GET https://api.sarvam.ai/
-        // v1/models` returned on 2026-08-01 (checked live, not from the
-        // docs — the docs also list `sarvam-30b`, which that endpoint does
-        // not serve). It is a default here because it was verified, not
-        // because it was plausible.
-        "sarvam" => Some(("sarvam", "SARVAM_API_KEY", Some("sarvam-105b"))),
         // goose implements OpenAI NATIVELY (`crates/goose/src/providers/
         // openai_def.rs`), reading OPENAI_API_KEY, provider name "openai".
         // Like xai, it has no declarative JSON — its base URL is a Rust
@@ -1045,16 +1019,15 @@ fn goose_declarative_provider_for(
         // already handled by a typed refusal, not a bug to fix here.
         "openai" => Some(("openai", "OPENAI_API_KEY", None)),
         // goose BUNDLES a declarative definition for DeepSeek, but its name
-        // is "custom_deepseek", not "deepseek" — a rename mapping like
-        // glm -> zhipu, not an identity mapping like sarvam -> sarvam.
-        // Because it has a JSON definition (unlike openai/xai's native Rust
-        // providers), model discovery DOES work for it. The bundled JSON
-        // lists models (`deepseek-v4-flash`, `deepseek-v4-pro`), but those
-        // are not copied in as a default here: querying the live list
-        // needs a key this module does not hold at this call site, and
-        // `sarvam-30b` — copied from documentation rather than verified
-        // live — is exactly how a phantom model got into this repo's
-        // config before. So DeepSeek's default model stays `None`.
+        // is "custom_deepseek", not "deepseek" — a rename mapping, not an
+        // identity mapping. Because it has a JSON definition (unlike
+        // openai/xai's native Rust providers), model discovery DOES work for
+        // it. The bundled JSON lists models (`deepseek-v4-flash`,
+        // `deepseek-v4-pro`), but those are not copied in as a default here:
+        // querying the live list needs a key this module does not hold at
+        // this call site, and a model copied from documentation rather than
+        // verified live is how a phantom model got into this repo's config
+        // before. So DeepSeek's default model stays `None`.
         "deepseek" => Some(("custom_deepseek", "DEEPSEEK_API_KEY", None)),
         // goose implements OpenRouter NATIVELY (`providers/openrouter.rs`,
         // name "openrouter", key OPENROUTER_API_KEY). No default model:
@@ -1561,7 +1534,7 @@ pub enum BootProviderPin {
     /// that choice.
     ClaudeCode { cli_path: PathBuf },
     /// A persisted `api_key` config for a vendor goose reaches through a
-    /// DECLARATIVE provider (sarvam, xai, mistral, glm, kimi) — repin to
+    /// DECLARATIVE provider (xai, mistral, deepseek, openrouter) — repin to
     /// it, exactly as `PUT /api/ai/provider` does live.
     ///
     /// This variant exists because its absence was a silent regression.
@@ -1576,7 +1549,7 @@ pub enum BootProviderPin {
     /// again through the vendor family added later.
     Declarative {
         /// Roshera's allowlist id, not goose's provider name — the
-        /// translation (e.g. `glm` → `zhipu`) belongs to
+        /// translation (e.g. `deepseek` → `custom_deepseek`) belongs to
         /// `goose_declarative_provider_for`, not to callers.
         roshera_provider_id: String,
         api_key: String,
@@ -2147,7 +2120,8 @@ mod tests {
     /// The regression Varun hit: a persisted declarative-vendor choice was
     /// discarded on every restart.
     ///
-    /// `sarvam`/`api_key` fell through to `Default`, which repins goose to
+    /// A declarative vendor's `api_key` (Sarvam's, when the regression was
+    /// hit) fell through to `Default`, which repins goose to
     /// `anthropic` — a provider holding no credential — so the first turn
     /// after any restart failed with "Provider not set" while the user's
     /// actual choice sat unread in `state/ai-provider.json`. Without the
@@ -2155,18 +2129,18 @@ mod tests {
     #[test]
     fn a_persisted_declarative_vendor_is_repinned_at_boot_not_dropped_to_anthropic() {
         let cfg = StoredProviderConfig {
-            provider: "sarvam".to_string(),
+            provider: "mistral".to_string(),
             mode: "api_key".to_string(),
             api_key: Some("sk_live_key".to_string()),
-            model: Some("sarvam-105b".to_string()),
+            model: Some("mistral-large-latest".to_string()),
             ..stored("api_key", None)
         };
         assert_eq!(
             resolve_boot_provider_pin(Some(&cfg), &cli_status(false, None)),
             BootProviderPin::Declarative {
-                roshera_provider_id: "sarvam".to_string(),
+                roshera_provider_id: "mistral".to_string(),
                 api_key: "sk_live_key".to_string(),
-                model: Some("sarvam-105b".to_string()),
+                model: Some("mistral-large-latest".to_string()),
             },
             "a persisted declarative vendor must be repinned at boot — dropping to \
              Default silently reverts the user's choice to a provider with no key"
@@ -2198,7 +2172,7 @@ mod tests {
     fn a_declarative_vendor_without_a_key_is_not_repinned() {
         for key in [None, Some(String::new()), Some("   ".to_string())] {
             let cfg = StoredProviderConfig {
-                provider: "sarvam".to_string(),
+                provider: "mistral".to_string(),
                 mode: "api_key".to_string(),
                 api_key: key.clone(),
                 ..stored("api_key", None)
@@ -2494,7 +2468,7 @@ mod tests {
     //     `Config` `OnceCell` (see `goose_acp`'s test-module doc).
 
     #[test]
-    fn goose_declarative_provider_for_maps_all_four_new_vendors() {
+    fn goose_declarative_provider_for_maps_xai_and_mistral() {
         assert_eq!(
             goose_declarative_provider_for("xai"),
             Some(("xai", "XAI_API_KEY", None))
@@ -2503,16 +2477,16 @@ mod tests {
             goose_declarative_provider_for("mistral"),
             Some(("mistral", "MISTRAL_API_KEY", None))
         );
-        assert_eq!(
-            goose_declarative_provider_for("glm"),
-            Some(("zhipu", "ZHIPU_API_KEY", None)),
-            "Roshera's 'glm' id must map to goose's own 'zhipu' provider name"
-        );
-        assert_eq!(
-            goose_declarative_provider_for("kimi"),
-            Some(("moonshot", "MOONSHOT_API_KEY", None)),
-            "Roshera's 'kimi' id must map to goose's own 'moonshot' provider name"
-        );
+    }
+
+    /// Sarvam AI, Moonshot Kimi and Zhipu GLM were removed (Varun
+    /// 2026-11-13): none has a goose repin target any more, so a stored
+    /// choice of one can never pin goose to it.
+    #[test]
+    fn removed_vendors_have_no_goose_repin_target() {
+        for id in ["sarvam", "kimi", "glm"] {
+            assert_eq!(goose_declarative_provider_for(id), None, "{id}");
+        }
     }
 
     /// OpenRouter reaches goose's NATIVE `openrouter` provider, which reads
@@ -2535,9 +2509,8 @@ mod tests {
             "anthropic",
             "openai",
             "xai",
-            "moonshot",
-            "zhipu",
-            "sarvam",
+            "mistral",
+            "deepseek",
             "claude-code",
         ] {
             assert_eq!(
@@ -2558,12 +2531,12 @@ mod tests {
 
     /// A default model may only be present where the identifier was checked
     /// against the vendor's live API. This is the ratchet: adding one from
-    /// documentation or memory is how `sarvam-30b` — a model that vendor
-    /// does not serve — sat in this repo's config until a live check
-    /// removed it.
+    /// documentation or memory is how a model the vendor does not serve
+    /// once sat in this repo's config until a live check removed it. No
+    /// remaining vendor has a live-verified default.
     #[test]
     fn only_live_verified_vendors_carry_a_default_model() {
-        for id in ["xai", "mistral", "glm", "kimi", "openai", "deepseek"] {
+        for id in ["xai", "mistral", "openai", "deepseek", "openrouter"] {
             let (_, _, default_model) = goose_declarative_provider_for(id)
                 .unwrap_or_else(|| panic!("{id} must still map to a goose provider"));
             assert_eq!(
@@ -2572,15 +2545,6 @@ mod tests {
                  identifier fails at first use while the dialog shows it connected"
             );
         }
-
-        let (_, _, sarvam_default) =
-            goose_declarative_provider_for("sarvam").expect("sarvam must map");
-        assert_eq!(
-            sarvam_default,
-            Some("sarvam-105b"),
-            "sarvam-105b is the only chat model GET https://api.sarvam.ai/v1/models served \
-             on 2026-08-01 — verified live, which is the bar for being a default here"
-        );
     }
 
     /// The defect Varun hit connecting Sarvam: the repin accepted an empty
@@ -2600,17 +2564,6 @@ mod tests {
                 "the refusal must name what is missing: {err}"
             );
         }
-    }
-
-    #[test]
-    fn goose_declarative_provider_for_maps_sarvam_by_identity() {
-        assert_eq!(
-            goose_declarative_provider_for("sarvam"),
-            Some(("sarvam", "SARVAM_API_KEY", Some("sarvam-105b"))),
-            "Roshera's 'sarvam' id must map to goose's custom-provider name \
-             'sarvam' (identity mapping — there is no goose-bundled provider \
-             to rename to, unlike glm -> zhipu)"
-        );
     }
 
     #[test]

@@ -156,8 +156,8 @@ export interface ModelDiscoveryResponse {
   provider: string
   base_url: string
   /** Which resolution tier answered — `custom_provider_json` (this
-   *  deployment's own override, e.g. Sarvam) or `bundled_declarative`
-   *  (goose's compiled-in definitions, e.g. Mistral/GLM/Kimi). */
+   *  deployment's own override) or `bundled_declarative`
+   *  (goose's compiled-in definitions, e.g. Mistral). */
   base_url_source: 'custom_provider_json' | 'bundled_declarative'
   models_url: string
   models: DiscoveredModel[]

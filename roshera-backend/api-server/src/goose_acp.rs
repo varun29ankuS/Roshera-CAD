@@ -201,8 +201,10 @@ pub(crate) enum GooseAcpError {
     McpEntryMissing(String),
     #[error("failed to pin goose to the persisted subscription_cli provider at boot: {0}")]
     ProviderPin(String),
-    #[error("failed to write the Sarvam AI custom-provider definition to '{path}': {source}")]
-    CustomProviderWrite {
+    #[error(
+        "failed to remove the retired Sarvam AI custom-provider definition '{path}': {source}"
+    )]
+    CustomProviderRemove {
         path: String,
         #[source]
         source: std::io::Error,
@@ -251,141 +253,24 @@ fn resolve_mcp_entry_path() -> Result<PathBuf, GooseAcpError> {
     Ok(path)
 }
 
-/// Sarvam AI's confirmed OpenAI-compatible endpoint and credential env var,
-/// taken verbatim from goose's OWN bundled provider catalog —
-/// `goose-provider-types/src/canonical/data/provider_metadata.json`:
-/// `{"id": "sarvam", "display_name": "Sarvam AI", "npm":
-/// "@ai-sdk/openai-compatible", "api": "https://api.sarvam.ai/v1", "env":
-/// ["SARVAM_API_KEY"], ...}`. Not invented: goose does not bundle a
-/// `sarvam.json` *declarative-provider* definition the way it does for
-/// xai/mistral/zhipu/moonshot (`declarative/definitions/`), only this
-/// separate model/endpoint catalog, so the value is otherwise unreachable
-/// without writing it ourselves.
-/// ★ This is the FULL completions endpoint, not the API root, because that
-/// is what goose treats `base_url` as. Its own declarative fixtures use
-/// values like `https://example.invalid/v1/chat/completions`, and it POSTs
-/// to this value directly rather than appending a path.
-///
-/// Measured 2026-08-01, which is how this was found:
-///   POST https://api.sarvam.ai/v1                   -> 404 Not Found
-///   POST https://api.sarvam.ai/v1/chat/completions  -> 403 (endpoint real,
-///                                                      key rejected)
-/// With the root here, every turn 404'd, and goose's retry layer reported
-/// that as `NetworkError("Could not connect to api.sarvam.ai — check your
-/// network connection")`. The host was reachable throughout; a wrong path
-/// was being reported as a dead network, which sent the diagnosis to the
-/// wrong layer entirely.
-///
-/// `POST /api/ai/provider/models` still works against this value: it strips
-/// a trailing `/chat/completions` before appending `/models`, mirroring
-/// goose's own `map_base_path`.
-const SARVAM_BASE_URL: &str = "https://api.sarvam.ai/v1/chat/completions";
-const SARVAM_API_KEY_ENV: &str = "SARVAM_API_KEY";
-
-/// Register Sarvam AI as a goose declarative provider by writing a
-/// definition into `<goose root>/config/custom_providers/sarvam.json` —
-/// the SAME directory goose's own `declarative_providers::load_provider`
-/// and `register_declarative_providers` read (goose crate,
-/// `config/declarative_providers.rs`: `custom_providers_dir()` is
-/// `Paths::config_dir().join("custom_providers")`, checked BEFORE the
-/// bundled `fixed_provider_configs()` set — a custom file with the same
-/// id shadows a bundled one). This is the general, non-code path goose
-/// exposes for any OpenAI-compatible vendor it does not bundle: write one
-/// JSON file into a directory goose already scans, no goose-side patch
-/// required. Must run after [`initialize`] has set `GOOSE_PATH_ROOT` —
-/// `custom_providers_dir()` reads it fresh on every call, so ordering
-/// relative to the `Config::global()` `OnceCell` touch does not matter
-/// here the way it does for the provider pin.
-///
-/// Written unconditionally on every boot (not "only if missing") so the
-/// definition never drifts from what this function declares — the same
-/// convention [`initialize`] already uses for the provider pin below.
-///
-/// This does NOT make Sarvam AI a live inference path by itself: writing
-/// the definition only lets goose's provider registry *construct* a
-/// `sarvam` provider by id when asked. Nothing yet *asks* — Roshera's own
-/// provider repin/selection logic (`ai_provider_config.rs`) only ever
-/// pins `anthropic` or repins to `claude-code`. That is the same
-/// selection gap the allowlist documents for xai/mistral/glm/kimi, whose
-/// goose-bundled definitions are equally unselected today; see the
-/// `sarvam` entry in `ai-integration/src/providers/allowlist.rs`.
-fn write_sarvam_custom_provider_definition() -> Result<(), GooseAcpError> {
-    let dir = goose::config::declarative_providers::custom_providers_dir();
-    std::fs::create_dir_all(&dir).map_err(|source| GooseAcpError::CustomProviderWrite {
-        path: dir.display().to_string(),
-        source,
-    })?;
-
-    let config = goose::config::DeclarativeProviderConfig {
-        name: "sarvam".to_string(),
-        engine: goose::config::declarative_providers::ProviderEngine::OpenAI,
-        display_name: "Sarvam AI".to_string(),
-        description: Some(
-            "Sarvam AI — Indian LLM vendor, OpenAI-compatible Chat \
-             Completions API."
-                .to_string(),
-        ),
-        api_key_env: SARVAM_API_KEY_ENV.to_string(),
-        base_url: SARVAM_BASE_URL.to_string(),
-        // ONE model, because the vendor serves one.
-        //
-        // This list previously carried `sarvam-30b` too, taken from goose's
-        // canonical model catalog. On 2026-08-01 `GET
-        // https://api.sarvam.ai/v1/models` (public, no key needed) was
-        // called for the first time and returned exactly one chat model:
-        // `sarvam-105b`. `sarvam-30b` appears in the catalog and in
-        // Sarvam's own documentation, and the live API does not serve it —
-        // so it was selectable here and would have failed at the first
-        // turn, which is the failure this provider's seam existed to
-        // prevent. The catalog is a plausible source, not an authoritative
-        // one.
-        //
-        // The old comment justified the static list by saying this build
-        // "has never called" that endpoint. It has now, and `POST
-        // /api/ai/provider/models` calls it for every vendor at connect
-        // time. This list remains only for the boot path, which has no key
-        // in hand to query with; discovery is the source of truth wherever
-        // a key exists.
-        //
-        // ⚠ Hand-editing the generated `custom_providers/sarvam.json` does
-        // NOTHING — this function rewrites it on every boot. Change it here.
-        models: vec![goose::providers::base::ModelInfo::new(
-            "sarvam-105b",
-            131_072,
-        )],
-        headers: None,
-        timeout_seconds: None,
-        supports_streaming: Some(true),
-        requires_auth: true,
-        catalog_provider_id: None,
-        base_path: None,
-        env_vars: None,
-        dynamic_models: Some(false),
-        skip_canonical_filtering: false,
-        // The previous link 404'd (checked 2026-08-01, along with
-        // `docs.sarvam.ai/llms-full.txt`, which is a navigation stub). This
-        // one resolves.
-        model_doc_link: Some(
-            "https://docs.sarvam.ai/api-reference-docs/chat/chat-completions".to_string(),
-        ),
-        setup_steps: Vec::new(),
-        fast_model: None,
-        preserves_thinking: true,
-    };
-
-    let file_path = dir.join("sarvam.json");
-    let json = serde_json::to_string_pretty(&config).map_err(|source| {
-        GooseAcpError::CustomProviderWrite {
+/// Remove the Sarvam AI custom-provider definition earlier builds wrote into
+/// `<goose root>/config/custom_providers/sarvam.json` on every boot. Sarvam
+/// AI, Moonshot Kimi and Zhipu GLM were removed from Roshera's providers
+/// (Varun 2026-11-13); goose's declarative-provider loader registers every
+/// JSON in that directory, so the file left behind would keep Sarvam
+/// constructible inside the agent host although no Roshera route offers it.
+/// Idempotent: nothing to remove is not an error.
+fn remove_retired_sarvam_custom_provider_definition() -> Result<(), GooseAcpError> {
+    let file_path =
+        goose::config::declarative_providers::custom_providers_dir().join("sarvam.json");
+    match std::fs::remove_file(&file_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(GooseAcpError::CustomProviderRemove {
             path: file_path.display().to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
-        }
-    })?;
-    std::fs::write(&file_path, json).map_err(|source| GooseAcpError::CustomProviderWrite {
-        path: file_path.display().to_string(),
-        source,
-    })?;
-
-    Ok(())
+            source,
+        }),
+    }
 }
 
 /// The directory goose treats as a session's `cwd` — where the agent policy (`AGENTS.md`)
@@ -431,10 +316,8 @@ fn agent_workspace_dir() -> Result<PathBuf, GooseAcpError> {
 /// `<workspace>/AGENTS.md`. This must be the ONLY writer of that path in
 /// this repo — the hand-copy it replaces (four hours stale when the drift
 /// was caught) is exactly the failure mode "written unconditionally on
-/// every boot" forecloses, the same convention
-/// [`write_sarvam_custom_provider_definition`] already documents for the
-/// same reason: "written if missing" can still go stale, "written every
-/// boot from the one embedded source" cannot.
+/// every boot" forecloses: "written if missing" can still go stale,
+/// "written every boot from the one embedded source" cannot.
 ///
 /// Delivered as `AGENTS.md` — the host-neutral context-file name goose loads
 /// by default (`goose::hints::get_context_filenames`, alongside its own
@@ -735,12 +618,10 @@ pub(crate) fn initialize(
     // extension entries we never audited.
     std::env::remove_var("GOOSE_ADDITIONAL_CONFIG_FILES");
 
-    // Stage the Sarvam AI declarative-provider definition into this root's
-    // custom_providers directory now that GOOSE_PATH_ROOT points at it —
-    // see write_sarvam_custom_provider_definition's doc comment for what
-    // this does and does not achieve (construction becomes possible;
-    // selection is a separate, not-yet-generalized gap).
-    write_sarvam_custom_provider_definition()?;
+    // Sarvam AI is no longer a Roshera provider: remove the definition an
+    // earlier build left in this root's custom_providers directory, so the
+    // agent host stops registering it.
+    remove_retired_sarvam_custom_provider_definition()?;
 
     // Refresh the agent workspace's policy (AGENTS.md) from the one embedded
     // source on every boot — see `agent_workspace_dir` and

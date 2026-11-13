@@ -263,54 +263,6 @@ pub const PROVIDER_ALLOWLIST: &[AllowlistedProvider] = &[
         }],
     },
     AllowlistedProvider {
-        id: "glm",
-        display_name: "Zhipu GLM",
-        reason: "Zhipu's GLM models, OpenAI-compatible Chat Completions API. \
-                 Operator/user-configured only.",
-        modes: &[ModeEntry {
-            mode: CredentialMode::ApiKey,
-            spawns_local_process: false,
-            wiring: WiringStatus::Wired,
-            reason: "Static Zhipu API key over HTTPS Bearer auth \
-                     (ZHIPU_API_KEY). Wires the agent (/acp) surface only, \
-                     via goose's bundled `zhipu` declarative provider — \
-                     Roshera's own allowlist id for this vendor is `glm` \
-                     (the model family users type), which \
-                     `repin_goose_to_declarative_provider` maps to goose's \
-                     `zhipu` provider name; see xai's entry for the repin \
-                     mechanism, identical here. REST routes \
-                     (/api/ai/command) have no native Roshera LLMProvider \
-                     for GLM and stay unavailable through this key. The key \
-                     is accepted unverified; an invalid key surfaces at \
-                     first use.",
-        }],
-    },
-    AllowlistedProvider {
-        id: "kimi",
-        display_name: "Moonshot Kimi",
-        reason: "Moonshot's Kimi models, over Moonshot's own OpenAI-compatible \
-                 Chat Completions API. Operator/user-configured only.",
-        modes: &[ModeEntry {
-            mode: CredentialMode::ApiKey,
-            spawns_local_process: false,
-            wiring: WiringStatus::Wired,
-            reason: "Static Moonshot API key over HTTPS Bearer auth \
-                     (MOONSHOT_API_KEY) — distinct from the Kimi Code CLI \
-                     subscription credential goose separately supports \
-                     (`kimi_code`, untouched by this entry). Wires the agent \
-                     (/acp) surface only, via goose's bundled `moonshot` \
-                     declarative provider — Roshera's own allowlist id for \
-                     this vendor is `kimi` (the model family users type), \
-                     which `repin_goose_to_declarative_provider` maps to \
-                     goose's `moonshot` provider name; see xai's entry for \
-                     the repin mechanism, identical here. REST routes \
-                     (/api/ai/command) have no native Roshera LLMProvider \
-                     for Kimi and stay unavailable through this key. The key \
-                     is accepted unverified; an invalid key surfaces at \
-                     first use.",
-        }],
-    },
-    AllowlistedProvider {
         id: "openrouter",
         display_name: "OpenRouter",
         reason: "OpenRouter's hosted model catalogue (many vendors, including \
@@ -346,9 +298,8 @@ pub const PROVIDER_ALLOWLIST: &[AllowlistedProvider] = &[
                      provider — Roshera's own allowlist id for this vendor is \
                      `deepseek` (the vendor name users type), which \
                      `repin_goose_to_declarative_provider` maps to goose's \
-                     `custom_deepseek` provider name (a rename like glm's \
-                     mapping to `zhipu`, because goose's own bundled name for \
-                     this vendor isn't the bare vendor string either); see \
+                     `custom_deepseek` provider name (goose's own bundled \
+                     name for this vendor isn't the bare vendor string); see \
                      xai's entry for the repin mechanism, identical here. \
                      Because it has a declarative JSON definition (unlike \
                      openai/xai's native Rust providers), model discovery CAN \
@@ -360,47 +311,7 @@ pub const PROVIDER_ALLOWLIST: &[AllowlistedProvider] = &[
                      `deepseek-v4-flash`/`deepseek-v4-pro`, but querying that \
                      list live requires a key this build does not hold, and a \
                      model copied from documentation rather than verified \
-                     live is exactly how `sarvam-30b` — a model that vendor \
-                     does not serve — ended up in this repo's config before.",
-        }],
-    },
-    AllowlistedProvider {
-        id: "sarvam",
-        display_name: "Sarvam AI",
-        reason: "Sarvam AI, an Indian LLM vendor exposing an \
-                 OpenAI-compatible Chat Completions API. \
-                 Operator/user-configured only.",
-        modes: &[ModeEntry {
-            mode: CredentialMode::ApiKey,
-            spawns_local_process: false,
-            wiring: WiringStatus::Wired,
-            reason: "Static Sarvam AI API key over HTTPS Bearer auth \
-                     (SARVAM_API_KEY). Unlike xai/mistral/glm/kimi, Sarvam \
-                     has no goose-bundled declarative provider — instead \
-                     the custom-provider JSON lives at \
-                     `state/goose-root/config/custom_providers/sarvam.json`, \
-                     which goose's declarative-provider loader \
-                     (`declarative_providers.rs::load_provider` and \
-                     `register_declarative_providers`) reads ahead of its \
-                     bundled definitions and registers into the same \
-                     `ProviderRegistry` as the bundled vendors, keyed by \
-                     the same `name` field — so `repin_goose_to_declarative_provider` \
-                     maps Roshera's `sarvam` id to goose's provider name \
-                     `sarvam` (an identity mapping, unlike glm's mapping to \
-                     `zhipu`) and it resolves the same way xai/mistral/glm/ \
-                     kimi already do. The base URL \
-                     (`https://api.sarvam.ai/v1`) and the single live \
-                     model `sarvam-105b` were verified against \
-                     `GET https://api.sarvam.ai/v1/models` on 2026-08-01; \
-                     `sarvam-30b`, previously declared in that JSON, was \
-                     removed because the live API does not serve it — \
-                     declaring a model the vendor doesn't serve is the \
-                     exact failure this seam existed to prevent. This \
-                     wires the agent (/acp) surface only: there is no \
-                     native Roshera `LLMProvider` for Sarvam, so REST \
-                     routes (/api/ai/command) stay unavailable through \
-                     this key. The key itself is accepted unverified; an \
-                     invalid key surfaces at first use.",
+                     live can name a model the vendor does not serve.",
         }],
     },
 ];
@@ -650,22 +561,13 @@ mod tests {
         // subscription_cli entry above.
         ("xai", CredentialMode::ApiKey),
         ("mistral", CredentialMode::ApiKey),
-        ("glm", CredentialMode::ApiKey),
-        ("kimi", CredentialMode::ApiKey),
-        // sarvam has no goose-bundled provider — it resolves through the
-        // custom-provider JSON at
-        // `state/goose-root/config/custom_providers/sarvam.json`, which
-        // `register_declarative_providers` registers into the same
-        // `ProviderRegistry` as the bundled vendors above, so it is
-        // equally resolvable, not a different tier of "wired".
-        ("sarvam", CredentialMode::ApiKey),
         // openai resolves through goose's own NATIVE OpenAI provider (Rust,
         // not a JSON definition) — same repin mechanism, no discovery base
         // URL (see openai's entry above and BaseUrlUnresolved's doc).
         ("openai", CredentialMode::ApiKey),
         // deepseek resolves through goose's bundled `custom_deepseek`
         // declarative JSON, reached via a rename mapping (deepseek ->
-        // custom_deepseek), same tier as xai/mistral/glm/kimi.
+        // custom_deepseek), same tier as xai/mistral.
         ("deepseek", CredentialMode::ApiKey),
         // goose's native `openrouter` provider (providers/openrouter.rs),
         // reading OPENROUTER_API_KEY — mapped in
@@ -693,15 +595,15 @@ mod tests {
         }
     }
 
-    /// The four vendors `api-server`'s `repin_goose_to_declarative_provider`
-    /// serves via one of goose's own bundled providers (2026-08-01): each
-    /// pins goose's own bundled provider for the vendor and supplies its
-    /// API key via the exact env var that provider's credential resolution
-    /// reads. None spawns a local process — these are pure API-key
-    /// vendors, unlike subscription_cli.
+    /// The vendors `api-server`'s `repin_goose_to_declarative_provider`
+    /// serves via one of goose's own bundled providers: each pins goose's
+    /// own bundled provider for the vendor and supplies its API key via the
+    /// exact env var that provider's credential resolution reads. None
+    /// spawns a local process -- these are pure API-key vendors, unlike
+    /// subscription_cli.
     #[test]
-    fn xai_mistral_glm_kimi_api_key_are_wired() {
-        for id in ["xai", "mistral", "glm", "kimi"] {
+    fn xai_mistral_api_key_are_wired() {
+        for id in ["xai", "mistral"] {
             let (_, entry) = resolve_mode(id, CredentialMode::ApiKey)
                 .unwrap_or_else(|e| panic!("'{id}'/api_key must be allowlisted: {e}"));
             assert_eq!(
@@ -717,26 +619,23 @@ mod tests {
         }
     }
 
-    /// `sarvam` is `Wired` via a different path than the four above: it has
-    /// no goose-bundled provider, so `repin_goose_to_declarative_provider`
-    /// targets the custom-provider JSON at
-    /// `state/goose-root/config/custom_providers/sarvam.json` under an
-    /// identity mapping (`sarvam` -> `sarvam`), verified live against
-    /// `GET https://api.sarvam.ai/v1/models` on 2026-08-01.
+    /// Sarvam AI, Moonshot Kimi and Zhipu GLM were removed from Roshera's
+    /// providers (Varun 2026-11-13). Selecting any of them is refused as not
+    /// allowlisted -- never silently mapped to another vendor.
     #[test]
-    fn sarvam_api_key_is_wired() {
-        let (_, entry) = resolve_mode("sarvam", CredentialMode::ApiKey)
-            .unwrap_or_else(|e| panic!("'sarvam'/api_key must be allowlisted: {e}"));
-        assert_eq!(
-            entry.wiring,
-            WiringStatus::Wired,
-            "'sarvam'/api_key must be Wired now that its custom-provider JSON is written \
-             and verified"
-        );
-        assert!(
-            !entry.spawns_local_process,
-            "'sarvam'/api_key is a plain API-key vendor and must not declare it spawns a \
-             local process"
-        );
+    fn sarvam_moonshot_and_zhipu_are_not_offered() {
+        for id in ["sarvam", "kimi", "glm"] {
+            assert!(
+                PROVIDER_ALLOWLIST.iter().all(|p| p.id != id),
+                "'{id}' must not be on the provider allowlist"
+            );
+            assert!(
+                matches!(
+                    resolve_mode(id, CredentialMode::ApiKey),
+                    Err(ProviderSelectionRefusal::NotAllowlisted { .. })
+                ),
+                "selecting '{id}' must be refused as not allowlisted"
+            );
+        }
     }
 }
