@@ -50,11 +50,14 @@ function Row({
   depth,
   selected,
   onSelect,
+  ahead = false,
 }: {
   c: Chapter
   depth: number
   selected: number | null
   onSelect: (anchor: number) => void
+  /** After the slider's position: not applied in what the viewport shows. */
+  ahead?: boolean
 }) {
   const [open, setOpen] = useState(false)
   const isPattern = c.instances.length > 0
@@ -74,6 +77,7 @@ function Row({
           'flex items-start gap-2 rounded px-1.5 py-1 cursor-default outline-none',
           'hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring',
           selected === c.anchor && 'bg-accent/60',
+          ahead && 'opacity-45',
         )}
         style={{ paddingLeft: 6 + depth * 14 }}
       >
@@ -109,7 +113,7 @@ function Row({
       {isPattern && open ? (
         <ul role="group">
           {c.instances.map((i) => (
-            <Row key={i.anchor} c={i} depth={depth + 1} selected={selected} onSelect={onSelect} />
+            <Row key={i.anchor} c={i} depth={depth + 1} selected={selected} onSelect={onSelect} ahead={ahead} />
           ))}
         </ul>
       ) : null}
@@ -119,21 +123,12 @@ function Row({
 
 export function ChapterList({ branch = 'main' }: { branch?: string }) {
   const { chapters, loading, error } = useChapters(branch)
+  // Selecting a row highlights that feature, as in a feature tree. It never
+  // moves the timeline: only the slider travels in time. Rows after the
+  // slider's position are greyed, like features below a rollback bar.
+  const selected = useHistoryView((s) => s.selectedChapter)
+  const select = useHistoryView((s) => s.selectChapter)
   const viewing = useHistoryView((s) => s.step)
-  const view = useHistoryView((s) => s.view)
-  const last = chapters[chapters.length - 1]
-  // The row the viewport is showing: a past chapter, or the last (live).
-  const selected = viewing ?? last?.anchor ?? null
-  const select = (anchor: number) => {
-    if (anchor === last?.anchor) {
-      view(null)
-      return
-    }
-    const find = (cs: Chapter[]): Chapter | undefined =>
-      cs.find((c) => c.anchor === anchor) ?? cs.map((c) => find(c.instances)).find(Boolean)
-    const c = find(chapters)
-    view(anchor, c ? chapterTitle(c) : null, branch)
-  }
 
   if (error && chapters.length === 0) {
     return <div className="px-3 py-2 text-[11px] text-destructive">history unavailable — {error}</div>
@@ -148,7 +143,14 @@ export function ChapterList({ branch = 'main' }: { branch?: string }) {
   return (
     <ul role="tree" aria-label="Part history" className="px-1 py-1">
       {chapters.map((c) => (
-        <Row key={c.anchor} c={c} depth={0} selected={selected} onSelect={select} />
+        <Row
+          key={c.anchor}
+          c={c}
+          depth={0}
+          selected={selected}
+          onSelect={select}
+          ahead={viewing !== null && c.anchor > viewing}
+        />
       ))}
     </ul>
   )

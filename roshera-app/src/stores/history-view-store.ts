@@ -19,6 +19,12 @@ interface HistoryViewState {
   error: string | null
   /** Show the part right after `step` (null: back to the live part). */
   view: (step: number | null, label?: string | null, branch?: string) => void
+  /** The chapter selected in the chapter list (its anchor step), or null.
+   *  Selecting a chapter highlights it, as in a feature tree; it never moves
+   *  the timeline -- only the slider travels in time (Varun 2026-11-13). */
+  selectedChapter: number | null
+  /** Select a chapter; selecting the selected one again clears it. */
+  selectChapter: (anchor: number | null) => void
 }
 
 let request = 0
@@ -29,6 +35,9 @@ export const useHistoryView = create<HistoryViewState>((set) => ({
   objects: [],
   loading: false,
   error: null,
+  selectedChapter: null,
+  selectChapter: (anchor) =>
+    set((s) => ({ selectedChapter: anchor !== null && s.selectedChapter === anchor ? null : anchor })),
   view: (step, label = null, branch = 'main') => {
     const id = ++request
     if (step === null) {

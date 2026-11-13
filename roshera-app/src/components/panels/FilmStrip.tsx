@@ -73,6 +73,7 @@ export function FilmStrip({
   onFrameContextMenu?: (e: React.MouseEvent, anchor: number) => void
 }) {
   const viewing = useHistoryView((s) => s.step)
+  const selectedChapter = useHistoryView((s) => s.selectedChapter)
   const view = useHistoryView((s) => s.view)
   const strip = useRef<HTMLOListElement>(null)
   const dragging = useRef(false)
@@ -152,6 +153,8 @@ export function FilmStrip({
               className={cn(
                 'relative overflow-hidden rounded border bg-background',
                 current ? 'border-amber-500 ring-1 ring-amber-500' : 'border-border/60',
+                // The chapter selected in the list: marked, not travelled to.
+                !current && selectedChapter === c.anchor && 'border-sky-500 ring-1 ring-sky-500',
                 !c.sound && 'border-destructive',
               )}
               style={{ width: FRAME_PX, height: FRAME_PX }}
