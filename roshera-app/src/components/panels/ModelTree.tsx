@@ -804,7 +804,8 @@ export function ModelTree({
   // `mode` flips the body between the assembly tree and the
   // timeline-derived operation graph. Header chip remains a single
   // "browser" anchor; the segmented control inside it swaps modes.
-  const [mode, setMode] = useState<BrowserMode>('browser')
+  // Features first (the approved mockup): the part's history, by feature.
+  const [mode, setMode] = useState<BrowserMode>('features')
   const [backendNodes, setBackendNodes] = useState<TreeNode[] | null>(null)
   const [datums, setDatums] = useState<DatumDto[]>([])
   const [menu, setMenu] = useState<TreeContextMenuState | null>(null)
@@ -1123,8 +1124,8 @@ export function ModelTree({
         // one spans a 224px rail carrying a label, a two-tab control and a
         // chevron, and the token's padding pushed that row past its own edge.
         className={cn(
-          'flex w-full items-center gap-1.5 border-b border-border px-2 py-1.5',
-          'font-mono text-[11px] font-medium uppercase tracking-[0.1em] text-muted-foreground',
+          'flex w-full items-center gap-1 border-b border-border px-1.5 py-1',
+          'text-[12px] text-muted-foreground',
           expanded ? 'bg-transparent' : 'bg-transparent',
         )}
       >
@@ -1140,10 +1141,10 @@ export function ModelTree({
             // it rendered as "brow", which a tooltip technically admits and no
             // reader forgives. The chevron carries the affordance at that
             // width; the label returns with the room to hold it.
-            expanded ? 'flex-1' : 'sr-only',
+            'sr-only',
           )}
         >
-          browser
+          Tree
         </button>
         {!expanded && (
           <span aria-hidden className="flex-1 text-center text-muted-foreground">
@@ -1154,42 +1155,33 @@ export function ModelTree({
           <div
             role="tablist"
             aria-label="Browser mode"
-            className="flex items-center gap-0 text-[11px] leading-none"
+            className="flex flex-1 items-center gap-0.5 leading-none"
           >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mode === 'browser'}
-              onClick={(e) => {
-                e.stopPropagation()
-                setMode('browser')
-              }}
-              className={cn(
-                'px-1.5 py-0.5 rounded-sm transition-colors',
-                mode === 'browser'
-                  ? 'bg-accent text-foreground'
-                  : 'text-muted-foreground hover:text-foreground',
-              )}
-            >
-              parts
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mode === 'features'}
-              onClick={(e) => {
-                e.stopPropagation()
-                setMode('features')
-              }}
-              className={cn(
-                'px-1.5 py-0.5 rounded-sm transition-colors',
-                mode === 'features'
-                  ? 'bg-accent text-foreground'
-                  : 'text-muted-foreground hover:text-foreground',
-              )}
-            >
-              features
-            </button>
+            {(
+              [
+                ['features', 'Features'],
+                ['browser', 'Parts'],
+              ] as const
+            ).map(([m, label]) => (
+              <button
+                key={m}
+                type="button"
+                role="tab"
+                aria-selected={mode === m}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setMode(m)
+                }}
+                className={cn(
+                  'rounded px-2 py-1 transition-colors',
+                  mode === m
+                    ? 'bg-accent font-semibold text-foreground'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {label}
+              </button>
+            ))}
           </div>
         )}
         <button

@@ -10,7 +10,7 @@ import { cn } from '@/lib/utils'
 import { chapterIconKey, chapterTitle, type Chapter } from '@/lib/chapters-api'
 import { useChapters } from '@/hooks/use-chapters'
 import { useHistoryView } from '@/stores/history-view-store'
-import { Bot, Box, Check, ChevronDown, ChevronRight, User, X, ToolIcons } from '@/components/ui/icons'
+import { Box, Check, ChevronDown, ChevronRight, X, ToolIcons } from '@/components/ui/icons'
 
 function ChapterIcon({ c, size }: { c: Chapter; size: number }) {
   const key = chapterIconKey(c.kind)
@@ -19,30 +19,27 @@ function ChapterIcon({ c, size }: { c: Chapter; size: number }) {
 }
 
 function Verdict({ c }: { c: Chapter }) {
-  if (c.sound) return <Check size={14} title="sound — the kernel re-measured every step" />
+  if (c.sound)
+    return (
+      <Check size={12} className="text-emerald-600/60 dark:text-emerald-400/60" title="sound — the kernel re-measured every step" />
+    )
   const why = c.refusals.map((r) => `step ${r.sequence}: ${r.status}${r.reason ? ` — ${r.reason}` : ''}`).join('\n')
   return <X size={14} title={why || 'not sound'} />
 }
 
-function Byline({ c }: { c: Chapter }) {
-  if (c.author === 'agent') {
-    return (
-      <span className="inline-flex items-center gap-1">
-        <Bot size={12} />
-        {c.author_detail.model ?? 'agent'}
-        {c.intent ? <span className="truncate"> · {c.intent}</span> : null}
-      </span>
-    )
-  }
-  if (c.author === 'user') {
-    return (
-      <span className="inline-flex items-center gap-1">
-        <User size={12} />
-        {c.author_detail.name ?? 'you'}
-      </span>
-    )
-  }
-  return null
+/** Who made the feature and why, for the row's hover: the tree shows one
+ *  line per feature, as CAD trees do (the approved mockup). */
+function byline(c: Chapter): string {
+  if (c.author === 'agent') return `Made by ${c.author_detail.model ?? 'the agent'}${c.intent ? ` · ${c.intent}` : ''}`
+  if (c.author === 'user') return `Made by ${c.author_detail.name ?? 'you'}`
+  return ''
+}
+
+/** The feature's name as the tree shows it: capitalised, as a CAD tree
+ *  reads ("Flange", not "flange"); the stored name is unchanged. */
+function displayName(c: Chapter): string {
+  const t = chapterTitle(c)
+  return t.charAt(0).toUpperCase() + t.slice(1)
 }
 
 function Row({
@@ -73,8 +70,9 @@ function Row({
           if (e.key === 'Enter') onSelect(c.anchor)
           if (isPattern && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) setOpen(e.key === 'ArrowRight')
         }}
+        title={byline(c) || undefined}
         className={cn(
-          'flex items-start gap-2 rounded px-1.5 py-1 cursor-default outline-none',
+          'flex h-6 items-center gap-1.5 rounded px-1.5 cursor-default outline-none',
           'hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring',
           selected === c.anchor && 'bg-accent/60',
           ahead && 'opacity-45',
@@ -89,27 +87,27 @@ function Row({
               e.stopPropagation()
               setOpen((o) => !o)
             }}
-            className="mt-1 shrink-0"
+            className="shrink-0 text-muted-foreground"
           >
-            {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
           </button>
         ) : (
           <span className="w-3 shrink-0" />
         )}
-        <ChapterIcon c={c} size={22} />
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-[12px] leading-5 text-foreground">{chapterTitle(c)}</div>
-          <div className="truncate text-[11px] leading-4 text-muted-foreground">
-            <Byline c={c} />
-          </div>
-          {!c.sound && c.refusals[0]?.reason ? (
-            <div className="text-[11px] leading-4 text-destructive">{c.refusals[0].reason}</div>
-          ) : null}
-        </div>
-        <span className="mt-1 shrink-0">
+        <ChapterIcon c={c} size={17} />
+        <span className="min-w-0 flex-1 truncate text-[12px] text-foreground">{displayName(c)}</span>
+        {c.author === 'agent' && (
+          <span aria-label="made by the agent" className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
+        )}
+        <span className="shrink-0">
           <Verdict c={c} />
         </span>
       </div>
+      {!c.sound && c.refusals[0]?.reason ? (
+        <div className="pb-1 text-[11px] leading-4 text-destructive" style={{ paddingLeft: 30 + depth * 14 }}>
+          {c.refusals[0].reason}
+        </div>
+      ) : null}
       {isPattern && open ? (
         <ul role="group">
           {c.instances.map((i) => (
