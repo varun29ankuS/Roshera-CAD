@@ -22,6 +22,7 @@ pub use timeline_impl::{BranchInfo, ReplayResult, TimelineState};
 pub mod branch;
 pub mod brep_serialization;
 pub mod cache;
+pub mod chapters;
 pub mod dependency_graph;
 pub mod dependency_projection;
 pub mod dimension_drive;
