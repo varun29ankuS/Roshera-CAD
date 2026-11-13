@@ -130,3 +130,21 @@ export function chapterIconKey(kind: string): ChapterIconKey | null {
   if (kind === 'pattern') return 'circularPattern'
   return ICON_OF[kind] ?? null
 }
+
+/** Whether a chapter is a step of the DOCUMENT rather than a feature of the
+ *  part: a drawing made from the part changes nothing about it (its picture
+ *  is the step before's). In SolidWorks or Inventor a drawing is its own
+ *  document, never a row in the part's tree (Varun 2026-11-13: "why is
+ *  there a drawing on the timeline?"). */
+export function isDocumentChapter(c: Chapter): boolean {
+  return c.kind.startsWith('drawing')
+}
+
+/** The part's own history (tree, slider, film strip) and, apart, the
+ *  document's steps (drawings) -- listed, not hidden. */
+export function partChapters(cs: Chapter[]): { part: Chapter[]; documents: Chapter[] } {
+  return {
+    part: cs.filter((c) => !isDocumentChapter(c)),
+    documents: cs.filter(isDocumentChapter),
+  }
+}

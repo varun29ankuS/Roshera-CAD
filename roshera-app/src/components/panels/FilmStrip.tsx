@@ -18,35 +18,61 @@ const FRAME_PX = 64
 const FRAME_PITCH = 72 + 8
 const STRIP_PAD_LEFT = 12
 
+/** Pictures already fetched, by branch, step and pixel size: a picture seen
+ *  once shows instantly after (the slider's hover preview, the strip).
+ *  Bounded; an evicted picture's object URL is released. */
+const MAX_PICTURES = 300
+const pictures = new Map<string, string>()
+
+function keepPicture(key: string, url: string) {
+  pictures.set(key, url)
+  while (pictures.size > MAX_PICTURES) {
+    const oldest = pictures.keys().next().value
+    if (oldest === undefined) break
+    const old = pictures.get(oldest)
+    pictures.delete(oldest)
+    if (old) URL.revokeObjectURL(old)
+  }
+}
+
 /**
- * One frame's picture. Loaded through `fetch` -- not a bare `<img src>` --
- * so it carries the sign-in the app's fetch interceptor adds: with auth on,
- * an `<img>` request has no Authorization header and the picture route
- * refuses it. Rendered at 2x on a high-density screen; the object URL is
- * released when the frame changes or goes away.
+ * One step's picture at `px` CSS pixels. Loaded through `fetch` -- not a bare
+ * `<img src>` -- so it carries the sign-in the app's fetch interceptor adds:
+ * with auth on, an `<img>` request has no Authorization header and the
+ * picture route refuses it. Rendered at 2x on a high-density screen.
  */
-function FramePicture({ branch, seq, alt }: { branch: string; seq: number; alt: string }) {
-  const [url, setUrl] = useState<string | null>(null)
+export function FramePicture({
+  branch,
+  seq,
+  alt,
+  px = FRAME_PX,
+}: {
+  branch: string
+  seq: number
+  alt: string
+  px?: number
+}) {
+  const scale = typeof window !== 'undefined' && window.devicePixelRatio > 1 ? 2 : 1
+  const key = `${branch}:${seq}:${px * scale}`
+  const [url, setUrl] = useState<string | null>(() => pictures.get(key) ?? null)
   const [failed, setFailed] = useState(false)
   useEffect(() => {
-    const scale = typeof window !== 'undefined' && window.devicePixelRatio > 1 ? 2 : 1
-    let objectUrl: string | null = null
+    if (pictures.has(key)) return
     let live = true
-    fetch(framePictureUrl(branch, seq, FRAME_PX * scale))
+    fetch(framePictureUrl(branch, seq, px * scale))
       .then((r) => (r.ok ? r.blob() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((blob) => {
-        if (!live) return
-        objectUrl = URL.createObjectURL(blob)
-        setUrl(objectUrl)
+        const objectUrl = URL.createObjectURL(blob)
+        keepPicture(key, objectUrl)
+        if (live) setUrl(objectUrl)
       })
       .catch(() => {
         if (live) setFailed(true)
       })
     return () => {
       live = false
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [branch, seq])
+  }, [branch, seq, px, scale, key])
   if (failed) {
     return <span className="flex h-full w-full items-center justify-center text-[11px] text-muted-foreground">no picture</span>
   }
@@ -54,8 +80,8 @@ function FramePicture({ branch, seq, alt }: { branch: string; seq: number; alt: 
   return (
     <img
       src={url}
-      width={FRAME_PX}
-      height={FRAME_PX}
+      width={px}
+      height={px}
       alt={alt}
       draggable={false}
       className="block h-full w-full object-contain"

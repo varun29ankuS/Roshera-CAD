@@ -29,6 +29,55 @@ interface HistoryViewState {
 
 let request = 0
 
+/** Steps already fetched, newest last: sliding back and forth re-reads them.
+ *  Bounded (a step's meshes can be several MB); the oldest is dropped. */
+const MAX_KEPT = 16
+const kept = new Map<string, CADObject[]>()
+const inFlight = new Map<string, Promise<CADObject[]>>()
+
+function keyOf(branch: string, step: number): string {
+  return `${branch}:${step}`
+}
+
+function load(branch: string, step: number): Promise<CADObject[]> {
+  const key = keyOf(branch, step)
+  const have = kept.get(key)
+  if (have) {
+    // Refresh its place as the most recently used.
+    kept.delete(key)
+    kept.set(key, have)
+    return Promise.resolve(have)
+  }
+  const pending = inFlight.get(key)
+  if (pending) return pending
+  const p = fetchScrub(branch, step)
+    .then((objects) => {
+      kept.set(key, objects)
+      while (kept.size > MAX_KEPT) {
+        const oldest = kept.keys().next().value
+        if (oldest === undefined) break
+        kept.delete(oldest)
+      }
+      return objects
+    })
+    .finally(() => inFlight.delete(key))
+  inFlight.set(key, p)
+  return p
+}
+
+/** Fetch a step ahead of time (the slider's neighbours) without showing it. */
+export function prefetchStep(step: number, branch = 'main'): void {
+  load(branch, step).catch(() => {
+    // A failed prefetch is retried when the step is actually viewed.
+  })
+}
+
+/** Forget every kept step: the history changed, so a step number may now
+ *  mean a different state. */
+export function forgetKeptSteps(): void {
+  kept.clear()
+}
+
 export const useHistoryView = create<HistoryViewState>((set) => ({
   step: null,
   label: null,
@@ -44,8 +93,13 @@ export const useHistoryView = create<HistoryViewState>((set) => ({
       set({ step: null, label: null, objects: [], loading: false, error: null })
       return
     }
+    const ready = kept.get(keyOf(branch, step))
+    if (ready) {
+      set({ step, label, objects: ready, loading: false, error: null })
+      return
+    }
     set({ step, label, loading: true, error: null })
-    fetchScrub(branch, step)
+    load(branch, step)
       .then((objects) => {
         if (id === request) set({ objects, loading: false })
       })

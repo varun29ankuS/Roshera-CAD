@@ -45,3 +45,11 @@ test('each chapter wears the icon of the tool that made it', () => {
 test('a frame picture is addressed by branch and step', () => {
   assert.equal(framePictureUrl('main', 4, 128), '/api/timeline/frame/main/4/picture?size=128')
 })
+
+test("a drawing is the document's, not a feature of the part: it leaves the part's history", async () => {
+  const { partChapters } = await import('../src/lib/chapters-api.ts')
+  const cs = [ch({ kind: 'box', anchor: 0 }), ch({ kind: 'drawing.create_from_part', anchor: 1 }), ch({ kind: 'hole', anchor: 3 })]
+  const { part, documents } = partChapters(cs)
+  assert.deepEqual(part.map((c) => c.anchor), [0, 3])
+  assert.deepEqual(documents.map((c) => c.anchor), [1])
+})

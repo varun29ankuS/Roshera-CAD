@@ -24,6 +24,7 @@ import {
 } from '@/lib/timeline-events'
 import { DecisionRail, DurabilityChip } from './TimelineDecisions'
 import { FilmStrip } from './FilmStrip'
+import { TimelineSlider } from './TimelineSlider'
 import { useChapters } from '@/hooks/use-chapters'
 
 // Graph ("map") view — a second, toggleable view alongside this strip
@@ -1784,6 +1785,8 @@ export function Timeline() {
               once there are features; the ops strip keeps the honest empty
               and boot-failure states. */}
           {chapterState.chapters.length > 0 ? (
+            <div className="flex min-w-0 flex-1 flex-col">
+            <TimelineSlider chapters={chapterState.chapters} />
             <FilmStrip
               chapters={chapterState.chapters}
               onFrameContextMenu={(e, anchor) => {
@@ -1791,6 +1794,7 @@ export function Timeline() {
                 if (event) handleEventContextMenu(e, event)
               }}
             />
+            </div>
           ) : (
             <RecentOpsStrip
               events={events}
