@@ -3,6 +3,13 @@ import * as THREE from 'three'
 import { Html } from '@react-three/drei'
 import { useThree, type ThreeEvent } from '@react-three/fiber'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
+import { useExtrudeStore } from '@/stores/extrude-store'
+import {
+  commitFaceExtrude,
+  faceExtrudeBody,
+  previewFaceExtrude,
+  type PreviewMesh,
+} from '@/lib/face-extrude'
 
 /**
  * Direct-modeling face-pull gizmo. Visible whenever exactly one face is
@@ -51,11 +58,6 @@ import { useSceneStore, type CADObject } from '@/stores/scene-store'
 const EXTRUDE_STEP = 0.1
 const PREVIEW_DEBOUNCE_MS = 50
 
-type PreviewMesh = {
-  vertices: number[]
-  indices: number[]
-  normals: number[]
-}
 
 export function ExtrudeGizmo() {
   const subElementSelections = useSceneStore((s) => s.subElementSelections)
@@ -145,6 +147,19 @@ export function ExtrudeGizmo() {
     }
     return { origin: centroid, axis: accumNormal }
   }, [sel, meshRefs, objects])
+
+  // The Extrude panel extrudes the face this arrow sits on.
+  useEffect(() => {
+    useExtrudeStore
+      .getState()
+      .setTarget(
+        sel && transform
+          ? { objectId: sel.objectId, faceId: sel.index, axis: [transform.axis.x, transform.axis.y, transform.axis.z] }
+          : null,
+      )
+  }, [sel, transform])
+  const typedPreview = useExtrudeStore((s) => (s.open ? s.preview : null))
+  const typedDistance = useExtrudeStore((s) => (s.open ? s.distance : null))
 
   const [active, setActive] = useState(false)
   // Two independent hover states so each arrow's tint reflects only
@@ -327,57 +342,14 @@ export function ExtrudeGizmo() {
       const seq = ++previewSeqRef.current
       previewLastDistanceRef.current = snapped
       try {
-        const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
-        const resp = await fetch(
-          `${API_BASE}/geometry/face/extrude/preview`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              object_uuid: objectId,
-              face_id: faceId,
-              distance: snapped,
-              direction: [axis.x, axis.y, axis.z],
-            }),
-            signal: controller.signal,
-          },
+        // The same request the Extrude panel sends (lib/face-extrude.ts).
+        // A sequence guard drops a slower answer from an earlier tick.
+        const mesh = await previewFaceExtrude(
+          faceExtrudeBody(objectId, faceId, snapped, [axis.x, axis.y, axis.z]),
+          controller.signal,
         )
-        // Sequence guard: a slower response from an earlier dispatch
-        // must not clobber a newer ghost. Abort already pushes us
-        // into the catch branch in modern browsers, but the guard
-        // also covers the case where the request resolved with a
-        // body before abort took effect.
-        if (seq !== previewSeqRef.current) return
-        if (!resp.ok) {
-          // Non-2xx responses are silently swallowed for preview —
-          // we don't want a noisy console for every drag tick that
-          // produced a degenerate intermediate state. The commit
-          // path still surfaces real errors.
-          return
-        }
-        const data = (await resp.json()) as {
-          mesh?: {
-            vertices?: number[]
-            indices?: number[]
-            normals?: number[]
-          }
-        }
-        if (seq !== previewSeqRef.current) return
-        const mesh = data.mesh
-        if (
-          !mesh ||
-          !Array.isArray(mesh.vertices) ||
-          !Array.isArray(mesh.indices) ||
-          !Array.isArray(mesh.normals) ||
-          mesh.indices.length === 0
-        ) {
-          return
-        }
-        setPreviewMesh({
-          vertices: mesh.vertices,
-          indices: mesh.indices,
-          normals: mesh.normals,
-        })
+        if (seq !== previewSeqRef.current || !mesh) return
+        setPreviewMesh(mesh)
       } catch (err) {
         // AbortError is the expected path when a newer dispatch
         // supersedes us; ignore. Anything else is a network error
@@ -435,39 +407,21 @@ export function ExtrudeGizmo() {
     ) => {
       setSubmitting(true)
       try {
-        const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
-        // Pin the direction to the same vector the gizmo renders. Without
-        // this, the backend falls back to `face.normal_at(0.5, 0.5)` which
-        // for a closed curved face (cone lateral, cylinder side, sphere)
-        // gives a radial / perpendicular-to-slant normal that disagrees
-        // with the axial arrow the user sees, producing tilted side faces
-        // and a non-manifold shell.
-        const resp = await fetch(`${API_BASE}/geometry/face/extrude`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            object_uuid: objectId,
-            face_id: faceId,
-            distance: finalDistance,
-            direction: [axis.x, axis.y, axis.z],
-          }),
-        })
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({}))
-           
-          console.error(
-            '[ExtrudeGizmo] face/extrude failed:',
-            resp.status,
-            err?.message || err?.error || resp.statusText,
-          )
+        // Pin the direction to the same vector the gizmo renders: for a
+        // closed curved face the backend's own default normal disagrees
+        // with the axial arrow the user sees.
+        const result = await commitFaceExtrude(
+          faceExtrudeBody(objectId, faceId, finalDistance, [axis.x, axis.y, axis.z]),
+        )
+        if (!result.ok) {
+          console.error('[ExtrudeGizmo] face/extrude failed:', result.reason)
         }
         // Backend broadcasts ObjectDeleted + ObjectCreated; the local
         // scene store reconciles via ws-bridge. The selection is
         // cleared because the host UUID is retired — and a fresh face
         // selection has to be made on the new solid.
       } catch (err) {
-         
-        console.error('[ExtrudeGizmo] face/extrude network error:', err)
+        console.error('[ExtrudeGizmo] face/extrude refused before sending:', err)
       } finally {
         setSubmitting(false)
         setDistance(0)
@@ -506,20 +460,22 @@ export function ExtrudeGizmo() {
   // hashes to "once per preview tick". The geometry's previous
   // `.dispose()` is called inside the same memo to free the WebGL
   // buffers before the next one allocates.
+  // A drag's own ghost wins; otherwise the typed distance's (Extrude panel).
+  const ghost = previewMesh ?? (active ? null : typedPreview)
   const previewGeometry = useMemo(() => {
-    if (!previewMesh) return null
+    if (!ghost) return null
     const geometry = new THREE.BufferGeometry()
     geometry.setAttribute(
       'position',
-      new THREE.Float32BufferAttribute(previewMesh.vertices, 3),
+      new THREE.Float32BufferAttribute(ghost.vertices, 3),
     )
     geometry.setAttribute(
       'normal',
-      new THREE.Float32BufferAttribute(previewMesh.normals, 3),
+      new THREE.Float32BufferAttribute(ghost.normals, 3),
     )
-    geometry.setIndex(previewMesh.indices)
+    geometry.setIndex(ghost.indices)
     return geometry
-  }, [previewMesh])
+  }, [ghost])
 
   // Dispose the previous geometry when this hook re-runs or the
   // gizmo unmounts. `previewGeometry` holds onto GPU buffers; React
@@ -595,8 +551,10 @@ export function ExtrudeGizmo() {
   // -arrow grows when distance < 0 — so the visual unambiguously
   // reflects which way the face is moving regardless of which arrow
   // the user grabbed.
-  const posShaft = Math.max(SHAFT_BASE, SHAFT_BASE + Math.max(0, distance))
-  const negShaft = Math.max(SHAFT_BASE, SHAFT_BASE + Math.max(0, -distance))
+  // The arrow shows a typed distance too, while the Extrude panel previews.
+  const shown = active ? distance : (typedDistance ?? distance)
+  const posShaft = Math.max(SHAFT_BASE, SHAFT_BASE + Math.max(0, shown))
+  const negShaft = Math.max(SHAFT_BASE, SHAFT_BASE + Math.max(0, -shown))
 
   // While idle, both arrows render so the user can pick a direction.
   // While dragging, only the picked arrow renders so the opposite
@@ -611,7 +569,7 @@ export function ExtrudeGizmo() {
         ? '#ffaa00'
         : '#ff8800'
 
-  const showReadout = active || Math.abs(distance) > 1e-4
+  const showReadout = active || Math.abs(shown) > 1e-4
 
   // Tip offset for the readout — anchor on whichever arrow currently
   // dominates so the readout follows the active drag.
@@ -640,6 +598,12 @@ export function ExtrudeGizmo() {
             side={THREE.DoubleSide}
             metalness={0.0}
             roughness={0.8}
+            // The ghost is the whole resulting part; where it coincides with
+            // the unchanged part it would fight it for depth and speckle.
+            // Pulled toward the camera, it tints those faces evenly instead.
+            polygonOffset
+            polygonOffsetFactor={-2}
+            polygonOffsetUnits={-4}
           />
         </mesh>
       )}
@@ -695,8 +659,8 @@ export function ExtrudeGizmo() {
           <div className="cad-panel cad-readout px-2 py-1 text-[11px] uppercase tracking-wider whitespace-nowrap">
             <span className="text-muted-foreground mr-2">PULL</span>
             <span className="text-foreground tabular-nums">
-              {distance >= 0 ? '+' : ''}
-              {distance.toFixed(1)}
+              {shown >= 0 ? '+' : ''}
+              {shown.toFixed(1)}
             </span>
           </div>
         </Html>

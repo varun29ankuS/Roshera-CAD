@@ -8,6 +8,7 @@ import {
   ToolIcons,
   type LucideIcon,
 } from '@/components/ui/icons'
+import { useExtrudeStore } from '@/stores/extrude-store'
 import { useSceneStore, type TransformTool } from '@/stores/scene-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { processBlackboardMessage } from '@/lib/ai-client'
@@ -1342,7 +1343,16 @@ export function ToolBar() {
         {
           label: 'Solid',
           items: [
-            { icon: ToolIcons.extrude, label: 'Extrude', action: () => notYetWired('Extrude', 'use Sketch → Finish → Extrude flow') },
+            {
+              icon: ToolIcons.extrude,
+              label: 'Extrude',
+              // Pick a face, type a distance (ExtrudePanel); a sketch still
+              // extrudes from Sketch → Finish.
+              action: () => {
+                useSceneStore.getState().setSelectionMode('face')
+                useExtrudeStore.getState().setOpen(true)
+              },
+            },
             { icon: ToolIcons.revolve, label: 'Revolve', action: () => notYetWired('Revolve') },
             { icon: ToolIcons.loft, label: 'Loft', action: () => notYetWired('Loft') },
             { icon: ToolIcons.sweep, label: 'Sweep', action: () => notYetWired('Sweep') },

@@ -9,6 +9,7 @@ import { PropertiesPanel } from '@/components/panels/PropertiesPanel'
 import { Blackboard } from '@/components/panels/Blackboard'
 import { ModelTree } from '@/components/panels/ModelTree'
 import { DfmPanel } from '@/components/panels/DfmPanel'
+import { ExtrudePanel } from '@/components/panels/ExtrudePanel'
 import { Timeline } from '@/components/panels/Timeline'
 import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
 import { AssemblyWorkspace } from '@/components/panels/AssemblyWorkspace'
@@ -193,6 +194,11 @@ export function App() {
                   expanded={browserOpen}
                   onToggle={() => setBrowserOpen((open) => !open)}
                 />
+              </div>
+
+              {/* A feature tool's panel (Extrude), top centre over the model. */}
+              <div className="pointer-events-none absolute left-[15.5rem] right-[21rem] top-14 z-30 flex justify-center">
+                <ExtrudePanel />
               </div>
 
               {/* DFM: the check's panel sits where the tree is, wider and
