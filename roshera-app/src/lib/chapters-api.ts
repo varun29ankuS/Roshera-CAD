@@ -79,6 +79,7 @@ const KIND_LABEL: Record<string, string> = {
   torus: 'Torus',
   transform: 'Move',
   set_name: 'Name',
+  'drawing.create_from_part': 'Drawing',
 }
 
 function readable(kind: string): string {

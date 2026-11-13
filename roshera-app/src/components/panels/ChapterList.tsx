@@ -9,6 +9,7 @@ import { useState } from 'react'
 import { cn } from '@/lib/utils'
 import { chapterIconKey, chapterTitle, type Chapter } from '@/lib/chapters-api'
 import { useChapters } from '@/hooks/use-chapters'
+import { useHistoryView } from '@/stores/history-view-store'
 import { Bot, Box, Check, ChevronDown, ChevronRight, User, X, ToolIcons } from '@/components/ui/icons'
 
 function ChapterIcon({ c, size }: { c: Chapter; size: number }) {
@@ -118,7 +119,21 @@ function Row({
 
 export function ChapterList({ branch = 'main' }: { branch?: string }) {
   const { chapters, loading, error } = useChapters(branch)
-  const [selected, setSelected] = useState<number | null>(null)
+  const viewing = useHistoryView((s) => s.step)
+  const view = useHistoryView((s) => s.view)
+  const last = chapters[chapters.length - 1]
+  // The row the viewport is showing: a past chapter, or the last (live).
+  const selected = viewing ?? last?.anchor ?? null
+  const select = (anchor: number) => {
+    if (anchor === last?.anchor) {
+      view(null)
+      return
+    }
+    const find = (cs: Chapter[]): Chapter | undefined =>
+      cs.find((c) => c.anchor === anchor) ?? cs.map((c) => find(c.instances)).find(Boolean)
+    const c = find(chapters)
+    view(anchor, c ? chapterTitle(c) : null, branch)
+  }
 
   if (error && chapters.length === 0) {
     return <div className="px-3 py-2 text-[11px] text-destructive">history unavailable — {error}</div>
@@ -133,7 +148,7 @@ export function ChapterList({ branch = 'main' }: { branch?: string }) {
   return (
     <ul role="tree" aria-label="Part history" className="px-1 py-1">
       {chapters.map((c) => (
-        <Row key={c.anchor} c={c} depth={0} selected={selected} onSelect={setSelected} />
+        <Row key={c.anchor} c={c} depth={0} selected={selected} onSelect={select} />
       ))}
     </ul>
   )

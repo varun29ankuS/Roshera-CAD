@@ -1,3 +1,4 @@
+import { HistoryViewBanner } from './HistoryViewBanner'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
 import {
@@ -226,6 +227,7 @@ export function CADViewport() {
       <DimensionKindChips />
       <ViewportHints />
       <ModeBanner />
+      <HistoryViewBanner />
       <MatePickHintBanner />
       <SectionViewPanel />
       <ViewportContextMenu />
