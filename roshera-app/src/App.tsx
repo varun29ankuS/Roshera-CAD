@@ -198,7 +198,7 @@ export function App() {
               {/* DFM: the check's panel sits where the tree is, wider and
                   solid -- its findings are read, not looked through. */}
               {docMode === 'dfm' && (
-                <div className="absolute bottom-2 left-2 top-2 z-20 flex w-72 flex-col overflow-hidden rounded border border-border bg-card/95">
+                <div className="absolute bottom-12 left-2 top-2 z-20 flex w-72 flex-col overflow-hidden rounded border border-border bg-card/95">
                   <DfmPanel />
                 </div>
               )}
@@ -217,7 +217,10 @@ export function App() {
               {/* Agent Eye: a RENDER of the part, which makes it an instrument
                   of the model rather than of the dialogue. Bottom-right, out of
                   the tree's corner, and it keeps its own collapse. */}
-              <div className="absolute bottom-24 right-[21rem] z-10 flex w-56 flex-col overflow-hidden rounded border border-border bg-card/95">
+              {/* Bottom left, beside the history strip, bottom-aligned with it
+                  and folded until opened (Varun 2026-11-13). Opened, it grows
+                  upward. */}
+              <div className="absolute bottom-2 left-2 z-10 flex w-56 flex-col overflow-hidden rounded-lg border border-border bg-card/95">
                 <AgentEyePanel defaultMinimized />
               </div>
 
