@@ -2,12 +2,10 @@ import { useMemo } from 'react'
 import { useThemeStore } from '@/stores/theme-store'
 
 /**
- * Scene lighting that follows the active blueprint theme.
- *
- * Light theme: warm cream sky / paper ground bounce — geometry reads as
- * if lit on a drafting table.
- * Dark theme: cool cyan key / saturated navy ground bounce — geometry
- * reads as if lit under a hooded engineering lamp.
+ * Scene lighting that follows the theme. Neutral, like the mockup's kernel
+ * renders (2026-11-14): white key and a soft grey sky/ground bounce, so a
+ * part reads light grey with crisp edges and no colour cast. The dark theme
+ * keeps the same neutrality, a little dimmer.
  */
 export function SceneLighting() {
   const theme = useThemeStore((s) => s.theme)
@@ -15,25 +13,27 @@ export function SceneLighting() {
   const palette = useMemo(() => {
     if (theme === 'dark') {
       return {
-        ambient: '#c8cde8',
+        ambient: '#e4e6ea',
         keyLight: '#ffffff',
-        fillLight: '#b0c4de',
-        hemiSky: '#7090c0',
-        hemiGround: '#1e1e2e',
+        fillLight: '#c9ced6',
+        hemiSky: '#9aa3ae',
+        hemiGround: '#2a2d33',
+        ambientIntensity: 0.6,
       }
     }
     return {
-      ambient: '#f0e8d8',
+      ambient: '#ffffff',
       keyLight: '#ffffff',
-      fillLight: '#d4c8b0',
-      hemiSky: '#e8e0c8',
-      hemiGround: '#b0a890',
+      fillLight: '#e6e8eb',
+      hemiSky: '#f4f5f7',
+      hemiGround: '#a7adb4',
+      ambientIntensity: 0.75,
     }
   }, [theme])
 
   return (
     <>
-      <ambientLight intensity={0.6} color={palette.ambient} />
+      <ambientLight intensity={palette.ambientIntensity} color={palette.ambient} />
       <directionalLight
         position={[15, 25, 10]}
         intensity={1.0}
@@ -62,7 +62,7 @@ export function SceneLighting() {
         intensity={0.4}
         color={palette.fillLight}
       />
-      <hemisphereLight args={[palette.hemiSky, palette.hemiGround, 0.4]} />
+      <hemisphereLight args={[palette.hemiSky, palette.hemiGround, 0.5]} />
     </>
   )
 }

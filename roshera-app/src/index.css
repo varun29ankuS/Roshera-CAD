@@ -5,27 +5,28 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* ─── Light theme — Off-white drafting paper ─────────────────────────
-   Warm cream paper ground (hue 90, slight chroma) with deep navy strokes
-   and type (hue 252). Single-hue palette: every surface, border, and bit
-   of text reads as ink-on-paper. Shadows are nearly invisible — depth
-   comes from line weight, not elevation. */
+/* ─── Light theme — the approved mockup's palette (2026-11-14) ──────────
+   Neutral warm greys (panels #F6F6F4, cards #FBFBFA, fields #ECECE8,
+   borders #DCDCD6), near-black ink (#1D2125) and secondary text (#5B636C);
+   amber (#F2A516) is the one accent, for what is selected, and blue
+   (#2F6FDB) marks focus. Varun 2026-11-13: the mockup's colours, over the
+   earlier cream-and-navy drafting paper. */
 :root {
   --radius: 0.25rem;
-  --background: oklch(0.965 0.012 90);
-  --foreground: oklch(0.22 0.07 252);
-  --card: oklch(0.945 0.012 90);
-  --card-foreground: oklch(0.22 0.07 252);
-  --popover: oklch(0.97 0.012 90);
-  --popover-foreground: oklch(0.22 0.07 252);
-  --primary: oklch(0.30 0.10 252);
-  --primary-foreground: oklch(0.97 0.012 90);
-  --secondary: oklch(0.91 0.015 90);
-  --secondary-foreground: oklch(0.22 0.07 252);
-  --muted: oklch(0.92 0.012 90);
-  --muted-foreground: oklch(0.42 0.06 252);
-  --accent: oklch(0.88 0.025 252);
-  --accent-foreground: oklch(0.22 0.07 252);
+  --background: oklch(0.973 0.002 106);
+  --foreground: oklch(0.24 0.008 250);
+  --card: oklch(0.988 0.001 106);
+  --card-foreground: oklch(0.24 0.008 250);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.24 0.008 250);
+  --primary: oklch(0.24 0.008 250);
+  --primary-foreground: oklch(0.973 0.002 106);
+  --secondary: oklch(0.94 0.004 106);
+  --secondary-foreground: oklch(0.24 0.008 250);
+  --muted: oklch(0.94 0.004 106);
+  --muted-foreground: oklch(0.49 0.017 250);
+  --accent: oklch(0.925 0.005 106);
+  --accent-foreground: oklch(0.24 0.008 250);
   --destructive: oklch(0.50 0.20 25);
   --destructive-foreground: oklch(0.97 0.012 90);
   /* HAIRLINE, not a pen. This was oklch(0.55 0.08 252) — nearly as dark as body
@@ -55,38 +56,38 @@
   --negative-border: oklch(0.80 0.08 25);
 
   /* Selection needs a wash for list rows, not only a geometry highlight. */
-  --cad-selected-wash: oklch(0.65 0.18 60 / 0.16);
+  --cad-selected-wash: oklch(0.78 0.16 75 / 0.18);
 
-  --border: oklch(0.88 0.015 252);
-  --border-strong: oklch(0.55 0.08 252);
-  --input: oklch(0.85 0.03 252);
-  --ring: oklch(0.30 0.10 252);
+  --border: oklch(0.889 0.007 106);
+  --border-strong: oklch(0.62 0.012 250);
+  --input: oklch(0.86 0.007 106);
+  --ring: oklch(0.55 0.17 260);
   /* Charts stay in the navy/cyan family — no rainbow palettes. */
-  --chart-1: oklch(0.30 0.10 252);
-  --chart-2: oklch(0.45 0.12 220);
-  --chart-3: oklch(0.55 0.10 200);
-  --chart-4: oklch(0.65 0.13 60);
+  --chart-1: oklch(0.24 0.008 250);
+  --chart-2: oklch(0.55 0.17 260);
+  --chart-3: oklch(0.60 0.12 200);
+  --chart-4: oklch(0.78 0.16 75);
   --chart-5: oklch(0.50 0.20 25);
-  --sidebar-background: oklch(0.945 0.012 90);
-  --sidebar-foreground: oklch(0.30 0.07 252);
-  --sidebar-primary: oklch(0.30 0.10 252);
-  --sidebar-primary-foreground: oklch(0.97 0.012 90);
-  --sidebar-accent: oklch(0.88 0.025 252);
-  --sidebar-accent-foreground: oklch(0.22 0.07 252);
-  --sidebar-border: oklch(0.55 0.08 252);
-  --sidebar-ring: oklch(0.30 0.10 252);
-  --sidebar: oklch(0.945 0.012 90);
+  --sidebar-background: oklch(0.973 0.002 106);
+  --sidebar-foreground: oklch(0.24 0.008 250);
+  --sidebar-primary: oklch(0.24 0.008 250);
+  --sidebar-primary-foreground: oklch(0.973 0.002 106);
+  --sidebar-accent: oklch(0.925 0.005 106);
+  --sidebar-accent-foreground: oklch(0.24 0.008 250);
+  --sidebar-border: oklch(0.889 0.007 106);
+  --sidebar-ring: oklch(0.55 0.17 260);
+  --sidebar: oklch(0.973 0.002 106);
 
   /* CAD-specific tokens — fine graph-paper grid in navy on cream. */
-  --cad-grid: oklch(0.55 0.08 252 / 0.25);
-  --cad-grid-section: oklch(0.45 0.10 252 / 0.45);
-  --cad-tick: oklch(0.30 0.10 252 / 0.85);
-  --cad-selected: oklch(0.65 0.18 60);   /* warm yellow — single accent */
-  --cad-hovered: oklch(0.45 0.12 220);
-  --cad-face-selected: oklch(0.65 0.18 60 / 0.30);
+  --cad-grid: oklch(0.24 0.008 250 / 0.07);
+  --cad-grid-section: oklch(0.24 0.008 250 / 0.14);
+  --cad-tick: oklch(0.24 0.008 250 / 0.8);
+  --cad-selected: oklch(0.78 0.16 75);   /* warm yellow — single accent */
+  --cad-hovered: oklch(0.55 0.17 260);
+  --cad-face-selected: oklch(0.78 0.16 75 / 0.32);
   --cad-edge-selected: oklch(0.78 0.18 95);  /* yellow — saturated enough to read against cream viewport on thin lines */
   --cad-vertex-selected: oklch(0.55 0.20 25);
-  --cad-viewport-bg: oklch(0.955 0.012 90);
+  --cad-viewport-bg: oklch(0.947 0.004 248);
 
   /* Blueprint UIs are line-based — shadows nearly invisible. Kept only
      for genuinely floating popovers so they don't fuse with content. */
@@ -97,26 +98,25 @@
     0 2px 4px -2px oklch(0.22 0.07 252 / 0.10);
 }
 
-/* ─── Dark theme — Navy blueprint ─────────────────────────────────────
-   Saturated navy ground (hue 252, real chroma 0.05+) with neutral white
-   strokes and type. Reads as engineering blueprint / mission control
-   rather than neutral dark mode. Destructive red is the only warm
-   accent kept. */
+/* ─── Dark theme — charcoal, the mockup's dark palette (2026-11-14) ─────
+   #1E2024 ground, #24272C cards, #2E3238 fields, #363A41 borders, #E7E9EC
+   ink, #A1A9B3 secondary text, viewport #2A2D33; the same amber for
+   selection. Replaces the navy blueprint. */
 .dark {
-  --background: oklch(0.16 0.055 252);
-  --foreground: oklch(0.95 0 0);
-  --card: oklch(0.20 0.055 252);
-  --card-foreground: oklch(0.95 0 0);
-  --popover: oklch(0.20 0.060 252);
-  --popover-foreground: oklch(0.95 0 0);
-  --primary: oklch(0.92 0 0);
-  --primary-foreground: oklch(0.16 0.055 252);
-  --secondary: oklch(0.24 0.055 252);
-  --secondary-foreground: oklch(0.95 0 0);
-  --muted: oklch(0.22 0.050 252);
-  --muted-foreground: oklch(0.70 0 0);
-  --accent: oklch(0.28 0.065 252);
-  --accent-foreground: oklch(0.95 0 0);
+  --background: oklch(0.235 0.008 265);
+  --foreground: oklch(0.93 0.004 250);
+  --card: oklch(0.265 0.009 260);
+  --card-foreground: oklch(0.93 0.004 250);
+  --popover: oklch(0.29 0.01 258);
+  --popover-foreground: oklch(0.93 0.004 250);
+  --primary: oklch(0.93 0.004 250);
+  --primary-foreground: oklch(0.235 0.008 265);
+  --secondary: oklch(0.31 0.01 255);
+  --secondary-foreground: oklch(0.93 0.004 250);
+  --muted: oklch(0.31 0.01 255);
+  --muted-foreground: oklch(0.72 0.016 250);
+  --accent: oklch(0.335 0.011 258);
+  --accent-foreground: oklch(0.93 0.004 250);
   --destructive: oklch(0.65 0.22 25);
   --destructive-foreground: oklch(0.97 0.012 90);
   /* Same split on the dark ground: a hairline that separates without drawing
@@ -134,39 +134,39 @@
   --negative-wash: oklch(0.27 0.05 25);
   --negative-border: oklch(0.45 0.10 25);
 
-  --cad-selected-wash: oklch(0.72 0.17 70 / 0.20);
+  --cad-selected-wash: oklch(0.78 0.16 75 / 0.18);
 
-  --border: oklch(0.34 0 0);
-  --border-strong: oklch(0.55 0 0);
-  --input: oklch(0.28 0.060 252);
-  --ring: oklch(0.92 0 0);
+  --border: oklch(0.34 0.01 260);
+  --border-strong: oklch(0.55 0.012 255);
+  --input: oklch(0.33 0.01 258);
+  --ring: oklch(0.70 0.13 260);
   /* Charts: neutral white-on-navy; destructive red preserved as the single
      warm accent so error/danger remains visually distinct. */
-  --chart-1: oklch(0.92 0 0);
-  --chart-2: oklch(0.78 0 0);
-  --chart-3: oklch(0.62 0 0);
-  --chart-4: oklch(0.85 0 0);
+  --chart-1: oklch(0.93 0.004 250);
+  --chart-2: oklch(0.70 0.13 260);
+  --chart-3: oklch(0.70 0.10 200);
+  --chart-4: oklch(0.80 0.15 75);
   --chart-5: oklch(0.65 0.20 25);
-  --sidebar-background: oklch(0.14 0.050 252);
-  --sidebar-foreground: oklch(0.92 0 0);
-  --sidebar-primary: oklch(0.92 0 0);
-  --sidebar-primary-foreground: oklch(0.16 0.055 252);
-  --sidebar-accent: oklch(0.26 0.060 252);
-  --sidebar-accent-foreground: oklch(0.95 0 0);
-  --sidebar-border: oklch(0.55 0 0);
-  --sidebar-ring: oklch(0.92 0 0);
-  --sidebar: oklch(0.14 0.050 252);
+  --sidebar-background: oklch(0.235 0.008 265);
+  --sidebar-foreground: oklch(0.93 0.004 250);
+  --sidebar-primary: oklch(0.93 0.004 250);
+  --sidebar-primary-foreground: oklch(0.235 0.008 265);
+  --sidebar-accent: oklch(0.335 0.011 258);
+  --sidebar-accent-foreground: oklch(0.93 0.004 250);
+  --sidebar-border: oklch(0.34 0.01 260);
+  --sidebar-ring: oklch(0.70 0.13 260);
+  --sidebar: oklch(0.235 0.008 265);
 
   /* CAD-specific tokens — fine white graph-paper grid on navy. */
   --cad-grid: oklch(1 0 0 / 0.05);
-  --cad-grid-section: oklch(1 0 0 / 0.14);
-  --cad-tick: oklch(1 0 0 / 0.85);
-  --cad-selected: oklch(0.95 0 0);
-  --cad-hovered: oklch(0.92 0 0);
-  --cad-face-selected: oklch(1 0 0 / 0.25);
+  --cad-grid-section: oklch(1 0 0 / 0.11);
+  --cad-tick: oklch(1 0 0 / 0.8);
+  --cad-selected: oklch(0.80 0.15 75);
+  --cad-hovered: oklch(0.70 0.13 260);
+  --cad-face-selected: oklch(0.80 0.15 75 / 0.30);
   --cad-edge-selected: oklch(0.88 0.18 95);  /* yellow — chroma bumped so it reads against navy viewport on thin lines */
   --cad-vertex-selected: oklch(0.95 0 0);
-  --cad-viewport-bg: oklch(0.16 0.10 258);
+  --cad-viewport-bg: oklch(0.29 0.01 260);
 
   /* Blueprint dark mode — shadows essentially absent. The white border
      stroke is what reads as panel edge. */

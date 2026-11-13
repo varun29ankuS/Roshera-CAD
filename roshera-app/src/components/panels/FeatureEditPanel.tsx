@@ -49,6 +49,8 @@ export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
   const chapter = findChapter(chapters, selected)
 
   const [params, setParams] = useState<EditableParameter[]>([])
+  // Why the sizes could not be read (the server unreachable or refusing).
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [outcome, setOutcome] = useState<Outcome>(null)
   const [reload, setReload] = useState(0)
@@ -60,10 +62,14 @@ export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
     let live = true
     fetchEditableParameters(branch)
       .then((p) => {
-        if (live) setParams(p)
+        if (!live) return
+        setParams(p)
+        setLoadError(null)
       })
-      .catch(() => {
-        if (live) setParams([])
+      .catch((e: unknown) => {
+        if (!live) return
+        setParams([])
+        setLoadError(e instanceof Error ? e.message : String(e))
       })
     return () => {
       live = false
@@ -107,7 +113,11 @@ export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
           <X size={13} />
         </button>
       </div>
-      {fields.length === 0 ? (
+      {loadError ? (
+        <p className="px-2.5 pb-2.5 text-[11px] text-red-700 dark:text-red-300">
+          Could not read this feature's sizes ({loadError}). Is the server running?
+        </p>
+      ) : fields.length === 0 ? (
         <p className="px-2.5 pb-2.5 text-[11px] text-muted-foreground">
           This feature has no sizes to edit here.
         </p>
