@@ -10,6 +10,7 @@ import { Blackboard } from '@/components/panels/Blackboard'
 import { ModelTree } from '@/components/panels/ModelTree'
 import { DfmPanel } from '@/components/panels/DfmPanel'
 import { ExtrudePanel } from '@/components/panels/ExtrudePanel'
+import { ViewBar } from '@/components/viewport/ViewBar'
 import { FeatureEditPanel } from '@/components/panels/FeatureEditPanel'
 import { Timeline } from '@/components/panels/Timeline'
 import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
@@ -199,6 +200,11 @@ export function App() {
                     <FeatureEditPanel />
                   </div>
                 )}
+              </div>
+
+              {/* The view bar, top centre over the model (the approved mockup). */}
+              <div className="pointer-events-none absolute left-[15.5rem] right-[21rem] top-2 z-20 flex justify-center">
+                <ViewBar />
               </div>
 
               {/* A feature tool's panel (Extrude), top centre over the model. */}

@@ -18,7 +18,7 @@ export function SceneLighting() {
         fillLight: '#c9ced6',
         hemiSky: '#9aa3ae',
         hemiGround: '#2a2d33',
-        ambientIntensity: 0.6,
+        ambientIntensity: 0.4,
       }
     }
     return {
@@ -27,16 +27,21 @@ export function SceneLighting() {
       fillLight: '#e6e8eb',
       hemiSky: '#f4f5f7',
       hemiGround: '#a7adb4',
-      ambientIntensity: 0.75,
+      ambientIntensity: 0.45,
     }
   }, [theme])
 
   return (
     <>
       <ambientLight intensity={palette.ambientIntensity} color={palette.ambient} />
+      {/* Z-up world (main.tsx sets DEFAULT_UP): the key light is above the
+          part, in front and to the right -- the default iso camera's side --
+          so the tops and the faces you look at are lit. (It sat at
+          [15, 25, 10], "above" only in a Y-up world: behind the part, with
+          the fill below it, which left the part dark.) */}
       <directionalLight
-        position={[15, 25, 10]}
-        intensity={1.0}
+        position={[20, -25, 35]}
+        intensity={2.4}
         color={palette.keyLight}
         castShadow
         shadow-mapSize-width={4096}
@@ -58,8 +63,8 @@ export function SceneLighting() {
         shadow-normalBias={0.04}
       />
       <directionalLight
-        position={[-10, 10, -15]}
-        intensity={0.4}
+        position={[-25, 20, 12]}
+        intensity={0.8}
         color={palette.fillLight}
       />
       <hemisphereLight args={[palette.hemiSky, palette.hemiGround, 0.5]} />

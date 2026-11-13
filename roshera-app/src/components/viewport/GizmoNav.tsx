@@ -1,6 +1,23 @@
-import { GizmoHelper, GizmoViewport } from '@react-three/drei'
-import { useFrame } from '@react-three/fiber'
+import { GizmoHelper, GizmoViewcube } from '@react-three/drei'
+import { useFrame, type ThreeEvent } from '@react-three/fiber'
 import { useSceneStore } from '@/stores/scene-store'
+import { useThemeStore } from '@/stores/theme-store'
+
+/** The cube's faces in drei's order (+X, −X, +Y, −Y, +Z, −Z), named for the
+ *  kernel's Z-up world: +Y is the back, +Z the top. */
+const Z_UP_FACES = ['Right', 'Left', 'Back', 'Front', 'Top', 'Bottom']
+
+/** The app's camera preset for the cube face (or edge / corner) clicked:
+ *  its dominant axis. The presets carry the right up-vector for a Z-up
+ *  world; drei's own click tween assumes Y-up and degenerates on Top. */
+function presetForNormal(n: { x: number; y: number; z: number }): string {
+  const ax = Math.abs(n.x)
+  const ay = Math.abs(n.y)
+  const az = Math.abs(n.z)
+  if (az >= ax && az >= ay) return n.z > 0 ? 'top' : 'bottom'
+  if (ax >= ay) return n.x > 0 ? 'right' : 'left'
+  return n.y > 0 ? 'back' : 'front'
+}
 
 /**
  * Render-priority dance — the long version, because this has bitten us
@@ -27,23 +44,35 @@ import { useSceneStore } from '@/stores/scene-store'
  * avoids double-rendering the scene the frame the EffectComposer takes
  * over (and the frame it tears down).
  *
- * Axis colours keep the conventional X=red / Y=green / Z=blue encoding —
- * this widget's whole purpose is to disambiguate the three world axes.
- * Labels are rendered in black so they read clearly against the
- * saturated coloured spheres in both themes.
+ * The corner widget is a view cube (the approved mockup, 2026-11-14), its
+ * faces named for the kernel's Z-up world.
  */
 export function GizmoNav() {
   const hasOutlineTarget = useSceneStore(
     (s) => s.selectedIds.size > 0 || s.hoveredId !== null,
   )
+  const setCameraPreset = useSceneStore((s) => s.setCameraPreset)
+  const dark = useThemeStore((s) => s.theme) === 'dark'
+  const onFace = (e: ThreeEvent<MouseEvent>) => {
+    e.stopPropagation()
+    if (e.face) setCameraPreset(presetForNormal(e.face.normal))
+    return null
+  }
   return (
     <>
       <ManualSceneRender active={!hasOutlineTarget} />
       {/* Left of the docked Blackboard (w-80 = 320 px + its 8 px gap). */}
       <GizmoHelper alignment="top-right" margin={[72 + 336, 72]} renderPriority={2}>
-        <GizmoViewport
-          axisColors={['#e74c3c', '#2ecc71', '#3498db']}
-          labelColor="#000000"
+        {/* A view cube (the approved mockup): click a face, edge or corner
+            to look from that side. */}
+        <GizmoViewcube
+          faces={Z_UP_FACES}
+          color={dark ? '#33373e' : '#fbfbfa'}
+          hoverColor="#f2a516"
+          textColor={dark ? '#e7e9ec' : '#5b636c'}
+          strokeColor={dark ? '#555b63' : '#b9bdc2'}
+          opacity={1}
+          onClick={onFace}
         />
       </GizmoHelper>
     </>
