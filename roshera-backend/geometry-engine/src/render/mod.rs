@@ -53,7 +53,7 @@ pub enum CanonicalView {
 
 impl CanonicalView {
     /// Unit view direction (from camera toward the scene).
-    pub(crate) fn direction(self) -> Vector3 {
+    pub fn direction(self) -> Vector3 {
         match self {
             CanonicalView::Isometric => {
                 let inv = 1.0 / 3.0_f64.sqrt();
@@ -66,7 +66,7 @@ impl CanonicalView {
     }
 
     /// A world "up" hint that is never parallel to the view direction.
-    pub(crate) fn up_hint(self) -> Vector3 {
+    pub fn up_hint(self) -> Vector3 {
         match self {
             CanonicalView::Top => Vector3::new(0.0, 1.0, 0.0),
             _ => Vector3::new(0.0, 0.0, 1.0),
@@ -430,6 +430,44 @@ pub fn render_solids_dir(
     up_hint: Vector3,
     opts: &RenderOptions,
 ) -> Option<RenderFrame> {
+    let (merged, tri_colors) = merge_solids(model, solid_ids, colors, opts);
+    render_mesh_dir(&merged, dir, up_hint, opts, Some(&tri_colors), &[])
+}
+
+/// [`render_solids_dir`] lit by a fixed oblique `key_light` instead of the
+/// headlight. The headlight shades the three visible faces of an iso cube
+/// one identical grey (|n·view| = 1/√3 on each); a key light steps them to
+/// distinct values -- the presentation pictures (the timeline's film strip)
+/// need that to read as solids.
+pub fn render_solids_dir_lit(
+    model: &BRepModel,
+    solid_ids: &[SolidId],
+    colors: &[[u8; 3]],
+    dir: Vector3,
+    up_hint: Vector3,
+    key_light: Vector3,
+    opts: &RenderOptions,
+) -> Option<RenderFrame> {
+    let (merged, tri_colors) = merge_solids(model, solid_ids, colors, opts);
+    render_mesh_dir_marks(
+        &merged,
+        dir,
+        up_hint,
+        opts,
+        Some(&tri_colors),
+        &[],
+        Some(key_light),
+    )
+}
+
+/// Tessellate `solid_ids` into one mesh, with each triangle's base colour
+/// (`colors` parallel to `solid_ids`; missing entries light grey).
+fn merge_solids(
+    model: &BRepModel,
+    solid_ids: &[SolidId],
+    colors: &[[u8; 3]],
+    opts: &RenderOptions,
+) -> (TriangleMesh, Vec<[u8; 3]>) {
     const DEFAULT: [u8; 3] = [200, 200, 200];
     let mut merged = TriangleMesh::new();
     let mut tri_colors: Vec<[u8; 3]> = Vec::new();
@@ -452,7 +490,7 @@ pub fn render_solids_dir(
             tri_colors.push(col);
         }
     }
-    render_mesh_dir(&merged, dir, up_hint, opts, Some(&tri_colors), &[])
+    (merged, tri_colors)
 }
 
 /// INSTANCED scene render — the true-assembly eye. Each instance is a

@@ -11730,6 +11730,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/timeline/chapters/{branch_id}",
             get(crate::handlers::timeline::get_chapters),
         )
+        // The film strip's frames: a picture of the part right after a step.
+        .route(
+            "/api/timeline/frame/{branch_id}/{sequence}/picture",
+            get(crate::handlers::timeline::get_frame_picture),
+        )
         // Evidence-pack export (document scope): one call bundling a
         // branch's recorded operations + their certificates AS RECORDED,
         // final-state mass properties with provenance, and the agent's

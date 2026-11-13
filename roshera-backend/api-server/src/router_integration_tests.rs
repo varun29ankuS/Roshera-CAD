@@ -11980,3 +11980,49 @@ async fn the_timeline_lists_chapters_and_leaves_out_undone_steps() {
         "the undone subtract is not a chapter; body = {body}"
     );
 }
+
+/// The film strip shows a real picture of the part after each chapter
+/// (Varun 2026-11-13). The picture at a step is the model replayed to that
+/// step (frame cache) and rendered isometric, served as a PNG the timeline
+/// can use directly. The box before and after the drill are different
+/// pictures; a step the branch does not have is refused, never drawn as
+/// something else.
+#[tokio::test]
+async fn the_film_strip_pictures_the_part_as_it_stood_at_each_chapter() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+    let (_, body) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    let anchors: Vec<u64> = body["chapters"]
+        .as_array()
+        .expect("chapters")
+        .iter()
+        .filter_map(|c| c["anchor"].as_u64())
+        .collect();
+    assert_eq!(anchors.len(), 2, "box and hole; body = {body}");
+
+    let picture = |seq: u64| {
+        let state = state.clone();
+        async move {
+            dispatch_raw(
+                &state,
+                json_get(&format!("/api/timeline/frame/main/{seq}/picture?size=128")),
+            )
+            .await
+        }
+    };
+    let (s_box, png_box) = picture(anchors[0]).await;
+    let (s_hole, png_hole) = picture(anchors[1]).await;
+    assert_eq!((s_box, s_hole), (StatusCode::OK, StatusCode::OK));
+    for png in [&png_box, &png_hole] {
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "a PNG");
+        let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+        assert_eq!(w, 128, "at the requested size");
+    }
+    assert_ne!(
+        png_box, png_hole,
+        "the part before and after the drill differ"
+    );
+
+    let (s, _) = picture(9_999).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a step the branch does not have");
+}

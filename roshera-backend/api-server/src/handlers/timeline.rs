@@ -3188,6 +3188,96 @@ pub async fn get_chapters(
     })))
 }
 
+/// Query for [`get_frame_picture`]: the square image size in pixels
+/// (default 256, clamped to 32..=1024).
+#[derive(Deserialize)]
+pub struct FramePictureQuery {
+    #[serde(default)]
+    pub size: Option<usize>,
+}
+
+/// `GET /api/timeline/frame/{branch_id}/{sequence}/picture` — a picture of
+/// the part as it stood right after step `sequence` of the branch's applied
+/// history: the film strip's frames (Varun 2026-11-13). The model is the
+/// history replayed through the frame cache to that step (cached steps cost
+/// nothing), rendered by the kernel's software rasterizer from the fixed
+/// isometric view so frames compare, every solid at that step in one image.
+/// Served as `image/png`.
+///
+/// `404` when the applied history has no step `sequence`, or nothing solid
+/// stands at that step — never a picture of another step.
+pub async fn get_frame_picture(
+    State(state): State<AppState>,
+    Path((branch_id, sequence)): Path<(String, u64)>,
+    Query(q): Query<FramePictureQuery>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse;
+    use geometry_engine::render::{render_solids_dir_lit, CanonicalView, RenderOptions};
+
+    let _ = state.timeline_recorder.settle().await;
+    let branch_id = resolve_branch_ref(&branch_id)?;
+    let prefix = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        all.sort_by_key(|e| e.sequence_number);
+        let applied = timeline
+            .applied_count(&branch_id)
+            .map_err(|_| StatusCode::NOT_FOUND)? as usize;
+        all.truncate(applied);
+        let end = all
+            .iter()
+            .position(|e| e.sequence_number == sequence)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        all.truncate(end + 1);
+        all
+    };
+    let size = q.size.unwrap_or(256).clamp(32, 1024);
+    let frames = state.frames.clone();
+    let png = tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
+        let (model, _outcome, _stats) = frames.replay(&prefix);
+        let solids: Vec<geometry_engine::primitives::solid::SolidId> =
+            model.solids.iter().map(|(id, _)| id).collect();
+        if solids.is_empty() {
+            return None;
+        }
+        let opts = RenderOptions {
+            width: size,
+            height: size,
+            view: CanonicalView::Isometric,
+            ..Default::default()
+        };
+        let view = CanonicalView::Isometric;
+        // The pictorial key light the drawing's shaded view uses: high and
+        // behind-left, so an iso box shows three distinct face shades.
+        let key_light = geometry_engine::math::Vector3::new(-0.4, -0.6, 0.8)
+            .normalize()
+            .ok()?;
+        let frame = render_solids_dir_lit(
+            &model,
+            &solids,
+            &[],
+            view.direction(),
+            view.up_hint(),
+            key_light,
+            &opts,
+        )?;
+        frame.to_png().ok()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "image/png"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        png,
+    )
+        .into_response())
+}
+
 // ─── Evidence-pack export ───────────────────────────────────────────
 //
 // One call bundling a document's recorded design history into the
