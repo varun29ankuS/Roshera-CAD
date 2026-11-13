@@ -5,11 +5,12 @@
  * kernel's own reason). A pattern opens to its instances. Rows are chapters
  * grouped by the kernel from its recorded steps (GET /api/timeline/chapters).
  */
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { cn } from '@/lib/utils'
 import { chapterIconKey, chapterTitle, type Chapter } from '@/lib/chapters-api'
 import { useChapters } from '@/hooks/use-chapters'
 import { useHistoryView } from '@/stores/history-view-store'
+import { featureFields, fetchEditableParameters, sizeSummary, type EditableParameter } from '@/lib/feature-edit'
 import { Box, Check, ChevronDown, ChevronRight, X, ToolIcons } from '@/components/ui/icons'
 
 function ChapterIcon({ c, size }: { c: Chapter; size: number }) {
@@ -48,9 +49,12 @@ function Row({
   selected,
   onSelect,
   ahead = false,
+  params,
 }: {
   c: Chapter
   depth: number
+  /** Every size an edit can change, for the row's size column. */
+  params: EditableParameter[]
   selected: number | null
   onSelect: (anchor: number) => void
   /** After the slider's position: not applied in what the viewport shows. */
@@ -96,6 +100,11 @@ function Row({
         )}
         <ChapterIcon c={c} size={17} />
         <span className="min-w-0 flex-1 truncate text-[12px] text-foreground">{displayName(c)}</span>
+        {/* The feature's sizes as an engineer writes them (the mockup's size
+            column): Ø80 × 12, R3, 4× Ø8. */}
+        <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
+          {sizeSummary(c.kind, featureFields(c, params), c.instances.length)}
+        </span>
         {c.author === 'agent' && (
           <span aria-label="made by the agent" className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
         )}
@@ -111,7 +120,7 @@ function Row({
       {isPattern && open ? (
         <ul role="group">
           {c.instances.map((i) => (
-            <Row key={i.anchor} c={i} depth={depth + 1} selected={selected} onSelect={onSelect} ahead={ahead} />
+            <Row key={i.anchor} c={i} depth={depth + 1} selected={selected} onSelect={onSelect} ahead={ahead} params={params} />
           ))}
         </ul>
       ) : null}
@@ -127,6 +136,18 @@ export function ChapterList({ branch = 'main' }: { branch?: string }) {
   const selected = useHistoryView((s) => s.selectedChapter)
   const select = useHistoryView((s) => s.selectChapter)
   const viewing = useHistoryView((s) => s.step)
+  // The sizes, refetched whenever the history changes. A failure leaves the
+  // size column empty -- the rows and verdicts still stand.
+  const [params, setParams] = useState<EditableParameter[]>([])
+  useEffect(() => {
+    let live = true
+    fetchEditableParameters(branch)
+      .then((p) => live && setParams(p))
+      .catch(() => live && setParams([]))
+    return () => {
+      live = false
+    }
+  }, [branch, chapters])
 
   if (error && chapters.length === 0) {
     return <div className="px-3 py-2 text-[11px] text-destructive">history unavailable — {error}</div>
@@ -148,6 +169,7 @@ export function ChapterList({ branch = 'main' }: { branch?: string }) {
           selected={selected}
           onSelect={select}
           ahead={viewing !== null && c.anchor > viewing}
+          params={params}
         />
       ))}
     </ul>

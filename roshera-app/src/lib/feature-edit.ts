@@ -100,6 +100,44 @@ export function featureFields(feature: FeatureShape, params: EditableParameter[]
   return fields
 }
 
+/** A size as a drawing writes it: no trailing zeros. */
+function num(v: number): string {
+  return String(Number(v.toFixed(3)))
+}
+
+const CUTS = new Set(['cut', 'hole', 'subtract', 'pattern'])
+
+/**
+ * A feature's sizes in one short line, the way an engineer writes them
+ * (the feature tree's size column): Ø80 × 12 for a cylinder, Ø8 for a hole
+ * (its tool's length is not a size), 4× Ø8 for a pattern, R3 for a fillet,
+ * 0.5 × 45° for a chamfer, 10 × 20 × 5 for a box. Positions never show.
+ */
+export function sizeSummary(kind: string, fields: FeatureField[], instances: number): string {
+  const v = (key: string) => fields.find((f) => f.key === key)?.value
+  const radius = v('radius')
+  const parts: string[] = []
+  if (kind === 'fillet') {
+    if (radius !== undefined) parts.push(`R${num(radius)}`)
+  } else if (kind === 'chamfer') {
+    const d = v('distance') ?? v('distance1')
+    if (d !== undefined) parts.push(`${num(d)} × 45°`)
+  } else if (kind === 'box') {
+    for (const k of ['width', 'depth', 'height']) {
+      const x = v(k)
+      if (x !== undefined) parts.push(num(x))
+    }
+  } else {
+    if (radius !== undefined) parts.push(`Ø${num(2 * radius)}`)
+    if (!CUTS.has(kind)) {
+      const length = v('height') ?? v('length') ?? v('distance') ?? v('thickness')
+      if (length !== undefined) parts.push(num(length))
+    }
+  }
+  const line = parts.join(' × ')
+  return line && instances > 0 ? `${instances}× ${line}` : line
+}
+
 /** The mould request setting `field` to `value` (linked across a pattern). */
 export function mouldBody(field: FeatureField, value: number) {
   const [head, ...rest] = field.targets
