@@ -48,6 +48,7 @@ import {
   downloadDrawing,
   fetchDrawingSvg,
   getDrawing,
+  getDrawingQuality,
   listDrawings,
   removeView,
   renameDrawing,
@@ -57,6 +58,15 @@ import {
 import { useDocumentStore } from '@/stores/document-store'
 import { HISTORY_CHANGED_EVENT, timelineAction } from '@/lib/history'
 import { useDocModeStore } from '@/stores/doc-mode-store'
+import {
+  describeMove,
+  draggedPosition,
+  isDrag,
+  newLayoutIssues,
+  planViewDrag,
+  screenPxPerMm,
+  type SheetQuality,
+} from '@/lib/drawing-drag'
 
 // CSS pixels per millimetre at the standard 96 DPI mapping. At zoom
 // `1.0` the sheet renders at its true physical size.
@@ -136,6 +146,8 @@ const DIM_KIND_WORDS: Record<string, string> = {
   angle: 'angle',
   hole_callout: 'hole',
   pcd: 'pitch circle',
+  fillet: 'fillet radius',
+  chamfer: 'chamfer',
 }
 
 export function DrawingsWorkspace() {
@@ -558,7 +570,9 @@ export function DrawingsWorkspace() {
                         : '; moved to the nearest free space (no room in line with FRONT)'
                       : ''
                   }`
-                : `${v.name} renamed ${edit.name ?? ''}`
+                : edit.position_mm !== undefined
+                  ? describeMove(v.name, v.position_mm, edit.position_mm)
+                  : `${v.name} renamed ${edit.name ?? ''}`
         setNoteKind(moved && !aligned ? 'info' : 'done')
         setEditNote(`${what}. Ctrl+Z undoes it.`)
       } catch (e) {
@@ -746,6 +760,131 @@ export function DrawingsWorkspace() {
     return () => el.removeEventListener('wheel', onWheel)
   }, [zoomMode, zoom, fitScale, sheetWPx, sheetHPx])
 
+  // ── Drag a selected view to move it ──────────────────────────────
+  // Press on the SELECTED view and drag: a ghost outline follows the cursor
+  // and the drop sends ONE position edit (`PATCH .../views/{id}`), recorded
+  // in the history so Ctrl+Z puts the view back. The kernel applies or
+  // refuses it; a refusal leaves the view where it was and says why. After
+  // the move the kernel's sheet check is asked what the move broke (an
+  // overlap, past the frame, out of line with FRONT) and that is reported.
+  // Pressing anywhere else still pans the sheet.
+  const sheetRef = useRef<HTMLDivElement | null>(null)
+  const viewDragRef = useRef<{
+    drawingId: string
+    viewId: string
+    startX: number
+    startY: number
+    /** The view's `position_mm` when the drag began. */
+    start: [number, number]
+    pxPerMm: number
+    /** The selection outline when the drag began (canvas px). */
+    base: { left: number; top: number; width: number; height: number }
+    /** The sheet check before the move, asked once the press became a drag. */
+    before: Promise<SheetQuality | null> | null
+  } | null>(null)
+  const [viewGhost, setViewGhost] = useState<{
+    left: number
+    top: number
+    width: number
+    height: number
+    /** Offset from where the view sits, in sheet mm (y up the sheet). */
+    dxMm: number
+    dyMm: number
+  } | null>(null)
+
+  const commitViewMove = useCallback(
+    async (
+      drawingId: string,
+      viewId: string,
+      from: [number, number],
+      edit: { position_mm: [number, number] },
+      before: Promise<SheetQuality | null> | null,
+    ) => {
+      const v = activeDrawing?.views.find((x) => x.id === viewId)
+      if (!v || activeDrawing?.id !== drawingId) return
+      setError(null)
+      setViewsBusy(true)
+      try {
+        // The before-check must answer before the move is sent, or it could
+        // read the moved sheet and hide what the move broke.
+        const had = before ? await before : null
+        await updateView(drawingId, viewId, edit)
+        setRemovedView(null)
+        await refreshActive(drawingId)
+        const moved = describeMove(v.name, from, edit.position_mm)
+        const now = await getDrawingQuality(drawingId).catch(() => null)
+        if (!now) {
+          setNoteKind('info')
+          setEditNote(`${moved}; the sheet check did not answer. Ctrl+Z undoes the move.`)
+          return
+        }
+        const problems = newLayoutIssues(had, now)
+        if (problems.length > 0) {
+          setNoteKind('info')
+          setEditNote(
+            `${moved}, but the sheet check now finds: ${problems.join('; ')}. Ctrl+Z undoes the move.`,
+          )
+        } else {
+          setNoteKind('done')
+          setEditNote(`${moved}. Ctrl+Z undoes it.`)
+        }
+      } catch (e) {
+        // The view did not move; the sheet still shows it where it was.
+        setError(
+          e instanceof DrawingRefusal
+            ? `${v.name} not moved: ${e.message}`
+            : e instanceof Error
+              ? e.message
+              : String(e),
+        )
+      } finally {
+        setViewsBusy(false)
+      }
+    },
+    [activeDrawing, refreshActive],
+  )
+  // The window-level mouse-up listener is bound once; it reaches the
+  // current commit through this ref.
+  const commitViewMoveRef = useRef(commitViewMove)
+  useEffect(() => {
+    commitViewMoveRef.current = commitViewMove
+  }, [commitViewMove])
+
+  /** Start dragging the selected view when the press lands on it. */
+  const beginViewDrag = useCallback(
+    (clientX: number, clientY: number): boolean => {
+      if (!selectedViewId || !activeDrawing || !selRect || viewsBusy || dimEdit) return false
+      if (viewAt(clientX, clientY) !== selectedViewId) return false
+      const view = activeDrawing.views.find((v) => v.id === selectedViewId)
+      const sheet = sheetRef.current
+      const pxPerMm = sheet ? screenPxPerMm(sheet.getBoundingClientRect().width, sheetWMm) : null
+      if (!view || pxPerMm === null) return false
+      viewDragRef.current = {
+        drawingId: activeDrawing.id,
+        viewId: view.id,
+        startX: clientX,
+        startY: clientY,
+        start: [view.position_mm[0], view.position_mm[1]],
+        pxPerMm,
+        base: selRect,
+        before: null,
+      }
+      return true
+    },
+    [selectedViewId, activeDrawing, selRect, viewsBusy, dimEdit, viewAt, sheetWMm],
+  )
+
+  // Over the selected view the cursor says it can be moved.
+  const onCanvasHover = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const el = canvasRef.current
+      if (!el || panStateRef.current.dragging || viewDragRef.current) return
+      const over = !!selectedViewId && !viewsBusy && viewAt(e.clientX, e.clientY) === selectedViewId
+      el.style.cursor = over ? 'move' : ''
+    },
+    [selectedViewId, viewsBusy, viewAt],
+  )
+
   // ── Drag-to-pan ──────────────────────────────────────────────────
   // Left-click drag updates the `pan` translation directly. Because
   // the sheet is positioned with CSS `transform: translate(...)` and
@@ -759,32 +898,86 @@ export function DrawingsWorkspace() {
     if (e.button !== 0) return
     const el = canvasRef.current
     if (!el) return
+    // The click that ends this press must not reselect: record where it began.
+    panStateRef.current.startX = e.clientX
+    panStateRef.current.startY = e.clientY
+    if (beginViewDrag(e.clientX, e.clientY)) {
+      el.style.cursor = 'move'
+      e.preventDefault()
+      return
+    }
     panStateRef.current.dragging = true
     panStateRef.current.startX = e.clientX
     panStateRef.current.startY = e.clientY
     panStateRef.current.startPan = { ...panStateRef.current.pan }
     el.style.cursor = 'grabbing'
     e.preventDefault()
-  }, [])
+  }, [beginViewDrag])
 
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
+      const d = viewDragRef.current
+      if (d) {
+        const dx = e.clientX - d.startX
+        const dy = e.clientY - d.startY
+        if (!isDrag(dx, dy)) {
+          setViewGhost(null)
+          return
+        }
+        // Ask the kernel's sheet check now, so the drop can tell what the
+        // move itself changed.
+        if (!d.before) d.before = getDrawingQuality(d.drawingId).catch(() => null)
+        const p = draggedPosition(d.start, dx, dy, d.pxPerMm)
+        setViewGhost({
+          left: d.base.left + dx,
+          top: d.base.top + dy,
+          width: d.base.width,
+          height: d.base.height,
+          dxMm: Number((p[0] - d.start[0]).toFixed(2)),
+          dyMm: Number((p[1] - d.start[1]).toFixed(2)),
+        })
+        return
+      }
       const s = panStateRef.current
       if (!s.dragging) return
       const dx = e.clientX - s.startX
       const dy = e.clientY - s.startY
       setPan({ x: s.startPan.x + dx, y: s.startPan.y + dy })
     }
-    const onMouseUp = () => {
+    const onMouseUp = (e: MouseEvent) => {
       const el = canvasRef.current
       if (el) el.style.cursor = ''
       panStateRef.current.dragging = false
+      const d = viewDragRef.current
+      if (!d) return
+      viewDragRef.current = null
+      const edit = planViewDrag(d.start, e.clientX - d.startX, e.clientY - d.startY, d.pxPerMm)
+      if (!edit) {
+        setViewGhost(null)
+        return
+      }
+      // The ghost stays where it was dropped until the kernel answers: on
+      // success the view is redrawn under it, on a refusal it snaps back.
+      void commitViewMoveRef.current(d.drawingId, d.viewId, d.start, edit, d.before).finally(() =>
+        setViewGhost(null),
+      )
+    }
+    // Escape while dragging drops the drag; nothing is sent.
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && viewDragRef.current) {
+        viewDragRef.current = null
+        setViewGhost(null)
+        const el = canvasRef.current
+        if (el) el.style.cursor = ''
+      }
     }
     window.addEventListener('mousemove', onMouseMove)
     window.addEventListener('mouseup', onMouseUp)
+    window.addEventListener('keydown', onKeyDown)
     return () => {
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mouseup', onMouseUp)
+      window.removeEventListener('keydown', onKeyDown)
     }
   }, [])
 
@@ -905,10 +1098,12 @@ export function DrawingsWorkspace() {
         ref={canvasRef}
         className="absolute inset-0 overflow-hidden bg-muted/20 cursor-grab"
         onMouseDown={onCanvasMouseDown}
+        onMouseMove={onCanvasHover}
       >
         {activeDrawing ? (
           svg ? (
             <div
+              ref={sheetRef}
               className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full [&_[data-dim-id]]:cursor-pointer [&_[data-dim-id]:hover]:fill-blue-600 [&_[data-dim-editing]]:fill-blue-700 [&_[data-dim-editing]]:font-bold"
               onClick={onSheetClick}
               onContextMenu={onSheetContextMenu}
@@ -981,6 +1176,22 @@ export function DrawingsWorkspace() {
           className="pointer-events-none absolute z-10 rounded-sm border border-dashed border-sky-600"
           style={selRect}
         />
+      )}
+      {viewGhost && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute z-10 rounded-sm border border-dashed border-sky-600 bg-sky-500/5"
+          style={{
+            left: viewGhost.left,
+            top: viewGhost.top,
+            width: viewGhost.width,
+            height: viewGhost.height,
+          }}
+        >
+          <span className="absolute -top-5 left-0 whitespace-nowrap rounded-sm bg-card/95 px-1 font-mono text-[11px] text-sky-700">
+            {`x ${viewGhost.dxMm >= 0 ? '+' : ''}${viewGhost.dxMm} · y ${viewGhost.dyMm >= 0 ? '+' : ''}${viewGhost.dyMm} mm`}
+          </span>
+        </div>
       )}
       {activeDrawing && viewMenu && (
         <ViewMenu

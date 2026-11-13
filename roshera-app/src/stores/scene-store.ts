@@ -22,6 +22,7 @@ import {
 } from '@/lib/csketch-api'
 import type { SectionCapMesh } from '@/lib/section-api'
 import type { DimensionRow } from '@/lib/measure-api'
+import { ALL_DIMENSION_KINDS } from '@/lib/dimension-kinds'
 import {
   AUTO_APPLY_CONFIDENCE_THRESHOLD,
   type FilteredProposal,
@@ -590,19 +591,10 @@ export interface PinnedMeasurement {
 }
 
 // ─── Dimension kind filter ───────────────────────────────────────────
-/**
- * The chip-filterable dimension kinds (ui-units polish, spec section 4).
- * `diameter` also covers kernel `radius` rows (one Ø chip); kinds not
- * listed here (angles, interactive-measure kinds) are never filtered.
- * Shared by the scene store default, the `DimensionKindChips` UI, and
- * the `PartDimensions` row filter so all three stay in lock-step.
- */
-export const ALL_DIMENSION_KINDS = [
-  'extent',
-  'diameter',
-  'length',
-  'position',
-] as const
+// The chip-filterable dimension kinds live in `@/lib/dimension-kinds` (with
+// the row→chip mapping and chip labels) so the store default, the
+// `DimensionKindChips` UI and the `PartDimensions` row filter share one list.
+export { ALL_DIMENSION_KINDS }
 
 // ─── Scene store ─────────────────────────────────────────────────────
 interface SceneState {

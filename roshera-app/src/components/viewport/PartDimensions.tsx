@@ -6,6 +6,7 @@ import { useSceneStore, type PinnedMeasurement } from '@/stores/scene-store'
 import type { DatumDescriptor } from '@/lib/measure-api'
 import { usePartDimensions, type DimensionRow } from './use-part-dimensions'
 import { usePinnedMeasurementsRevalidation } from './use-pinned-measurements'
+import { chipKindOf } from '@/lib/dimension-kinds'
 
 /**
  * Live kernel dimension annotations for every object whose id is in
@@ -30,8 +31,8 @@ import { usePinnedMeasurementsRevalidation } from './use-pinned-measurements'
  *     extension ticks perpendicular at the endpoints, and the text
  *     billboard centred on the span, offset a couple mm perpendicular
  *     so it doesn't sit on the line.
- *   - **Leader rows** (`diameter`, `radius`, `angle`, any future kind
- *     with a direction): unchanged — a short leader from `anchor` to a
+ *   - **Leader rows** (`diameter`, `radius`, `angle`, the blend
+ *     callouts `fillet` / `chamfer`, any future kind with a direction): unchanged — a short leader from `anchor` to a
  *     6 mm perpendicular offset, badge at the tip (Ø / ∠ prefixes are
  *     part of the kernel label).
  *   - **Direction-less rows** (`direction === null`, e.g. face-info
@@ -50,7 +51,8 @@ import { usePinnedMeasurementsRevalidation } from './use-pinned-measurements'
  *   - **Stacked standoffs**: linear dims sharing a span axis + lane are
  *     staggered deterministically (see {@link computeStandoffs}).
  *   - **Kind filter**: rows whose chip (`extent` / `diameter` /
- *     `length` / `position`) is toggled off in
+ *     `length` / `position` / `fillet` / `chamfer`, see
+ *     `@/lib/dimension-kinds`) is toggled off in
  *     `dimensionKindFilter` are skipped — including their standoff
  *     slots and datum markers, so hiding positions also hides the
  *     datums nothing references anymore. Chips UI lives in CADViewport.
@@ -139,19 +141,6 @@ export function PartDimensions() {
 interface ObjectDimensionsProps {
   objectId: string
   solidId: number
-}
-
-/**
- * Map a kernel row kind to its filter chip, or `null` for kinds no chip
- * governs (angles, interactive-measure kinds) — those always render.
- * `radius` shares the Ø chip: both are hole/boss size callouts.
- */
-function chipKindOf(kind: string): string | null {
-  if (kind === 'extent' || kind === 'length' || kind === 'position') {
-    return kind
-  }
-  if (kind === 'diameter' || kind === 'radius') return 'diameter'
-  return null
 }
 
 /**

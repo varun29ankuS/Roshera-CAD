@@ -24,6 +24,7 @@ import { SketchOverlay } from './SketchOverlay'
 import { ServerSketches } from './ServerSketches'
 import { SketchPanel } from '@/components/panels/SketchPanel'
 import { MateSuggestionPopover } from '@/components/panels/MateSuggestionPopover'
+import { DIMENSION_CHIP_LABELS } from '@/lib/dimension-kinds'
 import {
   ALL_DIMENSION_KINDS,
   isStandardPlane,
@@ -232,23 +233,9 @@ export function CADViewport() {
 }
 
 /**
- * Human-readable chip labels for the dimension-kind filter, in display
- * order. Keys are the store's {@link ALL_DIMENSION_KINDS}; "Ø" also
- * covers kernel `radius` rows (see PartDimensions' chipKindOf).
- */
-const DIMENSION_KIND_LABELS: Record<
-  (typeof ALL_DIMENSION_KINDS)[number],
-  string
-> = {
-  extent: 'Extents',
-  diameter: 'Ø',
-  length: 'Lengths',
-  position: 'Positions',
-}
-
-/**
  * Floating chip row filtering the dimension layer by kind (ui-units
- * polish item 3): Extents · Ø · Lengths · Positions. Screen-space UI
+ * polish item 3): Extents · Ø · Lengths · Positions · Fillets · Chamfers
+ * (labels from `@/lib/dimension-kinds`). Screen-space UI
  * (house `cad-panel` style, same overlay pattern as SectionViewPanel /
  * SketchCoordReadout), NOT an in-canvas billboard.
  *
@@ -279,8 +266,8 @@ function DimensionKindChips() {
             aria-pressed={active}
             title={
               active
-                ? `Hide ${DIMENSION_KIND_LABELS[kind]}`
-                : `Show ${DIMENSION_KIND_LABELS[kind]}`
+                ? `Hide ${DIMENSION_CHIP_LABELS[kind]}`
+                : `Show ${DIMENSION_CHIP_LABELS[kind]}`
             }
             className={[
               'px-2 py-0.5 border transition-colors',
@@ -289,7 +276,7 @@ function DimensionKindChips() {
                 : 'border-border/40 text-muted-foreground hover:text-foreground',
             ].join(' ')}
           >
-            {DIMENSION_KIND_LABELS[kind]}
+            {DIMENSION_CHIP_LABELS[kind]}
           </button>
         )
       })}

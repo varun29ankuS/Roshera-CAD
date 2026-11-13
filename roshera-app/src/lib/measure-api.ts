@@ -9,6 +9,8 @@
  * from a component file.
  */
 
+import type { DimensionKind } from '@/lib/dimension-kinds'
+
 const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
 
 /**
@@ -39,9 +41,12 @@ export interface DimensionRow {
   id: string
   /**
    * Semantic kind: `diameter`, `radius`, `length`, `angle`, `extent`,
-   * `position` (X/Y offset of a bore axis from a datum — Amendment A2).
+   * `position` (X/Y offset of a bore axis from a datum — Amendment A2),
+   * `fillet` (a blend's radius, label `R3.00`) or `chamfer` (an equal-leg
+   * chamfer, label `0.50 × 45°`). Interactive-measure results carry their
+   * own kinds, so the field stays open to other strings.
    */
-  kind: string
+  kind: DimensionKind | (string & {})
   /** Numeric magnitude in `unit`. All computation is kernel-side. */
   value: number
   /** Unit string, e.g. `"mm"` or `"deg"`. */

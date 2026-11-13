@@ -348,12 +348,17 @@ export interface ViewEdit {
   show_hidden?: boolean
   name?: string
   scale?: number
+  /** Where the view sits on the sheet (mm; y runs up the sheet). Recorded
+   *  with the edit, so undo puts the view back. */
+  position_mm?: [number, number]
 }
 
 /**
- * Change one view's display: hidden lines, name, scale. All-or-nothing; a
- * refusal (bad scale, a name another view already has) throws
- * `DrawingRefusal` with the reason.
+ * Change one view's display: hidden lines, name, scale, position.
+ * All-or-nothing; a refusal (bad scale, a name another view already has, a
+ * non-finite position) throws `DrawingRefusal` with the reason. `moved` /
+ * `aligned` describe where a RESCALE had to put the view; an explicit
+ * `position_mm` is applied as given and reports neither.
  */
 export async function updateView(
   drawingId: string,
@@ -500,6 +505,30 @@ export async function setDrawingProjection(
     body: JSON.stringify({ projection }),
   })
   await jsonOrRefusal<unknown>(r)
+}
+
+/** One finding of the kernel's sheet check (`verify_drawing`). */
+export interface DrawingQualityIssue {
+  severity: 'error' | 'warning'
+  /** Machine-stable kind, e.g. `view_overlap`, `view_outside_frame`. */
+  kind: string
+  message: string
+  /** The view the finding belongs to, when view-scoped. */
+  view?: string | null
+}
+
+/** The kernel's sheet check (`GET /api/drawings/{id}/quality`). */
+export interface DrawingQualityReport {
+  /** `true` iff there are no error-severity findings. */
+  passed: boolean
+  sheet_utilization: number
+  issues: DrawingQualityIssue[]
+}
+
+/** Re-run the kernel's sheet check on a drawing: overlaps, frame, alignment. */
+export async function getDrawingQuality(drawingId: string): Promise<DrawingQualityReport> {
+  const r = await fetch(`${API_HOST}/api/drawings/${drawingId}/quality`)
+  return jsonOrThrow<DrawingQualityReport>(r, 'getDrawingQuality')
 }
 
 /** Fetch the rendered SVG (raw XML string). Empty drawing → envelope only. */

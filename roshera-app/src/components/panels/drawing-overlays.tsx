@@ -4,8 +4,8 @@
  * closable overlay; peers hug, roles bookend).
  *
  * - top-left  : which drawing (switch, rename, delete, new from a part)
- * - top-right : how it is laid out and delivered (projection, title block,
- *               download)
+ * - top-right : how it is laid out, annotated and delivered (projection,
+ *               annotate, title block, download)
  * - bottom-left: its views (remove with undo, "Add view ▸ Left"); right-click
  *               a view (on the sheet or its chip) for its menu
  *
@@ -252,6 +252,7 @@ export function SheetActions({
           </button>
         ))}
       </div>
+      <AnnotateMenu />
       <button
         type="button"
         onClick={onToggleTitleBlock}
@@ -294,6 +295,89 @@ export function SheetActions({
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+// ── Annotate menu (top-right) ────────────────────────────────────────────
+
+/**
+ * What an engineer may want to add to a sheet, and whether the kernel can do
+ * it from the sheet today. An item is enabled only when a drawing route
+ * places that annotation on this sheet AND records it in the history (so
+ * Ctrl+Z and a restart keep it). `why` says, in a drafter's words, what is
+ * there instead. Surveyed against `api-server/src/main.rs` (the
+ * `/api/drawings/...` routes) and `drawing/types.rs`: there is no route that
+ * adds a note, dimension, centre mark, datum flag, feature control frame or
+ * surface-finish symbol to a sheet, so none is enabled; none is faked.
+ */
+const ANNOTATIONS: { key: string; label: string; why: string }[] = [
+  {
+    key: 'note',
+    label: 'Note',
+    why: 'Free text on the sheet is not available yet. The title block holds the drawing text.',
+  },
+  {
+    key: 'dimension',
+    label: 'Dimension',
+    why: 'Dimensions are placed by the kernel from the part. Click one to change the part; adding one is not available yet.',
+  },
+  {
+    key: 'centre',
+    label: 'Centre mark / line',
+    why: 'Drawn automatically on holes and round features; placing one by hand is not available yet.',
+  },
+  {
+    key: 'datum',
+    label: 'Datum flag',
+    why: 'Placing a datum from the sheet is not available yet. Datums designated through the agent API (this session only) are drawn when a sheet is made.',
+  },
+  {
+    key: 'fcf',
+    label: 'GD&T frame',
+    why: 'Adding a frame from the sheet is not available yet. Frames authored through the agent API (this session only) are drawn when a sheet is made.',
+  },
+  {
+    key: 'finish',
+    label: 'Surface finish',
+    why: 'Surface-finish symbols are not available yet.',
+  },
+]
+
+export function AnnotateMenu() {
+  const [open, setOpen] = useState(false)
+  const close = useCallback(() => setOpen(false), [])
+  const ref = useDismiss(open, close)
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        className={`${card} cad-focus flex items-center gap-1 px-2.5 py-1.5 text-xs hover:bg-accent/20`}
+      >
+        Annotate
+        <ChevronDown size={12} />
+      </button>
+      {open && (
+        <div role="menu" aria-label="Annotate" className={`${card} absolute right-0 mt-1 w-72 py-1 text-xs`}>
+          {ANNOTATIONS.map((a) => (
+            // Not a disabled <button>: browsers drop the tooltip on one, and
+            // the reason is what the engineer needs, so it is shown in the row.
+            <div
+              key={a.key}
+              role="menuitem"
+              aria-disabled="true"
+              title={a.why}
+              className="cursor-default px-3 py-1.5"
+            >
+              <div className="text-muted-foreground">{a.label}</div>
+              <div className="text-[11px] leading-snug text-muted-foreground/80">{a.why}</div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -666,7 +750,10 @@ export function SheetHint() {
   if (!show) return null
   return (
     <div className={`${card} absolute top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 px-3 py-1.5 text-xs`}>
-      <span>Click a dimension to change the part · drag the sheet to move it</span>
+      <span>
+        Click a dimension to change the part · click a view, then drag it to move it · drag the
+        sheet to pan
+      </span>
       <button
         type="button"
         aria-label="Dismiss hint"
