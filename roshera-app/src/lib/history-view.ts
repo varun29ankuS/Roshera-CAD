@@ -50,10 +50,69 @@ export function scrubObjects(answer: ScrubAnswer): CADObject[] {
   }))
 }
 
+interface BinaryObject {
+  id: string
+  name?: string
+  nv: number
+  ni: number
+  nn: number
+  nf: number
+}
+
+/**
+ * Read a binary step (`RSCB` v1, `?format=bin`): the magic, a u32 version,
+ * a u32 JSON length and that JSON (the objects and their array lengths),
+ * padding to 4 bytes, then each object's vertices (f32), indices (u32),
+ * normals (f32), face ids (u32). The arrays are VIEWS into the buffer -- no
+ * text is parsed and nothing is copied, which for a 3 MB step is most of the
+ * cost of showing it. Anything that is not RSCB v1 is refused.
+ */
+export function decodeScrubBinary(buf: ArrayBuffer): CADObject[] {
+  const u8 = new Uint8Array(buf)
+  const magic = String.fromCharCode(u8[0] ?? 0, u8[1] ?? 0, u8[2] ?? 0, u8[3] ?? 0)
+  if (buf.byteLength < 12 || magic !== 'RSCB') throw new Error('not a binary step (RSCB)')
+  const dv = new DataView(buf)
+  const version = dv.getUint32(4, true)
+  if (version !== 1) throw new Error(`RSCB version ${version} is not supported`)
+  const jsonLen = dv.getUint32(8, true)
+  const header = JSON.parse(new TextDecoder().decode(u8.subarray(12, 12 + jsonLen))) as {
+    objects?: BinaryObject[]
+  }
+  let at = Math.ceil((12 + jsonLen) / 4) * 4
+  const f32 = (n: number) => {
+    const v = new Float32Array(buf, at, n)
+    at += 4 * n
+    return v
+  }
+  const u32 = (n: number) => {
+    const v = new Uint32Array(buf, at, n)
+    at += 4 * n
+    return v
+  }
+  return (header.objects ?? []).map((o) => {
+    const vertices = f32(o.nv)
+    const indices = u32(o.ni)
+    const normals = f32(o.nn)
+    const faceIds = u32(o.nf)
+    return {
+      id: o.id,
+      name: o.name ?? o.id,
+      objectType: 'solid',
+      mesh: { vertices, indices, normals, faceIds: o.nf > 0 ? faceIds : undefined },
+      material: { color: '#9a9a9a', metalness: 0.1, roughness: 0.6, opacity: 1 },
+      position: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      visible: true,
+      locked: true,
+    }
+  })
+}
+
 export async function fetchScrub(branch: string, seq: number): Promise<CADObject[]> {
-  const r = await fetch(`${API_HOST}/api/timeline/scrub/${encodeURIComponent(branch)}/${seq}`)
+  const r = await fetch(`${API_HOST}/api/timeline/scrub/${encodeURIComponent(branch)}/${seq}?format=bin`)
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return scrubObjects((await r.json()) as ScrubAnswer)
+  return decodeScrubBinary(await r.arrayBuffer())
 }
 
 /** Which frame a drag at screen x is over: frames `width` px wide starting

@@ -2,14 +2,15 @@
  * The history track, built the way video editors build a timeline (Premiere,
  * Resolve, Final Cut -- Varun 2026-11-13): one row of clips, a clip per
  * feature (a real picture of the part right after it, rendered by the
- * kernel from its frame cache, with the tool icon and the name), and a
- * PLAYHEAD line across them. Drag the playhead or click a clip to travel; the
+ * kernel from its frame cache, with the tool icon and the name), and an
+ * orange TRAY round the clips from the first to the current one, its right
+ * edge a handle (iOS Photos' trim frame). Drag the playhead or click a clip to travel; the
  * viewport is the viewer -- it shows that step as the playhead moves (no
  * pop-up preview). Clips after the playhead fade back, as below a rollback
  * bar. Transport: start, back, play / pause, forward, end (live). Right-click
  * a clip for the actions on the step that defines it.
  *
- * Motion (iOS-grade): the playhead glides on an ease-out spring curve when it
+ * Motion (iOS-grade): the tray glides on an ease-out spring curve when it
  * jumps and follows the pointer exactly while dragging; the current clip
  * lifts; the track scrolls smoothly to keep the playhead in view. All motion
  * stops for users who ask the system for reduced motion.
@@ -212,7 +213,9 @@ export function FilmStrip({
   }, [at])
 
   const reduced = prefersReducedMotion()
-  const playheadX = STRIP_PAD_LEFT + at * FRAME_PITCH + (FRAME_PITCH - 8) / 2
+  // The tray spans clip 0 .. the current clip, with a little air and the
+  // handle outside the current clip's right edge.
+  const trayWidth = at * FRAME_PITCH + (FRAME_PITCH - 8) + 14
   const stop = () => setPlaying(false)
 
   return (
@@ -330,14 +333,14 @@ export function FilmStrip({
                 className="flex w-[52px] shrink-0 flex-col items-center gap-0.5"
                 style={{
                   opacity: ahead ? 0.42 : 1,
-                  transform: current ? 'translateY(-3px) scale(1.06)' : 'none',
+                  transform: current ? 'translateY(-1px) scale(1.03)' : 'none',
                   transition: reduced ? 'none' : `transform 260ms ${GLIDE}, opacity 220ms ease-out`,
                 }}
               >
                 <div
                   className={cn(
                     'relative overflow-hidden rounded-md border bg-background',
-                    current ? 'border-amber-500 shadow-[0_6px_14px_-6px_rgba(0,0,0,0.45)]' : 'border-border/60',
+                    current ? 'border-amber-500/70 shadow-[0_6px_14px_-6px_rgba(0,0,0,0.45)]' : 'border-border/60',
                     !current && selectedChapter === c.anchor && 'border-sky-500 ring-1 ring-sky-500',
                     !c.sound && 'border-destructive',
                   )}
@@ -368,18 +371,27 @@ export function FilmStrip({
               </li>
             )
           })}
-          {/* The playhead: a line across the clips with a head on top; glides
-              when it jumps, follows the pointer exactly while dragging. */}
+          {/* The tray (Varun 2026-11-13: "a complete orange outside the
+              pictures that acts like a loading tray" -- the trim frame of
+              iOS Photos): an orange frame round every clip from the first up
+              to the current one, its right edge a handle. Inside the tray is
+              in the part shown; outside is not yet. It grows and shrinks on
+              the glide curve, and follows the pointer exactly while
+              dragging. */}
           <span
             aria-hidden
-            className="pointer-events-none absolute bottom-0 left-0 top-0 w-0"
+            className="pointer-events-none absolute bottom-0 top-1 rounded-lg border-2 border-amber-500 bg-amber-500/[0.07]"
             style={{
-              transform: `translateX(${playheadX}px)`,
-              transition: dragging || reduced ? 'none' : `transform ${GLIDE_MS}ms ${GLIDE}`,
+              left: STRIP_PAD_LEFT - 5,
+              width: trayWidth,
+              transition: dragging || reduced ? 'none' : `width ${GLIDE_MS}ms ${GLIDE}`,
             }}
           >
-            <span className="absolute -left-[5px] top-0 h-2.5 w-2.5 rounded-full bg-amber-500 shadow-[0_0_0_2px_var(--background)]" />
-            <span className="absolute bottom-0 left-[-1px] top-1 w-0.5 rounded-full bg-amber-500/90" />
+            <span className="absolute -right-[2px] bottom-[-2px] top-[-2px] flex w-[9px] flex-col items-center justify-center gap-[3px] rounded-r-lg bg-amber-500">
+              <span className="h-[3px] w-[3px] rounded-full bg-background/90" />
+              <span className="h-[3px] w-[3px] rounded-full bg-background/90" />
+              <span className="h-[3px] w-[3px] rounded-full bg-background/90" />
+            </span>
           </span>
         </ol>
       </div>

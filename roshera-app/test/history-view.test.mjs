@@ -52,3 +52,35 @@ test('arrow keys step one chapter; past the last frame is the live part', () => 
   assert.equal(stepTo(anchors, 7, +1), null, 'forward onto the last frame is the live part')
   assert.equal(stepTo(anchors, null, +1), null, 'already live')
 })
+
+test('a binary step (RSCB v1) is read in place into scene objects', async () => {
+  const { decodeScrubBinary } = await import('../src/lib/history-view.ts')
+  const header = new TextEncoder().encode(
+    JSON.stringify({ at_sequence: 7, objects: [{ id: 'scrub:2', name: 'solid 2', nv: 9, ni: 3, nn: 9, nf: 1 }] }),
+  )
+  const pad = (4 - ((12 + header.length) % 4)) % 4
+  const buf = new ArrayBuffer(12 + header.length + pad + 4 * (9 + 3 + 9 + 1))
+  const u8 = new Uint8Array(buf)
+  u8.set(new TextEncoder().encode('RSCB'), 0)
+  const dv = new DataView(buf)
+  dv.setUint32(4, 1, true)
+  dv.setUint32(8, header.length, true)
+  u8.set(header, 12)
+  let at = 12 + header.length + pad
+  for (const x of [0, 0, 0, 1, 0, 0, 0, 1, 0]) { dv.setFloat32(at, x, true); at += 4 }
+  for (const x of [0, 1, 2]) { dv.setUint32(at, x, true); at += 4 }
+  for (const x of [0, 0, 1, 0, 0, 1, 0, 0, 1]) { dv.setFloat32(at, x, true); at += 4 }
+  dv.setUint32(at, 5, true)
+  const objs = decodeScrubBinary(buf)
+  assert.equal(objs.length, 1)
+  assert.equal(objs[0].id, 'scrub:2')
+  assert.equal(objs[0].locked, true)
+  assert.deepEqual(Array.from(objs[0].mesh.vertices), [0, 0, 0, 1, 0, 0, 0, 1, 0])
+  assert.deepEqual(Array.from(objs[0].mesh.indices), [0, 1, 2])
+  assert.deepEqual(Array.from(objs[0].mesh.faceIds ?? []), [5])
+})
+
+test('a buffer that is not RSCB v1 is refused, not misread', async () => {
+  const { decodeScrubBinary } = await import('../src/lib/history-view.ts')
+  assert.throws(() => decodeScrubBinary(new TextEncoder().encode('{"objects":[]}').buffer), /RSCB/)
+})
