@@ -11724,6 +11724,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/timeline/rebuild-certificate/{branch_id}",
             get(crate::handlers::timeline::get_rebuild_certificate),
         )
+        // The timeline's rows: the applied history grouped into engineering
+        // features (chapters), each with its verdict, author and intent.
+        .route(
+            "/api/timeline/chapters/{branch_id}",
+            get(crate::handlers::timeline::get_chapters),
+        )
         // Evidence-pack export (document scope): one call bundling a
         // branch's recorded operations + their certificates AS RECORDED,
         // final-state mass properties with provenance, and the agent's

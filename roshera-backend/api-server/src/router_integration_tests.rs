@@ -11920,3 +11920,63 @@ async fn a_drawing_can_be_created_first_angle() {
     let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
     assert_eq!(sheet["projection"], "first");
 }
+
+/// The timeline's rows are chapters -- engineering features, like a CAD
+/// feature tree (Varun 2026-11-13). A box drilled through by a cylinder the
+/// subtract consumes is two chapters, a box and a hole, each sound, each
+/// naming the step that defines it. An undone step is not part of the part:
+/// after undoing the drill, the cutter is a cylinder of its own.
+#[tokio::test]
+async fn the_timeline_lists_chapters_and_leaves_out_undone_steps() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+
+    let (s, body) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    let chapters = body["chapters"].as_array().expect("chapters array");
+    let kinds: Vec<&str> = chapters.iter().filter_map(|c| c["kind"].as_str()).collect();
+    assert_eq!(kinds, ["box", "hole"], "body = {body}");
+    for c in chapters {
+        assert_eq!(
+            c["sound"], true,
+            "every chapter of a sound part is sound; {c}"
+        );
+        assert!(
+            c["anchor"].is_u64(),
+            "each chapter names its defining step; {c}"
+        );
+        assert!(
+            c["author"].is_string(),
+            "each chapter says who made it; {c}"
+        );
+    }
+    assert!(
+        chapters[1]["events"].as_array().map_or(0, Vec::len) >= 2,
+        "the hole holds its cutter and its subtract; {}",
+        chapters[1]
+    );
+
+    let (us, ubody) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/undo",
+            json!({ "session_id": uuid::Uuid::new_v4().to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(us, StatusCode::OK, "undo; body = {ubody}");
+    assert_eq!(ubody["success"], true, "undo; body = {ubody}");
+    let (s, body) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    let kinds: Vec<&str> = body["chapters"]
+        .as_array()
+        .expect("chapters array")
+        .iter()
+        .filter_map(|c| c["kind"].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["box", "cylinder"],
+        "the undone subtract is not a chapter; body = {body}"
+    );
+}

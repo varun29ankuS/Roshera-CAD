@@ -40,6 +40,10 @@ pub struct Chapter {
     pub name: Option<String>,
     /// The sequence numbers of every recorded step in this chapter, ascending.
     pub events: Vec<u64>,
+    /// The step that defines the chapter (the subtract of a hole, the create
+    /// of a box; a pattern's last instance): the part "after this chapter" is
+    /// the model at this step.
+    pub anchor: u64,
     /// For a pattern: its instances, each a chapter. Empty otherwise.
     pub instances: Vec<Chapter>,
 }
@@ -205,6 +209,7 @@ pub fn chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
                 name: None,
                 events: vec![s.seq],
                 instances: Vec::new(),
+                anchor: s.seq,
             },
             anchor: s.seq,
             tool: tool_feature,
@@ -276,6 +281,7 @@ pub fn chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
                 name: s.name_text(),
                 events: vec![s.seq],
                 instances: Vec::new(),
+                anchor: s.seq,
             },
             anchor: s.seq,
             tool: None,
@@ -395,6 +401,7 @@ fn group_patterns(drafts: Vec<Draft>) -> Vec<Chapter> {
                 kind: "pattern".into(),
                 name: None,
                 events,
+                anchor: instances.last().map_or(0, |c| c.anchor),
                 instances,
             });
             i = j;

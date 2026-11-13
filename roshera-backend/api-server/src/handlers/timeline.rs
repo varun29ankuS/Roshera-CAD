@@ -3079,6 +3079,115 @@ pub async fn get_rebuild_certificate(
     Ok(Json(cert))
 }
 
+/// `GET /api/timeline/chapters/{branch_id}` — the timeline's rows: the
+/// branch's APPLIED history (an undone tail is not part of the part) grouped
+/// into engineering features by [`timeline_engine::chapters::chapters`], the
+/// way a CAD feature tree reads (Varun 2026-11-13). Each chapter carries:
+///
+/// * `kind` (the icon key), `name`, `events` (every recorded step in it),
+///   `anchor` (the step after which the part shows this feature), and a
+///   pattern's `instances`;
+/// * `sound` — every step in it re-measured Rebuilt / Unaffected by the
+///   frame-backed rebuild certificate; otherwise `refusals` lists each
+///   failing step with the kernel's own status and reason;
+/// * `author` (`user` / `agent` / `system`, with the agent's model) and the
+///   `intent` an agent stated for it, when it stated one.
+///
+/// A view over the immutable log: nothing is replayed into the live model.
+pub async fn get_chapters(
+    State(state): State<AppState>,
+    Path(branch_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _ = state.timeline_recorder.settle().await;
+    let branch_id = resolve_branch_ref(&branch_id)?;
+    let events = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        all.sort_by_key(|e| e.sequence_number);
+        let applied = timeline
+            .applied_count(&branch_id)
+            .map_err(|_| StatusCode::NOT_FOUND)? as usize;
+        all.truncate(applied);
+        all
+    };
+
+    let frames = state.frames.clone();
+    let replayed = events.clone();
+    let cert = tokio::task::spawn_blocking(move || {
+        timeline_engine::rebuild_certificate::certify_rebuild_with_frames(&replayed, None, &frames)
+            .1
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let verdict_of: std::collections::HashMap<u64, &timeline_engine::FeatureVerdict> =
+        cert.verdicts.iter().map(|v| (v.sequence, v)).collect();
+    let event_of: std::collections::HashMap<u64, &TimelineEvent> =
+        events.iter().map(|e| (e.sequence_number, e)).collect();
+
+    fn render(
+        c: &timeline_engine::chapters::Chapter,
+        verdict_of: &std::collections::HashMap<u64, &timeline_engine::FeatureVerdict>,
+        event_of: &std::collections::HashMap<u64, &TimelineEvent>,
+    ) -> serde_json::Value {
+        let refusals: Vec<serde_json::Value> = c
+            .events
+            .iter()
+            .filter_map(|seq| verdict_of.get(seq))
+            .filter(|v| {
+                !matches!(
+                    v.status,
+                    timeline_engine::FeatureStatus::Rebuilt
+                        | timeline_engine::FeatureStatus::Unaffected
+                )
+            })
+            .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
+            .collect();
+        let anchor = event_of.get(&c.anchor);
+        let author = match anchor.map(|e| &e.author) {
+            Some(timeline_engine::Author::User { name, .. }) => {
+                serde_json::json!({ "kind": "user", "name": name })
+            }
+            Some(timeline_engine::Author::AIAgent { model, .. }) => {
+                serde_json::json!({ "kind": "agent", "model": model })
+            }
+            _ => serde_json::json!({ "kind": "system" }),
+        };
+        let intent = c.events.iter().find_map(|seq| {
+            let Operation::Generic { parameters, .. } = &event_of.get(seq)?.operation else {
+                return None;
+            };
+            parameters
+                .pointer("/facets/roshera.intent/text")
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        });
+        serde_json::json!({
+            "kind": c.kind,
+            "name": c.name,
+            "events": c.events,
+            "anchor": c.anchor,
+            "sound": refusals.is_empty(),
+            "refusals": refusals,
+            "author": author["kind"],
+            "author_detail": author,
+            "intent": intent,
+            "instances": c.instances.iter().map(|i| render(i, verdict_of, event_of)).collect::<Vec<_>>(),
+        })
+    }
+
+    let chapters: Vec<serde_json::Value> = timeline_engine::chapters::chapters(&events)
+        .iter()
+        .map(|c| render(c, &verdict_of, &event_of))
+        .collect();
+    Ok(Json(serde_json::json!({
+        "branch": branch_id.to_string(),
+        "chapters": chapters,
+        "is_sound": cert.is_sound,
+    })))
+}
+
 // ─── Evidence-pack export ───────────────────────────────────────────
 //
 // One call bundling a document's recorded design history into the
