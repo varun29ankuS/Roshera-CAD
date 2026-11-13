@@ -4,14 +4,16 @@
  * workspace added here is offered, remembered and reachable everywhere at
  * once, and an unknown name is refused rather than half-handled.
  *
- * A workspace exists here only once it does something real. Simulate joins
- * when the kernel has a mesher and a solver behind it.
+ * A workspace exists here only once it does something real. DFM runs the
+ * kernel's rule packs; Simulate joins when the kernel has a mesher and a
+ * solver behind it.
  */
 
 export const WORKSPACES = [
   { id: 'part', label: 'Part' },
   { id: 'assembly', label: 'Assembly' },
   { id: 'drawing', label: 'Drawing' },
+  { id: 'dfm', label: 'DFM' },
 ] as const
 
 export type WorkspaceId = (typeof WORKSPACES)[number]['id']

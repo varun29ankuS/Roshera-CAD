@@ -9,6 +9,7 @@ import { StepImportDropzone } from '@/components/viewport/StepImportDropzone'
 import { PropertiesPanel } from '@/components/panels/PropertiesPanel'
 import { Blackboard } from '@/components/panels/Blackboard'
 import { ModelTree } from '@/components/panels/ModelTree'
+import { DfmPanel } from '@/components/panels/DfmPanel'
 import { Timeline } from '@/components/panels/Timeline'
 import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
 import { AssemblyWorkspace } from '@/components/panels/AssemblyWorkspace'
@@ -159,7 +160,9 @@ export function App() {
           <AssemblyWorkspace />
         ) : (
           <>
-            <ToolBar />
+            {/* DFM keeps the model and its history but not the modelling
+                tools: it is a check on the part, run on its own. */}
+            {docMode !== 'dfm' && <ToolBar />}
 
             {/* The tree lives INSIDE the viewport, over the model — not beside
                 it. I had docked it as a column for symmetry with the right
@@ -192,6 +195,14 @@ export function App() {
                 />
               </div>
 
+              {/* DFM: the check's panel sits where the tree is, wider and
+                  solid -- its findings are read, not looked through. */}
+              {docMode === 'dfm' && (
+                <div className="absolute bottom-2 left-2 top-2 z-20 flex w-72 flex-col overflow-hidden rounded border border-border bg-card/95">
+                  <DfmPanel />
+                </div>
+              )}
+
               {/* Properties: about the SELECTED OBJECT, so it belongs with the
                   object. Top-right, appearing only when there is a selection —
                   it was a permanent tenant of the right rail, which meant the
@@ -216,7 +227,12 @@ export function App() {
                   else is an instrument laid over it that the human can put
                   away. Bottom-left, clear of the tree's column, closable to a
                   pill. */}
-              <div className="pointer-events-none absolute bottom-[7.5rem] left-[15.5rem] right-[15.5rem] top-2 z-20 flex flex-col items-start justify-end">
+              <div
+                className={cn(
+                  'pointer-events-none absolute bottom-[7.5rem] right-[15.5rem] top-2 z-20 flex flex-col items-start justify-end',
+                  docMode === 'dfm' ? 'left-[19rem]' : 'left-[15.5rem]',
+                )}
+              >
                 <Blackboard />
               </div>
 
@@ -229,7 +245,12 @@ export function App() {
                   let the model read through it rather than stamping a slab over
                   the geometry. No blur — blur smears the one thing the app
                   exists to show. */}
-              <div className="pointer-events-auto absolute bottom-2 left-[15.5rem] right-[15.5rem] z-20 overflow-hidden rounded-lg border border-border/70 bg-card/45">
+              <div
+                className={cn(
+                  'pointer-events-auto absolute bottom-2 right-[15.5rem] z-20 overflow-hidden rounded-lg border border-border/70 bg-card/45',
+                  docMode === 'dfm' ? 'left-[19rem]' : 'left-[15.5rem]',
+                )}
+              >
                 <Timeline />
               </div>
             </div>

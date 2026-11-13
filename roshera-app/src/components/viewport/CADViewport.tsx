@@ -27,6 +27,7 @@ import { LabelHoverTooltip } from './LabelHoverTooltip'
 import { PartLabels } from './PartLabels'
 import { PartDimensions } from './PartDimensions'
 import { GdtAnnotations } from './GdtAnnotations'
+import { DfmFaceTints } from './DfmFaceTints'
 import { SketchOverlay } from './SketchOverlay'
 import { ServerSketches } from './ServerSketches'
 import { SketchPanel } from '@/components/panels/SketchPanel'
@@ -219,6 +220,7 @@ export function CADViewport() {
         <PartLabels />
         <PartDimensions />
         <GdtAnnotations />
+        <DfmFaceTints />
       </Canvas>
 
       <ViewportFrame />

@@ -10,6 +10,7 @@ test('the workspaces, in tab order, with the names engineers know', () => {
       ['part', 'Part'],
       ['assembly', 'Assembly'],
       ['drawing', 'Drawing'],
+      ['dfm', 'DFM'],
     ],
   )
 })
