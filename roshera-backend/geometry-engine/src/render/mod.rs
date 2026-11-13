@@ -187,6 +187,32 @@ impl RenderFrame {
         Ok(out)
     }
 
+    /// Encode as an RGBA PNG whose empty background is fully transparent,
+    /// so a thumbnail sits on whatever surface shows it (light or dark
+    /// theme). Every other pixel is opaque and unchanged. Exact for
+    /// `Shaded` renders: lambert shading scales the base colour by at most
+    /// 1, so no part pixel reaches the white background.
+    pub fn to_png_transparent(&self) -> Result<Vec<u8>, String> {
+        let mut rgba = Vec::with_capacity(self.width * self.height * 4);
+        for px in self.pixels.chunks_exact(3) {
+            rgba.extend_from_slice(px);
+            rgba.push(if px == BACKGROUND { 0 } else { 255 });
+        }
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, self.width as u32, self.height as u32);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder
+                .write_header()
+                .map_err(|e| format!("png header: {e}"))?;
+            writer
+                .write_image_data(&rgba)
+                .map_err(|e| format!("png data: {e}"))?;
+        }
+        Ok(out)
+    }
+
     /// Count of distinct non-background colors actually present in the
     /// framebuffer — the verification handle for `FaceIds` mode (should
     /// equal the number of camera-visible faces).

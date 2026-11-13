@@ -201,3 +201,49 @@ fn render_is_deterministic() {
     assert_eq!(a.pixels, b.pixels, "render must be bit-deterministic");
     assert_eq!(a.face_legend, b.face_legend, "legend must be deterministic");
 }
+
+/// Thumbnails sit on the app's own surface in either theme (Varun
+/// 2026-11-13: "the pictures on the timeline are not aligned according to
+/// the theme"), so the transparent PNG keeps only the part: the empty
+/// background is fully transparent, every part pixel fully opaque and
+/// unchanged.
+#[test]
+fn transparent_png_keeps_the_part_and_drops_the_background() {
+    let mut model = BRepModel::new();
+    let solid = union_box_cylinder(&mut model);
+    let opts = RenderOptions {
+        width: 96,
+        height: 96,
+        view: CanonicalView::Isometric,
+        mode: RenderMode::Shaded,
+        ..Default::default()
+    };
+    let frame = render_solid(&model, solid, &opts).expect("render");
+    let bytes = frame.to_png_transparent().expect("png");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().expect("png info");
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("png frame");
+    assert_eq!(
+        info.color_type,
+        png::ColorType::Rgba,
+        "must carry an alpha channel"
+    );
+    let rgba = &buf[..info.buffer_size()];
+    let (mut clear, mut solid_px) = (0usize, 0usize);
+    for (px, rgb) in rgba.chunks_exact(4).zip(frame.pixels.chunks_exact(3)) {
+        if rgb == [255, 255, 255] {
+            assert_eq!(px[3], 0, "background must be transparent");
+            clear += 1;
+        } else {
+            assert_eq!(px[3], 255, "part pixels must be opaque");
+            assert_eq!(&px[..3], rgb, "part pixels must keep their colour");
+            solid_px += 1;
+        }
+    }
+    assert_eq!(rgba[3], 0, "the corner is background");
+    assert!(
+        clear > 0 && solid_px > 0,
+        "both part and background present"
+    );
+}

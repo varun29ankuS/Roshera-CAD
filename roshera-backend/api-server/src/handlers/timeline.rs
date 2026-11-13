@@ -3238,7 +3238,7 @@ pub async fn get_frame_picture(
     let geometry_key = timeline_engine::frames::FrameCache::key_of(&prefix);
     let pkey = timeline_engine::frames::FrameCache::presentation_key(
         &geometry_key,
-        &format!("picture-v1-iso-{size}"),
+        &format!("picture-v2-iso-clear-{size}"),
     );
     if let Some(png) = state.frames.presentation(&pkey) {
         return Ok((
@@ -3283,7 +3283,9 @@ pub async fn get_frame_picture(
             key_light,
             &opts,
         )?;
-        let png = frame.to_png().ok()?;
+        // Transparent background: the picture sits on the app's own
+        // surface in either theme.
+        let png = frame.to_png_transparent().ok()?;
         Some(frames.store_presentation(pkey, png).as_ref().clone())
     })
     .await
