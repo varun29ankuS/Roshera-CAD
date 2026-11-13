@@ -155,6 +155,10 @@ function ModelPicker({
  * conversation fills the column; floating, its height follows the agent's
  * attention instead.
  */
+/** Starter prompts under an empty composer: plain questions the agent can
+ *  answer about the part as it stands. A click only fills the box. */
+const STARTERS = ['Is this part sound?', 'Check it for 3D printing', 'Walk me through the history']
+
 export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
   const lines = useBlackboardStore((s) => s.lines)
   const isProcessing = useBlackboardStore((s) => s.isProcessing)
@@ -456,9 +460,11 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
       )}
     >
       {/* Resize grip — a drag here overrides the attention-following split
-          and STICKS until released (double-click, or the "auto" chip). */}
+          and STICKS until released (double-click, or the "auto" chip).
+          Docked, the board is full height: nothing to size, no grip. */}
+      {!docked && (
       <div
-        className="flex h-2.5 shrink-0 cursor-ns-resize items-center justify-center touch-none hover:bg-white/5"
+        className="flex h-2.5 shrink-0 cursor-ns-resize items-center justify-center touch-none hover:bg-accent"
         onPointerDown={startDrag}
         onPointerMove={moveDrag}
         onPointerUp={endDrag}
@@ -468,6 +474,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
       >
         <GripHorizontal size={11} className="text-muted-foreground/40" />
       </div>
+      )}
       {/* Header */}
       {/* Hug, do not bookend. This header bookended its title against its own
           controls, which measured an 18px seam in a narrow rail and a 414px
@@ -475,10 +482,9 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
           header settled on: bookend app-level BARS, where end-anchoring spans
           real working space; a panel header is one unit and reads as one.
           Trailing space after the last button is row slack, not a void. */}
-      <div className="flex items-center gap-3 px-3 py-1.5 border-b border-white/5">
+      <div className="flex h-10 shrink-0 items-center gap-3 border-b border-border px-3">
         <div className="flex min-w-0 items-center gap-2">
-          <NotebookPen size={14} className="text-primary shrink-0" />
-          <span className="text-xs font-medium shrink-0">Blackboard</span>
+          <span className="shrink-0 text-[12.5px] font-semibold">Blackboard</span>
           {/* Attention state, legible without reading the board. */}
           {agentAttention === 'writing' && (
             <span className="flex shrink-0 items-center gap-1 text-[11px] text-primary/90">
@@ -717,7 +723,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
           composer, like Claude Code's status line. */}
       <TurnStatusLine />
 
-      <div className="shrink-0 border-t border-white/10 bg-white/[0.04]">
+      <div className="shrink-0 border-t border-border">
         {/* Someone watching the render rather than the transcript still has
             to learn the agent stopped and is waiting on them. */}
         <PermissionStrip
@@ -733,7 +739,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
         {waiting.length > 0 && (
           <div
             role="status"
-            className="flex flex-wrap items-center gap-1.5 border-b border-white/5 px-3 py-1.5 text-[11px]"
+            className="flex flex-wrap items-center gap-1.5 border-b border-border px-3 py-1.5 text-[11px]"
           >
             <Clock size={10} className="shrink-0 text-caution" />
             <span className="shrink-0 font-medium text-caution ">
@@ -753,11 +759,36 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
             ))}
           </div>
         )}
-        <form onSubmit={handleSubmit} className="flex items-end gap-1.5 px-2 py-2">
+        {/* Starters (the mockup's suggestion chips): plain prompts for the
+            agent. A click fills the box -- it never sends by itself. */}
+        {!draft.trim() && !isProcessing && (
+          <div className="flex flex-wrap gap-1 px-2 pt-2">
+            {STARTERS.map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => {
+                  setDraft(s)
+                  saveDraft(s)
+                  inputRef.current?.focus()
+                }}
+                className="cad-focus rounded-full border border-border bg-card px-2 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        )}
+        {/* The composer as one card (the mockup): the message, then a row
+            with the keys and Send. */}
+        <form
+          onSubmit={handleSubmit}
+          className="m-2 flex flex-col rounded-lg border border-border bg-card focus-within:border-ring"
+        >
           <textarea
             ref={inputRef}
             value={draft}
-            rows={1}
+            rows={2}
             onChange={(e) => {
               setDraft(e.target.value)
               // Persist on every keystroke — the draft survives blur, panel
@@ -766,28 +797,28 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
               setHistIdx(null)
             }}
             onKeyDown={handleKeyDown}
-            placeholder={
-              isProcessing
-                ? 'Turn in flight — a new prompt queues behind it…'
-                : 'Ask the agent — Enter sends, Shift+Enter for a new line…'
-            }
+            aria-label="Message the agent"
+            placeholder={isProcessing ? 'The agent is working — a new message waits its turn…' : 'Ask the agent…'}
             spellCheck={false}
-            className="max-h-40 min-h-8 flex-1 resize-none overflow-y-auto rounded-xl border border-white/10 bg-background/40 px-2.5 py-[7px] text-xs leading-relaxed text-foreground outline-none placeholder:text-white/30 focus:border-primary/50 scrollbar-thin"
+            className="max-h-40 min-h-12 resize-none overflow-y-auto bg-transparent px-2.5 pt-2 text-[12.5px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/70 scrollbar-thin"
           />
-          {/* A visible, labelled send control — the verb, not a paragraph
-              keystroke. Disabled only by an empty draft, never by a turn
-              in flight (that case queues, visibly). */}
-          <Button
-            type="submit"
-            size="sm"
-            disabled={!draft.trim()}
-            className="h-8 shrink-0 gap-1 rounded-xl px-2.5"
-            title="Send — Enter sends, Shift+Enter for a new line, ArrowUp recalls your last prompt"
-            aria-label="Send prompt"
-          >
-            <Send size={13} />
-            <span className="text-[11px]">Send</span>
-          </Button>
+          <div className="flex items-center gap-2 px-2 pb-1.5">
+            <span className="text-[10.5px] text-muted-foreground/80">Enter sends · Shift+Enter new line</span>
+            <span className="flex-1" />
+            {/* A visible, labelled send control. Disabled only by an empty
+                draft, never by a turn in flight (that case queues, visibly). */}
+            <Button
+              type="submit"
+              size="sm"
+              disabled={!draft.trim()}
+              className="h-7 shrink-0 gap-1 rounded-md px-2.5"
+              title="Send"
+              aria-label="Send prompt"
+            >
+              <Send size={12} />
+              <span className="text-[11px]">Send</span>
+            </Button>
+          </div>
         </form>
       </div>
     </div>

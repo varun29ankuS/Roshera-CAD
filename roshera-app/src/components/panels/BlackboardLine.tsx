@@ -344,7 +344,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
   return (
     <div
       className={cn(
-        'group/line flex items-start gap-2 px-3 py-1.5 hover:bg-white/[0.03] rounded-md',
+        'group/line flex items-start gap-2 px-3 py-1.5 hover:bg-accent/50 rounded-md',
         isUser && 'ml-6',
       )}
     >
@@ -427,7 +427,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
                   </RevealContext.Provider>
                 </CardActionsContext.Provider>
               ) : (
-                <span className="text-white/30 italic">Empty line</span>
+                <span className="italic text-muted-foreground/70">Empty line</span>
               )}
               {isSystem && line.repeatCount !== undefined && line.repeatCount > 1 && (
                 <span
@@ -507,7 +507,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
                   </RevealContext.Provider>
                 </CardActionsContext.Provider>
               ) : (
-                <span className="text-white/30 italic">Empty line</span>
+                <span className="italic text-muted-foreground/70">Empty line</span>
               )}
               {isSystem && line.repeatCount !== undefined && line.repeatCount > 1 && (
                 <span

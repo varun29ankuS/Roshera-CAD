@@ -144,7 +144,7 @@ export function TurnStatusLine() {
     <div
       role="status"
       aria-live="polite"
-      className="shrink-0 border-t border-white/10 px-3 py-1.5 text-xs"
+      className="shrink-0 border-t border-border px-3 py-1.5 text-xs"
     >
       <div className="flex items-baseline gap-2">
         <span aria-hidden className="w-3 shrink-0 text-center text-primary">

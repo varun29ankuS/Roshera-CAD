@@ -67,7 +67,7 @@ export function BuildStepStrip({
   }
 
   return (
-    <div className="group/line flex items-start gap-2 px-3 py-1.5 hover:bg-white/[0.03] rounded-md">
+    <div className="group/line flex items-start gap-2 px-3 py-1.5 hover:bg-accent/50 rounded-md">
       {/* Same origin marker BlackboardLine uses for a system-authored line —
           a step strip is still app-generated bookkeeping, not the agent's
           own prose. */}
