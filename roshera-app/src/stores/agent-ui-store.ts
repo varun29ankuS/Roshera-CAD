@@ -8,10 +8,10 @@ import { create } from 'zustand'
 interface AgentUiState {
   /** The provider and model saved on the server, or null when none is.
    *  Known before any agent session runs, so the chip can name it. */
-  configured: { provider: string; model: string | null } | null
+  configured: { provider: string; mode: string; model: string | null } | null
   /** Bumped by `openSettings`; the dialog opens on every change. */
   settingsRequests: number
-  setConfigured: (c: { provider: string; model: string | null } | null) => void
+  setConfigured: (c: { provider: string; mode: string; model: string | null } | null) => void
   openSettings: () => void
 }
 

@@ -30,3 +30,24 @@ test('no provider at all asks to be set up, never invents one', () => {
     state: 'setup',
   })
 })
+
+const { modelOptions } = await import('../src/lib/agent-chip.ts')
+
+test("Claude's drop-down lists just its models", () => {
+  assert.deepEqual(modelOptions('anthropic', 'sonnet'), [
+    { value: 'opus', label: 'Opus' },
+    { value: 'sonnet', label: 'Sonnet' },
+    { value: 'haiku', label: 'Haiku' },
+  ])
+})
+
+test('a saved model outside the list is shown as itself, never as another', () => {
+  const opts = modelOptions('anthropic', 'claude-opus-4-1')
+  assert.deepEqual(opts?.[0], { value: 'claude-opus-4-1', label: 'claude-opus-4-1' })
+  assert.equal(opts?.length, 4)
+})
+
+test('a vendor whose models are not known here has no drop-down', () => {
+  assert.equal(modelOptions('openrouter', 'some/model'), null)
+  assert.equal(modelOptions(null, null), null)
+})

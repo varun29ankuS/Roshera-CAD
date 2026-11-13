@@ -37,7 +37,8 @@ import {
 } from '@/components/ui/icons'
 import { VendorMark } from '@/components/settings/vendor-marks'
 import { useAgentUiStore } from '@/stores/agent-ui-store'
-import { agentChip } from '@/lib/agent-chip'
+import { agentChip, modelOptions } from '@/lib/agent-chip'
+import { switchAgentModel } from '@/lib/agent-model'
 import { TurnStatusLine } from './TurnStatusLine'
 import { useDocumentStore } from '@/stores/document-store'
 
@@ -111,6 +112,43 @@ function turnWeight(tokens: number): { className: string; label: string } {
   return { className: 'text-red-500', label: 'heavy turn' }
 }
 
+/** The model drop-down in the board's header: just the models available
+ *  (Varun 2026-11-13). Picking one saves it and restarts the agent on it;
+ *  a failure lands on the board in words. */
+function ModelPicker({
+  models,
+  current,
+}: {
+  models: { value: string; label: string }[]
+  current: string | null
+}) {
+  const [switching, setSwitching] = useState(false)
+  const pick = async (next: string) => {
+    if (!next || next === current) return
+    setSwitching(true)
+    const failure = await switchAgentModel(next)
+    setSwitching(false)
+    if (failure) useBlackboardStore.getState().addLine(failure, 'system')
+  }
+  return (
+    <select
+      aria-label="Model"
+      value={current ?? ''}
+      disabled={switching}
+      onChange={(e) => void pick(e.target.value)}
+      className="cad-focus h-6 shrink-0 cursor-pointer rounded-md border border-border/60 bg-transparent px-1 text-[11px] text-muted-foreground hover:bg-accent disabled:opacity-60"
+      title={switching ? 'Switching the model…' : 'Model'}
+    >
+      {!current && <option value="">default</option>}
+      {models.map((m) => (
+        <option key={m.value} value={m.value}>
+          {m.label}
+        </option>
+      ))}
+    </select>
+  )
+}
+
 export function Blackboard() {
   const lines = useBlackboardStore((s) => s.lines)
   const isProcessing = useBlackboardStore((s) => s.isProcessing)
@@ -138,11 +176,12 @@ export function Blackboard() {
   // A running session names what is really running; before one starts,
   // the chip names what is saved.
   const chipProvider = acpLive ? acpProvider : (configured?.provider ?? null)
-  const chip = agentChip({
-    provider: chipProvider,
-    model: acpLive ? acpModel : (configured?.model ?? null),
-    live: acpLive,
-  })
+  const chipModel = acpLive ? acpModel : (configured?.model ?? null)
+  const chip = agentChip({ provider: chipProvider, model: chipModel, live: acpLive })
+  const vendorLabel = agentChip({ provider: chipProvider, model: null, live: acpLive }).label
+  // The drop-down switches the SAVED choice, so it needs one saved.
+  const models = configured ? modelOptions(chipProvider, chipModel) : null
+
 
   // ── Checkpoint sections ─────────────────────────────────────────────
   //
@@ -494,9 +533,12 @@ export function Blackboard() {
                 className="h-3 w-3 shrink-0"
               />
             )}
-            <span className="truncate">{chip.label}</span>
-            <ChevronDown size={11} className="shrink-0 opacity-60" aria-hidden />
+            <span className="truncate">{models ? vendorLabel : chip.label}</span>
+            {!models && <ChevronDown size={11} className="shrink-0 opacity-60" aria-hidden />}
           </button>
+          {/* The model, as a drop-down of just the models available (Varun
+              2026-11-13). Picking one saves it and restarts the agent on it. */}
+          {models && <ModelPicker models={models} current={chipModel} />}
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
           {overrideHeight !== null && (

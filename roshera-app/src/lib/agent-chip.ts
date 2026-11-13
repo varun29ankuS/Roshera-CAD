@@ -39,3 +39,28 @@ export function agentChip(input: {
     state: input.live ? 'live' : 'idle',
   }
 }
+
+/** The models Claude offers, as the drop-downs list them. */
+export const CLAUDE_MODELS: { value: string; label: string }[] = [
+  { value: 'opus', label: 'Opus' },
+  { value: 'sonnet', label: 'Sonnet' },
+  { value: 'haiku', label: 'Haiku' },
+]
+
+/**
+ * The model drop-down's entries for a provider: just the models available.
+ * A saved model outside the list leads it, shown as itself -- never
+ * displayed as a different model. `null` for a vendor whose model list is
+ * not known here (its models are chosen in the AI pop-up).
+ */
+export function modelOptions(
+  provider: string | null | undefined,
+  current: string | null | undefined,
+): { value: string; label: string }[] | null {
+  if (provider !== 'anthropic') return null
+  const cur = current?.trim() ?? ''
+  if (cur && !CLAUDE_MODELS.some((m) => m.value === cur)) {
+    return [{ value: cur, label: cur }, ...CLAUDE_MODELS]
+  }
+  return [...CLAUDE_MODELS]
+}

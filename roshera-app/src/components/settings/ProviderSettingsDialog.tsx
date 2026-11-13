@@ -38,6 +38,7 @@ import {
 } from '@/lib/acp-blackboard'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { useAgentUiStore } from '@/stores/agent-ui-store'
+import { modelOptions } from '@/lib/agent-chip'
 
 /** `GET /api/ai/provider`'s `cli` object is keyed by CLI, not by provider
  *  id (`ai_provider_config::detect_claude_cli` / `detect_codex_cli`). */
@@ -195,20 +196,6 @@ const MODE_SHORT_LABELS: Record<CredentialMode, string> = {
 // key and a Max subscription don't necessarily serve the same set), so the
 // caption under the control says so explicitly and every value still goes
 // through the backend's live validation before it is treated as active.
-/** Claude's three models, as buttons: name and what each is for. */
-const CLAUDE_MODELS: { value: string; label: string; hint: string }[] = [
-  { value: 'opus', label: 'Opus', hint: 'most capable' },
-  { value: 'sonnet', label: 'Sonnet', hint: 'balanced' },
-  { value: 'haiku', label: 'Haiku', hint: 'fastest' },
-]
-
-const MODEL_PRESETS: { value: string; label: string }[] = [
-  { value: '', label: "default (provider's choice)" },
-  { value: 'opus', label: 'opus' },
-  { value: 'sonnet', label: 'sonnet' },
-  { value: 'haiku', label: 'haiku' },
-]
-
 /** The four states Varun asked to make visually distinct — computed only
  *  from facts the backend actually reports (`wiring.status`, `active`,
  *  `cli.*.installed/signed_in`), never invented:
@@ -313,18 +300,13 @@ export function AgentButton() {
       const a = next.data.active
       useAgentUiStore
         .getState()
-        .setConfigured(a ? { provider: a.provider, model: a.model ?? null } : null)
+        .setConfigured(a ? { provider: a.provider, mode: a.mode, model: a.model ?? null } : null)
     }
   }
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null)
   const [selectedMode, setSelectedMode] = useState<CredentialMode | null>(null)
   const [apiKey, setApiKey] = useState('')
   const [model, setModel] = useState('')
-  // Whether the model field is in "Custom…" mode. Tracked separately from
-  // `model` itself: selecting "Custom…" with an empty box must keep showing
-  // the free-text field, which a derivation from `model === ''` alone can't
-  // tell apart from the `default` preset also being empty.
-  const [modelCustom, setModelCustom] = useState(false)
   const [testedFor, setTestedFor] = useState<{ apiKey: string; model: string } | null>(null)
   const [testResult, setTestResult] = useState<{ ok: boolean; message?: string } | null>(null)
   const [testing, setTesting] = useState(false)
@@ -355,13 +337,10 @@ export function AgentButton() {
   // doc below for why that used to be wrong).
   const acpLive = useAcpSessionStore((s) => s.live)
 
-  /** Sets `model` and derives `modelCustom` from whether it matches a
-   *  known preset — the single place external data (load, provider switch)
-   *  is allowed to set the model field, so the dropdown and the free-text
-   *  box never fall out of sync with each other. */
+  /** Sets the model field -- the single place external data (load,
+   *  provider switch) is allowed to set it. */
   function applyModel(next: string) {
     setModel(next)
-    setModelCustom(!MODEL_PRESETS.some((p) => p.value === next))
     setTestResult(null)
   }
 
@@ -564,7 +543,6 @@ export function AgentButton() {
     setOpen(true)
     setApiKey('')
     setModel('')
-    setModelCustom(false)
     setTestedFor(null)
     setTestResult(null)
     setDiscovery(null)
@@ -778,7 +756,7 @@ export function AgentButton() {
 
   // Non-null only when discovery succeeded for the exact key currently in
   // the box — the model field becomes a picker over this REAL list
-  // (never merged with `MODEL_PRESETS`) instead of the preset+free-text
+  // (never merged with a preset list) instead of the preset+free-text
   // control. An empty array (vendor served zero models) is still an
   // honest "success" and still suppresses the preset/free-text UI —
   // showing stale presets after a real, empty answer would misrepresent
@@ -1313,7 +1291,7 @@ export function AgentButton() {
                         // picker over it, never free text (an id typed by
                         // hand could silently diverge from what discovery
                         // just proved this key can serve). Never merged
-                        // with `MODEL_PRESETS`: only ids the vendor itself
+                        // with a preset list: only ids the vendor itself
                         // named, plus "default".
                         <select
                           id="provider-model-select"
@@ -1329,59 +1307,36 @@ export function AgentButton() {
                             </option>
                           ))}
                         </select>
-                      ) : selectedProviderId === 'anthropic' && !modelCustom ? (
-                        <div className="grid grid-cols-3 gap-1.5" role="radiogroup" aria-label="Model">
-                          {CLAUDE_MODELS.map((m) => {
-                            const chosen = model === m.value
-                            const running = activeModelValue === m.value && acpLive
-                            return (
-                              <button
-                                key={m.value}
-                                type="button"
-                                role="radio"
-                                aria-checked={chosen}
-                                onClick={() => applyModel(m.value)}
-                                className={cn(
-                                  'flex flex-col items-start rounded-md border px-2 py-1.5 text-left transition-colors',
-                                  chosen
-                                    ? 'border-primary/60 bg-primary/10'
-                                    : 'border-border hover:bg-accent/30',
-                                )}
-                              >
-                                <span className="text-xs font-medium">{m.label}</span>
-                                <span className="text-[11px] text-muted-foreground">
-                                  {running ? (
-                                    <span className="text-emerald-500">● running</span>
-                                  ) : (
-                                    m.hint
-                                  )}
-                                </span>
-                              </button>
-                            )
-                          })}
-                        </div>
+                      ) : selectedProviderId === 'anthropic' ? (
+                        // Just the models available -- Varun 2026-11-13:
+                        // "the drop down should just show the list of
+                        // models available".
+                        <select
+                          id="provider-model-select"
+                          value={model}
+                          onChange={(e) => applyModel(e.target.value)}
+                          className="cad-focus h-7 rounded border border-border/60 bg-background/40 px-1.5 text-[11px] text-foreground/90 hover:bg-accent/30"
+                        >
+                          {model === '' && <option value="">default</option>}
+                          {(modelOptions('anthropic', model) ?? []).map((m) => (
+                            <option key={m.value} value={m.value}>
+                              {m.label}
+                              {activeModelValue === m.value && acpLive ? ' (running)' : ''}
+                            </option>
+                          ))}
+                        </select>
                       ) : (
                         <Input
                           id="provider-model-select"
                           value={model}
                           onChange={(e) => {
                             setModel(e.target.value)
-                            setModelCustom(true)
                             setTestResult(null)
                           }}
                           placeholder="model id"
                           className="h-7 text-[11px]"
                           autoComplete="off"
                         />
-                      )}
-                      {selectedProviderId === 'anthropic' && !discoveredModels && (
-                        <button
-                          type="button"
-                          onClick={() => (modelCustom ? applyModel('sonnet') : setModelCustom(true))}
-                          className="self-start text-[11px] text-muted-foreground underline-offset-2 hover:underline"
-                        >
-                          {modelCustom ? 'Back to the three models' : 'Another model…'}
-                        </button>
                       )}
                       {selectedMode === 'subscription_cli' && model !== (activeModelValue ?? '') && (
                         <p className="text-[11px] text-muted-foreground">
