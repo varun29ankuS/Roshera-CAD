@@ -83,13 +83,54 @@ pub struct ConnectorFrame {
     pub x_axis: [f64; 3],
 }
 
+/// A persistent id in JSON: written as decimal text, because a JSON number
+/// cannot hold 128 bits (`serde_json::to_value` refuses anything above
+/// u64::MAX, and the timeline records connectors as JSON values). Read back
+/// from that text, or from a plain number in records that predate it.
+mod pid_text {
+    use serde::de::{self, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(pid: &u128, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&pid.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+        struct PidVisitor;
+        impl Visitor<'_> for PidVisitor {
+            type Value = u128;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a persistent id as decimal text or an unsigned integer")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<u128, E> {
+                v.parse::<u128>()
+                    .map_err(|e| E::custom(format!("persistent id {v:?}: {e}")))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<u128, E> {
+                Ok(u128::from(v))
+            }
+            fn visit_u128<E: de::Error>(self, v: u128) -> Result<u128, E> {
+                Ok(v)
+            }
+        }
+        d.deserialize_any(PidVisitor)
+    }
+}
+
 /// WHERE a connector's frame is anchored — the durability ladder (module
 /// doc). The variant IS the provenance the certificate reports per mate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConnectorAnchor {
     /// Durable face identity: the frame derives from the face resolved via
     /// `face_by_pid`. Survives re-extrude / replay (#11 lineage).
-    FacePid { pid: u128 },
+    FacePid {
+        /// Written as decimal TEXT: a 128-bit id does not fit a JSON number,
+        /// and every connector is recorded into the timeline as JSON (see
+        /// `pid_text`).
+        #[serde(with = "pid_text")]
+        pid: u128,
+    },
     /// Durable NAME: label → PID → assertion, re-verified on every resolve
     /// (`Holds | Stale`). The strongest agent-ergonomic anchor.
     Label { name: String },
@@ -487,6 +528,51 @@ pub fn resolve_face_by_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A face anchor carries a full 128-bit persistent id (a v5 UUID, so
+    /// almost always above u64::MAX). The api-server records every connector
+    /// into the timeline as a `serde_json::Value` (`op_connector_add`), and a
+    /// JSON number cannot hold such an id: `to_value` refused it ("number out
+    /// of range") and the `json!` macro turned that into a panic -- every
+    /// connector anchored on a face with a PID crashed its request (found
+    /// 2026-11-14 building the certified assembly screen). The id must
+    /// survive the trip into a JSON value and back exactly.
+    #[test]
+    fn a_face_anchor_with_a_full_width_pid_round_trips_through_a_json_value() {
+        let pid = u128::MAX - 12_345;
+        let connector = MateConnector {
+            id: MateConnectorId::new(),
+            instance: super::super::instancing::InstanceId(Uuid::new_v4()),
+            anchor: ConnectorAnchor::FacePid { pid },
+            frame: ConnectorFrame {
+                origin: [0.0, 0.0, 0.0],
+                z_axis: [0.0, 0.0, 1.0],
+                x_axis: [1.0, 0.0, 0.0],
+            },
+            radius: Some(15.0),
+        };
+        let value = serde_json::to_value(&connector);
+        assert!(
+            value.is_ok(),
+            "the connector must fit a JSON value: {value:?}"
+        );
+        let back: Result<MateConnector, _> = value.and_then(serde_json::from_value);
+        assert!(
+            matches!(back, Ok(ref c) if c.anchor == ConnectorAnchor::FacePid { pid }),
+            "{back:?}"
+        );
+    }
+
+    /// Records written before the id travelled as text carried it as a plain
+    /// number (only possible when it fitted 64 bits): still read.
+    #[test]
+    fn a_face_anchor_recorded_as_a_plain_number_still_reads() {
+        let anchor: Result<ConnectorAnchor, _> = serde_json::from_str(r#"{"FacePid":{"pid":7}}"#);
+        assert!(
+            matches!(anchor, Ok(ConnectorAnchor::FacePid { pid: 7 })),
+            "{anchor:?}"
+        );
+    }
 
     #[test]
     fn anchor_provenance_matches_variant() {
