@@ -56,14 +56,14 @@ export function GizmoNav() {
   return (
     <>
       <ManualSceneRender active={!hasOutlineTarget} />
-      <GizmoHelper alignment="top-right" margin={[overlaid ? 72 + 336 : 72, 72]} renderPriority={2}>
+      <GizmoHelper alignment="top-right" margin={[overlaid ? 56 + 336 : 56, 56]} renderPriority={2}>
         {/* A view cube (the approved mockup): click a face, edge or corner
             to look from that side. */}
         {/* A light cube with medium-weight grey labels and fine edges, in
             both themes -- the CAD-standard look (Fusion, SolidWorks). Bold
             white labels on dark faces crowded the faces (Varun 2026-11-14:
             "now it looks even bad"). */}
-        <group scale={1.05}>
+        <group scale={0.78}>
           <GizmoViewcube
             faces={Z_UP_FACES}
             font="600 22px Inter, system-ui, sans-serif"
