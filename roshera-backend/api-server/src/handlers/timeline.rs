@@ -18,10 +18,10 @@ use std::sync::Arc;
 // row). It is deliberately not imported here; the lineage projection is
 // reached through `LineageGraph` / `LineageError` only.
 use timeline_engine::{
-    certify_rebuild, mould_operation, name_binding_operation, params_have_numeric, Author,
-    BranchId, BranchPurpose, EntityId, EventId, EventMetadata, LineageGraph, NameBindings,
-    Operation, OperationInputs, RebuildCertificate, ReplayOutcome, SessionId, Timeline,
-    TimelineError, TimelineEvent,
+    certify_rebuild, mould_operation, name_binding_operation, params_have_numeric,
+    suppress_operation, Author, BranchId, BranchPurpose, EntityId, EventId, EventMetadata,
+    LineageGraph, NameBindings, Operation, OperationInputs, RebuildCertificate, ReplayOutcome,
+    SessionId, Timeline, TimelineError, TimelineEvent,
 };
 use tracing::{error, info};
 use uuid::Uuid;
@@ -3070,6 +3070,253 @@ pub async fn mould_parameter(
             "objects": objects,
             // #64 Slice 5: the full honest per-feature rebuild certificate.
             "certificate": cand_cert,
+        })),
+    ))
+}
+
+/// `POST /api/timeline/suppress` body: the steps of ONE feature to delete.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SuppressRequest {
+    /// Session whose live model is reconciled (as for a mould; omit for live).
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Branch; defaults to `main`.
+    #[serde(default)]
+    pub branch_id: Option<String>,
+    /// The feature's steps (a chapter's `events`).
+    pub target_sequences: Vec<u64>,
+}
+
+/// `POST /api/timeline/suppress` -- DELETE a feature (Varun 2026-11-14:
+/// "there is no way to delete a feature, only to edit it").
+///
+/// Like a mould, a delete is an APPENDED correcting step (`param.suppress`,
+/// timeline-engine `mould.rs`), never a rewrite: replay skips the feature's
+/// steps and the body flows past them; Undo removes the step and the feature
+/// returns. It is trialled first exactly as a mould is -- the candidate
+/// history certified on a scratch model -- and REFUSED (409, nothing
+/// appended) when it would break a sound part: deleting the base a later
+/// feature is built on is refused, naming the feature that would break.
+pub async fn suppress_feature(
+    State(state): State<AppState>,
+    Json(request): Json<SuppressRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let branch_id = match request.branch_id.as_deref() {
+        Some(b) => resolve_branch_ref(b)?,
+        None => BranchId::main(),
+    };
+    let (session_uuid, session_is_live) =
+        resolve_reconcile_session(request.session_id.as_deref(), &branch_id)?;
+    let _ = state.timeline_recorder.settle().await;
+    let events = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        all.sort_by_key(|e| e.sequence_number);
+        all
+    };
+
+    // Every target must be a geometry step of this branch, not yet deleted.
+    let already = timeline_engine::OverrideSet::collect(&events);
+    let refuse = |kind: &str, reason: String| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "status": "DeleteRejected", "kind": kind, "reason": reason })),
+        )
+    };
+    if request.target_sequences.is_empty() {
+        return Ok(refuse("NothingToDelete", "no steps named".into()));
+    }
+    for seq in &request.target_sequences {
+        let Some(e) = events.iter().find(|e| e.sequence_number == *seq) else {
+            return Ok(refuse(
+                "UnknownStep",
+                format!("no step {seq} on this branch"),
+            ));
+        };
+        if let Operation::Generic { command_type, .. } = &e.operation {
+            if timeline_engine::is_param_meta(command_type) {
+                return Ok(refuse(
+                    "NotAFeature",
+                    format!("step {seq} is an edit, not a feature step"),
+                ));
+            }
+        }
+        if already.is_suppressed(*seq) {
+            return Ok(refuse(
+                "AlreadyDeleted",
+                format!("step {seq} is already deleted"),
+            ));
+        }
+    }
+
+    let mut targets = request.target_sequences.clone();
+    targets.sort_unstable();
+    targets.dedup();
+    let first_target = targets[0];
+    let mut delete_event = TimelineEvent {
+        id: EventId::new(),
+        sequence_number: events.last().map(|e| e.sequence_number + 1).unwrap_or(0),
+        timestamp: chrono::Utc::now(),
+        author: Author::System,
+        operation: suppress_operation(&targets),
+        inputs: OperationInputs::default(),
+        outputs: Default::default(),
+        metadata: EventMetadata::default(),
+    };
+    let mut candidate_events = events.clone();
+    candidate_events.push(delete_event.clone());
+
+    // Pre-flight: a history the shared guard would refuse to replay.
+    let preflight = {
+        let timeline = state.timeline.read().await;
+        timeline.replay_boundary(&branch_id, &candidate_events)
+    };
+    match preflight {
+        Ok(Some(boundary)) => {
+            let refusal = branch_replay_refused(
+                branch_id,
+                Some(boundary.sequence),
+                &boundary.kind,
+                &boundary.reason,
+                state.timeline_recorder.branch_id(),
+            );
+            return Ok((
+                refusal.code.status(),
+                Json(serde_json::to_value(&refusal).unwrap_or_default()),
+            ));
+        }
+        Ok(None) => {}
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+
+    // Trial on a scratch model, as a mould is: refuse a REGRESSION only.
+    let base_sound = {
+        let frames = std::sync::Arc::clone(&state.frames);
+        let ev = events.clone();
+        tokio::task::spawn_blocking(move || timeline_engine::frames::geometry_sound(&ev, &frames))
+            .await
+            .unwrap_or(true)
+    };
+    let (_cand_model, cand_cert) = {
+        let frames = std::sync::Arc::clone(&state.frames);
+        let ev = candidate_events.clone();
+        match tokio::task::spawn_blocking(move || {
+            timeline_engine::rebuild_certificate::certify_rebuild_with_frames(
+                &ev,
+                Some(first_target),
+                &frames,
+            )
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!(target: "timeline.delete", error = %e, "candidate certification task failed");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    };
+    if base_sound && !cand_cert.is_sound() {
+        let reason = cand_cert
+            .first_break()
+            .map(|v| {
+                format!(
+                    "deleting it breaks the feature at step {} ({}), which is built on it",
+                    v.sequence, v.kind
+                )
+            })
+            .unwrap_or_else(|| "deleting it leaves the part unsound".to_string());
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "DeleteRejected",
+                "kind": "BrokenDownstream",
+                "reason": reason,
+                "target_sequences": targets,
+                "certificate": cand_cert,
+            })),
+        ));
+    }
+
+    // Commit: append the delete, make it durable, reconcile the live model.
+    let appended_id = {
+        let timeline = state.timeline.write().await;
+        let seq = timeline.reserve_sequence_number();
+        delete_event.sequence_number = seq;
+        timeline
+            .add_operation_reserved(
+                delete_event.operation.clone(),
+                Author::System,
+                branch_id,
+                seq,
+            )
+            .await
+            .map_err(|e| {
+                error!(target: "timeline.delete", error = %e, "delete append failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+    if let Err(e) = crate::durability::persist_appended(&state, &[appended_id]).await {
+        error!(target: "timeline.delete", error = %e, "delete not persisted");
+        return Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "DeleteNotSaved",
+                "kind": "NotDurable",
+                "reason": format!("the delete is applied in memory but could not be saved: {e}"),
+            })),
+        ));
+    }
+    let seed = if session_is_live {
+        force_session_position_at_head(&state, session_uuid, &branch_id).await
+    } else {
+        ensure_session_position_at_head(&state, session_uuid).await
+    };
+    if let Err(err) = seed {
+        error!(target: "timeline.delete", session = %session_uuid, error = %err, "session seed failed");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let (events_applied, events_skipped) = match replay_session_to_model(&state, session_uuid).await
+    {
+        Ok(o) => (o.events_applied, o.events_skipped),
+        Err(err) => {
+            error!(target: "timeline.delete", session = %session_uuid, error = %err, "live reconcile failed");
+            return Ok(mutated_but_not_reconciled(
+                &state,
+                &err,
+                serde_json::json!({
+                    "operation": "delete",
+                    "delete_event_id": delete_event.id.to_string(),
+                    "target_sequences": targets,
+                }),
+            ));
+        }
+    };
+    let _ = state
+        .session_manager
+        .broadcast_manager()
+        .broadcast_to_session(
+            &session_uuid.to_string(),
+            BroadcastMessage::TimelineUpdate {
+                session_id: session_uuid,
+                event_id: delete_event.id.to_string(),
+                operation: "delete".to_string(),
+                user_id: "system".to_string(),
+            },
+        )
+        .await;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "FeatureDeleted",
+            "delete_event_id": delete_event.id.to_string(),
+            "delete_sequence": delete_event.sequence_number,
+            "target_sequences": targets,
+            "events_applied": events_applied,
+            "events_skipped": events_skipped,
+            "is_sound": cand_cert.is_sound(),
         })),
     ))
 }

@@ -63,8 +63,8 @@ pub use incremental::{
 };
 pub use lineage::{EntityRef, EventSummary, LineageEdge, LineageError, LineageGraph};
 pub use mould::{
-    is_param_meta, mould_operation, name_binding_operation, params_have_numeric, NameBindings,
-    OverrideSet, MOULD_COMMAND, NAME_COMMAND,
+    is_param_meta, mould_operation, name_binding_operation, params_have_numeric,
+    suppress_operation, NameBindings, OverrideSet, MOULD_COMMAND, NAME_COMMAND, SUPPRESS_COMMAND,
 };
 pub use rebuild_certificate::{
     certify_rebuild, certify_rebuild_with_drawings, FeatureStatus, FeatureVerdict,

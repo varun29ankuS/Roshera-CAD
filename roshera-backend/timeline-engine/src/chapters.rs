@@ -111,8 +111,22 @@ struct ToolFeature {
     part_out: Option<u64>,
 }
 
-/// Group a history into chapters, in order.
+/// Group a history into chapters, in order. A DELETED feature (every step
+/// of it named by a `param.suppress`) is left out -- it is no longer part of
+/// the part; the delete itself stays, as a step of the history.
 pub fn chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
+    let deleted = crate::mould::OverrideSet::collect(events);
+    let gone =
+        |c: &Chapter| !c.events.is_empty() && c.events.iter().all(|s| deleted.is_suppressed(*s));
+    let mut out = all_chapters(events);
+    for c in &mut out {
+        c.instances.retain(|i| !gone(i));
+    }
+    out.retain(|c| !gone(c));
+    out
+}
+
+fn all_chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
     let mut ordered: Vec<&TimelineEvent> = events.iter().collect();
     ordered.sort_by_key(|e| e.sequence_number);
     let null = Value::Null;

@@ -12365,3 +12365,98 @@ async fn a_part_render_asked_for_a_transparent_background_has_one() {
     .await;
     assert_eq!(corner_alpha(&opaque), Some(255), "the default stays opaque");
 }
+
+/// Deleting a feature (Varun 2026-11-14): `POST /api/timeline/suppress` with
+/// a chapter's steps. The drilled hole goes -- the part is a plain sound box
+/// again, nothing failing -- and the delete is a recorded step of its own.
+#[tokio::test]
+async fn deleting_the_hole_feature_leaves_a_sound_plain_box() {
+    let state = make_test_state().await;
+    seed_bored_box_live(&state).await;
+    let (_, ch) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    let hole = ch["chapters"]
+        .as_array()
+        .and_then(|cs| cs.iter().find(|c| c["kind"] == "hole"))
+        .cloned()
+        .expect("the drilled hole is a chapter");
+    let (s, body) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/suppress",
+            json!({ "target_sequences": hole["events"].clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    assert_eq!(body["status"], "FeatureDeleted", "{body}");
+    assert_eq!(body["events_skipped"], 0, "{body}");
+    assert_eq!(body["is_sound"], true, "{body}");
+    let model = state.model.read().await;
+    assert_eq!(model.solids.len(), 1, "one body: the box");
+    let solid = model
+        .solids
+        .iter()
+        .next()
+        .map(|(_, s)| s.clone())
+        .expect("a solid");
+    let faces = model
+        .shells
+        .get(solid.outer_shell)
+        .map(|sh| sh.faces.len())
+        .unwrap_or(0)
+        + solid.inner_shells.len();
+    assert_eq!(faces, 6, "a plain box: the bore wall is gone");
+    drop(model);
+    // And the feature tree no longer lists it.
+    let (_, after) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    let kinds: Vec<String> = after["chapters"]
+        .as_array()
+        .map(|cs| {
+            cs.iter()
+                .filter_map(|c| c["kind"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !kinds.iter().any(|k| k == "hole"),
+        "the deleted hole is gone from the tree: {kinds:?}"
+    );
+}
+
+/// Deleting the base a later feature is built on is REFUSED, with the
+/// kernel's reason, and nothing is appended.
+#[tokio::test]
+async fn deleting_the_base_under_a_hole_is_refused() {
+    let state = make_test_state().await;
+    seed_bored_box_live(&state).await;
+    let (_, ch) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    let chapters = ch["chapters"].as_array().cloned().unwrap_or_default();
+    let base = chapters
+        .iter()
+        .find(|c| c["kind"] == "box")
+        .cloned()
+        .expect("the box chapter");
+    let before = chapters.len();
+    let (s, body) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/suppress",
+            json!({ "target_sequences": base["events"].clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "body = {body}");
+    assert_eq!(body["kind"], "BrokenDownstream", "{body}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("breaks")),
+        "{body}"
+    );
+    let (_, after) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    assert_eq!(
+        after["chapters"].as_array().map(Vec::len),
+        Some(before),
+        "nothing appended"
+    );
+}

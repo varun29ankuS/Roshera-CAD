@@ -11714,6 +11714,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 axum::middleware::from_fn_with_state(intent_gate.clone(), require_declared_intent),
             ),
         )
+        // Delete a feature: an appended param.suppress step, trialled like a
+        // mould and refused when it would break what is built on it.
+        .route(
+            "/api/timeline/suppress",
+            post(crate::handlers::timeline::suppress_feature).route_layer(
+                axum::middleware::from_fn_with_state(intent_gate.clone(), require_declared_intent),
+            ),
+        )
         // #64 Slice 3: bind a stable NAME to a recorded (event, parameter) so a
         // mould can target it by name. Appended `param.name` event, latest-wins.
         // Every size an edit can change, with its value now (the feature edit
