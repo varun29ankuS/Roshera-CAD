@@ -2486,8 +2486,6 @@ pub async fn extrude_csketch(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use geometry_engine::math::Tolerance;
     use geometry_engine::operations::extrude::extrude_profile_regions;
-    use geometry_engine::sketch2d::sketch_topology::{ProfileExtractor, SketchTopology};
-    use geometry_engine::sketch2d::Tolerance2d;
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
@@ -2518,46 +2516,11 @@ pub async fn extrude_csketch(
     validate_extrude_direction(&direction, &plane.normal())?;
 
     let sketch = require_sketch(&state, id)?;
-    refuse_unsatisfied_sketch(&sketch)?;
-    refuse_profile_contacts(&sketch)?;
-    let tol2d = Tolerance2d::default();
-    let topology = SketchTopology::analyze(&sketch, &tol2d)
-        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
-    if !topology.is_valid_for_extrusion() {
-        // Agent-grade diagnosis: name every connectivity issue and
-        // every dangling endpoint so the caller can repair the sketch
-        // without rendering it.
-        let issues: Vec<String> = topology.issues().iter().map(|i| format!("{i:?}")).collect();
-        let open: Vec<[f64; 2]> = topology
-            .open_endpoints()
-            .iter()
-            .map(|p| [p.x, p.y])
-            .collect();
-        return Err(ApiError::new(
-            ErrorCode::InvalidParameter,
-            "sketch topology is not valid for extrusion (profiles must be closed, non-self-intersecting regions)",
-        )
-        .with_details(serde_json::json!({
-            "profile_type": format!("{:?}", topology.profile_type()),
-            "issues": issues,
-            "open_endpoints": open,
-        })));
-    }
-    let profiles = ProfileExtractor::extract_for_extrusion(&topology)
-        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
-    if profiles.is_empty() {
-        return Err(ApiError::new(
-            ErrorCode::InvalidParameter,
-            "sketch contains no closed regions to extrude",
-        ));
-    }
-
     // Materialise every region loop up front (no kernel mutation yet —
     // input errors must not leave orphan topology behind). Analytic
     // typed edges wherever the entity kinds allow (SKETCH-DCM #45
     // Slice 5); explicit chord-sampled fallback otherwise.
-    let (regions, analytic_loops, sampled_loops) =
-        materialise_profile_regions(&sketch, &topology, &profiles)?;
+    let (regions, analytic_loops, sampled_loops) = extrusion_regions(&sketch)?;
 
     // Suppress the kernel's inner events (extrude_face + region
     // Unions) for the duration of the build: they are not replayable
@@ -2629,15 +2592,7 @@ pub async fn extrude_csketch(
     // (the legacy shape, still replayable), `{"edges": [...]}` for
     // analytic typed edges.
     use geometry_engine::operations::recorder::OperationRecorder as _;
-    let regions_json: Vec<serde_json::Value> = regions
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "outer": profile_loop_json(&r.outer),
-                "holes": r.holes.iter().map(profile_loop_json).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
+    let regions_json = regions_json(&regions);
     let record = geometry_engine::operations::recorder::RecordedOperation::new("sketch_extrude")
         .with_parameters(serde_json::json!({
             "origin": [frame_origin.x, frame_origin.y, frame_origin.z],
@@ -2755,6 +2710,123 @@ pub async fn extrude_csketch(
 /// sampled polygons keep the legacy plain-array shape (old events stay
 /// replayable, old and new readers agree); analytic loops carry
 /// `{"edges": [...]}` with the typed `ProfileEdge` wire format.
+
+type MaterialisedRegions = (
+    Vec<geometry_engine::operations::extrude::ProfileRegion>,
+    usize,
+    usize,
+);
+
+/// A sketch's topology, checked fit to become a feature: constraints met,
+/// no profile contacts, closed non-self-intersecting regions. Refusals
+/// name every connectivity issue and dangling end, so the sketch can be
+/// repaired without rendering it.
+fn checked_topology(
+    sketch: &Sketch,
+    what: &str,
+) -> Result<geometry_engine::sketch2d::sketch_topology::SketchTopology, ApiError> {
+    use geometry_engine::sketch2d::sketch_topology::SketchTopology;
+    use geometry_engine::sketch2d::Tolerance2d;
+    refuse_unsatisfied_sketch(sketch)?;
+    refuse_profile_contacts(sketch)?;
+    let tol2d = Tolerance2d::default();
+    let topology = SketchTopology::analyze(sketch, &tol2d)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    if !topology.is_valid_for_extrusion() {
+        let issues: Vec<String> = topology.issues().iter().map(|i| format!("{i:?}")).collect();
+        let open: Vec<[f64; 2]> = topology
+            .open_endpoints()
+            .iter()
+            .map(|p| [p.x, p.y])
+            .collect();
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "sketch topology is not valid for {what} (profiles must be closed, non-self-intersecting regions)"
+            ),
+        )
+        .with_details(serde_json::json!({
+            "profile_type": format!("{:?}", topology.profile_type()),
+            "issues": issues,
+            "open_endpoints": open,
+        })));
+    }
+    Ok(topology)
+}
+
+/// The closed regions an extrude builds from, materialised.
+fn extrusion_regions(sketch: &Sketch) -> Result<MaterialisedRegions, ApiError> {
+    use geometry_engine::sketch2d::sketch_topology::ProfileExtractor;
+    let topology = checked_topology(sketch, "extrusion")?;
+    let profiles = ProfileExtractor::extract_for_extrusion(&topology)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    if profiles.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch contains no closed regions to extrude",
+        ));
+    }
+    materialise_profile_regions(sketch, &topology, &profiles)
+}
+
+/// The closed regions a revolve about `axis_origin` / `axis_direction`
+/// builds from (profiles CROSSING the axis are refused: they would
+/// self-intersect when revolved).
+fn revolution_regions(
+    sketch: &Sketch,
+    axis_origin: [f64; 2],
+    axis_direction: [f64; 2],
+) -> Result<MaterialisedRegions, ApiError> {
+    use geometry_engine::sketch2d::sketch_topology::ProfileExtractor;
+    let topology = checked_topology(sketch, "revolve")?;
+    let revolution_profiles = ProfileExtractor::extract_for_revolution(
+        &topology,
+        &Point2d::new(axis_origin[0], axis_origin[1]),
+        &geometry_engine::sketch2d::Vector2d::new(axis_direction[0], axis_direction[1]),
+    )
+    .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    if revolution_profiles.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch contains no closed regions to revolve",
+        ));
+    }
+    let profiles: Vec<geometry_engine::sketch2d::sketch_topology::ExtrusionProfile> =
+        revolution_profiles.into_iter().map(|p| p.profile).collect();
+    materialise_revolve_profile_regions(sketch, &topology, &profiles)
+}
+
+/// Regions as a sketch feature's history step records them (`regions`).
+pub(crate) fn regions_json(
+    regions: &[geometry_engine::operations::extrude::ProfileRegion],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        regions
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "outer": profile_loop_json(&r.outer),
+                    "holes": r.holes.iter().map(profile_loop_json).collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The new `regions` of a sketch feature, from its edited sketch: the
+/// extrude's regions, or -- for a revolve -- the regions about its axis.
+/// The same checks and materialisation the feature was first built with.
+pub(crate) fn feature_regions(
+    sketch: &Sketch,
+    revolve_axis: Option<([f64; 2], [f64; 2])>,
+) -> Result<serde_json::Value, ApiError> {
+    let (regions, _, _) = match revolve_axis {
+        Some((o, d)) => revolution_regions(sketch, o, d)?,
+        None => extrusion_regions(sketch)?,
+    };
+    Ok(regions_json(&regions))
+}
+
 fn profile_loop_json(lp: &geometry_engine::operations::extrude::ProfileLoop) -> serde_json::Value {
     use geometry_engine::operations::extrude::ProfileLoop;
     match lp {
@@ -3049,8 +3121,6 @@ pub async fn revolve_csketch(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use geometry_engine::math::Tolerance;
     use geometry_engine::operations::revolve::revolve_profile_regions;
-    use geometry_engine::sketch2d::sketch_topology::{ProfileExtractor, SketchTopology};
-    use geometry_engine::sketch2d::{Point2d, Tolerance2d, Vector2d};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
@@ -3078,47 +3148,7 @@ pub async fn revolve_csketch(
     validate_wire_plane(&plane)?;
 
     let sketch = require_sketch(&state, id)?;
-    refuse_unsatisfied_sketch(&sketch)?;
-    refuse_profile_contacts(&sketch)?;
-    let tol2d = Tolerance2d::default();
-    let topology = SketchTopology::analyze(&sketch, &tol2d)
-        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
-    if !topology.is_valid_for_extrusion() {
-        let issues: Vec<String> = topology.issues().iter().map(|i| format!("{i:?}")).collect();
-        let open: Vec<[f64; 2]> = topology
-            .open_endpoints()
-            .iter()
-            .map(|p| [p.x, p.y])
-            .collect();
-        return Err(ApiError::new(
-            ErrorCode::InvalidParameter,
-            "sketch topology is not valid for revolve (profiles must be closed, non-self-intersecting regions)",
-        )
-        .with_details(serde_json::json!({
-            "profile_type": format!("{:?}", topology.profile_type()),
-            "issues": issues,
-            "open_endpoints": open,
-        })));
-    }
-    // extract_for_revolution additionally rejects profiles CROSSING
-    // the axis (they would self-intersect when revolved).
-    let revolution_profiles = ProfileExtractor::extract_for_revolution(
-        &topology,
-        &Point2d::new(ax, ay),
-        &Vector2d::new(dx, dy),
-    )
-    .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
-    if revolution_profiles.is_empty() {
-        return Err(ApiError::new(
-            ErrorCode::InvalidParameter,
-            "sketch contains no closed regions to revolve",
-        ));
-    }
-    let profiles: Vec<geometry_engine::sketch2d::sketch_topology::ExtrusionProfile> =
-        revolution_profiles.into_iter().map(|p| p.profile).collect();
-
-    let (regions, analytic_loops, sampled_loops) =
-        materialise_revolve_profile_regions(&sketch, &topology, &profiles)?;
+    let (regions, analytic_loops, sampled_loops) = revolution_regions(&sketch, [ax, ay], [dx, dy])?;
 
     let frame_origin = plane.lift(0.0, 0.0);
     let u_pt = plane.lift(1.0, 0.0);
@@ -3157,15 +3187,7 @@ pub async fn revolve_csketch(
     // The replayable record — everything needed to rebuild this solid
     // from an empty model, applied through the same kernel path.
     use geometry_engine::operations::recorder::OperationRecorder as _;
-    let regions_json: Vec<serde_json::Value> = regions
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "outer": profile_loop_json(&r.outer),
-                "holes": r.holes.iter().map(profile_loop_json).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
+    let regions_json = regions_json(&regions);
     let record = geometry_engine::operations::recorder::RecordedOperation::new("sketch_revolve")
         .with_parameters(serde_json::json!({
             "origin": [frame_origin.x, frame_origin.y, frame_origin.z],

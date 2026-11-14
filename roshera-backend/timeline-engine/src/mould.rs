@@ -70,6 +70,32 @@ pub fn is_param_meta(command_type: &str) -> bool {
     command_type == MOULD_COMMAND
         || command_type == NAME_COMMAND
         || command_type == SUPPRESS_COMMAND
+        || command_type == RESKETCH_COMMAND
+}
+
+/// A sketch feature's sketch edited after the fact (Varun 2026-11-14: "no
+/// way to edit the sketch"): an appended step carrying the feature's NEW
+/// outline (`regions`, what replay builds from) and the sketch it came from
+/// (`source`). Like a size edit it never rewrites history; the latest
+/// resketch of a step wins, and size edits (e.g. the extrude depth) still
+/// apply on top.
+pub const RESKETCH_COMMAND: &str = "param.resketch";
+
+/// The `param.resketch` operation for the sketch feature at
+/// `target_sequence`.
+pub fn resketch_operation(target_sequence: u64, regions: &Value, source: &Value) -> Operation {
+    Operation::Generic {
+        command_type: RESKETCH_COMMAND.to_string(),
+        parameters: json!({
+            "params": {
+                "target_sequence": target_sequence,
+                "regions": regions,
+                "source": source,
+            },
+            "inputs": [],
+            "outputs": [],
+        }),
+    }
 }
 
 /// The `param.suppress` operation deleting the steps `target_sequences` (one
@@ -234,6 +260,9 @@ pub struct OverrideSet {
     resolved: HashMap<(u64, String), f64>,
     /// Steps deleted by `param.suppress` events: replay skips them.
     suppressed: std::collections::BTreeSet<u64>,
+    /// Sketch features re-sketched by `param.resketch` events: the step's new
+    /// `(regions, source)`, latest wins.
+    resketched: HashMap<u64, (Value, Value)>,
 }
 
 impl OverrideSet {
@@ -306,9 +335,34 @@ impl OverrideSet {
                 }
             }
         }
+        let mut resketches: Vec<(u64, u64, Value, Value)> = Vec::new();
+        for e in events {
+            if let Operation::Generic {
+                command_type,
+                parameters,
+            } = &e.operation
+            {
+                if command_type == RESKETCH_COMMAND {
+                    let p = envelope_params(parameters);
+                    if let (Some(target), Some(regions)) = (
+                        p.get("target_sequence").and_then(Value::as_u64),
+                        p.get("regions"),
+                    ) {
+                        let source = p.get(SKETCH_SOURCE_KEY).cloned().unwrap_or(Value::Null);
+                        resketches.push((e.sequence_number, target, regions.clone(), source));
+                    }
+                }
+            }
+        }
+        resketches.sort_by_key(|(own, ..)| *own);
+        let mut resketched = HashMap::new();
+        for (_, target, regions, source) in resketches {
+            resketched.insert(target, (regions, source));
+        }
         OverrideSet {
             resolved,
             suppressed,
+            resketched,
         }
     }
 
@@ -318,7 +372,7 @@ impl OverrideSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.resolved.is_empty() && self.suppressed.is_empty()
+        self.resolved.is_empty() && self.suppressed.is_empty() && self.resketched.is_empty()
     }
 
     /// The earliest event sequence any override targets — the incremental
@@ -328,10 +382,8 @@ impl OverrideSet {
     pub fn min_target_sequence(&self) -> Option<u64> {
         let edited = self.resolved.keys().map(|(seq, _)| *seq).min();
         let deleted = self.suppressed.iter().next().copied();
-        match (edited, deleted) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let resketched = self.resketched.keys().min().copied();
+        [edited, deleted, resketched].into_iter().flatten().min()
     }
 
     /// The overriding value for a specific `(sequence, parameter)`, if any.
@@ -351,7 +403,7 @@ impl OverrideSet {
     /// changes, so the persistent-id lineage (seeded from `sequence_number`) is
     /// untouched and references survive.
     pub fn overridden_event(&self, event: &TimelineEvent) -> Option<TimelineEvent> {
-        if self.resolved.is_empty() {
+        if self.resolved.is_empty() && self.resketched.is_empty() {
             return None;
         }
         let Operation::Generic {
@@ -369,7 +421,8 @@ impl OverrideSet {
             .filter(|((s, _), _)| *s == seq)
             .map(|((_, p), v)| (p.as_str(), *v))
             .collect();
-        if applicable.is_empty() {
+        let resketch = self.resketched.get(&seq);
+        if applicable.is_empty() && resketch.is_none() {
             return None;
         }
         // Deterministic application order (parameter name) so two replays fold
@@ -383,6 +436,15 @@ impl OverrideSet {
                 Some(inner) => inner,
                 None => &mut new_params,
             };
+            // A re-sketched feature first takes its new outline and sketch;
+            // size edits then apply on top.
+            if let (Some((regions, source)), Some(obj)) = (resketch, inner.as_object_mut()) {
+                if obj.contains_key("regions") {
+                    obj.insert("regions".to_string(), regions.clone());
+                    obj.insert(SKETCH_SOURCE_KEY.to_string(), source.clone());
+                    changed = true;
+                }
+            }
             for (param, value) in applicable {
                 if set_numeric_recursive(inner, param, value) {
                     changed = true;
@@ -406,14 +468,14 @@ impl OverrideSet {
     }
 }
 
-/// Whether `parameter` names a numeric key anywhere in a recorded op's params
-/// tree. Used by the surface to validate a mould target *before* appending —
-/// an unresolvable parameter is a typed refusal, not a silent no-op.
 /// The key a sketch feature's step saves its sketch under (entities +
 /// constraints, so it can be reopened). The rebuild uses the outline, never
 /// this, so no number inside it is a size an edit can find or write.
 pub const SKETCH_SOURCE_KEY: &str = "source";
 
+/// Whether `parameter` names a numeric key anywhere in a recorded op's params
+/// tree. Used by the surface to validate a mould target *before* appending —
+/// an unresolvable parameter is a typed refusal, not a silent no-op.
 pub fn params_have_numeric(params: &Value, parameter: &str) -> bool {
     let inner = envelope_params(params);
     find_numeric_recursive(inner, parameter)
