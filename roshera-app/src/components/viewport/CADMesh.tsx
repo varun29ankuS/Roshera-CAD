@@ -1,4 +1,5 @@
 import { useCursorStore } from '@/stores/cursor-store'
+import { INSTANCE_PREFIX } from '@/lib/assembly-pose'
 import { isNearestHit } from '@/lib/status-bar'
 import { memo, useRef, useMemo, useCallback, useEffect, type ComponentRef } from 'react'
 import { Edges } from '@react-three/drei'
@@ -268,6 +269,11 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
         type: subType,
         index: elementIndex,
       })
+
+      // An assembly instance's pick is the Assembly panel's (its mate tool
+      // reads the selection); the part-level pick services below do not know
+      // instance ids.
+      if (object.id.startsWith(INSTANCE_PREFIX)) return
 
       // Shared-perception bridge: tell the server (and through it, any
       // agent in conversation) what the user just pointed at. Fire and
