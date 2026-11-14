@@ -295,6 +295,12 @@ fn replay_slice(
                 continue;
             }
         }
+        // A deleted feature's step: skipped, the body flows past it.
+        if overrides.is_suppressed(event.sequence_number) {
+            crate::replay::skip_suppressed(event, id_remap);
+            outcome.events_applied += 1;
+            continue;
+        }
         let overridden = overrides.overridden_event(event);
         let dispatched = overridden.as_ref().unwrap_or(event);
         match apply_event(model, assemblies, dispatched, id_remap) {

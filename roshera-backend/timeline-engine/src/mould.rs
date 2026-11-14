@@ -56,11 +56,35 @@ pub const MOULD_COMMAND: &str = "param.mould";
 /// Command type of an appended parameter-name binding event (Slice 3).
 pub const NAME_COMMAND: &str = "param.name";
 
+/// Command type of an appended feature DELETE (Varun 2026-11-14: "there is no
+/// way to delete a feature, only to edit it"). Like a mould it is a correcting
+/// event, never a rewrite: it names the steps of the deleted feature, replay
+/// skips them, and the body flows past a deleted boolean (see
+/// [`crate::replay::skip_suppressed`]). Undo removes it and the feature returns.
+pub const SUPPRESS_COMMAND: &str = "param.suppress";
+
 /// True if `command_type` is a parametric-DAG metadata command (a mould
 /// override or a name binding). These carry **no geometry** — replay folds them
 /// in a pre-pass and must not dispatch them as kernel operations.
 pub fn is_param_meta(command_type: &str) -> bool {
-    command_type == MOULD_COMMAND || command_type == NAME_COMMAND
+    command_type == MOULD_COMMAND
+        || command_type == NAME_COMMAND
+        || command_type == SUPPRESS_COMMAND
+}
+
+/// The `param.suppress` operation deleting the steps `target_sequences` (one
+/// feature: e.g. a hole's cutter and the boolean that cuts it).
+pub fn suppress_operation(target_sequences: &[u64]) -> Operation {
+    Operation::Generic {
+        command_type: SUPPRESS_COMMAND.to_string(),
+        parameters: json!({
+            "params": { "target_sequences": target_sequences },
+            // No geometry lineage of its own: an isolated node in the
+            // dependency projection, like a mould.
+            "inputs": [],
+            "outputs": [],
+        }),
+    }
 }
 
 /// Build the `Operation` for an appended `param.mould` override event
@@ -208,6 +232,8 @@ impl NameBindings {
 #[derive(Debug, Clone, Default)]
 pub struct OverrideSet {
     resolved: HashMap<(u64, String), f64>,
+    /// Steps deleted by `param.suppress` events: replay skips them.
+    suppressed: std::collections::BTreeSet<u64>,
 }
 
 impl OverrideSet {
@@ -262,11 +288,37 @@ impl OverrideSet {
                 }
             }
         }
-        OverrideSet { resolved }
+        let mut suppressed = std::collections::BTreeSet::new();
+        for e in events {
+            if let Operation::Generic {
+                command_type,
+                parameters,
+            } = &e.operation
+            {
+                if command_type == SUPPRESS_COMMAND {
+                    let targets = parameters
+                        .get("params")
+                        .and_then(|p| p.get("target_sequences"))
+                        .and_then(Value::as_array);
+                    for t in targets.into_iter().flatten().filter_map(Value::as_u64) {
+                        suppressed.insert(t);
+                    }
+                }
+            }
+        }
+        OverrideSet {
+            resolved,
+            suppressed,
+        }
+    }
+
+    /// Whether replay skips the step `sequence` (its feature was deleted).
+    pub fn is_suppressed(&self, sequence: u64) -> bool {
+        self.suppressed.contains(&sequence)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.resolved.is_empty()
+        self.resolved.is_empty() && self.suppressed.is_empty()
     }
 
     /// The earliest event sequence any override targets — the incremental
@@ -274,7 +326,12 @@ impl OverrideSet {
     /// below this cannot observe any override (producers precede consumers), so
     /// its replayed state is reusable. `None` when no override is present.
     pub fn min_target_sequence(&self) -> Option<u64> {
-        self.resolved.keys().map(|(seq, _)| *seq).min()
+        let edited = self.resolved.keys().map(|(seq, _)| *seq).min();
+        let deleted = self.suppressed.iter().next().copied();
+        match (edited, deleted) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// The overriding value for a specific `(sequence, parameter)`, if any.

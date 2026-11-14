@@ -119,7 +119,9 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
     let switches = projection_switches(events);
     let geometry: Vec<TimelineEvent> = ordered
         .iter()
-        .filter(|e| is_geometry_event(e))
+        // Deletes travel with the geometry: the replay below skips the deleted
+        // feature's steps (the sheet must not show a feature that is gone).
+        .filter(|e| is_geometry_event(e) || kind(e) == crate::mould::SUPPRESS_COMMAND)
         .map(|e| {
             overrides
                 .overridden_event(e)

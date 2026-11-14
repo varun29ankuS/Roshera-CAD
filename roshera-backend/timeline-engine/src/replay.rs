@@ -563,6 +563,14 @@ pub fn rebuild_model_from_events(model: &mut BRepModel, events: &[TimelineEvent]
             }
         }
 
+        // A deleted feature's step (`param.suppress`) is skipped; the body
+        // flows past it. Counted as applied -- the delete took effect.
+        if overrides.is_suppressed(event.sequence_number) {
+            skip_suppressed(event, &mut outcome.id_remap);
+            outcome.events_applied += 1;
+            continue;
+        }
+
         // If a mould targets this event's sequence, replay an OVERRIDDEN clone
         // (same id / sequence / lineage, new dimensional value). Otherwise the
         // original event is replayed unchanged (borrowed, no clone).
@@ -601,6 +609,34 @@ pub fn rebuild_model_from_events(model: &mut BRepModel, events: &[TimelineEvent]
     let _ = model.attach_recorder(saved_recorder);
 
     outcome
+}
+
+/// Skip a step of a DELETED feature (`param.suppress`, see
+/// [`crate::mould::SUPPRESS_COMMAND`]). A step that turned one body into
+/// another -- a boolean, a fillet, a shell -- passes its first input body
+/// through as its output, so what was built after it carries on from the body
+/// as it stood before the deleted feature ("the body flows past it"). A step
+/// that created a body from nothing (a primitive) leaves nothing behind:
+/// whatever was built on it now fails, and the delete route refuses that.
+pub fn skip_suppressed(event: &TimelineEvent, id_remap: &mut HashMap<u64, u64>) {
+    let Operation::Generic { parameters, .. } = &event.operation else {
+        return;
+    };
+    let solid = |v: &serde_json::Value| {
+        v.as_str()
+            .and_then(|s| s.strip_prefix("solid:"))
+            .and_then(|n| n.parse::<u64>().ok())
+    };
+    let first = |key: &str| {
+        parameters
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| a.iter().find_map(solid))
+    };
+    if let (Some(input), Some(output)) = (first("inputs"), first("outputs")) {
+        let live = id_remap.get(&input).copied().unwrap_or(input);
+        id_remap.insert(output, live);
+    }
 }
 
 /// Apply a single event to the model (kernel kinds) or the assembly store

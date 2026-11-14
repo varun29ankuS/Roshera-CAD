@@ -266,12 +266,19 @@ impl FrameCache {
             .iter()
             .map(|e| {
                 let effective = overrides.overridden_event(e);
+                let deleted = overrides.is_suppressed(e.sequence_number);
                 let e = effective.as_ref().unwrap_or(e);
                 let mut h = Sha256::new();
                 h.update(prev);
                 h.update(e.sequence_number.to_le_bytes());
                 h.update(e.id.0.as_bytes());
-                h.update(serde_json::to_vec(&e.operation).unwrap_or_default());
+                // A deleted step replays as nothing: a different state, so a
+                // different key (a cached frame of it undeleted is never reused).
+                if deleted {
+                    h.update(b"deleted");
+                } else {
+                    h.update(serde_json::to_vec(&e.operation).unwrap_or_default());
+                }
                 prev = h.finalize().into();
                 prev
             })
@@ -348,6 +355,10 @@ impl FrameCache {
                 Operation::Generic { command_type, .. } if is_param_meta(command_type)
             );
             if is_meta {
+                outcome.events_applied += 1;
+            } else if overrides.is_suppressed(event.sequence_number) {
+                // A deleted feature's step: skipped, the body flows past it.
+                crate::replay::skip_suppressed(event, &mut id_remap);
                 outcome.events_applied += 1;
             } else {
                 let overridden = overrides.overridden_event(event);

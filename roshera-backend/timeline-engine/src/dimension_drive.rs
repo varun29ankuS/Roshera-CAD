@@ -754,6 +754,11 @@ impl<'a> ChainProbe<'a> {
                     },
                 );
             }
+            if overrides.is_suppressed(e.sequence_number) {
+                // A deleted feature's step: the body flows past it.
+                crate::replay::skip_suppressed(e, &mut id_remap);
+                continue;
+            }
             let over = overrides.overridden_event(e);
             match apply_event(
                 &mut model,
@@ -795,6 +800,11 @@ impl<'a> ChainProbe<'a> {
         for e in self.chain.iter().filter(|e| e.sequence_number >= sequence) {
             self.reexecuted
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if overrides.is_suppressed(e.sequence_number) {
+                // A deleted feature's step: the body flows past it.
+                crate::replay::skip_suppressed(e, &mut id_remap);
+                continue;
+            }
             let over = overrides.overridden_event(e);
             match apply_event(
                 &mut model,
@@ -1021,6 +1031,11 @@ fn geometry_replay(
             if is_param_meta(command_type) || command_type.contains('.') {
                 continue;
             }
+        }
+        if overrides.is_suppressed(e.sequence_number) {
+            // A deleted feature's step: the body flows past it.
+            crate::replay::skip_suppressed(e, &mut id_remap);
+            continue;
         }
         let over = overrides.overridden_event(e);
         match apply_event(
