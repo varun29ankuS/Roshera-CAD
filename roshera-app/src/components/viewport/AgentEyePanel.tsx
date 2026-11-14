@@ -114,8 +114,8 @@ export function AgentEyePanel({
         setPerc(null)
         const named = assemblyId.trim()
         const url = named
-          ? `${API_HOST}/api/assembly/${named}/view?az=${az}&el=${el}&mode=${sceneMode}&size=256&quality=medium`
-          : `${API_HOST}/api/agent/scene/orbit?az=${az}&el=${el}&mode=${sceneMode}&size=256&quality=medium`
+          ? `${API_HOST}/api/assembly/${named}/view?az=${az}&el=${el}&mode=${sceneMode}&size=256&quality=medium&bg=transparent`
+          : `${API_HOST}/api/agent/scene/orbit?az=${az}&el=${el}&mode=${sceneMode}&size=256&quality=medium&bg=transparent`
         const r = await fetch(url)
         if (r.status === 404) {
           setPng(null)
@@ -187,7 +187,7 @@ export function AgentEyePanel({
         setErr(null)
       } else {
         const r = await fetch(
-          `${API_HOST}/api/agent/parts/${id}/render?mode=${mode}&view=${view}&size=256`,
+          `${API_HOST}/api/agent/parts/${id}/render?mode=${mode}&view=${view}&size=256&bg=transparent`,
         )
         if (!r.ok) throw new Error(`render ${r.status}`)
         const data = (await r.json()) as { png_base64: string; open_edges: number; nonmanifold_edges: number }
@@ -346,7 +346,10 @@ export function AgentEyePanel({
           the image itself means an off-square snapshot letterboxes INSIDE its
           own frame, so no field ever surrounds it. */}
       <div className="flex flex-wrap items-start gap-3 px-2 py-2">
-        <div className="relative h-[200px] w-[200px] shrink-0 overflow-hidden rounded border border-border bg-muted">
+        {/* The renders come back with a see-through background (bg=transparent),
+            so the picture sits on the viewport's own themed colour. The
+            section and dimensioned views are still drawn on white. */}
+        <div className="relative h-[200px] w-[200px] shrink-0 overflow-hidden rounded border border-border bg-[var(--cad-viewport-bg)]">
           {png ? (
             <img
               src={`data:image/png;base64,${png}`}
