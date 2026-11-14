@@ -2012,6 +2012,29 @@ impl NurbsSurface {
         let span_u = self.find_span_u(u);
         let span_v = self.find_span_v(v);
 
+        // Every surface a real file carries has degree <= STACK_DEGREE: its
+        // basis tables live on the stack (the Vec path below allocated ~26
+        // times per call, the dominant cost of meshing a NURBS face). Same
+        // arithmetic in the same order, so the result is bit-identical.
+        if self.degree_u <= STACK_DEGREE && self.degree_v <= STACK_DEGREE {
+            return self.evaluate_derivatives_stack(u, v, span_u, span_v, du_order, dv_order);
+        }
+
+        self.evaluate_derivatives_heap(u, v, span_u, span_v, du_order, dv_order)
+    }
+
+    /// The heap-table evaluation: any degree. [`Self::evaluate_derivatives`]
+    /// uses it above `STACK_DEGREE`; a test holds the stack path to it bit
+    /// for bit.
+    pub(crate) fn evaluate_derivatives_heap(
+        &self,
+        u: f64,
+        v: f64,
+        span_u: usize,
+        span_v: usize,
+        du_order: usize,
+        dv_order: usize,
+    ) -> NurbsSurfacePoint {
         // Compute basis functions
         let nu = self.basis_functions_u(span_u, u);
         let nv = self.basis_functions_v(span_v, v);
@@ -2150,6 +2173,135 @@ impl NurbsSurface {
             }
         }
 
+        result
+    }
+
+    /// [`Self::evaluate_derivatives`] for degrees `<= STACK_DEGREE`, with the
+    /// basis tables on the stack. `u`, `v` are already clamped and the spans
+    /// found. Mirrors the heap path statement for statement.
+    fn evaluate_derivatives_stack(
+        &self,
+        u: f64,
+        v: f64,
+        span_u: usize,
+        span_v: usize,
+        du_order: usize,
+        dv_order: usize,
+    ) -> NurbsSurfacePoint {
+        let ku = du_order.min(2);
+        let kv = dv_order.min(2);
+        let mut nu_ders = [[0.0f64; STACK_DEGREE + 1]; 3];
+        let mut nv_ders = [[0.0f64; STACK_DEGREE + 1]; 3];
+        basis_ders_stack(
+            self.knots_u.values(),
+            self.degree_u,
+            span_u,
+            u,
+            ku,
+            &mut nu_ders,
+        );
+        basis_ders_stack(
+            self.knots_v.values(),
+            self.degree_v,
+            span_v,
+            v,
+            kv,
+            &mut nv_ders,
+        );
+        // Row 0 of the derivative table IS the basis: the same recurrence,
+        // the same operations, so the position is what the basis-only
+        // routine gives.
+        let (nu, nv) = (&nu_ders[0], &nv_ders[0]);
+
+        let mut point = Point3::ZERO;
+        let mut weight_sum = 0.0;
+        for i in 0..=self.degree_u {
+            for j in 0..=self.degree_v {
+                let idx_u = span_u - self.degree_u + i;
+                let idx_v = span_v - self.degree_v + j;
+                let w = self.weights[idx_u][idx_v];
+                let basis = nu[i] * nv[j] * w;
+                point += self.control_points[idx_u][idx_v].to_vec() * basis;
+                weight_sum += basis;
+            }
+        }
+        point = Point3::from(point.to_vec() / weight_sum);
+
+        let mut result = NurbsSurfacePoint {
+            point,
+            du: None,
+            dv: None,
+            duu: None,
+            dvv: None,
+            duv: None,
+            normal: None,
+            u,
+            v,
+        };
+        if ku >= 1 || kv >= 1 {
+            let mut aders = [[Vector3::ZERO; 3]; 3];
+            let mut wders = [[0.0f64; 3]; 3];
+            for i in 0..=self.degree_u {
+                let idx_u = span_u - self.degree_u + i;
+                for j in 0..=self.degree_v {
+                    let idx_v = span_v - self.degree_v + j;
+                    let w = self.weights[idx_u][idx_v];
+                    let wp = self.control_points[idx_u][idx_v].to_vec() * w;
+                    for k in 0..=ku {
+                        for l in 0..=kv {
+                            let basis = nu_ders[k][i] * nv_ders[l][j];
+                            aders[k][l] = aders[k][l] + wp * basis;
+                            wders[k][l] += w * basis;
+                        }
+                    }
+                }
+            }
+            let bin = |a: usize, b: usize| -> f64 {
+                match (a, b) {
+                    (_, 0) => 1.0,
+                    (1, 1) | (2, 2) => 1.0,
+                    (2, 1) => 2.0,
+                    _ => 0.0,
+                }
+            };
+            let w00 = wders[0][0];
+            let mut skl = [[Vector3::ZERO; 3]; 3];
+            for k in 0..=ku {
+                for l in 0..=kv {
+                    let mut val = aders[k][l];
+                    for j in 1..=l {
+                        val = val - skl[k][l - j] * (bin(l, j) * wders[0][j]);
+                    }
+                    for i in 1..=k {
+                        val = val - skl[k - i][l] * (bin(k, i) * wders[i][0]);
+                        let mut inner = Vector3::ZERO;
+                        for j in 1..=l {
+                            inner = inner + skl[k - i][l - j] * (bin(l, j) * wders[i][j]);
+                        }
+                        val = val - inner * bin(k, i);
+                    }
+                    skl[k][l] = val / w00;
+                }
+            }
+            if ku >= 1 {
+                result.du = Some(skl[1][0]);
+            }
+            if kv >= 1 {
+                result.dv = Some(skl[0][1]);
+            }
+            if let (Some(du), Some(dv)) = (result.du, result.dv) {
+                result.normal = dv.cross(&du).normalize().ok();
+            }
+            if ku >= 2 {
+                result.duu = Some(skl[2][0]);
+            }
+            if kv >= 2 {
+                result.dvv = Some(skl[0][2]);
+            }
+            if ku >= 1 && kv >= 1 {
+                result.duv = Some(skl[1][1]);
+            }
+        }
         result
     }
 
@@ -3323,6 +3475,83 @@ pub fn skin_surface_periodic_u(
     NurbsSurface::new(control_points, weights, knots_u, knots_v, DEG_U, degree_v)
 }
 
+/// Highest degree whose basis tables [`NurbsSurface::evaluate_derivatives`]
+/// keeps on the stack. Higher degrees take the heap path (same values).
+const STACK_DEGREE: usize = 15;
+
+/// Piegl & Tiller A2.3 `DersBasisFuns` into a stack table: row `k` holds the
+/// `k`-th derivatives (`k <= nd <= 2`) of the `degree + 1` non-zero basis
+/// functions over `span`. Statement for statement the heap routine
+/// `compute_basis_functions_derivatives`, so the values are bit-identical.
+fn basis_ders_stack(
+    knots: &[f64],
+    degree: usize,
+    span: usize,
+    u: f64,
+    nd: usize,
+    ders: &mut [[f64; STACK_DEGREE + 1]; 3],
+) {
+    let mut ndu = [[0.0f64; STACK_DEGREE + 1]; STACK_DEGREE + 1];
+    let mut a = [[0.0f64; STACK_DEGREE + 1]; 2];
+    let mut left = [0.0f64; STACK_DEGREE + 1];
+    let mut right = [0.0f64; STACK_DEGREE + 1];
+    ndu[0][0] = 1.0;
+    for j in 1..=degree {
+        left[j] = u - knots[span + 1 - j];
+        right[j] = knots[span + j] - u;
+        let mut saved = 0.0;
+        for r in 0..j {
+            ndu[j][r] = right[r + 1] + left[j - r];
+            let temp = ndu[r][j - 1] / ndu[j][r];
+            ndu[r][j] = saved + right[r + 1] * temp;
+            saved = left[j - r] * temp;
+        }
+        ndu[j][j] = saved;
+    }
+    for j in 0..=degree {
+        ders[0][j] = ndu[j][degree];
+    }
+    let kmax = nd.min(degree);
+    for r in 0..=degree {
+        let mut s1 = 0usize;
+        let mut s2 = 1usize;
+        a[0][0] = 1.0;
+        for k in 1..=kmax {
+            let mut d = 0.0;
+            let rk = r as i32 - k as i32;
+            let pk = degree as i32 - k as i32;
+            if r >= k {
+                a[s2][0] = a[s1][0] / ndu[(pk + 1) as usize][rk as usize];
+                d = a[s2][0] * ndu[rk as usize][pk as usize];
+            }
+            let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
+            let j2 = if (r as i32 - 1) <= pk {
+                k - 1
+            } else {
+                degree - r
+            };
+            for j in j1..=j2 {
+                let idx = (rk + j as i32) as usize;
+                a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[(pk + 1) as usize][idx];
+                d += a[s2][j] * ndu[idx][pk as usize];
+            }
+            if (r as i32) <= pk {
+                a[s2][k] = -a[s1][k - 1] / ndu[(pk + 1) as usize][r];
+                d += a[s2][k] * ndu[r][pk as usize];
+            }
+            ders[k][r] = d;
+            std::mem::swap(&mut s1, &mut s2);
+        }
+    }
+    let mut acc = degree as f64;
+    for k in 1..=kmax {
+        for i in 0..=degree {
+            ders[k][i] *= acc;
+        }
+        acc *= (degree - k) as f64;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4416,5 +4645,127 @@ mod tests {
             u_target
         );
         assert!((p_found - on_curve).magnitude() < 1e-6);
+    }
+}
+
+/// The stack evaluation path must give exactly what the heap path gives --
+/// every coordinate of the point and of every derivative, bit for bit -- on
+/// rational surfaces of many degrees and knot layouts.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod stack_evaluation_tests {
+    use super::*;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+    }
+
+    fn knots(rng: &mut Lcg, degree: usize, n_cp: usize) -> Vec<f64> {
+        // Clamped, with interior knots, some repeated.
+        let interior = n_cp - degree - 1;
+        let mut inner: Vec<f64> = Vec::new();
+        while inner.len() < interior {
+            // Strictly inside (0, 1); repeated (multiplicity 2) only where the
+            // degree allows it.
+            let k = 0.05 + 0.9 * rng.next();
+            inner.push(k);
+            if degree >= 2 && rng.next() < 0.3 && inner.len() < interior {
+                inner.push(k);
+            }
+        }
+        inner.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut out = vec![0.0; degree + 1];
+        out.extend(inner);
+        out.extend(vec![1.0; degree + 1]);
+        out
+    }
+
+    fn surface(rng: &mut Lcg, du: usize, dv: usize) -> NurbsSurface {
+        let (nu, nv) = (
+            du + 1 + (rng.next() * 5.0) as usize,
+            dv + 1 + (rng.next() * 5.0) as usize,
+        );
+        let cps: Vec<Vec<Point3>> = (0..nu)
+            .map(|i| {
+                (0..nv)
+                    .map(|j| {
+                        Point3::new(
+                            i as f64 + rng.next(),
+                            j as f64 + rng.next(),
+                            10.0 * (rng.next() - 0.5),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let ws: Vec<Vec<f64>> = (0..nu)
+            .map(|_| (0..nv).map(|_| 0.3 + rng.next() * 2.0).collect())
+            .collect();
+        let ku = knots(rng, du, nu);
+        let kv = knots(rng, dv, nv);
+        NurbsSurface::new(cps, ws, ku, kv, du, dv).expect("valid surface")
+    }
+
+    fn bits(p: &NurbsSurfacePoint) -> Vec<u64> {
+        let v = |o: Option<Vector3>| {
+            o.map_or([u64::MAX; 3], |v| {
+                [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]
+            })
+        };
+        let mut out = vec![
+            p.point.x.to_bits(),
+            p.point.y.to_bits(),
+            p.point.z.to_bits(),
+        ];
+        for d in [p.du, p.dv, p.duu, p.dvv, p.duv, p.normal] {
+            out.extend(v(d));
+        }
+        out
+    }
+
+    #[test]
+    fn stack_evaluation_is_bit_identical_to_the_heap_path() {
+        let mut rng = Lcg(0xBA515);
+        let mut checked = 0;
+        for du in 1..=5 {
+            for dv in 1..=5 {
+                for _ in 0..4 {
+                    let s = surface(&mut rng, du, dv);
+                    let mut params: Vec<(f64, f64)> =
+                        (0..60).map(|_| (rng.next(), rng.next())).collect();
+                    // Knots, bounds, and points on them.
+                    for &ku in s.knots_u.values() {
+                        params.push((ku, rng.next()));
+                    }
+                    for &kv in s.knots_v.values() {
+                        params.push((rng.next(), kv));
+                    }
+                    params.extend([(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)]);
+                    for (u, v) in params {
+                        for (a, b) in [(0, 0), (1, 0), (0, 1), (1, 1), (2, 2), (2, 1)] {
+                            let fast = s.evaluate_derivatives(u, v, a, b);
+                            let span_u = s.find_span_u(fast.u);
+                            let span_v = s.find_span_v(fast.v);
+                            let slow =
+                                s.evaluate_derivatives_heap(fast.u, fast.v, span_u, span_v, a, b);
+                            assert_eq!(
+                                bits(&fast),
+                                bits(&slow),
+                                "degree ({du},{dv}) at ({u},{v}) order ({a},{b})"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "only {checked} evaluations compared");
     }
 }

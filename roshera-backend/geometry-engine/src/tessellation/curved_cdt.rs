@@ -2330,6 +2330,9 @@ pub(crate) struct FidelityCache {
     positions: std::collections::HashMap<(u64, u64), Option<Point3>>,
     normals: std::collections::HashMap<(u64, u64), Option<Vector3>>,
     verdicts: std::collections::HashMap<[(u64, u64); 3], Option<((f64, f64), f64)>>,
+    /// Time in each refinement-scan stage, for `ROSHERA_TESS_PROFILE`:
+    /// fidelity scan, skinny scan, batch conflict filter, encroachment.
+    stage: [std::time::Duration; 4],
 }
 
 impl FidelityCache {
@@ -2680,15 +2683,20 @@ fn scan_one_pass<S: MeshChart + ?Sized>(
 ) -> RefinementDelta {
     // (1) α-style chord & normal violations (circumcenter insertion,
     //     centroid fallback).
+    let t_stage = std::time::Instant::now();
     let mut candidates = collect_refinement_centroids(
         triangles, pts2d, outer, inners, surface, face, params, cache,
     );
 
+    cache.stage[0] += t_stage.elapsed();
     // (2) Skinny-triangle circumcenters (fidelity-gated on developables
     //     only).
+    let t_stage = std::time::Instant::now();
     candidates.extend(scan_skinny_triangles(
         triangles, pts2d, outer, inners, surface, face, params,
     ));
+    cache.stage[1] += t_stage.elapsed();
+    let t_stage = std::time::Instant::now();
 
     // (3) Batch-insertion conflict filter: greedy independent set in
     //     descending-circumradius order; a candidate closer than
@@ -2710,9 +2718,11 @@ fn scan_one_pass<S: MeshChart + ?Sized>(
         }
     }
 
+    cache.stage[2] += t_stage.elapsed();
     // (4) Drop any candidate equal to (or within dedup tolerance of)
     //     an interior Steiner that's encroaching a boundary segment.
     //     The boundary itself is never mutated (per-edge cache contract).
+    let t_stage = std::time::Instant::now();
     let drops = scan_encroached_segments(pts2d, outer_uv_len, inner_uv_lens);
     if !drops.is_empty() {
         additions.retain(|p| {
@@ -2722,6 +2732,7 @@ fn scan_one_pass<S: MeshChart + ?Sized>(
         });
     }
 
+    cache.stage[3] += t_stage.elapsed();
     let converged = additions.is_empty();
     RefinementDelta {
         new_steiner: additions,
@@ -3063,13 +3074,17 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
     }
     if tess_profile_enabled() {
         eprintln!(
-            "[tess-profile] face {} steiner {:.1?} first-cdt {:.1?} refine {:.1?} emit {:.1?}              ({} triangles)",
+            "[tess-profile] face {} steiner {:.1?} first-cdt {:.1?} refine {:.1?} emit {:.1?}              ({} triangles) scan: fidelity {:.1?} skinny {:.1?} filter {:.1?} encroach {:.1?}",
             face.id,
             t_steiner,
             t_first_cdt,
             t_refine,
             t_stage.elapsed(),
-            final_triangles.len()
+            final_triangles.len(),
+            cache.stage[0],
+            cache.stage[1],
+            cache.stage[2],
+            cache.stage[3]
         );
     }
 
