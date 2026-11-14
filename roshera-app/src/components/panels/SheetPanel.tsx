@@ -58,6 +58,8 @@ export function SheetPanel({
   onViewMenu,
   onRemoveView,
   onAddView,
+  onHoverDimension,
+  onHoverView,
 }: {
   drawing: Drawing
   quality: DrawingQualityReport | null
@@ -70,6 +72,9 @@ export function SheetPanel({
   onViewMenu: (viewId: string, x: number, y: number) => void
   onRemoveView: (viewId: string) => void
   onAddView: (kind: ViewPreset, label: string) => void
+  /** Mark a dimension / view on the sheet while it is pointed at here. */
+  onHoverDimension: (dimId: string | null) => void
+  onHoverView: (viewId: string | null) => void
 }) {
   const [open, setOpen] = useState(true)
   const [issuesOpen, setIssuesOpen] = useState(false)
@@ -166,7 +171,12 @@ export function SheetPanel({
           {views.map((v) => {
             const view = byId.get(v.id)
             return (
-              <div key={v.id} className="px-1.5 py-0.5">
+              <div
+                key={v.id}
+                className="px-1.5 py-0.5"
+                onMouseEnter={() => onHoverView(v.id)}
+                onMouseLeave={() => onHoverView(null)}
+              >
                 <div
                   className={cn(
                     'group flex items-center gap-1.5 rounded px-1 py-0.5',
@@ -219,6 +229,8 @@ export function SheetPanel({
                           onOpenDimension(d.id, r.left, r.bottom + 6)
                         }}
                         title={`${dimensionWord(d.kind)} -- click to change the part`}
+                        onMouseEnter={() => onHoverDimension(d.id)}
+                        onMouseLeave={() => onHoverDimension(null)}
                         className={cn(
                           'cad-focus rounded border px-1.5 py-px font-mono text-[11px] transition-colors',
                           editingDimId === d.id

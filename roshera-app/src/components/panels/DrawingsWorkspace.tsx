@@ -651,6 +651,18 @@ export function DrawingsWorkspace() {
   // `escape_xml` helper sanitises every text-node string, and we never
   // splice user-supplied markup back into the payload. Safe to inline.
   const svgMarkup = useMemo(() => ({ __html: svg }), [svg])
+  // A dimension or view pointed at in the Sheet panel, marked on the sheet.
+  const [hoverDimId, setHoverDimId] = useState<string | null>(null)
+  const [hoverViewId, setHoverViewId] = useState<string | null>(null)
+  useEffect(() => {
+    const root = canvasRef.current
+    if (!root || !hoverDimId) return
+    const marked = Array.from(root.querySelectorAll(`[data-dim-id="${CSS.escape(hoverDimId)}"]`))
+    marked.forEach((el) => el.setAttribute('data-dim-editing', ''))
+    return () => marked.forEach((el) => el.removeAttribute('data-dim-editing'))
+  }, [hoverDimId, svgMarkup])
+  const [hoverRect, setHoverRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
+
   // Mark the dimension being edited on the sheet, so it is clear which one
   // the box changes.
   const editingDimId = dimEdit?.dim.id ?? null
@@ -695,7 +707,9 @@ export function DrawingsWorkspace() {
       return
     }
     const r = el.getBoundingClientRect()
-    const base = root.getBoundingClientRect()
+    // Measured from the workspace, where the box is drawn -- the sheet area
+    // starts right of the Sheet panel, so its own edge is the wrong origin.
+    const base = (root.parentElement ?? root).getBoundingClientRect()
     const pad = 4
     setSelRect({
       left: r.left - base.left - pad,
@@ -704,6 +718,19 @@ export function DrawingsWorkspace() {
       height: r.height + 2 * pad,
     })
   }, [selectedViewId, svgMarkup, pan, displayW, displayH])
+
+  // The view pointed at in the Sheet panel: a light box on the sheet.
+  useLayoutEffect(() => {
+    const root = canvasRef.current
+    const el = root && hoverViewId ? root.querySelector(`[data-view-id="${CSS.escape(hoverViewId)}"]`) : null
+    if (!root || !el || hoverViewId === selectedViewId) {
+      setHoverRect(null)
+      return
+    }
+    const r = el.getBoundingClientRect()
+    const base = (root.parentElement ?? root).getBoundingClientRect()
+    setHoverRect({ left: r.left - base.left - 4, top: r.top - base.top - 4, width: r.width + 8, height: r.height + 8 })
+  }, [hoverViewId, selectedViewId, svgMarkup, pan, displayW, displayH])
 
   const zoomIn = useCallback(() => {
     setZoom((prev) => {
@@ -1142,7 +1169,7 @@ export function DrawingsWorkspace() {
           svg ? (
             <div
               ref={sheetRef}
-              className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full [&_[data-dim-id]]:cursor-pointer [&_[data-dim-id]:hover]:fill-blue-600 [&_[data-dim-editing]]:fill-blue-700 [&_[data-dim-editing]]:font-bold"
+              className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full [&_[data-dim-id]]:cursor-pointer [&_[data-dim-id]:hover]:fill-[#d97706] [&_[data-dim-id]:hover]:font-bold [&_[data-dim-editing]]:fill-[#d97706] [&_[data-dim-editing]]:font-bold"
               onClick={onSheetClick}
               onContextMenu={onSheetContextMenu}
               style={{
@@ -1188,6 +1215,8 @@ export function DrawingsWorkspace() {
           onViewMenu={openViewMenu}
           onRemoveView={(id) => void handleRemoveView(id)}
           onAddView={(kind, label) => void handleAddLike(kind, label)}
+          onHoverDimension={setHoverDimId}
+          onHoverView={setHoverViewId}
         />
       )}
       {activeDrawing && (
@@ -1210,6 +1239,13 @@ export function DrawingsWorkspace() {
           }}
           onError={setError}
           onClose={() => setTitleBlockOpen(false)}
+        />
+      )}
+      {hoverRect && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute z-10 rounded-sm border border-[var(--cad-selected)]/70 bg-[var(--cad-selected-wash)]"
+          style={hoverRect}
         />
       )}
       {selRect && (
