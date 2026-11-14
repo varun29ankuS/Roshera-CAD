@@ -1894,6 +1894,137 @@ impl Sketch {
         Ok(())
     }
 
+    /// Delete as a sketch editor's Delete key does: a point takes the
+    /// curves built on it (a line cannot outlive its ends); a curve takes
+    /// its own end, centre and control points unless another surviving
+    /// entity still uses them. Returns every entity removed. An entity
+    /// that does not exist is refused before anything is removed.
+    pub fn delete_with_dependents(&self, entities: &[EntityRef]) -> Sketch2dResult<Vec<EntityRef>> {
+        for e in entities {
+            if !self.has_entity(e) {
+                return Err(Sketch2dError::EntityNotFound {
+                    entity_type: "sketch entity".to_string(),
+                    id: e.to_string(),
+                });
+            }
+        }
+        let mut doomed: std::collections::BTreeSet<EntityRef> = entities.iter().copied().collect();
+        // A deleted point takes every curve built on it.
+        let doomed_points: Vec<Point2dId> = doomed
+            .iter()
+            .filter_map(|e| match e {
+                EntityRef::Point(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        for p in &doomed_points {
+            for user in self.users_of_point(p) {
+                doomed.insert(user);
+            }
+        }
+        // A deleted curve takes the points only it used.
+        let mut freed: Vec<Point2dId> = Vec::new();
+        for e in &doomed {
+            freed.extend(self.linked_points(e));
+        }
+        for p in freed {
+            let still_used = self
+                .users_of_point(&p)
+                .into_iter()
+                .any(|u| !doomed.contains(&u));
+            if !still_used {
+                doomed.insert(EntityRef::Point(p));
+            }
+        }
+        // Curves first, then points, so no curve is ever left on a missing point.
+        let (points, curves): (Vec<EntityRef>, Vec<EntityRef>) = doomed
+            .into_iter()
+            .partition(|e| matches!(e, EntityRef::Point(_)));
+        let mut removed = Vec::new();
+        for e in curves.iter().chain(points.iter()) {
+            if self.has_entity(e) {
+                self.delete_entity(e)?;
+                removed.push(*e);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Whether `entity` is in this sketch.
+    pub fn has_entity(&self, entity: &EntityRef) -> bool {
+        match entity {
+            EntityRef::Point(id) => self.points.contains_key(id),
+            EntityRef::Line(id) => self.lines.contains_key(id),
+            EntityRef::Arc(id) => self.arcs.contains_key(id),
+            EntityRef::Circle(id) => self.circles.contains_key(id),
+            EntityRef::Rectangle(id) => self.rectangles.contains_key(id),
+            EntityRef::Ellipse(id) => self.ellipses.contains_key(id),
+            EntityRef::Spline(id) => self.splines.contains_key(id),
+            EntityRef::Polyline(id) => self.polylines.contains_key(id),
+        }
+    }
+
+    /// The point entities a curve is built on (ends, centre, control points).
+    fn linked_points(&self, entity: &EntityRef) -> Vec<Point2dId> {
+        match entity {
+            EntityRef::Line(id) => self
+                .lines
+                .get(id)
+                .and_then(|l| l.endpoints)
+                .map(|(a, b)| vec![a, b])
+                .unwrap_or_default(),
+            EntityRef::Arc(id) => self
+                .arcs
+                .get(id)
+                .map(|a| {
+                    a.endpoints
+                        .iter()
+                        .flat_map(|(s, e)| [*s, *e])
+                        .chain(a.center_point)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            EntityRef::Circle(id) => self
+                .circles
+                .get(id)
+                .and_then(|c| c.center_point)
+                .map(|p| vec![p])
+                .unwrap_or_default(),
+            EntityRef::Spline(id) => self
+                .splines
+                .get(id)
+                .and_then(|s| s.control_point_ids.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every curve built on point `p`.
+    fn users_of_point(&self, p: &Point2dId) -> Vec<EntityRef> {
+        let mut out = Vec::new();
+        for l in self.lines.iter() {
+            if self.linked_points(&EntityRef::Line(*l.key())).contains(p) {
+                out.push(EntityRef::Line(*l.key()));
+            }
+        }
+        for a in self.arcs.iter() {
+            if self.linked_points(&EntityRef::Arc(*a.key())).contains(p) {
+                out.push(EntityRef::Arc(*a.key()));
+            }
+        }
+        for c in self.circles.iter() {
+            if self.linked_points(&EntityRef::Circle(*c.key())).contains(p) {
+                out.push(EntityRef::Circle(*c.key()));
+            }
+        }
+        for s in self.splines.iter() {
+            if self.linked_points(&EntityRef::Spline(*s.key())).contains(p) {
+                out.push(EntityRef::Spline(*s.key()));
+            }
+        }
+        out
+    }
+
     /// Delete any entity by EntityRef
     /// This is the generic delete method that delegates to specific delete methods
     pub fn delete_entity(&self, entity: &EntityRef) -> Sketch2dResult<()> {

@@ -1027,6 +1027,36 @@ pub async fn delete_constraint(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Request body for `POST /api/csketch/{id}/delete`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteEntitiesRequest {
+    /// The entities the user deleted (the selection).
+    pub entities: Vec<EntityRef>,
+}
+
+/// `POST /api/csketch/{id}/delete` -- the sketch workbench's Delete key
+/// (Varun 2026-11-14). A point takes the curves built on it; a curve takes
+/// the points only it used (`Sketch::delete_with_dependents`); constraints
+/// on anything removed go with it. An unknown entity is refused before
+/// anything is removed. Returns the sketch as it now stands.
+pub async fn delete_entities(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<DeleteEntitiesRequest>,
+) -> Result<Json<CSketchSummary>, ApiError> {
+    let sketch = require_sketch(&state, id)?;
+    if req.entities.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "nothing to delete: `entities` is empty",
+        ));
+    }
+    sketch
+        .delete_with_dependents(&req.entities)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    Ok(Json(summarise(&sketch)))
+}
+
 /// `PATCH /api/csketch/{id}/constraint/{cid}/value` — edit the scalar
 /// target of a single dimensional constraint and re-solve the sketch.
 ///

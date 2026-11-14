@@ -12581,3 +12581,62 @@ async fn a_sketch_extrude_step_carries_the_sketch_it_was_made_from() {
     assert_eq!(reopened.rectangles().len(), 1);
     assert_eq!(reopened.circles().len(), 1);
 }
+
+/// Delete in the sketch workbench (Varun 2026-11-14): deleting a line takes
+/// its end points with it unless another entity still uses them; deleting a
+/// point takes the lines built on it (a line cannot outlive its ends).
+#[tokio::test]
+async fn deleting_sketch_geometry_takes_what_depends_on_it_and_nothing_else() {
+    let state = make_test_state().await;
+    let (_, body) = dispatch(&state, json_post("/api/csketch", json!({}))).await;
+    let sketch = body["id"].as_str().expect("sketch id").to_string();
+    let mut pts = Vec::new();
+    for (x, y) in [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)] {
+        let (_, b) = dispatch(
+            &state,
+            json_post(
+                &format!("/api/csketch/{sketch}/point"),
+                json!({"x": x, "y": y}),
+            ),
+        )
+        .await;
+        pts.push(b["id"].as_str().expect("point id").to_string());
+    }
+    let mut lines = Vec::new();
+    for (a, b) in [(0, 1), (1, 2)] {
+        let (s, body) = dispatch(
+            &state,
+            json_post(
+                &format!("/api/csketch/{sketch}/line"),
+                json!({"start": pts[a], "end": pts[b]}),
+            ),
+        )
+        .await;
+        assert!(s.is_success(), "{body}");
+        lines.push(body["id"].as_str().expect("line id").to_string());
+    }
+    // Delete the first line: its free end (point 0) goes, the shared corner stays.
+    let (s, snap) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/csketch/{sketch}/delete"),
+            json!({"entities": [{"Line": lines[0]}]}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "{snap}");
+    assert_eq!(snap["lines"].as_array().map(Vec::len), Some(1), "{snap}");
+    assert_eq!(snap["points"].as_array().map(Vec::len), Some(2), "{snap}");
+    // Delete the corner point: the line built on it goes too.
+    let (s, snap) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/csketch/{sketch}/delete"),
+            json!({"entities": [{"Point": pts[1]}]}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "{snap}");
+    assert_eq!(snap["lines"].as_array().map(Vec::len), Some(0), "{snap}");
+    assert_eq!(snap["points"].as_array().map(Vec::len), Some(0), "{snap}");
+}
