@@ -75,3 +75,11 @@ test('an edit is not a feature: consecutive size edits fold into one "Edit" step
   ])
   assert.deepEqual(folded.filter((c) => !isEdit(c)).map((c) => c.kind), ['cylinder', 'pattern', 'fillet'])
 })
+
+test('assembly steps are steps of the document, not features of the part', async () => {
+  const { partChapters } = await import('../src/lib/chapters-api.ts')
+  const ch = (kind) => ({ kind, name: null, events: [0], anchor: 0, sound: true, refusals: [], author: 'user', author_detail: { kind: 'user' }, intent: null, instances: [] })
+  const { part, documents } = partChapters([ch('cylinder'), ch('assembly.create'), ch('assembly.add_instance'), ch('assembly.solve'), ch('drawing.create_from_part')])
+  assert.deepEqual(part.map((c) => c.kind), ['cylinder'])
+  assert.equal(documents.length, 4)
+})

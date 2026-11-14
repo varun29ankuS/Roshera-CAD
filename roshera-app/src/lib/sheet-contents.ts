@@ -63,3 +63,15 @@ export function checkSummary(q: DrawingQualityReport | null): { tone: CheckTone;
   if (warnings > 0) return { tone: 'caution', text: `Passed with ${plural(warnings, 'warning')} · ${used}` }
   return { tone: 'positive', text: `Sheet check passed · ${used}` }
 }
+
+/** The standard views a sheet can add (the orthographic set and the iso). */
+export type ViewPreset = 'front' | 'top' | 'right' | 'left' | 'bottom' | 'isometric'
+
+export const VIEW_PRESETS: { kind: ViewPreset; label: string }[] = [
+  { kind: 'front', label: 'Front' },
+  { kind: 'top', label: 'Top' },
+  { kind: 'right', label: 'Right' },
+  { kind: 'left', label: 'Left' },
+  { kind: 'bottom', label: 'Bottom' },
+  { kind: 'isometric', label: 'Isometric' },
+]

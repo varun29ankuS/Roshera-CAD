@@ -39,7 +39,7 @@ export function suggestPrompts(chapters: Chapter[], documents: Chapter[]): strin
   if (chapters.some((c) => HOLES.has(c.kind)) && !kinds.has('chamfer')) {
     out.push('Chamfer the hole edges 0.5 mm')
   }
-  if (documents.length === 0) out.push('Make a drawing of this part')
+  if (!documents.some((d) => d.kind.startsWith('drawing'))) out.push('Make a drawing of this part')
 
   for (const fallback of ['Check it for 3D printing', 'Is this part sound?', 'Walk me through the history']) {
     if (out.length >= 3) break

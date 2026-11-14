@@ -137,7 +137,9 @@ export function chapterIconKey(kind: string): ChapterIconKey | null {
  *  document, never a row in the part's tree (Varun 2026-11-13: "why is
  *  there a drawing on the timeline?"). */
 export function isDocumentChapter(c: Chapter): boolean {
-  return c.kind.startsWith('drawing')
+  // Drawings and assemblies are documents MADE FROM the part: building
+  // one changes nothing about it.
+  return c.kind.startsWith('drawing') || c.kind.startsWith('assembly')
 }
 
 /** A size edit (`param.mould`, `param.name`) is recorded history, never a

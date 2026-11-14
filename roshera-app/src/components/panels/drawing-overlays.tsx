@@ -26,7 +26,6 @@ import {
   type Drawing,
   type DrawingFormat,
   type ProjectionAngle,
-  type ProjectionType,
   type TitleBlock,
   type TitleBlockPatch,
   type ViewEdit,
@@ -46,7 +45,9 @@ export interface PartRow {
   name: string
 }
 
-const card = 'bg-card/95 border border-border rounded-md shadow-md'
+// Solid, not translucent: a menu over the sheet or a panel must not let
+// what is under it read through.
+const card = 'bg-card border border-border rounded-md shadow-md'
 
 /** Close a popover on an outside click or Escape. */
 function useDismiss(open: boolean, onClose: () => void) {
@@ -98,7 +99,7 @@ export function DrawingSwitcher({
   const ref = useDismiss(open, close)
 
   return (
-    <div ref={ref} className="absolute top-3 left-3 z-20 max-w-[min(420px,calc(100%-24px))]">
+    <div ref={ref} className="absolute top-3 left-3 z-40 max-w-[min(420px,calc(100%-24px))]">
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
@@ -383,119 +384,6 @@ export function AnnotateMenu() {
               <div className="text-[11px] leading-snug text-muted-foreground/80">{a.why}</div>
             </div>
           ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ── Views (bottom-left) ──────────────────────────────────────────────────
-
-type Preset = Exclude<ProjectionType['kind'], 'custom'>
-
-const PRESETS: { kind: Preset; label: string }[] = [
-  { kind: 'front', label: 'Front' },
-  { kind: 'top', label: 'Top' },
-  { kind: 'right', label: 'Right' },
-  { kind: 'left', label: 'Left' },
-  { kind: 'bottom', label: 'Bottom' },
-  { kind: 'isometric', label: 'Isometric' },
-]
-
-export function ViewsBar({
-  drawing,
-  busy,
-  onRemove,
-  onAdd,
-  onMenu,
-  selectedId,
-}: {
-  drawing: Drawing
-  busy: boolean
-  onRemove: (viewId: string) => void
-  onAdd: (kind: Preset, label: string) => void
-  /** Open a view's menu at a screen point. */
-  onMenu: (viewId: string, x: number, y: number) => void
-  selectedId: string | null
-}) {
-  const [menu, setMenu] = useState(false)
-  const close = useCallback(() => setMenu(false), [])
-  const ref = useDismiss(menu, close)
-  const present = useMemo(
-    () => new Set(drawing.views.map((v) => v.projection.kind)),
-    [drawing.views],
-  )
-  const missing = PRESETS.filter((p) => !present.has(p.kind))
-  return (
-    <div className="absolute bottom-3 left-3 z-20 flex flex-wrap items-center gap-1.5 max-w-[calc(100%-260px)]">
-      {drawing.views.map((v) => (
-        <span
-          key={v.id}
-          className={`${card} group inline-flex items-center gap-1 pl-2 pr-1 py-1 text-[11px] ${
-            selectedId === v.id ? 'ring-1 ring-sky-600' : ''
-          }`}
-          onContextMenu={(e) => {
-            e.preventDefault()
-            onMenu(v.id, e.clientX, e.clientY)
-          }}
-        >
-          <button
-            type="button"
-            title="View options (or right-click the view on the sheet)"
-            onClick={(e) => {
-              const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-              onMenu(v.id, r.left, r.top - 8)
-            }}
-            className="cad-focus font-medium hover:underline"
-          >
-            {v.name}
-          </button>
-          {v.show_hidden === false && (
-            <span className="text-muted-foreground" title="Hidden lines removed">
-              no hidden
-            </span>
-          )}
-          {v.scale !== 1 && <span className="text-muted-foreground">{scaleLabel(v.scale)}</span>}
-          <button
-            type="button"
-            aria-label={`Remove view ${v.name}`}
-            title="Remove view (you can undo)"
-            disabled={busy}
-            onClick={() => onRemove(v.id)}
-            className="cad-focus rounded p-0.5 text-muted-foreground opacity-50 group-hover:opacity-100 hover:text-destructive"
-          >
-            <X size={11} />
-          </button>
-        </span>
-      ))}
-      {drawing.views.length > 0 && missing.length > 0 && (
-        <div ref={ref} className="relative">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => setMenu((m) => !m)}
-            className={`${card} cad-focus inline-flex items-center gap-1 px-2 py-1 text-[11px] hover:bg-accent/20`}
-          >
-            <Plus size={11} />
-            Add view
-          </button>
-          {menu && (
-            <div className={`${card} absolute bottom-full left-0 mb-1 w-40 py-1 text-xs`}>
-              {missing.map((p) => (
-                <button
-                  key={p.kind}
-                  type="button"
-                  onClick={() => {
-                    onAdd(p.kind, p.label)
-                    close()
-                  }}
-                  className="cad-focus block w-full px-3 py-1.5 text-left hover:bg-accent/20"
-                >
-                  {p.label}
-                </button>
-              ))}
-            </div>
-          )}
         </div>
       )}
     </div>

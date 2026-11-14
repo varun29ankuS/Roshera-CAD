@@ -30,7 +30,6 @@ import {
   SheetActions,
   SheetHint,
   TitleBlockCard,
-  ViewsBar,
   ViewMenu,
   type PartRow,
 } from '@/components/panels/drawing-overlays'
@@ -1185,6 +1184,10 @@ export function DrawingsWorkspace() {
           editingDimId={dimEdit?.dim.id ?? null}
           onSelectView={setSelectedViewId}
           onOpenDimension={openDimension}
+          busy={viewsBusy}
+          onViewMenu={openViewMenu}
+          onRemoveView={(id) => void handleRemoveView(id)}
+          onAddView={(kind, label) => void handleAddLike(kind, label)}
         />
       )}
       {activeDrawing && (
@@ -1207,16 +1210,6 @@ export function DrawingsWorkspace() {
           }}
           onError={setError}
           onClose={() => setTitleBlockOpen(false)}
-        />
-      )}
-      {activeDrawing && (
-        <ViewsBar
-          drawing={activeDrawing}
-          busy={viewsBusy}
-          onRemove={(id) => void handleRemoveView(id)}
-          onAdd={(kind, label) => void handleAddLike(kind, label)}
-          onMenu={openViewMenu}
-          selectedId={selectedViewId}
         />
       )}
       {selRect && (

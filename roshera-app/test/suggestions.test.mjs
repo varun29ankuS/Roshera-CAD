@@ -33,3 +33,8 @@ test('with a drawing already made, no drawing is suggested', () => {
   assert.ok(!s.some((x) => /drawing/i.test(x)), s.join(' | '))
   assert.equal(s.length, 3)
 })
+
+test('an assembly made from the part is not a drawing: a drawing is still suggested', () => {
+  const s = suggestPrompts([ch('cylinder', 'Flange'), ch('fillet'), ch('chamfer')], [ch('assembly.create')])
+  assert.ok(s.some((x) => /drawing/i.test(x)), s.join(' | '))
+})
