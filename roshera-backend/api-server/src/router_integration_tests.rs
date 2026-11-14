@@ -12616,6 +12616,18 @@ async fn deleting_sketch_geometry_takes_what_depends_on_it_and_nothing_else() {
         lines.push(body["id"].as_str().expect("line id").to_string());
     }
     // Delete the first line: its free end (point 0) goes, the shared corner stays.
+    // The snapshot says which points each line is built on (corners for
+    // fillet / chamfer are found from it).
+    let (_, snap0) = dispatch(&state, json_get(&format!("/api/csketch/{sketch}"))).await;
+    let first = snap0["lines"]
+        .as_array()
+        .and_then(|ls| {
+            ls.iter()
+                .find(|l| l["id"].as_str() == Some(lines[0].as_str()))
+        })
+        .cloned()
+        .expect("line 0 in the snapshot");
+    assert_eq!(first["endpoints"], json!([pts[0], pts[1]]), "{first}");
     let (s, snap) = dispatch(
         &state,
         json_post(
@@ -12714,4 +12726,44 @@ async fn sketch_fillet_chamfer_and_trim_at_reach_the_kernel() {
         !s.is_success(),
         "the corner is already rounded -- no corner left to chamfer: {b}"
     );
+}
+
+/// An arc can be built ON existing points (Varun 2026-11-14: a slot's ends
+/// must join its sides, and mirror / pattern only maintain shared-point
+/// arcs): `{start, end, radius, ccw, large_arc}` makes an arc whose ends
+/// ARE those points.
+#[tokio::test]
+async fn an_arc_can_be_built_on_existing_points() {
+    let state = make_test_state().await;
+    let (_, body) = dispatch(&state, json_post("/api/csketch", json!({}))).await;
+    let sk = body["id"].as_str().expect("sketch id").to_string();
+    let mut p = Vec::new();
+    for (x, y) in [(5.0, 0.0), (0.0, 5.0)] {
+        let (_, b) = dispatch(
+            &state,
+            json_post(&format!("/api/csketch/{sk}/point"), json!({"x": x, "y": y})),
+        )
+        .await;
+        p.push(b["id"].as_str().expect("point").to_string());
+    }
+    let (s, b) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/csketch/{sk}/arc"),
+            json!({"start": p[0], "end": p[1], "radius": 5.0, "ccw": true, "large_arc": false}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "{b}");
+    // Deleting a shared end point takes the arc built on it.
+    let (s, snap) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/csketch/{sk}/delete"),
+            json!({"entities": [{"Point": p[0]}]}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "{snap}");
+    assert_eq!(snap["arcs"].as_array().map(Vec::len), Some(0), "{snap}");
 }

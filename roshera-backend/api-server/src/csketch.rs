@@ -132,6 +132,9 @@ pub struct LineSummary {
     pub id: Uuid,
     pub geometry: geometry_engine::sketch2d::line2d::LineGeometry,
     pub is_construction: bool,
+    /// The point entities a segment is built on (`[start, end]`), when it
+    /// shares them -- a sketch corner is a point two lines share.
+    pub endpoints: Option<(Uuid, Uuid)>,
 }
 
 /// Wire form of a `ParametricCircle2d`. Center and radius are flat
@@ -610,6 +613,7 @@ fn summarise(sketch: &Sketch) -> CSketchSummary {
             id: e.key().0,
             geometry: e.value().geometry,
             is_construction: e.value().is_construction,
+            endpoints: e.value().endpoints.map(|(a, b)| (a.0, b.0)),
         })
         .collect();
     lines.sort_by_key(|l| l.id);
@@ -2099,15 +2103,34 @@ pub async fn set_construction_op(
 // brackets, cams) were impossible to express parametrically. These
 // handlers follow the add_point/add_circle conventions above.
 
-/// Request body for `POST /api/csketch/{id}/arc` — centre + radius +
-/// CCW angle span (radians).
+/// Request body for `POST /api/csketch/{id}/arc`: ON existing points
+/// (`start`, `end`, radius, sense, which of the two arcs) -- the arc's
+/// ends ARE those points, so it joins the lines that share them and
+/// mirror / pattern can maintain it -- or free, by centre + radius + CCW
+/// angle span (radians).
 #[derive(Debug, Clone, Deserialize)]
-pub struct AddArcRequest {
-    pub cx: f64,
-    pub cy: f64,
-    pub radius: f64,
-    pub start_angle: f64,
-    pub end_angle: f64,
+#[serde(untagged)]
+pub enum AddArcRequest {
+    OnPoints {
+        start: Uuid,
+        end: Uuid,
+        radius: f64,
+        #[serde(default = "default_true")]
+        ccw: bool,
+        #[serde(default)]
+        large_arc: bool,
+    },
+    CenterAngles {
+        cx: f64,
+        cy: f64,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Request body for `POST /api/csketch/{id}/rectangle` — two opposite
@@ -2146,12 +2169,40 @@ pub async fn add_arc(
     Path(id): Path<Uuid>,
     Json(req): Json<AddArcRequest>,
 ) -> Result<Json<EntityIdResponse>, ApiError> {
+    let (cx, cy, radius, start_angle, end_angle) = match req {
+        AddArcRequest::OnPoints {
+            start,
+            end,
+            radius,
+            ccw,
+            large_arc,
+        } => {
+            if !radius.is_finite() || radius <= 0.0 {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("arc radius must be a positive number (got {radius})"),
+                ));
+            }
+            let sketch = require_sketch(&state, id)?;
+            let aid = sketch
+                .add_arc(Point2dId(start), Point2dId(end), radius, ccw, large_arc)
+                .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+            return Ok(Json(EntityIdResponse { id: aid.0 }));
+        }
+        AddArcRequest::CenterAngles {
+            cx,
+            cy,
+            radius,
+            start_angle,
+            end_angle,
+        } => (cx, cy, radius, start_angle, end_angle),
+    };
     for (label, v) in [
-        ("cx", req.cx),
-        ("cy", req.cy),
-        ("radius", req.radius),
-        ("start_angle", req.start_angle),
-        ("end_angle", req.end_angle),
+        ("cx", cx),
+        ("cy", cy),
+        ("radius", radius),
+        ("start_angle", start_angle),
+        ("end_angle", end_angle),
     ] {
         if !v.is_finite() {
             return Err(ApiError::new(
@@ -2160,20 +2211,15 @@ pub async fn add_arc(
             ));
         }
     }
-    if req.radius <= 0.0 {
+    if radius <= 0.0 {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
-            format!("arc radius must be > 0 (got {})", req.radius),
+            format!("arc radius must be > 0 (got {radius})"),
         ));
     }
     let sketch = require_sketch(&state, id)?;
     let aid = sketch
-        .add_arc_center_angles(
-            Point2d::new(req.cx, req.cy),
-            req.radius,
-            req.start_angle,
-            req.end_angle,
-        )
+        .add_arc_center_angles(Point2d::new(cx, cy), radius, start_angle, end_angle)
         .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
     Ok(Json(EntityIdResponse { id: aid.0 }))
 }
