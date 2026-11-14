@@ -658,44 +658,74 @@ pub fn facet_true_normals(
     model: &BRepModel,
     mesh: &crate::tessellation::TriangleMesh,
 ) -> Vec<Option<crate::math::Vector3>> {
+    use rayon::prelude::*;
     let has_faces = mesh.face_map.len() == mesh.triangles.len();
     let tol = model.tolerance;
-    let mut previous: Option<(u32, (f64, f64))> = None;
-    mesh.triangles
-        .iter()
-        .enumerate()
-        .map(|(i, tri)| {
-            let fid = if has_faces { mesh.face_map[i] } else { 0 };
-            let face = model.faces.get(fid)?;
-            let surface = model.surfaces.get(face.surface_id)?;
-            let v = |k: usize| mesh.vertices.get(tri[k] as usize).copied();
-            let (v0, v1, v2) = (v(0)?, v(1)?, v(2)?);
-            let (p0, p1, p2) = (v0.position, v1.position, v2.position);
-            let centroid = crate::math::Point3::new(
-                (p0.x + p1.x + p2.x) / 3.0,
-                (p0.y + p1.y + p2.y) / 3.0,
-                (p0.z + p1.z + p2.z) / 3.0,
-            );
-            let reach = 0.5
-                * (p1 - p0)
-                    .magnitude()
-                    .max((p2 - p1).magnitude())
-                    .max((p0 - p2).magnitude());
-            let previous_here = previous.filter(|(f, _)| *f == fid).map(|(_, uv)| uv);
-            let (u, w) = facet_footpoint(
-                surface,
-                &centroid,
-                [v0.uv, v1.uv, v2.uv],
-                previous_here,
-                reach,
-                tol,
-            )?;
-            previous = Some((fid, (u, w)));
-            (surface.normal_at(u, w).ok()? * face.orientation.sign())
-                .normalize()
-                .ok()
+    let face_of = |i: usize| if has_faces { mesh.face_map[i] } else { 0 };
+    // Runs of consecutive facets on one face. Within a run each facet seeds
+    // the next (so a run is walked in order); runs are independent, so they
+    // go in parallel. The result is the same as one sequential walk: a seed
+    // never crosses a face change either way.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for i in 0..mesh.triangles.len() {
+        match runs.last_mut() {
+            Some((start, end)) if face_of(*start) == face_of(i) && *end == i => *end = i + 1,
+            _ => runs.push((i, i + 1)),
+        }
+    }
+    let per_run: Vec<Vec<Option<crate::math::Vector3>>> = runs
+        .par_iter()
+        .map(|&(start, end)| {
+            let mut previous: Option<(f64, f64)> = None;
+            (start..end)
+                .map(|i| {
+                    let normal = facet_true_normal(model, mesh, i, face_of(i), previous, tol);
+                    previous = normal.map(|(uv, _)| uv).or(previous);
+                    normal.map(|(_, n)| n)
+                })
+                .collect()
         })
-        .collect()
+        .collect();
+    per_run.into_iter().flatten().collect()
+}
+
+/// One facet's true normal and the footpoint it was found at.
+fn facet_true_normal(
+    model: &BRepModel,
+    mesh: &crate::tessellation::TriangleMesh,
+    i: usize,
+    fid: u32,
+    previous: Option<(f64, f64)>,
+    tol: crate::math::Tolerance,
+) -> Option<((f64, f64), crate::math::Vector3)> {
+    let tri = mesh.triangles.get(i)?;
+    let face = model.faces.get(fid)?;
+    let surface = model.surfaces.get(face.surface_id)?;
+    let v = |k: usize| mesh.vertices.get(tri[k] as usize).copied();
+    let (v0, v1, v2) = (v(0)?, v(1)?, v(2)?);
+    let (p0, p1, p2) = (v0.position, v1.position, v2.position);
+    let centroid = crate::math::Point3::new(
+        (p0.x + p1.x + p2.x) / 3.0,
+        (p0.y + p1.y + p2.y) / 3.0,
+        (p0.z + p1.z + p2.z) / 3.0,
+    );
+    let reach = 0.5
+        * (p1 - p0)
+            .magnitude()
+            .max((p2 - p1).magnitude())
+            .max((p0 - p2).magnitude());
+    let (u, w) = facet_footpoint(
+        surface,
+        &centroid,
+        [v0.uv, v1.uv, v2.uv],
+        previous,
+        reach,
+        tol,
+    )?;
+    let n = (surface.normal_at(u, w).ok()? * face.orientation.sign())
+        .normalize()
+        .ok()?;
+    Some(((u, w), n))
 }
 
 /// The (u, v) of the surface point nearest `centroid`, started from the mean
@@ -1721,10 +1751,17 @@ mod facet_footpoint_tests {
             nurbs_facets > 1000,
             "fixture must have a real NURBS wall ({nurbs_facets})"
         );
-        GLOBAL_FOOTPOINT_SEARCHES.with(|n| n.set(0));
-        let tq = tessellation_quality_of_mesh(&model, &mesh).expect("tess quality");
-        let mq = mesh_quality_of_mesh(&model, &mesh).expect("mesh quality");
-        let searches = GLOBAL_FOOTPOINT_SEARCHES.with(|n| n.get());
+        // One worker thread, so the thread-local counter sees every search.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool");
+        let (tq, mq, searches) = pool.install(|| {
+            GLOBAL_FOOTPOINT_SEARCHES.with(|n| n.set(0));
+            let tq = tessellation_quality_of_mesh(&model, &mesh).expect("tess quality");
+            let mq = mesh_quality_of_mesh(&model, &mesh).expect("mesh quality");
+            (tq, mq, GLOBAL_FOOTPOINT_SEARCHES.with(|n| n.get()))
+        });
         assert!(
             searches * 20 <= nurbs_facets,
             "{searches} global footpoint searches for {nurbs_facets} NURBS facets: each facet \

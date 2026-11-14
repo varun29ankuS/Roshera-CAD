@@ -3577,32 +3577,49 @@ impl BRepModel {
                 );
             }
             // The per-solid half (its own meshes and checks) is independent
-            // per solid, so it runs in parallel on a small pool: bounded so a
-            // batch of large parts cannot hold more than a few meshes at once.
+            // per solid. At most CERTIFY_BATCH_THREADS solids are in flight
+            // at once (each holds its certification meshes, so this bounds
+            // peak memory), largest first so a big part is not left for last;
+            // the work INSIDE each solid (its faces, its facets) runs on the
+            // whole global pool, so a batch of one large part still uses
+            // every core. A dedicated 4-thread pool capped that inner work
+            // at 4 cores too.
             let this: &Self = self;
-            let work = || {
-                use rayon::prelude::*;
-                cold.par_iter()
-                    .zip(errors.par_iter())
-                    .map(|(&id, brep_errors)| {
-                        let cert = this.compute_certificate_from_validation(
-                            id,
-                            labels,
-                            brep_errors,
-                            debris,
-                        );
-                        (id, cert)
+            let mut order: Vec<usize> = (0..cold.len()).collect();
+            let size = |i: usize| {
+                this.solids
+                    .get(cold[i])
+                    .map(|s| {
+                        s.all_shells()
+                            .iter()
+                            .filter_map(|&sh| this.shells.get(sh))
+                            .map(|sh| sh.faces.len())
+                            .sum::<usize>()
                     })
-                    .collect::<Vec<_>>()
+                    .unwrap_or(0)
             };
-            let threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .clamp(1, CERTIFY_BATCH_THREADS);
-            let computed = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
-                Ok(pool) => pool.install(work),
-                Err(_) => work(),
-            };
+            order.sort_by_key(|&i| std::cmp::Reverse(size(i)));
+            let mut computed: Vec<Option<_>> = vec![None; cold.len()];
+            for batch in order.chunks(CERTIFY_BATCH_THREADS.max(1)) {
+                use rayon::prelude::*;
+                let done: Vec<(usize, _)> = batch
+                    .par_iter()
+                    .map(|&i| {
+                        let cert = this.compute_certificate_from_validation(
+                            cold[i], labels, &errors[i], debris,
+                        );
+                        (i, cert)
+                    })
+                    .collect();
+                for (i, cert) in done {
+                    computed[i] = Some(cert);
+                }
+            }
+            let computed: Vec<_> = cold
+                .iter()
+                .zip(computed)
+                .filter_map(|(&id, cert)| cert.map(|c| (id, c)))
+                .collect();
             for (id, computed) in computed {
                 if let Some(solid) = self.solids.get(id) {
                     solid.store_certificate(computed.clone());

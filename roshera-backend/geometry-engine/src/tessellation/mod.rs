@@ -390,6 +390,23 @@ pub fn tessellate_shell(
     cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
+    tessellate_shell_with(shell, model, params, cache, mesh, true);
+}
+
+/// Faces of a shell are meshed independently -- a face reads only the model
+/// and the edge-sample cache (a concurrent map; an edge's samples are the
+/// same whichever face asks first) -- so they mesh in parallel, each into its
+/// own mesh, appended in shell order. The result is identical to meshing them
+/// one after another (`parallel = false`), which a test compares bit for bit.
+/// The weld then runs over the whole shell as before.
+pub(crate) fn tessellate_shell_with(
+    shell: &Shell,
+    model: &BRepModel,
+    params: &TessellationParams,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+    parallel: bool,
+) {
     let weld_start_vertices = mesh.vertices.len();
     let weld_start_triangles = mesh.triangles.len();
     // Per-face timing trace, gated on ROSHERA_TESS_TRACE. Used to find
@@ -397,31 +414,50 @@ pub fn tessellate_shell(
     // triangle count justifies: prints surface type, triangle yield and
     // microseconds per face, plus the shell weld at the end.
     let trace = std::env::var("ROSHERA_TESS_TRACE").is_ok();
-    for &face_id in &shell.faces {
-        if let Some(face) = model.faces.get(face_id) {
-            let tri_start = mesh.triangles.len();
-            let t0 = trace.then(std::time::Instant::now);
-            surface::tessellate_face(face, model, params, cache, mesh);
-            let tri_end = mesh.triangles.len();
-            if let Some(t0) = t0 {
-                let surface_kind = model
-                    .surfaces
-                    .get(face.surface_id)
-                    .map(|s| s.type_name())
-                    .unwrap_or("?");
-                eprintln!(
-                    "[tess] face {} {} tris={} {}us",
-                    face_id,
-                    surface_kind,
-                    tri_end - tri_start,
-                    t0.elapsed().as_micros()
-                );
-            }
-            // Record which B-Rep face each new triangle came from
-            for _ in tri_start..tri_end {
-                mesh.face_map.push(face_id);
-            }
+    let mesh_one = |face_id: u32| {
+        let face = model.faces.get(face_id)?;
+        let t0 = std::time::Instant::now();
+        let mut part = TriangleMesh::new();
+        surface::tessellate_face(face, model, params, cache, &mut part);
+        Some((face_id, face.surface_id, part, t0.elapsed()))
+    };
+    let parts: Vec<_> = if parallel && shell.faces.len() > 1 {
+        use rayon::prelude::*;
+        shell
+            .faces
+            .par_iter()
+            .filter_map(|&f| mesh_one(f))
+            .collect()
+    } else {
+        shell.faces.iter().filter_map(|&f| mesh_one(f)).collect()
+    };
+    for (face_id, surface_id, part, elapsed) in parts {
+        if trace {
+            let surface_kind = model
+                .surfaces
+                .get(surface_id)
+                .map(|s| s.type_name())
+                .unwrap_or("?");
+            eprintln!(
+                "[tess] face {} {} tris={} {}us",
+                face_id,
+                surface_kind,
+                part.triangles.len(),
+                elapsed.as_micros()
+            );
         }
+        let base = mesh.vertices.len() as u32;
+        let added = part.triangles.len();
+        mesh.vertices.extend(part.vertices);
+        mesh.triangles.extend(
+            part.triangles
+                .into_iter()
+                .map(|t| [t[0] + base, t[1] + base, t[2] + base]),
+        );
+        // Record which B-Rep face each new triangle came from.
+        mesh.face_map.extend(std::iter::repeat(face_id).take(added));
+        mesh.weld_refusals.non_finite += part.weld_refusals.non_finite;
+        mesh.weld_refusals.unaddressable += part.weld_refusals.unaddressable;
     }
     let weld_t0 = trace.then(std::time::Instant::now);
 
@@ -1138,5 +1174,124 @@ mod watertight_tests {
             (n_side_kept - n_side).magnitude() < 1e-12,
             "side-face normal must be preserved (= {n_side:?}), got {n_side_kept:?}"
         );
+    }
+}
+
+/// Meshing a shell's faces in parallel must give exactly the mesh that
+/// meshing them one after another gives: same vertices (bit for bit), same
+/// triangles, same face map. Repeated, so a scheduling-dependent difference
+/// (an edge's samples depending on which face asked first) shows up.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod parallel_shell_tests {
+    use super::*;
+    use crate::math::{Point3, Vector3};
+    use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+    use crate::operations::nurbs_loft::{nurbs_loft, NurbsLoftOptions};
+    use crate::primitives::topology_builder::TopologyBuilder;
+
+    fn mesh_of(model: &BRepModel, solid: &Solid, parallel: bool) -> TriangleMesh {
+        let params = TessellationParams::default();
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        for sh in solid.all_shells() {
+            if let Some(shell) = model.shells.get(sh) {
+                tessellate_shell_with(shell, model, &params, &cache, &mut mesh, parallel);
+            }
+        }
+        mesh
+    }
+
+    fn fingerprint(m: &TriangleMesh) -> (Vec<[u64; 8]>, Vec<[u32; 3]>, Vec<u32>) {
+        let verts = m
+            .vertices
+            .iter()
+            .map(|v| {
+                let (u, w) = v.uv.unwrap_or((f64::NAN, f64::NAN));
+                [
+                    v.position.x.to_bits(),
+                    v.position.y.to_bits(),
+                    v.position.z.to_bits(),
+                    v.normal.x.to_bits(),
+                    v.normal.y.to_bits(),
+                    v.normal.z.to_bits(),
+                    u.to_bits(),
+                    w.to_bits(),
+                ]
+            })
+            .collect();
+        (verts, m.triangles.clone(), m.face_map.clone())
+    }
+
+    fn ring(n: usize, r: f64, z: f64) -> Vec<Point3> {
+        (0..n)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::TAU / n as f64;
+                Point3::new(r * a.cos(), r * a.sin(), z)
+            })
+            .collect()
+    }
+
+    fn fixtures() -> Vec<(&'static str, BRepModel)> {
+        let mut out = Vec::new();
+        // A block with a bore: planes, a trimmed cylinder, holes.
+        let mut m = BRepModel::new();
+        {
+            let mut b = TopologyBuilder::new(&mut m);
+            b.create_box_3d(40.0, 30.0, 20.0).expect("box");
+            b.create_cylinder_3d(Point3::new(0.0, 0.0, -15.0), Vector3::Z, 6.0, 30.0)
+                .expect("cylinder");
+        }
+        let ids: Vec<_> = m.solids.iter().map(|(id, _)| id).collect();
+        boolean_operation(
+            &mut m,
+            ids[0],
+            ids[1],
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("bore");
+        out.push(("bored block", m));
+        let mut m = BRepModel::new();
+        TopologyBuilder::new(&mut m)
+            .create_sphere_3d(Point3::ZERO, 12.0)
+            .expect("sphere");
+        out.push(("sphere", m));
+        let mut m = BRepModel::new();
+        nurbs_loft(
+            &mut m,
+            vec![
+                ring(20, 20.0, 0.0),
+                ring(20, 30.0, 15.0),
+                ring(20, 35.0, 30.0),
+                ring(20, 20.0, 60.0),
+            ],
+            NurbsLoftOptions::default(),
+        )
+        .expect("barrel");
+        out.push(("NURBS barrel", m));
+        out
+    }
+
+    #[test]
+    fn parallel_face_meshing_is_bit_identical_to_serial() {
+        for (name, model) in fixtures() {
+            for (_, solid) in model.solids.iter() {
+                let serial = fingerprint(&mesh_of(&model, solid, false));
+                assert!(!serial.1.is_empty(), "{name}: meshed nothing");
+                for round in 0..3 {
+                    let parallel = fingerprint(&mesh_of(&model, solid, true));
+                    assert_eq!(
+                        serial.0.len(),
+                        parallel.0.len(),
+                        "{name} round {round}: vertex count"
+                    );
+                    assert!(
+                        serial == parallel,
+                        "{name} round {round}: parallel mesh differs from serial"
+                    );
+                }
+            }
+        }
     }
 }
