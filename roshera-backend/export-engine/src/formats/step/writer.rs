@@ -81,6 +81,12 @@ pub struct StepWriter<W: Write> {
     /// every pcurve `DEFINITIONAL_REPRESENTATION`. `None` until the first
     /// pcurve is emitted (a model with no parametric faces never creates it).
     parametric_context_id: Option<StepId>,
+    /// Value entities already written, by their exact text: a point,
+    /// direction, vector or placement written twice is the same value, so the
+    /// second request returns the first entity. Topology (vertices, edges,
+    /// faces) never goes through here -- two coincident vertices are still two
+    /// vertices.
+    shared: std::collections::HashMap<String, StepId>,
 }
 
 impl<W: Write> StepWriter<W> {
@@ -99,6 +105,7 @@ impl<W: Write> StepWriter<W> {
             entity_counter: 1,
             protocol,
             parametric_context_id: None,
+            shared: std::collections::HashMap::new(),
         }
     }
 
@@ -112,6 +119,22 @@ impl<W: Write> StepWriter<W> {
         let id = StepId(self.entity_counter);
         self.entity_counter += 1;
         id
+    }
+
+    /// Write a value entity once: a body (`NAME(...)`, without id or `;`)
+    /// already written returns its entity instead of a duplicate. STEP lets
+    /// any number of entities reference one geometric value, so sharing is
+    /// exact; a CAD file repeats the same corner, axis and placement many
+    /// times (every edge end, every surface frame), and writing each once
+    /// makes the file smaller and the reader's work less.
+    fn write_shared(&mut self, body: String) -> std::io::Result<StepId> {
+        if let Some(&id) = self.shared.get(&body) {
+            return Ok(id);
+        }
+        let id = self.next_id();
+        writeln!(self.writer, "{}={};", id, body)?;
+        self.shared.insert(body, id);
+        Ok(id)
     }
 
     /// Write the STEP header
@@ -175,14 +198,10 @@ impl<W: Write> StepWriter<W> {
 
     /// Write a Cartesian point
     pub fn write_cartesian_point(&mut self, point: &[f64; 3]) -> std::io::Result<StepId> {
-        let id = self.next_id();
-        writeln!(
-            self.writer,
-            "{}=CARTESIAN_POINT('',({}));",
-            id,
+        self.write_shared(format!(
+            "CARTESIAN_POINT('',({}))",
             format_real_list(&[point[0], point[1], point[2]])
-        )?;
-        Ok(id)
+        ))
     }
 
     /// Write a 2D `CARTESIAN_POINT` (a parameter-space `(u, v)` point) used
@@ -190,26 +209,18 @@ impl<W: Write> StepWriter<W> {
     /// 2D and 3D points solely by the length of the coordinate list, so a
     /// two-coordinate `CARTESIAN_POINT` is a valid parameter-space point.
     fn write_cartesian_point_2d(&mut self, point: &[f64; 2]) -> std::io::Result<StepId> {
-        let id = self.next_id();
-        writeln!(
-            self.writer,
-            "{}=CARTESIAN_POINT('',({}));",
-            id,
+        self.write_shared(format!(
+            "CARTESIAN_POINT('',({}))",
             format_real_list(&[point[0], point[1]])
-        )?;
-        Ok(id)
+        ))
     }
 
     /// Write a direction
     pub fn write_direction(&mut self, dir: &[f64; 3]) -> std::io::Result<StepId> {
-        let id = self.next_id();
-        writeln!(
-            self.writer,
-            "{}=DIRECTION('',({}));",
-            id,
+        self.write_shared(format!(
+            "DIRECTION('',({}))",
             format_real_list(&[dir[0], dir[1], dir[2]])
-        )?;
-        Ok(id)
+        ))
     }
 
     /// Write a vector
@@ -218,13 +229,7 @@ impl<W: Write> StepWriter<W> {
         direction_id: StepId,
         magnitude: f64,
     ) -> std::io::Result<StepId> {
-        let id = self.next_id();
-        writeln!(
-            self.writer,
-            "{}=VECTOR('',{},{});",
-            id, direction_id, magnitude
-        )?;
-        Ok(id)
+        self.write_shared(format!("VECTOR('',{},{})", direction_id, magnitude))
     }
 
     /// Write an axis2 placement 3D
@@ -280,23 +285,13 @@ impl<W: Write> StepWriter<W> {
             None
         };
 
-        let id = self.next_id();
-        write!(self.writer, "{}=AXIS2_PLACEMENT_3D('',{}", id, location_id)?;
-
-        if let Some(axis_id) = axis_id {
-            write!(self.writer, ",{}", axis_id)?;
-        } else {
-            write!(self.writer, ",$")?;
-        }
-
-        if let Some(ref_dir_id) = ref_dir_id {
-            write!(self.writer, ",{}", ref_dir_id)?;
-        } else {
-            write!(self.writer, ",$")?;
-        }
-
-        writeln!(self.writer, ");")?;
-        Ok(id)
+        let reference = |id: Option<StepId>| id.map_or_else(|| "$".to_string(), |i| i.to_string());
+        self.write_shared(format!(
+            "AXIS2_PLACEMENT_3D('',{},{},{})",
+            location_id,
+            reference(axis_id),
+            reference(ref_dir_id)
+        ))
     }
 
     /// Write an AXIS1_PLACEMENT (a location point + an axis direction) — the
@@ -308,13 +303,7 @@ impl<W: Write> StepWriter<W> {
     ) -> std::io::Result<StepId> {
         let location_id = self.write_cartesian_point(location)?;
         let axis_id = self.write_direction(axis)?;
-        let id = self.next_id();
-        writeln!(
-            self.writer,
-            "{}=AXIS1_PLACEMENT('',{},{});",
-            id, location_id, axis_id
-        )?;
-        Ok(id)
+        self.write_shared(format!("AXIS1_PLACEMENT('',{},{})", location_id, axis_id))
     }
 
     /// Write a line
