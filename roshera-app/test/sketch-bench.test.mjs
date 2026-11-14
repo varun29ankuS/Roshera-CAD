@@ -249,3 +249,9 @@ test('a constraint that only touches construction geometry is not marked on the 
   assert.equal(showsMark([{ Line: 'a' }, { Line: 'g' }], s), true)
   assert.equal(showsMark([{ Point: 'p' }], s), true)
 })
+
+test('a spline shows its control polygon -- the points you drag to reshape it', async () => {
+  const { controlPolygons } = await lib()
+  const s = sk({ splines: [{ id: 'sp', degree: 3, control_points: [[0, 0], [5, 5], [10, 0], [15, 5]], knots: [0, 0, 0, 0, 1, 1, 1, 1], weights: null, is_construction: false }] })
+  assert.deepEqual(controlPolygons(s), [[[0, 0], [5, 5], [10, 0], [15, 5]]])
+})

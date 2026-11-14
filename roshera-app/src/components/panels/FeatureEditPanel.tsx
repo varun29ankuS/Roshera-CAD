@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useSketchBench } from '@/stores/sketch-bench-store'
 import { HISTORY_CHANGED_EVENT } from '@/lib/history'
-import { Check, Trash2, X } from 'lucide-react'
+import { Check, PencilRuler, Trash2, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Box, ToolIcons } from '@/components/ui/icons'
 import { useChapters } from '@/hooks/use-chapters'
@@ -48,6 +48,9 @@ type Outcome = { key: string; kind: 'busy' } | { key: string; kind: 'refused'; r
  * scratch copy first and refuses, in its own words, when a later feature
  * would break or the part would not be sound -- nothing changes then.
  */
+/** Features made from a sketch: their sketch can be reopened and edited. */
+const SKETCH_FEATURES = new Set(['extrude', 'cut', 'boss', 'revolve'])
+
 export function FeatureEditPanel({
   branch = 'main',
   placement = 'column',
@@ -169,6 +172,24 @@ export function FeatureEditPanel({
         <span className="min-w-0 flex-1 truncate text-[12.5px] font-semibold">
           {title.charAt(0).toUpperCase() + title.slice(1)}
         </span>
+        {SKETCH_FEATURES.has(chapter.kind) && (
+          <button
+            type="button"
+            aria-label={`Edit the sketch of ${title}`}
+            title="Edit sketch -- reopen it, change it, Apply"
+            onClick={() => {
+              void useSketchBench
+                .getState()
+                .editFeatureSketch(chapter.events, title)
+                .then((r) => {
+                  if (!r.ok) setDeleting({ anchor: chapter.anchor, refused: r.reason, busy: false })
+                })
+            }}
+            className="cad-focus rounded p-0.5 text-muted-foreground hover:text-foreground"
+          >
+            <PencilRuler size={13} />
+          </button>
+        )}
         <button
           type="button"
           aria-label={`Delete ${title}`}
@@ -185,7 +206,7 @@ export function FeatureEditPanel({
       </div>
       {deleting && deleting.anchor === chapter.anchor && (deleting.busy || deleting.refused) && (
         <p className={cn('px-2.5 pb-1.5 text-[11px]', deleting.refused ? 'text-red-700 dark:text-red-300' : 'text-muted-foreground')}>
-          {deleting.busy ? 'Deleting…' : `Not deleted: ${deleting.refused}`}
+          {deleting.busy ? 'Deleting…' : `Not done: ${deleting.refused}`}
         </p>
       )}
       {loadError ? (

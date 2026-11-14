@@ -760,6 +760,12 @@ export const csketchApi = {
   deleteEntities(id: string, entities: EntityRef[]): Promise<CSketchSummary> {
     return request('POST', `/csketch/${id}/delete`, { entities })
   },
+  /** Build a drawn shape in ONE request: points, lines, arcs, circles,
+   *  splines and constraints in order (later steps name earlier ones by
+   *  key, existing points as `id:<uuid>`). All or nothing. */
+  build(id: string, ops: unknown[]): Promise<{ ids: Record<string, string>; created: EntityRef[]; summary: CSketchSummary }> {
+    return request('POST', `/csketch/${id}/build`, { ops })
+  },
   /** Trim at a click: cut back to the nearest crossings either side. */
   trimAt(id: string, entity: EntityRef, pick: [number, number]): Promise<unknown> {
     return request('POST', `/csketch/${id}/trim-at`, { entity, pick })

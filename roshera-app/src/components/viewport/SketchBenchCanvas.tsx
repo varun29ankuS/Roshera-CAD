@@ -17,6 +17,7 @@ import { useSceneStore } from '@/stores/scene-store'
 import {
   anchorOf,
   CONSTRAINT_GLYPH,
+  controlPolygons,
   crossings,
   entityPaths,
   overlaps,
@@ -210,6 +211,20 @@ function BenchSurface() {
           />
         )
       })}
+
+      {(summary ? controlPolygons(summary) : []).map((pts, i) => (
+        <Line
+          key={`hull-${i}`}
+          points={lift(pts, plane)}
+          color={colors.construction}
+          lineWidth={1}
+          dashed
+          dashSize={0.6}
+          gapSize={0.6}
+          depthTest={false}
+          renderOrder={4}
+        />
+      ))}
 
       {ghostPaths.map((pts, i) => (
         <Line key={`ghost-${i}`} points={lift(pts, plane)} color={colors.ink} lineWidth={2} depthTest={false} renderOrder={5} />

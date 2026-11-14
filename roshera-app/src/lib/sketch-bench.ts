@@ -917,3 +917,9 @@ export function showsMark(entities: EntityRef[], s: CSketchSummary): boolean {
   }
   return !curves.every(construction)
 }
+
+/** Each spline's control polygon (dashed on the sketch): its control
+ *  points are sketch points -- drag one and the curve reshapes. */
+export function controlPolygons(s: CSketchSummary): Vec2[][] {
+  return (s.splines ?? []).map((sp) => sp.control_points.map((p) => [p[0], p[1]] as Vec2))
+}

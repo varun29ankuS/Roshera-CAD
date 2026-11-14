@@ -122,6 +122,11 @@ export function sizeSummary(kind: string, fields: FeatureField[], instances: num
   } else if (kind === 'chamfer') {
     const d = v('distance') ?? v('distance1')
     if (d !== undefined) parts.push(`${num(d)} × 45°`)
+  } else if (kind === 'extrude' || ((kind === 'cut' || kind === 'boss') && v('distance') !== undefined)) {
+    // A sketch feature: its outline's sizes live in its sketch (Edit
+    // sketch); a radius here would be the first circle of the outline.
+    const d = v('distance')
+    if (d !== undefined) parts.push(`${num(Math.abs(d))} deep`)
   } else if (kind === 'box') {
     for (const k of ['width', 'depth', 'height']) {
       const x = v(k)

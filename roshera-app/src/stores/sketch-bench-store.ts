@@ -14,7 +14,7 @@
  */
 
 import { create } from 'zustand'
-import { timelineAction } from '@/lib/history'
+import { HISTORY_CHANGED_EVENT, timelineAction } from '@/lib/history'
 import {
   csketchApi,
   type Constraint,
@@ -105,6 +105,11 @@ interface BenchState {
   dragPoint: (pointId: string, to: Vec2) => Promise<void>
 
   open: (plane: CSketchPlane, onPart?: string | null) => Promise<void>
+  /** The feature whose sketch is open for editing; null for a new sketch. */
+  editOf: { targetSequence: number; feature: string } | null
+  /** Reopen a feature's sketch (its steps) to edit it; refusals land in
+   *  `error` -- the caller shows them. Resolves false when refused. */
+  editFeatureSketch: (sequences: number[], feature: string) => Promise<{ ok: true } | { ok: false; reason: string }>
   close: () => void
   setTool: (tool: BenchTool) => void
   setSides: (n: number) => void
@@ -132,70 +137,11 @@ export const useBenchCursor = create<{
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
-/** Send a plan in order; returns what it created, and its key -> id map. */
+/** Build a plan in ONE request (all or nothing); returns what it created,
+ *  and its key -> id map. */
 async function runPlan(id: string, plan: PlanOp[]): Promise<{ created: EntityRef[]; ids: Map<string, string> }> {
-  const ids = new Map<string, string>()
-  const created: EntityRef[] = []
-  const resolve = (ref: string) => {
-    if (ref.startsWith('id:')) return ref.slice(3)
-    const got = ids.get(ref)
-    if (!got) throw new Error(`plan step ${ref} was never built`)
-    return got
-  }
-  for (const op of plan) {
-    switch (op.op) {
-      case 'point': {
-        const r = await csketchApi.addPoint(id, { x: op.at[0], y: op.at[1] })
-        ids.set(op.key, r.id)
-        created.push({ Point: r.id })
-        break
-      }
-      case 'line': {
-        const r = await csketchApi.addLine(id, { start: resolve(op.a), end: resolve(op.b) })
-        ids.set(op.key, r.id)
-        created.push({ Line: r.id })
-        if (op.construction) await csketchApi.setConstruction(id, { Line: r.id }, true)
-        break
-      }
-      case 'circle': {
-        const r = await csketchApi.addCircle(id, { cx: op.c[0], cy: op.c[1], radius: op.r })
-        ids.set(op.key, r.id)
-        created.push({ Circle: r.id })
-        break
-      }
-      case 'arc': {
-        // On its end points, so it joins whatever shares them.
-        const r = await csketchApi.addArc(id, {
-          start: resolve(op.a),
-          end: resolve(op.b),
-          radius: op.r,
-          ccw: op.ccw,
-          large_arc: op.large,
-        })
-        ids.set(op.key, r.id)
-        created.push({ Arc: r.id })
-        break
-      }
-      case 'spline': {
-        const r = await csketchApi.addSpline(id, { degree: op.degree, control_point_ids: op.points.map(resolve) })
-        ids.set(op.key, r.id)
-        created.push({ Spline: r.id })
-        break
-      }
-      case 'constrain': {
-        await csketchApi.addConstraint(id, {
-          id: crypto.randomUUID(),
-          constraint_type: { Geometric: op.kind },
-          entities: op.refs.map((r) => ({ [r.kind]: resolve(r.ref) }) as EntityRef),
-          priority: 'Required',
-          status: 'Satisfied',
-          name: null,
-        })
-        break
-      }
-    }
-  }
-  return { created, ids }
+  const r = await csketchApi.build(id, plan)
+  return { created: r.created, ids: new Map(Object.entries(r.ids)) }
 }
 
 export const useSketchBench = create<BenchState>((set, get) => {
@@ -217,8 +163,8 @@ export const useSketchBench = create<BenchState>((set, get) => {
     if (!id || plan.length === 0) return null
     set((s) => ({ ghost: [...s.ghost, ...plan], busy: true, error: null }))
     try {
+      // Built and solved in one request.
       const { created, ids } = await runPlan(id, plan)
-      if (plan.some((o) => o.op === 'constrain')) await csketchApi.solve(id).catch(() => null)
       set((s) => ({ history: [...s.history, created] }))
       return ids
     } catch (e) {
@@ -427,8 +373,49 @@ export const useSketchBench = create<BenchState>((set, get) => {
     history: [],
     finish: { op: 'extrude', distance: 10, angle: 360 },
 
+    editOf: null,
+
+    editFeatureSketch: async (sequences, feature) => {
+      try {
+        const r = await fetch(`${API_BASE}/timeline/sketch/reopen`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sequences }),
+        })
+        const body = (await r.json().catch(() => ({}))) as {
+          csketch_id?: string
+          target_sequence?: number
+          plane?: CSketchPlane
+          distance?: number
+          reason?: string
+        }
+        if (!r.ok || !body.csketch_id || body.target_sequence === undefined) {
+          return { ok: false, reason: body.reason ?? `HTTP ${r.status}` }
+        }
+        set({
+          sketchId: body.csketch_id,
+          plane: body.plane ?? 'xy',
+          onPart: null,
+          editOf: { targetSequence: body.target_sequence, feature },
+          tool: 'select',
+          clicks: [],
+          selection: [],
+          ghost: [],
+          history: [],
+          summary: null,
+          dof: null,
+          error: null,
+          finish: { op: 'extrude', distance: body.distance ?? 10, angle: 360 },
+        })
+        await refresh()
+        return { ok: true }
+      } catch (e) {
+        return { ok: false, reason: message(e) }
+      }
+    },
+
     open: async (plane, onPart = null) => {
-      set({ busy: true, error: null })
+      set({ busy: true, error: null, editOf: null })
       try {
         const { id } = await csketchApi.create()
         set({
@@ -465,6 +452,7 @@ export const useSketchBench = create<BenchState>((set, get) => {
         error: null,
         constraints: [],
         selectedConstraint: null,
+        editOf: null,
       })
     },
 
@@ -617,10 +605,25 @@ export const useSketchBench = create<BenchState>((set, get) => {
     },
 
     complete: async () => {
-      const { sketchId, plane, finish, selection, summary, onPart } = get()
+      const { sketchId, plane, finish, selection, summary, onPart, editOf } = get()
       if (!sketchId) return false
       set({ busy: true, error: null })
       try {
+        if (editOf) {
+          // An edited sketch goes back to its feature; what is built on it follows.
+          const r = await fetch(`${API_BASE}/timeline/resketch`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target_sequence: editOf.targetSequence, csketch_id: sketchId }),
+          })
+          if (!r.ok) {
+            const body = (await r.json().catch(() => ({}))) as { reason?: string }
+            throw new Error(body.reason ?? `the sketch was not applied (HTTP ${r.status})`)
+          }
+          get().close()
+          window.dispatchEvent(new CustomEvent(HISTORY_CHANGED_EVENT, { detail: { action: 'resketch' } }))
+          return true
+        }
         if (finish.op === 'revolve') {
           // The axis is a selected line (usually a centre line).
           const axisRef = selection.find((r) => 'Line' in r)

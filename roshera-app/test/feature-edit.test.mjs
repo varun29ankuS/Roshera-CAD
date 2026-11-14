@@ -80,3 +80,10 @@ test('deleting a feature sends all of its steps', async () => {
   // A pattern: every instance's steps.
   assert.deepEqual(deleteBody({ events: [8, 9, 11, 12], instances: [{ events: [8, 9] }, { events: [11, 12] }] }), { target_sequences: [8, 9, 11, 12] })
 })
+
+test('a sketch feature reads by its depth, not a radius found in its outline', async () => {
+  const { sizeSummary } = await import('../src/lib/feature-edit.ts')
+  const fields = [{ key: 'radius', value: 13 }, { key: 'distance', value: 10 }]
+  assert.equal(sizeSummary('extrude', fields, 0), '10 deep')
+  assert.equal(sizeSummary('cut', fields, 0), '10 deep')
+})
