@@ -1,13 +1,7 @@
 import { HistoryViewBanner } from './HistoryViewBanner'
+import { InSlot } from '@/components/viewport/overlay-slots'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
-import {
-  Box,
-  Grid3x3,
-  Ruler,
-  SquareDashed,
-  Tags,
-} from '@/components/ui/icons'
 import { CADGrid } from './CADGrid'
 import { GizmoNav } from './GizmoNav'
 import { SceneLighting } from './SceneLighting'
@@ -224,7 +218,6 @@ export function CADViewport() {
       </Canvas>
 
       <ViewportFrame />
-      <ViewportControls />
       <SketchCoordReadout />
       <DimensionKindChips />
       <ViewportHints />
@@ -264,33 +257,35 @@ function DimensionKindChips() {
   if (showDimensions.size === 0) return null
 
   return (
-    <div className="absolute top-3 left-3 cad-panel px-1.5 py-1 flex items-center gap-1 text-[11px] uppercase tracking-wider">
-      <span className="px-1 text-muted-foreground/70 select-none">Dims</span>
-      {ALL_DIMENSION_KINDS.map((kind) => {
-        const active = kindFilter.has(kind)
-        return (
-          <button
-            key={kind}
-            type="button"
-            onClick={() => toggleDimensionKind(kind)}
-            aria-pressed={active}
-            title={
-              active
-                ? `Hide ${DIMENSION_CHIP_LABELS[kind]}`
-                : `Show ${DIMENSION_CHIP_LABELS[kind]}`
-            }
-            className={[
-              'px-2 py-0.5 border transition-colors',
-              active
-                ? 'border-border text-foreground bg-accent'
-                : 'border-border/40 text-muted-foreground hover:text-foreground',
-            ].join(' ')}
-          >
-            {DIMENSION_CHIP_LABELS[kind]}
-          </button>
-        )
-      })}
-    </div>
+    <InSlot name="top">
+      <div className="pointer-events-auto cad-panel px-1.5 py-1 flex items-center gap-1 text-[11px] uppercase tracking-wider">
+        <span className="px-1 text-muted-foreground/70 select-none">Dims</span>
+        {ALL_DIMENSION_KINDS.map((kind) => {
+          const active = kindFilter.has(kind)
+          return (
+            <button
+              key={kind}
+              type="button"
+              onClick={() => toggleDimensionKind(kind)}
+              aria-pressed={active}
+              title={
+                active
+                  ? `Hide ${DIMENSION_CHIP_LABELS[kind]}`
+                  : `Show ${DIMENSION_CHIP_LABELS[kind]}`
+              }
+              className={[
+                'px-2 py-0.5 border transition-colors',
+                active
+                  ? 'border-border text-foreground bg-accent'
+                  : 'border-border/40 text-muted-foreground hover:text-foreground',
+              ].join(' ')}
+            >
+              {DIMENSION_CHIP_LABELS[kind]}
+            </button>
+          )
+        })}
+      </div>
+    </InSlot>
   )
 }
 
@@ -336,44 +331,46 @@ function SketchCoordReadout() {
   const worldXYZ = hover ? sketchUvToWorldXYZ(hover, plane) : null
 
   return (
-    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[11px] uppercase tracking-wider min-w-[180px]">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-muted-foreground">Plane</span>
-        <span className="text-foreground">{planeLabel}</span>
-      </div>
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-muted-foreground">U</span>
-        <span className="text-foreground tabular-nums font-mono">
-          {hover ? fmt(hover[0]) : '   ---'}
-        </span>
-      </div>
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-muted-foreground">V</span>
-        <span className="text-foreground tabular-nums font-mono">
-          {hover ? fmt(hover[1]) : '   ---'}
-        </span>
-      </div>
-      <div className="mt-1 pt-1 border-t border-border/40">
+    <InSlot name="bottom">
+      <div className="pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[11px] uppercase tracking-wider min-w-[180px]">
         <div className="flex items-center justify-between gap-3">
-          <span className="text-muted-foreground/70">X</span>
-          <span className="text-muted-foreground tabular-nums font-mono">
-            {worldXYZ ? fmt(worldXYZ[0]) : '   ---'}
+          <span className="text-muted-foreground">Plane</span>
+          <span className="text-foreground">{planeLabel}</span>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground">U</span>
+          <span className="text-foreground tabular-nums font-mono">
+            {hover ? fmt(hover[0]) : '   ---'}
           </span>
         </div>
         <div className="flex items-center justify-between gap-3">
-          <span className="text-muted-foreground/70">Y</span>
-          <span className="text-muted-foreground tabular-nums font-mono">
-            {worldXYZ ? fmt(worldXYZ[1]) : '   ---'}
+          <span className="text-muted-foreground">V</span>
+          <span className="text-foreground tabular-nums font-mono">
+            {hover ? fmt(hover[1]) : '   ---'}
           </span>
         </div>
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-muted-foreground/70">Z</span>
-          <span className="text-muted-foreground tabular-nums font-mono">
-            {worldXYZ ? fmt(worldXYZ[2]) : '   ---'}
-          </span>
+        <div className="mt-1 pt-1 border-t border-border/40">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-muted-foreground/70">X</span>
+            <span className="text-muted-foreground tabular-nums font-mono">
+              {worldXYZ ? fmt(worldXYZ[0]) : '   ---'}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-muted-foreground/70">Y</span>
+            <span className="text-muted-foreground tabular-nums font-mono">
+              {worldXYZ ? fmt(worldXYZ[1]) : '   ---'}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-muted-foreground/70">Z</span>
+            <span className="text-muted-foreground tabular-nums font-mono">
+              {worldXYZ ? fmt(worldXYZ[2]) : '   ---'}
+            </span>
+          </div>
         </div>
       </div>
-    </div>
+    </InSlot>
   )
 }
 
@@ -469,69 +466,71 @@ function CSketchDofHud() {
   const filteredCount = filter?.dropped.length ?? 0
 
   return (
-    <div className="absolute top-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[11px] uppercase tracking-wider min-w-[180px]">
-      {statusLabel && (
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-muted-foreground">DOF</span>
-          <span className={`${statusClass} font-semibold`}>{statusLabel}</span>
-        </div>
-      )}
-      {(conflictCount > 0 || redundantCount > 0 || skippedCount > 0) && (
-        <div className="mt-1 pt-1 border-t border-border/40 space-y-0.5">
-          {conflictCount > 0 && (
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-muted-foreground">Conflicts</span>
-              <span className="text-rose-400 font-semibold tabular-nums">
-                {conflictCount}
-              </span>
-            </div>
-          )}
-          {redundantCount > 0 && (
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-muted-foreground">Redundant</span>
-              <span className="text-caution font-semibold tabular-nums">
-                {redundantCount}
-              </span>
-            </div>
-          )}
-          {skippedCount > 0 && (
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-muted-foreground/70">Skipped</span>
-              <span className="text-muted-foreground tabular-nums">
-                {skippedCount}
-              </span>
-            </div>
-          )}
-        </div>
-      )}
-      {filteredCount > 0 && filter && (
-        <div className="mt-1 pt-1 border-t border-border/40 space-y-0.5">
+    <InSlot name="right">
+      <div className="pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[11px] uppercase tracking-wider min-w-[180px]">
+        {statusLabel && (
           <div className="flex items-center justify-between gap-3">
-            <span className="text-muted-foreground/70">
-              Filtered this sketch (&lt;{filter.threshold.toFixed(2)})
-            </span>
-            <span className="text-caution font-semibold tabular-nums">
-              {filteredCount}
-            </span>
+            <span className="text-muted-foreground">DOF</span>
+            <span className={`${statusClass} font-semibold`}>{statusLabel}</span>
           </div>
-          {/* Named, not just counted — the whole point is that a
-              dropped proposal should not vanish without a trace.
-              Plain text (no hover) so it reads without a mouse.
-              Cumulative for the whole csketch session (see
-              `recordInferenceFilterResult`), so this is capped to the
-              most recent few rather than growing without bound across
-              a long sketch. */}
-          <div className="normal-case tracking-normal text-muted-foreground/60 leading-snug">
-            {filter.dropped
-              .slice(-FILTERED_DETAIL_LIMIT)
-              .map((d) => `${d.kind} ${d.confidence.toFixed(2)}`)
-              .join(', ')}
-            {filteredCount > FILTERED_DETAIL_LIMIT &&
-              ` (+${filteredCount - FILTERED_DETAIL_LIMIT} earlier)`}
+        )}
+        {(conflictCount > 0 || redundantCount > 0 || skippedCount > 0) && (
+          <div className="mt-1 pt-1 border-t border-border/40 space-y-0.5">
+            {conflictCount > 0 && (
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">Conflicts</span>
+                <span className="text-rose-400 font-semibold tabular-nums">
+                  {conflictCount}
+                </span>
+              </div>
+            )}
+            {redundantCount > 0 && (
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">Redundant</span>
+                <span className="text-caution font-semibold tabular-nums">
+                  {redundantCount}
+                </span>
+              </div>
+            )}
+            {skippedCount > 0 && (
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground/70">Skipped</span>
+                <span className="text-muted-foreground tabular-nums">
+                  {skippedCount}
+                </span>
+              </div>
+            )}
           </div>
-        </div>
-      )}
-    </div>
+        )}
+        {filteredCount > 0 && filter && (
+          <div className="mt-1 pt-1 border-t border-border/40 space-y-0.5">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground/70">
+                Filtered this sketch (&lt;{filter.threshold.toFixed(2)})
+              </span>
+              <span className="text-caution font-semibold tabular-nums">
+                {filteredCount}
+              </span>
+            </div>
+            {/* Named, not just counted — the whole point is that a
+                dropped proposal should not vanish without a trace.
+                Plain text (no hover) so it reads without a mouse.
+                Cumulative for the whole csketch session (see
+                `recordInferenceFilterResult`), so this is capped to the
+                most recent few rather than growing without bound across
+                a long sketch. */}
+            <div className="normal-case tracking-normal text-muted-foreground/60 leading-snug">
+              {filter.dropped
+                .slice(-FILTERED_DETAIL_LIMIT)
+                .map((d) => `${d.kind} ${d.confidence.toFixed(2)}`)
+                .join(', ')}
+              {filteredCount > FILTERED_DETAIL_LIMIT &&
+                ` (+${filteredCount - FILTERED_DETAIL_LIMIT} earlier)`}
+            </div>
+          </div>
+        )}
+      </div>
+    </InSlot>
   )
 }
 
@@ -578,19 +577,21 @@ function ModeBanner() {
   const { title, hint } = labels[selectionMode]
 
   return (
-    <div className="absolute top-3 left-1/2 -translate-x-1/2 pointer-events-auto cad-panel px-4 py-2 flex items-center gap-3 text-[11px] uppercase tracking-wider">
-      <span className="w-2 h-2 rounded-full bg-foreground animate-pulse" />
-      <span className="text-foreground font-semibold">{title}</span>
-      <span className="text-muted-foreground">{hint}</span>
-      <button
-        type="button"
-        onClick={() => setSelectionMode('object')}
-        className="ml-2 px-2 py-0.5 border border-border/60 hover:border-border text-muted-foreground hover:text-foreground transition-colors"
-        title="Exit to object mode"
-      >
-        Exit
-      </button>
-    </div>
+    <InSlot name="top">
+      <div className="pointer-events-auto cad-panel px-4 py-2 flex items-center gap-3 text-[11px] uppercase tracking-wider">
+        <span className="w-2 h-2 rounded-full bg-foreground animate-pulse" />
+        <span className="text-foreground font-semibold">{title}</span>
+        <span className="text-muted-foreground">{hint}</span>
+        <button
+          type="button"
+          onClick={() => setSelectionMode('object')}
+          className="ml-2 px-2 py-0.5 border border-border/60 hover:border-border text-muted-foreground hover:text-foreground transition-colors"
+          title="Exit to object mode"
+        >
+          Exit
+        </button>
+      </div>
+    </InSlot>
   )
 }
 
@@ -629,114 +630,26 @@ function MatePickHintBanner() {
       : 'Click a face on a different component · Esc to cancel'
 
   return (
-    <div className="absolute top-14 left-1/2 -translate-x-1/2 pointer-events-auto cad-panel px-4 py-2 flex items-center gap-3 text-[11px] uppercase tracking-wider">
-      <span className="w-2 h-2 rounded-full bg-foreground animate-pulse" />
-      <span className="text-foreground font-semibold">{title}</span>
-      <span className="text-muted-foreground">{hint}</span>
-      {stage === 'second' && (
-        <button
-          type="button"
-          onClick={clearPendingMate}
-          className="ml-2 px-2 py-0.5 border border-border/60 hover:border-border text-muted-foreground hover:text-foreground transition-colors"
-          title="Cancel mate pick (Esc)"
-        >
-          Cancel
-        </button>
-      )}
-    </div>
+    <InSlot name="top">
+      <div className="pointer-events-auto cad-panel px-4 py-2 flex items-center gap-3 text-[11px] uppercase tracking-wider">
+        <span className="w-2 h-2 rounded-full bg-foreground animate-pulse" />
+        <span className="text-foreground font-semibold">{title}</span>
+        <span className="text-muted-foreground">{hint}</span>
+        {stage === 'second' && (
+          <button
+            type="button"
+            onClick={clearPendingMate}
+            className="ml-2 px-2 py-0.5 border border-border/60 hover:border-border text-muted-foreground hover:text-foreground transition-colors"
+            title="Cancel mate pick (Esc)"
+          >
+            Cancel
+          </button>
+        )}
+      </div>
+    </InSlot>
   )
 }
 
-/**
- * Floating viewport toggles — grid on/off and projection (perspective
- * vs orthographic). Sits just above the readout in the bottom-right
- * corner. Engineers expect orthographic for measurement-accurate
- * views; designers prefer perspective for spatial reasoning. The
- * toggle preserves camera position/orientation across the swap (see
- * `CameraController`'s projection effect for the FOV ↔ zoom mapping).
- */
-function ViewportControls() {
-  const gridVisible = useSceneStore((s) => s.gridSettings.visible)
-  const setGridSettings = useSceneStore((s) => s.setGridSettings)
-  const projection = useSceneStore((s) => s.cameraProjection)
-  const toggleProjection = useSceneStore((s) => s.toggleCameraProjection)
-  const labelsVisible = useSceneStore((s) => s.labelsVisible)
-  const toggleLabelsVisible = useSceneStore((s) => s.toggleLabelsVisible)
-  const gdtVisible = useSceneStore((s) => s.gdtVisible)
-  const toggleGdtVisible = useSceneStore((s) => s.toggleGdtVisible)
-
-  const toggleGrid = useCallback(() => {
-    setGridSettings({ visible: !gridVisible })
-  }, [gridVisible, setGridSettings])
-
-  const isOrtho = projection === 'orthographic'
-  const ProjectionIcon = isOrtho ? SquareDashed : Box
-
-  return (
-    <div className="absolute bottom-[68px] right-3 flex items-center gap-1">
-      <button
-        type="button"
-        onClick={toggleProjection}
-        title={
-          isOrtho
-            ? 'Orthographic — click for perspective'
-            : 'Perspective — click for orthographic'
-        }
-        aria-pressed={isOrtho}
-        className={[
-          'cad-panel w-7 h-7 flex items-center justify-center transition-colors',
-          isOrtho
-            ? 'text-foreground border-border'
-            : 'text-muted-foreground/70 border-border/60 hover:text-foreground',
-        ].join(' ')}
-      >
-        <ProjectionIcon className="w-3.5 h-3.5" />
-      </button>
-      <button
-        type="button"
-        onClick={toggleGrid}
-        title={gridVisible ? 'Hide grid' : 'Show grid'}
-        aria-pressed={gridVisible}
-        className={[
-          'cad-panel w-7 h-7 flex items-center justify-center transition-colors',
-          gridVisible
-            ? 'text-foreground border-border'
-            : 'text-muted-foreground/70 border-border/60 hover:text-foreground',
-        ].join(' ')}
-      >
-        <Grid3x3 className="w-3.5 h-3.5" />
-      </button>
-      <button
-        type="button"
-        onClick={toggleLabelsVisible}
-        title={labelsVisible ? 'Hide labels' : 'Show labels'}
-        aria-pressed={labelsVisible}
-        className={[
-          'cad-panel w-7 h-7 flex items-center justify-center transition-colors',
-          labelsVisible
-            ? 'text-foreground border-border'
-            : 'text-muted-foreground/70 border-border/60 hover:text-foreground',
-        ].join(' ')}
-      >
-        <Tags className="w-3.5 h-3.5" />
-      </button>
-      <button
-        type="button"
-        onClick={toggleGdtVisible}
-        title={gdtVisible ? 'Hide GD&T annotations' : 'Show GD&T annotations'}
-        aria-pressed={gdtVisible}
-        className={[
-          'cad-panel w-7 h-7 flex items-center justify-center transition-colors',
-          gdtVisible
-            ? 'text-foreground border-border'
-            : 'text-muted-foreground/70 border-border/60 hover:text-foreground',
-        ].join(' ')}
-      >
-        <Ruler className="w-3.5 h-3.5" />
-      </button>
-    </div>
-  )
-}
 
 /**
  * Corner-tick frame surrounding the viewport — four L-shaped marks in the
@@ -785,63 +698,65 @@ function SectionViewPanel() {
   if (!sectionView.enabled) return null
 
   return (
-    <div className="absolute top-3 right-3 cad-panel px-3 py-2 flex flex-col gap-2 text-[11px] uppercase tracking-wider min-w-[200px]">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-foreground font-semibold">Section View</span>
+    <InSlot name="right">
+      <div className="pointer-events-auto cad-panel px-3 py-2 flex flex-col gap-2 text-[11px] uppercase tracking-wider min-w-[200px]">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-foreground font-semibold">Section View</span>
+          <button
+            type="button"
+            onClick={toggleSectionView}
+            className="px-2 py-0.5 border border-border/60 hover:border-border text-muted-foreground hover:text-foreground transition-colors"
+            title="Disable section view"
+          >
+            Off
+          </button>
+        </div>
+        <div className="flex items-center gap-1">
+          {(['x', 'y', 'z'] as const).map((axis) => (
+            <button
+              key={axis}
+              type="button"
+              onClick={() => setSectionView({ axis })}
+              className={[
+                'flex-1 px-2 py-1 border transition-colors',
+                sectionView.axis === axis
+                  ? 'border-border text-foreground bg-accent'
+                  : 'border-border/40 text-muted-foreground hover:text-foreground',
+              ].join(' ')}
+            >
+              {axis.toUpperCase()}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-muted-foreground w-12">Offset</span>
+          <input
+            type="range"
+            min={-50}
+            max={50}
+            step={0.5}
+            value={sectionView.offset}
+            onChange={(e) => setSectionView({ offset: Number(e.target.value) })}
+            className="flex-1"
+          />
+          <span className="tabular-nums text-foreground w-10 text-right">
+            {sectionView.offset.toFixed(1)}
+          </span>
+        </div>
         <button
           type="button"
-          onClick={toggleSectionView}
-          className="px-2 py-0.5 border border-border/60 hover:border-border text-muted-foreground hover:text-foreground transition-colors"
-          title="Disable section view"
+          onClick={() => setSectionView({ flipped: !sectionView.flipped })}
+          className={[
+            'px-2 py-1 border transition-colors',
+            sectionView.flipped
+              ? 'border-border text-foreground bg-accent'
+              : 'border-border/40 text-muted-foreground hover:text-foreground',
+          ].join(' ')}
         >
-          Off
+          Flip side
         </button>
       </div>
-      <div className="flex items-center gap-1">
-        {(['x', 'y', 'z'] as const).map((axis) => (
-          <button
-            key={axis}
-            type="button"
-            onClick={() => setSectionView({ axis })}
-            className={[
-              'flex-1 px-2 py-1 border transition-colors',
-              sectionView.axis === axis
-                ? 'border-border text-foreground bg-accent'
-                : 'border-border/40 text-muted-foreground hover:text-foreground',
-            ].join(' ')}
-          >
-            {axis.toUpperCase()}
-          </button>
-        ))}
-      </div>
-      <div className="flex items-center gap-2">
-        <span className="text-muted-foreground w-12">Offset</span>
-        <input
-          type="range"
-          min={-50}
-          max={50}
-          step={0.5}
-          value={sectionView.offset}
-          onChange={(e) => setSectionView({ offset: Number(e.target.value) })}
-          className="flex-1"
-        />
-        <span className="tabular-nums text-foreground w-10 text-right">
-          {sectionView.offset.toFixed(1)}
-        </span>
-      </div>
-      <button
-        type="button"
-        onClick={() => setSectionView({ flipped: !sectionView.flipped })}
-        className={[
-          'px-2 py-1 border transition-colors',
-          sectionView.flipped
-            ? 'border-border text-foreground bg-accent'
-            : 'border-border/40 text-muted-foreground hover:text-foreground',
-        ].join(' ')}
-      >
-        Flip side
-      </button>
-    </div>
+    </InSlot>
   )
 }
 
@@ -890,10 +805,12 @@ function ViewportHints() {
   if (dismissed) return null
 
   return (
-    <div className="absolute bottom-3 left-3 pointer-events-none flex items-center gap-4 px-2.5 py-1 text-[11px] uppercase tracking-wider font-mono text-muted-foreground/80">
-      <span>LMB · Orbit</span>
-      <span>MMB · Pan</span>
-      <span>Scroll · Zoom</span>
-    </div>
+    <InSlot name="bottom">
+      <div className="pointer-events-none flex items-center gap-4 px-2.5 py-1 text-[11px] uppercase tracking-wider font-mono text-muted-foreground/80">
+        <span>LMB · Orbit</span>
+        <span>MMB · Pan</span>
+        <span>Scroll · Zoom</span>
+      </div>
+    </InSlot>
   )
 }

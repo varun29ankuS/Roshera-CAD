@@ -19,6 +19,7 @@
  * mutate them.
  */
 
+import { InSlot } from '@/components/viewport/overlay-slots'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   PenTool,
@@ -449,330 +450,332 @@ export function SketchPanel() {
             : 'Click again for another circle · Enter to finish & extrude'
 
   return (
-    <div className="absolute top-3 left-1/2 -translate-x-1/2 pointer-events-auto cad-panel px-3 py-2 flex flex-col gap-2 text-[11px] uppercase tracking-wider min-w-[460px] max-w-[640px]">
-      {/* Top row: title + plane + close */}
-      <div className="flex items-center gap-3">
-        <span className="w-2 h-2 rounded-full bg-foreground animate-pulse" />
-        <span className="text-foreground font-semibold">Sketch</span>
-        <span className="text-muted-foreground normal-case tracking-normal">
-          {hint}
-        </span>
-        <div className="ml-auto flex items-center gap-1">
-          {!isStandardPlane(sketch.plane) && (
-            <span
-              className="px-2 py-0.5 border border-caution-border text-caution bg-caution-wash text-[11px] font-mono"
-              title="Sketch is anchored to a model face. Click XY/XZ/YZ to pivot off the face."
-            >
-              FACE
-            </span>
-          )}
-          {PLANE_OPTIONS.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              onClick={() => setSketchPlane(opt.value)}
-              className={cn(
-                'px-2 py-0.5 border text-[11px] font-mono transition-colors',
-                isStandardPlane(sketch.plane) && sketch.plane === opt.value
-                  ? 'border-border text-foreground bg-foreground/10'
-                  : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
-              )}
-              title={`Sketch on ${opt.label} plane`}
-            >
-              {opt.label}
-            </button>
-          ))}
-          <button
-            type="button"
-            onClick={() => exitSketch()}
-            className="ml-1 p-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border transition-colors"
-            title="Cancel sketch (Esc)"
-            aria-label="Cancel sketch"
-          >
-            <X className="w-3 h-3" />
-          </button>
-        </div>
-      </div>
-
-      {/* Tool selector + numeric inputs + measure */}
-      <div className="flex items-center gap-1">
-        {TOOL_OPTIONS.map((opt, i) => {
-          const Icon = opt.icon
-          return (
-            <button
-              key={opt.value}
-              type="button"
-              onClick={() => setSketchTool(opt.value)}
-              className={cn(
-                'flex items-center gap-1.5 px-2 py-1 border text-[11px] transition-colors',
-                sketch.tool === opt.value
-                  ? 'border-border text-foreground bg-foreground/10'
-                  : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
-              )}
-              title={`${opt.label} (${i + 1})`}
-            >
-              <Icon className="w-3 h-3" />
-              <span>{opt.label}</span>
-              <span className="text-muted-foreground/60 ml-1">{i + 1}</span>
-            </button>
-          )
-        })}
-
-        <div className="ml-auto flex items-center gap-2">
-          <NumberField
-            label="Snap"
-            value={sketch.snapStep}
-            onChange={(n) => setSketchView({ snapStep: Math.max(0, n) })}
-            min={0}
-            step={0.1}
-          />
-          <NumberField
-            label="Thick"
-            value={sketch.thickness}
-            onChange={(n) => setSketchView({ thickness: n })}
-            min={0.001}
-            step={0.5}
-          />
-          <button
-            type="button"
-            onClick={() => setSketchView({ measure: !sketch.measure })}
-            className={cn(
-              'flex items-center gap-1 px-2 py-1 border text-[11px] transition-colors',
-              sketch.measure
-                ? 'border-caution-border text-caution bg-caution-wash'
-                : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
-            )}
-            title="Show angles, perimeter, area"
-            aria-pressed={sketch.measure}
-          >
-            <Ruler className="w-3 h-3" />
-            <span>Measure</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Constrained-sketch (csketch) tool row (D-2-b). Renders only
-          when a csketch is open. Clicking the active tool again
-          deselects it (toggle behaviour) and returns the editor to
-          read-only / drag mode. Selecting a tool routes capture-plane
-          clicks through `csketchApi.addPoint` / `addLine` /
-          `addCircle` instead of the legacy sketch handler. */}
-      {csketchActiveId !== null && (
-        <div className="flex items-center gap-1">
-          <span className="text-[11px] text-muted-foreground/80 mr-1">
-            cSketch
+    <InSlot name="top">
+      <div className="pointer-events-auto cad-panel px-3 py-2 flex flex-col gap-2 text-[11px] uppercase tracking-wider min-w-[460px] max-w-[640px]">
+        {/* Top row: title + plane + close */}
+        <div className="flex items-center gap-3">
+          <span className="w-2 h-2 rounded-full bg-foreground animate-pulse" />
+          <span className="text-foreground font-semibold">Sketch</span>
+          <span className="text-muted-foreground normal-case tracking-normal">
+            {hint}
           </span>
-          {CSKETCH_TOOL_OPTIONS.map((opt) => {
+          <div className="ml-auto flex items-center gap-1">
+            {!isStandardPlane(sketch.plane) && (
+              <span
+                className="px-2 py-0.5 border border-caution-border text-caution bg-caution-wash text-[11px] font-mono"
+                title="Sketch is anchored to a model face. Click XY/XZ/YZ to pivot off the face."
+              >
+                FACE
+              </span>
+            )}
+            {PLANE_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setSketchPlane(opt.value)}
+                className={cn(
+                  'px-2 py-0.5 border text-[11px] font-mono transition-colors',
+                  isStandardPlane(sketch.plane) && sketch.plane === opt.value
+                    ? 'border-border text-foreground bg-foreground/10'
+                    : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
+                )}
+                title={`Sketch on ${opt.label} plane`}
+              >
+                {opt.label}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => exitSketch()}
+              className="ml-1 p-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border transition-colors"
+              title="Cancel sketch (Esc)"
+              aria-label="Cancel sketch"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+        </div>
+
+        {/* Tool selector + numeric inputs + measure */}
+        <div className="flex items-center gap-1">
+          {TOOL_OPTIONS.map((opt, i) => {
             const Icon = opt.icon
-            const active = csketchActiveTool === opt.value
             return (
               <button
                 key={opt.value}
                 type="button"
-                onClick={() =>
-                  setCSketchTool(active ? null : opt.value)
-                }
+                onClick={() => setSketchTool(opt.value)}
                 className={cn(
                   'flex items-center gap-1.5 px-2 py-1 border text-[11px] transition-colors',
-                  active
-                    ? 'border-sky-400/60 text-sky-300 bg-sky-500/10'
+                  sketch.tool === opt.value
+                    ? 'border-border text-foreground bg-foreground/10'
                     : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
                 )}
-                title={`Constrained ${opt.label.toLowerCase()}`}
-                aria-pressed={active}
+                title={`${opt.label} (${i + 1})`}
+              >
+                <Icon className="w-3 h-3" />
+                <span>{opt.label}</span>
+                <span className="text-muted-foreground/60 ml-1">{i + 1}</span>
+              </button>
+            )
+          })}
+
+          <div className="ml-auto flex items-center gap-2">
+            <NumberField
+              label="Snap"
+              value={sketch.snapStep}
+              onChange={(n) => setSketchView({ snapStep: Math.max(0, n) })}
+              min={0}
+              step={0.1}
+            />
+            <NumberField
+              label="Thick"
+              value={sketch.thickness}
+              onChange={(n) => setSketchView({ thickness: n })}
+              min={0.001}
+              step={0.5}
+            />
+            <button
+              type="button"
+              onClick={() => setSketchView({ measure: !sketch.measure })}
+              className={cn(
+                'flex items-center gap-1 px-2 py-1 border text-[11px] transition-colors',
+                sketch.measure
+                  ? 'border-caution-border text-caution bg-caution-wash'
+                  : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
+              )}
+              title="Show angles, perimeter, area"
+              aria-pressed={sketch.measure}
+            >
+              <Ruler className="w-3 h-3" />
+              <span>Measure</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Constrained-sketch (csketch) tool row (D-2-b). Renders only
+            when a csketch is open. Clicking the active tool again
+            deselects it (toggle behaviour) and returns the editor to
+            read-only / drag mode. Selecting a tool routes capture-plane
+            clicks through `csketchApi.addPoint` / `addLine` /
+            `addCircle` instead of the legacy sketch handler. */}
+        {csketchActiveId !== null && (
+          <div className="flex items-center gap-1">
+            <span className="text-[11px] text-muted-foreground/80 mr-1">
+              cSketch
+            </span>
+            {CSKETCH_TOOL_OPTIONS.map((opt) => {
+              const Icon = opt.icon
+              const active = csketchActiveTool === opt.value
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() =>
+                    setCSketchTool(active ? null : opt.value)
+                  }
+                  className={cn(
+                    'flex items-center gap-1.5 px-2 py-1 border text-[11px] transition-colors',
+                    active
+                      ? 'border-sky-400/60 text-sky-300 bg-sky-500/10'
+                      : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
+                  )}
+                  title={`Constrained ${opt.label.toLowerCase()}`}
+                  aria-pressed={active}
+                >
+                  <Icon className="w-3 h-3" />
+                  <span>{opt.label}</span>
+                </button>
+              )
+            })}
+          </div>
+        )}
+
+        {/* Multi-loop shapes are an implementation detail of the kernel —
+            they exist so the extrude pipeline can classify outer vs hole
+            loops via point-in-polygon containment. Surfacing them as
+            shape pills makes the sketch feel like a sequence of
+            disjoint mini-canvases ("draw shape 1, now draw shape 2");
+            Mainstream CAD sketchers present a single continuous 2D design
+            space and let the user keep adding geometry. We match that
+            by hiding the pill row entirely — every closed polyline /
+            completed rectangle / circle still rolls into its own
+            backend shape silently, but the user never has to think
+            about it. The next pointer click after a closure just
+            starts the next primitive on the same canvas. */}
+
+        {/* Per-tool dimension inputs — type exact lengths instead of
+            (or in addition to) clicking. Visible once enough points
+            exist for the dimensions to be meaningful. */}
+        <DimensionInputs
+          tool={sketch.tool}
+          points={sketch.points}
+          setSketchPoint={setSketchPoint}
+        />
+
+        {/* Finalise operation selector. Three ways to turn the 2D
+            profile into 3D: pull it (Extrude), pull-and-subtract
+            (Cut), or spin it around an axis (Revolve). Sweep/Loft are
+            out of scope for the single-sketch session (need cross-
+            sketch coordination — see slice J-5). */}
+        <div className="flex items-center gap-1 pt-1 border-t border-border/30 flex-wrap">
+          <span className="text-muted-foreground text-[11px] mr-1">Op</span>
+          {FINISH_OP_OPTIONS.map((opt) => {
+            const Icon = opt.icon
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setFinishOp(opt.value)}
+                className={cn(
+                  'flex items-center gap-1 px-2 py-0.5 border text-[11px] transition-colors',
+                  finishOp === opt.value
+                    ? 'border-border text-foreground bg-foreground/10'
+                    : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
+                )}
+                title={opt.title}
+                aria-pressed={finishOp === opt.value}
               >
                 <Icon className="w-3 h-3" />
                 <span>{opt.label}</span>
               </button>
             )
           })}
-        </div>
-      )}
-
-      {/* Multi-loop shapes are an implementation detail of the kernel —
-          they exist so the extrude pipeline can classify outer vs hole
-          loops via point-in-polygon containment. Surfacing them as
-          shape pills makes the sketch feel like a sequence of
-          disjoint mini-canvases ("draw shape 1, now draw shape 2");
-          Mainstream CAD sketchers present a single continuous 2D design
-          space and let the user keep adding geometry. We match that
-          by hiding the pill row entirely — every closed polyline /
-          completed rectangle / circle still rolls into its own
-          backend shape silently, but the user never has to think
-          about it. The next pointer click after a closure just
-          starts the next primitive on the same canvas. */}
-
-      {/* Per-tool dimension inputs — type exact lengths instead of
-          (or in addition to) clicking. Visible once enough points
-          exist for the dimensions to be meaningful. */}
-      <DimensionInputs
-        tool={sketch.tool}
-        points={sketch.points}
-        setSketchPoint={setSketchPoint}
-      />
-
-      {/* Finalise operation selector. Three ways to turn the 2D
-          profile into 3D: pull it (Extrude), pull-and-subtract
-          (Cut), or spin it around an axis (Revolve). Sweep/Loft are
-          out of scope for the single-sketch session (need cross-
-          sketch coordination — see slice J-5). */}
-      <div className="flex items-center gap-1 pt-1 border-t border-border/30 flex-wrap">
-        <span className="text-muted-foreground text-[11px] mr-1">Op</span>
-        {FINISH_OP_OPTIONS.map((opt) => {
-          const Icon = opt.icon
-          return (
-            <button
-              key={opt.value}
-              type="button"
-              onClick={() => setFinishOp(opt.value)}
-              className={cn(
-                'flex items-center gap-1 px-2 py-0.5 border text-[11px] transition-colors',
-                finishOp === opt.value
-                  ? 'border-border text-foreground bg-foreground/10'
-                  : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
-              )}
-              title={opt.title}
-              aria-pressed={finishOp === opt.value}
-            >
-              <Icon className="w-3 h-3" />
-              <span>{opt.label}</span>
-            </button>
-          )
-        })}
-        {finishOp === 'extrude_cut' && (
-          <span className="ml-2 text-[11px] font-mono text-muted-foreground">
-            target:{' '}
-            <span className={cn(cutTargetId ? 'text-foreground' : 'text-rose-400')}>
-              {cutTargetId ? cutTargetId.slice(0, 8) : '— select a body —'}
+          {finishOp === 'extrude_cut' && (
+            <span className="ml-2 text-[11px] font-mono text-muted-foreground">
+              target:{' '}
+              <span className={cn(cutTargetId ? 'text-foreground' : 'text-rose-400')}>
+                {cutTargetId ? cutTargetId.slice(0, 8) : '— select a body —'}
+              </span>
             </span>
+          )}
+        </div>
+
+        {finishOp === 'revolve' && (
+          <div className="flex items-center gap-2 flex-wrap pt-1 border-t border-border/30">
+            <NumberField
+              label="Angle°"
+              value={revolveAngleDeg}
+              onChange={(n) => setRevolveAngleDeg(n)}
+              step={15}
+            />
+            <NumberField
+              label="Segs"
+              value={revolveSegments}
+              onChange={(n) => setRevolveSegments(Math.max(3, Math.round(n)))}
+              min={3}
+              step={1}
+            />
+            <AxisInputs
+              label="origin"
+              value={revolveAxisOrigin}
+              onChange={setRevolveAxisOrigin}
+            />
+            <AxisInputs
+              label="dir"
+              value={revolveAxisDir}
+              onChange={setRevolveAxisDir}
+            />
+          </div>
+        )}
+
+        {/* Action row */}
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={popSketchPoint}
+            disabled={sketch.points.length === 0 || busy}
+            className="flex items-center gap-1.5 px-2 py-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80 disabled:opacity-40 disabled:hover:text-muted-foreground transition-colors text-[11px]"
+            title="Undo last point (Backspace)"
+          >
+            <Undo2 className="w-3 h-3" />
+            <span>Undo</span>
+          </button>
+          <button
+            type="button"
+            onClick={clearSketchPoints}
+            disabled={sketch.points.length === 0 || busy}
+            className="flex items-center gap-1.5 px-2 py-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80 disabled:opacity-40 disabled:hover:text-muted-foreground transition-colors text-[11px]"
+            title="Clear all points"
+          >
+            <Trash2 className="w-3 h-3" />
+            <span>Clear</span>
+          </button>
+          <span className="text-muted-foreground text-[11px] ml-2">
+            {sketch.points.length} pts
           </span>
+
+          <button
+            type="button"
+            onClick={() => void handleFinish()}
+            onPointerEnter={() => setExtrudeHover(true)}
+            onPointerLeave={() => setExtrudeHover(false)}
+            disabled={
+              busy ||
+              // At least one shape across the whole session must be
+              // finishable — i.e. materialise to a valid polygon. The
+              // active shape can legitimately be empty right after the
+              // user closes a polyline (the auto-commit pattern creates
+              // a fresh on-deck shape); in that case the committed loop
+              // is still extrudable and the button should stay live.
+              !hasFinishableShape ||
+              (finishOp === 'extrude_cut' && cutTargetId === null)
+            }
+            className={cn(
+              'ml-auto flex items-center gap-1.5 px-3 py-1 border text-[11px] font-semibold transition-colors',
+              busy
+                ? 'border-border/40 text-muted-foreground'
+                : 'border-emerald-400/60 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40',
+            )}
+            title={
+              finishOp === 'extrude_cut'
+                ? 'Finish sketch and cut from target (Enter)'
+                : finishOp === 'revolve'
+                  ? 'Finish sketch and revolve around axis (Enter)'
+                  : 'Finish sketch and extrude (Enter)'
+            }
+          >
+            <Check className="w-3 h-3" />
+            <span>
+              {busy
+                ? finishOp === 'extrude_cut'
+                  ? 'Cutting…'
+                  : finishOp === 'revolve'
+                    ? 'Revolving…'
+                    : 'Extruding…'
+                : finishOp === 'extrude_cut'
+                  ? 'Finish & Cut'
+                  : finishOp === 'revolve'
+                    ? 'Finish & Revolve'
+                    : 'Finish & Extrude'}
+            </span>
+          </button>
+        </div>
+
+        {/* Live measurements + error */}
+        {(summary || error) && (
+          <div className="flex items-center gap-4 pt-1 border-t border-border/30 text-[11px] text-muted-foreground font-mono">
+            {summary && (
+              <>
+                <span>
+                  Perimeter <span className="text-foreground">{summary.perimeter.toFixed(2)}</span>
+                </span>
+                {summary.closed && (
+                  <span>
+                    Area <span className="text-foreground">{summary.area.toFixed(2)}</span>
+                  </span>
+                )}
+              </>
+            )}
+            {error && (
+              <span className="ml-auto text-rose-400 normal-case tracking-normal">
+                {error}
+              </span>
+            )}
+          </div>
         )}
       </div>
-
-      {finishOp === 'revolve' && (
-        <div className="flex items-center gap-2 flex-wrap pt-1 border-t border-border/30">
-          <NumberField
-            label="Angle°"
-            value={revolveAngleDeg}
-            onChange={(n) => setRevolveAngleDeg(n)}
-            step={15}
-          />
-          <NumberField
-            label="Segs"
-            value={revolveSegments}
-            onChange={(n) => setRevolveSegments(Math.max(3, Math.round(n)))}
-            min={3}
-            step={1}
-          />
-          <AxisInputs
-            label="origin"
-            value={revolveAxisOrigin}
-            onChange={setRevolveAxisOrigin}
-          />
-          <AxisInputs
-            label="dir"
-            value={revolveAxisDir}
-            onChange={setRevolveAxisDir}
-          />
-        </div>
-      )}
-
-      {/* Action row */}
-      <div className="flex items-center gap-2">
-        <button
-          type="button"
-          onClick={popSketchPoint}
-          disabled={sketch.points.length === 0 || busy}
-          className="flex items-center gap-1.5 px-2 py-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80 disabled:opacity-40 disabled:hover:text-muted-foreground transition-colors text-[11px]"
-          title="Undo last point (Backspace)"
-        >
-          <Undo2 className="w-3 h-3" />
-          <span>Undo</span>
-        </button>
-        <button
-          type="button"
-          onClick={clearSketchPoints}
-          disabled={sketch.points.length === 0 || busy}
-          className="flex items-center gap-1.5 px-2 py-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80 disabled:opacity-40 disabled:hover:text-muted-foreground transition-colors text-[11px]"
-          title="Clear all points"
-        >
-          <Trash2 className="w-3 h-3" />
-          <span>Clear</span>
-        </button>
-        <span className="text-muted-foreground text-[11px] ml-2">
-          {sketch.points.length} pts
-        </span>
-
-        <button
-          type="button"
-          onClick={() => void handleFinish()}
-          onPointerEnter={() => setExtrudeHover(true)}
-          onPointerLeave={() => setExtrudeHover(false)}
-          disabled={
-            busy ||
-            // At least one shape across the whole session must be
-            // finishable — i.e. materialise to a valid polygon. The
-            // active shape can legitimately be empty right after the
-            // user closes a polyline (the auto-commit pattern creates
-            // a fresh on-deck shape); in that case the committed loop
-            // is still extrudable and the button should stay live.
-            !hasFinishableShape ||
-            (finishOp === 'extrude_cut' && cutTargetId === null)
-          }
-          className={cn(
-            'ml-auto flex items-center gap-1.5 px-3 py-1 border text-[11px] font-semibold transition-colors',
-            busy
-              ? 'border-border/40 text-muted-foreground'
-              : 'border-emerald-400/60 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40',
-          )}
-          title={
-            finishOp === 'extrude_cut'
-              ? 'Finish sketch and cut from target (Enter)'
-              : finishOp === 'revolve'
-                ? 'Finish sketch and revolve around axis (Enter)'
-                : 'Finish sketch and extrude (Enter)'
-          }
-        >
-          <Check className="w-3 h-3" />
-          <span>
-            {busy
-              ? finishOp === 'extrude_cut'
-                ? 'Cutting…'
-                : finishOp === 'revolve'
-                  ? 'Revolving…'
-                  : 'Extruding…'
-              : finishOp === 'extrude_cut'
-                ? 'Finish & Cut'
-                : finishOp === 'revolve'
-                  ? 'Finish & Revolve'
-                  : 'Finish & Extrude'}
-          </span>
-        </button>
-      </div>
-
-      {/* Live measurements + error */}
-      {(summary || error) && (
-        <div className="flex items-center gap-4 pt-1 border-t border-border/30 text-[11px] text-muted-foreground font-mono">
-          {summary && (
-            <>
-              <span>
-                Perimeter <span className="text-foreground">{summary.perimeter.toFixed(2)}</span>
-              </span>
-              {summary.closed && (
-                <span>
-                  Area <span className="text-foreground">{summary.area.toFixed(2)}</span>
-                </span>
-              )}
-            </>
-          )}
-          {error && (
-            <span className="ml-auto text-rose-400 normal-case tracking-normal">
-              {error}
-            </span>
-          )}
-        </div>
-      )}
-    </div>
+    </InSlot>
   )
 }
 

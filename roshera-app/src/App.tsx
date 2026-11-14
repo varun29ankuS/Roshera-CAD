@@ -11,6 +11,7 @@ import { ModelTree } from '@/components/panels/ModelTree'
 import { DfmPanel } from '@/components/panels/DfmPanel'
 import { ExtrudePanel } from '@/components/panels/ExtrudePanel'
 import { ViewBar } from '@/components/viewport/ViewBar'
+import { OverlaySlotsContext, type SlotName, type Slots } from '@/components/viewport/overlay-slots-context'
 import { FeatureEditPanel } from '@/components/panels/FeatureEditPanel'
 import { Timeline } from '@/components/panels/Timeline'
 import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
@@ -57,6 +58,17 @@ export function App() {
   // can switch freely.
   const docMode = useDocModeStore((s) => s.mode) ?? 'part'
   const [browserOpen, setBrowserOpen] = useState(true)
+  // The viewport's overlay slots (see overlay-slots.tsx). Stable callback
+  // refs: a fresh ref each render would detach and re-attach the slot and
+  // loop the state.
+  const [slots, setSlots] = useState<Slots>({})
+  const setSlot = useCallback((name: SlotName, el: HTMLDivElement | null) => {
+    setSlots((cur) => (cur[name] === el ? cur : { ...cur, [name]: el }))
+  }, [])
+  const attachTopSlot = useCallback((el: HTMLDivElement | null) => setSlot('top', el), [setSlot])
+  const attachRightSlot = useCallback((el: HTMLDivElement | null) => setSlot('right', el), [setSlot])
+  const attachLeftSlot = useCallback((el: HTMLDivElement | null) => setSlot('left', el), [setSlot])
+  const attachBottomSlot = useCallback((el: HTMLDivElement | null) => setSlot('bottom', el), [setSlot])
   const [route, setRoute] = useState<Route>(routeFromHash)
 
   useEffect(() => {
@@ -160,7 +172,9 @@ export function App() {
         ) : docMode === 'assembly' ? (
           <AssemblyWorkspace />
         ) : (
-          <>
+          // The slots' provider wraps the tool rail too: its dialogs (fillet,
+          // chamfer, shell) go in the viewport's top slot.
+          <OverlaySlotsContext.Provider value={slots}>
             {/* DFM keeps the model and its history but not the modelling
                 tools: it is a check on the part, run on its own. */}
             {docMode !== 'dfm' && <ToolBar />}
@@ -180,26 +194,38 @@ export function App() {
               <CADViewport />
               <StepImportDropzone />
 
-              {/* The left column: the tree card, and under it the selected
-                  feature's sizes to edit (the approved mockup). Both only as
-                  tall as their content, capped above the floating history. */}
+              {/* The left column, top to bottom of the viewport: the tree card
+                  and the selected feature's sizes (or, in DFM, the check's
+                  panel in their place), and Agent Eye at the foot. One column,
+                  so an opened Agent Eye pushes the tree card up instead of
+                  covering it. */}
               <div
                 className={cn(
-                  'pointer-events-none absolute left-2 top-2 z-10 flex max-h-[calc(100%-7.5rem)] flex-col gap-2 transition-[width] duration-200',
-                  browserOpen ? 'w-56' : 'w-10',
+                  'pointer-events-none absolute bottom-2 left-2 top-2 z-20 flex flex-col gap-2 transition-[width] duration-200',
+                  docMode === 'dfm' ? 'w-72' : browserOpen ? 'w-56' : 'w-10',
                 )}
               >
-                <div className="pointer-events-auto flex min-h-0 flex-col overflow-hidden rounded-lg border border-border/70 bg-card/90 shadow-sm">
-                  <ModelTree
-                  expanded={browserOpen}
-                  onToggle={() => setBrowserOpen((open) => !open)}
-                />
-                </div>
-                {browserOpen && (
-                  <div className="pointer-events-auto shrink-0">
-                    <FeatureEditPanel />
+                {docMode === 'dfm' ? (
+                  <div className="pointer-events-auto flex min-h-0 flex-1 flex-col overflow-hidden rounded border border-border bg-card/95">
+                    <DfmPanel />
                   </div>
+                ) : (
+                  <>
+                    <div className="pointer-events-auto flex min-h-0 flex-col overflow-hidden rounded-lg border border-border/70 bg-card/90 shadow-sm">
+                      <ModelTree expanded={browserOpen} onToggle={() => setBrowserOpen((open) => !open)} />
+                    </div>
+                    {browserOpen && (
+                      <div className="pointer-events-auto min-h-0 shrink overflow-y-auto">
+                        <FeatureEditPanel />
+                      </div>
+                    )}
+                    {/* LEFT SLOT: a tool's settings, under the tree. */}
+                    <div ref={attachLeftSlot} className="flex w-56 shrink-0 flex-col gap-2" />
+                  </>
                 )}
+                <div className="pointer-events-auto mt-auto flex w-56 shrink-0 flex-col overflow-hidden rounded-lg border border-border bg-card/95">
+                  <AgentEyePanel defaultMinimized />
+                </div>
               </div>
 
               {/* The view bar, top centre over the model (the approved mockup). */}
@@ -207,38 +233,34 @@ export function App() {
                 <ViewBar />
               </div>
 
-              {/* A feature tool's panel (Extrude), top centre over the model. */}
-              <div className="pointer-events-none absolute left-[15.5rem] right-[21rem] top-14 z-30 flex justify-center">
+              {/* TOP SLOT, under the view bar: a tool's panel (Extrude), mode
+                  banners and prompts, stacked -- never one over another. */}
+              <div
+                ref={attachTopSlot}
+                className={cn(
+                  'pointer-events-none absolute right-[21rem] top-12 z-30 flex flex-col items-center gap-2',
+                  docMode === 'dfm' ? 'left-[19rem]' : 'left-[15.5rem]',
+                )}
+              >
                 <ExtrudePanel />
               </div>
-
-              {/* DFM: the check's panel sits where the tree is, wider and
-                  solid -- its findings are read, not looked through. */}
-              {docMode === 'dfm' && (
-                <div className="absolute bottom-12 left-2 top-2 z-20 flex w-72 flex-col overflow-hidden rounded border border-border bg-card/95">
-                  <DfmPanel />
-                </div>
-              )}
 
               {/* Properties: about the SELECTED OBJECT, so it belongs with the
                   object. Top-right, appearing only when there is a selection —
                   it was a permanent tenant of the right rail, which meant the
                   conversation lost a third of its column to a panel that is
                   empty most of the time. */}
-              {hasSelection && (
-                <div className="absolute right-[21rem] top-2 z-10 flex max-h-[45%] w-56 flex-col overflow-hidden rounded border border-border bg-card/95">
-                  <PropertiesPanel />
-                </div>
-              )}
-
-              {/* Agent Eye: a RENDER of the part, which makes it an instrument
-                  of the model rather than of the dialogue. Bottom-right, out of
-                  the tree's corner, and it keeps its own collapse. */}
-              {/* Bottom left, beside the history strip, bottom-aligned with it
-                  and folded until opened (Varun 2026-11-13). Opened, it grows
-                  upward. */}
-              <div className="absolute bottom-2 left-2 z-10 flex w-56 flex-col overflow-hidden rounded-lg border border-border bg-card/95">
-                <AgentEyePanel defaultMinimized />
+              {/* RIGHT SLOT, under the view cube: properties of the selection,
+                  the section controls, live readouts -- stacked. */}
+              <div
+                ref={attachRightSlot}
+                className="pointer-events-none absolute right-[21rem] top-[9.5rem] z-20 flex max-h-[calc(100%-19rem)] w-60 flex-col gap-2 overflow-y-auto [scrollbar-width:none]"
+              >
+                {hasSelection && (
+                  <div className="pointer-events-auto flex max-h-[45vh] shrink-0 flex-col overflow-hidden rounded border border-border bg-card/95">
+                    <PropertiesPanel />
+                  </div>
+                )}
               </div>
 
               {/* The Blackboard is an overlay too. It has now been a floating
@@ -266,17 +288,19 @@ export function App() {
                   to be completely from left to right?"). */}
               <div
                 className={cn(
-                  'pointer-events-none absolute bottom-2 right-[21rem] z-20 flex justify-center',
+                  'pointer-events-none absolute bottom-2 right-[21rem] z-20 flex flex-col items-center gap-1.5',
                   docMode === 'dfm' ? 'left-[19rem]' : 'left-[15.5rem]',
                 )}
               >
+                {/* BOTTOM SLOT, just above the history: coordinate readouts
+                    and hints. */}
+                <div ref={attachBottomSlot} className="flex flex-col items-center gap-1" />
                 <div className="pointer-events-auto max-w-full overflow-hidden rounded-xl border border-border/70 bg-card/90 shadow-md">
                   <Timeline />
                 </div>
               </div>
             </div>
-
-          </>
+          </OverlaySlotsContext.Provider>
         )}
       </div>
       {/* Timeline — horizontal strip, full width. Hidden in Drawing

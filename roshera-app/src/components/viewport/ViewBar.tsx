@@ -11,7 +11,8 @@ const VIEWS: { preset: string; label: string; key: string }[] = [
 /**
  * The viewport's view bar (the approved mockup): how the part is drawn --
  * shaded with its edges, shaded only, a section cut -- then which side it
- * is seen from, and Fit. One compact row over the top of the viewport.
+ * is seen from, and Fit -- then perspective/ortho, grid, labels and GD&T.
+ * One compact row over the top of the viewport.
  */
 export function ViewBar() {
   const edges = useSceneStore((s) => s.edgeSettings.visible)
@@ -21,6 +22,14 @@ export function ViewBar() {
   const preset = useSceneStore((s) => s.cameraPreset)
   const setCameraPreset = useSceneStore((s) => s.setCameraPreset)
   const frame = useSceneStore((s) => s.setPendingFrameObject)
+  const ortho = useSceneStore((s) => s.cameraProjection) === 'orthographic'
+  const toggleProjection = useSceneStore((s) => s.toggleCameraProjection)
+  const grid = useSceneStore((s) => s.gridSettings.visible)
+  const setGridSettings = useSceneStore((s) => s.setGridSettings)
+  const labels = useSceneStore((s) => s.labelsVisible)
+  const toggleLabels = useSceneStore((s) => s.toggleLabelsVisible)
+  const gdt = useSceneStore((s) => s.gdtVisible)
+  const toggleGdt = useSceneStore((s) => s.toggleGdtVisible)
 
   const btn = (on: boolean) =>
     cn(
@@ -59,6 +68,21 @@ export function ViewBar() {
       <span aria-hidden className="mx-1 h-4 w-px bg-border" />
       <button type="button" className={btn(false)} onClick={() => frame(FRAME_FIT)} title="Fit the part to the view">
         Fit
+      </button>
+      <span aria-hidden className="mx-1 h-4 w-px bg-border" />
+      {/* What else the view shows (these sat in a corner the Blackboard now
+          covers). */}
+      <button type="button" className={btn(ortho)} aria-pressed={ortho} onClick={toggleProjection} title="Orthographic: parallel lines stay parallel">
+        Ortho
+      </button>
+      <button type="button" className={btn(grid)} aria-pressed={grid} onClick={() => setGridSettings({ visible: !grid })} title="Show the grid">
+        Grid
+      </button>
+      <button type="button" className={btn(labels)} aria-pressed={labels} onClick={toggleLabels} title="Show part labels">
+        Labels
+      </button>
+      <button type="button" className={btn(gdt)} aria-pressed={gdt} onClick={toggleGdt} title="Show GD&T annotations">
+        GD&amp;T
       </button>
     </div>
   )

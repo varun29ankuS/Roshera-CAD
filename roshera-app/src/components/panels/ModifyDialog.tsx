@@ -22,6 +22,7 @@
  * — this component is purely presentational + selection-mode plumbing.
  */
 
+import { InSlot } from '@/components/viewport/overlay-slots'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   X,
@@ -557,296 +558,146 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
   })()
 
   return (
-    <div
-      role="dialog"
-      aria-label={`${spec.title} settings`}
-      // Top-left, just under the menubar. Non-modal, so no backdrop —
-      // user can still pan/orbit + pick edges in the canvas.
-      className="fixed left-4 top-20 z-40 w-[280px] select-none rounded-lg border border-border bg-card shadow-xl"
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-border px-3 py-2">
-        <span className="text-[13px] font-semibold tracking-wide">
-          {spec.title}
-        </span>
-        <button
-          type="button"
-          onClick={close}
-          className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-          aria-label="Close"
-        >
-          <X className="h-3.5 w-3.5" />
-        </button>
-      </div>
+    <InSlot name="left">
+      <div
+        role="dialog"
+        aria-label={`${spec.title} settings`}
+        // In the viewport's left slot, under the tree, as CAD shows a tool's
+        // settings -- it used to pop over the tree and the tool rail. Non-
+        // modal, so no backdrop: the user can still orbit and pick edges.
+        className="pointer-events-auto w-full select-none rounded-lg border border-border bg-card shadow-xl"
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-border px-3 py-2">
+          <span className="text-[13px] font-semibold tracking-wide">
+            {spec.title}
+          </span>
+          <button
+            type="button"
+            onClick={close}
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            aria-label="Close"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
 
-      {/* Body */}
-      <div className="flex flex-col gap-3 p-3">
-        {spec.needsEdges && (
-          <Field label="Edges">
+        {/* Body */}
+        <div className="flex flex-col gap-3 p-3">
+          {spec.needsEdges && (
+            <Field label="Edges">
+              <div
+                className={cn(
+                  'flex items-center gap-2 rounded-md border px-2 py-1.5 text-[12px] font-mono',
+                  edgeCount > 0
+                    ? 'border-primary/40 bg-primary/5 text-foreground'
+                    : 'border-border text-muted-foreground',
+                )}
+              >
+                <MousePointerClick className="h-3.5 w-3.5 shrink-0" />
+                <span>{selectionHint}</span>
+              </div>
+            </Field>
+          )}
+
+          {!spec.needsEdges && (
             <div
               className={cn(
-                'flex items-center gap-2 rounded-md border px-2 py-1.5 text-[12px] font-mono',
-                edgeCount > 0
+                'rounded-md border px-2 py-1.5 text-[12px] font-mono',
+                selectedIds.size === 1
                   ? 'border-primary/40 bg-primary/5 text-foreground'
-                  : 'border-border text-muted-foreground',
+                  : 'border-destructive/40 bg-destructive/5 text-destructive',
               )}
             >
-              <MousePointerClick className="h-3.5 w-3.5 shrink-0" />
-              <span>{selectionHint}</span>
+              {selectionHint}
             </div>
-          </Field>
-        )}
+          )}
 
-        {!spec.needsEdges && (
-          <div
-            className={cn(
-              'rounded-md border px-2 py-1.5 text-[12px] font-mono',
-              selectedIds.size === 1
-                ? 'border-primary/40 bg-primary/5 text-foreground'
-                : 'border-destructive/40 bg-destructive/5 text-destructive',
-            )}
-          >
-            {selectionHint}
-          </div>
-        )}
-
-        {/* Single shared radius — `fillet` / `chamfer` / `shell`. */}
-        {!spec.perEdge && spec.profile === 'constant' && (
-          <Field label={spec.inputLabel}>
-            <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
-              <input
-                ref={inputRef}
-                type="text"
-                inputMode="decimal"
-                value={valueRaw}
-                onChange={(e) => setValueRaw(e.target.value)}
-                className={cn(
-                  'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
-                  !valueValid && 'text-destructive',
-                )}
-                placeholder={String(spec.defaultValue)}
-              />
-              <span className="flex items-center bg-muted px-2 font-mono text-[11px] text-muted-foreground">
-                mm
-              </span>
-              <div className="flex flex-col border-l border-input">
-                <button
-                  type="button"
-                  onClick={() => stepValue(spec.step)}
-                  className="flex h-4 items-center justify-center px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  aria-label="Increase"
-                >
-                  <ChevronUp className="h-3 w-3" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => stepValue(-spec.step)}
-                  className="flex h-4 items-center justify-center border-t border-input px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  aria-label="Decrease"
-                >
-                  <ChevronDown className="h-3 w-3" />
-                </button>
-              </div>
-            </div>
-            {!valueValid && (
-              <span className="text-[11px] font-mono text-destructive">
-                Must be a positive number.
-              </span>
-            )}
-          </Field>
-        )}
-
-        {/* Linear profile — start + end radii, uniform across edges. */}
-        {spec.profile === 'linear' && (
-          <Field label="Radius at endpoints">
-            <div className="grid grid-cols-2 gap-2">
-              {([
-                {
-                  label: 'Start',
-                  raw: linearStartRaw,
-                  setRaw: setLinearStartRaw,
-                  parsed: parsedLinearStart,
-                  refIt: true,
-                },
-                {
-                  label: 'End',
-                  raw: linearEndRaw,
-                  setRaw: setLinearEndRaw,
-                  parsed: parsedLinearEnd,
-                  refIt: false,
-                },
-              ] as const).map((field) => {
-                const rowValid = Number.isFinite(field.parsed) && field.parsed > 0
-                return (
-                  <div key={field.label} className="flex flex-col gap-1">
-                    <span className="text-[11px] uppercase tracking-wider text-muted-foreground/70 font-mono">
-                      {field.label}
-                    </span>
-                    <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
-                      <input
-                        ref={field.refIt ? inputRef : undefined}
-                        type="text"
-                        inputMode="decimal"
-                        value={field.raw}
-                        onChange={(e) => field.setRaw(e.target.value)}
-                        className={cn(
-                          'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
-                          !rowValid && 'text-destructive',
-                        )}
-                        placeholder={String(spec.defaultValue)}
-                        aria-label={`${field.label} radius`}
-                      />
-                      <span className="flex items-center bg-muted px-2 font-mono text-[11px] text-muted-foreground">
-                        mm
-                      </span>
-                      <div className="flex flex-col border-l border-input">
-                        <button
-                          type="button"
-                          onClick={() => stepLinear(field.raw, field.setRaw, spec.step)}
-                          className="flex h-4 items-center justify-center px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                          aria-label={`Increase ${field.label.toLowerCase()} radius`}
-                        >
-                          <ChevronUp className="h-3 w-3" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => stepLinear(field.raw, field.setRaw, -spec.step)}
-                          className="flex h-4 items-center justify-center border-t border-input px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                          aria-label={`Decrease ${field.label.toLowerCase()} radius`}
-                        >
-                          <ChevronDown className="h-3 w-3" />
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-            {!linearValid && (
-              <span className="text-[11px] font-mono text-destructive">
-                Both endpoints must be positive numbers.
-              </span>
-            )}
-          </Field>
-        )}
-
-        {/* Stations profile — table of (station, radius) rows. */}
-        {spec.profile === 'stations' && (
-          <Field label="Station radii">
-            <div className="flex max-h-[240px] flex-col gap-1 overflow-y-auto pr-1">
-              <div className="grid grid-cols-[1fr_1fr_auto] items-center gap-1.5 pb-1 text-[11px] uppercase tracking-wider text-muted-foreground/70 font-mono">
-                <span>Station (0–1)</span>
-                <span>Radius (mm)</span>
-                <span className="w-6" />
-              </div>
-              {stationsRaw.map((row, i) => {
-                const [sp, rp] = parsedSamples[i]
-                const sValid = Number.isFinite(sp) && sp >= 0 && sp <= 1
-                const rValid = Number.isFinite(rp) && rp > 0
-                return (
-                  <div
-                    key={i}
-                    className="grid grid-cols-[1fr_1fr_auto] items-stretch gap-1.5"
+          {/* Single shared radius — `fillet` / `chamfer` / `shell`. */}
+          {!spec.perEdge && spec.profile === 'constant' && (
+            <Field label={spec.inputLabel}>
+              <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+                <input
+                  ref={inputRef}
+                  type="text"
+                  inputMode="decimal"
+                  value={valueRaw}
+                  onChange={(e) => setValueRaw(e.target.value)}
+                  className={cn(
+                    'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
+                    !valueValid && 'text-destructive',
+                  )}
+                  placeholder={String(spec.defaultValue)}
+                />
+                <span className="flex items-center bg-muted px-2 font-mono text-[11px] text-muted-foreground">
+                  mm
+                </span>
+                <div className="flex flex-col border-l border-input">
+                  <button
+                    type="button"
+                    onClick={() => stepValue(spec.step)}
+                    className="flex h-4 items-center justify-center px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    aria-label="Increase"
                   >
-                    <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
-                      <input
-                        ref={i === 0 ? inputRef : undefined}
-                        type="text"
-                        inputMode="decimal"
-                        value={row.station}
-                        onChange={(e) => updateStation(i, 'station', e.target.value)}
-                        className={cn(
-                          'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
-                          !sValid && 'text-destructive',
-                        )}
-                        placeholder="0.5"
-                        aria-label={`Station ${i + 1} parameter`}
-                      />
-                    </div>
-                    <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
-                      <input
-                        type="text"
-                        inputMode="decimal"
-                        value={row.radius}
-                        onChange={(e) => updateStation(i, 'radius', e.target.value)}
-                        className={cn(
-                          'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
-                          !rValid && 'text-destructive',
-                        )}
-                        placeholder={String(spec.defaultValue)}
-                        aria-label={`Station ${i + 1} radius`}
-                      />
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => removeStation(i)}
-                      disabled={stationsRaw.length <= 1}
-                      className={cn(
-                        'flex h-8 w-6 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors',
-                        stationsRaw.length <= 1
-                          ? 'cursor-not-allowed opacity-40'
-                          : 'hover:bg-muted hover:text-foreground',
-                      )}
-                      aria-label={`Remove station ${i + 1}`}
-                    >
-                      <X className="h-3 w-3" />
-                    </button>
-                  </div>
-                )
-              })}
-            </div>
-            <button
-              type="button"
-              onClick={addStation}
-              className="mt-1 self-start rounded-md border border-dashed border-border px-2 py-1 text-[11px] font-mono text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
-            >
-              + Add station
-            </button>
-            {!stationsValid && (
-              <span className="text-[11px] font-mono text-destructive">
-                Every station must be in [0, 1] with a positive radius.
-              </span>
-            )}
-          </Field>
-        )}
+                    <ChevronUp className="h-3 w-3" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => stepValue(-spec.step)}
+                    className="flex h-4 items-center justify-center border-t border-input px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    aria-label="Decrease"
+                  >
+                    <ChevronDown className="h-3 w-3" />
+                  </button>
+                </div>
+              </div>
+              {!valueValid && (
+                <span className="text-[11px] font-mono text-destructive">
+                  Must be a positive number.
+                </span>
+              )}
+            </Field>
+          )}
 
-        {spec.perEdge && (
-          <Field label={`${spec.inputLabel} per edge`}>
-            {pickedEdges.length === 0 ? (
-              <span className="text-[11px] font-mono text-muted-foreground">
-                Pick edges in the viewport to set their radii.
-              </span>
-            ) : (
-              <div className="flex max-h-[200px] flex-col gap-1 overflow-y-auto pr-1">
-                {pickedEdges.map((eid, i) => {
-                  const raw = radiiRaw.get(eid) ?? ''
-                  const n = parsedRadii[i]
-                  const rowValid = Number.isFinite(n) && n > 0
+          {/* Linear profile — start + end radii, uniform across edges. */}
+          {spec.profile === 'linear' && (
+            <Field label="Radius at endpoints">
+              <div className="grid grid-cols-2 gap-2">
+                {([
+                  {
+                    label: 'Start',
+                    raw: linearStartRaw,
+                    setRaw: setLinearStartRaw,
+                    parsed: parsedLinearStart,
+                    refIt: true,
+                  },
+                  {
+                    label: 'End',
+                    raw: linearEndRaw,
+                    setRaw: setLinearEndRaw,
+                    parsed: parsedLinearEnd,
+                    refIt: false,
+                  },
+                ] as const).map((field) => {
+                  const rowValid = Number.isFinite(field.parsed) && field.parsed > 0
                   return (
-                    <div key={eid} className="flex items-stretch gap-1.5">
-                      <span className="flex h-8 w-10 shrink-0 items-center justify-center rounded-md border border-border bg-muted/30 font-mono text-[11px] text-muted-foreground">
-                        #{eid}
+                    <div key={field.label} className="flex flex-col gap-1">
+                      <span className="text-[11px] uppercase tracking-wider text-muted-foreground/70 font-mono">
+                        {field.label}
                       </span>
-                      <div className="flex flex-1 items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+                      <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
                         <input
-                          ref={i === 0 ? inputRef : undefined}
+                          ref={field.refIt ? inputRef : undefined}
                           type="text"
                           inputMode="decimal"
-                          value={raw}
-                          onChange={(e) => {
-                            const v = e.target.value
-                            setRadiiRaw((prev) => {
-                              const map = new Map(prev)
-                              map.set(eid, v)
-                              return map
-                            })
-                          }}
+                          value={field.raw}
+                          onChange={(e) => field.setRaw(e.target.value)}
                           className={cn(
                             'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
                             !rowValid && 'text-destructive',
                           )}
                           placeholder={String(spec.defaultValue)}
-                          aria-label={`${spec.inputLabel} for edge ${eid}`}
+                          aria-label={`${field.label} radius`}
                         />
                         <span className="flex items-center bg-muted px-2 font-mono text-[11px] text-muted-foreground">
                           mm
@@ -854,17 +705,17 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
                         <div className="flex flex-col border-l border-input">
                           <button
                             type="button"
-                            onClick={() => stepRadius(eid, spec.step)}
+                            onClick={() => stepLinear(field.raw, field.setRaw, spec.step)}
                             className="flex h-4 items-center justify-center px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                            aria-label={`Increase radius for edge ${eid}`}
+                            aria-label={`Increase ${field.label.toLowerCase()} radius`}
                           >
                             <ChevronUp className="h-3 w-3" />
                           </button>
                           <button
                             type="button"
-                            onClick={() => stepRadius(eid, -spec.step)}
+                            onClick={() => stepLinear(field.raw, field.setRaw, -spec.step)}
                             className="flex h-4 items-center justify-center border-t border-input px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                            aria-label={`Decrease radius for edge ${eid}`}
+                            aria-label={`Decrease ${field.label.toLowerCase()} radius`}
                           >
                             <ChevronDown className="h-3 w-3" />
                           </button>
@@ -874,26 +725,179 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
                   )
                 })}
               </div>
-            )}
-            {pickedEdges.length > 0 && !allRadiiValid && (
-              <span className="text-[11px] font-mono text-destructive">
-                Every radius must be a positive number.
-              </span>
-            )}
-          </Field>
-        )}
-      </div>
+              {!linearValid && (
+                <span className="text-[11px] font-mono text-destructive">
+                  Both endpoints must be positive numbers.
+                </span>
+              )}
+            </Field>
+          )}
 
-      {/* Footer */}
-      <div className="flex justify-end gap-2 border-t border-border px-3 py-2">
-        <Button variant="outline" size="sm" onClick={close}>
-          Cancel
-        </Button>
-        <Button size="sm" onClick={handleApply} disabled={!canApply}>
-          {spec.okLabel}
-        </Button>
+          {/* Stations profile — table of (station, radius) rows. */}
+          {spec.profile === 'stations' && (
+            <Field label="Station radii">
+              <div className="flex max-h-[240px] flex-col gap-1 overflow-y-auto pr-1">
+                <div className="grid grid-cols-[1fr_1fr_auto] items-center gap-1.5 pb-1 text-[11px] uppercase tracking-wider text-muted-foreground/70 font-mono">
+                  <span>Station (0–1)</span>
+                  <span>Radius (mm)</span>
+                  <span className="w-6" />
+                </div>
+                {stationsRaw.map((row, i) => {
+                  const [sp, rp] = parsedSamples[i]
+                  const sValid = Number.isFinite(sp) && sp >= 0 && sp <= 1
+                  const rValid = Number.isFinite(rp) && rp > 0
+                  return (
+                    <div
+                      key={i}
+                      className="grid grid-cols-[1fr_1fr_auto] items-stretch gap-1.5"
+                    >
+                      <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+                        <input
+                          ref={i === 0 ? inputRef : undefined}
+                          type="text"
+                          inputMode="decimal"
+                          value={row.station}
+                          onChange={(e) => updateStation(i, 'station', e.target.value)}
+                          className={cn(
+                            'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
+                            !sValid && 'text-destructive',
+                          )}
+                          placeholder="0.5"
+                          aria-label={`Station ${i + 1} parameter`}
+                        />
+                      </div>
+                      <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={row.radius}
+                          onChange={(e) => updateStation(i, 'radius', e.target.value)}
+                          className={cn(
+                            'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
+                            !rValid && 'text-destructive',
+                          )}
+                          placeholder={String(spec.defaultValue)}
+                          aria-label={`Station ${i + 1} radius`}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => removeStation(i)}
+                        disabled={stationsRaw.length <= 1}
+                        className={cn(
+                          'flex h-8 w-6 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors',
+                          stationsRaw.length <= 1
+                            ? 'cursor-not-allowed opacity-40'
+                            : 'hover:bg-muted hover:text-foreground',
+                        )}
+                        aria-label={`Remove station ${i + 1}`}
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+              <button
+                type="button"
+                onClick={addStation}
+                className="mt-1 self-start rounded-md border border-dashed border-border px-2 py-1 text-[11px] font-mono text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+              >
+                + Add station
+              </button>
+              {!stationsValid && (
+                <span className="text-[11px] font-mono text-destructive">
+                  Every station must be in [0, 1] with a positive radius.
+                </span>
+              )}
+            </Field>
+          )}
+
+          {spec.perEdge && (
+            <Field label={`${spec.inputLabel} per edge`}>
+              {pickedEdges.length === 0 ? (
+                <span className="text-[11px] font-mono text-muted-foreground">
+                  Pick edges in the viewport to set their radii.
+                </span>
+              ) : (
+                <div className="flex max-h-[200px] flex-col gap-1 overflow-y-auto pr-1">
+                  {pickedEdges.map((eid, i) => {
+                    const raw = radiiRaw.get(eid) ?? ''
+                    const n = parsedRadii[i]
+                    const rowValid = Number.isFinite(n) && n > 0
+                    return (
+                      <div key={eid} className="flex items-stretch gap-1.5">
+                        <span className="flex h-8 w-10 shrink-0 items-center justify-center rounded-md border border-border bg-muted/30 font-mono text-[11px] text-muted-foreground">
+                          #{eid}
+                        </span>
+                        <div className="flex flex-1 items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+                          <input
+                            ref={i === 0 ? inputRef : undefined}
+                            type="text"
+                            inputMode="decimal"
+                            value={raw}
+                            onChange={(e) => {
+                              const v = e.target.value
+                              setRadiiRaw((prev) => {
+                                const map = new Map(prev)
+                                map.set(eid, v)
+                                return map
+                              })
+                            }}
+                            className={cn(
+                              'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
+                              !rowValid && 'text-destructive',
+                            )}
+                            placeholder={String(spec.defaultValue)}
+                            aria-label={`${spec.inputLabel} for edge ${eid}`}
+                          />
+                          <span className="flex items-center bg-muted px-2 font-mono text-[11px] text-muted-foreground">
+                            mm
+                          </span>
+                          <div className="flex flex-col border-l border-input">
+                            <button
+                              type="button"
+                              onClick={() => stepRadius(eid, spec.step)}
+                              className="flex h-4 items-center justify-center px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                              aria-label={`Increase radius for edge ${eid}`}
+                            >
+                              <ChevronUp className="h-3 w-3" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => stepRadius(eid, -spec.step)}
+                              className="flex h-4 items-center justify-center border-t border-input px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                              aria-label={`Decrease radius for edge ${eid}`}
+                            >
+                              <ChevronDown className="h-3 w-3" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+              {pickedEdges.length > 0 && !allRadiiValid && (
+                <span className="text-[11px] font-mono text-destructive">
+                  Every radius must be a positive number.
+                </span>
+              )}
+            </Field>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex justify-end gap-2 border-t border-border px-3 py-2">
+          <Button variant="outline" size="sm" onClick={close}>
+            Cancel
+          </Button>
+          <Button size="sm" onClick={handleApply} disabled={!canApply}>
+            {spec.okLabel}
+          </Button>
+        </div>
       </div>
-    </div>
+    </InSlot>
   )
 }
 
