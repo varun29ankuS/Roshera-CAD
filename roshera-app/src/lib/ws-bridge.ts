@@ -3,6 +3,7 @@
  * Connects on mount, routes incoming ServerMessages to the appropriate stores,
  * and converts backend CADObject format to the scene store format.
  */
+import { DEFAULT_PART_MATERIAL } from '@/lib/part-material'
 import { wsClient, setResyncHook } from './ws-client'
 import { useWSStore } from '@/stores/ws-store'
 import { FRAME_ALL, FRAME_FIT, useSceneStore, type CADObject, type CADMesh, type CADMaterial, type AnalyticalGeometry } from '@/stores/scene-store'
@@ -42,13 +43,8 @@ function rgbaToHex(rgba: [number, number, number, number]): string {
 // serialization don't always attach a material, and a missing one must
 // NOT crash the whole scene convert (it used to throw on `mat.diffuse_color`
 // and, paired with a clear-then-build resync, blanked the viewport — the
-// "appears then disappears on reconnect" bug). Mirrors the scene-eye's grey.
-const DEFAULT_MATERIAL: CADMaterial = {
-  color: '#9a9a9a',
-  metalness: 0.1,
-  roughness: 0.6,
-  opacity: 1,
-}
+// "appears then disappears on reconnect" bug). Same grey as the server's default (lib/part-material).
+const DEFAULT_MATERIAL: CADMaterial = DEFAULT_PART_MATERIAL
 
 function convertMaterial(mat: MaterialProperties | null | undefined): CADMaterial {
   if (!mat || !mat.diffuse_color) return { ...DEFAULT_MATERIAL }

@@ -24,8 +24,10 @@ export type Tone = 'positive' | 'negative' | 'muted'
 
 /** The history's verdict: every step re-measured sound by the kernel, or not.
  *  Unknown until the history has been read -- never "sound" by default. */
-export function soundLabel(s: { loaded: boolean; sound: boolean }): { text: string; tone: Tone } {
+export function soundLabel(s: { loaded: boolean; sound: boolean; empty?: boolean }): { text: string; tone: Tone } {
   if (!s.loaded) return { text: 'history unread', tone: 'muted' }
+  // Nothing built yet: no verdict to give either way.
+  if (s.empty) return { text: 'no features yet', tone: 'muted' }
   return s.sound ? { text: '✓ sound', tone: 'positive' } : { text: '✗ not sound', tone: 'negative' }
 }
 

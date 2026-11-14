@@ -7,6 +7,7 @@ import { useHistoryView } from '@/stores/history-view-store'
 import { chapterIconKey, chapterTitle, type Chapter } from '@/lib/chapters-api'
 import {
   applyEdit,
+  draftKey,
   featureFields,
   fetchEditableParameters,
   mouldBody,
@@ -84,21 +85,22 @@ export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
   const title = chapterTitle(chapter)
 
   const apply = async (field: FeatureField) => {
-    const text = drafts[field.key]
+    const dk = draftKey(chapter.anchor, field.key)
+    const text = drafts[dk]
     if (text === undefined) return
     const value = parseSize(text)
     if (value === null || value === field.value) {
-      setDrafts((d) => without(d, field.key))
+      setDrafts((d) => without(d, dk))
       return
     }
-    setOutcome({ key: field.key, kind: 'busy' })
+    setOutcome({ key: dk, kind: 'busy' })
     const result = await applyEdit(mouldBody(field, value))
     if (result.ok) {
       setOutcome(null)
-      setDrafts((d) => without(d, field.key))
+      setDrafts((d) => without(d, dk))
       setReload((n) => n + 1)
     } else {
-      setOutcome({ key: field.key, kind: 'refused', reason: result.reason })
+      setOutcome({ key: dk, kind: 'refused', reason: result.reason })
     }
   }
 
@@ -124,9 +126,10 @@ export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
       ) : (
         <div className="flex flex-col gap-1.5 px-2.5 pb-2.5">
           {fields.map((f) => {
-            const text = drafts[f.key] ?? String(f.value)
-            const bad = drafts[f.key] !== undefined && parseSize(text) === null
-            const mine = outcome?.key === f.key ? outcome : null
+            const dk = draftKey(chapter.anchor, f.key)
+            const text = drafts[dk] ?? String(f.value)
+            const bad = drafts[dk] !== undefined && parseSize(text) === null
+            const mine = outcome?.key === dk ? outcome : null
             return (
               <div key={f.key} className="flex flex-col gap-0.5">
                 <label className="flex items-center gap-2">
@@ -134,7 +137,7 @@ export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
                   <span
                     className={cn(
                       'flex h-6 min-w-0 flex-1 items-center rounded border bg-background/80 px-1.5',
-                      bad ? 'border-red-500/60' : drafts[f.key] !== undefined ? 'border-[#2F6FDB]' : 'border-border/70',
+                      bad ? 'border-red-500/60' : drafts[dk] !== undefined ? 'border-[#2F6FDB]' : 'border-border/70',
                     )}
                   >
                     <input
@@ -142,13 +145,13 @@ export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
                       inputMode="decimal"
                       disabled={mine?.kind === 'busy'}
                       onChange={(e) => {
-                        setDrafts((d) => ({ ...d, [f.key]: e.target.value }))
-                        if (outcome?.key === f.key) setOutcome(null)
+                        setDrafts((d) => ({ ...d, [dk]: e.target.value }))
+                        if (outcome?.key === dk) setOutcome(null)
                       }}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') void apply(f)
                         if (e.key === 'Escape') {
-                          setDrafts((d) => without(d, f.key))
+                          setDrafts((d) => without(d, dk))
                         }
                       }}
                       className="w-full min-w-0 bg-transparent font-mono outline-none"

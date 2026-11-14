@@ -31,3 +31,7 @@ test('only the nearest part under the cursor reports (a part behind never overwr
   assert.equal(isNearestHit(intersections, back), false)
   assert.equal(isNearestHit([], front), false)
 })
+
+test('an empty history is neither sound nor unsound: it says there is nothing yet', () => {
+  assert.deepEqual(soundLabel({ loaded: true, sound: false, empty: true }), { text: 'no features yet', tone: 'muted' })
+})

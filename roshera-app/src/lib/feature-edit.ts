@@ -149,6 +149,12 @@ export function mouldBody(field: FeatureField, value: number) {
   }
 }
 
+/** Where the edit panel keeps a size being typed: per feature AND size, so
+ *  typing on one feature's radius never shows on another feature's radius. */
+export function draftKey(anchor: number, key: string): string {
+  return `${anchor}:${key}`
+}
+
 /** A typed size, or null when it is not a finite number. */
 export function parseSize(text: string): number | null {
   const m = /^\s*(-?\d+(?:\.\d+)?|-?\.\d+)\s*(mm|°)?\s*$/i.exec(text)

@@ -40,9 +40,9 @@ export function StatusBar() {
   const mode = useDocModeStore((s) => s.mode)
   const hit = useCursorStore((s) => s.hit)
   const hitName = useSceneStore((s) => (hit ? (s.objects.get(hit.objectId)?.name ?? 'part') : null))
-  const { loading, error, isSound } = useChapters('main')
+  const { chapters, loading, error, isSound } = useChapters('main')
 
-  const verdict = soundLabel({ loaded: !loading && !error, sound: isSound })
+  const verdict = soundLabel({ loaded: !loading && !error, sound: isSound, empty: chapters.length === 0 })
   const ping = lastPing !== null && (
     <>
       <Divider />

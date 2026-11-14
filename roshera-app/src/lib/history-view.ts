@@ -6,6 +6,7 @@
  * the live part until the user rolls back to the end.
  */
 import type { CADObject } from '@/stores/scene-store'
+import { DEFAULT_PART_MATERIAL } from './part-material.ts'
 
 const API_HOST: string =
   (import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL ?? ''
@@ -41,7 +42,7 @@ export function scrubObjects(answer: ScrubAnswer): CADObject[] {
       normals: new Float32Array(o.mesh.normals),
       faceIds: o.mesh.face_ids ? new Uint32Array(o.mesh.face_ids) : undefined,
     },
-    material: { color: '#9a9a9a', metalness: 0.1, roughness: 0.6, opacity: 1 },
+    material: { ...DEFAULT_PART_MATERIAL },
     position: [0, 0, 0],
     rotation: [0, 0, 0],
     scale: [1, 1, 1],
@@ -99,7 +100,7 @@ export function decodeScrubBinary(buf: ArrayBuffer): CADObject[] {
       name: o.name ?? o.id,
       objectType: 'solid',
       mesh: { vertices, indices, normals, faceIds: o.nf > 0 ? faceIds : undefined },
-      material: { color: '#9a9a9a', metalness: 0.1, roughness: 0.6, opacity: 1 },
+      material: { ...DEFAULT_PART_MATERIAL },
       position: [0, 0, 0],
       rotation: [0, 0, 0],
       scale: [1, 1, 1],

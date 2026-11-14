@@ -149,6 +149,12 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
       transparent: editingSketch || object.material.opacity < 1,
       opacity,
       depthWrite: editingSketch ? false : true,
+      // Push the shaded faces back a hair so the edge lines drawn on them
+      // win the depth test. Without it the lines sat at exactly the surface's
+      // depth and mostly lost: "Shaded + edges" showed scraps of a rim.
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1,
       // When section view is active, switch to `FrontSide` so the cut
       // opening doesn't leak the back-facing inner walls of the solid
       // through the clipped half-space. The matching SectionCap mesh

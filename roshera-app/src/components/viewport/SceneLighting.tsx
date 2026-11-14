@@ -18,7 +18,7 @@ export function SceneLighting() {
         fillLight: '#c9ced6',
         hemiSky: '#9aa3ae',
         hemiGround: '#2a2d33',
-        ambientIntensity: 0.4,
+        ambientIntensity: 0.75,
       }
     }
     return {
@@ -27,7 +27,7 @@ export function SceneLighting() {
       fillLight: '#e6e8eb',
       hemiSky: '#f4f5f7',
       hemiGround: '#a7adb4',
-      ambientIntensity: 0.45,
+      ambientIntensity: 0.9,
     }
   }, [theme])
 
@@ -67,7 +67,7 @@ export function SceneLighting() {
         intensity={0.8}
         color={palette.fillLight}
       />
-      <hemisphereLight args={[palette.hemiSky, palette.hemiGround, 0.5]} />
+      <hemisphereLight args={[palette.hemiSky, palette.hemiGround, 0.9]} />
     </>
   )
 }

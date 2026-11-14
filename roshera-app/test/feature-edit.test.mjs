@@ -67,3 +67,9 @@ test('a typed size is a finite number', () => {
   assert.equal(parseSize('-2'), -2)
   for (const t of ['', 'x', '1e999', '3..2']) assert.equal(parseSize(t), null, t)
 })
+
+test("typing kept for one feature's size never shows on another feature's size of the same name", async () => {
+  const { draftKey } = await import('../src/lib/feature-edit.ts')
+  assert.notEqual(draftKey(4, 'radius'), draftKey(9, 'radius'))
+  assert.equal(draftKey(4, 'radius'), draftKey(4, 'radius'))
+})
