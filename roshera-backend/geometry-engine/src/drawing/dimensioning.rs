@@ -705,6 +705,9 @@ pub fn standard_drawing_hlr_with_projection(
     scale: f64,
     angle: super::types::ProjectionAngle,
 ) -> Result<super::types::Drawing, super::projection::ProjectionError> {
+    // Hole recognition and round-part detection ask for this solid's
+    // adjacency graph in every view and pass; build it once for the sheet.
+    let _adjacency = crate::readable::adjacency::AdjacencyCacheScope::enter(model);
     use super::types::{Drawing, ViewSource};
 
     let mut drawing = Drawing::new("Auto Drawing (HLR)", sheet);
@@ -1518,6 +1521,9 @@ pub fn standard_drawing_auto_with_projection(
     part_uuid: uuid::Uuid,
     angle: super::types::ProjectionAngle,
 ) -> Result<super::types::Drawing, super::projection::ProjectionError> {
+    // Hole recognition and round-part detection ask for this solid's
+    // adjacency graph in every view and pass; build it once for the sheet.
+    let _adjacency = crate::readable::adjacency::AdjacencyCacheScope::enter(model);
     use super::types::{Drawing, ViewSource};
 
     let source = ViewSource::Part {
@@ -1550,31 +1556,51 @@ pub fn standard_drawing_auto_with_projection(
     let t_p1 = std::time::Instant::now();
     let mut extents = Vec::with_capacity(4);
     let mut band_probe = Drawing::new("band probe", super::types::SheetSize::A4);
+    let lap = |label: &str, t: std::time::Instant| {
+        if prof {
+            eprintln!(
+                "[draw-profile]   pass1 {label}: {:.1} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    };
     for (proj, name, dimensioned) in specs {
+        let t = std::time::Instant::now();
         let mut v =
             super::projection::project_solid_view(model, source, proj, name, [0.0, 0.0], 1.0)?;
+        lap(&format!("project {name}"), t);
         extents.push(v.extent);
         if dimensioned {
             // The dimensions each view will carry (no HLR: placement needs
             // only how many stack, not what is visible).
+            let t = std::time::Instant::now();
             v.dimensions = visible_dimensions(model, solid_id, proj, min_span);
+            lap(&format!("visible_dimensions {name}"), t);
             band_probe.add_view(v);
         }
     }
     dedup_dimensions_global(&mut band_probe);
     let (vgap, hgap) = {
+        let t = std::time::Instant::now();
         let dims = extract_dimensions(model, solid_id);
+        lap("extract_dimensions", t);
+        let t = std::time::Instant::now();
         let round = super::round_part::detect_round_part(model, solid_id, &dims);
+        lap("detect_round_part", t);
+        let t = std::time::Instant::now();
         let holes = super::hole_features::detect_hole_features(model, solid_id, round.as_ref());
+        lap("detect_hole_features", t);
         let mut called_out = round.map(|r| r.callout_faces()).unwrap_or_default();
         if let Some(h) = &holes {
             called_out.extend(h.callout_faces());
         }
+        let t = std::time::Instant::now();
         let tabled: std::collections::HashSet<u32> =
             crate::readable::bore_face_ids(model, solid_id)
                 .into_iter()
                 .filter(|f| !called_out.contains(f))
                 .collect();
+        lap("bore_face_ids", t);
         dimension_band_gaps(&band_probe.views, &tabled)
     };
     if prof {

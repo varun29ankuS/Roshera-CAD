@@ -610,12 +610,97 @@ fn label_arc(
     }
 }
 
+// One drawing asks for the same solid's graph many times: hole recognition
+// and round-part detection run per view and per layout pass, and each build
+// classifies every edge convex / concave (about 10 ms an edge when the
+// dihedral classifier has to probe the faces). A drawing of the U-joint's
+// 42-face yoke built it 18 times -- 4-5 s of a 16 s sheet.
+//
+// The cache lives only while an [`AdjacencyCacheScope`] is held, and only for
+// the model the scope was opened on. The drawing entry points hold the scope
+// for the whole call while they borrow the model immutably, so the model
+// cannot change under it. Outside a scope nothing is cached: there is no
+// change counter on the model that would make a longer-lived cache safe.
+thread_local! {
+    static AAG_CACHE: std::cell::RefCell<Option<AagCache>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static AAG_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct AagCache {
+    /// Address of the model the scope was opened on: a graph is served only
+    /// to that model (a section view's scratch model misses, as it must).
+    model: usize,
+    graphs: BTreeMap<SolidId, AttributedAdjacencyGraph>,
+}
+
+/// While held, [`attributed_adjacency_graph`] builds each solid's graph of
+/// `model` once and serves copies. Hold it only while `model` is borrowed
+/// immutably (the guard's lifetime is tied to that borrow). Scopes nest: the
+/// outer cache is restored on drop.
+pub struct AdjacencyCacheScope<'m> {
+    previous: Option<AagCache>,
+    _model: std::marker::PhantomData<&'m BRepModel>,
+}
+
+impl<'m> AdjacencyCacheScope<'m> {
+    /// Open a cache scope over `model`.
+    pub fn enter(model: &'m BRepModel) -> Self {
+        let fresh = AagCache {
+            model: model as *const BRepModel as usize,
+            graphs: BTreeMap::new(),
+        };
+        let previous = AAG_CACHE.with(|c| c.borrow_mut().replace(fresh));
+        Self {
+            previous,
+            _model: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for AdjacencyCacheScope<'_> {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        AAG_CACHE.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
 /// Build the attributed adjacency graph of `solid_id`. An unknown solid yields
-/// an empty graph.
+/// an empty graph. Inside an [`AdjacencyCacheScope`] over `model`, each
+/// solid's graph is built once.
 pub fn attributed_adjacency_graph(
     model: &BRepModel,
     solid_id: SolidId,
 ) -> AttributedAdjacencyGraph {
+    let key = model as *const BRepModel as usize;
+    let cached = AAG_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|cache| cache.model == key)
+            .and_then(|cache| cache.graphs.get(&solid_id).cloned())
+    });
+    if let Some(graph) = cached {
+        return graph;
+    }
+    let graph = build_attributed_adjacency_graph(model, solid_id);
+    AAG_CACHE.with(|c| {
+        if let Some(cache) = c.borrow_mut().as_mut().filter(|cache| cache.model == key) {
+            cache.graphs.insert(solid_id, graph.clone());
+        }
+    });
+    graph
+}
+
+fn build_attributed_adjacency_graph(
+    model: &BRepModel,
+    solid_id: SolidId,
+) -> AttributedAdjacencyGraph {
+    #[cfg(test)]
+    AAG_BUILDS.with(|n| n.set(n.get() + 1));
     let mut graph = AttributedAdjacencyGraph {
         solid: solid_id,
         nodes: Vec::new(),
@@ -703,4 +788,63 @@ pub fn attributed_adjacency_graph(
         });
     }
     graph
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::{attributed_adjacency_graph, AdjacencyCacheScope, AAG_BUILDS};
+    use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+    fn builds() -> usize {
+        AAG_BUILDS.with(|n| n.get())
+    }
+
+    fn box_model() -> (BRepModel, u32) {
+        let mut model = BRepModel::new();
+        let sid = match TopologyBuilder::new(&mut model).create_box_3d(40.0, 30.0, 20.0) {
+            Ok(GeometryId::Solid(s)) => s,
+            other => panic!("box: {other:?}"),
+        };
+        (model, sid)
+    }
+
+    #[test]
+    fn a_drawing_classifies_each_edge_once() {
+        let (model, sid) = box_model();
+        let before = builds();
+        crate::drawing::standard_drawing_auto(&model, sid, uuid::Uuid::nil()).expect("sheet");
+        assert_eq!(
+            builds() - before,
+            1,
+            "one drawing must build the solid's adjacency graph once"
+        );
+    }
+
+    #[test]
+    fn outside_a_scope_nothing_is_cached() {
+        let (model, sid) = box_model();
+        let before = builds();
+        let a = attributed_adjacency_graph(&model, sid);
+        let b = attributed_adjacency_graph(&model, sid);
+        assert_eq!(a, b);
+        assert_eq!(builds() - before, 2);
+    }
+
+    #[test]
+    fn a_scope_serves_only_its_own_model() {
+        let (model, sid) = box_model();
+        let (other, other_sid) = box_model();
+        let _scope = AdjacencyCacheScope::enter(&model);
+        let before = builds();
+        let a = attributed_adjacency_graph(&model, sid);
+        let b = attributed_adjacency_graph(&model, sid);
+        assert_eq!(a, b, "a cached graph is the graph");
+        attributed_adjacency_graph(&other, other_sid);
+        attributed_adjacency_graph(&other, other_sid);
+        assert_eq!(
+            builds() - before,
+            3,
+            "own model once; another model every time"
+        );
+    }
 }
