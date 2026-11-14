@@ -2650,6 +2650,8 @@ pub async fn extrude_csketch(
             // can be reopened and edited -- and survives a restart.
             // Replay builds from `regions`; this is the source they came from.
             "source": sketch.to_source(),
+            // Which sketch: its edits (csketch_* steps) fold into this feature.
+            "csketch_id": id,
         }))
         .with_output_solids([result_solid_id as u64])
         .with_solid_certificate(solid_certificate);
@@ -3176,6 +3178,7 @@ pub async fn revolve_csketch(
             "segments": req.segments,
             // The sketch itself, as for an extrude (reopen / edit).
             "source": sketch.to_source(),
+            "csketch_id": id,
         }))
         .with_output_solids([result_solid_id as u64]);
     if let Err(e) = state.timeline_recorder.record(record) {

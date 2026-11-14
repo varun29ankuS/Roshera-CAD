@@ -205,3 +205,54 @@ fn a_subtract_with_no_tool_only_operand_stays_its_own_row() {
     let kinds: Vec<&str> = cs.iter().map(|c| c.kind.as_str()).collect();
     assert_eq!(kinds, ["box", "box", "subtract", "transform"], "{cs:#?}");
 }
+
+fn sketch_op(seq: u64, kind: &str, sketch: &str) -> TimelineEvent {
+    ev(
+        seq,
+        kind,
+        json!({ "params": { "csketch_id": sketch }, "inputs": [], "outputs": [] }),
+    )
+}
+
+fn sketch_extrude(seq: u64, sketch: &str, out: u64) -> TimelineEvent {
+    ev(
+        seq,
+        "sketch_extrude",
+        json!({
+            "params": { "csketch_id": sketch, "distance": 5.0, "regions": [] },
+            "inputs": [], "outputs": [format!("solid:{out}")]
+        }),
+    )
+}
+
+/// Editing a sketch (trim, fillet, pattern ...) is part of making the
+/// feature the sketch becomes, not features of the part (Varun 2026-11-14:
+/// the tree listed "Csketch fillet", "Csketch trim" as features).
+#[test]
+fn sketch_edits_fold_into_the_feature_their_sketch_became() {
+    let h = vec![
+        boxx(0, 0, 50.0),
+        sketch_op(1, "csketch_fillet", "S1"),
+        sketch_op(2, "csketch_trim", "S1"),
+        sketch_extrude(3, "S1", 1),
+    ];
+    let cs = chapters(&h);
+    let kinds: Vec<&str> = cs.iter().map(|c| c.kind.as_str()).collect();
+    assert_eq!(kinds, ["box", "extrude"], "{cs:#?}");
+    assert_eq!(cs[1].events, vec![1, 2, 3]);
+}
+
+/// A sketch that never became a feature is one "sketch" entry, not a row
+/// per edit -- and still nothing is hidden.
+#[test]
+fn edits_of_a_sketch_never_extruded_are_one_sketch_entry() {
+    let h = vec![
+        boxx(0, 0, 50.0),
+        sketch_op(1, "csketch_fillet", "S2"),
+        sketch_op(2, "csketch_pattern_circular", "S2"),
+    ];
+    let cs = chapters(&h);
+    let kinds: Vec<&str> = cs.iter().map(|c| c.kind.as_str()).collect();
+    assert_eq!(kinds, ["box", "sketch"], "{cs:#?}");
+    assert_eq!(cs[1].events, vec![1, 2]);
+}

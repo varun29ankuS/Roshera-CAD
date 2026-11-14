@@ -118,11 +118,88 @@ pub fn chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
     let deleted = crate::mould::OverrideSet::collect(events);
     let gone =
         |c: &Chapter| !c.events.is_empty() && c.events.iter().all(|s| deleted.is_suppressed(*s));
-    let mut out = all_chapters(events);
+    let mut out = fold_sketch_edits(events, all_chapters(events));
     for c in &mut out {
         c.instances.retain(|i| !gone(i));
     }
     out.retain(|c| !gone(c));
+    out
+}
+
+/// The sketch a recorded step belongs to (`csketch_id`), if any.
+fn sketch_of(e: &TimelineEvent) -> Option<&str> {
+    let Operation::Generic { parameters, .. } = &e.operation else {
+        return None;
+    };
+    parameters
+        .get("params")
+        .unwrap_or(parameters)
+        .get("csketch_id")
+        .and_then(Value::as_str)
+}
+
+/// Editing a sketch (trim, fillet, mirror, pattern ... -- `csketch_*`
+/// steps) is part of making the feature the sketch becomes, not a feature
+/// of the part (Varun 2026-11-14). Each such step folds into the later
+/// sketch extrude / revolve of the SAME sketch; the edits of a sketch that
+/// never became a feature are one `sketch` entry. Nothing is hidden: every
+/// step stays in exactly one chapter.
+fn fold_sketch_edits(events: &[TimelineEvent], chapters: Vec<Chapter>) -> Vec<Chapter> {
+    let by_seq: std::collections::HashMap<u64, &TimelineEvent> =
+        events.iter().map(|e| (e.sequence_number, e)).collect();
+    let is_edit = |c: &Chapter| c.kind.starts_with("csketch_");
+    let sketch_id = |c: &Chapter| -> Option<String> {
+        c.events
+            .iter()
+            .find_map(|s| by_seq.get(s).and_then(|e| sketch_of(e)).map(str::to_string))
+    };
+    let mut out: Vec<Chapter> = Vec::with_capacity(chapters.len());
+    let mut pending: Vec<(String, Chapter)> = Vec::new();
+    if !chapters.iter().any(is_edit) {
+        return chapters;
+    }
+    for c in chapters {
+        if is_edit(&c) {
+            if let Some(id) = sketch_id(&c) {
+                pending.push((id, c));
+                continue;
+            }
+        }
+        // A sketch feature takes the edits of its own sketch.
+        let mut c = c;
+        if c.kind == "extrude" || c.kind == "revolve" || c.kind == "cut" || c.kind == "boss" {
+            if let Some(id) = sketch_id(&c) {
+                let (mine, rest): (Vec<_>, Vec<_>) =
+                    pending.into_iter().partition(|(sid, _)| *sid == id);
+                pending = rest;
+                for (_, e) in mine {
+                    c.events.extend(e.events);
+                }
+                c.events.sort_unstable();
+            }
+        }
+        out.push(c);
+    }
+    // Edits of sketches that never became a feature: one entry per sketch.
+    let mut sketches: Vec<(String, Chapter)> = Vec::new();
+    for (id, c) in pending {
+        if let Some((_, s)) = sketches.iter_mut().find(|(sid, _)| *sid == id) {
+            s.events.extend(c.events);
+            s.events.sort_unstable();
+            s.anchor = s.anchor.max(c.anchor);
+        } else {
+            sketches.push((
+                id,
+                Chapter {
+                    kind: "sketch".to_string(),
+                    name: None,
+                    ..c
+                },
+            ));
+        }
+    }
+    out.extend(sketches.into_iter().map(|(_, c)| c));
+    out.sort_by_key(|c| c.events.first().copied().unwrap_or(c.anchor));
     out
 }
 
