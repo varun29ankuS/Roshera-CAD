@@ -2,6 +2,7 @@ import { GizmoHelper, GizmoViewcube } from '@react-three/drei'
 import { useFrame, type ThreeEvent } from '@react-three/fiber'
 import { useSceneStore } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
 import { cubePreset } from '@/lib/view-cube'
 
 /** The cube's faces in drei's order (+X, −X, +Y, −Y, +Z, −Z), named for the
@@ -42,6 +43,10 @@ export function GizmoNav() {
   )
   const setCameraPreset = useSceneStore((s) => s.setCameraPreset)
   const dark = useThemeStore((s) => s.theme) === 'dark'
+  // In Part and DFM the Blackboard floats over the viewport's right side
+  // (w-80 = 320 px + its 8 px gap), so the cube sits left of it. Elsewhere
+  // (Assembly) the Blackboard is its own column: the cube hugs the edge.
+  const overlaid = useDocModeStore((s) => s.mode) !== 'assembly'
   const onFace = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation()
     // The app's preset (drei's own tween assumes Y-up and degenerates on Top).
@@ -51,19 +56,22 @@ export function GizmoNav() {
   return (
     <>
       <ManualSceneRender active={!hasOutlineTarget} />
-      {/* Left of the docked Blackboard (w-80 = 320 px + its 8 px gap). */}
-      <GizmoHelper alignment="top-right" margin={[72 + 336, 72]} renderPriority={2}>
+      <GizmoHelper alignment="top-right" margin={[overlaid ? 72 + 336 : 72, 72]} renderPriority={2}>
         {/* A view cube (the approved mockup): click a face, edge or corner
             to look from that side. */}
-        <GizmoViewcube
-          faces={Z_UP_FACES}
-          color={dark ? '#33373e' : '#fbfbfa'}
-          hoverColor="#f2a516"
-          textColor={dark ? '#e7e9ec' : '#5b636c'}
-          strokeColor={dark ? '#555b63' : '#b9bdc2'}
-          opacity={1}
-          onClick={onFace}
-        />
+        <group scale={1.15}>
+          <GizmoViewcube
+            faces={Z_UP_FACES}
+            // Bold, larger labels: the thin default read as noise at this size.
+            font="700 30px Inter, system-ui, sans-serif"
+            color={dark ? '#4a5059' : '#f4f5f7'}
+            hoverColor="#f2a516"
+            textColor={dark ? '#f3f4f6' : '#1d2125'}
+            strokeColor={dark ? '#7b828c' : '#9aa1a9'}
+            opacity={1}
+            onClick={onFace}
+          />
+        </group>
       </GizmoHelper>
     </>
   )
