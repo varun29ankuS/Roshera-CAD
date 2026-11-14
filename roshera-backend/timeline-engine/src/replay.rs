@@ -2429,6 +2429,8 @@ fn dispatch_generic(
         | "csketch_pattern_circular"
         | "csketch_pattern_curve"
         | "csketch_pattern_phyllotaxis"
+        | "csketch_fillet"
+        | "csketch_chamfer"
         | "csketch_construction" => {
             if inner.get("csketch_id").and_then(|v| v.as_str()).is_none() {
                 return Err(ReplayError::InvalidParameters {
@@ -4300,13 +4302,15 @@ mod tests {
             "csketch_pattern_circular",
             "csketch_pattern_curve",
             "csketch_pattern_phyllotaxis",
+            "csketch_fillet",
+            "csketch_chamfer",
             "csketch_construction",
         ]
         .iter()
         .map(|k| op_event(k))
         .collect();
         let outcome = rebuild_model_from_events(&mut ops_only, &events);
-        assert_eq!(outcome.events_applied, 9, "all op kinds must apply");
+        assert_eq!(outcome.events_applied, 11, "all op kinds must apply");
         assert_eq!(
             outcome.events_skipped, 0,
             "no skips — full-timeline honesty"
@@ -4318,7 +4322,7 @@ mod tests {
         let mut sequence = events;
         sequence.push(extrude_event.clone());
         let outcome = rebuild_model_from_events(&mut with_ops, &sequence);
-        assert_eq!(outcome.events_applied, 10);
+        assert_eq!(outcome.events_applied, 12);
         assert_eq!(outcome.events_skipped, 0);
 
         let mut extrude_only = BRepModel::new();

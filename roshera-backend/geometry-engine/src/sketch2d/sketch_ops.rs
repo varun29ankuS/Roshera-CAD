@@ -66,6 +66,10 @@ pub enum SketchOpKind {
     /// Vogel phyllotaxis spiral: r = c·√n, θ stepped by the exact
     /// golden angle (SKETCH-DCM #45 Slice 7 — biomimicry).
     PhyllotaxisPattern,
+    /// A sketch corner rounded by a tangent arc.
+    Fillet,
+    /// A sketch corner cut straight across.
+    Chamfer,
 }
 
 /// Op lineage of one minted entity (stored on the sketch, queryable
@@ -606,27 +610,90 @@ pub fn trim(
     }
     let cutter_curve = op_curve(sketch, cutter, OP)?;
     let target_curve = op_curve(sketch, target, OP)?;
-    let hits = intersections(&target_curve, &cutter_curve, OP)?;
+    let hits: Vec<(Point2d, EntityRef)> = intersections(&target_curve, &cutter_curve, OP)?
+        .into_iter()
+        .map(|p| (p, *cutter))
+        .collect();
+    trim_with_hits(
+        sketch,
+        target,
+        target_curve,
+        &hits,
+        pick,
+        &cutter.to_string(),
+    )
+}
 
+/// Trim at a click, as a CAD sketcher's Trim tool does (Varun 2026-11-14:
+/// "no trim tool"): the span of `target` under `pick` is cut back to the
+/// NEAREST crossing on each side by ANY other curve in the sketch -- not
+/// one named cutter -- and each new end is held on the curve that bounds
+/// it (`PointOnCurve`). A curve nothing crosses is removed whole (its
+/// own points too unless shared), as power-trim does.
+pub fn trim_at(
+    sketch: &Sketch,
+    target: &EntityRef,
+    pick: Point2d,
+) -> Result<SketchOpOutcome, SketchOpError> {
+    const OP: &str = "trim";
+    let target_curve = op_curve(sketch, target, OP)?;
+    let mut others: Vec<EntityRef> = Vec::new();
+    others.extend(sketch.lines().iter().map(|e| EntityRef::Line(*e.key())));
+    others.extend(sketch.arcs().iter().map(|e| EntityRef::Arc(*e.key())));
+    others.extend(sketch.circles().iter().map(|e| EntityRef::Circle(*e.key())));
+    let mut hits: Vec<(Point2d, EntityRef)> = Vec::new();
+    for other in others.into_iter().filter(|o| o != target) {
+        // Unbounded lines and other non-trim curves cannot bound a span.
+        let Ok(curve) = op_curve(sketch, &other, OP) else {
+            continue;
+        };
+        for p in intersections(&target_curve, &curve, OP)? {
+            hits.push((p, other));
+        }
+    }
+    let interior = |p: &Point2d| match &target_curve {
+        OpCurve::Segment { a, b } => (1e-6..=1.0 - 1e-6).contains(&seg_param(a, b, p)),
+        _ => true,
+    };
+    if !hits.iter().any(|(p, _)| interior(p)) {
+        let removed = sketch.delete_with_dependents(&[*target])?;
+        let mut outcome = SketchOpOutcome::new(SketchOpKind::Trim);
+        outcome.deleted.extend(removed);
+        return Ok(outcome);
+    }
+    trim_with_hits(sketch, target, target_curve, &hits, pick, "the sketch")
+}
+
+/// The trim itself: `hits` are the crossings on `target`, each with the
+/// curve that made it (the new end is held on THAT curve).
+fn trim_with_hits(
+    sketch: &Sketch,
+    target: &EntityRef,
+    target_curve: OpCurve,
+    hits: &[(Point2d, EntityRef)],
+    pick: Point2d,
+    cutter_name: &str,
+) -> Result<SketchOpOutcome, SketchOpError> {
+    const OP: &str = "trim";
     match (target, target_curve) {
         (EntityRef::Line(line_id), OpCurve::Segment { a, b }) => {
             // Interior cut parameters along the target.
-            let mut ts: Vec<f64> = hits
+            let mut ts: Vec<(f64, EntityRef)> = hits
                 .iter()
-                .map(|p| seg_param(&a, &b, p))
-                .filter(|t| (1e-6..=1.0 - 1e-6).contains(t))
+                .map(|(p, c)| (seg_param(&a, &b, p), *c))
+                .filter(|(t, _)| (1e-6..=1.0 - 1e-6).contains(t))
                 .collect();
-            ts.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-            ts.dedup_by(|x, y| (*x - *y).abs() < 1e-9);
+            ts.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+            ts.dedup_by(|x, y| (x.0 - y.0).abs() < 1e-9);
             if ts.is_empty() {
                 return Err(SketchOpError::NoIntersection {
                     op: OP,
-                    reason: format!("{cutter} does not cross the interior of {target}"),
+                    reason: format!("{cutter_name} does not cross the interior of {target}"),
                 });
             }
             let tp = seg_param(&a, &b, &pick).clamp(0.0, 1.0);
-            let lo = ts.iter().copied().rfind(|t| *t < tp);
-            let hi = ts.iter().copied().find(|t| *t > tp);
+            let lo = ts.iter().copied().rfind(|t| t.0 < tp);
+            let hi = ts.iter().copied().find(|t| t.0 > tp);
             if lo.is_none() && hi.is_none() {
                 return Err(SketchOpError::InvalidParameter {
                     op: OP,
@@ -653,41 +720,45 @@ pub fn trim(
             outcome.deleted.push(*target);
 
             let at = |t: f64| Point2d::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y));
-            let make_end = |t: f64, outcome: &mut SketchOpOutcome| -> Point2dId {
-                if t <= OP_EPS {
-                    if let Some((sa, _)) = endpoint_ids {
-                        return sa;
+            let make_end =
+                |t: f64, cut: Option<EntityRef>, outcome: &mut SketchOpOutcome| -> Point2dId {
+                    if t <= OP_EPS {
+                        if let Some((sa, _)) = endpoint_ids {
+                            return sa;
+                        }
+                    } else if t >= 1.0 - OP_EPS {
+                        if let Some((_, sb)) = endpoint_ids {
+                            return sb;
+                        }
                     }
-                } else if t >= 1.0 - OP_EPS {
-                    if let Some((_, sb)) = endpoint_ids {
-                        return sb;
+                    let pid = mint_point(
+                        sketch,
+                        at(t),
+                        SketchOpKind::Trim,
+                        Some(*target),
+                        None,
+                        outcome,
+                    );
+                    // Maintained contact: the cut point rides the curve that cut it.
+                    if let Some(cutter) = cut {
+                        mint_constraint(sketch, point_on_curve(pid, cutter), outcome);
                     }
-                }
-                let pid = mint_point(
-                    sketch,
-                    at(t),
-                    SketchOpKind::Trim,
-                    Some(*target),
-                    None,
-                    outcome,
-                );
-                // Maintained contact: the cut point rides the cutter.
-                mint_constraint(sketch, point_on_curve(pid, *cutter), outcome);
-                pid
-            };
+                    pid
+                };
 
-            let mut survivors: Vec<(f64, f64)> = Vec::new();
-            if let Some(t) = lo {
-                survivors.push((0.0, t));
+            // (start t, its cutter, end t, its cutter)
+            let mut survivors: Vec<(f64, Option<EntityRef>, f64, Option<EntityRef>)> = Vec::new();
+            if let Some((t, c)) = lo {
+                survivors.push((0.0, None, t, Some(c)));
             }
-            if let Some(t) = hi {
-                survivors.push((t, 1.0));
+            if let Some((t, c)) = hi {
+                survivors.push((t, Some(c), 1.0, None));
             }
             let mut kept_original = [false, false];
             let mut survivor_refs: Vec<EntityRef> = Vec::new();
-            for (t0, t1) in survivors {
-                let start_id = make_end(t0, &mut outcome);
-                let end_id = make_end(t1, &mut outcome);
+            for (t0, c0, t1, c1) in survivors {
+                let start_id = make_end(t0, c0, &mut outcome);
+                let end_id = make_end(t1, c1, &mut outcome);
                 if t0 <= OP_EPS {
                     kept_original[0] = true;
                 }
@@ -726,15 +797,18 @@ pub fn trim(
             Ok(outcome)
         }
         (EntityRef::Circle(circle_id), OpCurve::Circle { c, r }) => {
-            let mut angles: Vec<f64> = hits.iter().map(|p| norm_angle(c.angle_to(p))).collect();
-            angles.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-            angles.dedup_by(|x, y| (*x - *y).abs() < 1e-9);
+            let mut angles: Vec<(f64, EntityRef)> = hits
+                .iter()
+                .map(|(p, k)| (norm_angle(c.angle_to(p)), *k))
+                .collect();
+            angles.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+            angles.dedup_by(|x, y| (x.0 - y.0).abs() < 1e-9);
             if angles.len() < 2 {
                 return Err(SketchOpError::NoIntersection {
                     op: OP,
                     reason: format!(
                         "trimming a closed circle needs at least two intersections with \
-                         {cutter}; found {}",
+                         {cutter_name}; found {}",
                         angles.len()
                     ),
                 });
@@ -742,16 +816,16 @@ pub fn trim(
             let ap = norm_angle(c.angle_to(&pick));
             // The removed span is the cyclic interval (prev, next)
             // containing the pick; the survivor runs CCW next → prev.
-            let next = angles
+            let (next, next_cut) = angles
                 .iter()
                 .copied()
-                .find(|t| *t > ap)
+                .find(|t| t.0 > ap)
                 .unwrap_or(angles[0]);
-            let prev = angles
+            let (prev, prev_cut) = angles
                 .iter()
                 .copied()
-                .rfind(|t| *t < ap)
-                .unwrap_or(*angles.last().unwrap_or(&next));
+                .rfind(|t| t.0 < ap)
+                .unwrap_or(*angles.last().unwrap_or(&(next, next_cut)));
             let sweep = ccw_sweep(next, prev);
             if sweep < 1e-9 {
                 return Err(SketchOpError::InvalidParameter {
@@ -777,7 +851,7 @@ pub fn trim(
                 None,
                 &mut outcome,
             );
-            mint_constraint(sketch, point_on_curve(start_id, *cutter), &mut outcome);
+            mint_constraint(sketch, point_on_curve(start_id, next_cut), &mut outcome);
             let end_id = mint_point(
                 sketch,
                 at(prev),
@@ -786,7 +860,7 @@ pub fn trim(
                 None,
                 &mut outcome,
             );
-            mint_constraint(sketch, point_on_curve(end_id, *cutter), &mut outcome);
+            mint_constraint(sketch, point_on_curve(end_id, prev_cut), &mut outcome);
             let aid = sketch.add_arc(start_id, end_id, r, true, sweep > PI)?;
             record_created(
                 sketch,
@@ -844,22 +918,22 @@ pub fn trim(
                     }
                 }
             };
-            let mut ts: Vec<f64> = hits
+            let mut ts: Vec<(f64, EntityRef)> = hits
                 .iter()
-                .map(&fraction)
-                .filter(|t| (1e-6..=1.0 - 1e-6).contains(t))
+                .map(|(p, k)| (fraction(p), *k))
+                .filter(|(t, _)| (1e-6..=1.0 - 1e-6).contains(t))
                 .collect();
-            ts.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-            ts.dedup_by(|x, y| (*x - *y).abs() < 1e-9);
+            ts.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+            ts.dedup_by(|x, y| (x.0 - y.0).abs() < 1e-9);
             if ts.is_empty() {
                 return Err(SketchOpError::NoIntersection {
                     op: OP,
-                    reason: format!("{cutter} does not cross the interior of {target}"),
+                    reason: format!("{cutter_name} does not cross the interior of {target}"),
                 });
             }
             let tp = fraction(&pick);
-            let lo = ts.iter().copied().rfind(|t| *t < tp);
-            let hi = ts.iter().copied().find(|t| *t > tp);
+            let lo = ts.iter().copied().rfind(|t| t.0 < tp);
+            let hi = ts.iter().copied().find(|t| t.0 > tp);
             if lo.is_none() && hi.is_none() {
                 return Err(SketchOpError::InvalidParameter {
                     op: OP,
@@ -890,40 +964,43 @@ pub fn trim(
                     arc.center.y + arc.radius * ang.sin(),
                 )
             };
-            let make_end = |t: f64, outcome: &mut SketchOpOutcome| -> Point2dId {
-                if t <= OP_EPS {
-                    if let Some((sa, _)) = endpoint_ids {
-                        return sa;
+            let make_end =
+                |t: f64, cut: Option<EntityRef>, outcome: &mut SketchOpOutcome| -> Point2dId {
+                    if t <= OP_EPS {
+                        if let Some((sa, _)) = endpoint_ids {
+                            return sa;
+                        }
+                    } else if t >= 1.0 - OP_EPS {
+                        if let Some((_, sb)) = endpoint_ids {
+                            return sb;
+                        }
                     }
-                } else if t >= 1.0 - OP_EPS {
-                    if let Some((_, sb)) = endpoint_ids {
-                        return sb;
+                    let pid = mint_point(
+                        sketch,
+                        pos_at(t),
+                        SketchOpKind::Trim,
+                        Some(*target),
+                        None,
+                        outcome,
+                    );
+                    if let Some(cutter) = cut {
+                        mint_constraint(sketch, point_on_curve(pid, cutter), outcome);
                     }
-                }
-                let pid = mint_point(
-                    sketch,
-                    pos_at(t),
-                    SketchOpKind::Trim,
-                    Some(*target),
-                    None,
-                    outcome,
-                );
-                mint_constraint(sketch, point_on_curve(pid, *cutter), outcome);
-                pid
-            };
+                    pid
+                };
 
-            let mut survivors: Vec<(f64, f64)> = Vec::new();
-            if let Some(t) = lo {
-                survivors.push((0.0, t));
+            let mut survivors: Vec<(f64, Option<EntityRef>, f64, Option<EntityRef>)> = Vec::new();
+            if let Some((t, c)) = lo {
+                survivors.push((0.0, None, t, Some(c)));
             }
-            if let Some(t) = hi {
-                survivors.push((t, 1.0));
+            if let Some((t, c)) = hi {
+                survivors.push((t, Some(c), 1.0, None));
             }
             let mut kept_original = [false, false];
             let mut survivor_refs: Vec<EntityRef> = Vec::new();
-            for (t0, t1) in survivors {
-                let start_id = make_end(t0, &mut outcome);
-                let end_id = make_end(t1, &mut outcome);
+            for (t0, c0, t1, c1) in survivors {
+                let start_id = make_end(t0, c0, &mut outcome);
+                let end_id = make_end(t1, c1, &mut outcome);
                 if t0 <= OP_EPS {
                     kept_original[0] = true;
                 }
@@ -964,6 +1041,284 @@ pub fn trim(
             reason: format!("{target} cannot be trimmed (supported: line segment, arc, circle)"),
         }),
     }
+}
+
+// ── corner fillet / chamfer ─────────────────────────────────────────
+
+/// The two lines meeting at a sketch corner `p`, each with its far end.
+fn corner_lines(
+    sketch: &Sketch,
+    p: &Point2dId,
+    op: &'static str,
+) -> Result<[(Line2dId, Point2dId); 2], SketchOpError> {
+    let mut found: Vec<(Line2dId, Point2dId)> = Vec::new();
+    for e in sketch.lines().iter() {
+        match e.endpoints {
+            Some((a, b)) if a == *p => found.push((*e.key(), b)),
+            Some((a, b)) if b == *p => found.push((*e.key(), a)),
+            _ => {}
+        }
+    }
+    match found.as_slice() {
+        [l1, l2] => Ok([*l1, *l2]),
+        _ => Err(SketchOpError::InvalidParameter {
+            op,
+            parameter: "corner",
+            reason: format!(
+                "a corner is a point where exactly two lines meet; {} line(s) meet here",
+                found.len()
+            ),
+        }),
+    }
+}
+
+/// Replace corner line `line` (corner end `p`, far end `far`) by a line
+/// from `far` to the new point `to`, carrying over the constraints that
+/// survive a shorter line on the same carrier (as trim does).
+fn shorten_line(
+    sketch: &Sketch,
+    line: Line2dId,
+    far: Point2dId,
+    to: Point2dId,
+    kind: SketchOpKind,
+    outcome: &mut SketchOpOutcome,
+) -> Result<Line2dId, SketchOpError> {
+    let target = EntityRef::Line(line);
+    let originals = sketch.get_constraints_by_entity(&target);
+    sketch.delete_line(&line)?;
+    outcome.deleted.push(target);
+    let lid = sketch.add_line(far, to)?;
+    record_created(
+        sketch,
+        EntityRef::Line(lid),
+        kind,
+        Some(target),
+        None,
+        outcome,
+    );
+    reapply_trim_constraints(
+        sketch,
+        &originals,
+        &target,
+        &[EntityRef::Line(lid)],
+        outcome,
+    );
+    Ok(lid)
+}
+
+/// The corner's geometry: unit directions from `p` toward each far end,
+/// the lines' lengths, and the half-angle between them.
+fn corner_frame(
+    sketch: &Sketch,
+    p: &Point2dId,
+    ends: [(Line2dId, Point2dId); 2],
+    op: &'static str,
+) -> Result<(Point2d, [Vector2d; 2], [f64; 2], f64), SketchOpError> {
+    let missing = |id: &Point2dId| SketchOpError::EntityNotFound {
+        op,
+        entity: id.to_string(),
+    };
+    let pp = sketch.get_point(p).ok_or_else(|| missing(p))?;
+    let mut dirs = [Vector2d::new(0.0, 0.0); 2];
+    let mut lens = [0.0; 2];
+    for (i, (_, far)) in ends.iter().enumerate() {
+        let q = sketch.get_point(far).ok_or_else(|| missing(far))?;
+        let d = Vector2d::from_points(&pp, &q);
+        let len = d.magnitude();
+        if len < OP_EPS {
+            return Err(SketchOpError::InvalidParameter {
+                op,
+                parameter: "corner",
+                reason: "a line at the corner has no length".to_string(),
+            });
+        }
+        dirs[i] = Vector2d::new(d.x / len, d.y / len);
+        lens[i] = len;
+    }
+    let cos = (dirs[0].dot(&dirs[1])).clamp(-1.0, 1.0);
+    let half = cos.acos() / 2.0;
+    if half < 1e-6 || (PI / 2.0 - half) < 1e-6 {
+        return Err(SketchOpError::InvalidParameter {
+            op,
+            parameter: "corner",
+            reason: "the lines are in line with each other: there is no corner to round"
+                .to_string(),
+        });
+    }
+    Ok((pp, dirs, lens, half))
+}
+
+/// Round a sketch corner (Varun 2026-11-14: "no way to put in fillets"):
+/// the two lines meeting at `corner` are cut back to where an arc of
+/// `radius` touches them, the arc joins them on shared points, and it is
+/// held TANGENT to both, so the round survives later solves. Refused --
+/// with nothing changed -- when the round does not fit on the lines.
+pub fn fillet_corner(
+    sketch: &Sketch,
+    corner: &Point2dId,
+    radius: f64,
+) -> Result<SketchOpOutcome, SketchOpError> {
+    const OP: &str = "fillet";
+    if !(radius.is_finite() && radius > OP_EPS) {
+        return Err(SketchOpError::InvalidParameter {
+            op: OP,
+            parameter: "radius",
+            reason: format!("must be a positive length (got {radius})"),
+        });
+    }
+    let ends = corner_lines(sketch, corner, OP)?;
+    let (pp, dirs, lens, half) = corner_frame(sketch, corner, ends, OP)?;
+    // Tangent points sit `d` along each line from the corner.
+    let d = radius / half.tan();
+    if d >= lens[0] - OP_EPS || d >= lens[1] - OP_EPS {
+        return Err(SketchOpError::InvalidParameter {
+            op: OP,
+            parameter: "radius",
+            reason: format!(
+                "a {radius} round needs {d:.3} of each line; the lines are {:.3} and {:.3} long",
+                lens[0], lens[1]
+            ),
+        });
+    }
+    let t: Vec<Point2d> = dirs
+        .iter()
+        .map(|u| Point2d::new(pp.x + u.x * d, pp.y + u.y * d))
+        .collect();
+    let bis = Vector2d::new(dirs[0].x + dirs[1].x, dirs[0].y + dirs[1].y);
+    let bl = bis.magnitude();
+    let k = radius / half.sin() / bl;
+    let c = Point2d::new(pp.x + bis.x * k, pp.y + bis.y * k);
+    // From tangent point 0 to tangent point 1, the short way round.
+    let v0 = Vector2d::from_points(&c, &t[0]);
+    let v1 = Vector2d::from_points(&c, &t[1]);
+    let ccw = v0.cross(&v1) > 0.0;
+
+    let mut outcome = SketchOpOutcome::new(SketchOpKind::Fillet);
+    let t0 = mint_point(sketch, t[0], SketchOpKind::Fillet, None, None, &mut outcome);
+    let t1 = mint_point(sketch, t[1], SketchOpKind::Fillet, None, None, &mut outcome);
+    let l0 = shorten_line(
+        sketch,
+        ends[0].0,
+        ends[0].1,
+        t0,
+        SketchOpKind::Fillet,
+        &mut outcome,
+    )?;
+    let l1 = shorten_line(
+        sketch,
+        ends[1].0,
+        ends[1].1,
+        t1,
+        SketchOpKind::Fillet,
+        &mut outcome,
+    )?;
+    let aid = sketch.add_arc(t0, t1, radius, ccw, false)?;
+    record_created(
+        sketch,
+        EntityRef::Arc(aid),
+        SketchOpKind::Fillet,
+        None,
+        None,
+        &mut outcome,
+    );
+    for l in [l0, l1] {
+        mint_constraint(
+            sketch,
+            Constraint::new_geometric(
+                GeometricConstraint::Tangent,
+                vec![EntityRef::Arc(aid), EntityRef::Line(l)],
+                ConstraintPriority::High,
+            ),
+            &mut outcome,
+        );
+    }
+    drop_corner(sketch, corner, &mut outcome)?;
+    Ok(outcome)
+}
+
+/// Cut a sketch corner straight across (Varun 2026-11-14: "... chamfers"):
+/// each line is cut back `distance` from the corner and a new line joins
+/// the cut points. Refused, with nothing changed, if it does not fit.
+pub fn chamfer_corner(
+    sketch: &Sketch,
+    corner: &Point2dId,
+    distance: f64,
+) -> Result<SketchOpOutcome, SketchOpError> {
+    const OP: &str = "chamfer";
+    if !(distance.is_finite() && distance > OP_EPS) {
+        return Err(SketchOpError::InvalidParameter {
+            op: OP,
+            parameter: "distance",
+            reason: format!("must be a positive length (got {distance})"),
+        });
+    }
+    let ends = corner_lines(sketch, corner, OP)?;
+    let (pp, dirs, lens, _) = corner_frame(sketch, corner, ends, OP)?;
+    if distance >= lens[0] - OP_EPS || distance >= lens[1] - OP_EPS {
+        return Err(SketchOpError::InvalidParameter {
+            op: OP,
+            parameter: "distance",
+            reason: format!(
+                "a {distance} chamfer does not fit: the lines are {:.3} and {:.3} long",
+                lens[0], lens[1]
+            ),
+        });
+    }
+    let mut outcome = SketchOpOutcome::new(SketchOpKind::Chamfer);
+    let cut: Vec<Point2dId> = dirs
+        .iter()
+        .map(|u| {
+            mint_point(
+                sketch,
+                Point2d::new(pp.x + u.x * distance, pp.y + u.y * distance),
+                SketchOpKind::Chamfer,
+                None,
+                None,
+                &mut outcome,
+            )
+        })
+        .collect();
+    shorten_line(
+        sketch,
+        ends[0].0,
+        ends[0].1,
+        cut[0],
+        SketchOpKind::Chamfer,
+        &mut outcome,
+    )?;
+    shorten_line(
+        sketch,
+        ends[1].0,
+        ends[1].1,
+        cut[1],
+        SketchOpKind::Chamfer,
+        &mut outcome,
+    )?;
+    let lid = sketch.add_line(cut[0], cut[1])?;
+    record_created(
+        sketch,
+        EntityRef::Line(lid),
+        SketchOpKind::Chamfer,
+        None,
+        None,
+        &mut outcome,
+    );
+    drop_corner(sketch, corner, &mut outcome)?;
+    Ok(outcome)
+}
+
+/// The sharp corner point is gone once both lines are cut back -- unless
+/// something else still uses it.
+fn drop_corner(
+    sketch: &Sketch,
+    corner: &Point2dId,
+    outcome: &mut SketchOpOutcome,
+) -> Result<(), SketchOpError> {
+    if !point_in_use(sketch, corner) {
+        sketch.delete_point(corner)?;
+        outcome.deleted.push(EntityRef::Point(*corner));
+    }
+    Ok(())
 }
 
 // ── extend ──────────────────────────────────────────────────────────

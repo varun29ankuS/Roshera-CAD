@@ -12640,3 +12640,78 @@ async fn deleting_sketch_geometry_takes_what_depends_on_it_and_nothing_else() {
     assert_eq!(snap["lines"].as_array().map(Vec::len), Some(0), "{snap}");
     assert_eq!(snap["points"].as_array().map(Vec::len), Some(0), "{snap}");
 }
+
+/// The sketch Modify tools reach the kernel (Varun 2026-11-14: "no trim
+/// tool ... no way to put in fillets / chamfers"): fillet rounds a corner
+/// with an arc; chamfer cuts one; trim-at removes a clicked span; a round
+/// that does not fit is refused.
+#[tokio::test]
+async fn sketch_fillet_chamfer_and_trim_at_reach_the_kernel() {
+    let state = make_test_state().await;
+    let post = |path: String, body: serde_json::Value| {
+        let state = state.clone();
+        async move { dispatch(&state, json_post(&path, body)).await }
+    };
+    let (_, body) = post("/api/csketch".into(), json!({})).await;
+    let sk = body["id"].as_str().expect("sketch id").to_string();
+    let mut p = Vec::new();
+    for (x, y) in [
+        (10.0, 0.0),
+        (0.0, 0.0),
+        (0.0, 10.0),
+        (20.0, 0.0),
+        (20.0, 10.0),
+    ] {
+        let (_, b) = post(format!("/api/csketch/{sk}/point"), json!({"x": x, "y": y})).await;
+        p.push(b["id"].as_str().expect("point").to_string());
+    }
+    for (a, b) in [(0, 1), (1, 2), (3, 4)] {
+        let (s, b) = post(
+            format!("/api/csketch/{sk}/line"),
+            json!({"start": p[a], "end": p[b]}),
+        )
+        .await;
+        assert!(s.is_success(), "{b}");
+    }
+    let (s, b) = post(
+        format!("/api/csketch/{sk}/fillet"),
+        json!({"corner": p[1], "size": 50.0}),
+    )
+    .await;
+    assert!(!s.is_success(), "a 50 round on 10 lines is refused: {b}");
+    let (s, b) = post(
+        format!("/api/csketch/{sk}/fillet"),
+        json!({"corner": p[1], "size": 2.0}),
+    )
+    .await;
+    assert!(s.is_success(), "fillet: {b}");
+    let (_, snap) = dispatch(&state, json_get(&format!("/api/csketch/{sk}"))).await;
+    assert_eq!(snap["arcs"].as_array().map(Vec::len), Some(1), "{snap}");
+    // The lone line at x = 20: nothing crosses it, trim-at removes it.
+    let lone = snap["lines"]
+        .as_array()
+        .and_then(|ls| {
+            ls.iter()
+                .find(|l| l["geometry"]["Segment"]["start"]["x"].as_f64() == Some(20.0))
+        })
+        .and_then(|l| l["id"].as_str())
+        .expect("the lone line")
+        .to_string();
+    let (s, b) = post(
+        format!("/api/csketch/{sk}/trim-at"),
+        json!({"entity": {"Line": lone}, "pick": [20.0, 5.0]}),
+    )
+    .await;
+    assert!(s.is_success(), "trim-at: {b}");
+    let (_, snap) = dispatch(&state, json_get(&format!("/api/csketch/{sk}"))).await;
+    assert_eq!(snap["lines"].as_array().map(Vec::len), Some(2), "{snap}");
+    let (s, b) = post(
+        format!("/api/csketch/{sk}/chamfer"),
+        json!({"corner": p[1], "size": 1.0}),
+    )
+    .await;
+    assert!(
+        !s.is_success(),
+        "the corner is already rounded -- no corner left to chamfer: {b}"
+    );
+}

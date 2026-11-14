@@ -1598,6 +1598,109 @@ pub async fn trim_op(
     }))
 }
 
+/// Request body for `POST /api/csketch/{id}/trim-at`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrimAtRequest {
+    /// The curve the user clicked.
+    pub entity: EntityRef,
+    /// Where on it they clicked (the span to remove).
+    pub pick: [f64; 2],
+}
+
+/// `POST /api/csketch/{id}/trim-at` -- the sketch Trim tool (Varun
+/// 2026-11-14): remove the span under the click, cut back to the nearest
+/// crossing by ANY curve on each side (`sketch_ops::trim_at`); a curve
+/// nothing crosses is removed whole.
+pub async fn trim_at_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<TrimAtRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    if !req.pick[0].is_finite() || !req.pick[1].is_finite() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "pick coordinates must be finite",
+        ));
+    }
+    let sketch = require_sketch(&state, id)?;
+    let outcome = geometry_engine::sketch2d::sketch_ops::trim_at(
+        &sketch,
+        &req.entity,
+        Point2d::new(req.pick[0], req.pick[1]),
+    )
+    .map_err(op_error_to_api)?;
+    record_csketch_op(
+        &state,
+        "csketch_trim",
+        id,
+        serde_json::json!({ "entity": req.entity, "cutter": null, "pick": req.pick }),
+        &outcome,
+    );
+    let certificate = sketch.certify().compact();
+    Ok(Json(SketchOpResponse {
+        outcome,
+        certificate,
+    }))
+}
+
+/// Request body for `POST /api/csketch/{id}/fillet` and `/chamfer`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CornerRequest {
+    /// The corner point (where exactly two lines meet).
+    pub corner: Uuid,
+    /// Fillet radius, or chamfer distance along each line.
+    pub size: f64,
+}
+
+/// `POST /api/csketch/{id}/fillet` -- round a sketch corner with a tangent
+/// arc (`sketch_ops::fillet_corner`); refused, nothing changed, if the
+/// round does not fit on the lines.
+pub async fn fillet_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<CornerRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    corner_op(&state, id, req, "csketch_fillet").await
+}
+
+/// `POST /api/csketch/{id}/chamfer` -- cut a sketch corner straight across
+/// (`sketch_ops::chamfer_corner`).
+pub async fn chamfer_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<CornerRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    corner_op(&state, id, req, "csketch_chamfer").await
+}
+
+async fn corner_op(
+    state: &AppState,
+    id: Uuid,
+    req: CornerRequest,
+    kind: &'static str,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    let sketch = require_sketch(state, id)?;
+    let corner = Point2dId(req.corner);
+    let outcome = if kind == "csketch_fillet" {
+        geometry_engine::sketch2d::sketch_ops::fillet_corner(&sketch, &corner, req.size)
+    } else {
+        geometry_engine::sketch2d::sketch_ops::chamfer_corner(&sketch, &corner, req.size)
+    }
+    .map_err(op_error_to_api)?;
+    record_csketch_op(
+        state,
+        kind,
+        id,
+        serde_json::json!({ "corner": req.corner, "size": req.size }),
+        &outcome,
+    );
+    let certificate = sketch.certify().compact();
+    Ok(Json(SketchOpResponse {
+        outcome,
+        certificate,
+    }))
+}
+
 /// `POST /api/csketch/{id}/extend` — extend a line end to the nearest
 /// forward intersection with a boundary entity.
 pub async fn extend_op(
