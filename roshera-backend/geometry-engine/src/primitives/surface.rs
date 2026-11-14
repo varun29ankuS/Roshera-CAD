@@ -697,6 +697,22 @@ pub trait Surface: fmt::Debug + Send + Sync + Any {
     /// Find closest point on surface to given point
     fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)>;
 
+    /// The footpoint of `point` searched from `seed`, a parameter pair known
+    /// to be near it (the previous sample of a curve being projected). An
+    /// iterative surface (NURBS) marches from the seed instead of searching
+    /// the whole domain, which is both faster and keeps a projected curve on
+    /// one branch. The default ignores the seed: closed-form surfaces
+    /// (plane, cylinder, cone, sphere, torus) need none.
+    fn closest_point_near(
+        &self,
+        point: &Point3,
+        seed: (f64, f64),
+        tolerance: Tolerance,
+    ) -> MathResult<(f64, f64)> {
+        let _ = seed;
+        self.closest_point(point, tolerance)
+    }
+
     /// Exact `(u, v)` for a point ALREADY known to lie on this surface — an
     /// analytic ray/surface intersection, for instance — as opposed to
     /// [`Surface::closest_point`]'s NEAREST-POINT *projection*, which some
@@ -5007,6 +5023,85 @@ impl GeneralNurbsSurface {
     }
 }
 
+impl GeneralNurbsSurface {
+    /// Local footpoint of `point` from `seed`: Gauss-Newton on the squared
+    /// distance, with a backtracking line search so a step never moves away
+    /// from the point. Returns the parameters and the 3D distance reached.
+    ///
+    /// CRITICAL: uses the derivative-only evaluator (`evaluate_derivatives`,
+    /// position + du + dv), NOT `evaluate_full` -- on a collapsed control row
+    /// (a mixed-corner cap's apex) `evaluate_full` computes `du x dv` and
+    /// fails, while position and the two tangents are regular there.
+    ///
+    /// Stops when the residual is orthogonal to both tangents (the footpoint
+    /// condition) or a step no longer moves the surface point -- NOT only
+    /// when the point is reached: a point off the surface never is. The
+    /// solver this replaced stopped only on reaching the point and otherwise
+    /// ran 20 half-strength steps from one grid seed, so it was slow, fell
+    /// short of the footpoint, and could settle on the wrong side of a fold.
+    pub(crate) fn footpoint_from(
+        &self,
+        point: &Point3,
+        seed: (f64, f64),
+        tolerance: Tolerance,
+    ) -> (f64, f64, f64) {
+        let ((u_min, u_max), (v_min, v_max)) = self.parameter_bounds();
+        let clamp = |u: f64, v: f64| (u.clamp(u_min, u_max), v.clamp(v_min, v_max));
+        let (mut u, mut v) = clamp(seed.0, seed.1);
+        let resolution = (tolerance.distance() * 1e-3).max(1e-12);
+        let mut eval = self.nurbs.evaluate_derivatives(u, v, 1, 1);
+        let mut dist = eval.point.distance(point);
+        for _ in 0..32 {
+            let (Some(su), Some(sv)) = (eval.du, eval.dv) else {
+                break;
+            };
+            let r = eval.point - *point;
+            let (gu, gv) = (r.dot(&su), r.dot(&sv));
+            let (e, f, g) = (su.dot(&su), su.dot(&sv), sv.dot(&sv));
+            // Footpoint reached: the residual is normal to the surface.
+            let (lu, lv) = (e.sqrt(), g.sqrt());
+            if dist <= resolution
+                || ((lu <= 0.0 || gu.abs() <= resolution * lu)
+                    && (lv <= 0.0 || gv.abs() <= resolution * lv))
+            {
+                break;
+            }
+            let det = e * g - f * f;
+            let scale_eg = e.max(g).max(1.0);
+            if !(det.abs() > f64::EPSILON * scale_eg * scale_eg) {
+                break;
+            }
+            let step_u = -(g * gu - f * gv) / det;
+            let step_v = -(e * gv - f * gu) / det;
+            // Backtrack until the step brings the surface point closer.
+            let mut factor = 1.0;
+            let mut accepted = None;
+            for _ in 0..12 {
+                let (nu, nv) = clamp(u + factor * step_u, v + factor * step_v);
+                let next = self.nurbs.evaluate_derivatives(nu, nv, 1, 1);
+                let nd = next.point.distance(point);
+                if nd < dist {
+                    accepted = Some((nu, nv, next, nd));
+                    break;
+                }
+                factor *= 0.5;
+            }
+            let Some((nu, nv, next, nd)) = accepted else {
+                break;
+            };
+            let moved = next.point.distance(&eval.point);
+            u = nu;
+            v = nv;
+            eval = next;
+            dist = nd;
+            if moved <= resolution {
+                break;
+            }
+        }
+        (u, v, dist)
+    }
+}
+
 impl Surface for GeneralNurbsSurface {
     fn surface_type(&self) -> SurfaceType {
         SurfaceType::NURBS
@@ -5231,85 +5326,47 @@ impl Surface for GeneralNurbsSurface {
 
     #[allow(non_snake_case)] // E, F, G are standard First Fundamental Form names
     fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
-        // Newton-Raphson footpoint. CRITICAL: this uses the derivative-only
-        // evaluator (`evaluate_derivatives`, position + du + dv), NOT
-        // `evaluate_full` — on a collapsed control row (the mixed-corner cap's
-        // `u = u_max` apex) `evaluate_full` computes `du × dv` and returns
-        // `Err(DivisionByZero)`, which previously aborted the whole search and
-        // hid every apex-adjacent facet from the tessellation-soundness oracle.
-        // The footpoint needs only position and the two tangents, none of which
-        // is singular at the pole, so the search now converges to the apex row
-        // instead of erroring out.
-        let (u_bounds, v_bounds) = self.parameter_bounds();
-        let (u_min, u_max) = u_bounds;
-        let (v_min, v_max) = v_bounds;
-
-        // Initial guess — parameter-space grid search. `evaluate` (order 0) is
-        // position-only and never fails on the degenerate row, so the seed grid
-        // can consider the apex region too.
-        let samples = 10;
-        let mut best_dist = f64::INFINITY;
-        let mut best_u = (u_min + u_max) * 0.5;
-        let mut best_v = (v_min + v_max) * 0.5;
-
-        for i in 0..=samples {
-            let u = u_min + (u_max - u_min) * (i as f64) / (samples as f64);
-            for j in 0..=samples {
-                let v = v_min + (v_max - v_min) * (j as f64) / (samples as f64);
-                let p = self.nurbs.evaluate(u, v).point;
-                let dist = point.distance(&p);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_u = u;
-                    best_v = v;
-                }
+        // Global footpoint: seed from a parameter grid, then run the local
+        // solver from the few best seeds and keep the nearest result. One seed
+        // is not enough on a strongly curved patch -- the nearest grid node
+        // can sit in the wrong basin (the far side of a fold), and a solver
+        // started there converges to a local, not the global, footpoint.
+        //
+        // `evaluate` (order 0) is position-only and never fails on a collapsed
+        // control row, so the grid can consider an apex region too.
+        let ((u_min, u_max), (v_min, v_max)) = self.parameter_bounds();
+        const GRID: usize = 10;
+        const SEEDS: usize = 3;
+        let mut seeds: Vec<(f64, f64, f64)> = Vec::with_capacity((GRID + 1) * (GRID + 1));
+        for i in 0..=GRID {
+            let u = u_min + (u_max - u_min) * (i as f64) / (GRID as f64);
+            for j in 0..=GRID {
+                let v = v_min + (v_max - v_min) * (j as f64) / (GRID as f64);
+                let d = point.distance(&self.nurbs.evaluate(u, v).point);
+                seeds.push((d, u, v));
             }
         }
-
-        // Newton-Raphson refinement.
-        let mut u = best_u;
-        let mut v = best_v;
-        let max_iter = 20;
-        let tol = tolerance.distance();
-
-        for _ in 0..max_iter {
-            let eval = self.nurbs.evaluate_derivatives(u, v, 1, 1);
-            let diff = eval.point - *point;
-
-            // Check convergence
-            if diff.magnitude() < tol {
-                break;
-            }
-
-            let (Some(du), Some(dv)) = (eval.du, eval.dv) else {
-                break;
-            };
-
-            // Compute Newton step
-            let dot_du = diff.dot(&du);
-            let dot_dv = diff.dot(&dv);
-
-            let E = du.dot(&du);
-            let F = du.dot(&dv);
-            let G = dv.dot(&dv);
-
-            let det = E * G - F * F;
-            if det.abs() > 1e-10 {
-                let du_step = (G * dot_du - F * dot_dv) / det;
-                let dv_step = (E * dot_dv - F * dot_du) / det;
-
-                // Update with damping
-                u -= 0.5 * du_step;
-                v -= 0.5 * dv_step;
-
-                // Clamp to bounds
-                u = u.clamp(u_min, u_max);
-                v = v.clamp(v_min, v_max);
-            } else {
-                break;
+        seeds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut best: Option<(f64, f64, f64)> = None;
+        for &(_, u, v) in seeds.iter().take(SEEDS) {
+            let (fu, fv, d) = self.footpoint_from(point, (u, v), tolerance);
+            if best.map_or(true, |(bd, _, _)| d < bd) {
+                best = Some((d, fu, fv));
             }
         }
+        match best {
+            Some((_, u, v)) => Ok((u, v)),
+            None => Ok(((u_min + u_max) * 0.5, (v_min + v_max) * 0.5)),
+        }
+    }
 
+    fn closest_point_near(
+        &self,
+        point: &Point3,
+        seed: (f64, f64),
+        tolerance: Tolerance,
+    ) -> MathResult<(f64, f64)> {
+        let (u, v, _) = self.footpoint_from(point, seed, tolerance);
         Ok((u, v))
     }
 

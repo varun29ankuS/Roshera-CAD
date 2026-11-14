@@ -328,10 +328,7 @@ pub(crate) fn project_loop_to_uv(
                 .and_then(|cf| cf.closest_point_analytic(&p_3d));
             let (mut u, mut v) = match analytic {
                 Some(uv) => uv,
-                None => match surface.closest_point(&p_3d, Tolerance::default()) {
-                    Ok(uv) => uv,
-                    Err(_) => return Err(CurvedCdtError::ProjectionFailed),
-                },
+                None => march_footpoint(surface, &p_3d, last_uv, u_period, v_period)?,
             };
 
             // Periodicity unwrap against the previous sample. Mirrors
@@ -372,6 +369,72 @@ pub(crate) fn project_loop_to_uv(
         loop_type: loop_data.loop_type,
     })
 }
+
+/// The footpoint of a loop sample, marching from the previous one.
+///
+/// Consecutive samples of a loop are close on the surface (they share an edge,
+/// or a vertex across an edge boundary), so the previous sample's `(u, v)` is
+/// an excellent seed: the local solver converges in a few steps and stays on
+/// the loop's branch. Searching the whole domain for every sample -- what this
+/// replaces -- cost a grid search per point and could jump to the wrong side of
+/// a fold, making an outline that crosses itself (the face then meshed to
+/// nothing; the GrabCAD bench vice lost NURBS faces this way).
+///
+/// The marched result is checked: a sample lies ON the face, so a footpoint
+/// farther from it than [`MARCH_ACCEPT`] means the march went astray, and the
+/// global search decides instead (keeping whichever lands closer).
+fn march_footpoint(
+    surface: &dyn Surface,
+    p: &Point3,
+    previous: Option<(f64, f64)>,
+    u_period: Option<f64>,
+    v_period: Option<f64>,
+) -> Result<(f64, f64), CurvedCdtError> {
+    let tol = Tolerance::default();
+    let miss = |uv: (f64, f64)| {
+        surface
+            .point_at(uv.0, uv.1)
+            .map(|q| q.distance(p))
+            .unwrap_or(f64::INFINITY)
+    };
+    let global = || {
+        surface
+            .closest_point(p, tol)
+            .map_err(|_| CurvedCdtError::ProjectionFailed)
+    };
+    let Some(prev) = previous else {
+        return global();
+    };
+    // The previous sample may be unwrapped past the period (a loop that winds
+    // across a seam); seed the solver inside the chart.
+    let ((u_lo, _), (v_lo, _)) = surface.parameter_bounds();
+    let into_chart = |x: f64, lo: f64, period: Option<f64>| match period {
+        Some(t) if t > 0.0 => lo + (x - lo).rem_euclid(t),
+        _ => x,
+    };
+    let seed = (
+        into_chart(prev.0, u_lo, u_period),
+        into_chart(prev.1, v_lo, v_period),
+    );
+    let marched = surface
+        .closest_point_near(p, seed, tol)
+        .map_err(|_| CurvedCdtError::ProjectionFailed)?;
+    let marched_miss = miss(marched);
+    if marched_miss <= MARCH_ACCEPT {
+        return Ok(marched);
+    }
+    let searched = global()?;
+    Ok(if miss(searched) < marched_miss {
+        searched
+    } else {
+        marched
+    })
+}
+
+/// A loop sample lies on its face; a marched footpoint within this distance
+/// of it (mm) is accepted without a global search. Far looser than any
+/// solver residual, far tighter than a wrong branch.
+const MARCH_ACCEPT: f64 = 1.0e-4;
 
 /// Compute the UV bbox of a polygon. Returns `None` for empty input
 /// so the caller can short-circuit with `Err(DegenerateLoop)`.
@@ -2118,6 +2181,7 @@ fn collect_refinement_centroids<S: MeshChart + ?Sized>(
     surface: &S,
     face: &Face,
     params: &TessellationParams,
+    cache: &mut FidelityCache,
 ) -> Vec<((f64, f64), f64)> {
     use crate::math::circumcircle::{circumcircle_2d, radius_edge_ratio_sq};
     use crate::math::Vector2;
@@ -2127,110 +2191,204 @@ fn collect_refinement_centroids<S: MeshChart + ?Sized>(
     let domain = TrimIndex::new(&outer.points_uv, &hole_refs);
     let mut out: Vec<((f64, f64), f64)> = Vec::new();
     for tri in triangles {
-        let (ia, ib, ic) = (tri[0], tri[1], tri[2]);
-        if ia >= pts2d.len() || ib >= pts2d.len() || ic >= pts2d.len() {
+        // A triangle unchanged since an earlier pass (same corners, same
+        // order) gets the verdict it got then: same inputs, same answer.
+        let key = cache.triangle_key(tri, pts2d);
+        if let Some(&outcome) = key.as_ref().and_then(|k| cache.verdicts.get(k)) {
+            if let Some(candidate) = outcome {
+                out.push(candidate);
+            }
             continue;
         }
-        let pa = match resolve_position_3d(ia, outer, inners, pts2d, surface) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let pb = match resolve_position_3d(ib, outer, inners, pts2d, surface) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let pc = match resolve_position_3d(ic, outer, inners, pts2d, surface) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let (ua, va) = pts2d[ia];
-        let (ub, vb) = pts2d[ib];
-        let (uc, vc) = pts2d[ic];
-        let u_c = (ua + ub + uc) / 3.0;
-        let v_c = (va + vb + vc) / 3.0;
-
-        let p_centroid = match surface.point_at(u_c, v_c) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        // Build the planar triangle's outward normal from the 3D
-        // corners. Skip degenerate triangles (cross product near
-        // zero).
-        let e1 = pb - pa;
-        let e2 = pc - pa;
-        let plane_normal = match e1.cross(&e2).normalize() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        // Plane-corner triangle centroid in 3D (linear combination).
-        let plane_centroid = Point3::new(
-            (pa.x + pb.x + pc.x) / 3.0,
-            (pa.y + pb.y + pc.y) / 3.0,
-            (pa.z + pb.z + pc.z) / 3.0,
-        );
-        // Chord error: ⊥distance from surface-evaluated centroid to
-        // the plane spanned by the three corners.
-        let delta = p_centroid - plane_centroid;
-        let chord_error = delta.dot(&plane_normal).abs();
-
-        // Normal deviation: max angle between the surface normal at
-        // the centroid and the three corner normals.
-        let normal_centroid = oriented_normal(surface, face, u_c, v_c).unwrap_or(plane_normal);
-        let normal_a = oriented_normal(surface, face, ua, va).unwrap_or(plane_normal);
-        let normal_b = oriented_normal(surface, face, ub, vb).unwrap_or(plane_normal);
-        let normal_c = oriented_normal(surface, face, uc, vc).unwrap_or(plane_normal);
-        let ang = |n: Vector3| -> f64 {
-            let d = normal_centroid.dot(&n).clamp(-1.0, 1.0);
-            d.acos()
-        };
-        let max_dev = ang(normal_a).max(ang(normal_b)).max(ang(normal_c));
-
-        // A non-positive tolerance DISABLES that criterion (the
-        // project-wide `TessellationParams` convention; see the `> 0.0`
-        // guards in `edge_cache::sample_count_from_length_angle`). Comparing
-        // directly against `0.0` would instead flag *every* curved triangle
-        // — on an analytic face like a cylinder the centroid normal always
-        // deviates from the corner normals, so refinement would never
-        // converge and would subdivide maximally through all
-        // `RUPPERT_MAX_PASSES`, exploding the triangle count.
-        let chord_fail = params.chord_tolerance > 0.0 && chord_error > params.chord_tolerance;
-        let angle_fail = params.max_angle_deviation > 0.0 && max_dev > params.max_angle_deviation;
-        if chord_fail || angle_fail {
-            // Circumcenter when it is a valid interior insertion site
-            // (inside the outer trim, outside every hole, clear of the
-            // fixed constraint segments); centroid fallback otherwise.
-            let a2 = Vector2::new(ua, va);
-            let b2 = Vector2::new(ub, vb);
-            let c2 = Vector2::new(uc, vc);
-            let circumcenter = circumcircle_2d(a2, b2, c2)
-                .map(|(center, r_sq)| ((center.x, center.y), r_sq.max(0.0).sqrt()))
-                .filter(|&(cc, _r)| domain.inside(cc) && !domain.near(cc, keepout));
-            match circumcenter {
-                Some(candidate) => out.push(candidate),
-                // The centroid fallback is only sound for a WELL-SHAPED
-                // triangle. For a skinny one whose circumcenter is not a
-                // valid interior site, the triangle is structurally
-                // unfixable by interior insertion — splitting a
-                // near-degenerate UV ribbon at its centroid just halves
-                // it into two finer ribbons (the pre-Task-4C sliver
-                // cascade: 84 slivers at 0.57°). Skip it; the skinny
-                // scan owns the quality criterion and its circumcenter
-                // rejection is the same verdict.
-                None if radius_edge_ratio_sq(a2, b2, c2) <= RADIUS_EDGE_LIMIT_SQ => {
-                    // Fallback spacing radius: the centroid's clearance
-                    // to the nearest corner (the centroid is
-                    // unconditionally interior to its triangle, so this
-                    // is a genuine local length scale).
-                    let d = |x: f64, y: f64| ((u_c - x).powi(2) + (v_c - y).powi(2)).sqrt();
-                    out.push(((u_c, v_c), d(ua, va).min(d(ub, vb)).min(d(uc, vc))));
-                }
-                None => {}
+        let outcome: Option<((f64, f64), f64)> = 'tri: {
+            let (ia, ib, ic) = (tri[0], tri[1], tri[2]);
+            if ia >= pts2d.len() || ib >= pts2d.len() || ic >= pts2d.len() {
+                break 'tri None;
             }
+            let pa = match cache.position(ia, outer, inners, pts2d, surface) {
+                Ok(p) => p,
+                Err(_) => break 'tri None,
+            };
+            let pb = match cache.position(ib, outer, inners, pts2d, surface) {
+                Ok(p) => p,
+                Err(_) => break 'tri None,
+            };
+            let pc = match cache.position(ic, outer, inners, pts2d, surface) {
+                Ok(p) => p,
+                Err(_) => break 'tri None,
+            };
+
+            let (ua, va) = pts2d[ia];
+            let (ub, vb) = pts2d[ib];
+            let (uc, vc) = pts2d[ic];
+            let u_c = (ua + ub + uc) / 3.0;
+            let v_c = (va + vb + vc) / 3.0;
+
+            let p_centroid = match surface.point_at(u_c, v_c) {
+                Ok(p) => p,
+                Err(_) => break 'tri None,
+            };
+
+            // Build the planar triangle's outward normal from the 3D
+            // corners. Skip degenerate triangles (cross product near
+            // zero).
+            let e1 = pb - pa;
+            let e2 = pc - pa;
+            let plane_normal = match e1.cross(&e2).normalize() {
+                Ok(n) => n,
+                Err(_) => break 'tri None,
+            };
+            // Plane-corner triangle centroid in 3D (linear combination).
+            let plane_centroid = Point3::new(
+                (pa.x + pb.x + pc.x) / 3.0,
+                (pa.y + pb.y + pc.y) / 3.0,
+                (pa.z + pb.z + pc.z) / 3.0,
+            );
+            // Chord error: ⊥distance from surface-evaluated centroid to
+            // the plane spanned by the three corners.
+            let delta = p_centroid - plane_centroid;
+            let chord_error = delta.dot(&plane_normal).abs();
+
+            // Normal deviation: max angle between the surface normal at
+            // the centroid and the three corner normals.
+            let normal_centroid = cache
+                .normal(surface, face, u_c, v_c)
+                .unwrap_or(plane_normal);
+            let normal_a = cache.normal(surface, face, ua, va).unwrap_or(plane_normal);
+            let normal_b = cache.normal(surface, face, ub, vb).unwrap_or(plane_normal);
+            let normal_c = cache.normal(surface, face, uc, vc).unwrap_or(plane_normal);
+            let ang = |n: Vector3| -> f64 {
+                let d = normal_centroid.dot(&n).clamp(-1.0, 1.0);
+                d.acos()
+            };
+            let max_dev = ang(normal_a).max(ang(normal_b)).max(ang(normal_c));
+
+            // A non-positive tolerance DISABLES that criterion (the
+            // project-wide `TessellationParams` convention; see the `> 0.0`
+            // guards in `edge_cache::sample_count_from_length_angle`). Comparing
+            // directly against `0.0` would instead flag *every* curved triangle
+            // — on an analytic face like a cylinder the centroid normal always
+            // deviates from the corner normals, so refinement would never
+            // converge and would subdivide maximally through all
+            // `RUPPERT_MAX_PASSES`, exploding the triangle count.
+            let chord_fail = params.chord_tolerance > 0.0 && chord_error > params.chord_tolerance;
+            let angle_fail =
+                params.max_angle_deviation > 0.0 && max_dev > params.max_angle_deviation;
+            if chord_fail || angle_fail {
+                // Circumcenter when it is a valid interior insertion site
+                // (inside the outer trim, outside every hole, clear of the
+                // fixed constraint segments); centroid fallback otherwise.
+                let a2 = Vector2::new(ua, va);
+                let b2 = Vector2::new(ub, vb);
+                let c2 = Vector2::new(uc, vc);
+                let circumcenter = circumcircle_2d(a2, b2, c2)
+                    .map(|(center, r_sq)| ((center.x, center.y), r_sq.max(0.0).sqrt()))
+                    .filter(|&(cc, _r)| domain.inside(cc) && !domain.near(cc, keepout));
+                match circumcenter {
+                    Some(candidate) => break 'tri Some(candidate),
+                    // The centroid fallback is only sound for a WELL-SHAPED
+                    // triangle. For a skinny one whose circumcenter is not a
+                    // valid interior site, the triangle is structurally
+                    // unfixable by interior insertion — splitting a
+                    // near-degenerate UV ribbon at its centroid just halves
+                    // it into two finer ribbons (the pre-Task-4C sliver
+                    // cascade: 84 slivers at 0.57°). Skip it; the skinny
+                    // scan owns the quality criterion and its circumcenter
+                    // rejection is the same verdict.
+                    None if radius_edge_ratio_sq(a2, b2, c2) <= RADIUS_EDGE_LIMIT_SQ => {
+                        // Fallback spacing radius: the centroid's clearance
+                        // to the nearest corner (the centroid is
+                        // unconditionally interior to its triangle, so this
+                        // is a genuine local length scale).
+                        let d = |x: f64, y: f64| ((u_c - x).powi(2) + (v_c - y).powi(2)).sqrt();
+                        break 'tri Some(((u_c, v_c), d(ua, va).min(d(ub, vb)).min(d(uc, vc))));
+                    }
+                    None => {}
+                }
+            }
+            None
+        };
+        if let Some(k) = key {
+            cache.verdicts.insert(k, outcome);
+        }
+        if let Some(candidate) = outcome {
+            out.push(candidate);
         }
     }
     out
+}
+
+/// Surface evaluations of one face's refinement, memoised by exact (u, v)
+/// bits. Refinement re-triangulates every pass, so vertex indices change,
+/// but a vertex keeps its (u, v), and an unchanged triangle keeps its
+/// corners: a hit returns exactly what the evaluation returned the first
+/// time. Boundary vertices are never evaluated -- their 3D positions are the
+/// edges' cached samples (the shared-edge contract) -- so only interior
+/// positions are stored.
+#[derive(Default)]
+pub(crate) struct FidelityCache {
+    positions: std::collections::HashMap<(u64, u64), Option<Point3>>,
+    normals: std::collections::HashMap<(u64, u64), Option<Vector3>>,
+    verdicts: std::collections::HashMap<[(u64, u64); 3], Option<((f64, f64), f64)>>,
+}
+
+impl FidelityCache {
+    fn key(p: (f64, f64)) -> (u64, u64) {
+        (p.0.to_bits(), p.1.to_bits())
+    }
+
+    fn triangle_key(&self, tri: &[usize; 3], pts2d: &[(f64, f64)]) -> Option<[(u64, u64); 3]> {
+        let at = |i: usize| pts2d.get(i).map(|&p| Self::key(p));
+        Some([at(tri[0])?, at(tri[1])?, at(tri[2])?])
+    }
+
+    /// [`resolve_position_3d`], evaluating each interior (u, v) once.
+    fn position<S: MeshChart + ?Sized>(
+        &mut self,
+        i: usize,
+        outer: &ProjectedLoop,
+        inners: &[ProjectedLoop],
+        pts2d: &[(f64, f64)],
+        surface: &S,
+    ) -> Result<Point3, CurvedCdtError> {
+        let boundary =
+            outer.points_3d.len() + inners.iter().map(|l| l.points_3d.len()).sum::<usize>();
+        if i < boundary || i >= pts2d.len() {
+            return resolve_position_3d(i, outer, inners, pts2d, surface);
+        }
+        let key = Self::key(pts2d[i]);
+        let found = match self.positions.get(&key) {
+            Some(&p) => p,
+            None => {
+                let p = resolve_position_3d(i, outer, inners, pts2d, surface).ok();
+                self.positions.insert(key, p);
+                p
+            }
+        };
+        found.ok_or(CurvedCdtError::ProjectionFailed)
+    }
+
+    /// [`oriented_normal`], evaluating each (u, v) once.
+    fn normal<S: MeshChart + ?Sized>(
+        &mut self,
+        surface: &S,
+        face: &Face,
+        u: f64,
+        v: f64,
+    ) -> MathResult<Vector3> {
+        let key = Self::key((u, v));
+        let found = match self.normals.get(&key) {
+            Some(&n) => n,
+            None => {
+                let n = oriented_normal(surface, face, u, v).ok();
+                self.normals.insert(key, n);
+                n
+            }
+        };
+        found.ok_or(crate::math::MathError::InvalidParameter(
+            "surface normal undefined at this (u, v)".to_string(),
+        ))
+    }
 }
 
 /// Maximum number of Ruppert refinement passes. Ruppert is proven to
@@ -2518,11 +2676,13 @@ fn scan_one_pass<S: MeshChart + ?Sized>(
     surface: &S,
     face: &Face,
     params: &TessellationParams,
+    cache: &mut FidelityCache,
 ) -> RefinementDelta {
     // (1) α-style chord & normal violations (circumcenter insertion,
     //     centroid fallback).
-    let mut candidates =
-        collect_refinement_centroids(triangles, pts2d, outer, inners, surface, face, params);
+    let mut candidates = collect_refinement_centroids(
+        triangles, pts2d, outer, inners, surface, face, params, cache,
+    );
 
     // (2) Skinny-triangle circumcenters (fidelity-gated on developables
     //     only).
@@ -2591,6 +2751,7 @@ fn refine_to_convergence<S: MeshChart + ?Sized>(
     surface: &S,
     face: &Face,
     params: &TessellationParams,
+    cache: &mut FidelityCache,
 ) -> (Vec<(f64, f64)>, Vec<[usize; 3]>) {
     // Developable fast-path (cylinder / cone). A zero-Gaussian-curvature lateral
     // is already chord-faithful after the initial CDT: the developable-direction
@@ -2627,7 +2788,14 @@ fn refine_to_convergence<S: MeshChart + ?Sized>(
     let mut pts2d = initial_pts2d;
     let mut triangles = initial_triangles;
 
+    let mut profile = RefineProfile {
+        face: face.id,
+        passes: 0,
+        retriangulate: std::time::Duration::ZERO,
+        started: std::time::Instant::now(),
+    };
     for _pass in 0..RUPPERT_MAX_PASSES {
+        profile.passes += 1;
         let delta = scan_one_pass(
             &triangles,
             &pts2d,
@@ -2638,6 +2806,7 @@ fn refine_to_convergence<S: MeshChart + ?Sized>(
             surface,
             face,
             params,
+            cache,
         );
         if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
             eprintln!(
@@ -2681,7 +2850,10 @@ fn refine_to_convergence<S: MeshChart + ?Sized>(
             return (pts2d, triangles);
         }
 
-        match run_cdt(&outer.points_uv, inner_polygons, &steiner) {
+        let t_rerun = std::time::Instant::now();
+        let rerun = run_cdt(&outer.points_uv, inner_polygons, &steiner);
+        profile.retriangulate += t_rerun.elapsed();
+        match rerun {
             Ok((next_pts, next_tris)) => {
                 pts2d = next_pts;
                 triangles = next_tris;
@@ -2722,7 +2894,17 @@ pub(crate) fn tessellate_curved_cdt(
 ) -> Result<(), CurvedCdtError> {
     // Step 0 — boundary projection, in the surface's native (u, v) with the
     // periodicity unwrap and branch re-cuts.
+    let t_projection = std::time::Instant::now();
     let (mut outer, mut inners, outer_bbox) = run_boundary_projection(face, model, cache, surface)?;
+    if tess_profile_enabled() {
+        eprintln!(
+            "[tess-profile] face {} {} projection {:.1?} ({} outer samples)",
+            face.id,
+            surface.type_name(),
+            t_projection.elapsed(),
+            outer.points_uv.len()
+        );
+    }
 
     // A developable face (cylinder / cone) is then meshed in its ISOMETRIC
     // development: the projected boundary is mapped into it and Steps 1–5 run
@@ -2768,6 +2950,7 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
 ) -> Result<(), CurvedCdtError> {
     // Step 1 — chart handedness.
     let chart_sign = compute_chart_sign(surface, outer_bbox);
+    let t_stage = std::time::Instant::now();
 
     // Step 2 — Steiner candidates on a curvature-driven grid.
     let inner_polygons: Vec<Vec<(f64, f64)>> = inners.iter().map(|p| p.points_uv.clone()).collect();
@@ -2792,6 +2975,8 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
     }
 
     // Step 3 — first CDT run.
+    let t_steiner = t_stage.elapsed();
+    let t_stage = std::time::Instant::now();
     let (pts2d, triangles) = match run_cdt(&outer.points_uv, &inner_polygons, &steiner) {
         Ok(v) => v,
         Err(e) => {
@@ -2829,6 +3014,9 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
     // surfaces; the curved poke matrix + analytic-watertight + HARNESS-1000
     // guard correctness. Doubly-curved surfaces (sphere/torus/NURBS) still
     // refine.
+    let t_first_cdt = t_stage.elapsed();
+    let t_stage = std::time::Instant::now();
+    let mut cache = FidelityCache::default();
     let (final_pts2d, final_triangles) = refine_to_convergence(
         &outer,
         &inners,
@@ -2839,14 +3027,17 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
         surface,
         face,
         params,
+        &mut cache,
     );
 
     // Step 5 — mesh emission. Vertex base offset must be recorded so
     // triangle indices are rebased into `mesh.vertices` numbering.
+    let t_refine = t_stage.elapsed();
+    let t_stage = std::time::Instant::now();
     let vertex_base = mesh.vertices.len() as u32;
     for (i, &(u, v)) in final_pts2d.iter().enumerate() {
-        let position = resolve_position_3d(i, &outer, &inners, &final_pts2d, surface)?;
-        let normal = oriented_normal(surface, face, u, v).unwrap_or(Vector3::Z);
+        let position = cache.position(i, &outer, &inners, &final_pts2d, surface)?;
+        let normal = cache.normal(surface, face, u, v).unwrap_or(Vector3::Z);
         mesh.add_vertex(MeshVertex {
             position,
             normal,
@@ -2870,8 +3061,47 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
             mesh.add_triangle(a, c, b);
         }
     }
+    if tess_profile_enabled() {
+        eprintln!(
+            "[tess-profile] face {} steiner {:.1?} first-cdt {:.1?} refine {:.1?} emit {:.1?}              ({} triangles)",
+            face.id,
+            t_steiner,
+            t_first_cdt,
+            t_refine,
+            t_stage.elapsed(),
+            final_triangles.len()
+        );
+    }
 
     Ok(())
+}
+
+/// `ROSHERA_TESS_PROFILE` set: print per-stage timings of each curved face.
+fn tess_profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ROSHERA_TESS_PROFILE").is_some())
+}
+
+/// Refinement timings, reported when refinement returns (any exit).
+struct RefineProfile {
+    face: u32,
+    passes: usize,
+    retriangulate: std::time::Duration,
+    started: std::time::Instant,
+}
+
+impl Drop for RefineProfile {
+    fn drop(&mut self) {
+        if tess_profile_enabled() {
+            eprintln!(
+                "[tess-profile] face {} refine: {} passes, {:.1?} total, {:.1?} re-triangulating",
+                self.face,
+                self.passes,
+                self.started.elapsed(),
+                self.retriangulate
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4525,5 +4755,156 @@ mod trim_triangulation_tests {
                 .unwrap_or_else(|e| panic!("case {case}: valid domain refused: {e:?}"));
             assert_true_triangulation(&outer, &inners, &steiner, &pts, &tris);
         }
+    }
+}
+
+/// Refinement must not re-evaluate the surface for work it has already done.
+///
+/// On the GrabCAD bench vice, refinement was 88 % of curved-face meshing
+/// (143 s of 163 s): every pass re-evaluated the surface at every triangle's
+/// corners and centroid, including triangles unchanged since the last pass
+/// and corners shared by six triangles. Evaluations are counted through a
+/// wrapping chart on a doubly-curved (sphere) patch.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod refinement_cost_tests {
+    use super::*;
+    use crate::primitives::face::FaceOrientation;
+    use crate::primitives::surface::Sphere;
+    use std::cell::Cell;
+
+    struct Counting<'a> {
+        inner: &'a dyn Surface,
+        evaluations: Cell<usize>,
+    }
+
+    impl MeshChart for Counting<'_> {
+        fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
+            self.evaluations.set(self.evaluations.get() + 1);
+            MeshChart::evaluate_full(self.inner, u, v)
+        }
+        fn point_at(&self, u: f64, v: f64) -> MathResult<Point3> {
+            self.evaluations.set(self.evaluations.get() + 1);
+            MeshChart::point_at(self.inner, u, v)
+        }
+        fn normal_at(&self, u: f64, v: f64) -> MathResult<Vector3> {
+            self.evaluations.set(self.evaluations.get() + 1);
+            MeshChart::normal_at(self.inner, u, v)
+        }
+        fn is_developable(&self) -> bool {
+            MeshChart::is_developable(self.inner)
+        }
+        fn type_name(&self) -> &'static str {
+            MeshChart::type_name(self.inner)
+        }
+        fn native_uv(&self, u: f64, v: f64) -> (f64, f64) {
+            MeshChart::native_uv(self.inner, u, v)
+        }
+        fn rulings_along_v(&self) -> bool {
+            MeshChart::rulings_along_v(self.inner)
+        }
+    }
+
+    fn sphere_patch_mesh(chart: &Counting<'_>) -> TriangleMesh {
+        let (u0, u1, v0, v1) = (0.3, 1.3, -0.5, 0.5);
+        let n = 24;
+        let mut uv = Vec::new();
+        for i in 0..n {
+            uv.push((u0 + (u1 - u0) * i as f64 / n as f64, v0));
+        }
+        for i in 0..n {
+            uv.push((u1, v0 + (v1 - v0) * i as f64 / n as f64));
+        }
+        for i in 0..n {
+            uv.push((u1 - (u1 - u0) * i as f64 / n as f64, v1));
+        }
+        for i in 0..n {
+            uv.push((u0, v1 - (v1 - v0) * i as f64 / n as f64));
+        }
+        let outer = ProjectedLoop {
+            points_3d: uv
+                .iter()
+                .map(|&(u, v)| chart.inner.point_at(u, v).expect("on the sphere"))
+                .collect(),
+            points_uv: uv,
+            loop_type: LoopType::Outer,
+        };
+        let face = Face::new(0, 0, 0, FaceOrientation::Forward);
+        let params = TessellationParams {
+            chord_tolerance: 0.01,
+            max_angle_deviation: 0.05,
+            ..TessellationParams::default()
+        };
+        let mut mesh = TriangleMesh::new();
+        mesh_in_chart(
+            chart,
+            &face,
+            &params,
+            &mut mesh,
+            outer,
+            Vec::new(),
+            (u0, u1, v0, v1),
+        )
+        .expect("a sphere patch meshes");
+        mesh
+    }
+
+    fn mesh_hash(mesh: &TriangleMesh) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for v in &mesh.vertices {
+            (
+                v.position.x.to_bits(),
+                v.position.y.to_bits(),
+                v.position.z.to_bits(),
+            )
+                .hash(&mut h);
+            (
+                v.normal.x.to_bits(),
+                v.normal.y.to_bits(),
+                v.normal.z.to_bits(),
+            )
+                .hash(&mut h);
+        }
+        for t in &mesh.triangles {
+            t.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    #[test]
+    fn refinement_evaluates_each_vertex_and_triangle_once() {
+        let sphere = Sphere::new(Point3::ZERO, 10.0).expect("sphere");
+        let surface: &dyn Surface = &sphere;
+        let chart = Counting {
+            inner: surface,
+            evaluations: Cell::new(0),
+        };
+        let mesh = sphere_patch_mesh(&chart);
+        let (evals, tris, verts) = (
+            chart.evaluations.get(),
+            mesh.triangles.len(),
+            mesh.vertices.len(),
+        );
+        println!(
+            "sphere patch: {tris} triangles, {verts} vertices, {evals} surface evaluations, \
+             mesh hash {:016x}",
+            mesh_hash(&mesh)
+        );
+        assert!(
+            tris > 500,
+            "the patch must actually refine ({tris} triangles)"
+        );
+        // Each vertex needs its position and normal once; each triangle
+        // ever built needs its centroid position and normal once (about
+        // 1.5x the final count across passes); emission reads each vertex
+        // again. Anything near 8 evaluations per triangle per pass is
+        // repeated work.
+        assert!(
+            evals <= 8 * tris,
+            "{evals} surface evaluations for {tris} triangles ({:.1} per triangle): \
+             refinement is re-evaluating unchanged work",
+            evals as f64 / tris as f64
+        );
     }
 }
