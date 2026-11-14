@@ -59,15 +59,18 @@ export function GizmoNav() {
       <GizmoHelper alignment="top-right" margin={[overlaid ? 72 + 336 : 72, 72]} renderPriority={2}>
         {/* A view cube (the approved mockup): click a face, edge or corner
             to look from that side. */}
-        <group scale={1.15}>
+        {/* A light cube with medium-weight grey labels and fine edges, in
+            both themes -- the CAD-standard look (Fusion, SolidWorks). Bold
+            white labels on dark faces crowded the faces (Varun 2026-11-14:
+            "now it looks even bad"). */}
+        <group scale={1.05}>
           <GizmoViewcube
             faces={Z_UP_FACES}
-            // Bold, larger labels: the thin default read as noise at this size.
-            font="700 30px Inter, system-ui, sans-serif"
-            color={dark ? '#4a5059' : '#f4f5f7'}
+            font="600 22px Inter, system-ui, sans-serif"
+            color={dark ? '#d9dce1' : '#f1f2f4'}
             hoverColor="#f2a516"
-            textColor={dark ? '#f3f4f6' : '#1d2125'}
-            strokeColor={dark ? '#7b828c' : '#9aa1a9'}
+            textColor="#4a5059"
+            strokeColor={dark ? '#5b626b' : '#a3a9b1'}
             opacity={1}
             onClick={onFace}
           />
