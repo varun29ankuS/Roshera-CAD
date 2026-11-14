@@ -347,7 +347,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [lines, agentAttention, overrideHeight])
+  }, [lines, agentAttention, overrideHeight, isProcessing])
 
   useEffect(() => {
     if (isPanelOpen) {
@@ -706,6 +706,14 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
               transcript because that is where the turn actually stopped —
               hoisting them into chrome would separate the ask from the work
               that prompted it. */}
+          {/* What the agent is doing, before its reply has a line to sit
+              in (once it does, the status moves under the reply). */}
+          {isProcessing && streamingLineId === null && (
+            <div className="px-3">
+              <TurnStatusLine />
+            </div>
+          )}
+
           {pendingPermissions.map((req) => (
             <div key={String(req.requestId)} className="px-3">
               <PermissionCard request={req} />
@@ -719,9 +727,6 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
           transcript; what it sends still lands in the notebook as a normal
           line. Never disabled mid-turn: the transport queues serially and
           the strip below makes that queue visible. */}
-      {/* What the agent is doing right now — one live line above the
-          composer, like Claude Code's status line. */}
-      <TurnStatusLine />
 
       <div className="shrink-0 border-t border-border">
         {/* Someone watching the render rather than the transcript still has

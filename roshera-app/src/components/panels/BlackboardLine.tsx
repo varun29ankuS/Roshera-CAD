@@ -9,6 +9,7 @@ import { lineVerdict, type LineVerdict } from '@/lib/blackboard-line-state'
 import { useSceneStore } from '@/stores/scene-store'
 import type { BlackboardLine as Line } from '@/stores/blackboard-store'
 import { MessageMarkdown } from './MessageMarkdown'
+import { TurnStatusLine } from './TurnStatusLine'
 import { StreamingLineText } from './StreamingLineText'
 import {
   ExpandableProse,
@@ -390,17 +391,17 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
           // NOT height-capped: clamping the text currently arriving would
           // fight the board's scroll-to-newest.
           <div className="w-full max-w-[72ch] select-text rounded-sm border-l-2 border-primary/50 bg-primary/[0.03] pl-2 text-left text-sm leading-relaxed text-foreground/90">
-            {line.text.trim() ? (
+            {line.text.trim() && (
               <CardActionsContext.Provider value={cardActions}>
                 <RevealContext.Provider value={reveal}>
                   <StreamingLineText text={line.text} />
                 </RevealContext.Provider>
               </CardActionsContext.Provider>
-            ) : (
-              <span className="mt-0.5 inline-flex items-center">
-                <span className="chalk-cursor" />
-              </span>
             )}
+            {/* What the agent is doing, where the reply is arriving -- in
+                place of a blinking cursor (Varun 2026-11-14: "users don't
+                need to see a blinking cursor"). */}
+            <TurnStatusLine />
           </div>
         ) : toolCall ? (
           // A tool call reads as a chip row — mono name, status glyph +

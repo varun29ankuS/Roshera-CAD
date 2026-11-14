@@ -1,10 +1,11 @@
 /**
  * TURN STATUS LINE
  * ================
- * What the agent is doing RIGHT NOW, anchored at the foot of the Blackboard
- * above the composer — the way Claude Code keeps one live line at the bottom
- * of the terminal: a turning mark, a word for the work, how long it has been
- * going, how much it has moved, and the tool call actually running.
+ * What the agent is doing RIGHT NOW, shown where its reply arrives (under
+ * the reply as it streams, or at the end of the thread before it starts) --
+ * in place of a blinking cursor (Varun 2026-11-14): a turning mark, a word
+ * for the work, how long it has been going, how much it has moved, and the
+ * tool call actually running.
  *
  * The verb is play, not information, and is drawn only from mechanical
  * engineering so it reads as the shop floor rather than as noise. Everything
@@ -144,7 +145,7 @@ export function TurnStatusLine() {
     <div
       role="status"
       aria-live="polite"
-      className="shrink-0 border-t border-border px-3 py-1.5 text-xs"
+      className="py-1 text-xs"
     >
       <div className="flex items-baseline gap-2">
         <span aria-hidden className="w-3 shrink-0 text-center text-primary">

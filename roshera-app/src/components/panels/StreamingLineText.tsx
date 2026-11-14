@@ -30,7 +30,6 @@ export function StreamingLineText({ text }: { text: string }) {
           className="mt-0.5 inline-flex items-center gap-1.5 text-[11px] text-muted-foreground/80"
           title="The expression renders complete — streaming raw LaTeX is withheld by design"
         >
-          <span className="chalk-cursor" />
           {view.pending === 'math' ? 'writing an expression…' : 'writing a result…'}
         </span>
       )}
