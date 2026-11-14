@@ -12265,3 +12265,53 @@ async fn the_history_lists_each_steps_editable_sizes_with_their_current_values()
     );
     assert_eq!(radius["edited"], true, "{radius}");
 }
+
+/// The agent SHOWS the user something in the app (Varun 2026-11-14: "agents
+/// should be able to control the view as well"): `POST /api/agent/show`
+/// reaches every open app as one `AgentShow` frame on the live channel --
+/// the action and the agent's caption, exactly as sent.
+#[tokio::test]
+async fn an_agent_show_reaches_the_open_apps_as_one_frame() {
+    let state = make_test_state().await;
+    let mut rx = crate::geometry_broadcaster().subscribe();
+    let caption = format!("the bore -- {}", uuid::Uuid::new_v4());
+    let (s, body) = dispatch(
+        &state,
+        json_post(
+            "/api/agent/show",
+            serde_json::json!({ "action": "feature", "name": "Bore", "caption": caption }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    // The channel is shared by every test: find OUR frame by its caption.
+    let mut found = None;
+    while let Ok(text) = rx.try_recv() {
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if frame["type"] == "AgentShow" && frame["payload"]["caption"] == caption.as_str() {
+            found = Some(frame);
+        }
+    }
+    let frame = found.expect("an AgentShow frame with our caption");
+    assert_eq!(frame["payload"]["action"], "feature", "{frame}");
+    assert_eq!(frame["payload"]["name"], "Bore", "{frame}");
+}
+
+/// An action the app cannot carry out is refused before anything is sent.
+#[tokio::test]
+async fn an_agent_show_with_an_unknown_action_is_refused() {
+    let state = make_test_state().await;
+    let (s, _) = dispatch(
+        &state,
+        json_post(
+            "/api/agent/show",
+            serde_json::json!({ "action": "launch_rocket" }),
+        ),
+    )
+    .await;
+    // A REFUSAL by the route, not a route that does not exist.
+    assert!(
+        s == StatusCode::BAD_REQUEST || s == StatusCode::UNPROCESSABLE_ENTITY,
+        "status {s}"
+    );
+}

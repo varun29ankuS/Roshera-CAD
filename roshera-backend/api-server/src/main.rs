@@ -18,6 +18,7 @@ mod agent_activity;
 mod agent_registry;
 #[cfg(test)]
 mod agent_registry_tests;
+mod agent_show;
 mod ai_provider_config;
 mod assembly_instances;
 mod assembly_mates;
@@ -11594,6 +11595,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/agent/faces/{id}", get(handlers::agent::query_face))
         .route("/api/agent/edges/{id}", get(handlers::agent::query_edge))
         .route("/api/agent/hover/{id}", get(handlers::agent::query_hover))
+        // The agent shows the user something in the app (agent_show.rs).
+        .route("/api/agent/show", post(agent_show::show))
         // Session endpoints
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route(
