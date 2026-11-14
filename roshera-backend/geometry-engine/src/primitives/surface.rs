@@ -5023,6 +5023,14 @@ impl GeneralNurbsSurface {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Global footpoint searches run on this thread (test instrumentation:
+    /// a caller that has a good seed should not need one).
+    pub(crate) static GLOBAL_FOOTPOINT_SEARCHES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 impl GeneralNurbsSurface {
     /// Local footpoint of `point` from `seed`: Gauss-Newton on the squared
     /// distance, with a backtracking line search so a step never moves away
@@ -5326,6 +5334,8 @@ impl Surface for GeneralNurbsSurface {
 
     #[allow(non_snake_case)] // E, F, G are standard First Fundamental Form names
     fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
+        #[cfg(test)]
+        GLOBAL_FOOTPOINT_SEARCHES.with(|n| n.set(n.get() + 1));
         // Global footpoint: seed from a parameter grid, then run the local
         // solver from the few best seeds and keep the nearest result. One seed
         // is not enough on a strongly curved patch -- the nearest grid node

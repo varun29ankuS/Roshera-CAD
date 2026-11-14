@@ -3268,16 +3268,29 @@ impl BRepModel {
         });
         lap("display mesh", t);
         let t = std::time::Instant::now();
+        // Each facet's true surface normal, found once for both checks.
+        let true_normals = display_mesh
+            .as_ref()
+            .map(|m| crate::harness::watertight::facet_true_normals(self, m))
+            .unwrap_or_default();
         let tessellation = display_mesh
             .as_ref()
-            .and_then(|m| crate::harness::watertight::tessellation_quality_of_mesh(self, m))
+            .and_then(|m| {
+                crate::harness::watertight::tessellation_quality_with_normals(
+                    self,
+                    m,
+                    &true_normals,
+                )
+            })
             .unwrap_or_else(crate::primitives::provenance::TessellationQuality::empty);
         // Mesh-quality: catches a render mesh that is watertight + correctly
         // oriented yet violates a CAD tessellation rule — a facet bridging across
         // a bore (the "wing"), a far-off-surface normal, etc.
         let mesh_quality = display_mesh
             .as_ref()
-            .and_then(|m| crate::harness::watertight::mesh_quality_of_mesh(self, m))
+            .and_then(|m| {
+                crate::harness::watertight::mesh_quality_with_normals(self, m, &true_normals)
+            })
             .unwrap_or_else(crate::primitives::provenance::MeshQuality::empty);
         drop(display_mesh);
         lap("quality checks", t);

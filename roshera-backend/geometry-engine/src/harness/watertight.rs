@@ -515,13 +515,23 @@ pub fn tessellation_quality_of_mesh(
     model: &BRepModel,
     mesh: &crate::tessellation::TriangleMesh,
 ) -> Option<crate::primitives::provenance::TessellationQuality> {
+    tessellation_quality_with_normals(model, mesh, &facet_true_normals(model, mesh))
+}
+
+/// [`tessellation_quality_of_mesh`] given each facet's true surface normal
+/// ([`facet_true_normals`]), so a caller running both quality checks on one
+/// mesh finds every facet's footpoint once.
+pub fn tessellation_quality_with_normals(
+    model: &BRepModel,
+    mesh: &crate::tessellation::TriangleMesh,
+    true_normals: &[Option<crate::math::Vector3>],
+) -> Option<crate::primitives::provenance::TessellationQuality> {
     use crate::primitives::provenance::{TessFaceDefect, TessellationQuality};
     use std::cmp::Ordering::Equal;
     if mesh.triangles.is_empty() {
         return None;
     }
     let has_faces = mesh.face_map.len() == mesh.triangles.len();
-    let tol = model.tolerance;
 
     // Per-face: (triangles, degenerate, stored_agree, analytic_agree, comparable).
     let mut per_face: HashMap<u32, (usize, usize, usize, usize, usize)> = HashMap::new();
@@ -553,16 +563,12 @@ pub fn tessellation_quality_of_mesh(
         }
         // (2) analytic-normal agreement (ground truth). Unresolvable normal ⇒
         // treat as agreeing rather than manufacture a false defect.
-        if analytic_facet_agrees(
-            model,
-            fid,
-            &v0.position,
-            &v1.position,
-            &v2.position,
-            &geo,
-            tol,
-        )
-        .unwrap_or(true)
+        // Unresolvable normal => agreeing (never manufacture a defect).
+        if true_normals
+            .get(i)
+            .copied()
+            .flatten()
+            .is_none_or(|n| n.dot(&geo) > 0.0)
         {
             analytic_agree += 1;
             entry.3 += 1;
@@ -636,58 +642,130 @@ pub fn tessellation_quality_of_mesh(
     ))
 }
 
-/// `Some(true)` if the facet's winding normal `geo` sits in the same hemisphere as
-/// the TRUE surface normal at the facet centroid (oriented by the owning face's
-/// sense); `Some(false)` if it points the wrong way (off-surface / scribbled).
-/// `None` when the face / surface / normal can't be resolved (caller treats as
-/// agreeing).
-fn analytic_facet_agrees(
+/// Each facet's TRUE surface normal at its centroid, oriented by face sense
+/// and normalised, parallel to `mesh.triangles`; `None` where it cannot be
+/// resolved (no face, a degenerate facet, no footpoint).
+///
+/// The footpoint is searched locally: from the facet's own vertices' (u, v)
+/// where the tessellator recorded them, otherwise from the previous facet's
+/// footpoint on the same face (facets are emitted neighbour by neighbour).
+/// The global search runs only without a seed, or when the local answer
+/// lands farther from the centroid than half the facet's longest edge (a
+/// wrong branch; the true footpoint is a sagitta away).
+/// A global search per facet, twice (once per quality check), was 70 s of
+/// the bench vice's 100 s of certification.
+pub fn facet_true_normals(
     model: &BRepModel,
-    face_id: u32,
-    p0: &crate::math::Point3,
-    p1: &crate::math::Point3,
-    p2: &crate::math::Point3,
-    geo: &crate::math::Vector3,
-    tol: crate::math::Tolerance,
-) -> Option<bool> {
-    let face = model.faces.get(face_id)?;
-    let surface = model.surfaces.get(face.surface_id)?;
-    let centroid = crate::math::Point3::new(
-        (p0.x + p1.x + p2.x) / 3.0,
-        (p0.y + p1.y + p2.y) / 3.0,
-        (p0.z + p1.z + p2.z) / 3.0,
-    );
-    let (u, v) = surface.closest_point(&centroid, tol).ok()?;
-    let n = surface.normal_at(u, v).ok()?;
-    let oriented = n * face.orientation.sign();
-    Some(oriented.dot(geo) > 0.0)
+    mesh: &crate::tessellation::TriangleMesh,
+) -> Vec<Option<crate::math::Vector3>> {
+    let has_faces = mesh.face_map.len() == mesh.triangles.len();
+    let tol = model.tolerance;
+    let mut previous: Option<(u32, (f64, f64))> = None;
+    mesh.triangles
+        .iter()
+        .enumerate()
+        .map(|(i, tri)| {
+            let fid = if has_faces { mesh.face_map[i] } else { 0 };
+            let face = model.faces.get(fid)?;
+            let surface = model.surfaces.get(face.surface_id)?;
+            let v = |k: usize| mesh.vertices.get(tri[k] as usize).copied();
+            let (v0, v1, v2) = (v(0)?, v(1)?, v(2)?);
+            let (p0, p1, p2) = (v0.position, v1.position, v2.position);
+            let centroid = crate::math::Point3::new(
+                (p0.x + p1.x + p2.x) / 3.0,
+                (p0.y + p1.y + p2.y) / 3.0,
+                (p0.z + p1.z + p2.z) / 3.0,
+            );
+            let reach = 0.5
+                * (p1 - p0)
+                    .magnitude()
+                    .max((p2 - p1).magnitude())
+                    .max((p0 - p2).magnitude());
+            let previous_here = previous.filter(|(f, _)| *f == fid).map(|(_, uv)| uv);
+            let (u, w) = facet_footpoint(
+                surface,
+                &centroid,
+                [v0.uv, v1.uv, v2.uv],
+                previous_here,
+                reach,
+                tol,
+            )?;
+            previous = Some((fid, (u, w)));
+            (surface.normal_at(u, w).ok()? * face.orientation.sign())
+                .normalize()
+                .ok()
+        })
+        .collect()
 }
 
-/// Angle (degrees) between a facet's winding normal `geo` and the TRUE surface
-/// normal at its centroid (oriented by face sense). `None` if unresolvable.
-fn analytic_facet_deviation_deg(
-    model: &BRepModel,
-    face_id: u32,
-    p0: &crate::math::Point3,
-    p1: &crate::math::Point3,
-    p2: &crate::math::Point3,
-    geo: &crate::math::Vector3,
+/// The (u, v) of the surface point nearest `centroid`, started from the mean
+/// of the facet's vertex parameters (unwrapped across a periodic seam), with
+/// the global search as the fallback.
+fn facet_footpoint(
+    surface: &dyn crate::primitives::surface::Surface,
+    centroid: &crate::math::Point3,
+    uvs: [Option<(f64, f64)>; 3],
+    previous: Option<(f64, f64)>,
+    reach: f64,
     tol: crate::math::Tolerance,
-) -> Option<f64> {
-    let face = model.faces.get(face_id)?;
-    let surface = model.surfaces.get(face.surface_id)?;
-    let centroid = crate::math::Point3::new(
-        (p0.x + p1.x + p2.x) / 3.0,
-        (p0.y + p1.y + p2.y) / 3.0,
-        (p0.z + p1.z + p2.z) / 3.0,
-    );
-    let (u, v) = surface.closest_point(&centroid, tol).ok()?;
-    let n = (surface.normal_at(u, v).ok()? * face.orientation.sign())
-        .normalize()
-        .ok()?;
+) -> Option<(f64, f64)> {
+    let seed = match uvs {
+        [Some(a), Some(b), Some(c)] => {
+            let near = |x0: f64, x: f64, period: Option<f64>| match period {
+                Some(t) if t > 0.0 => x - t * ((x - x0) / t).round(),
+                _ => x,
+            };
+            let (pu, pv) = (surface.period_u(), surface.period_v());
+            Some((
+                (a.0 + near(a.0, b.0, pu) + near(a.0, c.0, pu)) / 3.0,
+                (a.1 + near(a.1, b.1, pv) + near(a.1, c.1, pv)) / 3.0,
+            ))
+        }
+        _ => previous,
+    };
+    if let Some(seed) = seed {
+        if let Ok(uv) = surface.closest_point_near(centroid, seed, tol) {
+            if is_footpoint(surface, centroid, uv, reach) {
+                return Some(uv);
+            }
+        }
+    }
+    surface.closest_point(centroid, tol).ok()
+}
+
+/// Is `uv` a footpoint of `p` within `reach`: the surface point there is
+/// near, and the miss is normal to the surface (orthogonal to both tangents
+/// to 1e-6 relative)? A local solve that stopped short, or settled on a
+/// shoulder, fails this and the caller searches globally.
+fn is_footpoint(
+    surface: &dyn crate::primitives::surface::Surface,
+    p: &crate::math::Point3,
+    uv: (f64, f64),
+    reach: f64,
+) -> bool {
+    let Ok(sp) = surface.evaluate_full(uv.0, uv.1) else {
+        return false;
+    };
+    let r = sp.position - *p;
+    let miss = r.magnitude();
+    if miss > reach {
+        return false;
+    }
+    if miss <= 1e-12 {
+        return true;
+    }
+    let along = |t: crate::math::Vector3| {
+        let len = t.magnitude();
+        len <= 0.0 || (r.dot(&t) / (len * miss)).abs() <= 1e-6
+    };
+    along(sp.du) && along(sp.dv)
+}
+
+/// Angle (degrees) between a facet's winding normal `geo` and the unit true
+/// surface normal `n`. `None` for a degenerate facet.
+fn facet_deviation_deg(geo: &crate::math::Vector3, n: &crate::math::Vector3) -> Option<f64> {
     let g = geo.normalize().ok()?;
-    let dot = g.dot(&n).clamp(-1.0, 1.0);
-    Some(dot.acos().to_degrees())
+    Some(g.dot(n).clamp(-1.0, 1.0).acos().to_degrees())
 }
 
 /// Angular extent a triangle covers on a periodic direction of period `p` — the
@@ -876,13 +954,22 @@ pub fn mesh_quality_of_mesh(
     model: &BRepModel,
     mesh: &crate::tessellation::TriangleMesh,
 ) -> Option<crate::primitives::provenance::MeshQuality> {
+    mesh_quality_with_normals(model, mesh, &facet_true_normals(model, mesh))
+}
+
+/// [`mesh_quality_of_mesh`] given each facet's true surface normal
+/// ([`facet_true_normals`]).
+pub fn mesh_quality_with_normals(
+    model: &BRepModel,
+    mesh: &crate::tessellation::TriangleMesh,
+    true_normals: &[Option<crate::math::Vector3>],
+) -> Option<crate::primitives::provenance::MeshQuality> {
     use crate::primitives::provenance::{MeshFaceQualityDefect, MeshQuality};
     use std::cmp::Ordering::Equal;
     if mesh.triangles.is_empty() {
         return None;
     }
     let has_faces = mesh.face_map.len() == mesh.triangles.len();
-    let tol = model.tolerance;
 
     // Every periodic face's own u-extent, measured before any facet is judged.
     // `is_bridging_facet` cannot decide the exactly-half-period case from the
@@ -929,7 +1016,12 @@ pub fn mesh_quality_of_mesh(
         entry.1 = entry.1.min(tmin);
 
         // Normal deviation from the true surface.
-        if let Some(dev) = analytic_facet_deviation_deg(model, fid, &p0, &p1, &p2, &geo, tol) {
+        if let Some(dev) = true_normals
+            .get(i)
+            .copied()
+            .flatten()
+            .and_then(|n| facet_deviation_deg(&geo, &n))
+        {
             max_dev = max_dev.max(dev);
             entry.2 = entry.2.max(dev);
         }
@@ -1533,6 +1625,121 @@ mod tests {
         assert!(
             r.is_valid_solid(),
             "sphere poke-through ∩ must be a valid closed/manifold/oriented solid: {r:?}"
+        );
+    }
+}
+
+/// The certificate's two mesh-quality checks judge every facet against the
+/// TRUE surface normal at its centroid. Found by a global footpoint search per
+/// facet, twice (once per check), that was 70 s of the bench vice's 100 s of
+/// certification. A facet's vertices carry their (u, v): the search starts
+/// there. The verdicts must not change.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod facet_footpoint_tests {
+    use super::*;
+    use crate::math::Point3;
+    use crate::operations::nurbs_loft::{nurbs_loft, NurbsLoftOptions};
+    use crate::primitives::surface::GLOBAL_FOOTPOINT_SEARCHES;
+    use crate::tessellation::{tessellate_solid, TessellationParams};
+
+    fn ring(n: usize, r: f64, z: f64) -> Vec<Point3> {
+        (0..n)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::TAU / n as f64;
+                Point3::new(r * a.cos(), r * a.sin(), z)
+            })
+            .collect()
+    }
+
+    fn barrel() -> (BRepModel, SolidId, crate::tessellation::TriangleMesh) {
+        let mut m = BRepModel::new();
+        let sections = vec![
+            ring(20, 20.0, 0.0),
+            ring(20, 30.0, 15.0),
+            ring(20, 35.0, 30.0),
+            ring(20, 30.0, 45.0),
+            ring(20, 20.0, 60.0),
+        ];
+        let s = nurbs_loft(&mut m, sections, NurbsLoftOptions::default()).expect("barrel");
+        let mesh = {
+            let solid = m.solids.get(s).expect("solid");
+            tessellate_solid(solid, &m, &TessellationParams::default())
+        };
+        (m, s, mesh)
+    }
+
+    /// The deviation every facet would get from a global search: the oracle.
+    fn brute_max_deviation(model: &BRepModel, mesh: &crate::tessellation::TriangleMesh) -> f64 {
+        let mut worst = 0.0_f64;
+        for (i, t) in mesh.triangles.iter().enumerate() {
+            let (p0, p1, p2) = (
+                mesh.vertices[t[0] as usize].position,
+                mesh.vertices[t[1] as usize].position,
+                mesh.vertices[t[2] as usize].position,
+            );
+            let geo = (p1 - p0).cross(&(p2 - p0));
+            if geo.magnitude() <= 1e-12 {
+                continue;
+            }
+            let face = model.faces.get(mesh.face_map[i]).expect("face");
+            let surface = model.surfaces.get(face.surface_id).expect("surface");
+            let c = Point3::new(
+                (p0.x + p1.x + p2.x) / 3.0,
+                (p0.y + p1.y + p2.y) / 3.0,
+                (p0.z + p1.z + p2.z) / 3.0,
+            );
+            let (u, v) = surface
+                .closest_point(&c, model.tolerance)
+                .expect("footpoint");
+            let n = (surface.normal_at(u, v).expect("normal") * face.orientation.sign())
+                .normalize()
+                .expect("unit");
+            let d = geo.normalize().expect("unit").dot(&n).clamp(-1.0, 1.0);
+            worst = worst.max(d.acos().to_degrees());
+        }
+        worst
+    }
+
+    #[test]
+    fn facet_checks_start_from_the_facets_own_uv() {
+        let (model, _, mesh) = barrel();
+        let nurbs_facets = mesh
+            .face_map
+            .iter()
+            .filter(|&&f| {
+                let face = model.faces.get(f).expect("face");
+                model
+                    .surfaces
+                    .get(face.surface_id)
+                    .expect("surface")
+                    .type_name()
+                    == "NurbsSurface"
+            })
+            .count();
+        assert!(
+            nurbs_facets > 1000,
+            "fixture must have a real NURBS wall ({nurbs_facets})"
+        );
+        GLOBAL_FOOTPOINT_SEARCHES.with(|n| n.set(0));
+        let tq = tessellation_quality_of_mesh(&model, &mesh).expect("tess quality");
+        let mq = mesh_quality_of_mesh(&model, &mesh).expect("mesh quality");
+        let searches = GLOBAL_FOOTPOINT_SEARCHES.with(|n| n.get());
+        assert!(
+            searches * 20 <= nurbs_facets,
+            "{searches} global footpoint searches for {nurbs_facets} NURBS facets: each facet \
+             must start from its own vertices' (u, v)"
+        );
+        // Same verdicts as the global search gives.
+        let brute = brute_max_deviation(&model, &mesh);
+        assert!(
+            (mq.max_normal_deviation_deg - brute).abs() < 1e-6,
+            "max normal deviation {} vs the global search's {brute}",
+            mq.max_normal_deviation_deg
+        );
+        assert_eq!(
+            tq.off_surface_facets, 0,
+            "a clean barrel has no off-surface facets"
         );
     }
 }
