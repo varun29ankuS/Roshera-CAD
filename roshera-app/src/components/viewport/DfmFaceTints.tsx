@@ -1,13 +1,10 @@
-import { useEffect, useMemo } from 'react'
-import * as THREE from 'three'
+import { useMemo } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useDfmStore } from '@/stores/dfm-store'
 import { dfmFaceTints } from '@/lib/dfm'
-
-/** How far tint triangles sit off the face, so they paint on it rather than
- *  fight it in the depth buffer (the GD&T tints use the same offset). */
-const TINT_OFFSET = 0.002
+import { TintMesh } from './face-tint'
+import { facePositions } from '@/lib/face-positions'
 
 const FIX = '#D23B3B'
 const UNKNOWN = '#E3A51A'
@@ -66,62 +63,4 @@ export function DfmFaceTints() {
       ))}
     </group>
   )
-}
-
-function TintMesh({ positions, color, opacity }: { positions: Float32Array; color: string; opacity: number }) {
-  const geometry = useMemo(() => {
-    const g = new THREE.BufferGeometry()
-    g.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-    g.computeVertexNormals()
-    return g
-  }, [positions])
-  useEffect(() => () => geometry.dispose(), [geometry])
-  return (
-    <mesh geometry={geometry} renderOrder={2}>
-      {/* Pulled toward the camera in depth, so the tint wins over the face
-          it lies on instead of speckling against it. */}
-      <meshBasicMaterial
-        color={color}
-        transparent
-        opacity={opacity}
-        side={THREE.DoubleSide}
-        depthWrite={false}
-        polygonOffset
-        polygonOffsetFactor={-2}
-        polygonOffsetUnits={-4}
-      />
-    </mesh>
-  )
-}
-
-/** World-space triangles of the given faces, lifted a hair off the surface. */
-function facePositions(mesh: THREE.Mesh, faceIds: ArrayLike<number>, wanted: Set<number>): Float32Array | null {
-  if (wanted.size === 0) return null
-  const geom = mesh.geometry
-  const pos = geom.getAttribute('position') as THREE.BufferAttribute | undefined
-  if (!pos) return null
-  const index = geom.getIndex()
-  mesh.updateWorldMatrix(true, false)
-  const world = mesh.matrixWorld
-  const a = new THREE.Vector3()
-  const b = new THREE.Vector3()
-  const c = new THREE.Vector3()
-  const n = new THREE.Vector3()
-  const ab = new THREE.Vector3()
-  const ac = new THREE.Vector3()
-  const out: number[] = []
-  for (let t = 0; t < faceIds.length; t++) {
-    if (!wanted.has(faceIds[t])) continue
-    const i0 = t * 3
-    const v0 = index ? index.getX(i0) : i0
-    const v1 = index ? index.getX(i0 + 1) : i0 + 1
-    const v2 = index ? index.getX(i0 + 2) : i0 + 2
-    if (v0 >= pos.count || v1 >= pos.count || v2 >= pos.count) continue
-    a.fromBufferAttribute(pos, v0).applyMatrix4(world)
-    b.fromBufferAttribute(pos, v1).applyMatrix4(world)
-    c.fromBufferAttribute(pos, v2).applyMatrix4(world)
-    n.crossVectors(ab.subVectors(b, a), ac.subVectors(c, a)).normalize()
-    for (const p of [a, b, c]) out.push(p.x + n.x * TINT_OFFSET, p.y + n.y * TINT_OFFSET, p.z + n.z * TINT_OFFSET)
-  }
-  return out.length > 0 ? new Float32Array(out) : null
 }

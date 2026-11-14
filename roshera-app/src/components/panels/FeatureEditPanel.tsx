@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils'
 import { Box, ToolIcons } from '@/components/ui/icons'
 import { useChapters } from '@/hooks/use-chapters'
 import { useHistoryView } from '@/stores/history-view-store'
+import { useFeatureLocationStore } from '@/stores/feature-location-store'
 import { chapterIconKey, chapterTitle, type Chapter } from '@/lib/chapters-api'
 import {
   applyEdit,
@@ -43,7 +44,16 @@ type Outcome = { key: string; kind: 'busy' } | { key: string; kind: 'refused'; r
  * scratch copy first and refuses, in its own words, when a later feature
  * would break or the part would not be sound -- nothing changes then.
  */
-export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
+export function FeatureEditPanel({
+  branch = 'main',
+  placement = 'column',
+}: {
+  branch?: string
+  /** `callout`: on the part, at the arrow (when the feature was found on it);
+   *  `column`: under the tree (when it was not -- e.g. a fillet). */
+  placement?: 'column' | 'callout'
+}) {
+  const located = useFeatureLocationStore((s) => s.located)
   const selected = useHistoryView((s) => s.selectedChapter)
   const select = useHistoryView((s) => s.selectChapter)
   const { chapters } = useChapters(branch)
@@ -78,6 +88,8 @@ export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
   }, [branch, selected, chapters, reload])
 
   if (!chapter) return null
+  const onPart = located.has(chapter.anchor)
+  if (placement === 'column' ? onPart : !onPart) return null
 
   const fields = featureFields(chapter, params)
   const key = chapterIconKey(chapter.kind)
@@ -105,7 +117,13 @@ export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
   }
 
   return (
-    <section aria-label={`Edit ${title}`} className="overflow-hidden rounded-lg border border-border bg-card/95 text-xs shadow-sm">
+    <section
+      aria-label={`Edit ${title}`}
+      className={cn(
+        'overflow-hidden rounded-lg border bg-card text-xs',
+        placement === 'callout' ? 'w-60 border-[var(--cad-selected)] shadow-lg' : 'border-border bg-card/95 shadow-sm',
+      )}
+    >
       <div className="flex items-center gap-2 px-2.5 pb-1.5 pt-2">
         <Icon size={17} />
         <span className="min-w-0 flex-1 truncate text-[12.5px] font-semibold">
@@ -169,6 +187,11 @@ export function FeatureEditPanel({ branch = 'main' }: { branch?: string }) {
               </div>
             )
           })}
+          {placement === 'column' && (
+            <p className="text-[11px] text-muted-foreground">
+              Not marked on the part: this feature records no shape to find it by.
+            </p>
+          )}
           {chapter.instances.length > 0 && (
             <p className="text-[11px] text-muted-foreground">Applies to all {chapter.instances.length} instances.</p>
           )}

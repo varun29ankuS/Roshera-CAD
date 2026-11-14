@@ -1,4 +1,5 @@
 import { HistoryViewBanner } from './HistoryViewBanner'
+import { FeatureHighlight } from './FeatureHighlight'
 import { InSlot } from '@/components/viewport/overlay-slots'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
@@ -215,6 +216,7 @@ export function CADViewport() {
         <PartDimensions />
         <GdtAnnotations />
         <DfmFaceTints />
+        <FeatureHighlight />
       </Canvas>
 
       <ViewportFrame />

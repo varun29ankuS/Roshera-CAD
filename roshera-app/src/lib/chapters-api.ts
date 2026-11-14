@@ -140,11 +140,53 @@ export function isDocumentChapter(c: Chapter): boolean {
   return c.kind.startsWith('drawing')
 }
 
+/** A size edit (`param.mould`, `param.name`) is recorded history, never a
+ *  feature: editing the hole radius changes the hole, it adds no hole. */
+function isEditStep(kind: string): boolean {
+  return kind.startsWith('param.')
+}
+
+/** Whether a chapter is a folded edit (see `foldEdits`). */
+export function isEdit(c: Chapter): boolean {
+  return c.kind === 'edit'
+}
+
+/**
+ * Edits folded: consecutive size-edit steps become ONE `edit` chapter (a
+ * pattern's edit writes one step per instance -- four holes, four steps --
+ * for what the engineer did once). The slider and film strip keep it as a
+ * moment of the history, because the part after it really differs (a frame
+ * cut before the edit still shows the old size); the feature tree leaves it
+ * out (`isEdit`), the edited feature showing its new size itself.
+ */
+export function foldEdits(cs: Chapter[]): Chapter[] {
+  const out: Chapter[] = []
+  for (const c of cs) {
+    if (!isEditStep(c.kind)) {
+      out.push(c)
+      continue
+    }
+    const prev = out[out.length - 1]
+    if (prev && isEdit(prev)) {
+      out[out.length - 1] = {
+        ...prev,
+        events: [...prev.events, ...c.events],
+        anchor: c.anchor,
+        sound: prev.sound && c.sound,
+        refusals: [...prev.refusals, ...c.refusals],
+      }
+    } else {
+      out.push({ ...c, kind: 'edit', name: 'Edit' })
+    }
+  }
+  return out
+}
+
 /** The part's own history (tree, slider, film strip) and, apart, the
  *  document's steps (drawings) -- listed, not hidden. */
 export function partChapters(cs: Chapter[]): { part: Chapter[]; documents: Chapter[] } {
   return {
-    part: cs.filter((c) => !isDocumentChapter(c)),
+    part: foldEdits(cs.filter((c) => !isDocumentChapter(c))),
     documents: cs.filter(isDocumentChapter),
   }
 }

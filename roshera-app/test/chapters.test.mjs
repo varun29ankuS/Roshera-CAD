@@ -53,3 +53,25 @@ test("a drawing is the document's, not a feature of the part: it leaves the part
   assert.deepEqual(part.map((c) => c.anchor), [0, 3])
   assert.deepEqual(documents.map((c) => c.anchor), [1])
 })
+
+test('an edit is not a feature: consecutive size edits fold into one "Edit" step, and the tree leaves it out', async () => {
+  const { foldEdits, isEdit } = await import('../src/lib/chapters-api.ts')
+  const ch = (kind, anchor, events) => ({ kind, name: null, events, anchor, sound: true, refusals: [], author: 'user', author_detail: { kind: 'user' }, intent: null, instances: [] })
+  const folded = foldEdits([
+    ch('cylinder', 0, [0, 1]),
+    ch('pattern', 19, [8, 19]),
+    ch('param.mould', 20, [20]),
+    ch('param.mould', 21, [21]),
+    ch('param.mould', 22, [22]),
+    ch('fillet', 24, [24]),
+    ch('param.mould', 25, [25]),
+  ])
+  assert.deepEqual(folded.map((c) => [c.kind, c.anchor, c.events]), [
+    ['cylinder', 0, [0, 1]],
+    ['pattern', 19, [8, 19]],
+    ['edit', 22, [20, 21, 22]],
+    ['fillet', 24, [24]],
+    ['edit', 25, [25]],
+  ])
+  assert.deepEqual(folded.filter((c) => !isEdit(c)).map((c) => c.kind), ['cylinder', 'pattern', 'fillet'])
+})
