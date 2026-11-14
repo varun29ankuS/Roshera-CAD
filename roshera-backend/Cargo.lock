@@ -2248,6 +2248,7 @@ dependencies = [
  "sha2 0.10.9",
  "shared-types",
  "simdeez",
+ "spade",
  "svg2pdf",
  "sysinfo 0.32.1",
  "thiserror 1.0.69",

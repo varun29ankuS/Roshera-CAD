@@ -38,6 +38,7 @@
 
 use super::edge_cache::EdgeSampleCache;
 use super::surface::polygon_signed_area_uv;
+use super::trim_index::TrimIndex;
 use super::{MeshVertex, TessellationParams, TriangleMesh};
 use crate::math::{MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::development::Development;
@@ -66,10 +67,30 @@ pub(crate) enum CurvedCdtError {
     /// inner bbox not contained in outer bbox, or signed area zero
     /// after unwrap.
     PolygonInvalid,
-    /// The `cdt` crate rejected the input set (e.g. duplicate points
-    /// after dedup, contour self-intersections that we didn't catch
-    /// in `PolygonInvalid`).
-    CdtFailed(cdt::Error),
+    /// The triangulator rejected the point set itself (a coordinate it
+    /// cannot represent, e.g. non-finite or beyond its exact-predicate
+    /// range), or every point was collinear so no triangle exists.
+    CdtFailed(spade::InsertionError),
+    /// Two boundary segments of the projected trim cross each other. A
+    /// crossing outline has no well-defined inside, and meshing it would
+    /// need a new vertex at the crossing that the neighbouring face does
+    /// not have (a crack in the solid's mesh). Refused, never meshed. A
+    /// crossing is almost always a projection fault (a boundary sample
+    /// put on the wrong branch of the surface), not real geometry.
+    OutlineCrossesItself {
+        /// Boundary segments that could not be inserted.
+        conflicts: usize,
+    },
+    /// Two boundary segments of the projected trim run over each other
+    /// along a length (a loop doubling back over its own samples). Like a
+    /// crossing this has no well-defined inside and is a projection fault --
+    /// typically an edge unwrapped one period off, its gap closed by a
+    /// segment lying over other samples. Meshing it would leave one long
+    /// mesh edge where the neighbouring face has many: refused.
+    OutlineOverlapsItself {
+        /// Boundary segments another segment runs along.
+        segments: usize,
+    },
     /// A hole crosses the branch cut of the unrolled chart and the outer
     /// loop could not be re-cut around it, so no single-branch polygon set
     /// exists for this face. The outer loop of a full-wrap lateral carries
@@ -80,12 +101,10 @@ pub(crate) enum CurvedCdtError {
     /// `PolygonInvalid` so the trace names the geometry rather than the
     /// symptom: the hole is real, the chart cannot express it.
     SeamStraddlingHole,
-    /// The `cdt` crate panicked internally on a degenerate input (an
-    /// `assert!` in its constraint-insertion walk, e.g. a contour
-    /// vertex lying exactly on another fixed edge). Caught via
-    /// `catch_unwind` so a third-party assert never aborts the whole
-    /// tessellation pass — this module's "never panics" contract holds
-    /// regardless of the `cdt` crate's internal robustness.
+    /// The triangulator panicked internally. It reports every known bad
+    /// input as a value (crossings, unrepresentable points), so this is a
+    /// backstop: caught via `catch_unwind` so a third-party assert can never
+    /// abort the whole tessellation pass.
     CdtPanicked,
 }
 
@@ -97,14 +116,23 @@ impl std::fmt::Display for CurvedCdtError {
                 write!(f, "closest_point failed on a boundary sample")
             }
             CurvedCdtError::PolygonInvalid => write!(f, "projected polygon is invalid"),
-            CurvedCdtError::CdtFailed(e) => write!(f, "cdt crate rejected input: {:?}", e),
+            CurvedCdtError::CdtFailed(e) => write!(f, "triangulator rejected input: {:?}", e),
+            CurvedCdtError::OutlineOverlapsItself { segments } => write!(
+                f,
+                "the projected outline overlaps itself ({segments} boundary                  segment(s) run along another)"
+            ),
+            CurvedCdtError::OutlineCrossesItself { conflicts } => write!(
+                f,
+                "the projected outline crosses itself ({conflicts} boundary \
+                 segment(s) cross another)"
+            ),
             CurvedCdtError::SeamStraddlingHole => write!(
                 f,
                 "an inner loop crosses the chart's branch cut and the outer \
                  loop could not be re-cut around it"
             ),
             CurvedCdtError::CdtPanicked => {
-                write!(f, "cdt crate panicked internally on degenerate input")
+                write!(f, "triangulator panicked internally on degenerate input")
             }
         }
     }
@@ -1087,18 +1115,6 @@ fn compute_chart_sign<S: MeshChart + ?Sized>(surface: &S, bbox: UvBBox) -> i32 {
     }
 }
 
-/// In-house winding-number test against a projected UV polygon.
-///
-/// Wraps `tessellation::surface::calculate_winding_number` with a
-/// fixed-tolerance "inside" cutoff: any |w| > 0.5 counts as inside.
-/// The cutoff matches the planar path's convention; a true CCW
-/// polygon containing the point returns `w ≈ +1`, a CW polygon
-/// containing it returns `w ≈ -1`, and `w ≈ 0` ⇒ outside.
-fn is_inside_uv_polygon(point: (f64, f64), polygon: &[(f64, f64)]) -> bool {
-    let w = super::surface::calculate_winding_number(&point, polygon);
-    w.abs() > 0.5
-}
-
 /// Step 2 — generate interior Steiner candidates and filter them
 /// against the projected outer + inner polygons.
 ///
@@ -1410,16 +1426,17 @@ fn generate_steiner_candidates<S: MeshChart + ?Sized>(
     let u_cell = u_span / (nu as f64);
     let v_cell = v_span / (nv as f64);
     let keepout = 0.25 * u_cell.min(v_cell);
-    let near_inner_edge = |u: f64, v: f64| -> bool {
-        inner_polygons.iter().any(|poly| {
-            let m = poly.len();
-            (0..m).any(|k| {
-                let (ax, ay) = poly[k];
-                let (bx, by) = poly[(k + 1) % m];
-                point_segment_distance_uv((u, v), (ax, ay), (bx, by)) < keepout
-            })
-        })
+    // Indexed once per face: a query visits the segments near it, not every
+    // segment of every loop (see `trim_index`).
+    let hole_refs: Vec<&[(f64, f64)]> = inner_polygons.iter().map(Vec::as_slice).collect();
+    let domain = TrimIndex::new(outer_polygon, &hole_refs);
+    let holes_only = match hole_refs.split_first() {
+        Some((first, rest)) => Some(TrimIndex::new(first, rest)),
+        None => None,
     };
+    let outer_only = TrimIndex::new(outer_polygon, &[]);
+    let near_inner_edge =
+        |u: f64, v: f64| -> bool { holes_only.as_ref().is_some_and(|h| h.near((u, v), keepout)) };
 
     // Generate interior grid (skip the four corners so we don't
     // collide with boundary samples that may sit on the bbox edge).
@@ -1447,13 +1464,7 @@ fn generate_steiner_candidates<S: MeshChart + ?Sized>(
             // **projected** polygons from Step 0 (not
             // `point_inside_face_uv`, which would re-project and risk
             // drift).
-            if !is_inside_uv_polygon((u, v), outer_polygon) {
-                continue;
-            }
-            if inner_polygons
-                .iter()
-                .any(|p| is_inside_uv_polygon((u, v), p))
-            {
+            if !domain.inside((u, v)) {
                 continue;
             }
             if near_inner_edge(u, v) {
@@ -1475,14 +1486,7 @@ fn generate_steiner_candidates<S: MeshChart + ?Sized>(
     // — and strictly interior (keepout from every boundary edge) so no Steiner
     // lands on a fixed edge. A no-op on a clean rectangular wall (no intermediate
     // heights), so the lean clean-cylinder mesh is unchanged.
-    let near_outer_edge = |u: f64, v: f64| -> bool {
-        let m = outer_polygon.len();
-        (0..m).any(|k| {
-            let (ax, ay) = outer_polygon[k];
-            let (bx, by) = outer_polygon[(k + 1) % m];
-            point_segment_distance_uv((u, v), (ax, ay), (bx, by)) < keepout
-        })
-    };
+    let near_outer_edge = |u: f64, v: f64| -> bool { outer_only.near((u, v), keepout) };
     let v_eps = v_span * 1e-3;
     // Grid-row keepout (Task 4C sliver factory). A boundary vertex whose
     // TRUE height coincides with a main grid row projects with
@@ -1534,16 +1538,21 @@ fn generate_steiner_candidates<S: MeshChart + ?Sized>(
         let rel = (v - v_lo) / v_span * (nv as f64);
         (rel - rel.round()).abs() * v_cell < v_row_keepout
     };
-    let mut trim_vs: Vec<f64> = Vec::new();
-    for poly in std::iter::once(outer_polygon).chain(inner_polygons.iter().map(|p| p.as_slice())) {
-        for &(_, v) in poly {
-            if v > v_lo + v_eps
-                && v < v_hi - v_eps
-                && !near_grid_row(v)
-                && !trim_vs.iter().any(|&t| (t - v).abs() < v_eps)
-            {
-                trim_vs.push(v);
-            }
+    // Distinct trim heights, `v_eps` apart. Sorted then swept: the
+    // keep-if-far-from-every-kept-height scan this replaces was quadratic in
+    // the boundary (a curved trim has a distinct height at nearly every
+    // sample). Same rule -- a height is kept when no kept height is within
+    // `v_eps` -- applied in ascending order.
+    let mut heights: Vec<f64> = std::iter::once(outer_polygon)
+        .chain(inner_polygons.iter().map(|p| p.as_slice()))
+        .flat_map(|poly| poly.iter().map(|&(_, v)| v))
+        .filter(|&v| v > v_lo + v_eps && v < v_hi - v_eps && !near_grid_row(v))
+        .collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut trim_vs: Vec<f64> = Vec::with_capacity(heights.len());
+    for v in heights {
+        if trim_vs.last().is_none_or(|&t| v - t >= v_eps) {
+            trim_vs.push(v);
         }
     }
     // TRIM-ROW BUDGET (#35 Slices 2-3). The rows above were designed for
@@ -1578,13 +1587,7 @@ fn generate_steiner_candidates<S: MeshChart + ?Sized>(
     for &v in &trim_vs {
         for i in 1..nu {
             let u = u_lo + (i as f64) * u_span / (nu as f64);
-            if !is_inside_uv_polygon((u, v), outer_polygon) {
-                continue;
-            }
-            if inner_polygons
-                .iter()
-                .any(|p| is_inside_uv_polygon((u, v), p))
-            {
+            if !domain.inside((u, v)) {
                 continue;
             }
             if near_outer_edge(u, v) || near_inner_edge(u, v) {
@@ -1599,12 +1602,13 @@ fn generate_steiner_candidates<S: MeshChart + ?Sized>(
 
 /// Step 3 — assemble pts2d (`outer_uv ++ each inner_uv ++ steiner`)
 /// and contours (one closed contour per loop, last index repeats
-/// first), then call `cdt::triangulate_contours`.
+/// first), then triangulate (see [`triangulate_trimmed_domain`]).
 ///
 /// Returns the assembled point list (so Step 5 can index into it
 /// when emitting the mesh) and the resulting triangle index triples.
 ///
-/// On `cdt::Error`, returns `Err(CdtFailed(_))`.
+/// A crossing outline returns `Err(OutlineCrossesItself)`; a point set
+/// the triangulator cannot represent returns `Err(CdtFailed(_))`.
 pub(crate) fn run_cdt(
     outer_uv: &[(f64, f64)],
     inner_uvs: &[Vec<(f64, f64)>],
@@ -1704,12 +1708,19 @@ pub(crate) fn run_cdt(
         compact_contours.push(rc);
     }
 
-    // The `cdt` crate `assert!`s on some degenerate inputs (a contour
-    // vertex lying on another fixed edge) rather than returning `Err`.
-    // Catch the unwind so a third-party panic degrades to a recoverable
-    // per-face error instead of aborting the entire tessellation pass.
+    // Constrained Delaunay triangulation of the compact set (spade, exact
+    // predicates). A point lying exactly on another boundary segment -- a hole
+    // touching the outer loop, a loop pinched at a point -- is a valid trim:
+    // the segment is split AT THAT EXISTING VERTEX, so no new point appears.
+    // Two segments that properly cross are a conflict, reported, and the face
+    // is refused (see `OutlineCrossesItself`). `catch_unwind` is a backstop
+    // only; spade reports bad input as values.
+    // Compact indices are assigned in input order, so the boundary samples
+    // (outer | inners) come first and the free (Steiner) points after them.
+    let boundary_orig = pts2d.len() - steiner.len();
+    let first_free = compact_to_orig.partition_point(|&o| o < boundary_orig);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cdt::triangulate_contours(&compact_pts, &compact_contours)
+        triangulate_trimmed_domain(&compact_pts, &compact_contours, first_free)
     }));
     match outcome {
         Ok(Ok(tris)) => {
@@ -1717,74 +1728,255 @@ pub(crate) fn run_cdt(
             // caller's boundary/steiner resolution still applies.
             let triangles: Vec<[usize; 3]> = tris
                 .into_iter()
-                .map(|(a, b, c)| [compact_to_orig[a], compact_to_orig[b], compact_to_orig[c]])
+                .map(|[a, b, c]| [compact_to_orig[a], compact_to_orig[b], compact_to_orig[c]])
                 .collect();
             Ok((pts2d, triangles))
         }
-        Ok(Err(e)) => Err(CurvedCdtError::CdtFailed(e)),
-        Err(_) => {
+        Ok(Err(e)) => {
             if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
-                // Which points lie ON an outer fixed edge (the cdt "failed to
-                // create fixed edge" trigger)? Check every assembled point
-                // against every outer segment, excluding that segment's own
-                // endpoints.
-                let no = outer_uv.len();
-                let mut on_edge = 0usize;
-                let mut example = String::new();
-                for k in 0..no {
-                    let a = outer_uv[k];
-                    let b = outer_uv[(k + 1) % no];
-                    for (pi, &p) in pts2d.iter().enumerate() {
-                        let is_a = (p.0 - a.0).abs() < 1e-12 && (p.1 - a.1).abs() < 1e-12;
-                        let is_b = (p.0 - b.0).abs() < 1e-12 && (p.1 - b.1).abs() < 1e-12;
-                        if is_a || is_b {
-                            continue;
-                        }
-                        let d = point_segment_distance_uv(p, a, b);
-                        if d < 1e-7 {
-                            on_edge += 1;
-                            if example.is_empty() {
-                                let src = if pi < no { "outer" } else { "steiner/inner" };
-                                example = format!(
-                                    "{src} pt[{pi}]=({:.4},{:.4}) ON outer seg[{k}] d={d:.2e}",
-                                    p.0, p.1
-                                );
-                            }
-                        }
-                    }
-                }
-                // Coincident points: cdt dedups them, which can collapse a
-                // contour edge to a degenerate "fixed edge" -> the panic.
-                let mut dup_pairs = 0usize;
-                let mut min_d = f64::INFINITY;
-                for i in 0..pts2d.len() {
-                    for j in (i + 1)..pts2d.len() {
-                        let dx = pts2d[i].0 - pts2d[j].0;
-                        let dy = pts2d[i].1 - pts2d[j].1;
-                        let d = (dx * dx + dy * dy).sqrt();
-                        if d < min_d {
-                            min_d = d;
-                        }
-                        if d < 1e-9 {
-                            dup_pairs += 1;
-                        }
-                    }
-                }
                 eprintln!(
-                    "[tess] run_cdt PANICKED: pts={} outer={} steiner={} | on_outer_edge={} \
-                     dup_pairs={} min_pair_dist={:.3e} {}",
+                    "[tess] run_cdt refused: {e} | pts={} outer={} steiner={}",
                     pts2d.len(),
-                    no,
-                    steiner.len(),
-                    on_edge,
-                    dup_pairs,
-                    min_d,
-                    example
+                    outer_uv.len(),
+                    steiner.len()
                 );
             }
-            Err(CurvedCdtError::CdtPanicked)
+            Err(e)
+        }
+        Err(_) => Err(CurvedCdtError::CdtPanicked),
+    }
+}
+
+/// Triangulate the region bounded by `contours` (closed index loops into
+/// `pts`, last index repeating the first; the first is the outer loop, the
+/// rest holes) with the remaining points as interior vertices.
+///
+/// Returns counter-clockwise triangles as indices into `pts`. `pts` must be
+/// free of exact duplicates (the caller welds them), so the triangulator's
+/// vertex handles coincide with `pts` indices; that is checked, not assumed.
+/// `pts[first_free..]` are free interior points (Steiner); the rest are
+/// boundary samples.
+///
+/// A free point lying exactly on a boundary segment would split it: the
+/// split vertex is not one of that edge's cached samples, so the
+/// neighbouring face would meet a crack there. Such points are dropped and
+/// the domain triangulated again; the result keeps every boundary segment
+/// as one mesh edge. (A BOUNDARY sample on another segment -- a hole
+/// touching the outer loop -- is real geometry and splits it legitimately.)
+///
+/// Which triangles are inside is decided by parity across boundary
+/// segments: walking from the unbounded outside, every boundary segment
+/// crossed toggles inside/outside. For loops that do not cross (crossings
+/// are refused before this point) that is exactly "inside the outer loop
+/// and outside every hole", independent of each loop's orientation, and it
+/// costs one pass over the triangles.
+fn triangulate_trimmed_domain(
+    pts: &[(f64, f64)],
+    contours: &[Vec<usize>],
+    first_free: usize,
+) -> Result<Vec<[usize; 3]>, CurvedCdtError> {
+    let mut segments: Vec<[usize; 2]> = Vec::new();
+    for c in contours {
+        for w in c.windows(2) {
+            if w[0] != w[1] {
+                segments.push([w[0], w[1]]);
+            }
         }
     }
+    let first = triangulate_segments(pts, &segments)?;
+    let overlapping = segments_overlapping_others(pts, &segments, first_free, &first.1);
+    if overlapping > 0 {
+        return Err(CurvedCdtError::OutlineOverlapsItself {
+            segments: overlapping,
+        });
+    }
+    let on_boundary = free_points_splitting_segments(pts, &segments, first_free, &first.1);
+    if std::env::var("ROSHERA_TESS_TRACE").is_ok() && !first.1.is_empty() {
+        let shown: Vec<_> = first
+            .1
+            .iter()
+            .take(4)
+            .map(|&k| {
+                let [a, b] = segments[k];
+                (a, b, pts[a], pts[b])
+            })
+            .collect();
+        eprintln!(
+            "[tess] {} of {} boundary segments split ({} by free points) e.g. {:?}",
+            first.1.len(),
+            segments.len(),
+            on_boundary.len(),
+            shown
+        );
+    }
+    if on_boundary.is_empty() {
+        return Ok(first.0);
+    }
+    // Drop the offending free points and triangulate again; map back.
+    let kept: Vec<usize> = (0..pts.len())
+        .filter(|i| !on_boundary.contains(i))
+        .collect();
+    let mut old_to_new = vec![usize::MAX; pts.len()];
+    for (new, &old) in kept.iter().enumerate() {
+        old_to_new[old] = new;
+    }
+    let kept_pts: Vec<(f64, f64)> = kept.iter().map(|&i| pts[i]).collect();
+    let kept_segments: Vec<[usize; 2]> = segments
+        .iter()
+        .map(|&[a, b]| [old_to_new[a], old_to_new[b]])
+        .collect();
+    let (tris, missing) = triangulate_segments(&kept_pts, &kept_segments)?;
+    if !free_points_splitting_segments(&kept_pts, &kept_segments, first_free, &missing).is_empty() {
+        return Err(CurvedCdtError::DegenerateLoop);
+    }
+    Ok(tris.into_iter().map(|t| t.map(|i| kept[i])).collect())
+}
+
+/// How many of the `missing` (split) boundary segments another boundary
+/// segment runs along -- an overlap of positive length, not a touch at a
+/// point. A boundary sample lying on segment `k` whose own next sample also
+/// lies on `k` means the loop walks along `k`: a doubled-back outline. A
+/// sample on `k` whose neighbours leave it (a hole touching the outer loop
+/// at a vertex) is a legitimate touch and is not counted.
+fn segments_overlapping_others(
+    pts: &[(f64, f64)],
+    segments: &[[usize; 2]],
+    first_free: usize,
+    missing: &[usize],
+) -> usize {
+    if missing.is_empty() {
+        return 0;
+    }
+    let mut next: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for &[a, b] in segments {
+        next.entry(a).or_default().push(b);
+    }
+    let mut count = 0;
+    for &k in missing {
+        let [a, b] = segments[k];
+        let (pa, pb) = (pts[a], pts[b]);
+        let len = ((pb.0 - pa.0).powi(2) + (pb.1 - pa.1).powi(2)).sqrt();
+        let tol = 1e-9 * len.max(f64::MIN_POSITIVE);
+        let on = |i: usize| point_segment_distance_uv(pts[i], pa, pb) <= tol;
+        let doubled = (0..first_free.min(pts.len())).any(|c| {
+            c != a
+                && c != b
+                && on(c)
+                && next
+                    .get(&c)
+                    .is_some_and(|ns| ns.iter().any(|&n| n != c && on(n)))
+        });
+        if doubled {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Free points (index `>= first_free`) lying on one of the `missing`
+/// boundary segments -- segments the triangulation split instead of
+/// keeping whole.
+fn free_points_splitting_segments(
+    pts: &[(f64, f64)],
+    segments: &[[usize; 2]],
+    first_free: usize,
+    missing: &[usize],
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    for &k in missing {
+        let [a, b] = segments[k];
+        let (pa, pb) = (pts[a], pts[b]);
+        let len = ((pb.0 - pa.0).powi(2) + (pb.1 - pa.1).powi(2)).sqrt();
+        for (i, &q) in pts.iter().enumerate().skip(first_free) {
+            if point_segment_distance_uv(q, pa, pb) <= 1e-9 * len.max(f64::MIN_POSITIVE) {
+                out.push(i);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// One constrained triangulation of `pts` with `segments` as boundary,
+/// keeping the triangles inside. Also returns the indices of segments the
+/// triangulation did not keep as single edges (split by a point on them).
+fn triangulate_segments(
+    pts: &[(f64, f64)],
+    segments: &[[usize; 2]],
+) -> Result<(Vec<[usize; 3]>, Vec<usize>), CurvedCdtError> {
+    use spade::handles::FixedVertexHandle;
+    use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
+
+    let vertices: Vec<Point2<f64>> = pts.iter().map(|&(u, v)| Point2::new(u, v)).collect();
+    let segments = segments.to_vec();
+    let mut conflicts = 0usize;
+    let cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::try_bulk_load_cdt(
+        vertices,
+        segments.clone(),
+        |_| conflicts += 1,
+    )
+    .map_err(CurvedCdtError::CdtFailed)?;
+    if conflicts > 0 {
+        return Err(CurvedCdtError::OutlineCrossesItself { conflicts });
+    }
+    if cdt.num_vertices() != pts.len() {
+        // A duplicate slipped past the weld: handles no longer match indices.
+        return Err(CurvedCdtError::DegenerateLoop);
+    }
+
+    // Flood fill from the outside: a triangle on the convex hull is inside
+    // exactly when its hull edge is a boundary segment.
+    let mut inside: Vec<Option<bool>> = vec![None; cdt.num_all_faces()];
+    let mut stack: Vec<(
+        spade::handles::FixedFaceHandle<spade::handles::InnerTag>,
+        bool,
+    )> = Vec::new();
+    for face in cdt.inner_faces() {
+        for e in face.adjacent_edges() {
+            if e.rev().face().is_outer() {
+                stack.push((face.fix(), cdt.is_constraint_edge(e.as_undirected().fix())));
+                break;
+            }
+        }
+    }
+    while let Some((f, state)) = stack.pop() {
+        let slot = &mut inside[f.index()];
+        if slot.is_some() {
+            continue;
+        }
+        *slot = Some(state);
+        for e in cdt.face(f).adjacent_edges() {
+            if let Some(next) = e.rev().face().as_inner() {
+                if inside[next.fix().index()].is_none() {
+                    let crossed = cdt.is_constraint_edge(e.as_undirected().fix());
+                    stack.push((next.fix(), state != crossed));
+                }
+            }
+        }
+    }
+
+    let triangles: Vec<[usize; 3]> = cdt
+        .inner_faces()
+        .filter(|f| inside[f.fix().index()] == Some(true))
+        .map(|f| f.vertices().map(|v| v.fix().index()))
+        .collect();
+    if triangles.is_empty() {
+        return Err(CurvedCdtError::DegenerateLoop);
+    }
+    let missing: Vec<usize> = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, &[a, b])| {
+            cdt.get_edge_from_neighbors(
+                FixedVertexHandle::from_index(a),
+                FixedVertexHandle::from_index(b),
+            )
+            .is_none()
+        })
+        .map(|(k, _)| k)
+        .collect();
+    Ok((triangles, missing))
 }
 
 /// Resolve the 3D position for a CDT-output point at index `i` in
@@ -1931,6 +2123,8 @@ fn collect_refinement_centroids<S: MeshChart + ?Sized>(
     use crate::math::Vector2;
 
     let keepout = boundary_keepout_uv(outer);
+    let hole_refs: Vec<&[(f64, f64)]> = inners.iter().map(|p| p.points_uv.as_slice()).collect();
+    let domain = TrimIndex::new(&outer.points_uv, &hole_refs);
     let mut out: Vec<((f64, f64), f64)> = Vec::new();
     for tri in triangles {
         let (ia, ib, ic) = (tri[0], tri[1], tri[2]);
@@ -2012,13 +2206,7 @@ fn collect_refinement_centroids<S: MeshChart + ?Sized>(
             let c2 = Vector2::new(uc, vc);
             let circumcenter = circumcircle_2d(a2, b2, c2)
                 .map(|(center, r_sq)| ((center.x, center.y), r_sq.max(0.0).sqrt()))
-                .filter(|&(cc, _r)| {
-                    is_inside_uv_polygon(cc, &outer.points_uv)
-                        && !inners
-                            .iter()
-                            .any(|p| is_inside_uv_polygon(cc, &p.points_uv))
-                        && !near_boundary_segment(cc, outer, inners, keepout)
-                });
+                .filter(|&(cc, _r)| domain.inside(cc) && !domain.near(cc, keepout));
             match circumcenter {
                 Some(candidate) => out.push(candidate),
                 // The centroid fallback is only sound for a WELL-SHAPED
@@ -2166,30 +2354,6 @@ fn boundary_total(outer_uv_len: usize, inner_uv_lens: &[usize]) -> usize {
     outer_uv_len + inner_uv_lens.iter().copied().sum::<usize>()
 }
 
-/// True when `p` lies within `keepout` of any boundary (constraint)
-/// segment of the outer or any inner loop. Refinement candidates this
-/// close to a fixed edge must be rejected BEFORE the CDT re-run: the
-/// `cdt` crate rejects (or `assert!`s on) a floating point coincident
-/// with a fixed-edge interior (`PointOnFixedEdge`), which would freeze
-/// refinement on the pre-insertion triangulation. The classic producer
-/// is a right triangle with its hypotenuse ON the boundary — its
-/// circumcenter is exactly the hypotenuse midpoint.
-fn near_boundary_segment(
-    p: (f64, f64),
-    outer: &ProjectedLoop,
-    inners: &[ProjectedLoop],
-    keepout: f64,
-) -> bool {
-    let near_poly = |poly: &[(f64, f64)]| -> bool {
-        let m = poly.len();
-        if m < 2 {
-            return false;
-        }
-        (0..m).any(|k| point_segment_distance_uv(p, poly[k], poly[(k + 1) % m]) < keepout)
-    };
-    near_poly(&outer.points_uv) || inners.iter().any(|i| near_poly(&i.points_uv))
-}
-
 /// Constraint-segment keepout distance for refinement candidates,
 /// relative to the outer loop's UV extent. Wide enough to clear the
 /// `cdt` crate's on-fixed-edge detection, narrow enough never to
@@ -2241,9 +2405,10 @@ fn scan_skinny_triangles<S: MeshChart + ?Sized>(
 ) -> Vec<((f64, f64), f64)> {
     use crate::math::circumcircle::{circumcircle_2d, radius_edge_ratio_sq};
     use crate::math::Vector2;
-    use crate::tessellation::surface::calculate_winding_number;
 
     let keepout = boundary_keepout_uv(outer);
+    let hole_refs: Vec<&[(f64, f64)]> = inners.iter().map(|p| p.points_uv.as_slice()).collect();
+    let domain = TrimIndex::new(&outer.points_uv, &hole_refs);
     let developable = surface.is_developable();
     let mut out = Vec::new();
     for tri in triangles {
@@ -2275,21 +2440,13 @@ fn scan_skinny_triangles<S: MeshChart + ?Sized>(
         // `calculate_winding_number` returns the geometric winding
         // (≈ ±1 for inside, ≈ 0 for outside); 0.5 is a generous floor.
         let center_pt = (center.x, center.y);
-        let w_outer = calculate_winding_number(&center_pt, &outer.points_uv);
-        if w_outer.abs() < 0.5 {
+        if !domain.inside(center_pt) {
             continue;
         }
-        let in_any_hole = inners.iter().any(|inner| {
-            let w = calculate_winding_number(&center_pt, &inner.points_uv);
-            w.abs() >= 0.5
-        });
-        if in_any_hole {
-            continue;
-        }
-        // Never hand the CDT a floating point ON a fixed edge (the
-        // right-triangle hypotenuse-midpoint case) — it aborts the whole
-        // re-run and freezes refinement.
-        if near_boundary_segment(center_pt, outer, inners, keepout) {
+        // Never hand the triangulator a floating point ON a fixed edge (the
+        // right-triangle hypotenuse-midpoint case): it would split a trim
+        // segment, so it is dropped there -- keep it from being proposed.
+        if domain.near(center_pt, keepout) {
             continue;
         }
         out.push((center_pt, r_sq.max(0.0).sqrt()));
@@ -2986,7 +3143,8 @@ mod tests {
     /// `format!` impl drifting out of sync with the enum.
     #[test]
     fn error_display_covers_all_variants() {
-        let cases: [CurvedCdtError; 5] = [
+        let cases: [CurvedCdtError; 6] = [
+            CurvedCdtError::OutlineCrossesItself { conflicts: 2 },
             CurvedCdtError::DegenerateLoop,
             CurvedCdtError::ProjectionFailed,
             CurvedCdtError::PolygonInvalid,
@@ -3421,45 +3579,18 @@ mod tests {
 
     // -- Phase E tests (Step 3: CDT call) -------------------------
 
-    /// Unit test 6: hand-built self-intersecting outer polygon must
-    /// return `Err(CdtFailed | PolygonInvalid)`, never panic.
+    /// Unit test 6: a hand-built self-intersecting outer polygon is refused
+    /// as `OutlineCrossesItself` -- never meshed, never a panic. (This test
+    /// used to accept ANY outcome, so it could catch nothing.)
     #[test]
     fn cdt_input_rejected_returns_err() {
         // Bowtie polygon: edges (0,0)-(1,1) and (1,0)-(0,1) cross.
         let bowtie = vec![(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0)];
         let inners: Vec<Vec<(f64, f64)>> = Vec::new();
         let steiner: Vec<(f64, f64)> = Vec::new();
-        let result = run_cdt(&bowtie, &inners, &steiner);
-        match result {
-            Ok((_, tris)) => {
-                // It is possible that the CDT crate flood-fills a
-                // degenerate cover; pin the expected behaviour as
-                // "either Err, or a non-empty triangulation that
-                // we can still emit". The plan requires *no panic*;
-                // we don't require Err strictly.
-                // However, the typical outcome is Err. Allow both
-                // but assert no panic via reaching this branch.
-                assert!(
-                    tris.iter()
-                        .all(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]),
-                    "bowtie CDT result must not contain degenerate triangles"
-                );
-            }
-            Err(e) => match e {
-                CurvedCdtError::CdtFailed(_)
-                | CurvedCdtError::CdtPanicked
-                | CurvedCdtError::PolygonInvalid
-                | CurvedCdtError::SeamStraddlingHole
-                | CurvedCdtError::DegenerateLoop => {
-                    // Expected: CDT crate rejected the self-
-                    // intersecting input (or panicked on it, caught
-                    // via catch_unwind), or our pre-check did.
-                }
-                CurvedCdtError::ProjectionFailed => panic!(
-                    "self-intersecting bowtie should not surface \
-                    ProjectionFailed (no projection runs in run_cdt)"
-                ),
-            },
+        match run_cdt(&bowtie, &inners, &steiner) {
+            Err(CurvedCdtError::OutlineCrossesItself { conflicts }) => assert!(conflicts >= 1),
+            other => panic!("bowtie must be refused as OutlineCrossesItself, got {other:?}"),
         }
     }
 
@@ -4106,5 +4237,293 @@ mod tests {
     #[allow(dead_code)]
     fn _phase_b_unused_imports_anchor() {
         let _ = Vector3::Z;
+    }
+}
+
+/// The trimmed-domain triangulator (`run_cdt`) judged against an oracle that
+/// shares none of its code: an integer winding number per triangle, exact
+/// shoelace areas, and a check that every boundary segment survives as a mesh
+/// edge (what keeps a face watertight against its neighbours).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod trim_triangulation_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn shoelace(poly: &[(f64, f64)]) -> f64 {
+        let n = poly.len();
+        (0..n)
+            .map(|i| {
+                let (a, b) = (poly[i], poly[(i + 1) % n]);
+                a.0 * b.1 - b.0 * a.1
+            })
+            .sum::<f64>()
+            * 0.5
+    }
+
+    /// Integer winding number by upward/downward crossings: a different method
+    /// from the triangulator's own inside test.
+    fn winding(p: (f64, f64), poly: &[(f64, f64)]) -> i32 {
+        let n = poly.len();
+        let mut w = 0;
+        for i in 0..n {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            let side = (b.0 - a.0) * (p.1 - a.1) - (p.0 - a.0) * (b.1 - a.1);
+            if a.1 <= p.1 {
+                if b.1 > p.1 && side > 0.0 {
+                    w += 1;
+                }
+            } else if b.1 <= p.1 && side < 0.0 {
+                w -= 1;
+            }
+        }
+        w
+    }
+
+    fn tri_area(pts: &[(f64, f64)], t: &[usize; 3]) -> f64 {
+        let (a, b, c) = (pts[t[0]], pts[t[1]], pts[t[2]]);
+        0.5 * ((b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1))
+    }
+
+    /// Every property a trimmed-domain triangulation owes its caller.
+    fn assert_true_triangulation(
+        outer: &[(f64, f64)],
+        inners: &[Vec<(f64, f64)>],
+        steiner: &[(f64, f64)],
+        pts: &[(f64, f64)],
+        tris: &[[usize; 3]],
+    ) {
+        assert!(!tris.is_empty(), "no triangles");
+        let mut edges: HashSet<(usize, usize)> = HashSet::new();
+        let mut used: HashSet<usize> = HashSet::new();
+        let mut area = 0.0;
+        for t in tris {
+            let a = tri_area(pts, t);
+            assert!(
+                a > 0.0,
+                "triangle {t:?} is not counter-clockwise (area {a:e})"
+            );
+            area += a;
+            let c = (
+                (pts[t[0]].0 + pts[t[1]].0 + pts[t[2]].0) / 3.0,
+                (pts[t[0]].1 + pts[t[1]].1 + pts[t[2]].1) / 3.0,
+            );
+            assert!(
+                winding(c, outer) != 0,
+                "triangle {t:?} lies outside the outer loop"
+            );
+            for h in inners {
+                assert_eq!(winding(c, h), 0, "triangle {t:?} lies inside a hole");
+            }
+            for k in 0..3 {
+                let (i, j) = (t[k], t[(k + 1) % 3]);
+                edges.insert((i.min(j), i.max(j)));
+                used.insert(i);
+            }
+        }
+        let expect = shoelace(outer).abs() - inners.iter().map(|h| shoelace(h).abs()).sum::<f64>();
+        assert!(
+            (area - expect).abs() <= 1e-9 * expect.abs().max(1.0),
+            "triangles cover {area}, the trimmed domain is {expect}"
+        );
+        // Watertightness: each boundary segment is a mesh edge, unsplit.
+        let mut start = 0;
+        for lp in std::iter::once(outer).chain(inners.iter().map(Vec::as_slice)) {
+            let n = lp.len();
+            for k in 0..n {
+                let (i, j) = (start + k, start + (k + 1) % n);
+                assert!(
+                    edges.contains(&(i.min(j), i.max(j))),
+                    "boundary segment {i}-{j} is not a mesh edge: the neighbouring face \
+                     would meet a crack or T-junction here"
+                );
+            }
+            start += n;
+        }
+        // Every interior Steiner point is a vertex of the mesh.
+        let base = pts.len() - steiner.len();
+        for (k, &s) in steiner.iter().enumerate() {
+            let inside = winding(s, outer) != 0 && inners.iter().all(|h| winding(s, h) == 0);
+            if inside {
+                assert!(
+                    used.contains(&(base + k)),
+                    "interior Steiner point {s:?} was dropped"
+                );
+            }
+        }
+    }
+
+    /// Small deterministic generator (no dependency, reproducible failures).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+    }
+
+    fn star(rng: &mut Lcg, c: (f64, f64), r: f64, n: usize, ccw: bool) -> Vec<(f64, f64)> {
+        let mut p: Vec<(f64, f64)> = (0..n)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::TAU / n as f64;
+                let rr = r * (0.6 + 0.4 * rng.next());
+                (c.0 + rr * a.cos(), c.1 + rr * a.sin())
+            })
+            .collect();
+        if !ccw {
+            p.reverse();
+        }
+        p
+    }
+
+    /// A loop that touches itself: a vertex sits exactly on another of its own
+    /// segments (two lobes pinched at a point). The `cdt` crate refused this
+    /// with `PointOnFixedEdge`, one way faces of an imported part came out
+    /// empty.
+    #[test]
+    fn a_loop_that_touches_itself_still_triangulates() {
+        let outer = vec![
+            (0.0, 0.0),
+            (2.0, 0.0),
+            (4.0, 0.0),
+            (4.0, 3.0),
+            (2.0, 0.0),
+            (0.0, 3.0),
+        ];
+        let left = [(0.0, 0.0), (2.0, 0.0), (0.0, 3.0)];
+        let right = [(2.0, 0.0), (4.0, 0.0), (4.0, 3.0)];
+        let (pts, tris) = run_cdt(&outer, &[], &[]).expect("a pinched loop is a valid trim");
+        let area: f64 = tris.iter().map(|t| tri_area(&pts, t)).sum();
+        let expect = shoelace(&left).abs() + shoelace(&right).abs();
+        assert!(
+            (area - expect).abs() < 1e-12,
+            "covers {area}, expected {expect}"
+        );
+    }
+
+    /// A hole whose sample lies exactly on the outer boundary (a pocket that
+    /// meets the face edge at a point).
+    #[test]
+    fn a_hole_touching_the_outer_boundary_still_triangulates() {
+        let outer = vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)];
+        let hole = vec![(2.0, 0.0), (1.0, 2.0), (3.0, 2.0)];
+        let (pts, tris) = run_cdt(&outer, &[hole.clone()], &[(2.0, 3.0)])
+            .expect("a hole touching the boundary at a point is a valid trim");
+        let area: f64 = tris.iter().map(|t| tri_area(&pts, t)).sum();
+        assert!(
+            (area - (16.0 - shoelace(&hole).abs())).abs() < 1e-12,
+            "covers {area}"
+        );
+    }
+
+    /// An outline that crosses itself has no inside: triangulating it would
+    /// mean inventing boundary vertices the neighbouring face does not have.
+    /// It is refused, by name; never meshed and never a panic.
+    #[test]
+    fn an_outline_that_crosses_itself_is_refused_by_name() {
+        let bowtie = vec![(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0)];
+        let refusal = run_cdt(&bowtie, &[], &[]).err().map(|e| e.to_string());
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|s| s.contains("outline crosses itself")),
+            "a crossing outline must be refused by name, got {refusal:?}"
+        );
+    }
+
+    /// An interior point that lands exactly ON a boundary segment (a grid
+    /// node on a slanted trim edge) must not split that segment: the split
+    /// vertex is not one of the edge's cached samples, so the neighbouring
+    /// face would meet a crack there. The point is dropped; the segment stays
+    /// one mesh edge.
+    #[test]
+    fn a_steiner_point_on_the_boundary_never_splits_it() {
+        let outer = vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)];
+        let hole = vec![(1.0, 1.0), (1.0, 3.0), (3.0, 3.0)];
+        // (2, 0) on the outer's bottom edge; (2, 2) on the hole's hypotenuse.
+        let steiner = vec![(2.0, 0.0), (2.0, 2.0), (3.0, 1.0)];
+        let (pts, tris) = run_cdt(&outer, &[hole.clone()], &steiner)
+            .expect("points on the boundary are dropped, not fatal");
+        let base = pts.len() - steiner.len();
+        let used: HashSet<usize> = tris.iter().flatten().copied().collect();
+        assert!(
+            !used.contains(&base) && !used.contains(&(base + 1)),
+            "a point on the boundary was meshed as a vertex (it splits a trim edge)"
+        );
+        assert!(
+            used.contains(&(base + 2)),
+            "the interior point (3, 1) was dropped"
+        );
+        // The oracle: exact area, CCW, every trim segment one mesh edge.
+        assert_true_triangulation(&outer, &[hole], &[], &pts, &tris);
+    }
+
+    /// A loop that doubles back over its own samples -- the through-bore
+    /// with both rims filleted: the wall's bottom rim was unwrapped one
+    /// period off, and the loop's closing segment ran back along the rim
+    /// samples, silently standing in for the real bottom edge. Meshing that
+    /// "succeeds" with ONE long edge where the neighbouring face has a
+    /// hundred samples: 103 open mesh edges. Two boundary segments that
+    /// overlap along a length are not a trim, they are a projection fault:
+    /// refused by name, like a crossing.
+    #[test]
+    fn a_loop_that_doubles_back_over_itself_is_refused_by_name() {
+        let outer = vec![
+            (3.0, 0.0),
+            (2.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (-1.0, 1.0),
+            (-1.0, 0.0),
+        ];
+        let refusal = run_cdt(&outer, &[], &[(0.0, 0.5)])
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|s| s.contains("overlaps itself")),
+            "a doubled-back outline must be refused by name, got {refusal:?}"
+        );
+    }
+
+    /// 300 random trimmed domains (star-shaped outers of 6-400 samples, up to
+    /// four holes of either orientation, interior Steiner points): every one
+    /// must triangulate exactly, judged by the oracle above.
+    #[test]
+    fn random_trimmed_domains_triangulate_exactly() {
+        let mut rng = Lcg(0x5eed_cad);
+        for case in 0..300 {
+            let n = 6 + (rng.next() * 394.0) as usize;
+            let outer = star(&mut rng, (0.0, 0.0), 10.0, n, case % 2 == 0);
+            let holes_n = (rng.next() * 5.0) as usize;
+            let mut inners = Vec::new();
+            for h in 0..holes_n.min(4) {
+                let a = h as f64 * std::f64::consts::TAU / 4.0 + 0.3;
+                let c = (3.0 * a.cos(), 3.0 * a.sin());
+                let m = 3 + (rng.next() * 40.0) as usize;
+                let ccw = rng.next() < 0.5;
+                inners.push(star(&mut rng, c, 1.0, m, ccw));
+            }
+            let mut steiner = Vec::new();
+            for _ in 0..(rng.next() * 300.0) as usize {
+                let p = (rng.next() * 12.0 - 6.0, rng.next() * 12.0 - 6.0);
+                if winding(p, &outer) != 0 && inners.iter().all(|h| winding(p, h) == 0) {
+                    let clear = std::iter::once(&outer)
+                        .chain(inners.iter())
+                        .flat_map(|lp| (0..lp.len()).map(move |k| (lp[k], lp[(k + 1) % lp.len()])))
+                        .all(|(a, b)| point_segment_distance_uv(p, a, b) > 1e-3);
+                    if clear {
+                        steiner.push(p);
+                    }
+                }
+            }
+            let (pts, tris) = run_cdt(&outer, &inners, &steiner)
+                .unwrap_or_else(|e| panic!("case {case}: valid domain refused: {e:?}"));
+            assert_true_triangulation(&outer, &inners, &steiner, &pts, &tris);
+        }
     }
 }

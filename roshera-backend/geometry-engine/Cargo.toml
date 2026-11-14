@@ -25,6 +25,13 @@ tokio = { version = "1.0", features = ["sync", "time", "rt"] }
 # axis-stacked holes (see polyline_cut_harness::sequential_chain_4_cuts).
 cdt = "0.1"
 
+# Constrained Delaunay triangulation for CURVED faces' trimmed (u, v)
+# domains. Exact predicates; reports crossing boundary segments as values
+# (try_bulk_load_cdt) and splits a segment at an existing vertex lying on it
+# (a hole touching the outer loop), the input `cdt` refused with
+# PointOnFixedEdge -- imported NURBS faces came out empty that way.
+spade = "2.15"
+
 # 2D polygon Boolean operations (Intersection, Union, Difference, Xor)
 # for the coplanar-face imprint-merge path. Pure Rust, robust against
 # shared vertices, T-junctions, collinear edges, and self-intersections

@@ -11,6 +11,7 @@ pub mod mesh;
 pub mod parallel;
 pub mod simple_box;
 pub mod surface;
+pub(crate) mod trim_index;
 
 // Re-export main types
 pub use adaptive::AdaptiveTessellator;

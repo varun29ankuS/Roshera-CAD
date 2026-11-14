@@ -138,6 +138,15 @@ pub(crate) fn cylinder_err_may_take_untrimmed_grid(e: &super::curved_cdt::Curved
         | E::PolygonInvalid
         | E::CdtFailed(_)
         | E::CdtPanicked => true,
+        // A crossing outline is a projection fault in the chart (a sample
+        // put on the wrong branch), not a hole the grid would erase: the
+        // same side as the other chart failures, as before the triangulator
+        // named it (it was `CdtFailed(CrossingFixedEdge)`).
+        E::OutlineCrossesItself { .. } => true,
+        // A doubled-back outline is the same kind of chart fault (an edge
+        // unwrapped a period off). The old triangulator refused it as
+        // `PointOnFixedEdge` and the wall took the grid; it still does.
+        E::OutlineOverlapsItself { .. } => true,
         // TRIM failure: the hole is real and the grid cannot express it.
         E::SeamStraddlingHole => false,
     }
@@ -11163,7 +11172,9 @@ mod cylinder_err_routing_tests {
             CurvedCdtError::DegenerateLoop,
             CurvedCdtError::ProjectionFailed,
             CurvedCdtError::PolygonInvalid,
-            CurvedCdtError::CdtFailed(cdt::Error::EmptyInput),
+            CurvedCdtError::CdtFailed(spade::InsertionError::NAN),
+            CurvedCdtError::OutlineCrossesItself { conflicts: 1 },
+            CurvedCdtError::OutlineOverlapsItself { segments: 1 },
             CurvedCdtError::CdtPanicked,
         ] {
             assert!(
