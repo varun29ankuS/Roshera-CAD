@@ -12315,3 +12315,53 @@ async fn an_agent_show_with_an_unknown_action_is_refused() {
         "status {s}"
     );
 }
+
+/// The Agent Eye's picture follows the app's theme (Varun 2026-11-14: "the
+/// agent eye colours and background have to sync with the theme"): asked
+/// with `bg=transparent`, a part render's background is transparent, so the
+/// panel's own (themed) background shows through; without it, the opaque
+/// render agents and exports rely on is unchanged.
+#[tokio::test]
+async fn a_part_render_asked_for_a_transparent_background_has_one() {
+    use base64::Engine as _;
+    let state = make_test_state().await;
+    seed_bored_box_live(&state).await;
+    let (_, parts) = dispatch(&state, json_get("/api/agent/parts")).await;
+    let list = parts["parts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| parts.as_array().cloned().unwrap_or_default());
+    let id = list.first().and_then(|p| p["id"].as_u64()).expect("a part");
+    let corner_alpha = |body: &serde_json::Value| -> Option<u8> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(body["png_base64"].as_str()?)
+            .ok()?;
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut reader = decoder.read_info().ok()?;
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).ok()?;
+        match info.color_type {
+            png::ColorType::Rgba => Some(buf[3]),
+            _ => Some(255),
+        }
+    };
+    let (s, clear) = dispatch(
+        &state,
+        json_get(&format!(
+            "/api/agent/parts/{id}/render?size=64&bg=transparent"
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{clear}");
+    assert_eq!(
+        corner_alpha(&clear),
+        Some(0),
+        "the corner is background: transparent"
+    );
+    let (_, opaque) = dispatch(
+        &state,
+        json_get(&format!("/api/agent/parts/{id}/render?size=64")),
+    )
+    .await;
+    assert_eq!(corner_alpha(&opaque), Some(255), "the default stays opaque");
+}

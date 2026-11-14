@@ -486,6 +486,19 @@ pub async fn query_hover(
 
 // ───────────────────── render (agent eyes) ──────────────────────────
 
+/// A render as PNG: with a transparent background when the caller asked
+/// for one (`bg=transparent`), else opaque.
+pub(crate) fn encode_render(
+    frame: &geometry_engine::render::RenderFrame,
+    bg: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    if bg == Some("transparent") {
+        frame.to_png_transparent()
+    } else {
+        frame.to_png()
+    }
+}
+
 /// Query parameters for `GET /api/agent/parts/{id}/render`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RenderQuery {
@@ -499,6 +512,10 @@ pub struct RenderQuery {
     /// eye) — a leader from each labelled entity's projected anchor to its name.
     /// Default `false`. Honoured in the `shaded` mode (the readable backdrop).
     pub labels: Option<bool>,
+    /// `transparent`: the background is see-through, so a themed panel
+    /// shows through it (the app's Agent Eye). Default: opaque white.
+    #[serde(default)]
+    pub bg: Option<String>,
 }
 
 /// One legend row: which RGB in an `ids`-mode image is which face.
@@ -625,8 +642,7 @@ pub async fn render_part(
         let model = model_handle.read().await;
         render_solid(&model, id as SolidId, &opts).ok_or_else(|| ApiError::solid_not_found(id))?
     };
-    let png = frame
-        .to_png()
+    let png = encode_render(&frame, q.bg.as_deref())
         .map_err(|e| ApiError::new(ErrorCode::Internal, format!("PNG encoding failed: {e}")))?;
 
     Ok(Json(RenderResponse {
@@ -873,6 +889,10 @@ pub async fn part_best_view(
 /// knows where to look, this shows it.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OrbitQuery {
+    /// `transparent`: the background is see-through, so a themed panel
+    /// shows through it (the app's Agent Eye). Default: opaque white.
+    #[serde(default)]
+    pub bg: Option<String>,
     pub az: Option<f64>,
     pub el: Option<f64>,
     pub mode: Option<String>,
@@ -960,8 +980,7 @@ pub async fn part_orbit(
         },
     )
     .ok_or_else(|| ApiError::solid_not_found(id))?;
-    let png = frame
-        .to_png()
+    let png = encode_render(&frame, q.bg.as_deref())
         .map_err(|e| ApiError::new(ErrorCode::Internal, format!("PNG encoding failed: {e}")))?;
 
     Ok(Json(OrbitResponse {
@@ -1069,7 +1088,7 @@ pub async fn scene_orbit(
             return StatusCode::NOT_FOUND.into_response();
         }
     };
-    let png = match frame.to_png() {
+    let png = match encode_render(&frame, q.bg.as_deref()) {
         Ok(p) => p,
         Err(e) => {
             return ApiError::new(ErrorCode::Internal, format!("PNG encoding failed: {e}"))

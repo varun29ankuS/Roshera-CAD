@@ -278,6 +278,9 @@ pub struct ViewQuery {
     pub mode: Option<String>,
     pub size: Option<usize>,
     pub quality: Option<String>,
+    /// `transparent`: a see-through background (the app's themed Agent Eye).
+    #[serde(default)]
+    pub bg: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -670,8 +673,7 @@ pub async fn view_assembly(
     })?;
     drop(model);
 
-    let png = frame
-        .to_png()
+    let png = crate::handlers::agent::encode_render(&frame, q.bg.as_deref())
         .map_err(|e| ApiError::new(ErrorCode::KernelError, e))?;
 
     Ok(Json(ViewResponse {
