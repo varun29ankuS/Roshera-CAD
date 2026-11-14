@@ -191,11 +191,132 @@ pub enum SketchOpError {
 
 /// Materialised op-level curve of an entity, read from LIVE geometry
 /// (shared endpoints / centers resolve through their points).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum OpCurve {
-    Segment { a: Point2d, b: Point2d },
+    Segment {
+        a: Point2d,
+        b: Point2d,
+    },
     Arc(Arc2d),
-    Circle { c: Point2d, r: f64 },
+    Circle {
+        c: Point2d,
+        r: f64,
+    },
+    /// A B-spline or NURBS: crossings are found numerically (fine
+    /// sampling, then refined by alternating projection).
+    Spline(super::Spline2d),
+}
+
+/// Samples per spline when looking for its crossings.
+const SPLINE_SAMPLES: usize = 256;
+
+/// `(parameter, point)` samples along a spline, ends included.
+fn spline_samples(sp: &super::Spline2d) -> Vec<(f64, Point2d)> {
+    let (u0, u1) = sp.parameter_range();
+    (0..=SPLINE_SAMPLES)
+        .filter_map(|i| {
+            let u = u0 + (u1 - u0) * i as f64 / SPLINE_SAMPLES as f64;
+            sp.evaluate(u.min(u1)).ok().map(|p| (u, p))
+        })
+        .collect()
+}
+
+/// The point of `curve`'s carrier nearest `p` (for a spline, of the curve).
+fn project_onto(curve: &OpCurve, p: &Point2d) -> Point2d {
+    match curve {
+        OpCurve::Segment { a, b } => {
+            let t = seg_param(a, b, p);
+            Point2d::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y))
+        }
+        OpCurve::Arc(arc) => radial(&arc.center, arc.radius, p),
+        OpCurve::Circle { c, r } => radial(c, *r, p),
+        OpCurve::Spline(sp) => spline_project(sp, p).map(|(q, _)| q).unwrap_or(*p),
+    }
+}
+
+/// The point of a spline nearest `p`, and its parameter, to full
+/// precision: the kernel's coarse search for a start, then Newton on
+/// f(u) = (C(u) - p) . C'(u) with f' = |C'|^2 + (C - p) . C'' (first and
+/// second derivatives), kept inside the parameter range.
+fn spline_project(sp: &super::Spline2d, p: &Point2d) -> Result<(Point2d, f64), SketchOpError> {
+    let (u0, u1) = sp.parameter_range();
+    let (_, mut u) = sp.closest_point(p, &Tolerance2d::default())?;
+    for _ in 0..60 {
+        let (c, d1, d2) = sp.derivatives2(u)?;
+        let r = Vector2d::from_points(p, &c);
+        let f = r.dot(&d1);
+        let df = d1.magnitude_squared() + r.dot(&d2);
+        if df.abs() < 1e-300 {
+            break;
+        }
+        let next = (u - f / df).clamp(u0, u1);
+        let moved = (next - u).abs();
+        u = next;
+        if moved < 1e-15 {
+            break;
+        }
+    }
+    Ok((sp.evaluate(u)?, u))
+}
+
+fn radial(c: &Point2d, r: f64, p: &Point2d) -> Point2d {
+    let d = Vector2d::from_points(c, p);
+    let m = d.magnitude();
+    if m < OP_EPS {
+        return Point2d::new(c.x + r, c.y);
+    }
+    Point2d::new(c.x + d.x / m * r, c.y + d.y / m * r)
+}
+
+/// The curve as straight pieces (a spline's samples; anything else as is).
+fn pieces_of(curve: &OpCurve) -> Vec<OpCurve> {
+    match curve {
+        OpCurve::Spline(sp) => spline_samples(sp)
+            .windows(2)
+            .map(|w| OpCurve::Segment {
+                a: w[0].1,
+                b: w[1].1,
+            })
+            .collect(),
+        other => vec![other.clone()],
+    }
+}
+
+/// Crossings of two curves at least one of which is a spline: found on
+/// their fine samples, then each refined by alternating projection onto
+/// the two curves until it lies on both (a crossing the refinement cannot
+/// pin to both curves is dropped, never reported approximately).
+fn spline_intersections(
+    a: &OpCurve,
+    b: &OpCurve,
+    op: &'static str,
+) -> Result<Vec<Point2d>, SketchOpError> {
+    let mut raw = Vec::new();
+    for pa in pieces_of(a) {
+        for pb in pieces_of(b) {
+            raw.extend(intersections(&pa, &pb, op)?);
+        }
+    }
+    let mut out: Vec<Point2d> = Vec::new();
+    for mut p in raw {
+        let mut on_both = false;
+        for _ in 0..200 {
+            let q = project_onto(b, &project_onto(a, &p));
+            let moved = q.distance_to(&p);
+            p = q;
+            if moved < 1e-13 {
+                break;
+            }
+        }
+        let p = project_onto(a, &p);
+        if p.distance_to(&project_onto(b, &p)) < 1e-9 && on_extent(a, &p) && on_extent(b, &p) {
+            on_both = true;
+        }
+        if on_both && !out.iter().any(|q| q.distance_to(&p) < 1e-7) {
+            out.push(p);
+        }
+    }
+    Ok(out)
 }
 
 fn norm_angle(a: f64) -> f64 {
@@ -281,10 +402,20 @@ fn op_curve(
                     })?;
             Ok(OpCurve::Circle { c, r })
         }
+        EntityRef::Spline(id) => {
+            let entry = sketch
+                .splines()
+                .get(id)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op,
+                    entity: entity.to_string(),
+                })?;
+            Ok(OpCurve::Spline(entry.spline.clone()))
+        }
         other => Err(SketchOpError::Unsupported {
             op,
             reason: format!(
-                "{other} is not a trim/extend curve (supported: line segment, arc, circle)"
+                "{other} is not a trim/extend curve (supported: line segment, arc, circle, spline)"
             ),
         }),
     }
@@ -311,6 +442,9 @@ fn on_extent(curve: &OpCurve, p: &Point2d) -> bool {
         }
         OpCurve::Arc(arc) => arc.contains_angle(arc.center.angle_to(p)),
         OpCurve::Circle { .. } => true,
+        // Within its own parameter range by construction (a projection
+        // onto the curve never leaves it).
+        OpCurve::Spline(_) => true,
     }
 }
 
@@ -318,10 +452,10 @@ fn carrier_circle(curve: &OpCurve, op: &'static str) -> Result<Circle2d, SketchO
     let (c, r) = match curve {
         OpCurve::Arc(arc) => (arc.center, arc.radius),
         OpCurve::Circle { c, r } => (*c, *r),
-        OpCurve::Segment { .. } => {
+        OpCurve::Segment { .. } | OpCurve::Spline(_) => {
             return Err(SketchOpError::Unsupported {
                 op,
-                reason: "internal: segment has no carrier circle".to_string(),
+                reason: "internal: this curve has no carrier circle".to_string(),
             })
         }
     };
@@ -334,6 +468,9 @@ fn intersections(
     b: &OpCurve,
     op: &'static str,
 ) -> Result<Vec<Point2d>, SketchOpError> {
+    if matches!(a, OpCurve::Spline(_)) || matches!(b, OpCurve::Spline(_)) {
+        return spline_intersections(a, b, op);
+    }
     let carrier_points: Vec<Point2d> = match (a, b) {
         (OpCurve::Segment { a: a0, b: a1 }, OpCurve::Segment { a: b0, b: b1 }) => {
             let d1 = Vector2d::from_points(a0, a1);
@@ -641,6 +778,7 @@ pub fn trim_at(
     others.extend(sketch.lines().iter().map(|e| EntityRef::Line(*e.key())));
     others.extend(sketch.arcs().iter().map(|e| EntityRef::Arc(*e.key())));
     others.extend(sketch.circles().iter().map(|e| EntityRef::Circle(*e.key())));
+    others.extend(sketch.splines().iter().map(|e| EntityRef::Spline(*e.key())));
     let mut hits: Vec<(Point2d, EntityRef)> = Vec::new();
     for other in others.into_iter().filter(|o| o != target) {
         // Unbounded lines and other non-trim curves cannot bound a span.
@@ -1036,9 +1174,81 @@ fn trim_with_hits(
             }
             Ok(outcome)
         }
+        (EntityRef::Spline(_), OpCurve::Spline(sp)) => {
+            let super::Spline2d::BSpline(bs) = &sp else {
+                return Err(SketchOpError::Unsupported {
+                    op: OP,
+                    reason: format!(
+                        "{target} is a rational (NURBS) spline; trimming one is not supported yet -- a B-spline is"
+                    ),
+                });
+            };
+            let (u0, u1) = sp.parameter_range();
+            let param = |p: &Point2d| spline_project(&sp, p).map(|(_, u)| u);
+            let mut us: Vec<(f64, EntityRef)> = hits
+                .iter()
+                .filter_map(|(p, k)| param(p).ok().map(|u| (u, *k)))
+                .filter(|(u, _)| *u > u0 + 1e-9 && *u < u1 - 1e-9)
+                .collect();
+            us.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+            us.dedup_by(|x, y| (x.0 - y.0).abs() < 1e-9);
+            if us.is_empty() {
+                return Err(SketchOpError::NoIntersection {
+                    op: OP,
+                    reason: format!("{cutter_name} does not cross the interior of {target}"),
+                });
+            }
+            let up = param(&pick)?;
+            let lo = us.iter().copied().rfind(|t| t.0 < up);
+            let hi = us.iter().copied().find(|t| t.0 > up);
+            if lo.is_none() && hi.is_none() {
+                return Err(SketchOpError::InvalidParameter {
+                    op: OP,
+                    parameter: "pick",
+                    reason: "pick sits exactly on the only crossing -- ambiguous span".to_string(),
+                });
+            }
+            let mut pieces = Vec::new();
+            if let Some((u, _)) = lo {
+                pieces.push(bs.split(u)?.0);
+            }
+            if let Some((u, _)) = hi {
+                pieces.push(bs.split(u)?.1);
+            }
+            let mut outcome = SketchOpOutcome::new(SketchOpKind::Trim);
+            // The kept spans are exact B-spline pieces of the original
+            // curve (split by knot insertion). Their control points are the
+            // split's own, so they are not draggable points; constraints
+            // on the original spline are reported dropped.
+            let originals = sketch.get_constraints_by_entity(target);
+            outcome
+                .constraints_removed
+                .extend(originals.iter().map(|c| c.id));
+            outcome
+                .deleted
+                .extend(sketch.delete_with_dependents(&[*target])?);
+            for piece in pieces {
+                let id = sketch.add_bspline(
+                    piece.degree,
+                    piece.control_points.clone(),
+                    piece.knots.clone(),
+                )?;
+                record_created(
+                    sketch,
+                    EntityRef::Spline(id),
+                    SketchOpKind::Trim,
+                    Some(*target),
+                    None,
+                    &mut outcome,
+                );
+            }
+            Ok(outcome)
+        }
         _ => Err(SketchOpError::Unsupported {
             op: OP,
-            reason: format!("{target} cannot be trimmed (supported: line segment, arc, circle)"),
+            reason: format!(
+                "{target} cannot be trimmed (supported: line segment, arc, circle, B-spline)"
+            ),
         }),
     }
 }
@@ -1436,6 +1646,23 @@ fn extend_line(
                 Point2d::new(c.x - r, c.y - r),
                 Point2d::new(c.x + r, c.y + r),
             ),
+            OpCurve::Spline(ref sp) => {
+                let pts: Vec<Point2d> = spline_samples(sp).into_iter().map(|(_, p)| p).collect();
+                let fold = |f: fn(f64, f64) -> f64, init: f64, x: bool| {
+                    pts.iter()
+                        .fold(init, |m, p| f(m, if x { p.x } else { p.y }))
+                };
+                (
+                    Point2d::new(
+                        fold(f64::min, f64::MAX, true),
+                        fold(f64::min, f64::MAX, false),
+                    ),
+                    Point2d::new(
+                        fold(f64::max, f64::MIN, true),
+                        fold(f64::max, f64::MIN, false),
+                    ),
+                )
+            }
         };
         let d1 = moving.distance_to(&bmin);
         let d2 = moving.distance_to(&bmax);

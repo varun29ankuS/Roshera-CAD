@@ -311,19 +311,54 @@ fn extend_refuses_legacy_arcs_and_spline_shapes_per_shape() {
     .expect_err("spline target must refuse");
     assert!(matches!(err, SketchOpError::Unsupported { .. }));
 
-    // Spline BOUNDARY: no analytic carrier intersection -- per-shape
-    // typed refusal.
-    let a = s.add_point(Point2d::new(0.0, 0.0));
-    let b = s.add_point(Point2d::new(5.0, 0.0));
+    // Spline BOUNDARY (2026-11-14, was refused: no carrier crossing): a
+    // spline's crossings are now found numerically and refined onto both
+    // curves, so a line extends to it -- its end lands ON the spline and
+    // is held there (PointOnCurve, which the solver evaluates on splines).
+    let a = s.add_point(Point2d::new(-2.0, 2.0));
+    let b = s.add_point(Point2d::new(2.0, 2.0));
     let line = s.add_line(a, b).expect("line");
-    let err = sketch_ops::extend(
+    sketch_ops::extend(
         &s,
         &EntityRef::Line(line),
         LineEnd::End,
         &EntityRef::Spline(spline),
     )
-    .expect_err("spline boundary must refuse");
-    assert!(matches!(err, SketchOpError::Unsupported { .. }));
+    .expect("a line extends to a spline boundary");
+    s.solve_constraints().expect("solves");
+    let end = s.get_point(&b).expect("the moved end");
+    // Distance to the curve, measured on a dense polyline of it (chord
+    // error ~1e-8 at this density).
+    let curve = s
+        .splines()
+        .get(&spline)
+        .expect("spline")
+        .value()
+        .spline
+        .clone();
+    let (u0, u1) = curve.parameter_range();
+    let n = 20_000;
+    let pts: Vec<Point2d> = (0..=n)
+        .map(|i| {
+            curve
+                .evaluate(u0 + (u1 - u0) * i as f64 / n as f64)
+                .expect("evaluates")
+        })
+        .collect();
+    let on = pts
+        .windows(2)
+        .map(|w| {
+            let (a, b) = (w[0], w[1]);
+            let (dx, dy) = (b.x - a.x, b.y - a.y);
+            let t =
+                (((end.x - a.x) * dx + (end.y - a.y) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+            ((end.x - a.x - t * dx).powi(2) + (end.y - a.y - t * dy).powi(2)).sqrt()
+        })
+        .fold(f64::MAX, f64::min);
+    assert!(
+        on < 1e-6,
+        "the extended end lies on the spline (off by {on})"
+    );
 }
 
 // ── 3. Legacy-arc + shared-CP-spline mirror (Slice-6 residual 5) ────

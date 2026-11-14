@@ -147,3 +147,102 @@ fn a_filleted_corner_solves_where_it_was_drawn() {
         );
     }
 }
+
+/// Trim with splines (Varun 2026-11-14: "trim tool along with nurbs and
+/// bsplines also helps in building the sketch"). A spline symmetric about
+/// the origin crosses the y axis at (0, 0).
+fn wave(s: &Sketch) -> geometry_engine::sketch2d::Spline2dId {
+    let pts: Vec<_> = [(-10.0, -4.0), (-3.0, 4.0), (3.0, -4.0), (10.0, 4.0)]
+        .iter()
+        .map(|(x, y)| s.add_point(Point2d::new(*x, *y)))
+        .collect();
+    s.add_bspline_with_control_points(3, &pts).unwrap()
+}
+
+#[test]
+fn a_line_trims_back_to_where_a_spline_crosses_it() {
+    let s = Sketch::new("S".into(), SketchAnchor::xy());
+    wave(&s);
+    let a = s.add_point(Point2d::new(0.0, -10.0));
+    let b = s.add_point(Point2d::new(0.0, 10.0));
+    let l = s.add_line(a, b).unwrap();
+    trim_at(&s, &EntityRef::Line(l), Point2d::new(0.0, 5.0)).unwrap();
+    let ends: Vec<(f64, f64)> = s
+        .lines()
+        .iter()
+        .filter_map(|e| {
+            let (p, q) = e.value().endpoints?;
+            let (p, q) = (s.get_point(&p)?, s.get_point(&q)?);
+            Some((p.y.min(q.y), p.y.max(q.y)))
+        })
+        .collect();
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert!(
+        (ends[0].0 + 10.0).abs() < 1e-9 && ends[0].1.abs() < 1e-6,
+        "{ends:?}"
+    );
+}
+
+#[test]
+fn a_spline_trims_back_to_where_a_line_crosses_it() {
+    use geometry_engine::sketch2d::Spline2d;
+    let s = Sketch::new("S".into(), SketchAnchor::xy());
+    let sp = wave(&s);
+    let a = s.add_point(Point2d::new(0.0, -10.0));
+    let b = s.add_point(Point2d::new(0.0, 10.0));
+    s.add_line(a, b).unwrap();
+    // Click the right half: it goes; the left half stays, ending at (0, 0).
+    trim_at(&s, &EntityRef::Spline(sp), Point2d::new(6.0, 0.5)).unwrap();
+    assert!(
+        s.splines().get(&sp).is_none(),
+        "the original spline is replaced"
+    );
+    let pieces: Vec<Spline2d> = s
+        .splines()
+        .iter()
+        .map(|e| e.value().spline.clone())
+        .collect();
+    assert_eq!(pieces.len(), 1);
+    let (u0, u1) = pieces[0].parameter_range();
+    let (p0, p1) = (
+        pieces[0].evaluate(u0).unwrap(),
+        pieces[0].evaluate(u1).unwrap(),
+    );
+    assert!(
+        (p0.x + 10.0).abs() < 1e-9 && (p0.y + 4.0).abs() < 1e-9,
+        "{p0:?}"
+    );
+    assert!(p1.x.abs() < 1e-6 && p1.y.abs() < 1e-6, "{p1:?}");
+}
+
+/// Splitting a B-spline (knot insertion) is exact: each half traces the
+/// original curve over its own parameter range, and they meet at the split.
+#[test]
+fn a_split_b_spline_is_the_same_curve_in_two_pieces() {
+    use geometry_engine::sketch2d::BSpline2d;
+    let pts = [
+        (-10.0, -4.0),
+        (-3.0, 4.0),
+        (3.0, -4.0),
+        (10.0, 4.0),
+        (14.0, 9.0),
+    ]
+    .iter()
+    .map(|(x, y)| Point2d::new(*x, *y))
+    .collect::<Vec<_>>();
+    let knots = vec![0.0, 0.0, 0.0, 0.0, 0.4, 1.0, 1.0, 1.0, 1.0];
+    let bs = BSpline2d::new(3, pts, knots).unwrap();
+    for u in [0.2, 0.4, 0.73] {
+        let (l, r) = bs.split(u).unwrap();
+        assert_eq!(l.parameter_range().1, u);
+        assert_eq!(r.parameter_range().0, u);
+        for i in 0..=20 {
+            let t = u * i as f64 / 20.0;
+            let (a, b) = (bs.evaluate(t).unwrap(), l.evaluate(t).unwrap());
+            assert!(a.distance_to(&b) < 1e-9, "left at {t}: {a:?} vs {b:?}");
+            let t = u + (1.0 - u) * i as f64 / 20.0;
+            let (a, b) = (bs.evaluate(t).unwrap(), r.evaluate(t).unwrap());
+            assert!(a.distance_to(&b) < 1e-9, "right at {t}: {a:?} vs {b:?}");
+        }
+    }
+}

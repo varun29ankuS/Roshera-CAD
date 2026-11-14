@@ -414,11 +414,54 @@ impl BSpline2d {
             });
         }
 
-        // Knot insertion to split curve
-        // This is a complex algorithm - for now return error
-        Err(Sketch2dError::NumericalError {
-            description: "Curve splitting requires knot insertion algorithm".to_string(),
-        })
+        // Boehm knot insertion (Piegl & Tiller, A5.1): insert `u` until its
+        // multiplicity equals the degree; the curve point at `u` is then a
+        // control point, and the curve separates exactly there.
+        let p = self.degree;
+        let mut knots = self.knots.clone();
+        let mut cps = self.control_points.clone();
+        let multiplicity = |k: &[f64]| k.iter().filter(|x| (**x - u).abs() < 1e-14).count();
+        while multiplicity(&knots) < p {
+            // Span: knots[k] <= u < knots[k + 1].
+            let k = (p..knots.len() - p - 1)
+                .rev()
+                .find(|&i| knots[i] <= u)
+                .unwrap_or(p);
+            let mut next = Vec::with_capacity(cps.len() + 1);
+            next.extend_from_slice(&cps[..k + 1 - p]);
+            for i in (k + 1 - p)..=k {
+                let den = knots[i + p] - knots[i];
+                let a = if den.abs() < 1e-300 {
+                    0.0
+                } else {
+                    (u - knots[i]) / den
+                };
+                next.push(Point2d::new(
+                    (1.0 - a) * cps[i - 1].x + a * cps[i].x,
+                    (1.0 - a) * cps[i - 1].y + a * cps[i].y,
+                ));
+            }
+            next.extend_from_slice(&cps[k..]);
+            knots.insert(k + 1, u);
+            cps = next;
+        }
+        // `u` now spans knots[m .. m + p]; the point at `u` is cps[m - 1].
+        let m = knots
+            .iter()
+            .position(|x| (*x - u).abs() < 1e-14)
+            .ok_or_else(|| Sketch2dError::NumericalError {
+                description: "knot insertion lost the split knot".to_string(),
+            })?;
+        let mut left_knots = knots[..m + p].to_vec();
+        left_knots.push(u);
+        let left_cps = cps[..m].to_vec();
+        let mut right_knots = vec![u];
+        right_knots.extend_from_slice(&knots[m..]);
+        let right_cps = cps[m - 1..].to_vec();
+        Ok((
+            BSpline2d::new(p, left_cps, left_knots)?,
+            BSpline2d::new(p, right_cps, right_knots)?,
+        ))
     }
 
     /// Compute the length of the curve
