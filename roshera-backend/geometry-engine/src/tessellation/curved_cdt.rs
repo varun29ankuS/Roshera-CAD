@@ -2642,25 +2642,32 @@ fn scan_encroached_segments(
     if pts2d.len() <= n_boundary {
         return Vec::new();
     }
-
+    // The boundary loops as stored (outer first, then each inner), indexed:
+    // a point can only encroach a segment whose diametral circle -- radius
+    // half the segment, centred on its midpoint -- contains it, so only
+    // segments within the longest half-segment are candidates. The exact
+    // predicate then decides, as the all-pairs scan this replaces did.
+    let mut loops: Vec<&[(f64, f64)]> = Vec::with_capacity(1 + inner_uv_lens.len());
+    let mut start = 0;
+    for len in std::iter::once(outer_uv_len).chain(inner_uv_lens.iter().copied()) {
+        let end = (start + len).min(pts2d.len());
+        loops.push(&pts2d[start..end]);
+        start = end;
+    }
+    let Some((outer, holes)) = loops.split_first() else {
+        return Vec::new();
+    };
+    let index = super::trim_index::TrimIndex::new(outer, holes);
+    let reach = index.longest_half_segment();
     let mut drops: Vec<(f64, f64)> = Vec::new();
-    for_each_boundary_edge(outer_uv_len, inner_uv_lens, |ia, ib| {
-        if ia >= pts2d.len() || ib >= pts2d.len() {
-            return;
-        }
-        let a = Vector2::new(pts2d[ia].0, pts2d[ia].1);
-        let b = Vector2::new(pts2d[ib].0, pts2d[ib].1);
-        for (j, &(px, py)) in pts2d.iter().enumerate().skip(n_boundary) {
-            let p = Vector2::new(px, py);
-            // Skip endpoints (trivially encroach themselves).
-            if j == ia || j == ib {
-                continue;
-            }
-            if is_encroached(a, b, p) {
+    for &(px, py) in &pts2d[n_boundary..] {
+        let p = Vector2::new(px, py);
+        for [a, b] in index.segments_near((px, py), reach) {
+            if is_encroached(Vector2::new(a.0, a.1), Vector2::new(b.0, b.1), p) {
                 drops.push((px, py));
             }
         }
-    });
+    }
     drops
 }
 
@@ -4733,6 +4740,53 @@ mod trim_triangulation_tests {
                 .is_some_and(|s| s.contains("overlaps itself")),
             "a doubled-back outline must be refused by name, got {refusal:?}"
         );
+    }
+
+    /// The indexed encroachment scan finds exactly the (segment, point)
+    /// encroachments the all-pairs scan finds, on random domains.
+    #[test]
+    fn indexed_encroachment_matches_the_all_pairs_scan() {
+        use crate::math::circumcircle::is_encroached;
+        use crate::math::Vector2;
+        let mut rng = Lcg(0xE1C);
+        for case in 0..150 {
+            let n = 4 + (rng.next() * 200.0) as usize;
+            let outer = star(&mut rng, (0.0, 0.0), 10.0, n, case % 2 == 0);
+            let m = 3 + (rng.next() * 30.0) as usize;
+            let hole = star(&mut rng, (2.0, 1.0), 2.0, m, true);
+            let mut pts = outer.clone();
+            pts.extend(hole.iter().copied());
+            for _ in 0..(rng.next() * 400.0) as usize {
+                pts.push((rng.next() * 24.0 - 12.0, rng.next() * 24.0 - 12.0));
+            }
+            let lens = [hole.len()];
+            let mut fast = scan_encroached_segments(&pts, outer.len(), &lens);
+            let mut slow = Vec::new();
+            let nb = outer.len() + hole.len();
+            for (start, len) in [(0usize, outer.len()), (outer.len(), hole.len())] {
+                for k in 0..len {
+                    let (a, b) = (pts[start + k], pts[start + (k + 1) % len]);
+                    if a == b {
+                        continue;
+                    }
+                    for &p in &pts[nb..] {
+                        if is_encroached(
+                            Vector2::new(a.0, a.1),
+                            Vector2::new(b.0, b.1),
+                            Vector2::new(p.0, p.1),
+                        ) {
+                            slow.push(p);
+                        }
+                    }
+                }
+            }
+            let key = |v: &mut Vec<(f64, f64)>| {
+                v.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            };
+            key(&mut fast);
+            key(&mut slow);
+            assert_eq!(fast, slow, "case {case}");
+        }
     }
 
     /// 300 random trimmed domains (star-shaped outers of 6-400 samples, up to

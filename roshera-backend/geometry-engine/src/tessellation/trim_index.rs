@@ -177,6 +177,38 @@ impl TrimIndex {
     }
 }
 
+impl TrimIndex {
+    /// Every indexed segment whose bounding box, grown by `r`, contains `p`:
+    /// a superset of the segments within `r` of `p`, each listed once.
+    pub(crate) fn segments_near(&self, p: (f64, f64), r: f64) -> Vec<[(f64, f64); 2]> {
+        if self.segments.is_empty() || !(r >= 0.0) {
+            return Vec::new();
+        }
+        let (i0, i1) = (self.col(p.0 - r), self.col(p.0 + r));
+        let (j0, j1) = (self.row(p.1 - r), self.row(p.1 + r));
+        let mut ids: Vec<u32> = Vec::new();
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                ids.extend_from_slice(&self.cells[j * self.nx + i]);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .map(|id| self.segments[id as usize])
+            .collect()
+    }
+
+    /// Half the longest indexed segment: no point farther than this from
+    /// every segment can lie in any segment's diametral circle.
+    pub(crate) fn longest_half_segment(&self) -> f64 {
+        self.segments
+            .iter()
+            .map(|[a, b]| 0.5 * ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt())
+            .fold(0.0, f64::max)
+    }
+}
+
 fn segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len_sq = dx * dx + dy * dy;
