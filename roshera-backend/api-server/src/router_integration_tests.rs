@@ -12767,3 +12767,127 @@ async fn an_arc_can_be_built_on_existing_points() {
     assert!(s.is_success(), "{snap}");
     assert_eq!(snap["arcs"].as_array().map(Vec::len), Some(0), "{snap}");
 }
+
+/// Editing a sketch after it became a feature (Varun 2026-11-14: "no way
+/// to edit the sketch"): reopen the feature's sketch (rebuilt from the
+/// history), change it, apply -- the feature is rebuilt from the new
+/// outline as an appended step, and it is still one feature in the tree.
+#[tokio::test]
+async fn a_feature_s_sketch_reopens_and_its_edit_rebuilds_the_feature() {
+    let state = make_test_state().await;
+    let (_, body) = dispatch(&state, json_post("/api/csketch", json!({}))).await;
+    let sk = body["id"].as_str().expect("sketch id").to_string();
+    let (s, b) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/csketch/{sk}/rectangle"),
+            json!({"x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 6.0}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "{b}");
+    let (s, b) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/csketch/{sk}/extrude"),
+            json!({"distance": 4.0}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "extrude: {b}");
+    let faces = |m: &geometry_engine::primitives::topology_builder::BRepModel| -> usize {
+        m.solids
+            .iter()
+            .map(|(_, s)| {
+                m.shells
+                    .get(s.outer_shell)
+                    .map(|sh| sh.faces.len())
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
+    assert_eq!(faces(&*state.model.read().await), 6, "a plain plate");
+
+    let (_, ch) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    let feature = ch["chapters"]
+        .as_array()
+        .and_then(|cs| cs.iter().find(|c| c["kind"] == "extrude"))
+        .cloned()
+        .expect("the extrude feature");
+    let (s, opened) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/sketch/reopen",
+            json!({ "sequences": feature["events"].clone() }),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "reopen: {opened}");
+    assert_eq!(opened["plane"], json!("xy"), "{opened}");
+    let reopened = opened["csketch_id"]
+        .as_str()
+        .expect("a sketch to edit")
+        .to_string();
+    let (_, snap) = dispatch(&state, json_get(&format!("/api/csketch/{reopened}"))).await;
+    assert_eq!(
+        snap["rectangles"].as_array().map(Vec::len),
+        Some(1),
+        "the drawn rectangle: {snap}"
+    );
+
+    // Add a hole to the sketch, then apply.
+    let (s, b) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/csketch/{reopened}/circle"),
+            json!({"cx": 5.0, "cy": 3.0, "radius": 1.0}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "{b}");
+    let (s, applied) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/resketch",
+            json!({ "target_sequence": opened["target_sequence"].clone(), "csketch_id": reopened }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "resketch: {applied}");
+    assert_eq!(applied["status"], "SketchApplied", "{applied}");
+    assert_eq!(
+        faces(&*state.model.read().await),
+        7,
+        "the plate now has its hole"
+    );
+    let (_, ch) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    let extrudes = ch["chapters"]
+        .as_array()
+        .map(|cs| cs.iter().filter(|c| c["kind"] == "extrude").count());
+    assert_eq!(extrudes, Some(1), "still one feature: {ch}");
+}
+
+/// A feature made before sketches were saved with their feature cannot be
+/// reopened -- refused, never an empty sketch passed off as the original.
+#[tokio::test]
+async fn a_sketch_that_was_never_saved_is_refused_not_faked() {
+    let state = make_test_state().await;
+    let (s, b) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 5.0, "depth": 5.0, "height": 5.0}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "{b}");
+    let (_, ch) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    let ev = ch["chapters"][0]["events"].clone();
+    let (s, b) = dispatch(
+        &state,
+        json_post("/api/timeline/sketch/reopen", json!({ "sequences": ev })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{b}");
+    assert_eq!(b["kind"], "NoSketch", "{b}");
+}

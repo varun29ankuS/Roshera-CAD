@@ -11718,6 +11718,18 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 axum::middleware::from_fn_with_state(intent_gate.clone(), require_declared_intent),
             ),
         )
+        // Edit a feature's sketch: reopen it from the history, then apply
+        // the edited sketch as an appended param.resketch step.
+        .route(
+            "/api/timeline/sketch/reopen",
+            post(crate::handlers::timeline::reopen_sketch),
+        )
+        .route(
+            "/api/timeline/resketch",
+            post(crate::handlers::timeline::resketch_feature).route_layer(
+                axum::middleware::from_fn_with_state(intent_gate.clone(), require_declared_intent),
+            ),
+        )
         // Delete a feature: an appended param.suppress step, trialled like a
         // mould and refused when it would break what is built on it.
         .route(

@@ -94,6 +94,14 @@ impl CSketchManager {
         id
     }
 
+    /// Register an existing sketch (e.g. one reopened from the history)
+    /// and return its id.
+    pub fn insert(&self, sketch: Sketch) -> SketchId {
+        let id = sketch.id;
+        self.sketches.insert(id, Arc::new(sketch));
+        id
+    }
+
     /// Cloned handle to the sketch. `None` when the id is unknown.
     pub fn get(&self, id: &SketchId) -> Option<Arc<Sketch>> {
         self.sketches.get(id).map(|e| Arc::clone(e.value()))

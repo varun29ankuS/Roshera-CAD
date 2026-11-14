@@ -3155,18 +3155,78 @@ pub async fn suppress_feature(
     targets.sort_unstable();
     targets.dedup();
     let first_target = targets[0];
-    let mut delete_event = TimelineEvent {
+    let detail = serde_json::json!({ "target_sequences": targets });
+    append_trialled(
+        &state,
+        branch_id,
+        session_uuid,
+        session_is_live,
+        events,
+        suppress_operation(&targets),
+        first_target,
+        TrialledStep {
+            verb: "delete",
+            subject: "deleting it",
+            rejected: "DeleteRejected",
+            applied: "FeatureDeleted",
+            not_saved: "DeleteNotSaved",
+            detail,
+        },
+    )
+    .await
+}
+
+/// How a trialled history step reports itself (delete, resketch ...).
+pub(crate) struct TrialledStep<'a> {
+    /// The verb for messages and the broadcast ("delete", "resketch").
+    pub verb: &'a str,
+    /// What breaks, as a sentence subject ("deleting it", "the new sketch").
+    pub subject: &'a str,
+    /// Status names: refused / applied / applied-but-not-saved.
+    pub rejected: &'a str,
+    pub applied: &'a str,
+    pub not_saved: &'a str,
+    /// Fields every reply carries (what was targeted).
+    pub detail: serde_json::Value,
+}
+
+fn with_detail(mut v: serde_json::Value, detail: &serde_json::Value) -> serde_json::Value {
+    if let (Some(o), Some(d)) = (v.as_object_mut(), detail.as_object()) {
+        for (k, x) in d {
+            o.insert(k.clone(), x.clone());
+        }
+    }
+    v
+}
+
+/// Append ONE correcting step (`operation`) to `branch_id` the way an edit
+/// is appended: pre-flight replay guard; the candidate history certified on
+/// a scratch model; REFUSED (409, nothing appended) when it would break a
+/// sound part, naming the feature that breaks; else appended, persisted,
+/// and the live model reconciled. Shared by delete and resketch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn append_trialled(
+    state: &AppState,
+    branch_id: BranchId,
+    session_uuid: Uuid,
+    session_is_live: bool,
+    events: Vec<TimelineEvent>,
+    operation: Operation,
+    first_target: u64,
+    t: TrialledStep<'_>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let mut appended = TimelineEvent {
         id: EventId::new(),
         sequence_number: events.last().map(|e| e.sequence_number + 1).unwrap_or(0),
         timestamp: chrono::Utc::now(),
         author: Author::System,
-        operation: suppress_operation(&targets),
+        operation,
         inputs: OperationInputs::default(),
         outputs: Default::default(),
         metadata: EventMetadata::default(),
     };
     let mut candidate_events = events.clone();
-    candidate_events.push(delete_event.clone());
+    candidate_events.push(appended.clone());
 
     // Pre-flight: a history the shared guard would refuse to replay.
     let preflight = {
@@ -3213,7 +3273,7 @@ pub async fn suppress_feature(
         {
             Ok(r) => r,
             Err(e) => {
-                error!(target: "timeline.delete", error = %e, "candidate certification task failed");
+                error!(target: "timeline.override", error = %e, "candidate certification task failed");
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
@@ -3223,20 +3283,22 @@ pub async fn suppress_feature(
             .first_break()
             .map(|v| {
                 format!(
-                    "deleting it breaks the feature at step {} ({}), which is built on it",
-                    v.sequence, v.kind
+                    "{} breaks the feature at step {} ({}), which is built on it",
+                    t.subject, v.sequence, v.kind
                 )
             })
-            .unwrap_or_else(|| "deleting it leaves the part unsound".to_string());
+            .unwrap_or_else(|| format!("{} leaves the part unsound", t.subject));
         return Ok((
             StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "status": "DeleteRejected",
-                "kind": "BrokenDownstream",
-                "reason": reason,
-                "target_sequences": targets,
-                "certificate": cand_cert,
-            })),
+            Json(with_detail(
+                serde_json::json!({
+                    "status": t.rejected,
+                    "kind": "BrokenDownstream",
+                    "reason": reason,
+                    "certificate": cand_cert,
+                }),
+                &t.detail,
+            )),
         ));
     }
 
@@ -3244,53 +3306,50 @@ pub async fn suppress_feature(
     let appended_id = {
         let timeline = state.timeline.write().await;
         let seq = timeline.reserve_sequence_number();
-        delete_event.sequence_number = seq;
+        appended.sequence_number = seq;
         timeline
-            .add_operation_reserved(
-                delete_event.operation.clone(),
-                Author::System,
-                branch_id,
-                seq,
-            )
+            .add_operation_reserved(appended.operation.clone(), Author::System, branch_id, seq)
             .await
             .map_err(|e| {
-                error!(target: "timeline.delete", error = %e, "delete append failed");
+                error!(target: "timeline.override", error = %e, "override append failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?
     };
-    if let Err(e) = crate::durability::persist_appended(&state, &[appended_id]).await {
-        error!(target: "timeline.delete", error = %e, "delete not persisted");
+    if let Err(e) = crate::durability::persist_appended(state, &[appended_id]).await {
+        error!(target: "timeline.override", error = %e, "override not persisted");
         return Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
-                "status": "DeleteNotSaved",
+                "status": t.not_saved,
                 "kind": "NotDurable",
-                "reason": format!("the delete is applied in memory but could not be saved: {e}"),
+                "reason": format!("the {} is applied in memory but could not be saved: {e}", t.verb),
             })),
         ));
     }
     let seed = if session_is_live {
-        force_session_position_at_head(&state, session_uuid, &branch_id).await
+        force_session_position_at_head(state, session_uuid, &branch_id).await
     } else {
-        ensure_session_position_at_head(&state, session_uuid).await
+        ensure_session_position_at_head(state, session_uuid).await
     };
     if let Err(err) = seed {
-        error!(target: "timeline.delete", session = %session_uuid, error = %err, "session seed failed");
+        error!(target: "timeline.override", session = %session_uuid, error = %err, "session seed failed");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
-    let (events_applied, events_skipped) = match replay_session_to_model(&state, session_uuid).await
+    let (events_applied, events_skipped) = match replay_session_to_model(state, session_uuid).await
     {
         Ok(o) => (o.events_applied, o.events_skipped),
         Err(err) => {
-            error!(target: "timeline.delete", session = %session_uuid, error = %err, "live reconcile failed");
+            error!(target: "timeline.override", session = %session_uuid, error = %err, "live reconcile failed");
             return Ok(mutated_but_not_reconciled(
-                &state,
+                state,
                 &err,
-                serde_json::json!({
-                    "operation": "delete",
-                    "delete_event_id": delete_event.id.to_string(),
-                    "target_sequences": targets,
-                }),
+                with_detail(
+                    serde_json::json!({
+                        "operation": t.verb,
+                        "event_id": appended.id.to_string(),
+                    }),
+                    &t.detail,
+                ),
             ));
         }
     };
@@ -3301,24 +3360,268 @@ pub async fn suppress_feature(
             &session_uuid.to_string(),
             BroadcastMessage::TimelineUpdate {
                 session_id: session_uuid,
-                event_id: delete_event.id.to_string(),
-                operation: "delete".to_string(),
+                event_id: appended.id.to_string(),
+                operation: t.verb.to_string(),
                 user_id: "system".to_string(),
             },
         )
         .await;
     Ok((
         StatusCode::OK,
+        Json(with_detail(
+            serde_json::json!({
+                "status": t.applied,
+                "event_id": appended.id.to_string(),
+                "sequence": appended.sequence_number,
+                "events_applied": events_applied,
+                "events_skipped": events_skipped,
+                "is_sound": cand_cert.is_sound(),
+            }),
+            &t.detail,
+        )),
+    ))
+}
+
+/// `POST /api/timeline/sketch/reopen` body: a feature's steps (a chapter's
+/// `events`); its sketch step is found among them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReopenSketchRequest {
+    pub sequences: Vec<u64>,
+    #[serde(default)]
+    pub branch_id: Option<String>,
+}
+
+/// The sketch step among `sequences`, as the history now reads it (a
+/// resketch already applied).
+fn sketch_step(
+    events: &[TimelineEvent],
+    sequences: &[u64],
+) -> Option<(u64, String, serde_json::Value)> {
+    let overrides = timeline_engine::OverrideSet::collect(events);
+    let mut seqs = sequences.to_vec();
+    seqs.sort_unstable();
+    seqs.into_iter().find_map(|seq| {
+        let e = events.iter().find(|e| e.sequence_number == seq)?;
+        let effective = overrides.overridden_event(e).unwrap_or_else(|| e.clone());
+        let Operation::Generic {
+            command_type,
+            parameters,
+        } = &effective.operation
+        else {
+            return None;
+        };
+        if command_type != "sketch_extrude" && command_type != "sketch_revolve" {
+            return None;
+        }
+        let params = parameters.get("params").unwrap_or(parameters).clone();
+        Some((seq, command_type.clone(), params))
+    })
+}
+
+/// The sketch plane of a recorded sketch step: a standard plane when its
+/// frame is one, else the frame itself.
+fn recorded_plane(params: &serde_json::Value) -> serde_json::Value {
+    let v3 = |k: &str| -> Option<[f64; 3]> {
+        let a = params.get(k)?.as_array()?;
+        Some([
+            a.first()?.as_f64()?,
+            a.get(1)?.as_f64()?,
+            a.get(2)?.as_f64()?,
+        ])
+    };
+    let (Some(o), Some(u), Some(v)) = (v3("origin"), v3("u_axis"), v3("v_axis")) else {
+        return serde_json::json!("xy");
+    };
+    let at_origin = o.iter().all(|c| c.abs() < 1e-12);
+    let is = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-12);
+    if at_origin && is(u, [1.0, 0.0, 0.0]) && is(v, [0.0, 1.0, 0.0]) {
+        return serde_json::json!("xy");
+    }
+    if at_origin && is(u, [1.0, 0.0, 0.0]) && is(v, [0.0, 0.0, 1.0]) {
+        return serde_json::json!("xz");
+    }
+    if at_origin && is(u, [0.0, 1.0, 0.0]) && is(v, [0.0, 0.0, 1.0]) {
+        return serde_json::json!("yz");
+    }
+    serde_json::json!({ "origin": o, "u_axis": u, "v_axis": v })
+}
+
+/// `POST /api/timeline/sketch/reopen` -- open a feature's sketch to edit it
+/// (Varun 2026-11-14: "no way to edit the sketch"). The sketch is rebuilt
+/// from the history (`source`, saved with the feature; a resketch already
+/// applied) into a fresh constraint sketch: the same entities, ids and
+/// constraints the user drew. A feature whose sketch was never saved (made
+/// before sketches were saved with their feature, or not from a sketch) is
+/// REFUSED, never handed back as an empty or guessed sketch.
+pub async fn reopen_sketch(
+    State(state): State<AppState>,
+    Json(request): Json<ReopenSketchRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let branch_id = match request.branch_id.as_deref() {
+        Some(b) => resolve_branch_ref(b)?,
+        None => BranchId::main(),
+    };
+    let _ = state.timeline_recorder.settle().await;
+    let events = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        all.sort_by_key(|e| e.sequence_number);
+        all
+    };
+    let refuse = |kind: &str, reason: &str| {
+        Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "status": "ReopenRefused", "kind": kind, "reason": reason })),
+        ))
+    };
+    let Some((seq, command, params)) = sketch_step(&events, &request.sequences) else {
+        return refuse("NoSketch", "this feature was not made from a sketch");
+    };
+    let Some(source) = params.get(timeline_engine::mould::SKETCH_SOURCE_KEY) else {
+        return refuse(
+            "SketchNotSaved",
+            "this feature was made before sketches were saved with their feature; its sketch cannot be reopened",
+        );
+    };
+    let source: geometry_engine::sketch2d::sketch_source::SketchSource =
+        match serde_json::from_value(source.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                return refuse(
+                    "SketchUnreadable",
+                    &format!("the saved sketch could not be read: {e}"),
+                )
+            }
+        };
+    let sketch = match geometry_engine::sketch2d::sketch::Sketch::from_source(
+        &source,
+        geometry_engine::sketch2d::sketch::SketchAnchor::xy(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return refuse(
+                "SketchUnreadable",
+                &format!("the saved sketch could not be rebuilt: {e}"),
+            )
+        }
+    };
+    let id = state.csketches.insert(sketch);
+    Ok((
+        StatusCode::OK,
         Json(serde_json::json!({
-            "status": "FeatureDeleted",
-            "delete_event_id": delete_event.id.to_string(),
-            "delete_sequence": delete_event.sequence_number,
-            "target_sequences": targets,
-            "events_applied": events_applied,
-            "events_skipped": events_skipped,
-            "is_sound": cand_cert.is_sound(),
+            "csketch_id": id.0,
+            "target_sequence": seq,
+            "kind": if command == "sketch_revolve" { "revolve" } else { "extrude" },
+            "plane": recorded_plane(&params),
+            "distance": params.get("distance"),
         })),
     ))
+}
+
+/// `POST /api/timeline/resketch` body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResketchRequest {
+    /// The sketch step of the feature (from `sketch/reopen`).
+    pub target_sequence: u64,
+    /// The edited sketch.
+    pub csketch_id: Uuid,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub branch_id: Option<String>,
+}
+
+/// `POST /api/timeline/resketch` -- apply an edited sketch to its feature:
+/// the new outline is built with exactly the checks the feature was first
+/// built with, then appended as a `param.resketch` step, trialled like an
+/// edit and REFUSED (409, nothing appended) when it would break a later
+/// feature. Undo takes it back.
+pub async fn resketch_feature(
+    State(state): State<AppState>,
+    Json(request): Json<ResketchRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let branch_id = match request.branch_id.as_deref() {
+        Some(b) => resolve_branch_ref(b)?,
+        None => BranchId::main(),
+    };
+    let (session_uuid, session_is_live) =
+        resolve_reconcile_session(request.session_id.as_deref(), &branch_id)?;
+    let _ = state.timeline_recorder.settle().await;
+    let events = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        all.sort_by_key(|e| e.sequence_number);
+        all
+    };
+    let refuse = |kind: &str, reason: String| {
+        Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "status": "SketchRejected", "kind": kind, "reason": reason })),
+        ))
+    };
+    let Some((seq, command, params)) = sketch_step(&events, &[request.target_sequence]) else {
+        return refuse(
+            "NotASketchFeature",
+            format!("step {} is not a sketch feature", request.target_sequence),
+        );
+    };
+    let Some(sketch) = state
+        .csketches
+        .get(&geometry_engine::sketch2d::SketchId(request.csketch_id))
+    else {
+        return refuse(
+            "UnknownSketch",
+            format!("no open sketch {}", request.csketch_id),
+        );
+    };
+    let axis = if command == "sketch_revolve" {
+        let v2 = |k: &str| -> Option<[f64; 2]> {
+            let a = params.get(k)?.as_array()?;
+            Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?])
+        };
+        match (v2("axis_origin"), v2("axis_direction")) {
+            (Some(o), Some(d)) => Some((o, d)),
+            _ => return refuse("NoAxis", "the revolve's axis is not recorded".to_string()),
+        }
+    } else {
+        None
+    };
+    let regions = match crate::csketch::feature_regions(&sketch, axis) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "status": "SketchRejected",
+                    "kind": "ProfileInvalid",
+                    "reason": e.error, "details": e.details,
+                })),
+            ))
+        }
+    };
+    let source = serde_json::to_value(sketch.to_source()).unwrap_or_default();
+    append_trialled(
+        &state,
+        branch_id,
+        session_uuid,
+        session_is_live,
+        events,
+        timeline_engine::resketch_operation(seq, &regions, &source),
+        seq,
+        TrialledStep {
+            verb: "resketch",
+            subject: "the new sketch",
+            rejected: "SketchRejected",
+            applied: "SketchApplied",
+            not_saved: "SketchNotSaved",
+            detail: serde_json::json!({ "target_sequence": seq }),
+        },
+    )
+    .await
 }
 
 /// `GET /api/timeline/rebuild-certificate/{branch_id}` — the honest per-feature
