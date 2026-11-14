@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { keepCameraPose, keptCameraPose } from '@/lib/camera-memory'
+import { FIT_MARGIN, fitDistance } from '@/lib/camera-fit'
 import { CAMERA_PRESETS, FRAME_ALL, FRAME_FIT } from '@/stores/scene-store'
 import { useThree, useFrame } from '@react-three/fiber'
 import {
@@ -238,8 +239,7 @@ export function CameraController() {
       let distance = sceneBounds.radius * 2.5
       const persp = perspRef.current
       if (persp && (camera as THREE.PerspectiveCamera).isPerspectiveCamera) {
-        const fov = (persp.fov * Math.PI) / 180
-        distance = (sceneBounds.radius / Math.tan(fov / 2)) * 1.4
+        distance = fitDistance(sceneBounds.radius, persp.fov, persp.aspect)
       }
       endPosition = endTarget.clone().addScaledVector(dir, distance)
     }
@@ -293,8 +293,7 @@ export function CameraController() {
     let distance = sceneBounds.radius * 2.5
     const persp = perspRef.current
     if (persp && (camera as THREE.PerspectiveCamera).isPerspectiveCamera) {
-      const fov = (persp.fov * Math.PI) / 180
-      distance = (sceneBounds.radius / Math.tan(fov / 2)) * 1.4
+      distance = fitDistance(sceneBounds.radius, persp.fov, persp.aspect)
     }
 
     animRef.current = {
@@ -354,15 +353,15 @@ export function CameraController() {
     const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5)
     const size = new THREE.Vector3().subVectors(max, min)
     const maxDim = Math.max(size.x, size.y, size.z, 1e-3)
+    // The bounding sphere: fits the part from any direction.
+    const radius = Math.max(size.length() / 2, 1e-3)
 
     let distance: number
     const persp = camera as THREE.PerspectiveCamera
     if (persp.isPerspectiveCamera) {
-      const fov = (persp.fov * Math.PI) / 180
-      // Distance s.t. an object of half-size `maxDim/2` fits with 1.5×
-      // padding inside the vertical fov. Using maxDim (not size.y) so
-      // the framing is robust against tall/wide aspect ratios.
-      distance = (maxDim / 2 / Math.tan(fov / 2)) * 1.5
+      // The part fills about half the view, on the tighter of height and
+      // width (lib/camera-fit).
+      distance = fitDistance(radius, persp.fov, persp.aspect)
     } else {
       // Orthographic: distance doesn't affect apparent size — `zoom`
       // does. Pick a viewing distance large enough to keep the camera
@@ -372,14 +371,16 @@ export function CameraController() {
       // perspective branch uses.
       distance = maxDim * 3
       const ortho = camera as THREE.OrthographicCamera
-      const { height } = useSceneStore.getState().viewportSize
+      const { width, height } = useSceneStore.getState().viewportSize
       if (ortho.isOrthographicCamera && height > 0) {
         // Imperative Three.js camera mutation inside an effect (not React
         // state) — required by the r3f/three API. The react-hooks
         // immutability rule can't distinguish an external mutable object
         // from frozen render state, so it false-positives here.
         // eslint-disable-next-line react-hooks/immutability
-        ortho.zoom = height / (maxDim * 1.5)
+        // The same margin as perspective: the sphere's diameter takes half
+        // the tighter of the view's height and width.
+        ortho.zoom = Math.min(height, width > 0 ? width : height) / (2 * radius * FIT_MARGIN)
         ortho.updateProjectionMatrix()
       }
     }
