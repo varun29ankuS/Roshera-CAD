@@ -3,6 +3,7 @@
  * Connects on mount, routes incoming ServerMessages to the appropriate stores,
  * and converts backend CADObject format to the scene store format.
  */
+import { useAgentShowStore } from '@/stores/agent-show-store'
 import { DEFAULT_PART_MATERIAL } from '@/lib/part-material'
 import { wsClient, setResyncHook } from './ws-client'
 import { useWSStore } from '@/stores/ws-store'
@@ -399,7 +400,12 @@ function handleServerMessage(msg: ServerMessage) {
       break
     }
 
-    case 'SceneSync': {
+    case 'AgentShow': {
+      // The agent drives the app to show the user something.
+      void useAgentShowStore.getState().receive(msg.payload)
+      break
+    }
+        case 'SceneSync': {
       // Full scene sync — replace all objects. This is an authoritative
       // snapshot, so any still-pending churn from the batching queue
       // above is superseded; drop it rather than let a stale queued

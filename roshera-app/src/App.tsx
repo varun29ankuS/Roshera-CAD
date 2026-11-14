@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
+import { AgentShowBar } from '@/components/layout/AgentShowBar'
 import { ToolBar } from '@/components/layout/ToolBar'
 import { StatusBar } from '@/components/layout/StatusBar'
 import { CADViewport } from '@/components/viewport/CADViewport'
@@ -161,6 +162,10 @@ export function App() {
           (2026-11-13) chose tabs, as in mainstream CAD, so the
           engineer always sees where they are. */}
       <TopBar />
+      {/* The agent driving the app: what it is showing, Pause, Take over. */}
+      <div className="pointer-events-none relative z-50 h-0">
+        <AgentShowBar />
+      </div>
       <div className="flex flex-1 min-h-0">
         {/* The Drawing workspace replaces the 3D pipeline entirely:
             no ToolBar (modelling primitives are irrelevant in a 2D

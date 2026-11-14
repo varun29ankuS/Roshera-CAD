@@ -1,4 +1,5 @@
 import { HistoryViewBanner } from './HistoryViewBanner'
+import { AgentFacesHighlight } from './AgentFacesHighlight'
 import { FeatureHighlight } from './FeatureHighlight'
 import { InSlot } from '@/components/viewport/overlay-slots'
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -217,6 +218,7 @@ export function CADViewport() {
         <GdtAnnotations />
         <DfmFaceTints />
         <FeatureHighlight />
+        <AgentFacesHighlight />
       </Canvas>
 
       <ViewportFrame />

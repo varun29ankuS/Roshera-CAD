@@ -227,6 +227,18 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     type: z.literal('SceneSync'),
     payload: z.object({ objects: z.array(cadObjectSchema) }),
   }),
+  // The agent showing the user something (POST /api/agent/show): one action,
+  // already checked strictly by the server; carried out by agent-show-store.
+  z.object({
+    type: z.literal('AgentShow'),
+    payload: z.discriminatedUnion('action', [
+      z.object({ action: z.literal('workspace'), mode: z.enum(['part', 'assembly', 'drawing', 'dfm']), caption: z.string().nullish() }),
+      z.object({ action: z.literal('view'), view: z.enum(['iso', 'front', 'back', 'top', 'bottom', 'left', 'right', 'fit']), caption: z.string().nullish() }),
+      z.object({ action: z.literal('feature'), name: z.string().nullish(), anchor: z.number().nullish(), caption: z.string().nullish() }),
+      z.object({ action: z.literal('faces'), solid_id: z.number(), face_ids: z.array(z.number()), caption: z.string().nullish() }),
+      z.object({ action: z.literal('step'), sequence: z.number(), caption: z.string().nullish() }),
+    ]),
+  }),
   z.object({
     type: z.literal('SessionUpdate'),
     payload: z.object({ session_id: z.string() }),
