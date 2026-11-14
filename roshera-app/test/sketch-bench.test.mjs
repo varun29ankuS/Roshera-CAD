@@ -255,3 +255,14 @@ test('a spline shows its control polygon -- the points you drag to reshape it', 
   const s = sk({ splines: [{ id: 'sp', degree: 3, control_points: [[0, 0], [5, 5], [10, 0], [15, 5]], knots: [0, 0, 0, 0, 1, 1, 1, 1], weights: null, is_construction: false }] })
   assert.deepEqual(controlPolygons(s), [[[0, 0], [5, 5], [10, 0], [15, 5]]])
 })
+
+test('where a spline crosses a line is marked too', async () => {
+  const { crossings } = await lib()
+  const s = sk({
+    lines: [seg('v', 0, -10, 0, 10)],
+    splines: [{ id: 'sp', degree: 3, control_points: [[-10, -4], [-3, 4], [3, -4], [10, 4]], knots: [0, 0, 0, 0, 1, 1, 1, 1], weights: null, is_construction: false }],
+  })
+  const xs = crossings(s)
+  assert.equal(xs.length, 1, JSON.stringify(xs))
+  assert.ok(Math.hypot(xs[0].at[0], xs[0].at[1]) < 1e-3, JSON.stringify(xs[0].at))
+})

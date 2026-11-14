@@ -698,6 +698,12 @@ function curvesOf(s: CSketchSummary): Curve[] {
     const a0 = a.ccw ? a.start_angle : a.end_angle
     out.push({ ref: { Arc: a.id }, kind: 'circ', c: [a.cx, a.cy], r: a.radius, a0: norm(a0), sweep })
   }
+  // A spline as its drawn pieces: crossings with it are marked (the kernel
+  // finds them exactly when Trim cuts there).
+  for (const p of entityPaths({ ...s, lines: [], circles: [], arcs: [], rectangles: [], ellipses: [], polylines: [] })) {
+    if (p.construction) continue
+    for (let i = 1; i < p.pts.length; i++) out.push({ ref: p.ref, kind: 'seg', a: p.pts[i - 1], b: p.pts[i] })
+  }
   return out
 }
 
@@ -775,9 +781,13 @@ export function crossings(s: CSketchSummary): { at: Vec2; refs: [EntityRef, Enti
   const out: { at: Vec2; refs: [EntityRef, EntityRef] }[] = []
   for (let i = 0; i < cs.length; i++) {
     for (let j = i + 1; j < cs.length; j++) {
+      // Pieces of one spline meet end to end: not crossings.
+      if (sameRef(cs[i].ref, cs[j].ref)) continue
       for (const p of carrierHits(cs[i], cs[j])) {
         if (!within(cs[i], p) || !within(cs[j], p)) continue
         if (isEnd(cs[i], p) && isEnd(cs[j], p)) continue
+        // A crossing at a spline piece joint is found by both pieces.
+        if (out.some((q) => Math.hypot(q.at[0] - p[0], q.at[1] - p[1]) < 1e-6)) continue
         out.push({ at: p, refs: [cs[i].ref, cs[j].ref] })
       }
     }
@@ -794,6 +804,7 @@ export function overlaps(s: CSketchSummary): [EntityRef, EntityRef][] {
     for (let j = i + 1; j < cs.length; j++) {
       const x = cs[i]
       const y = cs[j]
+      if (sameRef(x.ref, y.ref)) continue
       if (x.kind === 'seg' && y.kind === 'seg') {
         const d: Vec2 = [x.b[0] - x.a[0], x.b[1] - x.a[1]]
         const L = Math.hypot(d[0], d[1])
