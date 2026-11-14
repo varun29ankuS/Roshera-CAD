@@ -254,10 +254,10 @@ export function App() {
                   the section controls, live readouts -- stacked. */}
               <div
                 ref={attachRightSlot}
-                className="pointer-events-none absolute right-[21rem] top-[9.5rem] z-20 flex max-h-[calc(100%-19rem)] w-60 flex-col gap-2 overflow-y-auto [scrollbar-width:none]"
+                className="pointer-events-none absolute bottom-[9rem] right-[21rem] top-[9.5rem] z-20 flex w-64 flex-col gap-2"
               >
                 {hasSelection && (
-                  <div className="pointer-events-auto flex max-h-[45vh] shrink-0 flex-col overflow-hidden rounded border border-border bg-card/95">
+                  <div className="pointer-events-auto flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-card/95 shadow-sm">
                     <PropertiesPanel />
                   </div>
                 )}

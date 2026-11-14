@@ -1,7 +1,20 @@
-import { useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import { useSceneStore } from '@/stores/scene-store'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import { Separator } from '@/components/ui/separator'
+import { cn } from '@/lib/utils'
+import { verifyPart } from '@/lib/dfm'
+import {
+  diameterList,
+  fetchFace,
+  fetchPartProperties,
+  formatArea,
+  formatMass,
+  formatPoint3,
+  formatSize,
+  formatVolume,
+  type FaceReport,
+  type PartProperties,
+} from '@/lib/part-properties'
 import {
   Box,
   Eye,
@@ -11,6 +24,46 @@ import {
   Ruler,
 } from '@/components/ui/icons'
 
+/** A titled section that folds; the panel scrolls as a whole. */
+function Section({ title, defaultOpen = true, children }: { title: string; defaultOpen?: boolean; children: ReactNode }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <section className="border-t border-border/70 first:border-t-0">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="cad-focus flex w-full items-center gap-1 px-3 py-1.5 text-left text-[10.5px] font-medium uppercase tracking-[0.08em] text-muted-foreground hover:text-foreground"
+      >
+        {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        {title}
+      </button>
+      {open && <div className="space-y-1 px-3 pb-2.5">{children}</div>}
+    </section>
+  )
+}
+
+/** One spec-sheet row: the label, then the value. */
+function Row({ label, value, mono = true }: { label: string; value: ReactNode; mono?: boolean }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 text-[11.5px]">
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      {/* Wraps rather than cuts: a value cut to "4× …" is a wrong number. */}
+      <span className={cn('min-w-0 break-words text-right text-foreground', mono && 'font-mono tabular-nums')}>{value}</span>
+    </div>
+  )
+}
+
+const MATERIAL_KEYS = ['metalness', 'roughness', 'opacity'] as const
+
+/**
+ * Properties of the selected part (Varun 2026-11-14: "unscrollable ... and
+ * it needs a lot more features"): what it is and whether the kernel calls it
+ * sound; its size; its mass, material, volume, area and centre of mass; what
+ * it is made of (faces, edges, vertices, every cylinder's diameter); the
+ * picked face; its position; and, folded, its appearance and display.
+ * Every number is the kernel's own (lib/part-properties).
+ */
 export function PropertiesPanel() {
   const selectedIds = useSceneStore((s) => s.selectedIds)
   const objects = useSceneStore((s) => s.objects)
@@ -18,213 +71,189 @@ export function PropertiesPanel() {
   const selectionMode = useSceneStore((s) => s.selectionMode)
   const subSelections = useSceneStore((s) => s.subElementSelections)
 
-  if (selectedIds.size === 0) {
-    return (
-      <div className="w-56 cad-panel-elevated border-l flex flex-col min-h-0 overflow-hidden">
-        <div className="cad-panel-header">Properties</div>
-        <div className="flex-1 flex items-center justify-center p-4">
-          <p className="text-xs text-muted-foreground text-center">
-            Select an object to view properties
-          </p>
-        </div>
-      </div>
-    )
-  }
+  const id = selectedIds.size === 1 ? Array.from(selectedIds)[0] : null
+  const obj = id ? objects.get(id) : undefined
+  const solidId = obj?.analyticalGeometry?.solidId
+  const mesh = obj?.mesh
+
+  const [props, setProps] = useState<{ solidId: number; data: PartProperties } | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [reload, setReload] = useState(0)
+  const [verifying, setVerifying] = useState(false)
+
+  // Read again when the part changes (an edit hands it a new mesh).
+  useEffect(() => {
+    if (solidId === undefined) return
+    let live = true
+    fetchPartProperties(solidId)
+      .then((data) => {
+        if (!live) return
+        setProps({ solidId, data })
+        setLoadError(null)
+      })
+      .catch((e: unknown) => {
+        if (live) setLoadError(e instanceof Error ? e.message : String(e))
+      })
+    return () => {
+      live = false
+    }
+  }, [solidId, mesh, reload])
+
+  // The picked face, when picking faces.
+  const pickedFace = selectionMode === 'face' && subSelections.length === 1 ? subSelections[0].index : null
+  const [face, setFace] = useState<FaceReport | null>(null)
+  useEffect(() => {
+    if (pickedFace === null) return
+    let live = true
+    fetchFace(pickedFace)
+      .then((f) => {
+        if (live) setFace(f)
+      })
+      .catch(() => {
+        if (live) setFace(null)
+      })
+    return () => {
+      live = false
+    }
+  }, [pickedFace])
 
   if (selectedIds.size > 1) {
-    return (
-      <div className="w-56 cad-panel-elevated border-l flex flex-col min-h-0 overflow-hidden">
-        <div className="cad-panel-header">Properties</div>
-        <div className="p-3">
-          <p className="text-xs text-muted-foreground">
-            {selectedIds.size} objects selected
-          </p>
-        </div>
-      </div>
-    )
+    return <div className="p-3 text-[11.5px] text-muted-foreground">{selectedIds.size} parts selected</div>
   }
+  if (!id || !obj) return null
 
-  const id = Array.from(selectedIds)[0]
-  const obj = objects.get(id)
-  if (!obj) return null
-
-  const ag = obj.analyticalGeometry
+  const data = props && props.solidId === solidId ? props.data : null
+  const p = data?.part
+  const verdict = data?.perception
 
   return (
-    // No w-56, no border-l, no bg: the right dock owns the column's chrome.
-    // A panel that carries its own shell inside a dock draws a second border
-    // and a second width, which is how a "docked" panel ends up looking pasted
-    // on rather than built in.
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div className="cad-panel-header">Properties</div>
-
-      <ScrollArea className="flex-1 min-h-0">
-        {/* A measure cap, for the same reason prose gets one. Every row here is
-            a label bookended against its value, which is legitimate — a spec
-            sheet — but only while the eye can still bind the two. In the 560px
-            rail the gap between "Opacity" and "1.00" measured 470px, at which
-            point they are two unrelated words on opposite sides of a panel.
-            340px keeps the pair readable; below that the cap does nothing, so
-            the narrow rail is unaffected. */}
-        <div className="max-w-[340px] p-3 space-y-3">
-          {/* Name & Type */}
-          <div>
-            <div className="flex items-center gap-1.5 mb-1">
-              <Box size={12} className="text-primary" />
-              <span className="text-xs font-medium truncate">{obj.name}</span>
-            </div>
-            <span className="text-[11px] text-muted-foreground uppercase tracking-wider">
-              {obj.objectType}
-            </span>
-          </div>
-
-          <Separator />
-
-          {/* Visibility & Lock */}
-          <div className="flex items-center gap-1">
-            <button
-              onClick={() => updateObject(id, { visible: !obj.visible })}
-              className="cad-icon-btn h-6 w-6"
-              title={obj.visible ? 'Hide' : 'Show'}
-              aria-label={obj.visible ? 'Hide object' : 'Show object'}
-            >
-              {obj.visible ? <Eye size={12} /> : <EyeOff size={12} />}
-            </button>
-            <button
-              onClick={() => updateObject(id, { locked: !obj.locked })}
-              className="cad-icon-btn h-6 w-6"
-              title={obj.locked ? 'Unlock' : 'Lock'}
-              aria-label={obj.locked ? 'Unlock object' : 'Lock object'}
-            >
-              {obj.locked ? <Lock size={12} /> : <Unlock size={12} />}
-            </button>
-          </div>
-
-          <Separator />
-
-          {/* Transform — editable. Single source of truth for
-              Position / Rotation / Scale; read-only summary tiles
-              were removed because they duplicated this block and
-              pushed material controls below the fold. */}
-          <TransformEditor objectId={id} />
-
-          {/* Analytical geometry params */}
-          {ag && (
-            <>
-              <Separator />
-              <div>
-                <p className="text-[11px] text-muted-foreground uppercase tracking-wider mb-1.5">
-                  Dimensions
-                </p>
-                <div className="space-y-0.5">
-                  {Object.entries(ag.params).map(([key, val]) => (
-                    <div key={key} data-role="pair" className="flex justify-between text-[11px]">
-                      <span className="text-muted-foreground">{key}</span>
-                      <span className="font-mono">{typeof val === 'number' ? val.toFixed(2) : String(val)}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </>
-          )}
-
-          {/* Material */}
-          <Separator />
-          <div>
-            <p className="text-[11px] text-muted-foreground uppercase tracking-wider mb-1.5">
-              Material
-            </p>
-            <ColorPicker
-              value={obj.material.color}
-              onChange={(c) =>
-                updateObject(id, { material: { ...obj.material, color: c } })
-              }
-            />
-            <div className="mt-1.5 space-y-1">
-              <div>
-                <div data-role="pair" className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
-                  <span>Metalness</span>
-                  <span className="font-mono">{obj.material.metalness.toFixed(2)}</span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.01}
-                  value={obj.material.metalness}
-                  onChange={(e) =>
-                    updateObject(id, {
-                      material: { ...obj.material, metalness: Number(e.target.value) },
-                    })
-                  }
-                  className="w-full h-1 accent-primary"
-                />
-              </div>
-              <div>
-                <div data-role="pair" className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
-                  <span>Roughness</span>
-                  <span className="font-mono">{obj.material.roughness.toFixed(2)}</span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.01}
-                  value={obj.material.roughness}
-                  onChange={(e) =>
-                    updateObject(id, {
-                      material: { ...obj.material, roughness: Number(e.target.value) },
-                    })
-                  }
-                  className="w-full h-1 accent-primary"
-                />
-              </div>
-              <div>
-                <div data-role="pair" className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
-                  <span>Opacity</span>
-                  <span className="font-mono">{obj.material.opacity.toFixed(2)}</span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.01}
-                  value={obj.material.opacity}
-                  onChange={(e) =>
-                    updateObject(id, {
-                      material: { ...obj.material, opacity: Number(e.target.value) },
-                    })
-                  }
-                  className="w-full h-1 accent-primary"
-                />
-              </div>
-            </div>
-          </div>
-
-          {/* Sub-element selection info */}
-          {selectionMode !== 'object' && subSelections.length > 0 && (
-            <>
-              <Separator />
-              <div>
-                <p className="text-[11px] text-muted-foreground uppercase tracking-wider mb-1.5">
-                  Selection ({selectionMode})
-                </p>
-                <div className="space-y-0.5 text-[11px]">
-                  {subSelections.map((sel, i) => (
-                    <div key={i} className="text-muted-foreground">
-                      {sel.type} #{sel.index}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </>
-          )}
-
-          {/* Display Settings */}
-          <Separator />
-          <EdgeDisplayControls />
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* Header: what it is, and whether the kernel stands behind it. */}
+      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+        <Box size={16} />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[12.5px] font-semibold">{obj.name}</div>
+          <div className="text-[10.5px] text-muted-foreground">Part{solidId !== undefined ? ` · solid ${solidId}` : ''}</div>
         </div>
-      </ScrollArea>
+        <button
+          type="button"
+          onClick={() => updateObject(id, { visible: !obj.visible })}
+          className="cad-icon-btn h-6 w-6"
+          title={obj.visible ? 'Hide' : 'Show'}
+          aria-label={obj.visible ? 'Hide part' : 'Show part'}
+        >
+          {obj.visible ? <Eye size={12} /> : <EyeOff size={12} />}
+        </button>
+        <button
+          type="button"
+          onClick={() => updateObject(id, { locked: !obj.locked })}
+          className="cad-icon-btn h-6 w-6"
+          title={obj.locked ? 'Unlock' : 'Lock'}
+          aria-label={obj.locked ? 'Unlock part' : 'Lock part'}
+        >
+          {obj.locked ? <Lock size={12} /> : <Unlock size={12} />}
+        </button>
+      </div>
+      {verdict && (
+        <div
+          className={cn(
+            'flex items-center gap-2 border-b border-border px-3 py-1.5 text-[11px]',
+            verdict.sound ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-amber-400',
+          )}
+          title={verdict.verdict}
+        >
+          <span className="font-medium">{verdict.sound ? '✓ Sound' : verdict.verified ? '✗ Not sound' : 'Not verified'}</span>
+          <span className="min-w-0 flex-1 truncate text-muted-foreground">
+            {verdict.sound ? 'closed, manifold, no self-intersection' : verdict.status}
+          </span>
+          {!verdict.sound && solidId !== undefined && (
+            <button
+              type="button"
+              disabled={verifying}
+              onClick={async () => {
+                setVerifying(true)
+                await verifyPart(solidId).catch(() => false)
+                setVerifying(false)
+                setReload((n) => n + 1)
+              }}
+              className="cad-focus rounded border border-border px-1.5 py-0.5 text-foreground hover:bg-accent"
+            >
+              {verifying ? 'Verifying…' : 'Verify'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* The body scrolls; the header stays. */}
+      <div className="min-h-0 flex-1 overflow-y-auto [scrollbar-width:thin]">
+        {loadError && !data && (
+          <p className="px-3 py-2 text-[11px] text-red-700 dark:text-red-300">Could not read this part ({loadError}).</p>
+        )}
+        {p && (
+          <>
+            <Section title="Size">
+              <Row label="W × D × H" value={formatSize(p.dimensions_world)} />
+              <Row label="Centre" value={formatPoint3(p.center_world)} />
+              <Row label="From" value={formatPoint3(p.world_bbox_min)} />
+              <Row label="To" value={formatPoint3(p.world_bbox_max)} />
+            </Section>
+            <Section title="Mass">
+              <Row label="Mass" value={data?.mass ? formatMass(data.mass.mass) : '—'} />
+              <Row label="Material" value={`${p.material.name} · ${p.material.density.toLocaleString()} kg/m³`} mono={false} />
+              <Row label="Volume" value={formatVolume(p.volume)} />
+              <Row label="Surface area" value={formatArea(p.surface_area)} />
+              {data?.mass && <Row label="Centre of mass" value={formatPoint3(data.mass.center_of_mass)} />}
+              {data?.mass && (
+                <Row label="Principal moments" value={`${data.mass.principal_moments.map((m) => Math.round(m)).join(' · ')} kg·mm²`} />
+              )}
+            </Section>
+            <Section title="Contents">
+              <Row label="Faces · edges · vertices" value={`${p.topology.face_count} · ${p.topology.edge_count} · ${p.topology.vertex_count}`} />
+              <Row label="Diameters" value={diameterList(data?.diameters ?? [])} />
+            </Section>
+          </>
+        )}
+        {pickedFace !== null && face && face.id === pickedFace && (
+          <Section title={`Face ${face.id}`}>
+            <Row label="Surface" value={face.surface_type} mono={false} />
+            <Row label="Area" value={formatArea(face.area)} />
+            <Row label="Touches faces" value={face.neighbour_face_ids.join(', ') || 'none'} />
+          </Section>
+        )}
+        {selectionMode !== 'object' && subSelections.length > 1 && (
+          <Section title={`Picked (${selectionMode})`}>
+            <Row label="Count" value={subSelections.length} />
+            <Row label="Ids" value={subSelections.map((s) => s.index).join(', ')} />
+          </Section>
+        )}
+        <Section title="Position">
+          <TransformEditor objectId={id} />
+        </Section>
+        <Section title="Appearance" defaultOpen={false}>
+          <ColorPicker value={obj.material.color} onChange={(c) => updateObject(id, { material: { ...obj.material, color: c } })} />
+          {MATERIAL_KEYS.map((k) => (
+            <div key={k}>
+              <div className="mb-0.5 flex justify-between text-[11px] text-muted-foreground">
+                <span className="capitalize">{k}</span>
+                <span className="font-mono">{obj.material[k].toFixed(2)}</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={obj.material[k]}
+                aria-label={k}
+                onChange={(e) => updateObject(id, { material: { ...obj.material, [k]: Number(e.target.value) } })}
+                className="h-1 w-full accent-primary"
+              />
+            </div>
+          ))}
+        </Section>
+        <Section title="Display" defaultOpen={false}>
+          <EdgeDisplayControls />
+        </Section>
+      </div>
     </div>
   )
 }
