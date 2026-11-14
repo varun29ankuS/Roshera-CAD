@@ -115,8 +115,17 @@ pub fn import_step_text_with_report(
     source_hint: &str,
 ) -> Result<(BRepModel, ImportReport), ExportError> {
     // Parse → index → dispatch.
+    let prof = import_profile_enabled();
+    let t_all = std::time::Instant::now();
     let exchange = parser::parse_step(text, source_hint)?;
+    if prof {
+        eprintln!("[import-profile] parse {:?}", t_all.elapsed());
+    }
+    let t = std::time::Instant::now();
     let registry = EntityRegistry::build(&exchange);
+    if prof {
+        eprintln!("[import-profile] index {:?}", t.elapsed());
+    }
     let mut model = BRepModel::new();
     let mut report = ImportReport::new();
 
@@ -126,6 +135,7 @@ pub fn import_step_text_with_report(
     let mut dispatch = EntityDispatch::new();
     handlers::register_all(&mut dispatch);
 
+    let t = std::time::Instant::now();
     let (resolved, roots_with_solids, total_root_solids, caches) = {
         let mut ctx = ImportContext::new(&mut model, &mut report);
         let resolved = dispatch.run_all(&registry, &mut ctx);
@@ -134,12 +144,16 @@ pub fn import_step_text_with_report(
         let caches = std::mem::take(&mut ctx.caches);
         (resolved, roots_with_solids, total_root_solids, caches)
     };
+    if prof {
+        eprintln!("[import-profile] build geometry {:?}", t.elapsed());
+    }
     report.roots_resolved = roots_with_solids;
     report.solids_in_roots = total_root_solids;
 
     // Place assembly instances from the product tree, then give every solid
     // and face its identity — PIDs keyed by this file's CONTENT and the STEP
     // entity each came from, and `imported:step` provenance.
+    let t = std::time::Instant::now();
     let file_root = geometry_engine::primitives::persistent_id::PersistentId::root(text.as_bytes());
     let mut model = assembly_placement::finalize(
         model,
@@ -167,6 +181,10 @@ pub fn import_step_text_with_report(
     // failed and why, and can never read a false green.
     // One batch: a single model-wide validation sweep for every solid, not
     // one sweep per solid (quadratic on an assembly of hundreds of parts).
+    if prof {
+        eprintln!("[import-profile] place assembly {:?}", t.elapsed());
+    }
+    let t = std::time::Instant::now();
     let solid_ids: Vec<_> = model.solids.iter().map(|(sid, _)| sid).collect();
     let mut all_solids_sound = true;
     for (solid_id, cert) in model.certify_solids(&solid_ids) {
@@ -197,9 +215,24 @@ pub fn import_step_text_with_report(
     // flagged (and its failing dimension named) in `report.validation`.
     // ...and every part the assembly uses actually came in: a use whose
     // geometry built no solid is recorded as missing and fails `ok`.
+    if prof {
+        eprintln!(
+            "[import-profile] certify {} solids {:?} (total {:?})",
+            solid_ids.len(),
+            t.elapsed(),
+            t_all.elapsed()
+        );
+    }
     report.ok =
         resolved > 0 && !model.solids.is_empty() && all_solids_sound && report.missing_parts == 0;
     Ok((model, report))
+}
+
+/// `ROSHERA_IMPORT_PROFILE=1` prints how long each import stage took, to
+/// stderr. Off by default; the same switch the drawing pipeline has
+/// (`ROSHERA_DRAW_PROFILE`).
+fn import_profile_enabled() -> bool {
+    std::env::var_os("ROSHERA_IMPORT_PROFILE").is_some_and(|v| !v.is_empty())
 }
 
 /// Pull the AP / schema identifier out of the parsed `FILE_SCHEMA`

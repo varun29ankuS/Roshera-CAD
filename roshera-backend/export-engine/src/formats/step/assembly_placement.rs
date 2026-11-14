@@ -156,7 +156,17 @@ pub(crate) fn finalize(
                 continue;
             };
             if !inst.path.is_empty() {
-                match transform_solid(&mut out, sid, inst.transform, TransformOptions::default()) {
+                // A rigid move cannot make a part worse, so it is not
+                // re-validated here: a part with a flaw from its source CAD
+                // (a flipped face, say) used to be REFUSED and left at its
+                // own origin, inside the rest of the assembly. The flaw is
+                // still reported once, by the import certificate below. The
+                // same goes for the pre-flight check, which also cost one
+                // pass per use of every part.
+                let mut place = TransformOptions::default();
+                place.common.validate_before = false;
+                place.common.validate_result = false;
+                match transform_solid(&mut out, sid, inst.transform, place) {
                     // Remembered so a drawing can put the part back in the
                     // frame it was designed in. Only a move that happened is
                     // recorded: undoing one that did not would tilt the part.

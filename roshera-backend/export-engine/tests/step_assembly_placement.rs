@@ -616,3 +616,37 @@ fn a_placed_part_goes_back_to_its_design_frame_for_drawing() {
         );
     }
 }
+
+/// A part with a flaw (here one face flipped, as the GrabCAD U-joint's yoke
+/// has faces 14 and 53 agreeing on an edge) must still go where its assembly
+/// puts it. A rigid move cannot make a part worse, so placement must not
+/// re-validate it: the bench vice lost four parts this way -- each refused,
+/// each left at its own origin, inside the vice body. The flaw itself is
+/// still reported, by the import certificate.
+#[test]
+fn a_flawed_part_is_still_placed() {
+    let flawed = two_instance_assembly().replace(
+        "#142=ADVANCED_FACE('',(#112),#132,.T.);",
+        "#142=ADVANCED_FACE('',(#112),#132,.F.);",
+    );
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&flawed), "flawed")
+        .unwrap();
+    assert_eq!(model.solids.len(), 2, "{:?}", report.warnings);
+    let boxes: Vec<_> = model
+        .solids
+        .iter()
+        .map(|(sid, _)| solid_bbox(&model, sid))
+        .collect();
+    assert!(
+        boxes
+            .iter()
+            .any(|(lo, hi)| close(*lo, [10.0, 0.0, 0.0]) && close(*hi, [11.0, 1.0, 1.0])),
+        "the flawed cube must still land at (10,0,0): {boxes:?}; warnings {:?}",
+        report.warnings
+    );
+    assert!(
+        !report.ok,
+        "the flaw is still reported by the certificate, not hidden by placing it"
+    );
+}
