@@ -20,6 +20,7 @@
  * kernel's `escape_xml()` helper sanitises).
  */
 
+import { SheetPanel } from './SheetPanel'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   X,
@@ -39,6 +40,7 @@ import {
   type ProjectionAngle,
   type SheetDimension,
   type DimensionDriverResolution,
+  type DrawingQualityReport,
   getDimensionDriver,
   DrawingRefusal,
   setDrawingDimension,
@@ -514,6 +516,23 @@ export function DrawingsWorkspace() {
 
   // ── Selecting a view and its menu ──────────────────────────────────────────────
   const [selectedViewId, setSelectedViewId] = useState<string | null>(null)
+  // The kernel's sheet check for the open sheet, re-run whenever the sheet
+  // changes (a view moved, a dimension edited the part, a new projection).
+  const [sheetCheck, setSheetCheck] = useState<DrawingQualityReport | null>(null)
+  useEffect(() => {
+    if (!activeDrawing) return
+    let live = true
+    getDrawingQuality(activeDrawing.id)
+      .then((q) => {
+        if (live) setSheetCheck(q)
+      })
+      .catch(() => {
+        if (live) setSheetCheck(null)
+      })
+    return () => {
+      live = false
+    }
+  }, [activeDrawing])
   const [viewMenu, setViewMenu] = useState<{ viewId: string; x: number; y: number } | null>(null)
   const closeViewMenu = useCallback(() => setViewMenu(null), [])
   const openViewMenu = useCallback((viewId: string, x: number, y: number) => {
@@ -990,25 +1009,18 @@ export function DrawingsWorkspace() {
     }
   }, [])
 
-  const onSheetClick = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
-      const el = (e.target as Element).closest('[data-dim-id]')
-      if (!el) {
-        // A drag pans the sheet; only a click selects.
-        const s = panStateRef.current
-        if (Math.hypot(e.clientX - s.startX, e.clientY - s.startY) > 4) return
-        setSelectedViewId(viewAt(e.clientX, e.clientY))
-        return
-      }
+  /** Open a dimension's edit box at a screen point -- from a click on the
+   *  sheet, or on its row in the Sheet panel. */
+  const openDimension = useCallback(
+    (id: string, atX: number, atY: number) => {
       if (!activeDrawing) return
-      const id = el.getAttribute('data-dim-id') ?? ''
       const view = activeDrawing.views.find((v) => (v.dimensions ?? []).some((d) => d.id === id))
       const dim = view?.dimensions?.find((d) => d.id === id)
       if (!view || !dim) return
       setEditNote(null)
       // Keep the box on screen: 300 x 150 is its largest size.
-      const x = Math.min(e.clientX + 12, window.innerWidth - 312)
-      const y = Math.min(e.clientY + 12, window.innerHeight - 162)
+      const x = Math.min(atX, window.innerWidth - 312)
+      const y = Math.min(atY, window.innerHeight - 162)
       setDimEdit({
         dim,
         view: view.name,
@@ -1035,8 +1047,24 @@ export function DrawingsWorkspace() {
           ),
         )
     },
-    [activeDrawing, viewAt],
+    [activeDrawing],
   )
+
+  const onSheetClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const el = (e.target as Element).closest('[data-dim-id]')
+      if (!el) {
+        // A drag pans the sheet; only a click selects.
+        const s = panStateRef.current
+        if (Math.hypot(e.clientX - s.startX, e.clientY - s.startY) > 4) return
+        setSelectedViewId(viewAt(e.clientX, e.clientY))
+        return
+      }
+      openDimension(el.getAttribute('data-dim-id') ?? '', e.clientX + 12, e.clientY + 12)
+    },
+    [viewAt, openDimension],
+  )
+
 
   const onSheetContextMenu = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
@@ -1148,6 +1176,16 @@ export function DrawingsWorkspace() {
         onCreateFromPart={(part) => void handleCreateFromPart(part)}
       />
       {activeDrawing && (
+        <SheetPanel
+          drawing={activeDrawing}
+          quality={sheetCheck}
+          selectedViewId={selectedViewId}
+          editingDimId={dimEdit?.dim.id ?? null}
+          onSelectView={setSelectedViewId}
+          onOpenDimension={openDimension}
+        />
+      )}
+      {activeDrawing && (
         <SheetActions
           projection={activeDrawing.projection ?? 'third'}
           projectionBusy={projectionBusy}
@@ -1241,7 +1279,7 @@ export function DrawingsWorkspace() {
       )}
 
       {removedView && (
-        <div className="absolute bottom-14 left-3 z-30 flex items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs shadow-md">
+        <div className="absolute bottom-14 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs shadow-md">
           <span>Removed view {removedView.name}</span>
           <button
             type="button"
@@ -1344,7 +1382,7 @@ export function DrawingsWorkspace() {
             )}
 
             {editNote && (
-              <div className="absolute top-14 left-3 z-20 flex items-center gap-2 bg-card border border-border rounded-md shadow-md px-2 py-1 text-xs">
+              <div className="absolute bottom-14 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 bg-card border border-border rounded-md shadow-md px-2 py-1 text-xs">
                 <span aria-hidden className={noteKind === 'done' ? 'text-green-700' : 'text-sky-700'}>
                   {noteKind === 'done' ? '✓' : 'ⓘ'}
                 </span>
