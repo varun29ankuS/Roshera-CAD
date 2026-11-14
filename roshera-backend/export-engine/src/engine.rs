@@ -206,6 +206,19 @@ impl ExportEngine {
     ) -> Result<(BRepModel, ImportReport), ExportError> {
         import_step_text_with_report(content, source_hint)
     }
+
+    /// [`Self::import_step_content`] without certifying: the caller merges
+    /// the solids where they belong and certifies them there, then folds the
+    /// certificates into the report with
+    /// [`crate::formats::step::apply_certificates`]. The REST import route
+    /// does this so each part is certified once, in the document.
+    pub fn import_step_content_uncertified(
+        &self,
+        content: &str,
+        source_hint: &str,
+    ) -> Result<(BRepModel, ImportReport), ExportError> {
+        crate::formats::step::import_step_text_uncertified(content, source_hint)
+    }
 }
 
 impl Default for ExportEngine {

@@ -268,6 +268,17 @@ pub struct ImportReport {
     /// the "manifold-but-invalid import still reports ok" gap.
     #[serde(default)]
     pub validation: Vec<SolidValidation>,
+    /// `true` once [`Self::validation`] holds the full certificate of every
+    /// imported solid. An import that defers certification to its caller
+    /// (`import_step_text_uncertified`) reports `false`, and then `ok` is
+    /// `false` too: an unverified import is not a verified one.
+    #[serde(default)]
+    pub certified: bool,
+    /// The structural half of `ok`: an entity resolved, a solid materialised
+    /// and every part the assembly uses came in. `ok` additionally needs
+    /// every solid sound by its certificate.
+    #[serde(default)]
+    pub structurally_complete: bool,
 }
 
 /// Per-solid kernel-validation verdict, surfaced on

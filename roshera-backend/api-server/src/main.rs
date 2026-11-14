@@ -5762,18 +5762,19 @@ async fn import_step_geometry(
     // not an async worker. A request dropped here lands nothing: the model
     // is untouched until the splice below.
     let engine = state.export_engine.clone();
-    let (imported, report) =
-        tokio::task::spawn_blocking(move || engine.import_step_content(&content, &source_label))
-            .await
-            .map_err(|e| {
-                ApiError::new(ErrorCode::Internal, format!("STEP import task failed: {e}"))
-            })?
-            .map_err(|e| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!("STEP import failed: {e:?}"),
-                )
-            })?;
+    let (imported, mut report) = tokio::task::spawn_blocking(move || {
+        // Certified ONCE, below, in the document the parts land in --
+        // not here as well (that ran every check twice).
+        engine.import_step_content_uncertified(&content, &source_label)
+    })
+    .await
+    .map_err(|e| ApiError::new(ErrorCode::Internal, format!("STEP import task failed: {e}")))?
+    .map_err(|e| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("STEP import failed: {e:?}"),
+        )
+    })?;
 
     if imported.solids.is_empty() {
         return Err(ApiError::new(
@@ -5788,7 +5789,7 @@ async fn import_step_geometry(
     // Splice the reconstructed solids into the live session model
     // (remapping ids so they don't collide with existing parts), then
     // register + broadcast each one exactly like a primitive create.
-    let objects = splice_imported_model(
+    let (objects, certificates) = splice_imported_model(
         &state,
         &model_handle,
         imported,
@@ -5797,6 +5798,10 @@ async fn import_step_geometry(
         "step_import",
     )
     .await?;
+    // The report's verdicts are the document's certificates -- the same ones
+    // each object's perception reports -- keyed by the ids the parts have
+    // now.
+    export_engine::formats::step::apply_certificates(&mut report, &certificates);
 
     Ok(Json(serde_json::json!({
         "success": report.ok,
@@ -5821,7 +5826,7 @@ async fn splice_imported_model(
     base_name: Option<String>,
     object_type: &'static str,
     source: &'static str,
-) -> Result<Vec<serde_json::Value>, error_catalog::ApiError> {
+) -> Result<(Vec<serde_json::Value>, ImportCertificates), error_catalog::ApiError> {
     let state = state.clone();
     let model_handle = model_handle.clone();
     tokio::spawn(async move {
@@ -5866,6 +5871,12 @@ async fn splice_imported_model(
 /// its mesh: neither client reads it, and 572 meshes held as JSON values
 /// ran the server out of memory. Meshes reach viewers through the
 /// broadcast and the scene snapshot.
+/// Each registered part's certificate, in registration order.
+type ImportCertificates = Vec<(
+    u32,
+    geometry_engine::primitives::provenance::ValidityCertificate,
+)>;
+
 async fn register_imported_solids(
     state: &AppState,
     model_handle: &reconcile_task::ModelHandle,
@@ -5873,7 +5884,7 @@ async fn register_imported_solids(
     base_name: Option<&str>,
     object_type: &str,
     source: &str,
-) -> Vec<serde_json::Value> {
+) -> (Vec<serde_json::Value>, ImportCertificates) {
     use geometry_engine::tessellation::{tessellate_solids, TessellationParams};
 
     // Read once for the whole splice — the document's durability status
@@ -5946,7 +5957,7 @@ async fn register_imported_solids(
                 heavy_durability.clone(),
                 Some(cert.brep_valid),
             );
-            out.push((id, tri_mesh, perception));
+            out.push((id, tri_mesh, perception, cert));
         }
         out
     })
@@ -5960,12 +5971,14 @@ async fn register_imported_solids(
                 "import registration task failed; {} merged solids are not registered",
                 new_solid_ids.len()
             );
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
 
     let mut objects = Vec::with_capacity(heavy.len());
-    for (solid_id, tri_mesh, perception) in heavy {
+    let mut certificates: ImportCertificates = Vec::with_capacity(heavy.len());
+    for (solid_id, tri_mesh, perception, cert) in heavy {
+        certificates.push((solid_id, cert));
         let Some((_, i, name, occurrence)) = named.iter().find(|(id, ..)| *id == solid_id) else {
             continue;
         };
@@ -6003,7 +6016,7 @@ async fn register_imported_solids(
             "scale":    [1.0_f32, 1.0, 1.0],
         }));
     }
-    objects
+    (objects, certificates)
 }
 
 /// POST /api/geometry/import_ros — read a native `.ros` v3.1 file and
@@ -6214,7 +6227,8 @@ async fn import_ros_geometry(
     // collide with existing parts. `merge_solids_into` is the generic
     // BRepModel→BRepModel splice (it lives in `formats::step` because the
     // STEP route grew it first; nothing about it is STEP-specific).
-    let objects = splice_imported_model(
+    // Each object's perception already carries its certificate.
+    let (objects, _certificates) = splice_imported_model(
         &state,
         &model_handle,
         imported,

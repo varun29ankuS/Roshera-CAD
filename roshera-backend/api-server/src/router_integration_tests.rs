@@ -5649,6 +5649,53 @@ async fn import_step_route_lands_faces_with_pids_and_import_provenance() {
     }
 }
 
+/// Certified once, in the document: the import report's per-part verdicts
+/// are the document's certificates -- keyed by the ids the parts have in the
+/// session, agreeing with each object's perception -- not a second,
+/// separately computed verdict from the importer's own scratch model.
+#[tokio::test]
+async fn import_step_report_carries_the_documents_certificates() {
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box primitive must build for positive size");
+    }
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!("roshera_import_cert_test_{}.step", Uuid::new_v4()));
+    export_engine::formats::step::export_brep_to_step(&fresh_model, &tmp_path)
+        .await
+        .expect("STEP export of a single box must succeed");
+
+    let state = make_test_state().await;
+    let request = import_step_post(json!({
+        "path": tmp_path.to_string_lossy().to_string(),
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    let _ = std::fs::remove_file(&tmp_path);
+    assert_eq!(status, StatusCode::OK, "import must succeed; body = {body}");
+
+    let report = &body["report"];
+    assert_eq!(
+        report["certified"],
+        json!(true),
+        "the report is certified; body = {body}"
+    );
+    let verdicts = report["validation"].as_array().expect("validation array");
+    assert_eq!(verdicts.len(), 1, "one verdict for the one part");
+    let object = &body["objects"][0];
+    assert_eq!(
+        verdicts[0]["solid_id"], object["solid_id"],
+        "the verdict names the part by its id in the document"
+    );
+    assert_eq!(
+        verdicts[0]["sound"], object["sound"],
+        "one verdict, not two"
+    );
+    assert_eq!(body["success"], json!(true), "a sound box imports ok");
+}
+
 /// IMP-1: an import lands whole or not at all. The route merges every solid
 /// into the live model and then registers each one (UUID, name, verdict,
 /// broadcast). When the client hung up partway — a 10-minute robot-arm

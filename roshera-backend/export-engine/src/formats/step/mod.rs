@@ -114,6 +114,35 @@ pub fn import_step_text_with_report(
     text: &str,
     source_hint: &str,
 ) -> Result<(BRepModel, ImportReport), ExportError> {
+    let (mut model, mut report) = import_step_text_uncertified(text, source_hint)?;
+    // Validation gate (IMP5): the FULL certificate on every solid, one batch.
+    let t = std::time::Instant::now();
+    let solid_ids: Vec<_> = model.solids.iter().map(|(sid, _)| sid).collect();
+    let certs = model.certify_solids(&solid_ids);
+    apply_certificates(&mut report, &certs);
+    if import_profile_enabled() {
+        eprintln!(
+            "[import-profile] certify {} solids {:?}",
+            solid_ids.len(),
+            t.elapsed()
+        );
+    }
+    Ok((model, report))
+}
+
+/// [`import_step_text_with_report`] without the certificate: everything up
+/// to and including assembly placement, with `report.certified = false` and
+/// `report.ok = false` (an unverified import is not a verified one).
+///
+/// For a caller that certifies the solids itself where they END UP: the
+/// REST import route merges them into the document and certifies them there
+/// (a certificate also judges the model around a solid, so the document is
+/// the right place), then calls [`apply_certificates`]. Certifying here as
+/// well ran every check twice and produced two verdicts for one part.
+pub fn import_step_text_uncertified(
+    text: &str,
+    source_hint: &str,
+) -> Result<(BRepModel, ImportReport), ExportError> {
     // Parse → index → dispatch.
     let prof = import_profile_enabled();
     let t_all = std::time::Instant::now();
@@ -164,39 +193,48 @@ pub fn import_step_text_with_report(
         source_hint,
     );
 
-    // Validation gate (IMP5). A solid that materialises topologically is
-    // not yet trustworthy — STEP files in the wild deliver self-
-    // intersecting faces, non-manifold seams, and open boundaries. Run
-    // the kernel's FULL ground-truth certificate (`certify_solid` →
-    // `is_sound()`) on every imported solid and fold the verdict into
-    // `ImportReport::ok`. This is the SAME certificate the ambient
-    // perception verdict reports — deliberately NOT the weaker
-    // B-Rep-only `validate_solid_scoped`, which previously let the report
-    // claim `valid: true` on a solid whose display mesh did not close
-    // (the blend-rim interop defect: a valid B-Rep whose re-imported
-    // torus/cone boundary tessellated open). The per-solid verdicts are
-    // surfaced on `report.validation` — each carrying the component flags
-    // (`brep_valid`, `watertight`, `manifold`, `oriented`) alongside the
-    // full `sound` headline — so the caller sees exactly which solid(s)
-    // failed and why, and can never read a false green.
-    // One batch: a single model-wide validation sweep for every solid, not
-    // one sweep per solid (quadratic on an assembly of hundreds of parts).
     if prof {
         eprintln!("[import-profile] place assembly {:?}", t.elapsed());
     }
-    let t = std::time::Instant::now();
-    let solid_ids: Vec<_> = model.solids.iter().map(|(sid, _)| sid).collect();
-    let mut all_solids_sound = true;
-    for (solid_id, cert) in model.certify_solids(&solid_ids) {
+    // Structurally complete: at least one entity resolved, at least one
+    // kernel solid materialised, and every part the assembly uses came in (a
+    // use whose geometry built no solid is recorded as missing). `ok` also
+    // needs every solid SOUND, which only the certificate can say.
+    report.structurally_complete =
+        resolved > 0 && !model.solids.is_empty() && report.missing_parts == 0;
+    report.certified = false;
+    report.ok = false;
+    Ok((model, report))
+}
+
+/// Fold full certificates into an import report: one verdict per solid on
+/// `report.validation`, `certified = true`, and `ok` = structurally complete
+/// AND every solid sound.
+///
+/// This is the SAME ground-truth certificate the ambient perception verdict
+/// reports -- deliberately NOT the weaker B-Rep-only `validate_solid_scoped`,
+/// which once let the report claim `valid: true` on a solid whose display
+/// mesh did not close (a re-imported blend rim). Each verdict carries the
+/// component flags (`brep_valid`, `watertight`, `manifold`, `oriented`)
+/// beside the `sound` headline, so the caller sees which solid failed and
+/// why. One function for both import paths, so they cannot drift.
+pub fn apply_certificates(
+    report: &mut ImportReport,
+    certs: &[(
+        geometry_engine::primitives::solid::SolidId,
+        geometry_engine::primitives::provenance::ValidityCertificate,
+    )],
+) {
+    report.validation.clear();
+    let mut all_sound = true;
+    for (solid_id, cert) in certs {
         let sound = cert.is_sound();
-        if !sound {
-            all_solids_sound = false;
-        }
-        // Cap the captured messages so a pathological shell can't bloat
-        // the report; the count is always exact.
+        all_sound &= sound;
+        // Cap the captured messages so a pathological shell can't bloat the
+        // report; the count is always exact.
         let errors: Vec<String> = cert.errors.iter().take(8).cloned().collect();
         report.validation.push(diagnostics::SolidValidation {
-            solid_id,
+            solid_id: *solid_id,
             valid: sound,
             brep_valid: cert.brep_valid,
             watertight: cert.watertight,
@@ -207,25 +245,8 @@ pub fn import_step_text_with_report(
             errors,
         });
     }
-
-    // `ok` now requires: at least one entity resolved, at least one
-    // kernel solid materialised, AND every materialised solid is SOUND by
-    // the full certificate. Honest partial: a file that yields a sound
-    // solid plus an unsound husk reports `ok = false` with the husk
-    // flagged (and its failing dimension named) in `report.validation`.
-    // ...and every part the assembly uses actually came in: a use whose
-    // geometry built no solid is recorded as missing and fails `ok`.
-    if prof {
-        eprintln!(
-            "[import-profile] certify {} solids {:?} (total {:?})",
-            solid_ids.len(),
-            t.elapsed(),
-            t_all.elapsed()
-        );
-    }
-    report.ok =
-        resolved > 0 && !model.solids.is_empty() && all_solids_sound && report.missing_parts == 0;
-    Ok((model, report))
+    report.certified = true;
+    report.ok = report.structurally_complete && !certs.is_empty() && all_sound;
 }
 
 /// `ROSHERA_IMPORT_PROFILE=1` prints how long each import stage took, to
@@ -610,5 +631,64 @@ mod imp1_tests {
         assert!(report.ok);
         assert_eq!(report.roots_resolved, 2);
         assert_eq!(report.solids_in_roots, 2);
+    }
+
+    /// The route path imports WITHOUT certifying (it certifies once, in the
+    /// document, after the merge -- certifying here too ran every check
+    /// twice and produced two verdicts). An uncertified report must say so
+    /// and must not claim `ok`: an unverified import is not a verified one.
+    #[test]
+    fn an_uncertified_import_says_so_and_is_not_ok_yet() {
+        let src = ap242_step(&unit_cube_with_root("SHAPE_REPRESENTATION"));
+        let (model, report) = import_step_text_uncertified(&src, "t.step").expect("parse");
+        assert_eq!(model.solids.len(), 1);
+        assert!(
+            !report.certified,
+            "the report must say it is not certified yet"
+        );
+        assert!(
+            report.validation.is_empty(),
+            "no verdict before certification"
+        );
+        assert!(report.structurally_complete, "the cube built whole");
+        assert!(!report.ok, "an unverified import must not claim ok");
+    }
+
+    /// Certifying afterwards -- the same helper the certifying import uses --
+    /// fills one verdict per solid and folds soundness into `ok`.
+    #[test]
+    fn certifying_later_gives_the_same_report_as_certifying_at_import() {
+        let src = ap242_step(&unit_cube_with_root("SHAPE_REPRESENTATION"));
+        let (_, eager) = import_step_text_with_report(&src, "t.step").expect("parse");
+        let (mut model, mut deferred) =
+            import_step_text_uncertified(&src, "t.step").expect("parse");
+        let ids: Vec<_> = model.solids.iter().map(|(sid, _)| sid).collect();
+        let certs = model.certify_solids(&ids);
+        apply_certificates(&mut deferred, &certs);
+        assert!(deferred.certified && eager.certified);
+        assert_eq!(deferred.ok, eager.ok);
+        assert_eq!(deferred.validation.len(), eager.validation.len());
+        for (d, e) in deferred.validation.iter().zip(&eager.validation) {
+            assert_eq!(
+                (d.sound, d.brep_valid, d.watertight),
+                (e.sound, e.brep_valid, e.watertight)
+            );
+        }
+    }
+
+    /// One unsound part makes the whole import not ok.
+    #[test]
+    fn an_unsound_certificate_makes_the_import_not_ok() {
+        let src = ap242_step(&unit_cube_with_root("SHAPE_REPRESENTATION"));
+        let (mut model, mut report) = import_step_text_uncertified(&src, "t.step").expect("parse");
+        let ids: Vec<_> = model.solids.iter().map(|(sid, _)| sid).collect();
+        let mut certs = model.certify_solids(&ids);
+        for (_, cert) in &mut certs {
+            cert.watertight = false;
+        }
+        apply_certificates(&mut report, &certs);
+        assert!(report.certified);
+        assert!(!report.ok, "an unsound part must make the import not ok");
+        assert!(!report.validation[0].sound);
     }
 }
