@@ -67,10 +67,13 @@ export function GizmoNav() {
           <GizmoViewcube
             faces={Z_UP_FACES}
             font="600 22px Inter, system-ui, sans-serif"
-            color={dark ? '#d9dce1' : '#f1f2f4'}
+            // Contrast with the viewport in each theme: light faces on the
+            // dark viewport, mid-grey faces on the light one (#f1f2f4 there
+            // vanished into the background).
+            color={dark ? '#d9dce1' : '#c9ced5'}
             hoverColor="#f2a516"
-            textColor="#4a5059"
-            strokeColor={dark ? '#5b626b' : '#a3a9b1'}
+            textColor={dark ? '#4a5059' : '#2f353c'}
+            strokeColor={dark ? '#5b626b' : '#6f7781'}
             opacity={1}
             onClick={onFace}
           />
