@@ -1,15 +1,16 @@
 /**
  * The sketch workbench's tools (Varun 2026-11-14: "there are no buttons
- * that show up for sketching, for editing ..."). While a sketch is open
- * this rail REPLACES the part tools, as in every established CAD sketcher:
- * DRAW tools, EDIT tools, and Exit. Every button is wired; constraints,
- * smart dimension and trim / mirror / offset arrive as their slices land
- * (no button here that does nothing).
+ * that show up for sketching, for editing, for trimming, for mirror ...
+ * no way to constraint two lines"). While a sketch is open this rail
+ * REPLACES the part tools, as in every established CAD sketcher:
+ * DRAW, CONSTRAIN (each lights up only when the selection fits it),
+ * DIMENSION, MODIFY and EDIT. Every button is wired.
  */
 
 import { useEffect, type ComponentType } from 'react'
 import { cn } from '@/lib/utils'
-import type { BenchTool } from '@/lib/sketch-bench'
+import { constraintsFor, type BenchTool } from '@/lib/sketch-bench'
+import type { GeometricConstraint } from '@/lib/csketch-api'
 import { useSketchBench } from '@/stores/sketch-bench-store'
 import * as I from './sketch-icons'
 
@@ -21,6 +22,8 @@ interface RailItem {
   tool?: BenchTool
   action?: () => void
   disabled?: boolean
+  active?: boolean
+  hint?: string
 }
 
 const DRAW: RailItem[] = [
@@ -37,7 +40,21 @@ const DRAW: RailItem[] = [
   { id: 'centerline', label: 'Centre line', icon: I.CenterlineIcon, tool: 'centerline' },
 ]
 
-/** Keyboard: one letter per draw tool; Esc / Enter / Delete / X / Ctrl+Z. */
+const CONSTRAINTS: { kind: GeometricConstraint; label: string; icon: ComponentType<{ size?: number }>; needs: string }[] = [
+  { kind: 'Horizontal', label: 'Horizontal', icon: I.HorizontalIcon, needs: 'a line' },
+  { kind: 'Vertical', label: 'Vertical', icon: I.VerticalIcon, needs: 'a line' },
+  { kind: 'Coincident', label: 'Coincident', icon: I.CoincidentIcon, needs: 'two points' },
+  { kind: 'PointOnCurve', label: 'On curve', icon: I.OnCurveIcon, needs: 'a point and a curve' },
+  { kind: 'Midpoint', label: 'Midpoint', icon: I.MidpointIcon, needs: 'a point and a line' },
+  { kind: 'Parallel', label: 'Parallel', icon: I.ParallelIcon, needs: 'two lines' },
+  { kind: 'Perpendicular', label: 'Perpend.', icon: I.PerpendicularIcon, needs: 'two lines' },
+  { kind: 'Equal', label: 'Equal', icon: I.EqualIcon, needs: 'two lines, or two circles / arcs' },
+  { kind: 'Tangent', label: 'Tangent', icon: I.TangentIcon, needs: 'a line and a circle / arc, or two circles / arcs' },
+  { kind: 'Concentric', label: 'Concentric', icon: I.ConcentricIcon, needs: 'two circles / arcs' },
+  { kind: 'Symmetric', label: 'Symmetric', icon: I.SymmetricIcon, needs: 'two points and a line' },
+]
+
+/** Keyboard: one letter per draw tool; D dimension, T trim; Esc / Enter / Delete / X / Ctrl+Z. */
 function useBenchKeys() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -52,7 +69,9 @@ function useBenchKeys() {
       if (e.ctrlKey || e.metaKey || e.altKey) return
       switch (e.key) {
         case 'Escape':
-          b.escape()
+          if (b.editing) b.setEditing(null)
+          else if (b.action) b.setAction(null)
+          else b.escape()
           break
         case 'Enter':
           b.endChain()
@@ -63,17 +82,14 @@ function useBenchKeys() {
           break
         default: {
           const k = e.key.toUpperCase()
+          const map: Record<string, BenchTool> = { V: 'select', D: 'dimension', T: 'trim', F: 'fillet', M: 'mirror' }
           if (k === 'X') {
             void b.toggleConstruction()
             break
           }
-          if (k === 'V') {
-            b.setTool('select')
-            break
-          }
-          const item = DRAW.find((d) => d.key === k)
-          if (!item?.tool) return
-          b.setTool(item.tool)
+          const tool = map[k] ?? DRAW.find((d) => d.key === k)?.tool
+          if (!tool) return
+          b.setTool(tool)
         }
       }
       e.preventDefault()
@@ -83,39 +99,103 @@ function useBenchKeys() {
   }, [])
 }
 
-function RailButton({ item, active }: { item: RailItem; active: boolean }) {
+function RailButton({ item }: { item: RailItem }) {
   const set = useSketchBench((s) => s.setTool)
+  const tip = [item.label, item.key && `· ${item.key}`, item.hint && `-- ${item.hint}`].filter(Boolean).join(' ')
   return (
     <button
       type="button"
       disabled={item.disabled}
       onClick={() => (item.tool ? set(item.tool) : item.action?.())}
-      title={item.key ? `${item.label} · ${item.key}` : item.label}
+      title={tip}
       aria-label={item.label}
-      aria-pressed={active || undefined}
+      aria-pressed={item.active || undefined}
       className={cn(
-        'cad-focus flex w-[54px] flex-col items-center gap-0.5 rounded-md px-0.5 py-1 disabled:opacity-35',
-        active ? 'bg-[var(--cad-selected-wash)] text-foreground' : 'text-foreground/85 hover:bg-accent',
+        'cad-focus flex w-[48px] flex-col items-center gap-0.5 rounded-md px-0.5 py-1 disabled:opacity-30',
+        item.active ? 'bg-[var(--cad-selected-wash)] text-foreground' : 'text-foreground/85 hover:bg-accent',
       )}
     >
-      <item.icon size={20} />
-      <span className="w-full truncate text-center text-[10px] leading-tight">{item.label}</span>
+      <item.icon size={18} />
+      <span className="w-full truncate text-center text-[9.5px] leading-tight">{item.label}</span>
     </button>
   )
 }
 
-function Cap({ label }: { label: string }) {
-  return <span className="mt-1.5 text-[10px] font-medium tracking-[0.08em] text-muted-foreground">{label}</span>
+function Group({ label, items }: { label: string; items: RailItem[] }) {
+  return (
+    <>
+      <span className="col-span-2 mt-1.5 text-center text-[10px] font-medium tracking-[0.08em] text-muted-foreground">{label}</span>
+      {items.map((d) => (
+        <RailButton key={d.id} item={d} />
+      ))}
+    </>
+  )
 }
 
 export function SketchBenchRail() {
   useBenchKeys()
   const tool = useSketchBench((s) => s.tool)
+  const action = useSketchBench((s) => s.action)
   const selection = useSketchBench((s) => s.selection)
+  const selectedConstraint = useSketchBench((s) => s.selectedConstraint)
   const history = useSketchBench((s) => s.history)
   const sides = useSketchBench((s) => s.sides)
   const setSides = useSketchBench((s) => s.setSides)
   const b = useSketchBench.getState
+  const offers = constraintsFor(selection)
+  const has = selection.length > 0
+  const withTool = (items: RailItem[]) => items.map((i) => ({ ...i, active: i.active || (i.tool !== undefined && tool === i.tool) }))
+
+  const constrain: RailItem[] = CONSTRAINTS.map((c) => {
+    const offer = offers.find((o) => o.kind === c.kind)
+    return {
+      id: c.label,
+      label: c.label,
+      icon: c.icon,
+      disabled: !offer,
+      hint: offer ? 'apply to the selection' : `select ${c.needs}`,
+      action: () => {
+        if (offer) void b().applyConstraint(offer)
+      },
+    }
+  })
+  const onePoint = selection.length === 1 && 'Point' in selection[0] ? selection[0].Point : null
+  constrain.push({
+    id: 'fix',
+    label: 'Fix',
+    icon: I.FixIcon,
+    disabled: !onePoint,
+    hint: onePoint ? 'pin this point where it is' : 'select a point',
+    action: () => {
+      if (onePoint) void b().fixPoint(onePoint)
+    },
+  })
+  const modify: RailItem[] = [
+    { id: 'trim', label: 'Trim', key: 'T', icon: I.TrimIcon, tool: 'trim' },
+    { id: 'extend', label: 'Extend', icon: I.ExtendIcon, tool: 'extend' },
+    { id: 'fillet', label: 'Fillet', key: 'F', icon: I.SketchFilletIcon, tool: 'fillet' },
+    { id: 'chamfer', label: 'Chamfer', icon: I.SketchChamferIcon, tool: 'chamfer' },
+    {
+      id: 'offset',
+      label: 'Offset',
+      icon: I.OffsetIcon,
+      disabled: !has,
+      hint: has ? 'set the distance in the bar' : 'select a closed loop first',
+      active: action === 'offset',
+      action: () => b().setAction('offset'),
+    },
+    { id: 'mirror', label: 'Mirror', key: 'M', icon: I.MirrorIcon, tool: 'mirror', hint: 'select, then click the mirror line' },
+    {
+      id: 'linear-pattern',
+      label: 'Lin. pattern',
+      icon: I.LinearPatternIcon,
+      disabled: !has,
+      hint: has ? 'set count and spacing in the bar' : 'select what to pattern first',
+      active: action === 'linear-pattern',
+      action: () => b().setAction('linear-pattern'),
+    },
+    { id: 'circular-pattern', label: 'Circ. pattern', icon: I.CircularPatternIcon, tool: 'circular-pattern', hint: 'select, then click the centre' },
+  ]
   const edit: RailItem[] = [
     { id: 'select', label: 'Select', key: 'V', icon: I.SelectIcon, tool: 'select' },
     {
@@ -124,27 +204,25 @@ export function SketchBenchRail() {
       key: 'Del',
       icon: I.DeleteIcon,
       action: () => void b().deleteSelection(),
-      disabled: selection.length === 0,
+      disabled: !has && !selectedConstraint,
     },
     {
       id: 'construction',
-      label: 'Construction',
+      label: 'Construct.',
       key: 'X',
       icon: I.ConstructionIcon,
       action: () => void b().toggleConstruction(),
-      disabled: selection.length === 0,
+      disabled: !has,
     },
     { id: 'undo', label: 'Undo', key: 'Ctrl+Z', icon: I.UndoIcon, action: () => void b().undo(), disabled: history.length === 0 },
   ]
+
   return (
-    <div className="flex w-[60px] flex-col items-center border-r border-border bg-background">
-      <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-px overflow-y-auto py-1 [scrollbar-width:none]">
-        <Cap label="DRAW" />
-        {DRAW.map((d) => (
-          <RailButton key={d.id} item={d} active={tool === d.tool} />
-        ))}
+    <div className="flex w-[104px] flex-col items-center border-r border-border bg-background">
+      <div className="grid min-h-0 w-full flex-1 grid-cols-2 content-start justify-items-center gap-px overflow-y-auto py-1 [scrollbar-width:none]">
+        <Group label="DRAW" items={withTool(DRAW)} />
         {tool === 'polygon' && (
-          <label className="flex w-[54px] flex-col items-center text-[10px] text-muted-foreground">
+          <label className="col-span-2 flex items-center justify-center gap-1 text-[10px] text-muted-foreground">
             Sides
             <input
               type="number"
@@ -156,10 +234,13 @@ export function SketchBenchRail() {
             />
           </label>
         )}
-        <Cap label="EDIT" />
-        {edit.map((d) => (
-          <RailButton key={d.id} item={d} active={d.tool !== undefined && tool === d.tool} />
-        ))}
+        <Group label="CONSTRAIN" items={constrain} />
+        <Group
+          label="DIMENSION"
+          items={withTool([{ id: 'dimension', label: 'Smart dim.', key: 'D', icon: I.DimensionIcon, tool: 'dimension' }])}
+        />
+        <Group label="MODIFY" items={withTool(modify)} />
+        <Group label="EDIT" items={withTool(edit)} />
       </div>
     </div>
   )

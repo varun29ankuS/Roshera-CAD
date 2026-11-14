@@ -17,15 +17,22 @@ import { create } from 'zustand'
 import { timelineAction } from '@/lib/history'
 import {
   csketchApi,
+  type Constraint,
   type CSketchPlane,
   type CSketchSummary,
+  type DimensionalConstraint,
   type DofReport,
   type EntityRef,
 } from '@/lib/csketch-api'
 import {
+  extendBoundary,
+  isCorner,
+  nearerEnd,
   planShape,
   sameRef,
   TOOL_CLICKS,
+  type ConstraintOffer,
+  type DimensionOffer,
   type BenchTool,
   type Click,
   type PlanOp,
@@ -36,6 +43,19 @@ import {
 const API_BASE = `${(import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL ?? ''}/api`
 
 export type FinishOp = 'extrude' | 'cut' | 'revolve'
+
+/** Sizes the Modify tools use (shown and edited in the bar). */
+export interface ModifyOptions {
+  fillet: number
+  chamfer: number
+  offset: number
+  linCount: number
+  linDx: number
+  linDy: number
+  circCount: number
+  /** Total angle the circular pattern spans, degrees (360 = all round). */
+  circAngle: number
+}
 
 interface BenchState {
   /** The open sketch's server id; null when no sketch is open. */
@@ -60,6 +80,29 @@ interface BenchState {
   /** What each commit created, newest last (Ctrl+Z inside the sketch). */
   history: EntityRef[][]
   finish: { op: FinishOp; distance: number; angle: number }
+  /** The sketch's constraints (glyphs and dimensions on the sketch). */
+  constraints: Constraint[]
+  /** A constraint picked on the sketch (Delete removes it). */
+  selectedConstraint: string | null
+  opts: ModifyOptions
+  setOpts: (o: Partial<ModifyOptions>) => void
+  /** A selection action waiting for its sizes in the bar. */
+  action: 'offset' | 'linear-pattern' | null
+  setAction: (a: 'offset' | 'linear-pattern' | null) => void
+  /** A Modify tool's click: what it hit, and where. */
+  pick: (at: Vec2, ref: EntityRef | null, pointId?: string) => Promise<void>
+  applyConstraint: (offer: ConstraintOffer) => Promise<void>
+  /** Pin a point where it is (its X and Y held): how a sketch stops sliding. */
+  fixPoint: (pointId: string) => Promise<void>
+  addDimension: (offer: DimensionOffer, value: number) => Promise<void>
+  editDimension: (cid: string, value: number) => Promise<void>
+  selectConstraint: (cid: string | null) => void
+  /** A placed dimension being changed in the bar. */
+  editing: { id: string; kind: string; value: number; unit: 'mm' | 'deg' } | null
+  setEditing: (e: { id: string; kind: string; value: number; unit: 'mm' | 'deg' } | null) => void
+  offsetSelection: () => Promise<void>
+  linearPatternSelection: () => Promise<void>
+  dragPoint: (pointId: string, to: Vec2) => Promise<void>
 
   open: (plane: CSketchPlane, onPart?: string | null) => Promise<void>
   close: () => void
@@ -121,12 +164,13 @@ async function runPlan(id: string, plan: PlanOp[]): Promise<{ created: EntityRef
         break
       }
       case 'arc': {
+        // On its end points, so it joins whatever shares them.
         const r = await csketchApi.addArc(id, {
-          cx: op.c[0],
-          cy: op.c[1],
+          start: resolve(op.a),
+          end: resolve(op.b),
           radius: op.r,
-          start_angle: op.start,
-          end_angle: op.end,
+          ccw: op.ccw,
+          large_arc: op.large,
         })
         ids.set(op.key, r.id)
         created.push({ Arc: r.id })
@@ -159,8 +203,12 @@ export const useSketchBench = create<BenchState>((set, get) => {
   const refresh = async () => {
     const id = get().sketchId
     if (!id) return
-    const [summary, dof] = await Promise.all([csketchApi.get(id), csketchApi.dof(id).catch(() => null)])
-    if (get().sketchId === id) set({ summary, dof, ghost: [] })
+    const [summary, dof, constraints] = await Promise.all([
+      csketchApi.get(id),
+      csketchApi.dof(id).catch(() => null),
+      csketchApi.listConstraints(id).catch(() => [] as Constraint[]),
+    ])
+    if (get().sketchId === id) set({ summary, dof, constraints, ghost: [] })
   }
 
   /** Build a plan: drawn at once, then sent; the server's sketch replaces it. */
@@ -182,7 +230,187 @@ export const useSketchBench = create<BenchState>((set, get) => {
     }
   }
 
+  /** Run one sketch op: busy, refusal in the server's words, then re-read. */
+  const op = async (fn: (id: string) => Promise<unknown>) => {
+    const id = get().sketchId
+    if (!id) return
+    set({ busy: true, error: null })
+    try {
+      await fn(id)
+    } catch (e) {
+      set({ error: message(e) })
+    } finally {
+      set({ busy: false })
+      await refresh().catch((e) => set({ error: message(e) }))
+    }
+  }
+
+  /** A dimension as the solver takes it (a line's length is the distance
+   *  between its two end points; angles go in radians). */
+  const dimensional = (offer: DimensionOffer, value: number): { d: DimensionalConstraint; entities: EntityRef[] } => {
+    const s = get().summary
+    if (offer.kind === 'Length' && s) {
+      const lid = (offer.entities[0] as { Line: string }).Line
+      const ends = s.lines.find((l) => l.id === lid)?.endpoints
+      if (ends) return { d: { Distance: value }, entities: [{ Point: ends[0] }, { Point: ends[1] }] }
+      return { d: { Length: value }, entities: offer.entities }
+    }
+    if (offer.kind === 'Angle') return { d: { Angle: (value * Math.PI) / 180 }, entities: offer.entities }
+    if (offer.kind === 'Diameter') return { d: { Diameter: value }, entities: offer.entities }
+    if (offer.kind === 'Radius') return { d: { Radius: value }, entities: offer.entities }
+    return { d: { Distance: value }, entities: offer.entities }
+  }
+
   return {
+    constraints: [],
+    selectedConstraint: null,
+    opts: { fillet: 2, chamfer: 1, offset: 2, linCount: 3, linDx: 10, linDy: 0, circCount: 6, circAngle: 360 },
+    setOpts: (o) => set((s) => ({ opts: { ...s.opts, ...o } })),
+    action: null,
+    setAction: (action) => set({ action, error: null }),
+
+    pick: async (at, ref, pointId) => {
+      const { tool, summary, selection, opts } = get()
+      if (!summary) return
+      const lineId = ref && 'Line' in ref ? ref.Line : null
+      switch (tool) {
+        case 'trim':
+          if (!ref || 'Point' in ref) return set({ error: 'click the piece of a line, arc or circle to cut away' })
+          return op((id) => csketchApi.trimAt(id, ref, at))
+        case 'extend': {
+          if (!lineId) return set({ error: 'click near the end of a line to extend it' })
+          const end = nearerEnd(lineId, at, summary)
+          const boundary = end && extendBoundary(lineId, end, summary)
+          if (!end || !boundary) return set({ error: 'nothing lies ahead of that end to extend to' })
+          return op((id) => csketchApi.extend(id, { entity: { Line: lineId }, end, boundary }))
+        }
+        case 'fillet':
+        case 'chamfer': {
+          // A corner point, or the line end nearest the click.
+          let corner = ref && 'Point' in ref ? ref.Point : null
+          if (!corner && lineId) {
+            const l = summary.lines.find((x) => x.id === lineId)
+            const end = nearerEnd(lineId, at, summary)
+            if (l?.endpoints && end) corner = end === 'start' ? l.endpoints[0] : l.endpoints[1]
+          }
+          if (!corner || !isCorner(corner, summary)) {
+            return set({ error: 'click a corner -- a point where exactly two lines meet' })
+          }
+          const size = tool === 'fillet' ? opts.fillet : opts.chamfer
+          return op((id) => (tool === 'fillet' ? csketchApi.fillet(id, corner, size) : csketchApi.chamfer(id, corner, size)))
+        }
+        case 'mirror': {
+          if (!lineId) return set({ error: 'click the line to mirror about' })
+          const what = selection.filter((r) => !sameRef(r, { Line: lineId }))
+          if (what.length === 0) return set({ error: 'select what to mirror first, then click the mirror line' })
+          return op(async (id) => {
+            // The mirror line becomes a centre line, as in every CAD sketcher.
+            const axis = summary.lines.find((l) => l.id === lineId)
+            if (axis && !axis.is_construction) await csketchApi.setConstruction(id, { Line: lineId }, true)
+            await csketchApi.mirror(id, { entities: what, axis: lineId })
+            set({ selection: [] })
+          })
+        }
+        case 'circular-pattern': {
+          if (selection.length === 0) return set({ error: 'select what to pattern first, then click the centre' })
+          const n = Math.max(2, Math.round(opts.circCount))
+          const full = Math.abs(opts.circAngle - 360) < 1e-9
+          const step = ((full ? 360 / n : opts.circAngle / (n - 1)) * Math.PI) / 180
+          return op(async (id) => {
+            await csketchApi.circularPattern(id, {
+              entities: selection,
+              ...(pointId ? { center: pointId } : { center_position: at }),
+              count: n,
+              angle_step: step,
+            })
+            set({ selection: [] })
+          })
+        }
+      }
+    },
+
+    applyConstraint: (offer) =>
+      op(async (id) => {
+        await csketchApi.addConstraint(id, {
+          id: crypto.randomUUID(),
+          constraint_type: { Geometric: offer.kind },
+          entities: offer.entities,
+          priority: 'Required',
+          status: 'Satisfied',
+          name: null,
+        })
+        await csketchApi.solve(id)
+      }),
+
+    fixPoint: (pointId) =>
+      op(async (id) => {
+        const p = get().summary?.points.find((x) => x.id === pointId)
+        if (!p) throw new Error('that point is not in the sketch')
+        for (const d of [{ XCoordinate: p.x }, { YCoordinate: p.y }] as DimensionalConstraint[]) {
+          await csketchApi.addConstraint(id, {
+            id: crypto.randomUUID(),
+            constraint_type: { Dimensional: d },
+            entities: [{ Point: pointId }],
+            priority: 'Required',
+            status: 'Satisfied',
+            name: null,
+          })
+        }
+        await csketchApi.solve(id)
+        set({ selection: [] })
+      }),
+
+    addDimension: (offer, value) =>
+      op(async (id) => {
+        const { d, entities } = dimensional(offer, value)
+        const cid = crypto.randomUUID()
+        await csketchApi.addConstraint(id, {
+          id: cid,
+          constraint_type: { Dimensional: d },
+          entities,
+          priority: 'Required',
+          status: 'Satisfied',
+          name: null,
+        })
+        const report = await csketchApi.solve(id)
+        // A dimension the sketch cannot meet is taken back, with the reason.
+        const st = (report as { status?: { kind?: string } }).status?.kind
+        if (st === 'over_constrained' || st === 'not_converged' || st === 'unstable') {
+          await csketchApi.deleteConstraint(id, cid)
+          await csketchApi.solve(id).catch(() => null)
+          throw new Error('that dimension fights the sketch (over-defined): it was not added')
+        }
+        set({ selection: [] })
+      }),
+
+    editDimension: (cid, value) => op((id) => csketchApi.updateConstraintValue(id, cid, value)),
+
+    selectConstraint: (cid) => set({ selectedConstraint: cid }),
+    editing: null,
+    setEditing: (editing) => set({ editing, error: null }),
+
+    offsetSelection: () =>
+      op(async (id) => {
+        const { selection, opts } = get()
+        for (const r of selection) await csketchApi.offset(id, { entity: r, distance: opts.offset })
+        set({ selection: [] })
+      }),
+
+    linearPatternSelection: () =>
+      op(async (id) => {
+        const { selection, opts } = get()
+        await csketchApi.linearPattern(id, {
+          entities: selection,
+          count: Math.max(2, Math.round(opts.linCount)),
+          dx: opts.linDx,
+          dy: opts.linDy,
+        })
+        set({ selection: [] })
+      }),
+
+    dragPoint: (pointId, to) =>
+      op((id) => csketchApi.drag(id, { entity: { Point: pointId }, target: { kind: 'point', params: { x: to[0], y: to[1] } } })),
+
     sketchId: null,
     plane: 'xy',
     onPart: null,
@@ -226,10 +454,28 @@ export const useSketchBench = create<BenchState>((set, get) => {
 
     close: () => {
       useBenchCursor.getState().set(null)
-      set({ sketchId: null, summary: null, dof: null, clicks: [], selection: [], ghost: [], history: [], error: null })
+      set({
+        sketchId: null,
+        summary: null,
+        dof: null,
+        clicks: [],
+        selection: [],
+        ghost: [],
+        history: [],
+        error: null,
+        constraints: [],
+        selectedConstraint: null,
+      })
     },
 
-    setTool: (tool) => set({ tool, clicks: [], error: null }),
+    // Mirror and circular pattern act on the selection: keep it.
+    setTool: (tool) =>
+      set((s) => ({
+        tool,
+        clicks: [],
+        error: null,
+        selection: tool === 'mirror' || tool === 'circular-pattern' || tool === 'dimension' || tool === 'select' ? s.selection : [],
+      })),
     setSides: (n) => set({ sides: Math.max(3, Math.min(64, Math.round(n))) }),
     setGrid: (g) => set({ grid: Math.max(0, g) }),
     setFinish: (f) => set((s) => ({ finish: { ...s.finish, ...f } })),
@@ -290,7 +536,11 @@ export const useSketchBench = create<BenchState>((set, get) => {
     },
 
     deleteSelection: async () => {
-      const { sketchId, selection } = get()
+      const { sketchId, selection, selectedConstraint } = get()
+      if (sketchId && selectedConstraint) {
+        set({ selectedConstraint: null })
+        return op((id) => csketchApi.deleteConstraint(id, selectedConstraint))
+      }
       if (!sketchId || selection.length === 0) return
       set({ busy: true, error: null })
       try {

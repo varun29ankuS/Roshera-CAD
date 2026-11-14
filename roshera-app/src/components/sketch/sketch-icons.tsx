@@ -125,3 +125,167 @@ export const UndoIcon = ({ size }: { size?: number }) => (
     <path d="M5 11h9a5 5 0 0 1 0 10h-3" />
   </Svg>
 )
+
+// Constraints: the relation drawn, in yellow, on ink geometry.
+
+export const HorizontalIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M4 12h16" stroke={Y} strokeWidth="2.4" />
+    <text x="12" y="9" fontSize="7" textAnchor="middle" fill="currentColor" stroke="none" fontWeight="700">H</text>
+  </Svg>
+)
+
+export const VerticalIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M12 4v16" stroke={Y} strokeWidth="2.4" />
+    <text x="17.5" y="14" fontSize="7" textAnchor="middle" fill="currentColor" stroke="none" fontWeight="700">V</text>
+  </Svg>
+)
+
+export const CoincidentIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M4 18L12 12M12 12l8-7" />
+    <circle cx="12" cy="12" r="2.6" fill={Y} stroke="currentColor" strokeWidth="1.2" />
+  </Svg>
+)
+
+export const OnCurveIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M3 17C8 6 16 6 21 17" />
+    <circle cx="12" cy="9.2" r="2.4" fill={Y} stroke="currentColor" strokeWidth="1.2" />
+  </Svg>
+)
+
+export const MidpointIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M3 12h18" />
+    <path d="M3 9v6M21 9v6" strokeWidth="1" />
+    <circle cx="12" cy="12" r="2.4" fill={Y} stroke="currentColor" strokeWidth="1.2" />
+  </Svg>
+)
+
+export const ParallelIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M6 19L14 5M11 19L19 5" stroke={Y} strokeWidth="2.2" />
+  </Svg>
+)
+
+export const PerpendicularIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M5 19h14M8 19V5" stroke={Y} strokeWidth="2.2" />
+    <path d="M8 15h4v4" strokeWidth="1" />
+  </Svg>
+)
+
+export const EqualIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M5 9h14M5 15h14" stroke={Y} strokeWidth="2.4" />
+  </Svg>
+)
+
+export const TangentIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <circle cx="12" cy="13" r="5.5" />
+    <path d="M3 7.5h18" stroke={Y} strokeWidth="2.2" />
+  </Svg>
+)
+
+export const ConcentricIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <circle cx="12" cy="12" r="8" />
+    <circle cx="12" cy="12" r="4" stroke={Y} strokeWidth="2" />
+    <Dot x={12} y={12} />
+  </Svg>
+)
+
+export const SymmetricIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M12 3v18" strokeDasharray="2 2" />
+    <circle cx="6" cy="12" r="2.4" fill={Y} stroke="currentColor" strokeWidth="1.2" />
+    <circle cx="18" cy="12" r="2.4" fill={Y} stroke="currentColor" strokeWidth="1.2" />
+  </Svg>
+)
+
+export const DimensionIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M4 16h16" stroke={Y} strokeWidth="1.8" />
+    <path d="M4 13v6M20 13v6" />
+    <path d="M7 14l-3 2 3 2M17 14l3 2-3 2" strokeWidth="1.2" />
+    <text x="12" y="10" fontSize="7" textAnchor="middle" fill="currentColor" stroke="none" fontWeight="700">40</text>
+  </Svg>
+)
+
+// Modify
+
+export const TrimIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M4 12h5M15 12h5" stroke={Y} strokeWidth="2.2" />
+    <path d="M9 12h6" strokeDasharray="1.4 1.6" />
+    <path d="M9 5v14M15 5v14" />
+  </Svg>
+)
+
+export const ExtendIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M3 12h9" />
+    <path d="M12 12h6" stroke={Y} strokeWidth="2.2" />
+    <path d="M14 9l3 3-3 3" stroke={Y} strokeWidth="1.4" />
+    <path d="M20 5v14" />
+  </Svg>
+)
+
+export const SketchFilletIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M5 20V12" />
+    <path d="M12 5h7" />
+    <path d="M5 12a7 7 0 0 1 7-7" stroke={Y} strokeWidth="2.2" />
+  </Svg>
+)
+
+export const SketchChamferIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M5 20v-9M11 5h8" />
+    <path d="M5 11l6-6" stroke={Y} strokeWidth="2.2" />
+  </Svg>
+)
+
+export const OffsetIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <rect x="7" y="7" width="10" height="10" rx="1" />
+    <rect x="3.5" y="3.5" width="17" height="17" rx="2.5" stroke={Y} strokeWidth="1.8" />
+  </Svg>
+)
+
+export const MirrorIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M12 3v18" strokeDasharray="2 2" />
+    <path d="M9 7L4 17h5z" />
+    <path d="M15 7l5 10h-5z" stroke={Y} strokeWidth="1.8" />
+  </Svg>
+)
+
+export const LinearPatternIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <circle cx="5" cy="12" r="2.5" />
+    <circle cx="12" cy="12" r="2.5" stroke={Y} strokeWidth="1.8" />
+    <circle cx="19" cy="12" r="2.5" stroke={Y} strokeWidth="1.8" />
+  </Svg>
+)
+
+export const CircularPatternIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <Dot x={12} y={12} />
+    <circle cx="12" cy="4.5" r="2.2" />
+    <circle cx="19" cy="15" r="2.2" stroke={Y} strokeWidth="1.8" />
+    <circle cx="5" cy="15" r="2.2" stroke={Y} strokeWidth="1.8" />
+  </Svg>
+)
+
+export const FixIcon = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M4 20h16" />
+    <path d="M6 20l2-3M10 20l2-3M14 20l2-3M18 20l2-3" strokeWidth="1" />
+    <path d="M12 16V8" />
+    <circle cx="12" cy="7" r="3" fill={Y} stroke="currentColor" strokeWidth="1.2" />
+  </Svg>
+)

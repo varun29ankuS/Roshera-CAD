@@ -146,3 +146,106 @@ test('the freedom chip reads the solver verdict, not the raw count', async () =>
   assert.deepEqual(freedomLabel({ total_free_dofs: 4, status: { kind: 'over_constrained', conflicting_constraints: 2 } }, false), { text: '2 conflicting', tone: 'conflict' })
   assert.equal(freedomLabel({ total_free_dofs: 0, status: { kind: 'fully_constrained' } }, true), null, 'an empty sketch says nothing')
 })
+
+// ── Slice 2: constraints, dimensions, crossings, modify ─────────────────
+const seg = (id, x0, y0, x1, y1, construction = false) => ({ id, is_construction: construction, geometry: { Segment: { start: { x: x0, y: y0 }, end: { x: x1, y: y1 } } } })
+const sk = (o) => ({ id: 's', constraint_count: 0, points: [], lines: [], circles: [], arcs: [], splines: [], ellipses: [], polylines: [], rectangles: [], ...o })
+
+test('the constraints offered fit what is selected', async () => {
+  const { constraintsFor } = await lib()
+  const kinds = (sel) => constraintsFor(sel).map((c) => c.kind)
+  assert.deepEqual(kinds([{ Line: 'a' }]), ['Horizontal', 'Vertical'])
+  assert.deepEqual(kinds([{ Line: 'a' }, { Line: 'b' }]), ['Parallel', 'Perpendicular', 'Equal'])
+  assert.deepEqual(kinds([{ Point: 'p' }, { Point: 'q' }]), ['Coincident'])
+  assert.deepEqual(kinds([{ Point: 'p' }, { Line: 'a' }]), ['PointOnCurve', 'Midpoint'])
+  assert.deepEqual(kinds([{ Line: 'a' }, { Circle: 'c' }]), ['Tangent'])
+  assert.deepEqual(kinds([{ Circle: 'c' }, { Arc: 'r' }]), ['Concentric', 'Equal', 'Tangent'])
+  assert.deepEqual(kinds([{ Point: 'p' }, { Point: 'q' }, { Line: 'a' }]), ['Symmetric'])
+  assert.deepEqual(kinds([]), [])
+  // The point always goes first where the solver expects it.
+  assert.deepEqual(constraintsFor([{ Line: 'a' }, { Point: 'p' }])[0].entities, [{ Point: 'p' }, { Line: 'a' }])
+})
+
+test('smart dimension measures what is selected, at its current size', async () => {
+  const { dimensionFor } = await lib()
+  const s = sk({
+    points: [
+      { id: 'p', x: 0, y: 0, is_fixed: false, is_construction: false },
+      { id: 'q', x: 3, y: 4, is_fixed: false, is_construction: false },
+    ],
+    lines: [{ ...seg('a', 0, 0, 3, 4), endpoints: undefined }, seg('b', 0, 0, 10, 0)],
+    circles: [{ id: 'c', cx: 0, cy: 0, radius: 2.5, is_construction: false }],
+    arcs: [{ id: 'r', cx: 0, cy: 0, radius: 4, start_angle: 0, end_angle: 1, ccw: true, is_construction: false }],
+  })
+  const d1 = dimensionFor([{ Line: 'b' }], s)
+  assert.equal(d1.kind, 'Length')
+  assert.equal(d1.value, 10)
+  assert.deepEqual(dimensionFor([{ Circle: 'c' }], s), { kind: 'Diameter', entities: [{ Circle: 'c' }], value: 5, unit: 'mm' })
+  assert.equal(dimensionFor([{ Arc: 'r' }], s).kind, 'Radius')
+  assert.equal(dimensionFor([{ Point: 'p' }, { Point: 'q' }], s).value, 5)
+  const ang = dimensionFor([{ Line: 'a' }, { Line: 'b' }], s)
+  assert.equal(ang.kind, 'Angle')
+  assert.equal(ang.unit, 'deg')
+  assert.ok(Math.abs(ang.value - 53.130102) < 1e-4)
+  assert.equal(dimensionFor([{ Circle: 'c' }, { Line: 'b' }, { Point: 'p' }], s), null)
+})
+
+test('crossings are found; touching at a shared end is not a crossing; overlaps are flagged', async () => {
+  const { crossings, overlaps } = await lib()
+  const s = sk({
+    lines: [seg('a', 0, 0, 10, 0), seg('b', 5, -5, 5, 5), seg('c', 10, 0, 10, 8), seg('d', 2, 0, 6, 0)],
+    circles: [{ id: 'k', cx: 20, cy: 0, radius: 3, is_construction: false }],
+  })
+  const xs = crossings(s).map((p) => p.at.map((v) => Math.round(v * 1000) / 1000))
+  assert.ok(xs.some(([x, y]) => x === 5 && y === 0), JSON.stringify(xs))
+  assert.ok(!xs.some(([x, y]) => x === 10 && y === 0), 'a corner is not a crossing')
+  const ov = overlaps(s)
+  assert.equal(ov.length, 1)
+  assert.deepEqual(ov[0].map((r) => Object.values(r)[0]).sort(), ['a', 'd'])
+})
+
+test('extend runs a line end forward to the nearest curve it meets', async () => {
+  const { extendBoundary } = await lib()
+  const s = sk({ lines: [seg('a', 0, 0, 4, 0), seg('w1', 6, -5, 6, 5), seg('w2', 9, -5, 9, 5), seg('back', -3, -5, -3, 5)] })
+  assert.deepEqual(extendBoundary('a', 'end', s), { Line: 'w1' })
+  assert.deepEqual(extendBoundary('a', 'start', s), { Line: 'back' })
+  assert.equal(extendBoundary('w1', 'end', s), null)
+})
+
+test('a corner is a point where exactly two lines meet', async () => {
+  const { isCorner } = await lib()
+  const s = sk({
+    points: [{ id: 'p', x: 0, y: 0, is_fixed: false, is_construction: false }, { id: 'q', x: 9, y: 9, is_fixed: false, is_construction: false }],
+    lines: [{ ...seg('a', 0, 0, 5, 0), endpoints: ['p', 'x'] }, { ...seg('b', 0, 0, 0, 5), endpoints: ['y', 'p'] }],
+  })
+  assert.equal(isCorner('p', s), true)
+  assert.equal(isCorner('q', s), false)
+})
+
+test('arcs are built on their end points, so they join what shares them', async () => {
+  const { planShape } = await lib()
+  const arc = planShape('arc3', [{ at: [1, 0] }, { at: [-1, 0] }, { at: [0, 1] }])
+  const a = arc.find((o) => o.op === 'arc')
+  const pts = new Map(arc.filter((o) => o.op === 'point').map((o) => [o.key, o.at]))
+  assert.ok(pts.has(a.a) && pts.has(a.b), 'both ends are points of the plan')
+  // A slot's ends ARE its sides' end points: 4 points in all.
+  const slot = planShape('slot', [{ at: [0, 0] }, { at: [10, 0] }, { at: [5, 2] }])
+  assert.equal(slot.filter((o) => o.op === 'point').length, 4)
+  const lineEnds = new Set(slot.filter((o) => o.op === 'line').flatMap((o) => [o.a, o.b]))
+  for (const ar of slot.filter((o) => o.op === 'arc')) assert.ok(lineEnds.has(ar.a) && lineEnds.has(ar.b))
+})
+
+test('construction geometry is never an overlap or a crossing (it forms no profile)', async () => {
+  const { crossings, overlaps } = await lib()
+  const s = sk({ lines: [seg('a', 0, 0, 10, 0), seg('g', 2, 0, 6, 0, true), seg('v', 5, -5, 5, 5, true)] })
+  assert.equal(overlaps(s).length, 0)
+  assert.equal(crossings(s).length, 0)
+})
+
+test('a constraint that only touches construction geometry is not marked on the sketch', async () => {
+  const { showsMark } = await lib()
+  const s = sk({ lines: [seg('a', 0, 0, 10, 0), seg('g', 0, 0, 0, 10, true)], points: [{ id: 'p', x: 0, y: 0, is_fixed: false, is_construction: false }] })
+  assert.equal(showsMark([{ Line: 'g' }], s), false)
+  assert.equal(showsMark([{ Line: 'a' }, { Line: 'g' }], s), true)
+  assert.equal(showsMark([{ Point: 'p' }], s), true)
+})

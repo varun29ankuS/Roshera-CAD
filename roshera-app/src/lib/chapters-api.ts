@@ -148,6 +148,13 @@ function isEditStep(kind: string): boolean {
   return kind.startsWith('param.')
 }
 
+/** Whether a chapter is a row of the feature tree: not an edit or a
+ *  delete (folded or not), nor the edits of a sketch that never became a
+ *  feature. */
+export function inFeatureTree(c: Chapter): boolean {
+  return !isEdit(c) && !isEditStep(c.kind) && c.kind !== 'sketch'
+}
+
 /** Whether a chapter is a folded edit (see `foldEdits`). */
 export function isEdit(c: Chapter): boolean {
   return c.kind === 'edit'

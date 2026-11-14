@@ -7,7 +7,7 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { cn } from '@/lib/utils'
-import { chapterIconKey, chapterTitle, isEdit, type Chapter } from '@/lib/chapters-api'
+import { chapterIconKey, chapterTitle, inFeatureTree, type Chapter } from '@/lib/chapters-api'
 import { useChapters } from '@/hooks/use-chapters'
 import { useHistoryView } from '@/stores/history-view-store'
 import { featureFields, fetchEditableParameters, sizeSummary, type EditableParameter } from '@/lib/feature-edit'
@@ -132,7 +132,7 @@ export function ChapterList({ branch = 'main' }: { branch?: string }) {
   const { chapters: all, loading, error } = useChapters(branch)
   // Features only: a size edit is history (it stays on the slider), not a
   // row -- the edited feature shows its new size itself.
-  const chapters = useMemo(() => all.filter((c) => !isEdit(c)), [all])
+  const chapters = useMemo(() => all.filter(inFeatureTree), [all])
   // Selecting a row highlights that feature, as in a feature tree. It never
   // moves the timeline: only the slider travels in time. Rows after the
   // slider's position are greyed, like features below a rollback bar.

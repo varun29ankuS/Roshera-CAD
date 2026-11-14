@@ -90,3 +90,11 @@ test('a deleted feature reads as "Delete" in the film strip; an edit as "Edit"',
   const folded = foldEdits([ch('cylinder', 0), ch('param.suppress', 5), ch('param.mould', 6)])
   assert.deepEqual(folded.map((c) => c.name), [null, 'Delete', 'Edit'])
 })
+
+test('the feature tree lists features, not edits or unused sketches', async () => {
+  const { inFeatureTree } = await import('../src/lib/chapters-api.ts')
+  const ch = (kind) => ({ kind, name: null, events: [1], anchor: 1, sound: true, refusals: [], author: 'user', author_detail: { kind: 'user' }, intent: null, instances: [] })
+  assert.equal(inFeatureTree(ch('extrude')), true)
+  assert.equal(inFeatureTree(ch('sketch')), false)
+  assert.equal(inFeatureTree(ch('param.mould')), false)
+})

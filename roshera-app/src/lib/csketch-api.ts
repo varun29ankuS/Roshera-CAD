@@ -104,6 +104,8 @@ export interface CSketchLineSummary {
   id: string
   geometry: LineGeometry
   is_construction: boolean
+  /** The point entities a segment is built on, `[start, end]`. */
+  endpoints?: [string, string] | null
 }
 
 /** Wire form of a kernel `ParametricCircle2d` (centre + radius). */
@@ -743,7 +745,9 @@ export const csketchApi = {
   /** Append an arc by centre, radius and start / end angle (radians, CCW). */
   addArc(
     id: string,
-    body: { cx: number; cy: number; radius: number; start_angle: number; end_angle: number },
+    body:
+      | { start: string; end: string; radius: number; ccw: boolean; large_arc: boolean }
+      | { cx: number; cy: number; radius: number; start_angle: number; end_angle: number },
   ): Promise<EntityIdResponse> {
     return request('POST', `/csketch/${id}/arc`, body)
   },
@@ -755,6 +759,41 @@ export const csketchApi = {
    *  it, a curve the points only it used. Returns the sketch now. */
   deleteEntities(id: string, entities: EntityRef[]): Promise<CSketchSummary> {
     return request('POST', `/csketch/${id}/delete`, { entities })
+  },
+  /** Trim at a click: cut back to the nearest crossings either side. */
+  trimAt(id: string, entity: EntityRef, pick: [number, number]): Promise<unknown> {
+    return request('POST', `/csketch/${id}/trim-at`, { entity, pick })
+  },
+  /** Extend a line end forward to a boundary curve. */
+  extend(id: string, body: { entity: EntityRef; end: 'start' | 'end'; boundary: EntityRef }): Promise<unknown> {
+    return request('POST', `/csketch/${id}/extend`, body)
+  },
+  /** Round a corner (where two lines meet) with a tangent arc. */
+  fillet(id: string, corner: string, size: number): Promise<unknown> {
+    return request('POST', `/csketch/${id}/fillet`, { corner, size })
+  },
+  /** Cut a corner straight across. */
+  chamfer(id: string, corner: string, size: number): Promise<unknown> {
+    return request('POST', `/csketch/${id}/chamfer`, { corner, size })
+  },
+  /** Offset a closed loop (positive grows it). */
+  offset(id: string, body: { entity: EntityRef; distance: number }): Promise<unknown> {
+    return request('POST', `/csketch/${id}/offset`, body)
+  },
+  /** Mirror entities about a construction line. */
+  mirror(id: string, body: { entities: EntityRef[]; axis: string }): Promise<unknown> {
+    return request('POST', `/csketch/${id}/mirror`, body)
+  },
+  /** Linear pattern: `count` instances in all, stepped by (dx, dy). */
+  linearPattern(id: string, body: { entities: EntityRef[]; count: number; dx: number; dy: number }): Promise<unknown> {
+    return request('POST', `/csketch/${id}/pattern/linear`, body)
+  },
+  /** Circular pattern about a point (existing id, or a new one at a position). */
+  circularPattern(
+    id: string,
+    body: { entities: EntityRef[]; center?: string; center_position?: [number, number]; count: number; angle_step: number },
+  ): Promise<unknown> {
+    return request('POST', `/csketch/${id}/pattern/circular`, body)
   },
   /** Mark an entity as construction (guide) geometry, or clear the mark. */
   setConstruction(id: string, entity: EntityRef, isConstruction: boolean): Promise<unknown> {

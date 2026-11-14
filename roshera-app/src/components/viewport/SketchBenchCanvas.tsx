@@ -6,18 +6,26 @@
  * (`useBenchCursor`); the sketch itself re-renders when the sketch changes.
  */
 
-import { useCallback, useMemo, useRef } from 'react'
-import { Line } from '@react-three/drei'
+import { useCallback, useMemo, useRef, useState } from 'react'
+import { Html, Line } from '@react-three/drei'
 import { useThree, type ThreeEvent } from '@react-three/fiber'
 import * as THREE from 'three'
 import { useThemeStore } from '@/stores/theme-store'
+import { cn } from '@/lib/utils'
 import { useBenchCursor, useSketchBench } from '@/stores/sketch-bench-store'
+import { useSceneStore } from '@/stores/scene-store'
 import {
+  anchorOf,
+  CONSTRAINT_GLYPH,
+  crossings,
   entityPaths,
+  overlaps,
+  PICK_TOOLS,
   pickEntity,
   planPaths,
   planShape,
   sameRef,
+  showsMark,
   snap,
   snapTargets,
   TOOL_CLICKS,
@@ -39,6 +47,8 @@ function palette(dark: boolean) {
     selected: '#F2A516',
     ghost: dark ? '#9fd0ff' : '#2f7fd8',
     snap: '#F2A516',
+    bad: '#e5484d',
+    cross: dark ? '#c084fc' : '#9333ea',
     tint: dark ? '#3b82f6' : '#2563eb',
   }
 }
@@ -75,7 +85,18 @@ function BenchSurface() {
   const reachRef = useRef(1)
 
   const paths = useMemo(() => (summary ? entityPaths(summary) : []), [summary])
-  const targets = useMemo(() => (summary ? snapTargets(summary) : []), [summary])
+  const cross = useMemo(() => (summary ? crossings(summary) : []), [summary])
+  const overlapping = useMemo(() => (summary ? overlaps(summary).flat() : []), [summary])
+  const targets = useMemo(
+    () => [...(summary ? snapTargets(summary) : []), ...cross.map((c) => ({ at: c.at, kind: 'midpoint' as const }))],
+    [summary, cross],
+  )
+  // Marker size follows zoom (a few pixels on screen), updated when the
+  // zoom changes enough to show -- not on every mouse move.
+  const [mark, setMark] = useState(0.5)
+  // A sketch point being dragged (select tool): where it is now.
+  const [drag, setDrag] = useState<{ id: string; at: Vec2 } | null>(null)
+  const dragRef = useRef<{ id: string; at: Vec2 } | null>(null)
   const known = useMemo(() => new Map<string, Vec2>((summary?.points ?? []).map((p) => [p.id, [p.x, p.y]])), [summary])
 
   const toUv = useCallback(
@@ -89,10 +110,17 @@ function BenchSurface() {
   const onMove = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
       const uv = toUv(e)
+      const m = reachRef.current * 0.5
+      if (Math.abs(m - mark) > mark * 0.15) setMark(m)
       const grid = useSketchBench.getState().grid
-      useBenchCursor.getState().set(snap(uv, targets, { reach: reachRef.current, grid }))
+      const snapped = snap(uv, targets, { reach: reachRef.current, grid })
+      useBenchCursor.getState().set(snapped)
+      if (dragRef.current) {
+        dragRef.current = { id: dragRef.current.id, at: snapped.at }
+        setDrag(dragRef.current)
+      }
     },
-    [toUv, targets],
+    [toUv, targets, mark],
   )
 
   // Click vs. drag: orbiting the view over the plane must not place points.
@@ -103,16 +131,37 @@ function BenchSurface() {
       const y0 = e.nativeEvent.clientY
       const uv = toUv(e)
       const additive = e.nativeEvent.shiftKey || e.nativeEvent.ctrlKey || e.nativeEvent.metaKey
+      const start = useSketchBench.getState()
+      // Select tool on a point: drag it; the solver moves what it drives.
+      const under = start.summary ? pickEntity(uv, paths, start.summary, reachRef.current) : null
+      if (start.tool === 'select' && under && 'Point' in under) {
+        dragRef.current = { id: under.Point, at: uv }
+        useSceneStore.getState().setGizmoDragging(true)
+      }
       const onUp = (up: PointerEvent) => {
         window.removeEventListener('pointerup', onUp)
+        const dragged = dragRef.current
+        dragRef.current = null
+        setDrag(null)
+        useSceneStore.getState().setGizmoDragging(false)
         if (up.button !== 0) return
         const dx = up.clientX - x0
         const dy = up.clientY - y0
-        if (dx * dx + dy * dy > 16) return
+        if (dx * dx + dy * dy > 16) {
+          if (dragged) void useSketchBench.getState().dragPoint(dragged.id, dragged.at)
+          return
+        }
         const bench = useSketchBench.getState()
-        if (bench.tool === 'select') {
-          const s = bench.summary
-          bench.select(s ? pickEntity(uv, paths, s, reachRef.current) : null, additive)
+        const s = bench.summary
+        const hit = s ? pickEntity(uv, paths, s, reachRef.current) : null
+        if (bench.tool === 'select' || bench.tool === 'dimension') {
+          bench.selectConstraint(null)
+          bench.select(hit, additive || bench.tool === 'dimension')
+          return
+        }
+        if (PICK_TOOLS.has(bench.tool)) {
+          const at = useBenchCursor.getState().at
+          void bench.pick(at?.at ?? uv, hit, at?.pointId)
           return
         }
         const snapped = useBenchCursor.getState().at ?? snap(uv, targets, { reach: reachRef.current, grid: bench.grid })
@@ -146,11 +195,12 @@ function BenchSurface() {
 
       {paths.map((p) => {
         const sel = isSelected(p.ref)
+        const bad = overlapping.some((r) => sameRef(r, p.ref))
         return (
           <Line
             key={JSON.stringify(p.ref)}
             points={lift(p.pts, plane)}
-            color={sel ? colors.selected : p.construction ? colors.construction : colors.ink}
+            color={sel ? colors.selected : bad ? colors.bad : p.construction ? colors.construction : colors.ink}
             lineWidth={sel ? 3 : 2}
             dashed={p.construction}
             dashSize={1.2}
@@ -165,7 +215,48 @@ function BenchSurface() {
         <Line key={`ghost-${i}`} points={lift(pts, plane)} color={colors.ink} lineWidth={2} depthTest={false} renderOrder={5} />
       ))}
 
+      {cross.map((c, i) => {
+        const r = mark
+        return (
+          <Line
+            key={`x-${i}`}
+            points={lift(
+              [
+                [c.at[0] - r, c.at[1] - r],
+                [c.at[0] + r, c.at[1] + r],
+                [c.at[0], c.at[1]],
+                [c.at[0] - r, c.at[1] + r],
+                [c.at[0] + r, c.at[1] - r],
+              ],
+              plane,
+            )}
+            color={colors.cross}
+            lineWidth={1.5}
+            depthTest={false}
+            renderOrder={6}
+          />
+        )
+      })}
+
+      {drag && (
+        <Line
+          points={lift(
+            Array.from({ length: 13 }, (_, i) => {
+              const t = (i / 12) * 2 * Math.PI
+              const r = mark * 1.2
+              return [drag.at[0] + r * Math.cos(t), drag.at[1] + r * Math.sin(t)] as Vec2
+            }),
+            plane,
+          )}
+          color={colors.selected}
+          lineWidth={2.5}
+          depthTest={false}
+          renderOrder={9}
+        />
+      )}
+
       <BenchPoints colors={colors} />
+      <ConstraintMarks />
       <RubberBand colors={colors} known={known} />
     </group>
   )
@@ -233,6 +324,69 @@ function RubberBand({ colors, known }: { colors: ReturnType<typeof palette>; kno
         <Line key={`band-${i}`} points={lift(pts, plane)} color={colors.ghost} lineWidth={1.5} dashed dashSize={0.8} gapSize={0.5} depthTest={false} renderOrder={7} />
       ))}
       {marker && <Line points={lift(marker, plane)} color={colors.snap} lineWidth={2} depthTest={false} renderOrder={8} />}
+    </>
+  )
+}
+
+/** Constraint glyphs and dimension values ON the sketch, as established
+ *  sketchers show them: click a glyph to pick it (Delete removes it);
+ *  double-click a dimension to change it. */
+function ConstraintMarks() {
+  const plane = useSketchBench((s) => s.plane)
+  const summary = useSketchBench((s) => s.summary)
+  const constraints = useSketchBench((s) => s.constraints)
+  const picked = useSketchBench((s) => s.selectedConstraint)
+  const marks = useMemo(() => {
+    if (!summary) return []
+    // Several marks on one entity fan out instead of stacking.
+    const seen = new Map<string, number>()
+    return constraints.flatMap((c) => {
+      if (!showsMark(c.entities, summary)) return []
+      const at = anchorOf(c.entities, summary)
+      if (!at) return []
+      const key = `${at[0].toFixed(3)},${at[1].toFixed(3)}`
+      const n = seen.get(key) ?? 0
+      seen.set(key, n + 1)
+      const t = c.constraint_type
+      if ('Geometric' in t) {
+        const name = typeof t.Geometric === 'string' ? t.Geometric : 'IntersectionAngle'
+        return [{ id: c.id, at, n, text: CONSTRAINT_GLYPH[name] ?? name.slice(0, 2), title: name, dim: null as number | null, unit: '' }]
+      }
+      const [kind, raw] = Object.entries(t.Dimensional)[0] as [string, number]
+      if (typeof raw !== 'number') return []
+      const deg = kind === 'Angle'
+      const value = deg ? (raw * 180) / Math.PI : raw
+      const prefix = kind === 'Diameter' ? 'Ø' : kind === 'Radius' ? 'R' : ''
+      return [{ id: c.id, at, n, text: `${prefix}${Number(value.toFixed(3))}${deg ? '°' : ''}`, title: kind, dim: value, unit: deg ? '°' : 'mm' }]
+    })
+  }, [summary, constraints])
+  return (
+    <>
+      {marks.map((m) => (
+        <Html key={m.id} position={uvToWorld(m.at, plane)} center zIndexRange={[20, 0]} style={{ pointerEvents: 'none' }}>
+          <button
+            type="button"
+            title={m.dim === null ? `${m.title} -- click, then Delete removes it` : `${m.title} -- double-click to change`}
+            onClick={(e) => {
+              e.stopPropagation()
+              useSketchBench.getState().selectConstraint(m.id)
+            }}
+            onDoubleClick={(e) => {
+              e.stopPropagation()
+              if (m.dim === null) return
+              useSketchBench.getState().setEditing({ id: m.id, kind: m.title, value: m.dim, unit: m.unit === '°' ? 'deg' : 'mm' })
+            }}
+            style={{ pointerEvents: 'auto', transform: `translate(${10 + m.n * 14}px, ${-10 - m.n * 2}px)` }}
+            className={cn(
+              'cad-focus whitespace-nowrap rounded border px-1 text-[10px] leading-4 shadow-sm',
+              m.dim === null ? 'min-w-4 bg-card/90 text-muted-foreground' : 'bg-card font-medium text-foreground',
+              picked === m.id ? 'border-[var(--cad-selected)] text-foreground' : 'border-border',
+            )}
+          >
+            {m.text}
+          </button>
+        </Html>
+      ))}
     </>
   )
 }
