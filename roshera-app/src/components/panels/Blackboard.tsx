@@ -1,4 +1,6 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from 'react'
+import { useChapters } from '@/hooks/use-chapters'
+import { suggestPrompts } from '@/lib/suggestions'
 import { PermissionCard, PermissionStrip } from './PermissionCard'
 import { useAcpPermissionStore } from '@/stores/acp-permission-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
@@ -155,10 +157,6 @@ function ModelPicker({
  * conversation fills the column; floating, its height follows the agent's
  * attention instead.
  */
-/** Starter prompts under an empty composer: plain questions the agent can
- *  answer about the part as it stands. A click only fills the box. */
-const STARTERS = ['Is this part sound?', 'Check it for 3D printing', 'Walk me through the history']
-
 export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
   const lines = useBlackboardStore((s) => s.lines)
   const isProcessing = useBlackboardStore((s) => s.isProcessing)
@@ -170,6 +168,9 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
   const addLine = useBlackboardStore((s) => s.addLine)
   const agentAttention = useBlackboardStore((s) => s.agentAttention)
   const streamingLineId = useBlackboardStore((s) => s.streamingLineId)
+  // Starter prompts from the part's own history (lib/suggestions).
+  const { chapters: history, documents: historyDocs } = useChapters('main')
+  const starters = useMemo(() => suggestPrompts(history, historyDocs), [history, historyDocs])
 
   // Live ACP session stats (Feature B) — display-only, driven by
   // `lib/acp-blackboard.ts`'s wiring of the shared `AcpClient`. See
@@ -764,11 +765,11 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
             ))}
           </div>
         )}
-        {/* Starters (the mockup's suggestion chips): plain prompts for the
-            agent. A click fills the box -- it never sends by itself. */}
+        {/* Starters (the mockup's suggestion chips), drawn from the part's
+            history. A click fills the box -- it never sends by itself. */}
         {!draft.trim() && !isProcessing && (
           <div className="flex flex-wrap gap-1 px-2 pt-2">
-            {STARTERS.map((s) => (
+            {starters.map((s) => (
               <button
                 key={s}
                 type="button"
