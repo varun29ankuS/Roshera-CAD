@@ -1133,7 +1133,9 @@ export function DrawingsWorkspace() {
       {/* The sheet fills the window; every control is a small overlay on it. */}
       <div
         ref={canvasRef}
-        className="absolute inset-0 overflow-hidden bg-muted/20 cursor-grab"
+        // Right of the Sheet panel (w-64 + its margin) when a sheet is open,
+        // so Fit never lays the sheet under the panel.
+        className={`absolute inset-y-0 right-0 overflow-hidden bg-muted/20 cursor-grab ${activeDrawing ? 'left-[17rem]' : 'left-0'}`}
         onMouseDown={onCanvasMouseDown}
         onMouseMove={onCanvasHover}
       >

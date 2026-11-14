@@ -167,10 +167,17 @@ export function App() {
             sheet workspace), no PropertiesPanel, no Timeline strip.
             The kernel still drives the projection; this pane is the
             sheet inspector. */}
-        {docMode === 'drawing' ? (
-          <DrawingsWorkspace />
-        ) : docMode === 'assembly' ? (
-          <AssemblyWorkspace />
+        {docMode === 'drawing' || docMode === 'assembly' ? (
+          <>
+            {docMode === 'drawing' ? <DrawingsWorkspace /> : <AssemblyWorkspace />}
+            {/* The agent in every workspace (Varun 2026-11-14: "why is there
+                no Blackboard in other tabs ... users can't keep going back
+                and forth"). Docked as a column here, beside the sheet or
+                the assembly, so nothing of theirs sits under it. */}
+            <div className="flex w-[21rem] shrink-0 flex-col border-l border-border bg-background p-2">
+              <Blackboard docked />
+            </div>
+          </>
         ) : (
           // The slots' provider wraps the tool rail too: its dialogs (fillet,
           // chamfer, shell) go in the viewport's top slot.
