@@ -1713,6 +1713,205 @@ async fn corner_op(
     }))
 }
 
+/// One step of `POST /api/csketch/{id}/build`. References name an earlier
+/// step's `key`, or an existing point as `id:<uuid>`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum BuildOp {
+    Point {
+        key: String,
+        at: [f64; 2],
+    },
+    Line {
+        key: String,
+        a: String,
+        b: String,
+        #[serde(default)]
+        construction: bool,
+    },
+    Circle {
+        key: String,
+        c: [f64; 2],
+        r: f64,
+    },
+    Arc {
+        key: String,
+        a: String,
+        b: String,
+        r: f64,
+        #[serde(default = "default_true")]
+        ccw: bool,
+        #[serde(default)]
+        large: bool,
+    },
+    Spline {
+        key: String,
+        points: Vec<String>,
+        degree: usize,
+    },
+    Constrain {
+        kind: geometry_engine::sketch2d::GeometricConstraint,
+        refs: Vec<BuildRef>,
+    },
+}
+
+/// An entity a `constrain` step names: its kind and reference.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuildRef {
+    pub kind: String,
+    #[serde(rename = "ref")]
+    pub reference: String,
+}
+
+/// Request body for `POST /api/csketch/{id}/build`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuildRequest {
+    pub ops: Vec<BuildOp>,
+}
+
+/// `POST /api/csketch/{id}/build` -- build a drawn shape in ONE request
+/// (Varun 2026-11-14): points, lines, arcs, circles, splines and the
+/// constraints a sketcher adds while drawing, in order; later steps name
+/// earlier ones by key. A rectangle was 13 requests, and the workbench's
+/// re-reads spent the user's whole request budget in a few shapes. All or
+/// nothing: a step that fails takes back everything this plan built, and
+/// the refusal names the step. Constraints are solved once at the end.
+pub async fn build_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<BuildRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let sketch = require_sketch(&state, id)?;
+    let mut ids: std::collections::BTreeMap<String, Uuid> = std::collections::BTreeMap::new();
+    let mut created: Vec<EntityRef> = Vec::new();
+    let mut constrained = false;
+    let refuse = |i: usize, why: String| {
+        ApiError::new(ErrorCode::InvalidParameter, format!("step {i}: {why}"))
+    };
+    let result: Result<(), ApiError> = (|| {
+        let resolve = |ids: &std::collections::BTreeMap<String, Uuid>, r: &str| -> Option<Uuid> {
+            match r.strip_prefix("id:") {
+                Some(raw) => Uuid::parse_str(raw).ok(),
+                None => ids.get(r).copied(),
+            }
+        };
+        for (i, op) in req.ops.iter().enumerate() {
+            match op {
+                BuildOp::Point { key, at } => {
+                    if !at[0].is_finite() || !at[1].is_finite() {
+                        return Err(refuse(i, "point coordinates must be finite".into()));
+                    }
+                    let pid = sketch.add_point(Point2d::new(at[0], at[1]));
+                    created.push(EntityRef::Point(pid));
+                    ids.insert(key.clone(), pid.0);
+                }
+                BuildOp::Line {
+                    key,
+                    a,
+                    b,
+                    construction,
+                } => {
+                    let (Some(pa), Some(pb)) = (resolve(&ids, a), resolve(&ids, b)) else {
+                        return Err(refuse(i, format!("unknown point {a} or {b}")));
+                    };
+                    let lid = sketch
+                        .add_line(Point2dId(pa), Point2dId(pb))
+                        .map_err(|e| refuse(i, e.to_string()))?;
+                    created.push(EntityRef::Line(lid));
+                    if *construction {
+                        sketch
+                            .set_construction(&EntityRef::Line(lid), true)
+                            .map_err(|e| refuse(i, e.to_string()))?;
+                    }
+                    ids.insert(key.clone(), lid.0);
+                }
+                BuildOp::Circle { key, c, r } => {
+                    let cid = sketch
+                        .add_circle(Point2d::new(c[0], c[1]), *r)
+                        .map_err(|e| refuse(i, e.to_string()))?;
+                    created.push(EntityRef::Circle(cid));
+                    ids.insert(key.clone(), cid.0);
+                }
+                BuildOp::Arc {
+                    key,
+                    a,
+                    b,
+                    r,
+                    ccw,
+                    large,
+                } => {
+                    let (Some(pa), Some(pb)) = (resolve(&ids, a), resolve(&ids, b)) else {
+                        return Err(refuse(i, format!("unknown point {a} or {b}")));
+                    };
+                    let aid = sketch
+                        .add_arc(Point2dId(pa), Point2dId(pb), *r, *ccw, *large)
+                        .map_err(|e| refuse(i, e.to_string()))?;
+                    created.push(EntityRef::Arc(aid));
+                    ids.insert(key.clone(), aid.0);
+                }
+                BuildOp::Spline {
+                    key,
+                    points,
+                    degree,
+                } => {
+                    let mut pids = Vec::with_capacity(points.len());
+                    for p in points {
+                        let Some(u) = resolve(&ids, p) else {
+                            return Err(refuse(i, format!("unknown point {p}")));
+                        };
+                        pids.push(Point2dId(u));
+                    }
+                    let sid = sketch
+                        .add_bspline_with_control_points(*degree, &pids)
+                        .map_err(|e| refuse(i, e.to_string()))?;
+                    created.push(EntityRef::Spline(sid));
+                    ids.insert(key.clone(), sid.0);
+                }
+                BuildOp::Constrain { kind, refs } => {
+                    let mut entities = Vec::with_capacity(refs.len());
+                    for r in refs {
+                        let Some(u) = resolve(&ids, &r.reference) else {
+                            return Err(refuse(i, format!("unknown entity {}", r.reference)));
+                        };
+                        let e = match r.kind.as_str() {
+                            "Point" => EntityRef::Point(Point2dId(u)),
+                            "Line" => EntityRef::Line(geometry_engine::sketch2d::Line2dId(u)),
+                            "Arc" => EntityRef::Arc(geometry_engine::sketch2d::Arc2dId(u)),
+                            "Circle" => EntityRef::Circle(geometry_engine::sketch2d::Circle2dId(u)),
+                            other => return Err(refuse(i, format!("cannot constrain a {other}"))),
+                        };
+                        entities.push(e);
+                    }
+                    sketch.add_constraint(Constraint::new_geometric(
+                        *kind,
+                        entities,
+                        geometry_engine::sketch2d::ConstraintPriority::Required,
+                    ));
+                    constrained = true;
+                }
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        // All or nothing: take back what this plan built.
+        if !created.is_empty() {
+            let _ = sketch.delete_with_dependents(&created);
+        }
+        return Err(e);
+    }
+    if constrained {
+        // Solved once; a sketch the new constraints cannot settle reports
+        // through the freedom count, as any constraint add does.
+        let _ = sketch.solve_constraints();
+    }
+    Ok(Json(serde_json::json!({
+        "ids": ids,
+        "created": created,
+        "summary": summarise(&sketch),
+    })))
+}
+
 /// `POST /api/csketch/{id}/extend` — extend a line end to the nearest
 /// forward intersection with a boundary entity.
 pub async fn extend_op(
@@ -2644,10 +2843,7 @@ pub async fn extrude_csketch(
     let result_uuid = Uuid::new_v4();
     let result_id_str = result_uuid.to_string();
     state.register_id_mapping(result_uuid, result_solid_id);
-    let display_name = req
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("CSketch {result_solid_id}"));
+    let display_name = req.name.clone().unwrap_or_else(|| "Extrude".to_string());
     crate::persist_display_name(&state, &model_handle, result_solid_id, &display_name).await;
 
     let parameters = serde_json::json!({
@@ -3237,10 +3433,7 @@ pub async fn revolve_csketch(
     let result_uuid = Uuid::new_v4();
     let result_id_str = result_uuid.to_string();
     state.register_id_mapping(result_uuid, result_solid_id);
-    let display_name = req
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("CSketch revolve {result_solid_id}"));
+    let display_name = req.name.clone().unwrap_or_else(|| "Revolve".to_string());
     crate::persist_display_name(&state, &model_handle, result_solid_id, &display_name).await;
 
     let parameters = serde_json::json!({

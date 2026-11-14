@@ -746,6 +746,11 @@ const POLL_PREFIXES: &[&str] = &[
     "/api/documents",
     "/api/document",
     "/api/sketch",
+    // The sketch workbench re-reads its sketch (snapshot, freedoms,
+    // constraints) after every change: as Mutation, a few sketch actions
+    // spent the user's whole 100/min budget and every tab of theirs came
+    // back 429 (Varun 2026-11-14: "unable to select parts and features").
+    "/api/csketch",
 ];
 
 fn is_poll_prefix(path: &str) -> bool {
@@ -1250,6 +1255,10 @@ mod tests {
             "/api/documents",
             "/api/document/units",
             "/api/sketch",
+            // The sketch workbench reads its sketch after every change.
+            "/api/csketch/00000000-0000-0000-0000-000000000000",
+            "/api/csketch/00000000-0000-0000-0000-000000000000/dof",
+            "/api/csketch/00000000-0000-0000-0000-000000000000/constraints",
         ];
         for path in polls {
             let req = mk_request("GET", path, &[], None);

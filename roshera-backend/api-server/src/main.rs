@@ -11003,6 +11003,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         // Slice-6 sketch ops (SKETCH-DCM #45, spec §3.4).
         .route("/api/csketch/{id}/delete", post(csketch::delete_entities))
+        .route("/api/csketch/{id}/build", post(csketch::build_op))
         .route("/api/csketch/{id}/trim", post(csketch::trim_op))
         .route("/api/csketch/{id}/trim-at", post(csketch::trim_at_op))
         .route("/api/csketch/{id}/fillet", post(csketch::fillet_op))

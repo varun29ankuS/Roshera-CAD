@@ -12891,3 +12891,64 @@ async fn a_sketch_that_was_never_saved_is_refused_not_faked() {
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{b}");
     assert_eq!(b["kind"], "NoSketch", "{b}");
 }
+
+/// A drawn shape is built in ONE request (a rectangle was 13 -- with the
+/// re-read, a few shapes spent the user's whole request budget): points,
+/// lines, arcs and constraints in order, later steps naming earlier ones
+/// by key. A plan that fails part way leaves the sketch as it was.
+#[tokio::test]
+async fn a_drawn_shape_is_built_in_one_request_or_not_at_all() {
+    let state = make_test_state().await;
+    let (_, body) = dispatch(&state, json_post("/api/csketch", json!({}))).await;
+    let sk = body["id"].as_str().expect("sketch id").to_string();
+    let corners = [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]];
+    let mut ops: Vec<serde_json::Value> = corners
+        .iter()
+        .enumerate()
+        .map(|(i, at)| json!({"op": "point", "key": format!("p{i}"), "at": at}))
+        .collect();
+    for i in 0..4 {
+        ops.push(json!({"op": "line", "key": format!("l{i}"), "a": format!("p{i}"), "b": format!("p{}", (i + 1) % 4)}));
+    }
+    for (i, kind) in ["Horizontal", "Vertical", "Horizontal", "Vertical"]
+        .iter()
+        .enumerate()
+    {
+        ops.push(json!({"op": "constrain", "kind": kind, "refs": [{"kind": "Line", "ref": format!("l{i}")}]}));
+    }
+    let (s, b) = dispatch(
+        &state,
+        json_post(&format!("/api/csketch/{sk}/build"), json!({ "ops": ops })),
+    )
+    .await;
+    assert!(s.is_success(), "{b}");
+    assert_eq!(
+        b["summary"]["lines"].as_array().map(Vec::len),
+        Some(4),
+        "{b}"
+    );
+    assert_eq!(b["summary"]["constraint_count"], 4, "{b}");
+    assert!(b["ids"]["p0"].is_string(), "keys map to the new ids: {b}");
+
+    // A plan naming a point that does not exist builds nothing.
+    let bad = json!({ "ops": [
+        {"op": "point", "key": "q", "at": [20.0, 0.0]},
+        {"op": "line", "key": "m", "a": "q", "b": "missing"}
+    ]});
+    let (s, b) = dispatch(&state, json_post(&format!("/api/csketch/{sk}/build"), bad)).await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "refused like every sketch input error: {b}"
+    );
+    assert!(
+        b["error"].as_str().is_some_and(|e| e.contains("step 1")),
+        "names the step: {b}"
+    );
+    let (_, snap) = dispatch(&state, json_get(&format!("/api/csketch/{sk}"))).await;
+    assert_eq!(
+        snap["points"].as_array().map(Vec::len),
+        Some(4),
+        "the failed plan left nothing: {snap}"
+    );
+}
