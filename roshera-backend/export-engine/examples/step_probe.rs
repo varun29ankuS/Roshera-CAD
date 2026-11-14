@@ -13,7 +13,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
 
 use export_engine::ExportEngine;
-use geometry_engine::drawing::{render_drawing_svg, standard_drawing_auto, verify_drawing};
+use geometry_engine::drawing::{
+    draw_in_part_frame, render_drawing_svg, standard_drawing_auto, verify_drawing,
+};
 use geometry_engine::primitives::feature_recognition::recognize_features;
 use geometry_engine::primitives::topology_builder::BRepModel;
 use geometry_engine::readable::extract_dimensions;
@@ -69,7 +71,7 @@ fn main() {
         engine.import_step_content(&content, "probe")
     }));
     let import_ms = t0.elapsed().as_millis();
-    let (model, report) = match imported {
+    let (mut model, report) = match imported {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             println!("FILE {stem} IMPORT_ERROR ms={import_ms} err={e}");
@@ -129,6 +131,13 @@ fn main() {
 
         let mut drawing_col = "not_attempted".to_string();
         if rank < max_drawn {
+            // Same order as the drawing routes: the part back in its design
+            // frame first (the probe owns this model), then the sheet.
+            let frame = draw_in_part_frame(&mut model, *sid);
+            print!(
+                "  FRAME {sid} {frame:?}
+"
+            );
             let t = Instant::now();
             let res = catch_unwind(AssertUnwindSafe(|| {
                 standard_drawing_auto(&model, *sid, uuid::Uuid::new_v4())

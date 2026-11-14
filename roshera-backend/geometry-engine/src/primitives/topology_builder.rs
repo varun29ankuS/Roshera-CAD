@@ -658,6 +658,13 @@ pub struct BRepModel {
     /// cleared with the geometry (solid ids restart after `clear_geometry`).
     pub solid_occurrence:
         std::collections::HashMap<SolidId, crate::primitives::provenance::AssemblyOccurrence>,
+    /// Per-solid assembly placement: the rigid transform that carried an
+    /// imported part from the frame it was designed in to where its assembly
+    /// put it. Recorded by the STEP importer only when that move succeeded.
+    /// Read by the drawing pipeline to draw each part as designed, not at
+    /// whatever angle the assembly happened to hold it. Cleared with the
+    /// geometry, like `solid_occurrence`.
+    pub solid_placement: std::collections::HashMap<SolidId, crate::math::Matrix4>,
     /// Uses of an imported assembly's parts that produced NO solid (their
     /// geometry failed to import), with the reason. Not solids, so they have
     /// no id: kept so the browser can list what is ABSENT instead of letting
@@ -769,6 +776,7 @@ impl BRepModel {
             solid_provenance: std::collections::HashMap::new(),
             solid_construction: std::collections::HashMap::new(),
             solid_occurrence: std::collections::HashMap::new(),
+            solid_placement: std::collections::HashMap::new(),
             missing_occurrences: Vec::new(),
             document_unit: crate::units::LengthUnit::default(),
             gdt: crate::gdt::sidecar::GdtSidecar::new(),
@@ -912,6 +920,7 @@ impl BRepModel {
         self.solid_construction.clear();
         // Assembly occurrences name solids by id; ids restart after a clear.
         self.solid_occurrence.clear();
+        self.solid_placement.clear();
         self.missing_occurrences.clear();
         // Labels are bound to the topology (entity labels) / the part (section
         // labels) being discarded.
@@ -2893,6 +2902,22 @@ impl BRepModel {
         solid_id: SolidId,
     ) -> Option<&crate::primitives::provenance::AssemblyOccurrence> {
         self.solid_occurrence.get(&solid_id)
+    }
+
+    /// Record where an assembly placed an imported solid: the transform from
+    /// the part's own (design) frame to its place in the assembly.
+    pub fn set_solid_placement(&mut self, solid_id: SolidId, placement: crate::math::Matrix4) {
+        self.solid_placement.insert(solid_id, placement);
+    }
+
+    /// The design-frame → assembly transform an import recorded for a solid.
+    pub fn solid_placement(&self, solid_id: SolidId) -> Option<&crate::math::Matrix4> {
+        self.solid_placement.get(&solid_id)
+    }
+
+    /// Forget a solid's placement (it has been moved back to its design frame).
+    pub fn clear_solid_placement(&mut self, solid_id: SolidId) {
+        self.solid_placement.remove(&solid_id);
     }
 
     /// The kernel's recorded provenance for a solid, if any.

@@ -156,15 +156,17 @@ pub(crate) fn finalize(
                 continue;
             };
             if !inst.path.is_empty() {
-                if let Err(e) =
-                    transform_solid(&mut out, sid, inst.transform, TransformOptions::default())
-                {
-                    warn(
+                match transform_solid(&mut out, sid, inst.transform, TransformOptions::default()) {
+                    // Remembered so a drawing can put the part back in the
+                    // frame it was designed in. Only a move that happened is
+                    // recorded: undoing one that did not would tilt the part.
+                    Ok(_) => out.set_solid_placement(sid, inst.transform),
+                    Err(e) => warn(
                         report,
                         "NEXT_ASSEMBLY_USAGE_OCCURRENCE",
                         inst.path.last().copied(),
                         &format!("placing solid {part_solid:?} failed: {e}"),
-                    );
+                    ),
                 }
             }
             let faces: Vec<(FaceId, FaceId)> = face_map.iter().map(|(s, d)| (*d, *s)).collect();

@@ -587,3 +587,32 @@ fn placement_entities_are_no_longer_reported_unsupported() {
         );
     }
 }
+
+/// A drawing must show each part as designed, not at the angle its assembly
+/// holds it. The importer records every placement it applied; the merge into
+/// the session keeps it; and the drawing step undoes it, putting the rotated
+/// instance (+90° about Z, then to (0,20,0)) back on the unit cube at the
+/// origin. Without the record, the sheet would be projected from the placed
+/// body and ink its tilted widths as sizes.
+#[test]
+fn a_placed_part_goes_back_to_its_design_frame_for_drawing() {
+    use geometry_engine::drawing::{draw_in_part_frame, PartFrame};
+    let (src, _) = ExportEngine::new()
+        .import_step_content(&envelope(&two_instance_assembly()), "asm.step")
+        .unwrap();
+    let mut target = BRepModel::new();
+    let merged = export_engine::formats::step::merge_solids_into(&mut target, &src);
+    assert_eq!(merged.len(), 2);
+    for sid in merged {
+        assert_eq!(
+            draw_in_part_frame(&mut target, sid),
+            PartFrame::AsDesigned,
+            "solid {sid}: the import must record the placement it applied"
+        );
+        let (lo, hi) = solid_bbox(&target, sid);
+        assert!(
+            close(lo, [0.0, 0.0, 0.0]) && close(hi, [1.0, 1.0, 1.0]),
+            "solid {sid} must be back on the unit cube at the origin: lo={lo:?} hi={hi:?}"
+        );
+    }
+}

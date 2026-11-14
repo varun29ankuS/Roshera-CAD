@@ -111,6 +111,9 @@ fn carry_identity(
         let created_by = prov.created_by.clone();
         dst.set_solid_provenance(dst_sid, created_by, Vec::new());
     }
+    if let Some(placement) = src.solid_placement(src_sid) {
+        dst.set_solid_placement(dst_sid, *placement);
+    }
     if let Some(occ) = src.solid_occurrence(src_sid) {
         dst.set_solid_occurrence(dst_sid, occ.clone());
     }

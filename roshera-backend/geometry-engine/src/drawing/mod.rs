@@ -29,6 +29,7 @@ pub mod dxf;
 pub mod hole_features;
 pub mod hole_table;
 pub mod layout;
+pub mod part_frame;
 pub mod pdf;
 pub mod projection;
 pub mod query;
@@ -51,6 +52,7 @@ pub use dimensioning::{
 };
 pub use dxf::{render_drawing_dxf, DxfRenderError};
 pub use hole_table::{build_hole_table, qualifies_for_baseline, tag_letter, HoleSite};
+pub use part_frame::{draw_in_part_frame, PartFrame};
 pub use pdf::{render_drawing_pdf, PdfRenderError};
 pub use projection::{
     project_solid_edges, project_solid_view, view_matrix_for_projection, ProjectionError,

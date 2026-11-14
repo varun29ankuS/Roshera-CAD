@@ -1397,6 +1397,13 @@ async fn build_standard_drawing_off_lock(
     tokio::task::spawn_blocking(move || {
         let mut owned = BRepModel::new();
         snap.restore(&mut owned);
+        // An assembly part is drawn in the frame it was designed in, not at
+        // the angle the assembly holds it: its views square and its sizes
+        // true. `owned` is this request's copy; the live model is untouched.
+        let frame = geometry_engine::drawing::draw_in_part_frame(&mut owned, solid_id);
+        if let geometry_engine::drawing::PartFrame::AsPlaced { reason } = &frame {
+            tracing::warn!(solid_id, %reason, "sheet drawn at the assembly placement");
+        }
         match scale {
             Some(scale) => standard_drawing_hlr_with_projection(
                 &owned,
@@ -3026,6 +3033,47 @@ mod tests {
     }
 
     // ── Off-lock drawing build (runtime-starvation fix) ─────────────
+
+    #[tokio::test]
+    async fn a_part_an_assembly_placed_is_drawn_as_designed() {
+        // An imported assembly part arrives at the angle its assembly holds it.
+        // The route must draw it in the frame it was designed in: a 40×30×20
+        // box turned 17° would otherwise be inked 27.90 and 34.54 -- projected
+        // widths presented as sizes. The live model must stay where it is.
+        use geometry_engine::math::{Matrix4, Vector3};
+        use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+        let (mut model, sid) = build_box_model(40.0, 30.0, 20.0);
+        let placement = Matrix4::from_translation(&Vector3::new(12.0, -7.0, 31.0))
+            * Matrix4::rotation_x(17f64.to_radians());
+        transform_solid(&mut model, sid, placement, TransformOptions::default()).expect("place");
+        model.set_solid_placement(sid, placement);
+        let handle = Arc::new(RwLock::new(model));
+
+        let drawing = build_standard_drawing_off_lock(
+            handle.clone(),
+            sid,
+            Uuid::nil(),
+            None,
+            ProjectionAngle::First,
+        )
+        .await
+        .expect("off-lock auto drawing");
+        let values: Vec<f64> = drawing
+            .views
+            .iter()
+            .flat_map(|v| v.dimensions.iter().map(|d| d.value))
+            .collect();
+        for want in [40.0, 30.0, 20.0] {
+            assert!(
+                values.iter().any(|v| (v - want).abs() < 1e-6),
+                "the sheet must carry the box's {want} size; it carries {values:?}"
+            );
+        }
+        assert!(
+            handle.read().await.solid_placement(sid).is_some(),
+            "the live model keeps its placement: only the request's copy is moved"
+        );
+    }
 
     #[tokio::test]
     async fn off_lock_drawing_builds_and_coexists_with_readers() {
