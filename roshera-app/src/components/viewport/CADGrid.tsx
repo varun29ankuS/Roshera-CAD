@@ -1,4 +1,5 @@
 import { useMemo, useRef } from 'react'
+import { useSketchBench } from '@/stores/sketch-bench-store'
 import { useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
 import {
@@ -90,8 +91,12 @@ export function CADGrid() {
   )
   // Track the sketch plane only when sketch mode is active; otherwise the
   // grid stays on the XY ground plane (Z-up world).
-  const sketchActive = useSceneStore((s) => s.sketch.active)
-  const sketchPlane = useSceneStore((s) => s.sketch.plane)
+  const benchOpen = useSketchBench((s) => s.sketchId !== null)
+  const benchPlane = useSketchBench((s) => s.plane)
+  // The old sketch mode or the sketch workbench: the same camera / grid rules.
+  const sketchActive = useSceneStore((s) => s.sketch.active) || benchOpen
+  const legacyPlane = useSceneStore((s) => s.sketch.plane)
+  const sketchPlane = benchOpen ? benchPlane : legacyPlane
   // The infinite grid shader is parametrised over the three axis-
   // aligned planes; on a custom (face-anchored) sketch plane we fall
   // back to the XY ground grid rather than fight the shader to track

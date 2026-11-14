@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { useSketchBench } from '@/stores/sketch-bench-store'
 import { keepCameraPose, keptCameraPose } from '@/lib/camera-memory'
 import { FIT_MARGIN, fitDistance } from '@/lib/camera-fit'
 import { CAMERA_PRESETS, FRAME_ALL, FRAME_FIT } from '@/stores/scene-store'
@@ -107,8 +108,12 @@ export function CameraController() {
   const gizmoDragging = useSceneStore((s) => s.gizmoDragging)
   // Sketch mode: on ENTRY, snap the camera normal-to the sketch plane so the
   // 2D profile reads face-on instead of as a foreshortened diagonal.
-  const sketchActive = useSceneStore((s) => s.sketch.active)
-  const sketchPlane = useSceneStore((s) => s.sketch.plane)
+  const benchOpen = useSketchBench((s) => s.sketchId !== null)
+  const benchPlane = useSketchBench((s) => s.plane)
+  // The old sketch mode or the sketch workbench: the same camera / grid rules.
+  const sketchActive = useSceneStore((s) => s.sketch.active) || benchOpen
+  const legacyPlane = useSceneStore((s) => s.sketch.plane)
+  const sketchPlane = benchOpen ? benchPlane : legacyPlane
   const wasSketchingRef = useRef(false)
 
   // Scene-adaptive framing: recompute the world bounding sphere whenever the

@@ -1,4 +1,5 @@
 import { useEffect } from 'react'
+import { useSketchBench } from '@/stores/sketch-bench-store'
 import { invalidate } from '@react-three/fiber'
 import { useSceneStore } from '@/stores/scene-store'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
@@ -69,6 +70,11 @@ export function useKeyboardShortcuts() {
         return
       }
 
+      // While the sketch workbench is open it owns the keyboard: its own
+      // tools, Delete, Esc, Enter and Ctrl+Z act on the sketch, never on
+      // the part or the timeline.
+      if (useSketchBench.getState().sketchId !== null) return
+
       const state = useSceneStore.getState()
 
       // Inside sketch mode the SketchPanel owns Enter/Esc/Backspace
@@ -80,6 +86,14 @@ export function useKeyboardShortcuts() {
       }
 
       switch (e.key.toLowerCase()) {
+        // K: start a sketch (on XY; right-click a face to sketch on it).
+        case 'k':
+          if (!ctrl && !e.altKey && !state.sketch.active) {
+            e.preventDefault()
+            void useSketchBench.getState().open('xy')
+          }
+          break
+
         // Undo / Redo
         case 'z':
           if (ctrl) {

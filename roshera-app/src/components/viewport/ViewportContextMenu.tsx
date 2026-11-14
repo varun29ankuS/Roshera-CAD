@@ -1,4 +1,5 @@
 import { useCallback } from 'react'
+import { useSketchBench } from '@/stores/sketch-bench-store'
 import {
   Eye,
   EyeOff,
@@ -87,7 +88,8 @@ export function ViewportContextMenu() {
       // kernel uses, so the in-canvas overlay and any subsequent
       // extrude all see consistent (u, v) coordinates.
       const plane = await sketchApi.planeFromFace(menu.objectId, menu.faceId)
-      useSceneStore.getState().enterSketch(plane, 'polyline')
+      // The sketch workbench, on the face; the part is the default Cut target.
+      void useSketchBench.getState().open(plane, menu.objectId)
     } catch (err) {
       // Most common failure here is a non-planar face (face/surface
       // wasn't a Plane). Surface to the dev console rather than a

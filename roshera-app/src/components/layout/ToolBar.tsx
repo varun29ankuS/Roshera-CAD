@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useSketchBench } from '@/stores/sketch-bench-store'
+import { SketchBenchRail } from '@/components/sketch/SketchBenchRail'
 import { createPortal } from 'react-dom'
 import {
   MousePointer2,
@@ -1261,6 +1263,7 @@ export function ToolBar() {
   // because the three operations are mutually exclusive (one panel at
   // a time); the dialog renders nothing when `null`.
   const [modifyMode, setModifyMode] = useState<ModifyMode | null>(null)
+  const benchOpen = useSketchBench((s) => s.sketchId !== null)
 
   const handleModifyApply = useCallback((payload: ModifyApplyPayload) => {
     switch (payload.mode) {
@@ -1478,7 +1481,8 @@ export function ToolBar() {
   const rail: RailEntry[] = [
     flyout(selectGroup, 'Select'),
     { kind: 'cap', label: 'MODEL' },
-    tool({ icon: ToolIcons.sketch, label: 'Sketch', shortcut: 'K', action: () => useSceneStore.getState().enterSketch('xy', 'polyline') }),
+    // The sketch workbench (constraint sketcher); right-click a face to sketch on it.
+    tool({ icon: ToolIcons.sketch, label: 'Sketch', shortcut: 'K', action: () => void useSketchBench.getState().open('xy') }),
     tool({
       icon: ToolIcons.extrude,
       label: 'Extrude',
@@ -1504,6 +1508,9 @@ export function ToolBar() {
     tool({ icon: DrawingIcon, label: 'Drawing', action: () => setDocMode('drawing') }),
     flyout(exportGroup, 'Export'),
   ]
+
+  // While a sketch is open its tools replace the part tools.
+  if (benchOpen) return <SketchBenchRail />
 
   return (
     <>

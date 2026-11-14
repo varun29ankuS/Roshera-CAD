@@ -129,8 +129,74 @@ export interface CSketchSummary {
   points: CSketchPointSummary[]
   lines: CSketchLineSummary[]
   circles: CSketchCircleSummary[]
+  splines: CSketchSplineSummary[]
+  arcs: CSketchArcSummary[]
+  rectangles: CSketchRectangleSummary[]
+  ellipses: CSketchEllipseSummary[]
+  polylines: CSketchPolylineSummary[]
   constraint_count: number
 }
+
+/** Wire form of a kernel `ParametricSpline2d` (B-spline, or NURBS when
+ *  `weights` is present). */
+export interface CSketchSplineSummary {
+  id: string
+  degree: number
+  control_points: [number, number][]
+  knots: number[]
+  weights: number[] | null
+  is_construction: boolean
+}
+
+/** Wire form of a kernel `ParametricArc2d` (angles in radians). */
+export interface CSketchArcSummary {
+  id: string
+  cx: number
+  cy: number
+  radius: number
+  start_angle: number
+  end_angle: number
+  ccw: boolean
+  is_construction: boolean
+}
+
+/** Wire form of a kernel `ParametricRectangle2d`. */
+export interface CSketchRectangleSummary {
+  id: string
+  cx: number
+  cy: number
+  width: number
+  height: number
+  rotation: number
+  is_construction: boolean
+}
+
+/** Wire form of a kernel `ParametricEllipse2d`. */
+export interface CSketchEllipseSummary {
+  id: string
+  cx: number
+  cy: number
+  semi_major: number
+  semi_minor: number
+  rotation: number
+  is_construction: boolean
+}
+
+/** Wire form of a kernel `ParametricPolyline2d`. */
+export interface CSketchPolylineSummary {
+  id: string
+  vertices: [number, number][]
+  closed: boolean
+  is_construction: boolean
+}
+
+/** A sketch plane, as the server takes it: a standard plane, or a frame
+ *  (e.g. from a picked face). */
+export type CSketchPlane =
+  | 'xy'
+  | 'xz'
+  | 'yz'
+  | { origin: [number, number, number]; u_axis: [number, number, number]; v_axis: [number, number, number] }
 
 // ── Constraint wire types ───────────────────────────────────────────
 
@@ -673,6 +739,40 @@ export const csketchApi = {
   /** Append a circle by centre + radius. */
   addCircle(id: string, body: AddCircleRequest): Promise<EntityIdResponse> {
     return request('POST', `/csketch/${id}/circle`, body)
+  },
+  /** Append an arc by centre, radius and start / end angle (radians, CCW). */
+  addArc(
+    id: string,
+    body: { cx: number; cy: number; radius: number; start_angle: number; end_angle: number },
+  ): Promise<EntityIdResponse> {
+    return request('POST', `/csketch/${id}/arc`, body)
+  },
+  /** Append a spline built on existing points (its control points). */
+  addSpline(id: string, body: { degree: number; control_point_ids: string[] }): Promise<EntityIdResponse> {
+    return request('POST', `/csketch/${id}/spline`, body)
+  },
+  /** Delete entities as the Delete key does: a point takes the curves on
+   *  it, a curve the points only it used. Returns the sketch now. */
+  deleteEntities(id: string, entities: EntityRef[]): Promise<CSketchSummary> {
+    return request('POST', `/csketch/${id}/delete`, { entities })
+  },
+  /** Mark an entity as construction (guide) geometry, or clear the mark. */
+  setConstruction(id: string, entity: EntityRef, isConstruction: boolean): Promise<unknown> {
+    return request('PATCH', `/csketch/${id}/construction`, { entity, is_construction: isConstruction })
+  },
+  /** Extrude the sketch's closed regions into a solid. */
+  extrude(
+    id: string,
+    body: { distance: number; plane: CSketchPlane; name?: string },
+  ): Promise<{ object?: { id: string }; [k: string]: unknown }> {
+    return request('POST', `/csketch/${id}/extrude`, body)
+  },
+  /** Revolve the sketch's closed regions about an in-plane axis. */
+  revolve(
+    id: string,
+    body: { axis_origin: [number, number]; axis_direction: [number, number]; angle: number; plane: CSketchPlane },
+  ): Promise<{ object?: { id: string }; [k: string]: unknown }> {
+    return request('POST', `/csketch/${id}/revolve`, body)
   },
   /**
    * Add a constraint. The caller supplies a fully-formed

@@ -27,6 +27,8 @@ import { DfmFaceTints } from './DfmFaceTints'
 import { SketchOverlay } from './SketchOverlay'
 import { ServerSketches } from './ServerSketches'
 import { SketchPanel } from '@/components/panels/SketchPanel'
+import { SketchBenchBar } from '@/components/sketch/SketchBenchBar'
+import { SketchBenchCanvas } from './SketchBenchCanvas'
 import { MateSuggestionPopover } from '@/components/panels/MateSuggestionPopover'
 import { DIMENSION_CHIP_LABELS } from '@/lib/dimension-kinds'
 import {
@@ -212,6 +214,7 @@ export function CADViewport() {
         <ExtrudeGizmo />
         <SelectionOutline />
         <SketchOverlay />
+        <SketchBenchCanvas />
         <ServerSketches />
         <PartLabels />
         <PartDimensions />
@@ -234,6 +237,9 @@ export function CADViewport() {
       <LabelHoverTooltip />
       <CSketchDofHud />
       <SketchPanel />
+      <InSlot name="top">
+        <SketchBenchBar />
+      </InSlot>
       <MateSuggestionPopover />
     </div>
   )

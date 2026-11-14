@@ -34,7 +34,7 @@ import {
 } from '@/stores/scene-store'
 import { buildProfile2D } from '@/lib/sketch-extrude'
 import { ExtrudeRegionPreview } from './ExtrudeRegionPreview'
-import { uvToWorld } from './sketch-plane-uv'
+import { planeMeshPosition, planeMeshQuaternion, pointToPlaneUV, uvToWorld } from './sketch-plane-uv'
 import {
   CSketchConstraintConflictError,
   csketchApi,
@@ -57,64 +57,6 @@ const PLANE_SIZE = 400 // world units; large enough that the user
 // engages within a glyph-width of an existing entity — the same
 // "feel" as mainstream CAD hover-on-vertex magnetism.
 const CSKETCH_SNAP_RADIUS = 1.5
-
-/** Project a world-space `THREE.Vector3` onto the chosen sketch plane. */
-function pointToPlaneUV(
-  p: THREE.Vector3,
-  plane: SketchPlane,
-): [number, number] {
-  if (isStandardPlane(plane)) {
-    switch (plane) {
-      case 'xy': return [p.x, p.y]
-      case 'xz': return [p.x, p.z]
-      case 'yz': return [p.y, p.z]
-    }
-  }
-  // Custom face-anchored plane: subtract origin then dot against the
-  // in-plane basis. Backend's SketchPlane::from_face guarantees u_axis
-  // and v_axis are orthonormal, so this gives the same (u, v) the
-  // backend's lift() inverts.
-  const origin = new THREE.Vector3(...plane.origin)
-  const uAxis = new THREE.Vector3(...plane.u_axis)
-  const vAxis = new THREE.Vector3(...plane.v_axis)
-  const d = p.clone().sub(origin)
-  return [d.dot(uAxis), d.dot(vAxis)]
-}
-
-/** World position for the capture-plane mesh (origin for custom planes). */
-function planeMeshPosition(plane: SketchPlane): THREE.Vector3 {
-  if (isStandardPlane(plane)) return new THREE.Vector3(0, 0, 0)
-  return new THREE.Vector3(...plane.origin)
-}
-
-/**
- * Quaternion that orients the default `<planeGeometry>` (whose local
- * +X is right, +Y is up, +Z is normal) to lie on the sketch plane.
- * For standard planes we replay the same Euler rotations the previous
- * implementation used so the visual result is unchanged. For custom
- * planes we build an orthonormal basis directly from u_axis / v_axis
- * and extract the quaternion from the basis matrix.
- */
-function planeMeshQuaternion(plane: SketchPlane): THREE.Quaternion {
-  const q = new THREE.Quaternion()
-  if (isStandardPlane(plane)) {
-    const euler = (() => {
-      switch (plane) {
-        case 'xy': return new THREE.Euler(0, 0, 0)
-        case 'xz': return new THREE.Euler(-Math.PI / 2, 0, 0)
-        case 'yz': return new THREE.Euler(0, Math.PI / 2, 0)
-      }
-    })()
-    q.setFromEuler(euler)
-    return q
-  }
-  const uAxis = new THREE.Vector3(...plane.u_axis)
-  const vAxis = new THREE.Vector3(...plane.v_axis)
-  const nAxis = new THREE.Vector3().crossVectors(uAxis, vAxis)
-  const m = new THREE.Matrix4().makeBasis(uAxis, vAxis, nAxis)
-  q.setFromRotationMatrix(m)
-  return q
-}
 
 /**
  * Origin/axis/grid snap stage of the snap pipeline. Magnetically

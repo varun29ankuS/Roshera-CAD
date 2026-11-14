@@ -1,4 +1,5 @@
 import { useCursorStore } from '@/stores/cursor-store'
+import { useSketchBench } from '@/stores/sketch-bench-store'
 import { INSTANCE_PREFIX } from '@/lib/assembly-pose'
 import { isNearestHit } from '@/lib/status-bar'
 import { memo, useRef, useMemo, useCallback, useEffect, type ComponentRef } from 'react'
@@ -74,7 +75,8 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
   // SketchOverlay capture plane behind the solids. Otherwise the
   // raycaster hits CAD geometry first, this mesh's handlers fire with
   // e.stopPropagation(), and the user can only click in empty space.
-  const sketchActive = useSceneStore((s) => s.sketch.active)
+  const benchOpen = useSketchBench((s) => s.sketchId !== null)
+  const sketchActive = useSceneStore((s) => s.sketch.active) || benchOpen
   const sectionView = useSceneStore((s) => s.sectionView)
 
   const { defaultEdgeHex, accentEdgeHex, selectedEdgeHex } = useMemo(() => {
