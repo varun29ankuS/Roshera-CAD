@@ -538,6 +538,29 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "guide_attention",
+            Core,
+            Stable,
+            Curated,
+            "GUIDE the person's attention: drive their open app -- switch workspace, move the camera, select a feature (lit, arrowed, sizes), highlight faces, jump the history slider -- under a pausable 'Claude is showing you' bar with your caption. Changes no geometry; delivered_to 0 = no app open.",
+
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["workspace", "view", "feature", "faces", "step"], "description": "what to show"},
+                    "mode": {"type": "string", "enum": ["part", "assembly", "drawing", "dfm"], "description": "workspace: which one"},
+                    "view": {"type": "string", "enum": ["iso", "front", "back", "top", "bottom", "left", "right", "fit"], "description": "camera: which side, or fit"},
+                    "name": {"type": "string", "description": "feature: its name in the history (e.g. Bore)"},
+                    "anchor": {"type": "integer", "description": "feature: its anchor step (instead of a name)"},
+                    "solid_id": {"type": "integer", "description": "faces: the part id"},
+                    "face_ids": {"type": "array", "items": {"type": "integer"}, "description": "faces: kernel face ids"},
+                    "sequence": {"type": "integer", "description": "step: the history step to show"},
+                    "caption": {"type": "string", "description": "one line the person reads: what you point at and why"}
+                },
+                "required": ["action"]
+            }),
+        ),
+        t(
             "scene_view",
             Core,
             Stable,
@@ -2237,7 +2260,9 @@ mod tests {
         // which is the compiled zod contract and therefore the wire truth.
         // 109 -> 111 (2026-11-11): drawing_set_dimension + drawing_set_projection.
         // 111 -> 112 (2026-11-12): drawing_set_title.
-        assert_eq!(tools.len(), 112, "expected 112 tools, got {}", tools.len());
+        // 112 -> 113 (2026-11-14): guide_attention -- the agent drives the
+        // user's app to show them something (POST /api/agent/show).
+        assert_eq!(tools.len(), 113, "expected 113 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

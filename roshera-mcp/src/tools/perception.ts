@@ -433,4 +433,35 @@ export function registerPerceptionTools(server: ToolHost) {
       }
     },
   );
+
+  server.tool(
+    "guide_attention",
+    "GUIDE the person's attention: drive their open app -- switch workspace, move the camera, select a feature (lit, arrowed, sizes), highlight faces, jump the history slider -- under a pausable 'Claude is showing you' bar with your caption. Changes no geometry; delivered_to 0 = no app open.",
+    {
+      action: z
+        .enum(["workspace", "view", "feature", "faces", "step"])
+        .describe("what to show"),
+      mode: z.enum(["part", "assembly", "drawing", "dfm"]).optional().describe("workspace: which one"),
+      view: z
+        .enum(["iso", "front", "back", "top", "bottom", "left", "right", "fit"])
+        .optional()
+        .describe("camera: which side, or fit"),
+      name: z.string().optional().describe("feature: its name in the history (e.g. Bore)"),
+      anchor: z.number().int().optional().describe("feature: its anchor step (instead of a name)"),
+      solid_id: z.number().int().optional().describe("faces: the part id"),
+      face_ids: z.array(z.number().int()).optional().describe("faces: kernel face ids"),
+      sequence: z.number().int().optional().describe("step: the history step to show"),
+      caption: z.string().optional().describe("one line the person reads: what you point at and why"),
+    },
+    async (args) => {
+      try {
+        // Only the fields the action uses travel: the server refuses unknown
+        // ones, and an absent optional is not sent as null.
+        const body = Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined))
+        return ok(await api("POST", "/api/agent/show", body));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
 }

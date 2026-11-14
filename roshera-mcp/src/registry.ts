@@ -253,6 +253,7 @@ const BENCH_OF: Record<string, Bench> = {
   get_part: "core",
   render_part: "core",
   scene_view: "core",
+  guide_attention: "core",
   section_view: "core",
   verify_part: "core",
   mass_properties: "core",
