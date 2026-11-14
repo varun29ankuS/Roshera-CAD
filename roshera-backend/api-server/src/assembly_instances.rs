@@ -195,6 +195,44 @@ pub struct AssemblyInstancesSummary {
     pub bbox: Option<[[f64; 3]; 2]>,
     /// True iff every resolvable instance is sound AND no instance dangles.
     pub all_sound: bool,
+    /// Every mate, with the two INSTANCES it joins -- so a reader can show
+    /// what joins what without re-solving (a solve is a recorded mutation,
+    /// this read is not).
+    pub mates: Vec<MateListing>,
+}
+
+/// One mate on the read: its kind, its connectors, and the instances they
+/// sit on.
+#[derive(Debug, Clone, Serialize)]
+pub struct MateListing {
+    pub id: Uuid,
+    pub kind: geometry_engine::assembly::mates::DocMateKind,
+    pub a_connector: Uuid,
+    pub b_connector: Uuid,
+    pub a_instance: Uuid,
+    pub b_instance: Uuid,
+}
+
+/// Every mate of `assembly`, with the instances its connectors sit on. A mate
+/// whose connector is missing is left out (the document refuses such a mate,
+/// so this does not happen; never a guessed instance).
+pub(crate) fn mate_listing(assembly: &InstancedAssembly) -> Vec<MateListing> {
+    assembly
+        .mates()
+        .iter()
+        .filter_map(|m| {
+            let a = assembly.connector(m.a)?;
+            let b = assembly.connector(m.b)?;
+            Some(MateListing {
+                id: m.id.0,
+                kind: m.kind.clone(),
+                a_connector: m.a.0,
+                b_connector: m.b.0,
+                a_instance: a.instance.0,
+                b_instance: b.instance.0,
+            })
+        })
+        .collect()
 }
 
 // ── Request bodies ──────────────────────────────────────────────────
@@ -386,6 +424,7 @@ fn build_summary(
         instances,
         bbox,
         all_sound,
+        mates: mate_listing(assembly),
     }
 }
 
@@ -842,5 +881,61 @@ mod tests {
         let mgr = InstancedAssemblyManager::new();
         mgr.record_event(op_create(Uuid::nil(), "noop"));
         assert_eq!(mgr.len(), 0); // reached ⇒ no panic, hard no-op
+    }
+
+    /// The assembly read lists its mates with the two INSTANCES each joins
+    /// (not only connector ids), so a screen can show "Flange ⟳ Shaft"
+    /// without re-solving -- a solve is a recorded mutation, a read is not.
+    #[test]
+    fn the_assembly_read_lists_each_mate_with_the_instances_it_joins() {
+        use geometry_engine::assembly::mates::{
+            ConnectorAnchor, ConnectorFrame, DocMate, DocMateId, DocMateKind, MateConnector,
+            MateConnectorId,
+        };
+        let mut doc = InstancedAssembly::new("rig");
+        let flange = doc
+            .add_instance(Uuid::new_v4(), Matrix4::IDENTITY, Some("Flange".into()))
+            .0;
+        let shaft = doc
+            .add_instance(Uuid::new_v4(), Matrix4::IDENTITY, Some("Shaft".into()))
+            .0;
+        let frame = ConnectorFrame {
+            origin: [0.0, 0.0, 0.0],
+            z_axis: [0.0, 0.0, 1.0],
+            x_axis: [1.0, 0.0, 0.0],
+        };
+        let ca = MateConnector {
+            id: MateConnectorId::new(),
+            instance: InstanceId(flange),
+            anchor: ConnectorAnchor::FacePid { pid: u128::MAX - 1 },
+            frame,
+            radius: Some(15.0),
+        };
+        let cb = MateConnector {
+            id: MateConnectorId::new(),
+            instance: InstanceId(shaft),
+            anchor: ConnectorAnchor::RawFrame,
+            frame,
+            radius: None,
+        };
+        let (a, b) = (ca.id, cb.id);
+        assert!(doc.add_connector(ca) && doc.add_connector(cb));
+        let mate_id = DocMateId::new();
+        assert!(doc.add_mate(DocMate {
+            id: mate_id,
+            kind: DocMateKind::Revolute { limits: None },
+            a,
+            b,
+            couples: vec![],
+            at: vec![],
+        }));
+
+        let mates = mate_listing(&doc);
+        assert_eq!(mates.len(), 1);
+        assert_eq!(mates[0].id, mate_id.0);
+        assert_eq!((mates[0].a_instance, mates[0].b_instance), (flange, shaft));
+        assert!(matches!(mates[0].kind, DocMateKind::Revolute { .. }));
+        // And it travels as JSON (the connector's 128-bit id included).
+        assert!(serde_json::to_value(&mates).is_ok());
     }
 }
