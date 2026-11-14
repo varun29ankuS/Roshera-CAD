@@ -173,7 +173,61 @@ pub struct CSketchSummary {
     pub lines: Vec<LineSummary>,
     pub circles: Vec<CircleSummary>,
     pub splines: Vec<SplineSummary>,
+    /// Arcs (centre, radius, start/end angle in radians, sense).
+    pub arcs: Vec<ArcSummary>,
+    /// Rectangles (centre, size, rotation in radians).
+    pub rectangles: Vec<RectangleSummary>,
+    /// Ellipses (centre, semi-axes, rotation in radians).
+    pub ellipses: Vec<EllipseSummary>,
+    /// Polylines (vertices, open or closed).
+    pub polylines: Vec<PolylineSummary>,
     pub constraint_count: usize,
+}
+
+/// Wire form of a `ParametricArc2d`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArcSummary {
+    pub id: Uuid,
+    pub cx: f64,
+    pub cy: f64,
+    pub radius: f64,
+    pub start_angle: f64,
+    pub end_angle: f64,
+    pub ccw: bool,
+    pub is_construction: bool,
+}
+
+/// Wire form of a `ParametricRectangle2d`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RectangleSummary {
+    pub id: Uuid,
+    pub cx: f64,
+    pub cy: f64,
+    pub width: f64,
+    pub height: f64,
+    pub rotation: f64,
+    pub is_construction: bool,
+}
+
+/// Wire form of a `ParametricEllipse2d`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EllipseSummary {
+    pub id: Uuid,
+    pub cx: f64,
+    pub cy: f64,
+    pub semi_major: f64,
+    pub semi_minor: f64,
+    pub rotation: f64,
+    pub is_construction: bool,
+}
+
+/// Wire form of a `ParametricPolyline2d`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolylineSummary {
+    pub id: Uuid,
+    pub vertices: Vec<[f64; 2]>,
+    pub closed: bool,
+    pub is_construction: bool,
 }
 
 /// Request body for `POST /api/csketch/{id}/point`. `fixed` defaults
@@ -533,10 +587,8 @@ fn require_sketch(state: &AppState, id: Uuid) -> Result<Arc<Sketch>, ApiError> {
 
 // ── Snapshot helpers ────────────────────────────────────────────────
 
-/// Build a `CSketchSummary` from a sketch handle. Iterates the
-/// internal DashMaps under `points()` / `lines()` / `circles()`; arcs,
-/// rectangles, ellipses, splines, and polylines are not yet surfaced
-/// because no entity-add endpoint can create them in this slice.
+/// Build a `CSketchSummary` from a sketch handle: every entity kind an
+/// add route can create (the app draws exactly what the sketch holds).
 fn summarise(sketch: &Sketch) -> CSketchSummary {
     let mut points: Vec<PointSummary> = sketch
         .points()
@@ -603,12 +655,86 @@ fn summarise(sketch: &Sketch) -> CSketchSummary {
         .collect();
     splines.sort_by_key(|s| s.id);
 
+    let mut arcs: Vec<ArcSummary> = sketch
+        .arcs()
+        .iter()
+        .map(|e| {
+            let a = &e.value().arc;
+            ArcSummary {
+                id: e.key().0,
+                cx: a.center.x,
+                cy: a.center.y,
+                radius: a.radius,
+                start_angle: a.start_angle,
+                end_angle: a.end_angle,
+                ccw: a.ccw,
+                is_construction: e.value().is_construction,
+            }
+        })
+        .collect();
+    arcs.sort_by_key(|a| a.id);
+
+    let mut rectangles: Vec<RectangleSummary> = sketch
+        .rectangles()
+        .iter()
+        .map(|e| {
+            let r = &e.value().rectangle;
+            RectangleSummary {
+                id: e.key().0,
+                cx: r.center.x,
+                cy: r.center.y,
+                width: r.width,
+                height: r.height,
+                rotation: r.rotation,
+                is_construction: e.value().is_construction,
+            }
+        })
+        .collect();
+    rectangles.sort_by_key(|r| r.id);
+
+    let mut ellipses: Vec<EllipseSummary> = sketch
+        .ellipses()
+        .iter()
+        .map(|e| {
+            let el = &e.value().ellipse;
+            EllipseSummary {
+                id: e.key().0,
+                cx: el.center.x,
+                cy: el.center.y,
+                semi_major: el.semi_major,
+                semi_minor: el.semi_minor,
+                rotation: el.rotation,
+                is_construction: e.value().is_construction,
+            }
+        })
+        .collect();
+    ellipses.sort_by_key(|e| e.id);
+
+    let mut polylines: Vec<PolylineSummary> = sketch
+        .polylines()
+        .iter()
+        .map(|e| {
+            let pl = &e.value().polyline;
+            PolylineSummary {
+                id: e.key().0,
+                vertices: pl.vertices.iter().map(|p| [p.x, p.y]).collect(),
+                closed: pl.is_closed,
+                is_construction: e.value().is_construction,
+            }
+        })
+        .collect();
+    polylines.sort_by_key(|p| p.id);
+
     CSketchSummary {
         id: sketch.id.0,
         points,
         lines,
         circles,
         splines,
+        arcs,
+        rectangles,
+        ellipses,
+        polylines,
         constraint_count: sketch.all_constraints().len(),
     }
 }
@@ -2341,6 +2467,10 @@ pub async fn extrude_csketch(
             "regions": regions_json,
             "distance": req.distance,
             "direction": [direction.x, direction.y, direction.z],
+            // The sketch itself (entities + constraints), so the feature
+            // can be reopened and edited -- and survives a restart.
+            // Replay builds from `regions`; this is the source they came from.
+            "source": sketch.to_source(),
         }))
         .with_output_solids([result_solid_id as u64])
         .with_solid_certificate(solid_certificate);
@@ -2865,6 +2995,8 @@ pub async fn revolve_csketch(
             "axis_direction": req.axis_direction,
             "angle": req.angle,
             "segments": req.segments,
+            // The sketch itself, as for an extrude (reopen / edit).
+            "source": sketch.to_source(),
         }))
         .with_output_solids([result_solid_id as u64]);
     if let Err(e) = state.timeline_recorder.record(record) {

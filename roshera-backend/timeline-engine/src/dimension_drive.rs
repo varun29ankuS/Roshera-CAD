@@ -245,7 +245,9 @@ fn collect_numeric(value: &Value, out: &mut Vec<(String, f64)>) {
     match value {
         Value::Object(map) => {
             for (k, v) in map {
-                if k == "inputs" || k == "outputs" {
+                // The saved sketch (`source`) is where the outline came
+                // from, not a size of the feature (see mould::SKETCH_SOURCE_KEY).
+                if k == "inputs" || k == "outputs" || k == crate::mould::SKETCH_SOURCE_KEY {
                     continue;
                 }
                 match v.as_f64() {

@@ -283,6 +283,318 @@ impl Sketch {
         }
     }
 
+    // Sketch source (reopen / edit, Varun 2026-11-14)
+
+    /// The whole sketch as a history event carries it: every entity with
+    /// its id, flags and shared-point links, in insertion order, and every
+    /// constraint, in its order. See [`super::sketch_source`].
+    pub fn to_source(&self) -> super::sketch_source::SketchSource {
+        use super::sketch_source::{SourceEntity, SKETCH_SOURCE_VERSION};
+        let mut entities: Vec<(u64, SourceEntity)> = Vec::new();
+        for e in self.points.iter() {
+            let p = e.value();
+            entities.push((
+                self.entity_sequence(&EntityRef::Point(p.id)),
+                SourceEntity::Point {
+                    id: p.id,
+                    position: p.position,
+                    fixed: p.is_fixed,
+                    construction: p.is_construction,
+                },
+            ));
+        }
+        for e in self.lines.iter() {
+            let l = e.value();
+            entities.push((
+                self.entity_sequence(&EntityRef::Line(l.id)),
+                SourceEntity::Line {
+                    id: l.id,
+                    geometry: l.geometry,
+                    endpoints: l.endpoints,
+                    construction: l.is_construction,
+                },
+            ));
+        }
+        for e in self.arcs.iter() {
+            let a = e.value();
+            entities.push((
+                self.entity_sequence(&EntityRef::Arc(a.id)),
+                SourceEntity::Arc {
+                    id: a.id,
+                    arc: a.arc,
+                    endpoints: a.endpoints,
+                    center_point: a.center_point,
+                    construction: a.is_construction,
+                },
+            ));
+        }
+        for e in self.circles.iter() {
+            let c = e.value();
+            entities.push((
+                self.entity_sequence(&EntityRef::Circle(c.id)),
+                SourceEntity::Circle {
+                    id: c.id,
+                    circle: c.circle,
+                    center_point: c.center_point,
+                    construction: c.is_construction,
+                },
+            ));
+        }
+        for e in self.rectangles.iter() {
+            let r = e.value();
+            entities.push((
+                self.entity_sequence(&EntityRef::Rectangle(r.id)),
+                SourceEntity::Rectangle {
+                    id: r.id,
+                    rectangle: r.rectangle,
+                    construction: r.is_construction,
+                },
+            ));
+        }
+        for e in self.ellipses.iter() {
+            let el = e.value();
+            entities.push((
+                self.entity_sequence(&EntityRef::Ellipse(el.id)),
+                SourceEntity::Ellipse {
+                    id: el.id,
+                    ellipse: el.ellipse,
+                    construction: el.is_construction,
+                },
+            ));
+        }
+        for e in self.splines.iter() {
+            let sp = e.value();
+            entities.push((
+                self.entity_sequence(&EntityRef::Spline(sp.id)),
+                SourceEntity::Spline {
+                    id: sp.id,
+                    spline: sp.spline.clone(),
+                    control_point_ids: sp.control_point_ids.clone(),
+                    construction: sp.is_construction,
+                },
+            ));
+        }
+        for e in self.polylines.iter() {
+            let pl = e.value();
+            entities.push((
+                self.entity_sequence(&EntityRef::Polyline(pl.id)),
+                SourceEntity::Polyline {
+                    id: pl.id,
+                    polyline: pl.polyline.clone(),
+                    construction: pl.is_construction,
+                },
+            ));
+        }
+        entities.sort_by_key(|(seq, _)| *seq);
+        let mut constraints = self.all_constraints();
+        constraints.sort_by_key(|c| c.sequence);
+        // The insertion sequence is the sketch's own bookkeeping: the
+        // restored sketch stamps it afresh, in this same order.
+        for c in &mut constraints {
+            c.sequence = 0;
+        }
+        super::sketch_source::SketchSource {
+            version: SKETCH_SOURCE_VERSION,
+            name: self.name.clone(),
+            entities: entities.into_iter().map(|(_, e)| e).collect(),
+            constraints,
+        }
+    }
+
+    /// Read a [`super::sketch_source::SketchSource`] back as the same
+    /// sketch: same ids, links and constraints, in the same order.
+    /// Refused when a constraint or link names an entity the source does
+    /// not hold, or the format version is unknown -- never restored with
+    /// a constraint silently dropped.
+    pub fn from_source(
+        source: &super::sketch_source::SketchSource,
+        anchor: SketchAnchor,
+    ) -> Sketch2dResult<Self> {
+        use super::sketch_source::{SourceEntity, SKETCH_SOURCE_VERSION};
+        if source.version != SKETCH_SOURCE_VERSION {
+            return Err(Sketch2dError::InvalidParameter {
+                parameter: "sketch source version".to_string(),
+                value: source.version.to_string(),
+                constraint: format!("equal to {SKETCH_SOURCE_VERSION}"),
+            });
+        }
+        let missing = |what: &str, id: String| Sketch2dError::EntityNotFound {
+            entity_type: what.to_string(),
+            id,
+        };
+        let sketch = Sketch::new(source.name.clone(), anchor);
+        for entity in &source.entities {
+            match entity {
+                SourceEntity::Point {
+                    id,
+                    position,
+                    fixed,
+                    construction,
+                } => {
+                    let mut p = ParametricPoint2d::new(position.x, position.y);
+                    p.id = *id;
+                    p.is_fixed = *fixed;
+                    p.is_construction = *construction;
+                    sketch.update_spatial_index_point(*id, position);
+                    sketch.points.insert(*id, p);
+                    sketch.stamp_entity_sequence(EntityRef::Point(*id));
+                }
+                SourceEntity::Line {
+                    id,
+                    geometry,
+                    endpoints,
+                    construction,
+                } => {
+                    for p in endpoints.iter().flat_map(|(a, b)| [*a, *b]) {
+                        if !sketch.points.contains_key(&p) {
+                            return Err(missing("Point", p.to_string()));
+                        }
+                    }
+                    let mut l = match geometry {
+                        super::line2d::LineGeometry::Infinite(g) => {
+                            ParametricLine2d::new_infinite(*g)
+                        }
+                        super::line2d::LineGeometry::Ray(g) => ParametricLine2d::new_ray(*g),
+                        super::line2d::LineGeometry::Segment(g) => {
+                            ParametricLine2d::new_segment(*g)
+                        }
+                    };
+                    l.id = *id;
+                    l.endpoints = *endpoints;
+                    l.is_construction = *construction;
+                    let (min, max) = l.bounding_box();
+                    sketch.update_spatial_index(EntityRef::Line(*id), min, max);
+                    sketch.lines.insert(*id, l);
+                    sketch.stamp_entity_sequence(EntityRef::Line(*id));
+                }
+                SourceEntity::Arc {
+                    id,
+                    arc,
+                    endpoints,
+                    center_point,
+                    construction,
+                } => {
+                    let linked = endpoints
+                        .iter()
+                        .flat_map(|(a, b)| [*a, *b])
+                        .chain(center_point.iter().copied());
+                    for p in linked {
+                        if !sketch.points.contains_key(&p) {
+                            return Err(missing("Point", p.to_string()));
+                        }
+                    }
+                    let mut a = ParametricArc2d::new(*arc);
+                    a.id = *id;
+                    a.endpoints = *endpoints;
+                    a.center_point = *center_point;
+                    a.is_construction = *construction;
+                    let (min, max) = a.bounding_box();
+                    sketch.update_spatial_index(EntityRef::Arc(*id), min, max);
+                    sketch.arcs.insert(*id, a);
+                    sketch.stamp_entity_sequence(EntityRef::Arc(*id));
+                }
+                SourceEntity::Circle {
+                    id,
+                    circle,
+                    center_point,
+                    construction,
+                } => {
+                    if let Some(p) = center_point {
+                        if !sketch.points.contains_key(p) {
+                            return Err(missing("Point", p.to_string()));
+                        }
+                    }
+                    let mut c = ParametricCircle2d::new(*circle);
+                    c.id = *id;
+                    c.center_point = *center_point;
+                    c.is_construction = *construction;
+                    let (min, max) = c.bounding_box();
+                    sketch.update_spatial_index(EntityRef::Circle(*id), min, max);
+                    sketch.circles.insert(*id, c);
+                    sketch.stamp_entity_sequence(EntityRef::Circle(*id));
+                }
+                SourceEntity::Rectangle {
+                    id,
+                    rectangle,
+                    construction,
+                } => {
+                    let mut r = ParametricRectangle2d::new(*rectangle);
+                    r.id = *id;
+                    r.is_construction = *construction;
+                    let (min, max) = r.bounding_box();
+                    sketch.update_spatial_index(EntityRef::Rectangle(*id), min, max);
+                    sketch.rectangles.insert(*id, r);
+                    sketch.stamp_entity_sequence(EntityRef::Rectangle(*id));
+                }
+                SourceEntity::Ellipse {
+                    id,
+                    ellipse,
+                    construction,
+                } => {
+                    let mut el = ParametricEllipse2d::new(*ellipse);
+                    el.id = *id;
+                    el.is_construction = *construction;
+                    let (min, max) = el.bounding_box();
+                    sketch.update_spatial_index(EntityRef::Ellipse(*id), min, max);
+                    sketch.ellipses.insert(*id, el);
+                    sketch.stamp_entity_sequence(EntityRef::Ellipse(*id));
+                }
+                SourceEntity::Spline {
+                    id,
+                    spline,
+                    control_point_ids,
+                    construction,
+                } => {
+                    for p in control_point_ids.iter().flatten() {
+                        if !sketch.points.contains_key(p) {
+                            return Err(missing("Point", p.to_string()));
+                        }
+                    }
+                    let mut sp = ParametricSpline2d::new(spline.clone());
+                    sp.id = *id;
+                    sp.control_point_ids = control_point_ids.clone();
+                    sp.is_construction = *construction;
+                    let (min, max) = sp.bounding_box();
+                    sketch.update_spatial_index(EntityRef::Spline(*id), min, max);
+                    sketch.splines.insert(*id, sp);
+                    sketch.stamp_entity_sequence(EntityRef::Spline(*id));
+                }
+                SourceEntity::Polyline {
+                    id,
+                    polyline,
+                    construction,
+                } => {
+                    let mut pl = ParametricPolyline2d::new(polyline.clone());
+                    pl.id = *id;
+                    pl.is_construction = *construction;
+                    let (min, max) = pl.bounding_box();
+                    sketch.update_spatial_index(EntityRef::Polyline(*id), min, max);
+                    sketch.polylines.insert(*id, pl);
+                    sketch.stamp_entity_sequence(EntityRef::Polyline(*id));
+                }
+            }
+        }
+        for c in &source.constraints {
+            for e in &c.entities {
+                let present = match e {
+                    EntityRef::Point(id) => sketch.points.contains_key(id),
+                    EntityRef::Line(id) => sketch.lines.contains_key(id),
+                    EntityRef::Arc(id) => sketch.arcs.contains_key(id),
+                    EntityRef::Circle(id) => sketch.circles.contains_key(id),
+                    EntityRef::Rectangle(id) => sketch.rectangles.contains_key(id),
+                    EntityRef::Ellipse(id) => sketch.ellipses.contains_key(id),
+                    EntityRef::Spline(id) => sketch.splines.contains_key(id),
+                    EntityRef::Polyline(id) => sketch.polylines.contains_key(id),
+                };
+                if !present {
+                    return Err(missing("constrained entity", e.to_string()));
+                }
+            }
+            sketch.add_constraint(c.clone());
+        }
+        Ok(sketch)
+    }
+
     // Entity insertion order (Task 48)
 
     /// Stamp an entity with the next insertion sequence.

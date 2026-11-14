@@ -409,6 +409,11 @@ impl OverrideSet {
 /// Whether `parameter` names a numeric key anywhere in a recorded op's params
 /// tree. Used by the surface to validate a mould target *before* appending —
 /// an unresolvable parameter is a typed refusal, not a silent no-op.
+/// The key a sketch feature's step saves its sketch under (entities +
+/// constraints, so it can be reopened). The rebuild uses the outline, never
+/// this, so no number inside it is a size an edit can find or write.
+pub const SKETCH_SOURCE_KEY: &str = "source";
+
 pub fn params_have_numeric(params: &Value, parameter: &str) -> bool {
     let inner = envelope_params(params);
     find_numeric_recursive(inner, parameter)
@@ -420,6 +425,9 @@ fn find_numeric_recursive(value: &Value, key: &str) -> bool {
     match value {
         Value::Object(map) => {
             for (k, v) in map {
+                if k == SKETCH_SOURCE_KEY {
+                    continue;
+                }
                 if k == key && v.is_number() {
                     return true;
                 }
@@ -535,6 +543,9 @@ fn set_numeric_recursive(value: &mut Value, key: &str, new_value: f64) -> bool {
     match value {
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
+                if k == SKETCH_SOURCE_KEY {
+                    continue;
+                }
                 if k == key && v.is_number() {
                     *v = json!(new_value);
                     changed = true;

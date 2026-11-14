@@ -56,6 +56,8 @@ pub mod sketch_solver;
 // Sketch container and management
 pub mod sketch;
 pub mod sketch_plane;
+/// A sketch's source as a history event carries it (reopen / edit).
+pub mod sketch_source;
 
 // Snap engine: cursor → entity feature proximity (D-1-a).
 pub mod snap;

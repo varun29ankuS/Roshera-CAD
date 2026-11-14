@@ -12460,3 +12460,124 @@ async fn deleting_the_base_under_a_hole_is_refused() {
         "nothing appended"
     );
 }
+
+/// The sketch workbench draws what the sketch HOLDS (Varun 2026-11-14:
+/// "the sketching is severely underworked"). Every entity an add route
+/// can create must come back in the sketch's snapshot -- an arc the app
+/// cannot see is a tool that draws nothing.
+#[tokio::test]
+async fn every_entity_a_sketch_route_adds_is_in_the_sketch_snapshot() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(&state, json_post("/api/csketch", json!({}))).await;
+    assert!(status.is_success(), "create sketch: {status} {body}");
+    let sketch = body["id"].as_str().expect("sketch id").to_string();
+    for (route, req) in [
+        (
+            "arc",
+            json!({"cx": 0.0, "cy": 0.0, "radius": 5.0, "start_angle": 0.0, "end_angle": 1.5}),
+        ),
+        (
+            "rectangle",
+            json!({"x1": 10.0, "y1": 0.0, "x2": 20.0, "y2": 8.0}),
+        ),
+        (
+            "ellipse",
+            json!({"cx": 40.0, "cy": 0.0, "semi_major": 6.0, "semi_minor": 3.0, "rotation": 0.0}),
+        ),
+        (
+            "polyline",
+            json!({"points": [[0.0, 30.0], [10.0, 30.0], [10.0, 40.0]], "closed": false}),
+        ),
+    ] {
+        let (s, b) = dispatch(
+            &state,
+            json_post(&format!("/api/csketch/{sketch}/{route}"), req),
+        )
+        .await;
+        assert!(s.is_success(), "add {route}: {s} {b}");
+    }
+    let (_, snap) = dispatch(&state, json_get(&format!("/api/csketch/{sketch}"))).await;
+    for key in ["arcs", "rectangles", "ellipses", "polylines"] {
+        assert_eq!(
+            snap[key].as_array().map(Vec::len),
+            Some(1),
+            "the snapshot carries the {key}: {snap}"
+        );
+    }
+    assert_eq!(snap["arcs"][0]["radius"], 5.0, "{snap}");
+    assert_eq!(snap["rectangles"][0]["width"], 10.0, "{snap}");
+    assert_eq!(
+        snap["polylines"][0]["vertices"].as_array().map(Vec::len),
+        Some(3),
+        "{snap}"
+    );
+}
+
+/// Find `key` anywhere inside a JSON value (depth-first).
+fn find_key<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    match v {
+        serde_json::Value::Object(m) => m
+            .get(key)
+            .or_else(|| m.values().find_map(|x| find_key(x, key))),
+        serde_json::Value::Array(a) => a.iter().find_map(|x| find_key(x, key)),
+        _ => None,
+    }
+}
+
+/// A sketch is saved WITH its feature (Varun 2026-11-14: "no way to edit
+/// the sketch"): the extrude's history step carries the sketch's source,
+/// which reads back as the sketch that was drawn -- so it can be reopened,
+/// and survives a restart.
+#[tokio::test]
+async fn a_sketch_extrude_step_carries_the_sketch_it_was_made_from() {
+    use geometry_engine::sketch2d::sketch::{Sketch, SketchAnchor};
+    use geometry_engine::sketch2d::sketch_source::SketchSource;
+    let state = make_test_state().await;
+    let (_, body) = dispatch(&state, json_post("/api/csketch", json!({}))).await;
+    let sketch = body["id"].as_str().expect("sketch id").to_string();
+    let (s, b) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/csketch/{sketch}/rectangle"),
+            json!({"x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 6.0}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "{b}");
+    let (s, b) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/csketch/{sketch}/circle"),
+            json!({"cx": 5.0, "cy": 3.0, "radius": 1.0}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "{b}");
+    let (s, b) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/csketch/{sketch}/extrude"),
+            json!({"distance": 4.0}),
+        ),
+    )
+    .await;
+    assert!(s.is_success(), "extrude: {b}");
+
+    let _ = state.timeline_recorder.settle().await;
+    let events = state
+        .timeline
+        .read()
+        .await
+        .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+        .expect("main events");
+    let step = events
+        .iter()
+        .find(|e| matches!(&e.operation, timeline_engine::Operation::Generic { command_type, .. } if command_type == "sketch_extrude"))
+        .expect("the extrude is recorded");
+    let params = serde_json::to_value(&step.operation).expect("operation json");
+    let source = find_key(&params, "source").expect("the step carries the sketch source");
+    let source: SketchSource = serde_json::from_value(source.clone()).expect("a sketch source");
+    let reopened = Sketch::from_source(&source, SketchAnchor::xy()).expect("it reads back");
+    assert_eq!(reopened.rectangles().len(), 1);
+    assert_eq!(reopened.circles().len(), 1);
+}
