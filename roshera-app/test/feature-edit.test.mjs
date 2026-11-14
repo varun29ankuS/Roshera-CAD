@@ -73,3 +73,10 @@ test("typing kept for one feature's size never shows on another feature's size o
   assert.notEqual(draftKey(4, 'radius'), draftKey(9, 'radius'))
   assert.equal(draftKey(4, 'radius'), draftKey(4, 'radius'))
 })
+
+test('deleting a feature sends all of its steps', async () => {
+  const { deleteBody } = await import('../src/lib/feature-edit.ts')
+  assert.deepEqual(deleteBody({ events: [8, 9, 10], instances: [] }), { target_sequences: [8, 9, 10] })
+  // A pattern: every instance's steps.
+  assert.deepEqual(deleteBody({ events: [8, 9, 11, 12], instances: [{ events: [8, 9] }, { events: [11, 12] }] }), { target_sequences: [8, 9, 11, 12] })
+})

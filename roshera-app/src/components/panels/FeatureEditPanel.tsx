@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
-import { Check, X } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { HISTORY_CHANGED_EVENT } from '@/lib/history'
+import { Check, Trash2, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Box, ToolIcons } from '@/components/ui/icons'
 import { useChapters } from '@/hooks/use-chapters'
@@ -8,6 +9,8 @@ import { useFeatureLocationStore } from '@/stores/feature-location-store'
 import { chapterIconKey, chapterTitle, type Chapter } from '@/lib/chapters-api'
 import {
   applyEdit,
+  deleteBody,
+  deleteFeature,
   draftKey,
   featureFields,
   fetchEditableParameters,
@@ -65,6 +68,41 @@ export function FeatureEditPanel({
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [outcome, setOutcome] = useState<Outcome>(null)
   const [reload, setReload] = useState(0)
+  // Deleting the feature: busy, or the kernel's refusal (on this card).
+  const [deleting, setDeleting] = useState<{ anchor: number; refused: string | null; busy: boolean } | null>(null)
+
+  // Delete the selected feature (the card's 🗑, or the Delete key). The kernel
+  // trials it and refuses -- in its own words -- when a later feature is
+  // built on it; Undo brings a deleted feature back.
+  const remove = useCallback(async () => {
+    if (!chapter) return
+    setDeleting({ anchor: chapter.anchor, refused: null, busy: true })
+    const result = await deleteFeature(deleteBody(chapter))
+    if (result.ok) {
+      setDeleting(null)
+      select(null)
+      window.dispatchEvent(new CustomEvent(HISTORY_CHANGED_EVENT, { detail: { action: 'delete' } }))
+    } else {
+      setDeleting({ anchor: chapter.anchor, refused: result.reason, busy: false })
+    }
+  }, [chapter, select])
+
+  // The Delete key deletes the selected feature -- not while a size is being
+  // typed (the key then belongs to the field). One card owns the key: the
+  // callout when the feature is on the part, else the column card.
+  const ownsKey = chapter !== null && (placement === 'callout') === located.has(chapter.anchor)
+  useEffect(() => {
+    if (!ownsKey) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Delete') return
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      e.preventDefault()
+      void remove()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [ownsKey, remove])
 
   // The sizes of the history as it is now -- refetched when the selection
   // or the history changes (an edit appends a step, so `chapters` changes).
@@ -129,10 +167,25 @@ export function FeatureEditPanel({
         <span className="min-w-0 flex-1 truncate text-[12.5px] font-semibold">
           {title.charAt(0).toUpperCase() + title.slice(1)}
         </span>
+        <button
+          type="button"
+          aria-label={`Delete ${title}`}
+          title="Delete this feature (Delete key) -- Undo brings it back"
+          disabled={deleting?.busy === true}
+          onClick={() => void remove()}
+          className="cad-focus rounded p-0.5 text-muted-foreground hover:text-destructive disabled:opacity-40"
+        >
+          <Trash2 size={13} />
+        </button>
         <button type="button" aria-label="Close" onClick={() => select(null)} className="cad-focus rounded p-0.5 text-muted-foreground hover:text-foreground">
           <X size={13} />
         </button>
       </div>
+      {deleting && deleting.anchor === chapter.anchor && (deleting.busy || deleting.refused) && (
+        <p className={cn('px-2.5 pb-1.5 text-[11px]', deleting.refused ? 'text-red-700 dark:text-red-300' : 'text-muted-foreground')}>
+          {deleting.busy ? 'Deleting…' : `Not deleted: ${deleting.refused}`}
+        </p>
+      )}
       {loadError ? (
         <p className="px-2.5 pb-2.5 text-[11px] text-red-700 dark:text-red-300">
           Could not read this feature's sizes ({loadError}). Is the server running?

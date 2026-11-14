@@ -83,3 +83,10 @@ test('assembly steps are steps of the document, not features of the part', async
   assert.deepEqual(part.map((c) => c.kind), ['cylinder'])
   assert.equal(documents.length, 4)
 })
+
+test('a deleted feature reads as "Delete" in the film strip; an edit as "Edit"', async () => {
+  const { foldEdits } = await import('../src/lib/chapters-api.ts')
+  const ch = (kind, anchor) => ({ kind, name: null, events: [anchor], anchor, sound: true, refusals: [], author: 'user', author_detail: { kind: 'user' }, intent: null, instances: [] })
+  const folded = foldEdits([ch('cylinder', 0), ch('param.suppress', 5), ch('param.mould', 6)])
+  assert.deepEqual(folded.map((c) => c.name), [null, 'Delete', 'Edit'])
+})

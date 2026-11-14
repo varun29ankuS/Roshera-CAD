@@ -155,6 +155,31 @@ export function draftKey(anchor: number, key: string): string {
   return `${anchor}:${key}`
 }
 
+/** The delete request for a feature: all of its steps (a pattern's are its
+ *  instances' steps too, all listed in its own `events`). */
+export function deleteBody(feature: FeatureShape): { target_sequences: number[] } {
+  const all = new Set<number>(feature.events)
+  for (const i of feature.instances) for (const e of i.events) all.add(e)
+  return { target_sequences: [...all].sort((a, b) => a - b) }
+}
+
+/** Delete a feature. The kernel trials it and refuses, in its own words,
+ *  when a later feature is built on it. */
+export async function deleteFeature(body: { target_sequences: number[] }): Promise<{ ok: true } | { ok: false; reason: string }> {
+  try {
+    const r = await fetch(`${API_HOST}/api/timeline/suppress`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (r.ok) return { ok: true }
+    const err = (await r.json().catch(() => ({}))) as { reason?: string; error?: string; message?: string }
+    return { ok: false, reason: err.reason ?? err.message ?? err.error ?? `HTTP ${r.status}` }
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : String(e) }
+  }
+}
+
 /** A typed size, or null when it is not a finite number. */
 export function parseSize(text: string): number | null {
   const m = /^\s*(-?\d+(?:\.\d+)?|-?\.\d+)\s*(mm|°)?\s*$/i.exec(text)

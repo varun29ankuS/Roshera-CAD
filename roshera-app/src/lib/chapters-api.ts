@@ -168,8 +168,11 @@ export function foldEdits(cs: Chapter[]): Chapter[] {
       out.push(c)
       continue
     }
+    // A delete and a size edit are different moments: grouped apart, and
+    // named for what they did.
+    const name = c.kind === 'param.suppress' ? 'Delete' : 'Edit'
     const prev = out[out.length - 1]
-    if (prev && isEdit(prev)) {
+    if (prev && isEdit(prev) && prev.name === name) {
       out[out.length - 1] = {
         ...prev,
         events: [...prev.events, ...c.events],
@@ -178,7 +181,7 @@ export function foldEdits(cs: Chapter[]): Chapter[] {
         refusals: [...prev.refusals, ...c.refusals],
       }
     } else {
-      out.push({ ...c, kind: 'edit', name: 'Edit' })
+      out.push({ ...c, kind: 'edit', name })
     }
   }
   return out
