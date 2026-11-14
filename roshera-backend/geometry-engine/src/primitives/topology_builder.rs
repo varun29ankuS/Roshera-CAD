@@ -3184,6 +3184,16 @@ impl BRepModel {
     ) -> crate::primitives::provenance::ValidityCertificate {
         use crate::primitives::provenance::ValidityCertificate;
         let brep_valid = brep_errors.is_empty();
+        let prof = cert_profile_enabled();
+        let lap = |label: &str, t: std::time::Instant| {
+            if prof {
+                eprintln!(
+                    "[cert-profile] solid {solid_id} {label}: {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        };
+        let t = std::time::Instant::now();
         // `oriented` / `inconsistent_directed_edges` close a LIVE hole: a mesh can
         // be watertight (no boundary edges) and manifold (no 3+-fan edges) yet
         // still have two triangles winding the SAME way across a shared edge — a
@@ -3205,6 +3215,7 @@ impl BRepModel {
                 Some((r, w)) => (Some(r), w),
                 None => (None, Vec::new()),
             };
+        lap("manifold+orientation mesh", t);
         let shells_measured = report.is_some();
         let shells_outward = shells_measured && misoriented_shells.is_empty();
         let (watertight, manifold, oriented, euler, be, rf, nm, ide) = match report {
@@ -3229,8 +3240,11 @@ impl BRepModel {
         };
         // Self-intersection at a COARSE chord (gross self-overlap is visible at
         // low density; keeps the O(n²) pair scan cheap for this on-demand check).
+        let t = std::time::Instant::now();
         let self_intersection_free =
             !crate::harness::self_intersection::mesh_self_intersects(self, solid_id, 0.5);
+        lap("self-intersection", t);
+        let t = std::time::Instant::now();
         // FIX 2 — cross-entity consistency: is the solid's linked construction
         // geometry (source sketch) still co-located with the solid? Tri-state,
         // and NotApplicable when no sketch is linked (does not block soundness).
@@ -3240,13 +3254,33 @@ impl BRepModel {
         // renders wrong. Same chord as the manifold check above. A solid that
         // tessellates to nothing is already unsound via `watertight`, so an empty
         // mesh maps to the not-applicable `empty()` verdict.
-        let tessellation = crate::harness::watertight::tessellation_quality(self, solid_id)
+        lap("construction", t);
+        let t = std::time::Instant::now();
+        // One display-resolution mesh feeds both quality checks below: meshing
+        // an imported part can take tens of seconds, and each check used to
+        // mesh it again on its own.
+        let display_mesh = self.solids.get(solid_id).map(|s| {
+            crate::tessellation::tessellate_solid(
+                &s,
+                self,
+                &crate::tessellation::TessellationParams::default(),
+            )
+        });
+        lap("display mesh", t);
+        let t = std::time::Instant::now();
+        let tessellation = display_mesh
+            .as_ref()
+            .and_then(|m| crate::harness::watertight::tessellation_quality_of_mesh(self, m))
             .unwrap_or_else(crate::primitives::provenance::TessellationQuality::empty);
         // Mesh-quality: catches a render mesh that is watertight + correctly
         // oriented yet violates a CAD tessellation rule — a facet bridging across
         // a bore (the "wing"), a far-off-surface normal, etc.
-        let mesh_quality = crate::harness::watertight::mesh_quality(self, solid_id)
+        let mesh_quality = display_mesh
+            .as_ref()
+            .and_then(|m| crate::harness::watertight::mesh_quality_of_mesh(self, m))
             .unwrap_or_else(crate::primitives::provenance::MeshQuality::empty);
+        drop(display_mesh);
+        lap("quality checks", t);
         let mut errors: Vec<String> = brep_errors.iter().map(|e| format!("{e:?}")).collect();
         // Dual-eye render-free cross-check (Truth↔Semantic): recognized features
         // must reference live faces. Gates is_sound via EyesConsistency.
@@ -3277,7 +3311,9 @@ impl BRepModel {
                 }
             }
         }
+        let t = std::time::Instant::now();
         let features = crate::primitives::feature_recognition::recognize_features(solid_id, self);
+        lap("feature recognition", t);
         let eyes_consistent = match crate::perception::reconcile::check_eyes_consistent(
             &live_face_ids,
             &face_surfaces,
@@ -3505,11 +3541,28 @@ impl BRepModel {
                     .unwrap_or(false)
             })
             .collect();
+        let prof = cert_profile_enabled();
+        let t = std::time::Instant::now();
         let debris = crate::primitives::validation::count_orphan_faces(self);
+        if prof {
+            eprintln!("[cert-profile] orphan scan: {:?}", t.elapsed());
+        }
         if !cold.is_empty() {
+            let t = std::time::Instant::now();
             let labels = self.labels_consistency();
+            if prof {
+                eprintln!("[cert-profile] labels: {:?}", t.elapsed());
+            }
+            let t = std::time::Instant::now();
             let errors =
                 scoped_errors_by_solid(self, &cold, self.tolerance, ValidationLevel::Standard);
+            if prof {
+                eprintln!(
+                    "[cert-profile] B-Rep validation ({} solids): {:?}",
+                    cold.len(),
+                    t.elapsed()
+                );
+            }
             // The per-solid half (its own meshes and checks) is independent
             // per solid, so it runs in parallel on a small pool: bounded so a
             // batch of large parts cannot hold more than a few meshes at once.
@@ -7747,6 +7800,12 @@ impl<'a> TopologyBuilder<'a> {
                 + (GEOMETRY_PARAMETERS.len() * std::mem::size_of::<DashMap<String, f64>>()),
         }
     }
+}
+
+/// `ROSHERA_CERT_PROFILE=1` prints how long each certificate step took, per
+/// solid, to stderr. Off by default.
+fn cert_profile_enabled() -> bool {
+    std::env::var_os("ROSHERA_CERT_PROFILE").is_some_and(|v| !v.is_empty())
 }
 
 #[cfg(test)]

@@ -502,11 +502,21 @@ pub fn tessellation_quality(
     model: &BRepModel,
     solid: SolidId,
 ) -> Option<crate::primitives::provenance::TessellationQuality> {
+    let solid_ref = model.solids.get(solid)?;
+    let mesh = tessellate_solid(solid_ref, model, &TessellationParams::default());
+    tessellation_quality_of_mesh(model, &mesh)
+}
+
+/// [`tessellation_quality`] of a mesh the caller already has: `mesh` must be
+/// the solid's tessellation at [`TessellationParams::default`]. Lets the
+/// certificate mesh a solid once for this check and [`mesh_quality_of_mesh`]
+/// (meshing an imported part can take tens of seconds).
+pub fn tessellation_quality_of_mesh(
+    model: &BRepModel,
+    mesh: &crate::tessellation::TriangleMesh,
+) -> Option<crate::primitives::provenance::TessellationQuality> {
     use crate::primitives::provenance::{TessFaceDefect, TessellationQuality};
     use std::cmp::Ordering::Equal;
-    let solid_ref = model.solids.get(solid)?;
-    let params = TessellationParams::default();
-    let mesh = tessellate_solid(solid_ref, model, &params);
     if mesh.triangles.is_empty() {
         return None;
     }
@@ -855,11 +865,19 @@ pub fn mesh_quality(
     model: &BRepModel,
     solid: SolidId,
 ) -> Option<crate::primitives::provenance::MeshQuality> {
+    let solid_ref = model.solids.get(solid)?;
+    let mesh = tessellate_solid(solid_ref, model, &TessellationParams::default());
+    mesh_quality_of_mesh(model, &mesh)
+}
+
+/// [`mesh_quality`] of a mesh the caller already has: `mesh` must be the
+/// solid's tessellation at [`TessellationParams::default`].
+pub fn mesh_quality_of_mesh(
+    model: &BRepModel,
+    mesh: &crate::tessellation::TriangleMesh,
+) -> Option<crate::primitives::provenance::MeshQuality> {
     use crate::primitives::provenance::{MeshFaceQualityDefect, MeshQuality};
     use std::cmp::Ordering::Equal;
-    let solid_ref = model.solids.get(solid)?;
-    let params = TessellationParams::default();
-    let mesh = tessellate_solid(solid_ref, model, &params);
     if mesh.triangles.is_empty() {
         return None;
     }
