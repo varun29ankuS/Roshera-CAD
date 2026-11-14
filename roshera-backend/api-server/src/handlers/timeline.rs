@@ -3691,9 +3691,32 @@ pub async fn get_chapters(
 
     let frames = state.frames.clone();
     let replayed = events.clone();
-    let cert = tokio::task::spawn_blocking(move || {
-        timeline_engine::rebuild_certificate::certify_rebuild_with_frames(&replayed, None, &frames)
-            .1
+    let chapter_list = timeline_engine::chapters::chapters(&events);
+    let recorded_parts: Vec<u64> = chapter_list
+        .iter()
+        .flat_map(|c| std::iter::once(c.part).chain(c.instances.iter().map(|i| i.part)))
+        .flatten()
+        .collect();
+    let (cert, live_part) = tokio::task::spawn_blocking(move || {
+        let cert = timeline_engine::rebuild_certificate::certify_rebuild_with_frames(
+            &replayed, None, &frames,
+        )
+        .1;
+        // Each feature's part as the LIVE model numbers it (the replay's id
+        // table maps recorded ids to the ids the rebuilt model uses), and
+        // only when that part stands now.
+        let (model, outcome, _) = frames.replay(&replayed);
+        let live: std::collections::HashMap<u64, u64> = recorded_parts
+            .into_iter()
+            .filter_map(|rec| {
+                let id = outcome.id_remap.get(&rec).copied().unwrap_or(rec);
+                let present = u32::try_from(id)
+                    .ok()
+                    .is_some_and(|sid| model.solids.get(sid).is_some());
+                present.then_some((rec, id))
+            })
+            .collect();
+        (cert, live)
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -3706,6 +3729,7 @@ pub async fn get_chapters(
         c: &timeline_engine::chapters::Chapter,
         verdict_of: &std::collections::HashMap<u64, &timeline_engine::FeatureVerdict>,
         event_of: &std::collections::HashMap<u64, &TimelineEvent>,
+        live_part: &std::collections::HashMap<u64, u64>,
     ) -> serde_json::Value {
         let refusals: Vec<serde_json::Value> = c
             .events
@@ -3749,13 +3773,16 @@ pub async fn get_chapters(
             "author": author["kind"],
             "author_detail": author,
             "intent": intent,
-            "instances": c.instances.iter().map(|i| render(i, verdict_of, event_of)).collect::<Vec<_>>(),
+            "instances": c.instances.iter().map(|i| render(i, verdict_of, event_of, live_part)).collect::<Vec<_>>(),
+            // The part (live kernel solid id) this feature ended up in, when
+            // it stands now: the tree nests the feature under it.
+            "part": c.part.and_then(|rec| live_part.get(&rec)),
         })
     }
 
-    let chapters: Vec<serde_json::Value> = timeline_engine::chapters::chapters(&events)
+    let chapters: Vec<serde_json::Value> = chapter_list
         .iter()
-        .map(|c| render(c, &verdict_of, &event_of))
+        .map(|c| render(c, &verdict_of, &event_of, &live_part))
         .collect();
     Ok(Json(serde_json::json!({
         "branch": branch_id.to_string(),

@@ -98,3 +98,27 @@ test('the feature tree lists features, not edits or unused sketches', async () =
   assert.equal(inFeatureTree(ch('sketch')), false)
   assert.equal(inFeatureTree(ch('param.mould')), false)
 })
+
+test('one tree: each part with the features that ended up in it, in build order', async () => {
+  const { groupByPart } = await import('../src/lib/chapters-api.ts')
+  const ch = (anchor, part, kind = 'hole') => ({ kind, name: null, events: [anchor], anchor, sound: true, refusals: [], author: 'user', author_detail: { kind: 'user' }, intent: null, instances: [], part })
+  const parts = [
+    { id: 'u-flange', solidId: 12, name: 'Flange' },
+    { id: 'u-shaft', solidId: 13, name: 'Shaft' },
+    { id: 'u-step', solidId: 20, name: 'Imported' },
+  ]
+  const groups = groupByPart([ch(1, 12, 'cylinder'), ch(5, 13, 'cylinder'), ch(3, 12), ch(7, null, 'datum')], parts)
+  assert.deepEqual(
+    groups.map((g) => [g.part?.name ?? null, g.features.map((f) => f.anchor)]),
+    [['Flange', [1, 3]], ['Shaft', [5]], ['Imported', []], [null, [7]]],
+  )
+})
+
+test('an unnamed part reads as its first feature, not its internal id', async () => {
+  const { partLabel } = await import('../src/lib/chapters-api.ts')
+  const f = (name, kind) => ({ kind, name, events: [1], anchor: 1, sound: true, refusals: [], author: 'user', author_detail: { kind: 'user' }, intent: null, instances: [] })
+  assert.equal(partLabel({ id: 'u', solidId: 12, name: 'solid_12' }, [f('Flange', 'cylinder'), f('Hub', 'boss')]), 'Flange')
+  assert.equal(partLabel({ id: 'u', solidId: 14, name: 'solid_14' }, [f(null, 'extrude')]), 'Extrude')
+  assert.equal(partLabel({ id: 'u', solidId: 13, name: 'Shaft' }, [f('Shaft body', 'cylinder')]), 'Shaft', 'a chosen name stands')
+  assert.equal(partLabel({ id: 'u', solidId: 20, name: 'solid_20' }, []), 'Part 20', 'nothing to go by: a readable fallback')
+})

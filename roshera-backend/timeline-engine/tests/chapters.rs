@@ -256,3 +256,28 @@ fn edits_of_a_sketch_never_extruded_are_one_sketch_entry() {
     assert_eq!(kinds, ["box", "sketch"], "{cs:#?}");
     assert_eq!(cs[1].events, vec![1, 2]);
 }
+
+/// Parts and features in ONE tree (Varun 2026-11-14: "shouldn't features
+/// and parts be part of the same tree"): every feature names the part it
+/// ended up in -- the body its own result became after everything that
+/// consumed it -- so the tree can nest it under that part.
+#[test]
+fn every_feature_names_the_part_it_ended_up_in() {
+    let h = vec![
+        boxx(0, 0, 50.0),
+        cylinder(1, 1, [0.0, 0.0, -1.0], 3.0, 60.0),
+        difference(2, 0, 1, 2),
+        boxx(3, 3, 10.0),
+    ];
+    let cs = chapters(&h);
+    let parts: Vec<(String, Option<u64>)> = cs.iter().map(|c| (c.kind.clone(), c.part)).collect();
+    assert_eq!(
+        parts,
+        vec![
+            ("box".to_string(), Some(2)),
+            ("hole".to_string(), Some(2)),
+            ("box".to_string(), Some(3)),
+        ],
+        "{cs:#?}"
+    );
+}

@@ -39,6 +39,46 @@ export interface Chapter {
   intent: string | null
   /** A pattern's instances. */
   instances: Chapter[]
+  /** The part (live kernel solid id) this feature ended up in, when it
+   *  stands now; null when it made no solid or its part is gone. */
+  part?: number | null
+}
+
+/** A part as the one tree lists it. */
+export interface TreePart {
+  /** The scene id (selection, visibility). */
+  id: string
+  /** The kernel solid id the history names. */
+  solidId: number
+  name: string
+}
+
+/** One tree for parts and features (Varun 2026-11-14): each part with the
+ *  features that ended up in it, in build order; parts are ordered by their
+ *  first feature, parts with none after them, then the features that are
+ *  in no standing part. */
+export function groupByPart(
+  chapters: Chapter[],
+  parts: TreePart[],
+): { part: TreePart | null; features: Chapter[] }[] {
+  const ordered = [...chapters].sort((a, b) => a.anchor - b.anchor)
+  const bySolid = new Map(parts.map((p) => [p.solidId, p]))
+  const groups = new Map<number, { part: TreePart; features: Chapter[] }>()
+  const loose: Chapter[] = []
+  for (const c of ordered) {
+    const part = c.part != null ? bySolid.get(c.part) : undefined
+    if (!part) {
+      loose.push(c)
+      continue
+    }
+    const g = groups.get(part.solidId) ?? { part, features: [] }
+    g.features.push(c)
+    groups.set(part.solidId, g)
+  }
+  const out: { part: TreePart | null; features: Chapter[] }[] = [...groups.values()]
+  for (const p of parts) if (!groups.has(p.solidId)) out.push({ part: p, features: [] })
+  if (loose.length > 0) out.push({ part: null, features: loose })
+  return out
 }
 
 export interface ChaptersResponse {
@@ -201,4 +241,17 @@ export function partChapters(cs: Chapter[]): { part: Chapter[]; documents: Chapt
     part: foldEdits(cs.filter((c) => !isDocumentChapter(c))),
     documents: cs.filter(isDocumentChapter),
   }
+}
+
+/** A part's name in the tree: the one it was given, else -- as established
+ *  CAD trees name a body -- its first feature's ("Flange"), never an
+ *  internal id ("solid_12"). */
+export function partLabel(part: TreePart, features: Chapter[]): string {
+  if (!/^solid[_ ]?\d+$/i.test(part.name.trim()) && part.name.trim() !== '') return part.name
+  const first = features[0]
+  if (first) {
+    const t = chapterTitle(first)
+    return t.charAt(0).toUpperCase() + t.slice(1)
+  }
+  return `Part ${part.solidId}`
 }

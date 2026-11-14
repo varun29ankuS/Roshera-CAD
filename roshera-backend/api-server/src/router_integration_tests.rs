@@ -12952,3 +12952,32 @@ async fn a_drawn_shape_is_built_in_one_request_or_not_at_all() {
         "the failed plan left nothing: {snap}"
     );
 }
+
+/// One tree for parts and features (Varun 2026-11-14): each feature in the
+/// chapters names the LIVE part it ended up in, so the tree nests it there.
+#[tokio::test]
+async fn each_feature_names_the_live_part_it_belongs_to() {
+    let state = make_test_state().await;
+    seed_bored_box_live(&state).await;
+    let live: Vec<u64> = state
+        .model
+        .read()
+        .await
+        .solids
+        .iter()
+        .map(|(id, _)| u64::from(id))
+        .collect();
+    assert_eq!(live.len(), 1, "one drilled box");
+    let (_, ch) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    let parts: Vec<serde_json::Value> = ch["chapters"]
+        .as_array()
+        .expect("chapters")
+        .iter()
+        .map(|c| c["part"].clone())
+        .collect();
+    assert_eq!(
+        parts,
+        vec![json!(live[0]), json!(live[0])],
+        "box and hole both in the one part: {ch}"
+    );
+}

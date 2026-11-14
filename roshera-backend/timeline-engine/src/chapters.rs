@@ -46,6 +46,10 @@ pub struct Chapter {
     pub anchor: u64,
     /// For a pattern: its instances, each a chapter. Empty otherwise.
     pub instances: Vec<Chapter>,
+    /// The part this feature ended up in: the RECORDED solid id its result
+    /// became after everything that consumed it (a hole's cut ends in the
+    /// body it was cut into). `None` when the feature makes no solid.
+    pub part: Option<u64>,
 }
 
 /// One recorded step, read once.
@@ -119,11 +123,62 @@ pub fn chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
     let gone =
         |c: &Chapter| !c.events.is_empty() && c.events.iter().all(|s| deleted.is_suppressed(*s));
     let mut out = fold_sketch_edits(events, all_chapters(events));
+    assign_parts(events, &mut out);
     for c in &mut out {
         c.instances.retain(|i| !gone(i));
     }
     out.retain(|c| !gone(c));
     out
+}
+
+/// Each feature's part: follow its result forward through every step that
+/// consumed it (a boolean's inputs become its output) to the solid it
+/// ended up in. Deleted steps consume nothing.
+fn assign_parts(events: &[TimelineEvent], chapters: &mut [Chapter]) {
+    let deleted = crate::mould::OverrideSet::collect(events);
+    let mut ordered: Vec<&TimelineEvent> = events.iter().collect();
+    ordered.sort_by_key(|e| e.sequence_number);
+    let mut next: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut made: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for e in &ordered {
+        if deleted.is_suppressed(e.sequence_number) {
+            continue;
+        }
+        let outs = recorded_solid_outputs(e);
+        if let Some(out) = outs.first() {
+            made.insert(e.sequence_number, *out);
+            for input in recorded_solid_inputs(e) {
+                if input != *out {
+                    next.insert(input, *out);
+                }
+            }
+        }
+    }
+    let end_of = |mut id: u64| -> u64 {
+        // Each hop follows a later step; a cycle (ids re-used) stops.
+        for _ in 0..next.len() + 1 {
+            match next.get(&id) {
+                Some(n) if *n != id => id = *n,
+                _ => break,
+            }
+        }
+        id
+    };
+    let part_of = |c: &Chapter| -> Option<u64> {
+        let mut steps = c.events.clone();
+        steps.sort_unstable();
+        let own = made
+            .get(&c.anchor)
+            .copied()
+            .or_else(|| steps.iter().rev().find_map(|s| made.get(s).copied()))?;
+        Some(end_of(own))
+    };
+    for c in chapters.iter_mut() {
+        for i in c.instances.iter_mut() {
+            i.part = part_of(i);
+        }
+        c.part = part_of(c);
+    }
 }
 
 /// The sketch a recorded step belongs to (`csketch_id`), if any.
@@ -301,6 +356,7 @@ fn all_chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
                 events: vec![s.seq],
                 instances: Vec::new(),
                 anchor: s.seq,
+                part: None,
             },
             anchor: s.seq,
             tool: tool_feature,
@@ -373,6 +429,7 @@ fn all_chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
                 events: vec![s.seq],
                 instances: Vec::new(),
                 anchor: s.seq,
+                part: None,
             },
             anchor: s.seq,
             tool: None,
@@ -494,6 +551,7 @@ fn group_patterns(drafts: Vec<Draft>) -> Vec<Chapter> {
                 events,
                 anchor: instances.last().map_or(0, |c| c.anchor),
                 instances,
+                part: None,
             });
             i = j;
         } else {

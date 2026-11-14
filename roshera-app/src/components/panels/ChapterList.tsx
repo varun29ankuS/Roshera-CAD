@@ -7,11 +7,12 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { cn } from '@/lib/utils'
-import { chapterIconKey, chapterTitle, inFeatureTree, type Chapter } from '@/lib/chapters-api'
+import { chapterIconKey, chapterTitle, groupByPart, inFeatureTree, partLabel, type Chapter, type TreePart } from '@/lib/chapters-api'
+import { useSceneStore } from '@/stores/scene-store'
 import { useChapters } from '@/hooks/use-chapters'
 import { useHistoryView } from '@/stores/history-view-store'
 import { featureFields, fetchEditableParameters, sizeSummary, type EditableParameter } from '@/lib/feature-edit'
-import { Box, Check, ChevronDown, ChevronRight, X, ToolIcons } from '@/components/ui/icons'
+import { Box, Check, ChevronDown, ChevronRight, Eye, EyeOff, X, ToolIcons } from '@/components/ui/icons'
 
 function ChapterIcon({ c, size }: { c: Chapter; size: number }) {
   const key = chapterIconKey(c.kind)
@@ -128,12 +129,119 @@ function Row({
   )
 }
 
-export function ChapterList({ branch = 'main' }: { branch?: string }) {
+/** A part row of the one tree: select it, hide / show it, fold its features. */
+function PartRow({
+  part,
+  count,
+  open,
+  onFold,
+  selected,
+  visible,
+  onSelect,
+  onToggleVisible,
+  onContextMenu,
+}: {
+  part: TreePart
+  count: number
+  open: boolean
+  onFold: () => void
+  selected: boolean
+  visible: boolean
+  onSelect: (additive: boolean) => void
+  onToggleVisible: () => void
+  onContextMenu?: (e: React.MouseEvent) => void
+}) {
+  return (
+    <div
+      role="treeitem"
+      aria-selected={selected}
+      aria-expanded={count > 0 ? open : undefined}
+      tabIndex={0}
+      onClick={(e) => onSelect(e.shiftKey || e.ctrlKey || e.metaKey)}
+      onContextMenu={onContextMenu}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') onSelect(false)
+        if (count > 0 && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
+          if ((e.key === 'ArrowRight') !== open) onFold()
+        }
+      }}
+      title={`${part.name} -- ${count} feature${count === 1 ? '' : 's'}`}
+      className={cn(
+        'group flex h-6 items-center gap-1.5 rounded px-1.5 cursor-default outline-none',
+        'hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring',
+        selected && 'bg-accent/60',
+        !visible && 'opacity-50',
+      )}
+    >
+      {count > 0 ? (
+        <button
+          type="button"
+          aria-label={open ? `Fold ${part.name}` : `Open ${part.name}`}
+          onClick={(e) => {
+            e.stopPropagation()
+            onFold()
+          }}
+          className="shrink-0 text-muted-foreground"
+        >
+          {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        </button>
+      ) : (
+        <span className="w-3 shrink-0" />
+      )}
+      <Box size={16} />
+      <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-foreground">{part.name}</span>
+      <button
+        type="button"
+        aria-label={visible ? `Hide ${part.name}` : `Show ${part.name}`}
+        onClick={(e) => {
+          e.stopPropagation()
+          onToggleVisible()
+        }}
+        className={cn('shrink-0 text-muted-foreground hover:text-foreground', visible && 'opacity-0 group-hover:opacity-100')}
+      >
+        {visible ? <Eye size={12} /> : <EyeOff size={12} />}
+      </button>
+    </div>
+  )
+}
+
+/**
+ * One tree for parts and features (Varun 2026-11-14: "shouldn't features
+ * and parts be part of the same tree"): each part, with the features that
+ * built it nested under it in build order, as established CAD trees show a
+ * body and its features. A feature's part is the body its result ended up
+ * in (kernel chapters, `part`); features in no standing part follow.
+ */
+export function ChapterList({
+  branch = 'main',
+  onPartContextMenu,
+}: {
+  branch?: string
+  /** Right-click on a part row (rename / delete ...). */
+  onPartContextMenu?: (e: React.MouseEvent, id: string, name: string) => void
+}) {
   const { chapters: all, loading, error } = useChapters(branch)
   // Features only: a size edit is history (it stays on the slider), not a
   // row -- the edited feature shows its new size itself.
   const chapters = useMemo(() => all.filter(inFeatureTree), [all])
-  // Selecting a row highlights that feature, as in a feature tree. It never
+  const objects = useSceneStore((s) => s.objects)
+  const objectOrder = useSceneStore((s) => s.objectOrder)
+  const selectedIds = useSceneStore((s) => s.selectedIds)
+  const selectObject = useSceneStore((s) => s.selectObject)
+  const updateObject = useSceneStore((s) => s.updateObject)
+  const parts = useMemo<TreePart[]>(
+    () =>
+      objectOrder
+        .map((id) => objects.get(id))
+        .flatMap((o) => {
+          const solidId = o?.analyticalGeometry?.solidId
+          return o && solidId !== undefined ? [{ id: o.id, solidId, name: o.name }] : []
+        }),
+    [objects, objectOrder],
+  )
+  const groups = useMemo(() => groupByPart(chapters, parts), [chapters, parts])
+  const [folded, setFolded] = useState<Set<string>>(new Set())
+  // Selecting a feature highlights it, as in a feature tree. It never
   // moves the timeline: only the slider travels in time. Rows after the
   // slider's position are greyed, like features below a rollback bar.
   const selected = useHistoryView((s) => s.selectedChapter)
@@ -152,29 +260,65 @@ export function ChapterList({ branch = 'main' }: { branch?: string }) {
     }
   }, [branch, chapters])
 
-  if (error && chapters.length === 0) {
+  if (error && chapters.length === 0 && parts.length === 0) {
     return <div className="px-3 py-2 text-[11px] text-destructive">history unavailable — {error}</div>
   }
-  if (chapters.length === 0) {
+  if (chapters.length === 0 && parts.length === 0) {
     return (
       <div className="px-3 py-2 text-[11px] text-muted-foreground">
-        {loading ? '⋯ loading history' : '∅ no features yet — build something and it appears here'}
+        {loading ? '⋯ loading history' : '∅ no parts yet — build something and it appears here'}
       </div>
     )
   }
+  const featureRows = (list: Chapter[], depth: number) =>
+    list.map((c) => (
+      <Row
+        key={c.anchor}
+        c={c}
+        depth={depth}
+        selected={selected}
+        onSelect={select}
+        ahead={viewing !== null && c.anchor > viewing}
+        params={params}
+      />
+    ))
   return (
-    <ul role="tree" aria-label="Part history" className="px-1 py-1">
-      {chapters.map((c) => (
-        <Row
-          key={c.anchor}
-          c={c}
-          depth={0}
-          selected={selected}
-          onSelect={select}
-          ahead={viewing !== null && c.anchor > viewing}
-          params={params}
-        />
-      ))}
+    <ul role="tree" aria-label="Parts and features" className="px-1 py-1">
+      {groups.map((g) =>
+        g.part ? (
+          <li key={g.part.id}>
+            <PartRow
+              part={{ ...g.part, name: partLabel(g.part, g.features) }}
+              count={g.features.length}
+              open={!folded.has(g.part.id)}
+              onFold={() =>
+                setFolded((f) => {
+                  const next = new Set(f)
+                  const id = (g.part as TreePart).id
+                  if (next.has(id)) next.delete(id)
+                  else next.add(id)
+                  return next
+                })
+              }
+              selected={selectedIds.has(g.part.id)}
+              visible={objects.get(g.part.id)?.visible ?? true}
+              onSelect={(additive) => selectObject((g.part as TreePart).id, additive)}
+              onToggleVisible={() => {
+                const id = (g.part as TreePart).id
+                updateObject(id, { visible: !(objects.get(id)?.visible ?? true) })
+              }}
+              onContextMenu={
+                onPartContextMenu
+                  ? (e) => onPartContextMenu(e, (g.part as TreePart).id, (g.part as TreePart).name)
+                  : undefined
+              }
+            />
+            {!folded.has(g.part.id) && g.features.length > 0 && <ul role="group">{featureRows(g.features, 1)}</ul>}
+          </li>
+        ) : (
+          featureRows(g.features, 0)
+        ),
+      )}
     </ul>
   )
 }
