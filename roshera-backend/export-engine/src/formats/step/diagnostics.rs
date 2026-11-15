@@ -109,6 +109,14 @@ pub enum HealingKind {
     /// `DIRECTION`'s reported components were the zero vector. We
     /// substituted `+Z` to keep downstream evaluation finite.
     ZeroLengthDirection,
+    /// An `EDGE_CURVE` lay farther from an analytic surface of a face using
+    /// it than the file's declared accuracy, but within
+    /// [`super::EDGE_GAP_REPAIR_CAP`]: the edge's tolerance was raised to the
+    /// measured gap (`deviation`), as exchange readers do (OCCT's
+    /// `ShapeFix_Edge::FixSameParameter`). `tolerance` is the declared
+    /// tolerance it exceeded. A gap beyond the cap is refused instead (a
+    /// warning, and the edge keeps the declared tolerance).
+    EdgeToleranceRaised,
 }
 
 /// A structured healing event applied during dispatch. Logged on

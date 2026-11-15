@@ -178,6 +178,7 @@ pub fn import_step_text_uncertified(
     }
     report.roots_resolved = roots_with_solids;
     report.solids_in_roots = total_root_solids;
+    raise_edge_tolerances_to_measured_gaps(&mut model, &caches, &mut report);
 
     // Place assembly instances from the product tree, then give every solid
     // and face its identity — PIDs keyed by this file's CONTENT and the STEP
@@ -273,6 +274,107 @@ fn extract_file_schema(exchange: &ruststep::ast::Exchange) -> Option<String> {
         }
     }
     None
+}
+
+/// The largest gap between an edge and a face's surface that the importer
+/// repairs by raising the edge's tolerance (mm). Beyond it an edge is not on
+/// its face and the part is refused, with the gap in the report.
+pub const EDGE_GAP_REPAIR_CAP: f64 = 0.01;
+
+/// Measure every edge's gap from the ANALYTIC surfaces of the faces using it
+/// (plane, cylinder, cone, sphere, torus -- the surfaces the validator judges
+/// exactly) and, where it exceeds the edge's declared tolerance but not
+/// [`EDGE_GAP_REPAIR_CAP`], raise the tolerance to the gap and record a
+/// [`diagnostics::HealingKind::EdgeToleranceRaised`]. A gap beyond the cap is
+/// left alone and reported as a warning. Writers state one model-wide
+/// accuracy (OCCT writes the AVERAGE tolerance), but individual edges --
+/// intersection curves, approximated splines -- sit farther off; every
+/// exchange reader records the real per-edge tolerance, and so does this,
+/// openly.
+fn raise_edge_tolerances_to_measured_gaps(
+    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
+    caches: &context::ResolutionCaches,
+    report: &mut ImportReport,
+) {
+    use geometry_engine::math::Tolerance;
+    let instance_of: std::collections::HashMap<u32, u64> = caches
+        .edges
+        .iter()
+        .map(|(inst, &eid)| (eid, *inst))
+        .collect();
+    let mut gap: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+    for (_, face) in model.faces.iter() {
+        let Some(surface) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        if !matches!(
+            surface.type_name(),
+            "Plane" | "Cylinder" | "Cone" | "Sphere" | "Torus"
+        ) {
+            continue;
+        }
+        for l in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+            let Some(lp) = model.loops.get(l) else {
+                continue;
+            };
+            for &eid in &lp.edges {
+                let Some(edge) = model.edges.get(eid) else {
+                    continue;
+                };
+                let Some(curve) = model.curves.get(edge.curve_id) else {
+                    continue;
+                };
+                let r = edge.param_range;
+                let mut worst = 0.0_f64;
+                for k in 0..=8 {
+                    let t = r.start + (r.end - r.start) * k as f64 / 8.0;
+                    let Ok(p) = curve.evaluate(t) else { continue };
+                    let p = p.position;
+                    if let Ok((u, v)) = surface.closest_point(&p, Tolerance::default()) {
+                        if let Ok(q) = surface.point_at(u, v) {
+                            worst = worst.max(p.distance(&q));
+                        }
+                    }
+                }
+                let g = gap.entry(eid).or_insert(0.0);
+                *g = g.max(worst);
+            }
+        }
+    }
+    let mut ids: Vec<u32> = gap.keys().copied().collect();
+    ids.sort_unstable();
+    for eid in ids {
+        let g = gap[&eid];
+        let Some(edge) = model.edges.get_mut(eid) else {
+            continue;
+        };
+        let declared = edge.tolerance;
+        if !(g > declared) {
+            continue;
+        }
+        let instance = instance_of.get(&eid).copied().unwrap_or(0);
+        if g <= EDGE_GAP_REPAIR_CAP {
+            // A hair above the measured gap, as OCCT does, so the edge is
+            // within its tolerance at every measured point.
+            edge.set_tolerance(g * (1.0 + 1e-6));
+            report.healings.push(diagnostics::Healing {
+                kind: diagnostics::HealingKind::EdgeToleranceRaised,
+                entity: "EDGE_CURVE".into(),
+                instance,
+                deviation: g,
+                tolerance: declared,
+            });
+        } else {
+            report.push_warning(diagnostics::Warning {
+                severity: diagnostics::Severity::Warn,
+                entity: "EDGE_CURVE".into(),
+                instance: Some(instance),
+                message: format!(
+                    "edge lies {g:.3e} mm off its face, beyond the {EDGE_GAP_REPAIR_CAP} mm repair                      cap; left at its declared tolerance {declared:.1e}"
+                ),
+            });
+        }
+    }
 }
 
 #[cfg(test)]
