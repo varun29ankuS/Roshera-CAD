@@ -15,5 +15,5 @@
     "@modelcontextprotocol/sdk": "^1.0.0",
     "pg": "^8.23.0"
   },
-  "license": "FSL-1.1-Apache-2.0"
+  "license": "AGPL-3.0-only"
 }

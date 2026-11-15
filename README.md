@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="#status"><img src="https://img.shields.io/badge/status-work%20in%20progress-yellow" alt="Status" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue" alt="License" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License" /></a>
 </p>
 
 <p align="center">
@@ -83,7 +83,7 @@ roshera-backend/       Rust workspace (10 crates)
   verdict-harness/     Multi-agent verdict/consensus harness
   api-server/          Axum REST + WebSocket API (embeds the agent harness)
   shared-types/        Common type definitions
-  vendor/goose/        Agent harness — goose, vendored as Roshera's own code (Apache-2.0, see VENDORED.md)
+  vendor/goose/        Agent harness — goose, third-party, vendored (Apache-2.0, see VENDORED.md)
 
 roshera-agent-policy.md  The rules every agent works under, delivered to agents as AGENTS.md
 roshera-app/           React + Three.js + TypeScript browser client
@@ -327,16 +327,16 @@ The Roshera mark is a Boolean union of a rectangle (2x × 3.236x) and a circle (
 
 ## License
 
-**[Functional Source License 1.1 (FSL-1.1-Apache-2.0)](LICENSE)** — Fair Source.
+**[GNU Affero General Public License v3.0 (AGPL-3.0-only)](LICENSE).**
 
-You may use, copy, modify, and redistribute Roshera for any purpose — including
-commercial use — **except** offering a product or service that competes with it
-(e.g. a competing geometry kernel, CAD engine, or hosted service built on this
-code). Internal use, education, research, and building non-competing products
-on top of Roshera are all permitted.
+You may use, study, modify and redistribute Roshera, including commercially.
+If you distribute a modified version, or run one as a service that users
+interact with over a network, you must make your modified source available to
+them under the same license.
 
-**Every release automatically converts to [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0)
-two years after publication** — today's code is tomorrow's open source.
-
-For licensing beyond the grant (OEM/embedding, competing-use exceptions):
+Commercial licenses (for embedding Roshera in a closed product, or running it
+as a service without the AGPL's source obligations) are available:
 29.varuns@gmail.com.
+
+Third-party code keeps its own license: `roshera-backend/vendor/goose` is
+Apache-2.0 (see its `LICENSE` and `VENDORED.md`).

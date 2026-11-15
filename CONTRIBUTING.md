@@ -4,13 +4,13 @@ Thanks for your interest in Roshera — the agent-native geometry kernel.
 
 ## License of contributions
 
-Roshera is licensed under the [Functional Source License 1.1 with Apache 2.0
-future grant](LICENSE) (FSL-1.1-Apache-2.0). By contributing, you agree that
-your contributions are licensed under the same terms, and that the project
-maintainer may relicense the project (including your contributions) under any
-OSI-approved open-source license in the future — this keeps the already-promised
-FSL→Apache-2.0 conversion (and any future move to a more permissive license)
-possible without tracking down every past contributor.
+Roshera is licensed under the [GNU Affero General Public License v3.0](LICENSE)
+(AGPL-3.0-only). By contributing, you agree that your contributions are
+licensed under the same terms, and you grant the project maintainer the right
+to also license your contributions under other terms, including commercial
+licenses. This keeps Roshera's dual licensing (AGPL for everyone, a commercial
+license for those who need one) possible without tracking down every past
+contributor.
 
 ## Developer Certificate of Origin (DCO)
 

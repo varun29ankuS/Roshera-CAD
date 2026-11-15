@@ -3,7 +3,7 @@ name = "api-server"
 version = "0.1.0"
 edition = "2021"
 description = "HTTP and WebSocket API server for Roshera CAD"
-license = "FSL-1.1-Apache-2.0"
+license = "AGPL-3.0-only"
 
 [[bin]]
 name = "api-server"
