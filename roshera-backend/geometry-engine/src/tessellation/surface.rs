@@ -5490,11 +5490,46 @@ fn tessellate_blend_torus_conforming(
     };
     let va = v_of_ring(&ring_a);
     let vb = v_of_ring(&ring_b);
-    // Order rings by ascending v: row 0 = low-v boundary, last row = high-v.
-    let (v_low_ring, v_high_ring, v_low, v_high) = if va <= vb {
-        (&ring_a, &ring_b, va, vb)
+    // WHICH of the two arcs between the rims is the band: the one the loop's
+    // seam edge (the meridian arc between the rims, ON the face) lies on.
+    // Going straight from the lower rim v to the higher is right only when
+    // the band does not cross the tube's own v seam; a band from -60 to +60
+    // degrees reads as rims at 300 and 60, and the straight interval is the
+    // 240-degree complement -- a mesh through the part's material.
+    let tau = std::f64::consts::TAU;
+    let seam_v = outer
+        .edges
+        .iter()
+        .find(|&&eid| !ring_edges.contains(&eid))
+        .and_then(|&eid| {
+            let e = model.edges.get(eid)?;
+            let c = model.curves.get(e.curve_id)?;
+            let t = 0.5 * (e.param_range.start + e.param_range.end);
+            let p = c.evaluate(t).ok()?.position;
+            surface
+                .closest_point(&p, Tolerance::default())
+                .ok()
+                .map(|(_, v)| v)
+        });
+    let a_to_b = (vb - va).rem_euclid(tau);
+    let band_from_a = match seam_v {
+        Some(vm) => (vm - va).rem_euclid(tau) <= a_to_b,
+        // No seam edge to tell: the historical ascending-v band.
+        None => va <= vb,
+    };
+    // Row 0 = the ring the band starts from, last row = the ring it ends at;
+    // v runs up by the band's own span (it may pass 2*pi -- the torus is
+    // periodic in v).
+    let (v_low_ring, v_high_ring, v_low, v_high) = if seam_v.is_none() {
+        if va <= vb {
+            (&ring_a, &ring_b, va, vb)
+        } else {
+            (&ring_b, &ring_a, vb, va)
+        }
+    } else if band_from_a {
+        (&ring_a, &ring_b, va, va + a_to_b)
     } else {
-        (&ring_b, &ring_a, vb, va)
+        (&ring_b, &ring_a, vb, vb + (tau - a_to_b))
     };
     // Guard: the two trim rings must sit at DISTINCT v (else this is not a
     // clean blend band — a degenerate/zero-height window — and we defer to the
@@ -6201,37 +6236,32 @@ fn tessellate_revolution_wedge(
         if tris.is_empty() {
             return false;
         }
-        // Outward normal: Newell of the real 3D ring (CCW about the surface's
-        // natural normal, since the loop is CCW) times the face orientation sign
-        // — identical convention to `tessellate_planar_face`.
-        let outward = newell_normal(&p3)
-            .map(|nv| nv * face.orientation.sign())
-            .unwrap_or(Vector3::Z);
-        // SMOOTH SHADING: take each vertex's normal from the surface itself
-        // (evaluate_full at the vertex's (u,v)), not a single flat per-band
-        // normal — otherwise each sloped band renders as a faceted rectangle
-        // ("rectangular spots" on a revolved cone). The wedge's (u,v) square
-        // maps to the SurfaceOfRevolution params as u=profile∈[0,1],
-        // v=angle∈[0,angle]; puv carries (u, v_frac, 0). Orient each to the
-        // outward side so shading is consistent; fall back to the flat outward
-        // normal if the surface evaluation fails.
+        // Outward side from the SURFACE, where each point is: its normal at
+        // the point's projection, times the face's sense. Not from the
+        // boundary's winding: the kernel winds a loop about the face's
+        // OUTWARD normal, so "winding x sense" inverted every Backward band.
+        // Not from the (u, v) square either: it is the wedge's own chart, not
+        // the surface's parameters, and on an imported patch it pointed at
+        // another part of the surface.
         let surf = model.surfaces.get(face.surface_id);
-        let ang = surf.map(|s| s.parameter_bounds().1 .1).unwrap_or(0.0);
+        let sign = face.orientation.sign();
+        let outward_at = |p: Point3| -> Option<Vector3> {
+            let s = surf?;
+            let (u, v) = s.closest_point(&p, Tolerance::default()).ok()?;
+            s.normal_at(u, v).ok()?.normalize().ok().map(|n| n * sign)
+        };
+        // A band-wide fallback: the mean of the boundary's outward normals.
+        let fallback = p3
+            .iter()
+            .filter_map(|&p| outward_at(p))
+            .fold(Vector3::ZERO, |acc, n| acc + n)
+            .normalize()
+            .unwrap_or(Vector3::Z);
         let idx: Vec<u32> = (0..p3.len())
             .map(|k| {
-                let normal = surf
-                    .and_then(|s| s.evaluate_full(puv[k].x, puv[k].y * ang).ok())
-                    .map(|sp| {
-                        if sp.normal.dot(&outward) < 0.0 {
-                            -sp.normal
-                        } else {
-                            sp.normal
-                        }
-                    })
-                    .unwrap_or(outward);
                 mesh.add_vertex(MeshVertex {
                     position: p3[k],
-                    normal,
+                    normal: outward_at(p3[k]).unwrap_or(fallback),
                     uv: None,
                 })
             })
@@ -6239,7 +6269,13 @@ fn tessellate_revolution_wedge(
         for t in &tris {
             let (i0, i1, i2) = (t[0], t[1], t[2]);
             let gn = (p3[i1] - p3[i0]).cross(&(p3[i2] - p3[i0]));
-            if gn.dot(&outward) >= 0.0 {
+            let c = Point3::new(
+                (p3[i0].x + p3[i1].x + p3[i2].x) / 3.0,
+                (p3[i0].y + p3[i1].y + p3[i2].y) / 3.0,
+                (p3[i0].z + p3[i1].z + p3[i2].z) / 3.0,
+            );
+            let out = outward_at(c).unwrap_or(fallback);
+            if gn.dot(&out) >= 0.0 {
                 mesh.add_triangle(idx[i0], idx[i1], idx[i2]);
             } else {
                 mesh.add_triangle(idx[i0], idx[i2], idx[i1]);
@@ -6370,20 +6406,20 @@ fn tessellate_revolution_wedge(
     // geometrically to match it — exactly the self-consistent rule the unequal-
     // count branch above already uses, and independent of any i/j↔u/v convention.
     let surf = model.surfaces.get(face.surface_id);
-    let ang = surf.map(|s| s.parameter_bounds().1 .1).unwrap_or(0.0);
     let sign = face.orientation.sign();
+    // The surface normal AT the node: its position projected onto the
+    // surface. The grid index is not a surface parameter -- scaling it onto
+    // the surface's whole (profile, angle) domain is only right for a wall
+    // that spans that whole domain. An imported face is a patch of its
+    // surface; read at a scaled index, the normal came from elsewhere on the
+    // surface (across the axis) and the patch was wound inward.
     let surf_outward = |i: usize, j: usize| -> Option<Vector3> {
-        // Grid maps to the SurfaceOfRevolution params as u=profile∈[0,1] (the j
-        // index, normalised over the seam chain), v=angle∈[0,angle] (the i index,
-        // normalised over the ring chain). When chain `a` is the seam these roles
-        // swap, mirroring the `node` closure above.
-        let (u, vf) = if a_is_seam {
-            (i as f64 / (n - 1) as f64, j as f64 / (m - 1) as f64)
-        } else {
-            (j as f64 / (m - 1) as f64, i as f64 / (n - 1) as f64)
-        };
-        surf.and_then(|s| s.evaluate_full(u, vf * ang).ok())
-            .map(|sp| sp.normal * sign)
+        let p = *pos.get(i)?.get(j)?;
+        let s = surf?;
+        let (u, v) = s.closest_point(&p, Tolerance::default()).ok()?;
+        s.normal_at(u, v)
+            .ok()
+            .map(|nv| nv * sign)
             .and_then(|nv| nv.normalize().ok())
     };
 

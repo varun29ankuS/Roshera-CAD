@@ -171,3 +171,72 @@ fn a_torus_patch_across_the_seam_meshes_as_the_patch() {
     assert_meshes_as_the_patch(-FRAC_PI_4, FRAC_PI_4);
     assert_meshes_as_the_patch(7.0 * PI / 6.0, TAU);
 }
+
+/// A fillet band between two full rims, as STEP writers emit a rolled
+/// circular edge (two closed rims and the meridian seam arc between them),
+/// that runs ACROSS the tube's v = 0 seam -- here from -60 to +60 degrees round
+/// the tube. The band is the arc the seam edge lies on, not the other one:
+/// the mesher went straight from the lower rim angle to the higher and
+/// meshed the 240-degree complement, which cut through the part's material.
+#[test]
+fn a_fillet_band_across_the_tube_seam_meshes_the_band() {
+    let s60 = 3f64.sqrt();
+    let band = format!(
+        "#1=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#3=DIRECTION('',(1.,0.,0.));
+#4=AXIS2_PLACEMENT_3D('',#1,#2,#3);
+#5=TOROIDAL_SURFACE('',#4,10.,2.);
+#11=CARTESIAN_POINT('',(11.,0.,{lo:.17}));
+#12=CARTESIAN_POINT('',(11.,0.,{hi:.17}));
+#21=VERTEX_POINT('',#11);
+#22=VERTEX_POINT('',#12);
+#30=CARTESIAN_POINT('',(0.,0.,{lo:.17}));
+#31=AXIS2_PLACEMENT_3D('',#30,#2,#3);
+#32=CIRCLE('',#31,11.);
+#33=CARTESIAN_POINT('',(0.,0.,{hi:.17}));
+#34=AXIS2_PLACEMENT_3D('',#33,#2,#3);
+#35=CIRCLE('',#34,11.);
+#36=CARTESIAN_POINT('',(10.,0.,0.));
+#37=DIRECTION('',(0.,-1.,0.));
+#38=AXIS2_PLACEMENT_3D('',#36,#37,#3);
+#39=CIRCLE('',#38,2.);
+#51=EDGE_CURVE('',#21,#21,#32,.T.);
+#52=EDGE_CURVE('',#21,#22,#39,.T.);
+#53=EDGE_CURVE('',#22,#22,#35,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#62=ORIENTED_EDGE('',*,*,#52,.T.);
+#63=ORIENTED_EDGE('',*,*,#53,.F.);
+#64=ORIENTED_EDGE('',*,*,#52,.F.);
+#70=EDGE_LOOP('',(#61,#62,#63,#64));
+#71=FACE_OUTER_BOUND('',#70,.T.);
+#80=ADVANCED_FACE('',(#71),#5,.T.);
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));",
+        lo = -s60,
+        hi = s60
+    );
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&band), "band")
+        .expect("imports");
+    let face = the_torus_face(&model);
+    let _ = &report;
+    let params = TessellationParams::default();
+    let cache = EdgeSampleCache::new(&params);
+    let mut mesh = TriangleMesh::new();
+    tessellate_face(face, &model, &params, &cache, &mut mesh);
+    assert!(!mesh.triangles.is_empty(), "the band meshes");
+    let worst = mesh
+        .vertices
+        .iter()
+        .map(|v| {
+            let p = v.position;
+            let rad = (p.x * p.x + p.y * p.y).sqrt() - RING;
+            p.z.atan2(rad).to_degrees().abs()
+        })
+        .fold(0.0_f64, f64::max);
+    assert!(
+        worst <= 60.0 + 1e-6,
+        "a mesh vertex sits {worst:.1} degrees round the tube: the band is -60..+60"
+    );
+}

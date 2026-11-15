@@ -1727,7 +1727,12 @@ fn try_analytic_band_revolution(
     match attempt {
         Ok(sid) => Ok(Some(sid)),
         Err(e) if strict => Err(e),
-        Err(_) => Ok(None),
+        Err(e) => {
+            if std::env::var_os("ROSHERA_TESS_TRACE").is_some() {
+                eprintln!("[revolve] analytic bands declined, faceted grid used: {e:?}");
+            }
+            Ok(None)
+        }
     }
 }
 

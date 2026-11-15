@@ -186,3 +186,133 @@ fn a_revolution_of_a_spline_on_its_own_domain_is_the_swept_surface() {
         );
     }
 }
+
+/// An imported revolution face is a PATCH of its surface (here a quarter of
+/// the turn) and its mesh must face out where the patch actually is. The
+/// structured wedge mesher read each cell's outward side from the surface
+/// at a parameter scaled from the grid index -- right for a kernel wall that
+/// spans the whole surface, but on a patch it sampled the surface elsewhere
+/// (across the axis) and wound the triangles inward. Four hole walls of one
+/// CADGenBench part meshed inside out against every neighbour.
+#[test]
+fn an_imported_revolution_patch_meshes_facing_out() {
+    use geometry_engine::tessellation::{
+        edge_cache::EdgeSampleCache, tessellate_face, TessellationParams, TriangleMesh,
+    };
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(WALL), "rev")
+        .expect("imports");
+    let faces: Vec<_> = model.faces.iter().collect();
+    assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
+    let (_, face) = faces[0];
+    let params = TessellationParams::default();
+    let cache = EdgeSampleCache::new(&params);
+    let mut mesh = TriangleMesh::new();
+    tessellate_face(face, &model, &params, &cache, &mut mesh);
+    assert!(!mesh.triangles.is_empty(), "the wall meshes");
+    let mut inward = 0;
+    for t in &mesh.triangles {
+        let (a, b, c) = (
+            mesh.vertices[t[0] as usize].position,
+            mesh.vertices[t[1] as usize].position,
+            mesh.vertices[t[2] as usize].position,
+        );
+        let n = (b - a).cross(&(c - a));
+        let m = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+        // STEP says this wall faces away from the axis.
+        if n.dot(&geometry_engine::math::Vector3::new(m.x, m.y, 0.0)) < 0.0 {
+            inward += 1;
+        }
+    }
+    assert_eq!(
+        inward,
+        0,
+        "{inward} of {} triangles face the axis",
+        mesh.triangles.len()
+    );
+}
+
+/// A Backward revolution patch whose two rims have DIFFERENT radii -- a
+/// conical band, as a countersink or chamfer wall is written -- so its rims
+/// carry different sample counts and it meshes through the unequal-count
+/// branch. That branch took the face's outward side from its boundary's
+/// winding times the face sense, reading the loop as wound about the
+/// SURFACE normal; the kernel winds it about the face's OUTWARD normal, so
+/// every Backward band came out inside out (four countersink walls of one
+/// CADGenBench part, against every neighbour).
+#[test]
+fn a_backward_conical_revolution_band_meshes_facing_the_axis() {
+    use geometry_engine::tessellation::{
+        edge_cache::EdgeSampleCache, tessellate_face, TessellationParams, TriangleMesh,
+    };
+    let body = "#1=CARTESIAN_POINT('',(10.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#3=DIRECTION('',(-0.847998304005088,0.,0.529998940003180));
+#4=VECTOR('',#3,1.);
+#9=LINE('',#1,#4);
+#5=CARTESIAN_POINT('',(0.,0.,0.));
+#6=AXIS1_PLACEMENT('',#5,#2);
+#7=SURFACE_OF_REVOLUTION('',#9,#6);
+#11=CARTESIAN_POINT('',(10.,0.,0.));
+#12=CARTESIAN_POINT('',(0.,10.,0.));
+#13=CARTESIAN_POINT('',(0.,2.,5.));
+#14=CARTESIAN_POINT('',(2.,0.,5.));
+#21=VERTEX_POINT('',#11);
+#22=VERTEX_POINT('',#12);
+#23=VERTEX_POINT('',#13);
+#24=VERTEX_POINT('',#14);
+#30=DIRECTION('',(1.,0.,0.));
+#31=AXIS2_PLACEMENT_3D('',#5,#2,#30);
+#32=CIRCLE('',#31,10.);
+#33=CARTESIAN_POINT('',(0.,0.,5.));
+#34=AXIS2_PLACEMENT_3D('',#33,#2,#30);
+#35=CIRCLE('',#34,2.);
+#36=CARTESIAN_POINT('',(0.,10.,0.));
+#37=DIRECTION('',(0.,-0.847998304005088,0.529998940003180));
+#40=VECTOR('',#37,1.);
+#38=LINE('',#36,#40);
+#51=EDGE_CURVE('',#21,#22,#32,.T.);
+#52=EDGE_CURVE('',#22,#23,#38,.T.);
+#53=EDGE_CURVE('',#24,#23,#35,.T.);
+#54=EDGE_CURVE('',#21,#24,#9,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#62=ORIENTED_EDGE('',*,*,#52,.T.);
+#63=ORIENTED_EDGE('',*,*,#53,.F.);
+#64=ORIENTED_EDGE('',*,*,#54,.F.);
+#70=EDGE_LOOP('',(#61,#62,#63,#64));
+#71=FACE_BOUND('',#70,.F.);
+#80=ADVANCED_FACE('',(#71),#7,.F.);
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));";
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(body), "cone")
+        .expect("imports");
+    let faces: Vec<_> = model.faces.iter().collect();
+    assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
+    let (_, face) = faces[0];
+    let params = TessellationParams::default();
+    let cache = EdgeSampleCache::new(&params);
+    let mut mesh = TriangleMesh::new();
+    tessellate_face(face, &model, &params, &cache, &mut mesh);
+    assert!(!mesh.triangles.is_empty(), "the band meshes");
+    let mut away = 0;
+    for t in &mesh.triangles {
+        let (a, b, c) = (
+            mesh.vertices[t[0] as usize].position,
+            mesh.vertices[t[1] as usize].position,
+            mesh.vertices[t[2] as usize].position,
+        );
+        let n = (b - a).cross(&(c - a));
+        let m = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+        // Backward: this wall faces the axis.
+        if n.dot(&geometry_engine::math::Vector3::new(m.x, m.y, 0.0)) > 0.0 {
+            away += 1;
+        }
+    }
+    assert_eq!(
+        away,
+        0,
+        "{away} of {} triangles face away from the axis",
+        mesh.triangles.len()
+    );
+}
