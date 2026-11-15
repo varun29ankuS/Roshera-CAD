@@ -274,6 +274,8 @@ const READ_ONLY = new Set<string>([
   "rebuild_certificate",
   "label_list",
   "label_resolve",
+  "lens_explain",
+  "lens_why_not_sound",
   "blackboard_list",
   "assembly_list_instances",
   "assembly_view",

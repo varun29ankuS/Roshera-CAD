@@ -256,6 +256,8 @@ const BENCH_OF: Record<string, Bench> = {
   guide_attention: "core",
   section_view: "core",
   verify_part: "core",
+  lens_explain: "core",
+  lens_why_not_sound: "core",
   mass_properties: "core",
   document_units: "core",
   document_rename: "core",

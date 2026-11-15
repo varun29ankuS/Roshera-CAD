@@ -207,6 +207,7 @@ pub(crate) async fn make_test_state_with_database(
         consumed_uuids: Arc::new(DashMap::new()),
         solid_colors: Arc::new(DashMap::new()),
         solid_profiles: Arc::new(DashMap::new()),
+        lens: crate::lens_routes::LensStore::default(),
         ai_processor,
         session_aware_ai,
         full_integration_executor,
@@ -13027,4 +13028,149 @@ async fn each_feature_names_the_live_part_it_belongs_to() {
         vec![json!(live[0]), json!(live[0])],
         "box and hole both in the one part: {ch}"
     );
+}
+
+// =====================================================================
+// Tests — Kernel Lens routes (`/api/lens/{part}`, `/api/lens/{part}/face/{face_id}`)
+// =====================================================================
+
+/// A 10 mm box written by the export route's own STEP writer; with
+/// `flip_first_bound`, its first `FACE_OUTER_BOUND` is marked `.F.` so the
+/// importer has a decision to record.
+async fn box_step_text(flip_first_bound: bool) -> String {
+    let mut model = BRepModel::new();
+    TopologyBuilder::new(&mut model)
+        .create_box_3d(10.0, 10.0, 10.0)
+        .expect("box primitive must build for positive size");
+    let mut path = std::env::temp_dir();
+    path.push(format!("roshera_lens_route_{}.step", Uuid::new_v4()));
+    export_engine::formats::step::export_brep_to_step(&model, &path)
+        .await
+        .expect("STEP export of a single box must succeed");
+    let text = std::fs::read_to_string(&path).expect("exported STEP reads back");
+    let _ = std::fs::remove_file(&path);
+    if !flip_first_bound {
+        return text;
+    }
+    let at = text
+        .find("FACE_OUTER_BOUND(")
+        .expect("the writer emits outer bounds");
+    let rel = text[at..]
+        .find(".T.)")
+        .expect("an outer bound carries its flag");
+    let mut out = text.clone();
+    out.replace_range(at + rel..at + rel + 3, ".F.");
+    out
+}
+
+/// Import STEP text through the route; the imported object's UUID.
+async fn import_for_lens(state: &AppState, text: String) -> String {
+    let (status, body) = dispatch(state, import_step_post(json!({ "content": text }))).await;
+    assert_eq!(status, StatusCode::OK, "import: {body}");
+    body["objects"][0]["id"]
+        .as_str()
+        .expect("the imported object has an id")
+        .to_string()
+}
+
+fn lens_get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())
+        .expect("static request must build")
+}
+
+#[tokio::test]
+async fn importing_a_step_part_then_reading_its_lens() {
+    let state = make_test_state().await;
+    let part = import_for_lens(&state, box_step_text(true).await).await;
+    let (status, body) = dispatch(&state, lens_get(&format!("/api/lens/{part}"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let overview = body["overview"].as_array().expect("overview");
+    assert!(
+        overview.iter().any(|o| o["kind"] == "loop_reversed"),
+        "the reversed bound is in the overview: {body}"
+    );
+    let faces = body["faces"].as_array().expect("faces");
+    assert_eq!(faces.len(), 6, "{body}");
+    let touched: Vec<&Value> = faces
+        .iter()
+        .filter(|f| f["status"] != "as_written")
+        .collect();
+    assert_eq!(touched.len(), 1, "exactly the flipped face: {body}");
+    assert!(
+        touched[0]["pid"]
+            .as_str()
+            .map(|p| p.len() == 32)
+            .unwrap_or(false),
+        "faces are named by persistent id: {body}"
+    );
+    let face_id = touched[0]["face_id"].as_u64().expect("face id");
+    let (status, face) = dispatch(
+        &state,
+        lens_get(&format!("/api/lens/{part}/face/{face_id}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{face}");
+    let events = face["events"].as_array().expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["kind"] == "loop_reversed" && e["stage"] == "import"),
+        "the face's story names the decision: {face}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e["why"].as_str().map(|w| !w.is_empty()).unwrap_or(false)),
+        "every event says why: {face}"
+    );
+}
+
+#[tokio::test]
+async fn a_second_import_has_its_own_journal() {
+    let state = make_test_state().await;
+    let _flipped = import_for_lens(&state, box_step_text(true).await).await;
+    let clean = import_for_lens(&state, box_step_text(false).await).await;
+    let (status, body) = dispatch(&state, lens_get(&format!("/api/lens/{clean}"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sound"], true, "{body}");
+    assert!(
+        body["overview"]
+            .as_array()
+            .map(|o| o.is_empty())
+            .unwrap_or(false),
+        "the clean box carries none of the other part's events: {body}"
+    );
+    assert!(
+        body["faces"]
+            .as_array()
+            .expect("faces")
+            .iter()
+            .all(|f| f["status"] == "as_written"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn per_face_events_are_only_on_the_face_route() {
+    let state = make_test_state().await;
+    let part = import_for_lens(&state, box_step_text(true).await).await;
+    let (_, body) = dispatch(&state, lens_get(&format!("/api/lens/{part}"))).await;
+    for f in body["faces"].as_array().expect("faces") {
+        assert!(f.get("events").is_none(), "the overview stays small: {f}");
+    }
+}
+
+#[tokio::test]
+async fn unknown_solid_is_a_404_not_an_empty_lens() {
+    let state = make_test_state().await;
+    let (status, _) = dispatch(&state, lens_get("/api/lens/987654")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = dispatch(&state, lens_get(&format!("/api/lens/{}", Uuid::new_v4()))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let part = import_for_lens(&state, box_step_text(false).await).await;
+    let (status, _) = dispatch(&state, lens_get(&format!("/api/lens/{part}/face/987654"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a face not on the part");
 }

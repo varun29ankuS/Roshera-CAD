@@ -65,6 +65,7 @@ mod idempotency;
 #[cfg(test)]
 mod intent_required_mode_tests;
 mod kernel_state;
+mod lens_routes;
 mod metrics;
 mod part_mgr;
 mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transport)
@@ -187,6 +188,9 @@ pub struct AppState {
     /// timeline replay (the construction sidecar is set outside the recorded op,
     /// so a replay drops it) and `GET /parts/{id}/profile` can always recover it.
     pub solid_profiles: Arc<DashMap<u32, Vec<[f64; 2]>>>,
+    /// Kernel Lens: what the importer decided, by face persistent id
+    /// (served by `lens_routes`).
+    pub lens: lens_routes::LensStore,
 
     // Enhanced AI integration
     ai_processor: Arc<Mutex<AIProcessor>>,
@@ -5802,6 +5806,9 @@ async fn import_step_geometry(
     // each object's perception reports -- keyed by the ids the parts have
     // now.
     export_engine::formats::step::apply_certificates(&mut report, &certificates);
+    // Kernel Lens: keep what the importer decided, by face persistent id --
+    // the ids the merged faces still carry -- for `GET /api/lens/{part}`.
+    state.lens.record(&report.lens);
 
     Ok(Json(serde_json::json!({
         "success": report.ok,
@@ -10321,6 +10328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         consumed_uuids: Arc::new(DashMap::new()),
         solid_colors: Arc::new(DashMap::new()),
         solid_profiles: Arc::new(DashMap::new()),
+        lens: lens_routes::LensStore::default(),
         ai_processor,
         session_aware_ai,
         full_integration_executor,
@@ -11307,6 +11315,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // Frame readback (exteroception) — server-rendered PNG of the
         // live scene. Multimodal LLMs consume the image directly.
         .route("/api/frame", get(frame::get_frame))
+        .route("/api/lens/{part}", get(lens_routes::get_part_lens))
+        .route(
+            "/api/lens/{part}/face/{face_id}",
+            get(lens_routes::get_face_lens),
+        )
         // Documents (task doc-1, "Roshera has no New") — the top-level
         // scope above branches. POST creates an empty, unopened document;
         // GET lists every registered document (flagged with which one is

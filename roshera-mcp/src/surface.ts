@@ -21,6 +21,7 @@ import { registerIoTools } from "./tools/io.js";
 import { registerTimelineTools } from "./tools/timeline.js";
 import { registerBlackboardTools } from "./tools/blackboard.js";
 import { registerLabelTools } from "./tools/labels.js";
+import { registerLensTools } from "./tools/lens.js";
 import { registerAssemblyTools } from "./tools/assembly.js";
 import { registerGdtTools } from "./tools/gdt.js";
 import { registerDrawingTools } from "./tools/drawing.js";
@@ -138,6 +139,7 @@ export function buildTableWithControls(): {
   registerTimelineTools(table);
   registerBlackboardTools(table);
   registerLabelTools(table);
+  registerLensTools(table);
   registerAssemblyTools(table);
   registerGdtTools(table);
   registerDrawingTools(table);

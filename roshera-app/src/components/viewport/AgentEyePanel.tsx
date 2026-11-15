@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ModeChip, ModeChipGroup, StatusPill, TabChip } from '@/components/ui/status-pill'
+import { useSceneStore } from '@/stores/scene-store'
+import { useLensStore } from '@/stores/lens-store'
+import { fetchLensPart, lensSummary } from '@/lib/lens'
 
 const API_HOST = import.meta.env.VITE_API_URL || ''
 
 // Single-view render modes hit /render; `dim` and `section` hit the richer
 // EYE-1 / EYE-2 endpoints (2×2 dimensioned composite and a cross-section).
-type RenderMode = 'shaded' | 'diagnostic' | 'ids' | 'dim' | 'section'
+// `lens` keeps the shaded render and turns on the Kernel Lens: the live
+// model's faces tinted by what the kernel did to them (see LensFaceTints).
+type RenderMode = 'shaded' | 'diagnostic' | 'ids' | 'dim' | 'section' | 'lens'
 type ViewName = 'iso' | 'front' | 'top' | 'right'
 
 // What the eye is looking at: a single part (newest/selected), or an
@@ -15,7 +20,7 @@ type ViewName = 'iso' | 'front' | 'top' | 'right'
 // implicit "everything" assembly. Two scopes only: part + assembly.
 type Scope = 'part' | 'assembly'
 
-const SINGLE_VIEW: RenderMode[] = ['shaded', 'diagnostic', 'ids']
+const SINGLE_VIEW: RenderMode[] = ['shaded', 'diagnostic', 'ids', 'lens']
 
 // The scene-eye (`/api/agent/scene/orbit`) accepts the same render mode names
 // but has no per-part `dim`/`section` notion. These are the modes shared by
@@ -94,6 +99,15 @@ export function AgentEyePanel({
   // edits that keep the same list (e.g. a parameter edit on the same part).
   const lastSig = useRef<string | null>(null)
   const lastFullAt = useRef(0)
+  const lensPart = useLensStore((s) => s.part)
+  const setLensPart = useLensStore((s) => s.setPart)
+  const clearLens = useLensStore((s) => s.clear)
+  const [lensErr, setLensErr] = useState<string | null>(null)
+
+  // Leaving Lens mode (or the part scope) takes the tints off the model.
+  useEffect(() => {
+    if (mode !== 'lens' || scope !== 'part') clearLens()
+  }, [mode, scope, clearLens])
 
   // In Assembly mode only the scene-shared modes are valid; fall back cleanly
   // if the user was on `dim`/`section` when they switched.
@@ -186,8 +200,20 @@ export function AgentEyePanel({
         setDiag(null)
         setErr(null)
       } else {
+        if (mode === 'lens') {
+          // The scene object that shows this solid, for its mesh.
+          const obj = [...useSceneStore.getState().objects.values()].find((o) => o.analyticalGeometry?.solidId === id)
+          try {
+            const lp = await fetchLensPart(id)
+            if (obj) setLensPart(obj.id, id, lp)
+            setLensErr(obj ? null : 'part not in the viewport')
+          } catch (e) {
+            setLensErr(e instanceof Error ? e.message : String(e))
+          }
+        }
+        const renderMode = mode === 'lens' ? 'shaded' : mode
         const r = await fetch(
-          `${API_HOST}/api/agent/parts/${id}/render?mode=${mode}&view=${view}&size=256&bg=transparent`,
+          `${API_HOST}/api/agent/parts/${id}/render?mode=${renderMode}&view=${view}&size=256&bg=transparent`,
         )
         if (!r.ok) throw new Error(`render ${r.status}`)
         const data = (await r.json()) as { png_base64: string; open_edges: number; nonmanifold_edges: number }
@@ -200,7 +226,7 @@ export function AgentEyePanel({
     } finally {
       inFlight.current = false
     }
-  }, [scope, mode, view, az, el, sceneMode, assemblyId])
+  }, [scope, mode, view, az, el, sceneMode, assemblyId, setLensPart])
 
   useEffect(() => {
     if (minimized) return
@@ -230,7 +256,7 @@ export function AgentEyePanel({
 
   const activeMode: RenderMode = isSceneScope ? sceneMode : mode
   const modeOptions: RenderMode[] =
-    isSceneScope ? SCENE_MODES : (['shaded', 'diagnostic', 'ids', 'dim', 'section'] as RenderMode[])
+    isSceneScope ? SCENE_MODES : (['shaded', 'diagnostic', 'ids', 'dim', 'section', 'lens'] as RenderMode[])
 
   return (
     // DOCKED, not floating. A panel parked permanently over the canvas occludes
@@ -370,7 +396,36 @@ export function AgentEyePanel({
           )}
         </div>
 
-        {scope === 'part' && perc && (
+        {scope === 'part' && mode === 'lens' && (
+          // What the kernel did to this part, by kind. Pick a face on the model
+          // for its story.
+          <div className="flex min-w-[150px] flex-1 flex-col gap-1 font-mono text-[11px]">
+            {lensPart ? (
+              <>
+                <StatusPill
+                  tone={
+                    lensSummary(lensPart).state === 'blocking'
+                      ? 'negative'
+                      : lensSummary(lensPart).state === 'repaired'
+                        ? 'caution'
+                        : 'positive'
+                  }
+                  label={lensSummary(lensPart).text}
+                />
+                {lensPart.overview.map((o) => (
+                  <div key={o.kind} className="flex justify-between gap-3">
+                    <span className="text-muted-foreground">{o.kind.replace(/_/g, ' ')}</span>
+                    <span className="tabular-nums">{o.count}</span>
+                  </div>
+                ))}
+                <span className="text-muted-foreground">pick a face for its story</span>
+              </>
+            ) : (
+              <span className="text-muted-foreground">{lensErr ?? 'reading the journal…'}</span>
+            )}
+          </div>
+        )}
+        {scope === 'part' && mode !== 'lens' && perc && (
           // Label/value pairs in a column, not five chips distributed across
           // the panel. Bookending is legal at the PAIR level — that is a spec
           // sheet — and illegal across five peers, which is what made the old

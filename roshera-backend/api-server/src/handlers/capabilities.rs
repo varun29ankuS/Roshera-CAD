@@ -343,6 +343,7 @@ fn endpoints() -> Value {
             "capabilities": "GET /api/capabilities",
             "kernel_state": "GET /api/kernel/state",
             "frame":        "GET /api/frame",
+            "lens":         "GET /api/lens/{part}, GET /api/lens/{part}/face/{face_id}",
             "health":       "GET /health"
         },
         "timeline": {

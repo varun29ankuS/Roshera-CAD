@@ -124,8 +124,10 @@ const table = buildTable();
   // 114 -> 115 (2026-11-12): drawing_set_title (kernel, "drawing").
   // 115 -> 116 (2026-11-14): guide_attention (kernel, "core") -- the agent drives
   // the user's app to show them something (POST /api/agent/show).
-  if (table.size === 116) pass("table holds 116 tools (111 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 116`);
+  // 116 -> 118 (2026-11-15): lens_explain + lens_why_not_sound (kernel,
+  // "core") -- the agent reads the Kernel Lens journal.
+  if (table.size === 118) pass("table holds 118 tools (113 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 118`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -153,8 +155,9 @@ const table = buildTable();
 
   const full = exposedNamesFor(table, "full");
   // 109 -> 111 (2026-11-11): drawing_set_dimension + drawing_set_projection.
-  if (full.length === 113) pass("full surface exposes exactly 113 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 113`);
+  // 113 -> 115 (2026-11-15): lens_explain + lens_why_not_sound.
+  if (full.length === 115) pass("full surface exposes exactly 115 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 115`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");

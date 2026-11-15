@@ -1834,6 +1834,34 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "required": ["part_id"]
             }),
         ),
+        // ═══════════════════ KERNEL LENS ═══════════════════
+        t(
+            "lens_explain",
+            Core,
+            Stable,
+            Curated,
+            "What the kernel decided about a part, per face: overview and face statuses, or one face's story (rule followed, numbers measured).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
+                    "face_id": {"type": "integer", "description": "a face of the part, for its story"}
+                },
+                "required": ["part_id"]
+            }),
+        ),
+        t(
+            "lens_why_not_sound",
+            Core,
+            Stable,
+            Curated,
+            "Why a part is not sound: each failing certificate check with the faces it is on, what was measured, and what to look at next. Read-only.",
+            json!({
+                "type": "object",
+                "properties": {"part_id": {"type": "integer", "description": "kernel part id from list_parts"}},
+                "required": ["part_id"]
+            }),
+        ),
         // ═══════════════════ LABELS ═══════════════════
         t(
             "label_create",
@@ -2262,7 +2290,9 @@ mod tests {
         // 111 -> 112 (2026-11-12): drawing_set_title.
         // 112 -> 113 (2026-11-14): guide_attention -- the agent drives the
         // user's app to show them something (POST /api/agent/show).
-        assert_eq!(tools.len(), 113, "expected 113 tools, got {}", tools.len());
+        // 113 -> 115 (2026-11-15): lens_explain + lens_why_not_sound -- the
+        // agent reads the Kernel Lens journal (GET /api/lens/{part}).
+        assert_eq!(tools.len(), 115, "expected 115 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

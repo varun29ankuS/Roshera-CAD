@@ -869,6 +869,7 @@ fn describe_operation(method: &Method, path: &str, body: Option<&Value>) -> Opti
 
         // ── misc reads agents legitimately perform ────────────────
         ["frame"] if get => "viewport frame",
+        ["lens", ..] if get => "kernel lens query",
         ["scene", "snapshot"] if get => "scene snapshot",
         ["hierarchy", ..] if get => "hierarchy query",
         ["kernel", "state"] if get => "kernel state query",
