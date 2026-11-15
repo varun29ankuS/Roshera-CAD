@@ -146,9 +146,40 @@ def _circ2(cx, r):
 
 
 def t_sketch():
-    r1, c1 = strip2d(_rect2(-0.2, 0.42, 0.34), 0.05), strip2d(_circ2(0.45, 0.3), 0.05)
-    return _sketch(lambda p: union(r1(p), c1(p)),
-                   [(-0.62, -0.34), (0.22, -0.34), (0.22, 0.34), (-0.62, 0.34), (0.45, 0.0)])
+    # Read at 16 px: a FLAT sketch plane (seen as a large iso diamond, like the
+    # extrude icon's base), a bold closed yellow profile standing proud of it,
+    # big white nodes at its corners, and a blue pencil drawing it.
+    w = 0.1
+
+    def outline2d(p):
+        slab = np.maximum(np.abs(p[..., 1]) - 0.5, -0.8 - p[..., 0])
+        cap = np.linalg.norm(p[..., :2] - np.array([0.15, 0.0]), axis=-1) - 0.5
+        return np.maximum(slab, np.minimum(p[..., 0] - 0.15, cap))
+
+    def raised(d2, width):
+        return lambda p: np.maximum(np.abs(d2(p)) - width, np.abs(p[..., 2] - 0.02) - 0.08)
+
+    prof = lambda p: union(raised(outline2d, w)(p), raised(_circ2(0.15, 0.2), w * 0.8)(p))
+
+    def plate(p):
+        return box(p, V(0, 0, -0.12), V(1.05, 1.05, 0.06))
+
+    pts = [(-0.8, -0.5), (-0.8, 0.5), (0.15, 0.5), (0.15, -0.5)]
+
+    def nodes(p):
+        d = None
+        for x, y in pts:
+            c = sphere(p, V(x, y, 0.08), 0.15)
+            d = c if d is None else union(d, c)
+        return d
+
+    def pencil(p):
+        shaft = capsule(p, V(0.95, -0.95, 0.95), V(0.55, -0.55, 0.38), 0.11)
+        tip = capsule(p, V(0.55, -0.55, 0.38), V(0.42, -0.42, 0.16), 0.055)
+        return union(shaft, tip)
+
+    whole = lambda p: union(union(union(plate(p), prof(p)), nodes(p)), pencil(p))
+    return Scene(whole, {"feature": on(prof, 0.04), "node": on(nodes, 0.04), "info": on(pencil, 0.04)})
 
 
 def t_polyline():

@@ -13,11 +13,11 @@ import {
   ContextMenuItem,
   ContextMenuSeparator,
 } from '@/components/ui/context-menu'
-import { useSceneStore, isStandardPlane, type CADObject, type SketchPlane } from '@/stores/scene-store'
+import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useWSStore } from '@/stores/ws-store'
 import { useDocumentStore } from '@/stores/document-store'
-import { sketchApi, type ServerSketchSession } from '@/lib/sketch-api'
+import { sketchApi } from '@/lib/sketch-api'
 import { createPartDrawing } from '@/lib/drawings-api'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
@@ -373,95 +373,6 @@ function TreeItem({
 // ─── Convert backend hierarchy to tree nodes ────────────────────────
 
 
-// ─── Build sketch nodes from server-tracked sessions ────────────────
-
-/**
- * One tree node per known sketch session. Children describe the
- * sketch's plane and tool — purely informational, the actual edit
- * action is on the parent node's context menu ("Edit sketch").
- *
- * Sessions are sorted by `created_at` so the order in the tree is
- * stable across re-renders — backend `Map` iteration order is
- * insertion-order today but we don't want to rely on that.
- */
-function sketchPlaneLabel(plane: SketchPlane): string {
-  // Standard planes serialise as bare strings ('xy' | 'xz' | 'yz');
-  // face-anchored sketches arrive as { origin, u_axis, v_axis } objects
-  // which have no `.toUpperCase()`. Calling it unconditionally on a
-  // discriminated union throws at runtime and tears down the model
-  // tree render — that's how Task #38's plane refactor leaked into the
-  // browser as a "nothing renders, can't right-click anything" state.
-  return isStandardPlane(plane) ? plane.toUpperCase() : 'FACE'
-}
-
-function sketchesToNodes(
-  sketches: Map<string, ServerSketchSession>,
-  hiddenSketchIds: Set<string>,
-): TreeNode[] {
-  return Array.from(sketches.values())
-    .sort((a, b) => a.created_at - b.created_at)
-    .map((s, idx) => {
-      const planeLabel = sketchPlaneLabel(s.plane)
-      // Defensive: a session deserialised from an older format (or a
-      // partial WS frame the bridge let through) may be missing
-      // `shapes` entirely. Reading `.reduce` on `undefined` here used
-      // to throw and tear down the entire ModelTree render — same
-      // failure mode the `sketchPlaneLabel` defense above guards
-      // against. Treat a missing/invalid shapes array as zero shapes.
-      const shapes = Array.isArray(s.shapes) ? s.shapes : []
-      const totalPoints = shapes.reduce(
-        (sum, shape) =>
-          sum + (Array.isArray(shape?.points) ? shape.points.length : 0),
-        0,
-      )
-      const ptSuffix = totalPoints === 1 ? 'pt' : 'pts'
-      const shapeSuffix =
-        shapes.length > 1 ? ` · ${shapes.length} shapes` : ''
-      return {
-        id: s.id,
-        name: `Sketch ${idx + 1} (${planeLabel} · ${totalPoints} ${ptSuffix}${shapeSuffix})`,
-        type: 'sketch',
-        symbol: symbolForType('sketch'),
-        visible: !hiddenSketchIds.has(s.id),
-        locked: false,
-      }
-    })
-}
-
-/**
- * Index objects by the sketch id they were produced from. Each
- * extrude / extrude_cut result carries
- * `analyticalGeometry.params.sketch_id` (set by `extrude_sketch` in
- * api-server/src/sketch.rs); we read it back so the tree can nest the
- * source sketch *under* the resulting solid — the convention every
- * mainstream CAD package uses and the explicit design intent recorded
- * on `ExtrudeSketchBody.consume` (default `false` precisely so the
- * sketch persists for re-edit).
- *
- * Returns a `sketchId -> ownerObjectId` map. Sketches that don't
- * appear in this map are still in the "drawing" phase and render at
- * root.
- */
-function indexSketchOwners(objects: Map<string, CADObject>): Map<string, string> {
-  const owners = new Map<string, string>()
-  for (const obj of objects.values()) {
-    const params = obj.analyticalGeometry?.params as
-      | Record<string, unknown>
-      | undefined
-    const sketchId = params?.['sketch_id']
-    if (typeof sketchId === 'string' && sketchId.length > 0) {
-      // First writer wins — if a sketch was extruded, then later
-      // (re-)extruded into a second body, the original producer keeps
-      // the lineage badge so the tree shape stays stable across edits.
-      if (!owners.has(sketchId)) {
-        owners.set(sketchId, obj.id)
-      }
-    }
-  }
-  return owners
-}
-
-
 // ─── Build tree from local scene store (fallback) ───────────────────
 
 
@@ -511,7 +422,6 @@ export function ModelTree({
   const selectObject = useSceneStore((s) => s.selectObject)
   const updateObject = useSceneStore((s) => s.updateObject)
   const serverSketches = useSceneStore((s) => s.serverSketches)
-  const hiddenSketchIds = useSceneStore((s) => s.hiddenSketchIds)
   const toggleSketchVisibility = useSceneStore((s) => s.toggleSketchVisibility)
   const wsStatus = useWSStore((s) => s.status)
 
@@ -646,34 +556,7 @@ export function ModelTree({
       ]),
     [objects, objectOrder, missingParts],
   )
-  const allSketchNodes = sketchesToNodes(serverSketches, hiddenSketchIds)
   const datumNodes = datumsToNodes(datums)
-
-  // Split sketches into "owned" (parent body exists in the scene) and
-  // "standalone" (still in the drawing / pre-extrude phase). The
-  // ownership index is built from the canonical scene-store object
-  // map regardless of which object source feeds the tree, because the
-  // `analyticalGeometry.params.sketch_id` link lives on every object
-  // broadcast and is the single source of lineage truth.
-  const sketchOwners = indexSketchOwners(objects)
-  const sketchesByOwnerId = new Map<string, TreeNode[]>()
-  const standaloneSketchNodes: TreeNode[] = []
-  for (const sketchNode of allSketchNodes) {
-    const ownerId = sketchOwners.get(sketchNode.id)
-    if (ownerId !== undefined) {
-      const existing = sketchesByOwnerId.get(ownerId)
-      if (existing) {
-        existing.push(sketchNode)
-      } else {
-        sketchesByOwnerId.set(ownerId, [sketchNode])
-      }
-    } else {
-      standaloneSketchNodes.push(sketchNode)
-    }
-  }
-  // Sketches the old sketch tool attached to a part list with the others:
-  // the one tree nests features under parts, and a sketch is not a feature.
-  const sketchNodes = [...standaloneSketchNodes, ...[...sketchesByOwnerId.values()].flat()]
 
   const handleToggleVisibility = useCallback(
     (id: string) => {
@@ -849,25 +732,17 @@ export function ModelTree({
                 }
               />
             )}
+            {/* Parts with their features; each feature made from a sketch
+                holds that sketch (Extrude1 > Sketch1); sketches no feature
+                has used yet follow, in the same rows. */}
             <ChapterList
               onPartContextMenu={(e, id, name) =>
                 handleNodeContextMenu(e, { id, name, type: 'part', symbol: '◆' })
               }
+              onSketchContextMenu={(e, sk) =>
+                handleNodeContextMenu(e, { id: sk.id, name: sk.name, type: 'sketch', symbol: '' })
+              }
             />
-            {sketchNodes.map((node: TreeNode, idx: number) => (
-              <TreeItem
-                key={node.id}
-                node={node}
-                siblings={sketchNodes.map((n: TreeNode) => n.name)}
-                isLast={idx === sketchNodes.length - 1}
-                ancestorIsLast={[]}
-                selectedIds={selectedIds}
-                onSelect={selectObject}
-                onToggleVisibility={handleToggleVisibility}
-                onToggleLock={handleToggleLock}
-                onContextMenu={handleNodeContextMenu}
-              />
-            ))}
           </div>
         </ScrollArea>
       )}

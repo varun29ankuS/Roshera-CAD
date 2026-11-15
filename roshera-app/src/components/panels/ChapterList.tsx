@@ -7,12 +7,88 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { cn } from '@/lib/utils'
-import { chapterIconKey, chapterTitle, groupByPart, inFeatureTree, partLabel, type Chapter, type TreePart } from '@/lib/chapters-api'
+import { chapterIconKey, chapterTitle, groupByPart, inFeatureTree, partLabel, sketchOwners, type Chapter, type TreePart } from '@/lib/chapters-api'
 import { useSceneStore } from '@/stores/scene-store'
 import { useChapters } from '@/hooks/use-chapters'
 import { useHistoryView } from '@/stores/history-view-store'
 import { featureFields, fetchEditableParameters, sizeSummary, type EditableParameter } from '@/lib/feature-edit'
 import { Box, Check, ChevronDown, ChevronRight, Eye, EyeOff, X, ToolIcons } from '@/components/ui/icons'
+import { isStandardPlane, type SketchPlane } from '@/stores/scene-store'
+import type { ServerSketchSession } from '@/lib/sketch-api'
+
+/** A sketch as the tree lists it. */
+export interface TreeSketch {
+  id: string
+  /** "Sketch 3", numbered in creation order as CAD trees number them. */
+  name: string
+  /** The plane it is drawn on, for the row's detail column. */
+  plane: string
+}
+
+function planeLabel(plane: SketchPlane): string {
+  // Face-anchored sketches arrive as { origin, u_axis, v_axis } objects.
+  return isStandardPlane(plane) ? plane.toUpperCase() : 'Face'
+}
+
+/** The document's sketches, numbered in creation order. */
+export function treeSketches(sessions: Map<string, ServerSketchSession>): TreeSketch[] {
+  return Array.from(sessions.values())
+    .sort((a, b) => a.created_at - b.created_at)
+    .map((s, i) => ({ id: s.id, name: `Sketch ${i + 1}`, plane: planeLabel(s.plane) }))
+}
+
+/** What a sketch row can do, from the tree that owns sketch actions. */
+export interface SketchRowActions {
+  selectedIds: Set<string>
+  hidden: Set<string>
+  onSelect: (id: string, additive: boolean) => void
+  onToggleVisible: (id: string) => void
+  onContextMenu?: (e: React.MouseEvent, sketch: TreeSketch) => void
+}
+
+/** A sketch row: the same row, font and icon family as a feature. */
+function SketchRow({ sketch, depth, actions }: { sketch: TreeSketch; depth: number; actions: SketchRowActions }) {
+  const visible = !actions.hidden.has(sketch.id)
+  const selected = actions.selectedIds.has(sketch.id)
+  return (
+    <li>
+      <div
+        role="treeitem"
+        aria-selected={selected}
+        tabIndex={0}
+        onClick={(e) => actions.onSelect(sketch.id, e.shiftKey || e.ctrlKey || e.metaKey)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') actions.onSelect(sketch.id, false)
+        }}
+        onContextMenu={actions.onContextMenu ? (e) => actions.onContextMenu?.(e, sketch) : undefined}
+        title={`${sketch.name} -- on the ${sketch.plane} plane`}
+        className={cn(
+          'group flex h-6 items-center gap-1.5 rounded px-1.5 cursor-default outline-none',
+          'hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring',
+          selected && 'bg-accent/60',
+          !visible && 'opacity-50',
+        )}
+        style={{ paddingLeft: 6 + depth * 14 }}
+      >
+        <span className="w-3 shrink-0" />
+        <ToolIcons.sketch size={17} />
+        <span className="min-w-0 flex-1 truncate text-[12px] text-foreground">{sketch.name}</span>
+        <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{sketch.plane}</span>
+        <button
+          type="button"
+          aria-label={visible ? `Hide ${sketch.name}` : `Show ${sketch.name}`}
+          onClick={(e) => {
+            e.stopPropagation()
+            actions.onToggleVisible(sketch.id)
+          }}
+          className={cn('shrink-0 text-muted-foreground hover:text-foreground', visible && 'opacity-0 group-hover:opacity-100')}
+        >
+          {visible ? <Eye size={12} /> : <EyeOff size={12} />}
+        </button>
+      </div>
+    </li>
+  )
+}
 
 function ChapterIcon({ c, size }: { c: Chapter; size: number }) {
   const key = chapterIconKey(c.kind)
@@ -51,9 +127,14 @@ function Row({
   onSelect,
   ahead = false,
   params,
+  sketchOf,
+  sketchActions,
 }: {
   c: Chapter
   depth: number
+  /** The sketch a chapter was made from, when the tree knows it. */
+  sketchOf: (c: Chapter) => TreeSketch | undefined
+  sketchActions: SketchRowActions
   /** Every size an edit can change, for the row's size column. */
   params: EditableParameter[]
   selected: number | null
@@ -63,17 +144,21 @@ function Row({
 }) {
   const [open, setOpen] = useState(false)
   const isPattern = c.instances.length > 0
+  // A feature made from a sketch owns it, as in every CAD tree
+  // (Extrude1 > Sketch1); it folds open like a pattern.
+  const sketch = sketchOf(c)
+  const opens = isPattern || sketch !== undefined
   return (
     <li>
       <div
         role="treeitem"
         aria-selected={selected === c.anchor}
-        aria-expanded={isPattern ? open : undefined}
+        aria-expanded={opens ? open : undefined}
         tabIndex={0}
         onClick={() => onSelect(c.anchor)}
         onKeyDown={(e) => {
           if (e.key === 'Enter') onSelect(c.anchor)
-          if (isPattern && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) setOpen(e.key === 'ArrowRight')
+          if (opens && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) setOpen(e.key === 'ArrowRight')
         }}
         title={byline(c) || undefined}
         className={cn(
@@ -84,10 +169,10 @@ function Row({
         )}
         style={{ paddingLeft: 6 + depth * 14 }}
       >
-        {isPattern ? (
+        {opens ? (
           <button
             type="button"
-            aria-label={open ? 'Fold the pattern' : 'Open the pattern'}
+            aria-label={open ? `Fold ${displayName(c)}` : `Open ${displayName(c)}`}
             onClick={(e) => {
               e.stopPropagation()
               setOpen((o) => !o)
@@ -118,10 +203,21 @@ function Row({
           {c.refusals[0].reason}
         </div>
       ) : null}
-      {isPattern && open ? (
+      {opens && open ? (
         <ul role="group">
+          {sketch ? <SketchRow sketch={sketch} depth={depth + 1} actions={sketchActions} /> : null}
           {c.instances.map((i) => (
-            <Row key={i.anchor} c={i} depth={depth + 1} selected={selected} onSelect={onSelect} ahead={ahead} params={params} />
+            <Row
+              key={i.anchor}
+              c={i}
+              depth={depth + 1}
+              selected={selected}
+              onSelect={onSelect}
+              ahead={ahead}
+              params={params}
+              sketchOf={sketchOf}
+              sketchActions={sketchActions}
+            />
           ))}
         </ul>
       ) : null}
@@ -215,10 +311,13 @@ function PartRow({
 export function ChapterList({
   branch = 'main',
   onPartContextMenu,
+  onSketchContextMenu,
 }: {
   branch?: string
   /** Right-click on a part row (rename / delete ...). */
   onPartContextMenu?: (e: React.MouseEvent, id: string, name: string) => void
+  /** Right-click on a sketch row (edit sketch ...). */
+  onSketchContextMenu?: (e: React.MouseEvent, sketch: TreeSketch) => void
 }) {
   const { chapters: all, loading, error } = useChapters(branch)
   // Features only: a size edit is history (it stays on the slider), not a
@@ -240,6 +339,33 @@ export function ChapterList({
     [objects, objectOrder],
   )
   const groups = useMemo(() => groupByPart(chapters, parts), [chapters, parts])
+  const serverSketches = useSceneStore((s) => s.serverSketches)
+  const hiddenSketchIds = useSceneStore((s) => s.hiddenSketchIds)
+  const toggleSketchVisibility = useSceneStore((s) => s.toggleSketchVisibility)
+  const sketches = useMemo(() => treeSketches(serverSketches), [serverSketches])
+  // Which feature each sketch belongs to (see `sketchOwners`).
+  const sketchOwner = useMemo(() => {
+    const bodies = [...objects.values()].flatMap((o) => {
+      const params = o.analyticalGeometry?.params as Record<string, unknown> | undefined
+      const sketchId = params?.['sketch_id']
+      const solidId = o.analyticalGeometry?.solidId
+      return typeof sketchId === 'string' && solidId !== undefined ? [{ sketchId, solidId }] : []
+    })
+    return sketchOwners(chapters, sketches.map((s) => s.id), bodies)
+  }, [chapters, sketches, objects])
+  const sketchById = new Map(sketches.map((s) => [s.id, s]))
+  const sketchOf = (c: Chapter) => {
+    const id = sketchOwner.owner.get(c.anchor)
+    return id ? sketchById.get(id) : undefined
+  }
+  const looseSketches = sketchOwner.loose.flatMap((id) => sketchById.get(id) ?? [])
+  const sketchActions: SketchRowActions = {
+    selectedIds,
+    hidden: hiddenSketchIds,
+    onSelect: (id, additive) => selectObject(id, additive),
+    onToggleVisible: toggleSketchVisibility,
+    onContextMenu: onSketchContextMenu,
+  }
   const [folded, setFolded] = useState<Set<string>>(new Set())
   // Selecting a feature highlights it, as in a feature tree. It never
   // moves the timeline: only the slider travels in time. Rows after the
@@ -263,7 +389,7 @@ export function ChapterList({
   if (error && chapters.length === 0 && parts.length === 0) {
     return <div className="px-3 py-2 text-[11px] text-destructive">history unavailable — {error}</div>
   }
-  if (chapters.length === 0 && parts.length === 0) {
+  if (chapters.length === 0 && parts.length === 0 && sketches.length === 0) {
     return (
       <div className="px-3 py-2 text-[11px] text-muted-foreground">
         {loading ? '⋯ loading history' : '∅ no parts yet — build something and it appears here'}
@@ -280,6 +406,8 @@ export function ChapterList({
         onSelect={select}
         ahead={viewing !== null && c.anchor > viewing}
         params={params}
+        sketchOf={sketchOf}
+        sketchActions={sketchActions}
       />
     ))
   return (
@@ -319,6 +447,10 @@ export function ChapterList({
           featureRows(g.features, 0)
         ),
       )}
+      {/* Sketches no feature has used yet: after the parts, in the same rows. */}
+      {looseSketches.map((sk) => (
+        <SketchRow key={sk.id} sketch={sk} depth={0} actions={sketchActions} />
+      ))}
     </ul>
   )
 }

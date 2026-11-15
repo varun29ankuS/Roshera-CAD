@@ -2106,6 +2106,9 @@ pub async fn extrude_sketch(
             "sketch_extrude",
         )
         .with_parameters(serde_json::json!({
+            // Which sketch this feature consumed: the feature tree nests the
+            // sketch under it (Extrude1 > Sketch1, as every CAD tree does).
+            "sketch_id": session.id.to_string(),
             "origin": [frame_origin.x, frame_origin.y, frame_origin.z],
             "u_axis": [u_pt.x - frame_origin.x, u_pt.y - frame_origin.y, u_pt.z - frame_origin.z],
             "v_axis": [v_pt.x - frame_origin.x, v_pt.y - frame_origin.y, v_pt.z - frame_origin.z],

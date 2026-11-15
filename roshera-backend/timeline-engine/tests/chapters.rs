@@ -281,3 +281,30 @@ fn every_feature_names_the_part_it_ended_up_in() {
         "{cs:#?}"
     );
 }
+
+/// A feature made from a sketch names the sketch it consumed, so the tree
+/// can nest the sketch under it (Extrude1 > Sketch1, as every CAD tree does;
+/// Varun 2026-11-15: "a part that is extruded from sketch should show
+/// that"). Either sketch tool: the session sketch (`sketch_id`) or the
+/// constrained sketch (`csketch_id`).
+#[test]
+fn a_sketch_feature_names_the_sketch_it_consumed() {
+    let session_extrude = ev(
+        1,
+        "sketch_extrude",
+        json!({
+            "params": { "sketch_id": "session-7", "distance": 5.0, "regions": [] },
+            "inputs": [], "outputs": ["solid:1"]
+        }),
+    );
+    let h = vec![
+        boxx(0, 0, 10.0),
+        session_extrude,
+        sketch_extrude(2, "S9", 2),
+    ];
+    let cs = chapters(&h);
+    assert_eq!(cs.len(), 3, "{cs:#?}");
+    assert_eq!(cs[0].sketch, None, "a box is made from no sketch");
+    assert_eq!(cs[1].sketch.as_deref(), Some("session-7"));
+    assert_eq!(cs[2].sketch.as_deref(), Some("S9"));
+}

@@ -50,6 +50,12 @@ pub struct Chapter {
     /// became after everything that consumed it (a hole's cut ends in the
     /// body it was cut into). `None` when the feature makes no solid.
     pub part: Option<u64>,
+    /// The sketch this feature was made from (a sketch extrude / revolve):
+    /// the session sketch's `sketch_id` or the constrained sketch's
+    /// `csketch_id`. The feature tree nests that sketch under the feature.
+    /// `None` for a feature made from no sketch, or recorded before
+    /// features named their sketch.
+    pub sketch: Option<String>,
 }
 
 /// One recorded step, read once.
@@ -124,6 +130,7 @@ pub fn chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
         |c: &Chapter| !c.events.is_empty() && c.events.iter().all(|s| deleted.is_suppressed(*s));
     let mut out = fold_sketch_edits(events, all_chapters(events));
     assign_parts(events, &mut out);
+    assign_sketches(events, &mut out);
     for c in &mut out {
         c.instances.retain(|i| !gone(i));
     }
@@ -179,6 +186,44 @@ fn assign_parts(events: &[TimelineEvent], chapters: &mut [Chapter]) {
         }
         c.part = part_of(c);
     }
+}
+
+/// Name, on every feature made from a sketch, the sketch it consumed.
+fn assign_sketches(events: &[TimelineEvent], chapters: &mut [Chapter]) {
+    let by_seq: HashMap<u64, &TimelineEvent> =
+        events.iter().map(|e| (e.sequence_number, e)).collect();
+    for c in chapters.iter_mut() {
+        if c.kind == "sketch" {
+            continue;
+        }
+        c.sketch = c
+            .events
+            .iter()
+            .filter_map(|s| by_seq.get(s))
+            .find_map(|e| consumed_sketch_of(e))
+            .map(str::to_string);
+    }
+}
+
+/// The sketch a FEATURE step was made from: the session sketch an extrude
+/// recorded (`sketch_id`) or the constrained sketch (`csketch_id`) of a
+/// sketch extrude / revolve. Sketch EDIT steps carry `csketch_id` too, but
+/// they fold into their feature, whose own step names the same sketch.
+fn consumed_sketch_of(e: &TimelineEvent) -> Option<&str> {
+    let Operation::Generic {
+        command_type,
+        parameters,
+    } = &e.operation
+    else {
+        return None;
+    };
+    if !command_type.starts_with("sketch_") {
+        return None;
+    }
+    let p = parameters.get("params").unwrap_or(parameters);
+    p.get("sketch_id")
+        .or_else(|| p.get("csketch_id"))
+        .and_then(Value::as_str)
 }
 
 /// The sketch a recorded step belongs to (`csketch_id`), if any.
@@ -357,6 +402,7 @@ fn all_chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
                 instances: Vec::new(),
                 anchor: s.seq,
                 part: None,
+                sketch: None,
             },
             anchor: s.seq,
             tool: tool_feature,
@@ -430,6 +476,7 @@ fn all_chapters(events: &[TimelineEvent]) -> Vec<Chapter> {
                 instances: Vec::new(),
                 anchor: s.seq,
                 part: None,
+                sketch: None,
             },
             anchor: s.seq,
             tool: None,
@@ -552,6 +599,7 @@ fn group_patterns(drafts: Vec<Draft>) -> Vec<Chapter> {
                 anchor: instances.last().map_or(0, |c| c.anchor),
                 instances,
                 part: None,
+                sketch: None,
             });
             i = j;
         } else {

@@ -42,6 +42,51 @@ export interface Chapter {
   /** The part (live kernel solid id) this feature ended up in, when it
    *  stands now; null when it made no solid or its part is gone. */
   part?: number | null
+  /** The sketch this feature was made from (session `sketch_id` or
+   *  constrained `csketch_id`); the tree nests that sketch under it. */
+  sketch?: string | null
+}
+
+/** Which feature each sketch belongs to (Extrude1 > Sketch1, as every CAD
+ *  tree nests it), keyed by the feature's anchor step.
+ *
+ *  The kernel names the sketch on the chapter (`sketch`). History recorded
+ *  before that is linked through the body the sketch made (`bodies`: the
+ *  sketch id an extruded body carries, and that body's solid): it goes to the
+ *  first sketch feature (extrude / revolve / cut / boss) of the part that body
+ *  ended up in, that has no sketch yet. A sketch is owned once; the rest are
+ *  `loose` (drawn, not yet used by a feature). */
+export function sketchOwners(
+  chapters: Chapter[],
+  sketchIds: string[],
+  bodies: { sketchId: string; solidId: number }[],
+): { owner: Map<number, string>; loose: string[] } {
+  const known = new Set(sketchIds)
+  const owner = new Map<number, string>()
+  const claimed = new Set<string>()
+  const walk = (cs: Chapter[], f: (c: Chapter) => void) =>
+    cs.forEach((c) => {
+      f(c)
+      walk(c.instances, f)
+    })
+  walk(chapters, (c) => {
+    if (c.sketch && known.has(c.sketch) && !claimed.has(c.sketch)) {
+      owner.set(c.anchor, c.sketch)
+      claimed.add(c.sketch)
+    }
+  })
+  const sketchFeature = (k: string) => k === 'extrude' || k === 'revolve' || k === 'cut' || k === 'boss'
+  for (const b of bodies) {
+    if (!known.has(b.sketchId) || claimed.has(b.sketchId)) continue
+    const c = chapters.find(
+      (ch) => sketchFeature(ch.kind) && ch.part === b.solidId && !ch.sketch && !owner.has(ch.anchor),
+    )
+    if (c) {
+      owner.set(c.anchor, b.sketchId)
+      claimed.add(b.sketchId)
+    }
+  }
+  return { owner, loose: sketchIds.filter((id) => !claimed.has(id)) }
 }
 
 /** A part as the one tree lists it. */
