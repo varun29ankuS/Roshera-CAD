@@ -263,22 +263,9 @@ impl EntityHandler for ToroidalSurfaceHandler {
                 message: "non-positive radius".into(),
             };
         }
-        // STEP allows "spindle" tori where minor_radius > major_radius
-        // (self-intersecting). The kernel rejects those; surface the
-        // rejection up-front so the warning attribution is clean.
-        if raw_minor >= raw_major {
-            push_warn(
-                ctx,
-                names::TOROIDAL_SURFACE,
-                instance,
-                format!(
-                    "minor_radius {raw_minor} ≥ major_radius {raw_major}; spindle/horn torus unsupported"
-                ),
-            );
-            return HandlerOutcome::Failed {
-                message: "spindle torus".into(),
-            };
-        }
+        // Horn (minor = major) and spindle (minor > major) tori are valid
+        // STEP surfaces -- Open CASCADE writes them for a fillet rounded
+        // down to the axis -- and the kernel's torus takes them.
         let placement = match resolve_placement(placement_ref, registry, dispatch, ctx) {
             Some(p) => p,
             None => {
@@ -651,23 +638,24 @@ mod tests {
         );
     }
 
+    /// Horn (minor = major) and spindle (minor > major) tori are valid STEP
+    /// surfaces -- Open CASCADE writes them for a fillet rounded down to the
+    /// axis -- and import as surfaces (13 of the 81 CADGenBench parts built
+    /// no solid while they were refused).
     #[test]
-    fn toroidal_surface_rejects_spindle_minor_ge_major() {
-        let body = format!(
-            "{WORLD_PLACEMENT}\
-             #10 = TOROIDAL_SURFACE('t',#4,2.0,5.0);\n"
-        );
-        let (_model, report, caches) = run(&body);
-        assert!(!caches.surfaces.contains_key(&10));
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.entity == "TOROIDAL_SURFACE"
-                    && w.message.contains("spindle/horn torus")),
-            "expected spindle-rejection warning; got: {:#?}",
-            report.warnings
-        );
+    fn toroidal_surface_accepts_horn_and_spindle_tori() {
+        for (major, minor) in [(5.0, 5.0), (2.0, 5.0)] {
+            let body = format!(
+                "{WORLD_PLACEMENT}                 #10 = TOROIDAL_SURFACE('t',#4,{major:.1},{minor:.1});
+"
+            );
+            let (_model, report, caches) = run(&body);
+            assert!(
+                caches.surfaces.contains_key(&10),
+                "TOROIDAL_SURFACE({major}, {minor}) must import; warnings: {:#?}",
+                report.warnings
+            );
+        }
     }
 
     #[test]

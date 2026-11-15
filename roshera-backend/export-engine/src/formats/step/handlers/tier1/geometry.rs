@@ -40,7 +40,10 @@ use geometry_engine::primitives::{
 };
 
 use crate::formats::step::{
-    context::{Axis2Placement, ImportContext, StepCircleGeom, StepEllipseGeom, StepLineGeom},
+    context::{
+        Axis2Placement, ImportContext, StepCircleGeom, StepEllipseGeom, StepLineGeom,
+        StepOpenConicGeom,
+    },
     diagnostics::{Severity, Warning},
     dispatch::{EntityDispatch, EntityHandler, HandlerOutcome, Phase},
     registry::EntityRegistry,
@@ -61,6 +64,8 @@ mod names {
     pub const LINE: &str = "LINE";
     pub const CIRCLE: &str = "CIRCLE";
     pub const ELLIPSE: &str = "ELLIPSE";
+    pub const HYPERBOLA: &str = "HYPERBOLA";
+    pub const PARABOLA: &str = "PARABOLA";
     pub const PLANE: &str = "PLANE";
     pub const CYLINDRICAL_SURFACE: &str = "CYLINDRICAL_SURFACE";
     pub const VERTEX_POINT: &str = "VERTEX_POINT";
@@ -669,6 +674,114 @@ impl EntityHandler for EllipseHandler {
 }
 
 // =========================================================================
+// HYPERBOLA / PARABOLA
+// =========================================================================
+
+/// `HYPERBOLA('label', #position, semi_axis, semi_imag_axis)` and
+/// `PARABOLA('label', #position, focal_dist)`. A plane cutting a cone
+/// parallel to its axis (or to a generator) makes these edges. Stored as
+/// templates at `caches.step_open_conics`; each EDGE_CURVE builds the exact
+/// rational quadratic arc between its vertices.
+pub struct OpenConicHandler;
+/// Static binding consumed by [`register`].
+pub static OPEN_CONIC_HANDLER: OpenConicHandler = OpenConicHandler;
+
+impl EntityHandler for OpenConicHandler {
+    fn names(&self) -> &'static [&'static str] {
+        &[names::HYPERBOLA, names::PARABOLA]
+    }
+    fn phase(&self) -> Phase {
+        Phase::Geometry
+    }
+    fn handle(
+        &self,
+        instance: u64,
+        record: &Record,
+        registry: &EntityRegistry,
+        dispatch: &EntityDispatch,
+        ctx: &mut ImportContext<'_>,
+    ) -> HandlerOutcome {
+        let name = if record.name == names::PARABOLA {
+            names::PARABOLA
+        } else {
+            names::HYPERBOLA
+        };
+        let fields = match params::record_fields(&record.parameter, name, instance) {
+            Ok(f) => f,
+            Err(e) => {
+                ctx.report.push_warning(e.into_warning());
+                return HandlerOutcome::Failed {
+                    message: "bad record shape".into(),
+                };
+            }
+        };
+        let reals_needed = if name == names::PARABOLA { 1 } else { 2 };
+        if fields.len() < 2 + reals_needed {
+            return field_count_error(
+                ctx,
+                name,
+                instance,
+                "expected (label, position, the conic's lengths)",
+            );
+        }
+        let placement_ref = match params::as_entity_ref(&fields[1], name, instance, "position") {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.report.push_warning(e.into_warning());
+                return HandlerOutcome::Failed {
+                    message: "bad placement ref".into(),
+                };
+            }
+        };
+        let mut lengths = [0.0_f64; 2];
+        for k in 0..reals_needed {
+            match params::as_real(&fields[2 + k], name, instance, "length") {
+                Ok(v) if v > 0.0 && v.is_finite() => lengths[k] = v * ctx.unit.length,
+                Ok(v) => {
+                    ctx.report.push_warning(Warning {
+                        severity: Severity::Warn,
+                        entity: name.into(),
+                        instance: Some(instance),
+                        message: format!("non-positive length {v}; {name} skipped"),
+                    });
+                    return HandlerOutcome::Failed {
+                        message: "non-positive length".into(),
+                    };
+                }
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad length".into(),
+                    };
+                }
+            }
+        }
+        let placement = match resolve_placement(placement_ref, registry, dispatch, ctx) {
+            Some(p) => p,
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "placement unresolved".into(),
+                }
+            }
+        };
+        let geom = if name == names::PARABOLA {
+            StepOpenConicGeom::Parabola {
+                placement,
+                focal_dist: lengths[0],
+            }
+        } else {
+            StepOpenConicGeom::Hyperbola {
+                placement,
+                semi_axis: lengths[0],
+                semi_imag_axis: lengths[1],
+            }
+        };
+        ctx.caches.step_open_conics.insert(instance, geom);
+        HandlerOutcome::Resolved
+    }
+}
+
+// =========================================================================
 // PLANE
 // =========================================================================
 
@@ -1029,6 +1142,7 @@ pub fn register(dispatch: &mut EntityDispatch) {
     dispatch.register(&LINE_HANDLER);
     dispatch.register(&CIRCLE_HANDLER);
     dispatch.register(&ELLIPSE_HANDLER);
+    dispatch.register(&OPEN_CONIC_HANDLER);
     dispatch.register(&PLANE_HANDLER);
     dispatch.register(&CYLINDRICAL_SURFACE_HANDLER);
     dispatch.register(&VERTEX_POINT_HANDLER);

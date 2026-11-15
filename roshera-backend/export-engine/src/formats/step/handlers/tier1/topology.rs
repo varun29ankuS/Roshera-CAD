@@ -62,9 +62,9 @@ use std::f64::consts::TAU;
 
 use ruststep::ast::Record;
 
-use geometry_engine::math::{Point3, Vector3};
+use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::primitives::{
-    curve::{Arc, Circle, Curve, Ellipse, Line, ParameterRange},
+    curve::{Arc, Circle, Curve, Ellipse, Line, NurbsCurve, ParameterRange},
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceOrientation},
     r#loop::{Loop, LoopId, LoopType},
@@ -74,7 +74,7 @@ use geometry_engine::primitives::{
 };
 
 use crate::formats::step::{
-    context::{ImportContext, StepCircleGeom, StepEllipseGeom, StepLineGeom},
+    context::{ImportContext, StepCircleGeom, StepEllipseGeom, StepLineGeom, StepOpenConicGeom},
     diagnostics::{Severity, Warning},
     dispatch::{EntityDispatch, EntityHandler, HandlerOutcome, Phase},
     registry::{EntityKind, EntityRegistry},
@@ -279,6 +279,8 @@ impl EntityHandler for EdgeCurveHandler {
                 "LINE",
                 "CIRCLE",
                 "ELLIPSE",
+                "HYPERBOLA",
+                "PARABOLA",
                 "B_SPLINE_CURVE_WITH_KNOTS",
                 "BOUNDED_CURVE",
                 "B_SPLINE_CURVE",
@@ -344,13 +346,41 @@ impl EntityHandler for EdgeCurveHandler {
                     }
                 }
             }
+        } else if let Some(conic) = ctx.caches.step_open_conics.get(&geom_ref).copied() {
+            match build_open_conic_curve(conic, start_pos, end_pos, instance, ctx) {
+                Some((c, range)) => {
+                    edge_param_range = range;
+                    c
+                }
+                None => {
+                    return HandlerOutcome::Failed {
+                        message: "kernel rejected the conic arc".into(),
+                    }
+                }
+            }
         } else if let Some(curve_id) = ctx.caches.curves.get(&geom_ref).copied() {
             // Free-form edge backed by an already-materialised kernel
             // curve (B-spline / NURBS). Clone it so this edge owns an
             // independent curve instance and preserve its native domain.
             match ctx.model.curves.get(curve_id) {
                 Some(c) => {
-                    edge_param_range = c.parameter_range();
+                    let domain = c.parameter_range();
+                    edge_param_range = match span_between_vertices(
+                        c, start_pos, end_pos, same_sense,
+                    ) {
+                        Ok(range) => range,
+                        Err(off) => {
+                            ctx.report.push_warning(Warning {
+                                severity: Severity::Warn,
+                                entity: names::EDGE_CURVE.into(),
+                                instance: Some(instance),
+                                message: format!(
+                                    "a vertex lies {off:.3e} off its curve #{geom_ref}; the edge                                      keeps the whole curve"
+                                ),
+                            });
+                            domain
+                        }
+                    };
                     c.clone_box()
                 }
                 None => {
@@ -487,6 +517,150 @@ fn build_ellipse_curve(
     Some((Box::new(curve), range))
 }
 
+/// The exact rational quadratic arc of a HYPERBOLA or PARABOLA between two
+/// of its points (Piegl & Tiller, The NURBS Book, sec. 7.5: every conic arc
+/// is a rational quadratic Bezier). With the arc's parameters t0, t1,
+/// m = (t0 + t1) / 2 and h = (t1 - t0) / 2:
+///   hyperbola  P1 = o + (a cosh m / cosh h) x + (b sinh m / cosh h) y,
+///              middle weight cosh h;
+///   parabola   P1 = o + f t0 t1 x + f (t0 + t1) y, middle weight 1.
+/// An open conic is a single branch, so the arc between two of its points
+/// is unique and the edge's sense needs no special handling: the arc runs
+/// from the start vertex to the end vertex. Returns the curve and its
+/// parameter range [0, 1].
+fn build_open_conic_curve(
+    conic: StepOpenConicGeom,
+    start: [f64; 3],
+    end: [f64; 3],
+    instance: u64,
+    ctx: &mut ImportContext<'_>,
+) -> Option<(Box<dyn Curve>, ParameterRange)> {
+    let placement = match conic {
+        StepOpenConicGeom::Hyperbola { placement, .. } => placement,
+        StepOpenConicGeom::Parabola { placement, .. } => placement,
+    };
+    let o = Point3::new(
+        placement.origin[0],
+        placement.origin[1],
+        placement.origin[2],
+    );
+    let x = Vector3::new(placement.x[0], placement.x[1], placement.x[2]);
+    let z = Vector3::new(placement.z[0], placement.z[1], placement.z[2]);
+    let y = z.cross(&x);
+    let local = |q: [f64; 3]| -> (f64, f64) {
+        let d = Vector3::new(q[0] - o.x, q[1] - o.y, q[2] - o.z);
+        (d.dot(&x), d.dot(&y))
+    };
+    let at = |u: f64, v: f64| o + x * u + y * v;
+    let (p1, w1, t0, t1) = match conic {
+        StepOpenConicGeom::Hyperbola {
+            semi_axis: a,
+            semi_imag_axis: b,
+            ..
+        } => {
+            let t0 = (local(start).1 / b).asinh();
+            let t1 = (local(end).1 / b).asinh();
+            let (m, h) = (0.5 * (t0 + t1), 0.5 * (t1 - t0));
+            let ch = h.cosh();
+            (at(a * m.cosh() / ch, b * m.sinh() / ch), ch, t0, t1)
+        }
+        StepOpenConicGeom::Parabola { focal_dist: f, .. } => {
+            let t0 = local(start).1 / (2.0 * f);
+            let t1 = local(end).1 / (2.0 * f);
+            (at(f * t0 * t1, f * (t0 + t1)), 1.0, t0, t1)
+        }
+    };
+    if !(t1 - t0).is_finite() || (t1 - t0).abs() < f64::EPSILON {
+        ctx.report.push_warning(Warning {
+            severity: Severity::Warn,
+            entity: names::EDGE_CURVE.into(),
+            instance: Some(instance),
+            message: "conic edge has no length between its vertices".into(),
+        });
+        return None;
+    }
+    let p0 = Point3::new(start[0], start[1], start[2]);
+    let p2 = Point3::new(end[0], end[1], end[2]);
+    match NurbsCurve::new(
+        2,
+        vec![p0, p1, p2],
+        vec![1.0, w1, 1.0],
+        vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+    ) {
+        Ok(c) => Some((Box::new(c), ParameterRange::new(0.0, 1.0))),
+        Err(e) => {
+            ctx.report.push_warning(Warning {
+                severity: Severity::Warn,
+                entity: names::EDGE_CURVE.into(),
+                instance: Some(instance),
+                message: format!("kernel rejected the conic arc: {e}"),
+            });
+            None
+        }
+    }
+}
+
+/// The part of a shared curve an edge uses: the parameter span between its
+/// two vertices. STEP writers reuse one long curve (an intersection curve, a
+/// spline through several faces) for several edges, each a piece of it, so
+/// an edge is the curve BETWEEN its vertices, not the whole curve. A vertex
+/// at an end of the curve keeps that end exactly; a vertex inside it is
+/// projected onto the curve. A curve whose two ends meet (a closed spline)
+/// with both vertices there is the whole curve. `Err(distance)` when a
+/// vertex is farther than [`VERTEX_ON_CURVE`] from the curve.
+fn span_between_vertices(
+    curve: &dyn Curve,
+    start: [f64; 3],
+    end: [f64; 3],
+    same_sense: bool,
+) -> Result<ParameterRange, f64> {
+    let domain = curve.parameter_range();
+    let at = |t: f64| curve.evaluate(t).ok().map(|p| p.position);
+    let (Some(c0), Some(c1)) = (at(domain.start), at(domain.end)) else {
+        return Ok(domain);
+    };
+    let to = |p: Point3, q: [f64; 3]| p.distance(&Point3::new(q[0], q[1], q[2]));
+    let end_tol = VERTEX_ON_CURVE;
+    let closed = c0.distance(&c1) <= end_tol;
+    let param = |q: [f64; 3]| -> Result<f64, f64> {
+        if to(c0, q) <= end_tol {
+            return Ok(domain.start);
+        }
+        if to(c1, q) <= end_tol {
+            return Ok(domain.end);
+        }
+        let target = Point3::new(q[0], q[1], q[2]);
+        match curve.closest_point(&target, Tolerance::from_distance(1e-10)) {
+            Ok((t, p)) if p.distance(&target) <= VERTEX_ON_CURVE => Ok(t),
+            Ok((_, p)) => Err(p.distance(&target)),
+            Err(_) => Err(f64::INFINITY),
+        }
+    };
+    let ts = param(start)?;
+    let te = param(end)?;
+    if closed && (ts - te).abs() <= f64::EPSILON * (domain.end - domain.start).abs().max(1.0) {
+        // Both vertices at the closed curve's seam: the whole loop.
+        return Ok(domain);
+    }
+    if closed {
+        // On a closed curve a vertex at the seam is at BOTH ends of the
+        // domain. Along the curve's direction the edge runs from its start
+        // vertex when `same_sense`, else from its end vertex: the leading
+        // vertex takes the domain's start, the trailing one its end.
+        let seam = |t: f64| t == domain.start || t == domain.end;
+        let (lead, trail) = if same_sense { (ts, te) } else { (te, ts) };
+        let lead = if seam(lead) { domain.start } else { lead };
+        let trail = if seam(trail) { domain.end } else { trail };
+        return Ok(ParameterRange::new(lead.min(trail), lead.max(trail)));
+    }
+    Ok(ParameterRange::new(ts.min(te), ts.max(te)))
+}
+
+/// How far a vertex may sit from the curve its edge runs along and still
+/// be read as ON it (model units after scaling). STEP writers' own vertex
+/// tolerances are well inside this; a vertex farther off is broken data.
+const VERTEX_ON_CURVE: f64 = 1e-3;
+
 /// Construct a `Line` curve sized to the edge's two vertex positions.
 fn build_line_curve(_line: StepLineGeom, start: [f64; 3], end: [f64; 3]) -> Box<dyn Curve> {
     let s = Point3::new(start[0], start[1], start[2]);
@@ -539,7 +713,9 @@ fn build_circle_curve(
     let dy = start[1] - end[1];
     let dz = start[2] - end[2];
     if (dx * dx + dy * dy + dz * dz).sqrt() < ctx.default_tolerance {
-        return match Circle::new(center, normal, circle.radius) {
+        // The whole circle, starting and ending at the edge's vertex.
+        let vertex = Point3::new(start[0], start[1], start[2]);
+        return match Circle::new_starting_at(center, normal, circle.radius, vertex) {
             Ok(c) => Some(Box::new(c)),
             Err(e) => {
                 ctx.report.push_warning(Warning {
@@ -1754,6 +1930,46 @@ mod tests {
         assert!(((p0.x - 1.0).abs() < 1e-9) && ((p1.x - 1.0).abs() < 1e-9));
     }
 
+    /// A full-circle seam edge starts AND ends at its vertex, wherever on the
+    /// circle the vertex sits, in either sense. The circle used to start at
+    /// the kernel's own x-axis: a rim whose seam vertex sat elsewhere was
+    /// sampled from the wrong point, the face outline then ran back over
+    /// itself and the face was refused (48 cylinder walls of one
+    /// CADGenBench part fell back to an untrimmed grid and cracked the mesh).
+    #[test]
+    fn edge_curve_seam_circle_starts_at_its_vertex() {
+        for sense in [".T.", ".F."] {
+            let (model, _r, c) = run(&format!(
+                "#1=CARTESIAN_POINT('',(-0.6,0.8,5.));\
+                 #11=VERTEX_POINT('',#1);\
+                 #2=CARTESIAN_POINT('',(0.,0.,5.));\
+                 #21=DIRECTION('',(0.,0.,1.));\
+                 #22=DIRECTION('',(1.,0.,0.));\
+                 #31=AXIS2_PLACEMENT_3D('',#2,#21,#22);\
+                 #41=CIRCLE('',#31,1.);\
+                 #51=EDGE_CURVE('',#11,#11,#41,{sense});"
+            ));
+            let eid = *c.edges.get(&51).expect("seam edge cached");
+            let v = [-0.6, 0.8, 5.0];
+            assert!(
+                near(edge_point(&model, eid, 0.0), v),
+                "{sense}: starts at its vertex"
+            );
+            assert!(
+                near(edge_point(&model, eid, 1.0), v),
+                "{sense}: ends at its vertex"
+            );
+            // A quarter of the way round, in the edge's sense about +Z.
+            let q = edge_point(&model, eid, 0.25);
+            let turn = if sense == ".T." { 1.0 } else { -1.0 };
+            let want = [-0.8 * turn, -0.6 * turn, 5.0];
+            assert!(
+                near(q, want),
+                "{sense}: quarter turn at {q:?}, want {want:?}"
+            );
+        }
+    }
+
     #[test]
     fn edge_curve_half_arc_yields_pi_sweep() {
         // Start (1,0,0), end (-1,0,0) about (0,0,0) normal +Z → π sweep.
@@ -1799,6 +2015,73 @@ mod tests {
 
     fn near(a: [f64; 3], b: [f64; 3]) -> bool {
         (a[0] - b[0]).hypot(a[1] - b[1]).hypot(a[2] - b[2]) < 1e-9
+    }
+
+    /// HYPERBOLA and PARABOLA edges: a plane cutting a cone parallel to its
+    /// axis (or to a generator). Generated CAD is full of them (5 of the 81
+    /// CADGenBench parts built no solid without them). The edge is an EXACT
+    /// rational quadratic arc: every point satisfies the conic's equation.
+    const CONIC_FRAME: &str = "#3=CARTESIAN_POINT('',(0.,0.,0.));\
+         #21=DIRECTION('',(0.,0.,1.));\
+         #22=DIRECTION('',(1.,0.,0.));\
+         #31=AXIS2_PLACEMENT_3D('',#3,#21,#22);";
+
+    fn conic_edge(curve: &str, a: [f64; 3], b: [f64; 3]) -> (BRepModel, u32) {
+        let (model, _r, c) = run(&format!(
+            "{CONIC_FRAME}{curve}\
+             #1=CARTESIAN_POINT('',({:.15},{:.15},{:.15}));\
+             #2=CARTESIAN_POINT('',({:.15},{:.15},{:.15}));\
+             #11=VERTEX_POINT('',#1);\
+             #12=VERTEX_POINT('',#2);\
+             #51=EDGE_CURVE('',#11,#12,#41,.T.);",
+            a[0], a[1], a[2], b[0], b[1], b[2]
+        ));
+        let eid = *c.edges.get(&51).expect("conic edge imported");
+        (model, eid)
+    }
+
+    #[test]
+    fn edge_curve_hyperbola_is_an_exact_arc() {
+        // x = 2 cosh t, y = sinh t: x^2/4 - y^2 = 1, t from -1 to 1.5.
+        let at = |t: f64| [2.0 * t.cosh(), t.sinh(), 0.0];
+        let (model, eid) = conic_edge("#41=HYPERBOLA('',#31,2.,1.);", at(-1.0), at(1.5));
+        assert!(
+            near(edge_point(&model, eid, 0.0), at(-1.0)),
+            "starts at its vertex"
+        );
+        assert!(
+            near(edge_point(&model, eid, 1.0), at(1.5)),
+            "ends at its vertex"
+        );
+        for k in 0..=20 {
+            let p = edge_point(&model, eid, k as f64 / 20.0);
+            let on = p[0] * p[0] / 4.0 - p[1] * p[1];
+            assert!(
+                (on - 1.0).abs() < 1e-9,
+                "point {p:?} off the hyperbola ({on})"
+            );
+            assert!(
+                p[0] > 0.0 && p[2].abs() < 1e-12,
+                "on the right branch, in plane"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_curve_parabola_is_an_exact_arc() {
+        // x = f t^2, y = 2 f t with f = 0.5: x = y^2 / (4 f), t from -1 to 2.
+        let f = 0.5;
+        let at = |t: f64| [f * t * t, 2.0 * f * t, 0.0];
+        let (model, eid) = conic_edge("#41=PARABOLA('',#31,0.5);", at(-1.0), at(2.0));
+        assert!(near(edge_point(&model, eid, 0.0), at(-1.0)));
+        assert!(near(edge_point(&model, eid, 1.0), at(2.0)));
+        for k in 0..=20 {
+            let p = edge_point(&model, eid, k as f64 / 20.0);
+            assert!(
+                (p[0] - p[1] * p[1] / (4.0 * f)).abs() < 1e-9,
+                "point {p:?} off the parabola"
+            );
+        }
     }
 
     #[test]

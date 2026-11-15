@@ -93,6 +93,31 @@ pub struct StepEllipseGeom {
     pub semi_axis_2: f64,
 }
 
+/// Parameterless conic geometry for the open conics: a HYPERBOLA
+/// (`semi_axis` along the placement `x`, `semi_imag_axis` along `z × x`;
+/// C(t) = o + a cosh t x + b sinh t y) or a PARABOLA (`focal_dist` f;
+/// C(t) = o + f t² x + 2 f t y), ISO 10303-42. Trimmed per edge, like
+/// [`StepEllipseGeom`].
+#[derive(Debug, Clone, Copy)]
+pub enum StepOpenConicGeom {
+    /// `HYPERBOLA`: C(t) = o + a cosh t x + b sinh t y.
+    Hyperbola {
+        /// The conic's frame.
+        placement: Axis2Placement,
+        /// `a`, along the placement `x`, millimetres after unit scaling.
+        semi_axis: f64,
+        /// `b`, along `z × x`, millimetres after unit scaling.
+        semi_imag_axis: f64,
+    },
+    /// `PARABOLA`: C(t) = o + f t² x + 2 f t y.
+    Parabola {
+        /// The conic's frame.
+        placement: Axis2Placement,
+        /// `f`, millimetres after unit scaling.
+        focal_dist: f64,
+    },
+}
+
 /// Orthonormal frame derived from a STEP `AXIS2_PLACEMENT_3D`.
 ///
 /// `AXIS2_PLACEMENT_3D(location, axis, ref_direction)`:
@@ -197,6 +222,8 @@ pub struct ResolutionCaches {
     pub step_circles: HashMap<u64, StepCircleGeom>,
     /// Source `#N` → `ELLIPSE` geometry (placement + semi-axes).
     pub step_ellipses: HashMap<u64, StepEllipseGeom>,
+    /// Source `#N` → `HYPERBOLA` / `PARABOLA` geometry.
+    pub step_open_conics: HashMap<u64, StepOpenConicGeom>,
     /// The product structure (parts, assembly occurrences, placements),
     /// read by the tier-3 product handlers and consumed after dispatch by
     /// the assembly-placement pass (`super::assembly_placement`).

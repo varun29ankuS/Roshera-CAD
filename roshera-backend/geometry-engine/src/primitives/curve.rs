@@ -3678,6 +3678,25 @@ impl Circle {
         Ok(Self { arc })
     }
 
+    /// A circle whose parameter 0 (and 1) sits at `start`: the point on the
+    /// circle in the direction of `start` from the centre. A closed edge
+    /// that begins and ends at a vertex must run from that vertex; a circle
+    /// starting at the kernel's own reference direction instead made a face
+    /// outline jump from the vertex to that point and back.
+    pub fn new_starting_at(
+        center: Point3,
+        normal: Vector3,
+        radius: f64,
+        start: Point3,
+    ) -> MathResult<Self> {
+        let probe = Arc::new(center, normal, radius, 0.0, consts::TWO_PI)?;
+        let d = start - center;
+        let y_axis = probe.normal.cross(&probe.x_axis);
+        let angle = d.dot(&y_axis).atan2(d.dot(&probe.x_axis));
+        let arc = Arc::new(center, normal, radius, angle, consts::TWO_PI)?;
+        Ok(Self { arc })
+    }
+
     /// Get center point
     pub fn center(&self) -> Point3 {
         self.arc.center

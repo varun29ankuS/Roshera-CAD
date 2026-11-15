@@ -177,9 +177,17 @@ impl EntityHandler for SurfaceOfRevolutionHandler {
             }
         };
 
+        // ISO 10303-42 parameterises a surface of revolution (u = rotation
+        // angle, v = profile) and takes its normal as dσ/du × dσ/dv; the
+        // kernel's has u along the profile and v the angle, which reverses
+        // that cross product. Revolving about the NEGATED axis runs the angle
+        // the other way and brings the kernel normal back to STEP's, so every
+        // face's `same_sense` means what the file says. The point set is the
+        // same (a STEP revolution is always the full turn). The writer
+        // negates it back (`writer.rs`).
         let surf = match SurfaceOfRevolution::new(
             Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]),
-            Vector3::new(axis_dir[0], axis_dir[1], axis_dir[2]),
+            Vector3::new(-axis_dir[0], -axis_dir[1], -axis_dir[2]),
             profile,
             TAU,
         ) {

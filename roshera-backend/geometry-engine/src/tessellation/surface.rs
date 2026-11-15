@@ -338,12 +338,42 @@ pub fn tessellate_face(
             // Trimmed torus (boolean rim-poke main body / bump) → conforming
             // grid+stitch mesher; untrimmed full torus falls through to the fast
             // structured grid.
-            if tessellate_torus_two_circle_band(face, model, surface, cache, params, mesh) {
-                // A fillet/round as STEP writers emit it: one closed major
-                // circle as the outer loop, one as the inner, no seam.
-            } else if tessellate_blend_torus_conforming(face, model, surface, cache, params, mesh) {
-            } else if !tessellate_toroidal_trimmed(face, model, surface, cache, params, mesh) {
-                tessellate_toroidal_face(face, model, params, cache, mesh);
+            let path =
+                if tessellate_torus_two_circle_band(face, model, surface, cache, params, mesh) {
+                    // A fillet/round as STEP writers emit it: one closed major
+                    // circle as the outer loop, one as the inner, no seam.
+                    "two-circle band"
+                } else if tessellate_blend_torus_conforming(
+                    face, model, surface, cache, params, mesh,
+                ) {
+                    "blend conforming"
+                } else if tessellate_toroidal_trimmed(face, model, surface, cache, params, mesh) {
+                    "trimmed"
+                } else if face_has_a_trim_edge(face, model) {
+                    // A patch of the torus (a fillet quarter bounded by arcs):
+                    // the untrimmed grid would mesh the WHOLE torus and ignore
+                    // these edges, so the patch would never meet its
+                    // neighbours. Mesh it from its edges; on refusal it emits
+                    // nothing, never the wrong surface.
+                    match super::curved_cdt::tessellate_curved_cdt(
+                        surface, face, model, params, cache, mesh,
+                    ) {
+                        Ok(()) => "curved-CDT",
+                        Err(e) => {
+                            tracing::warn!(
+                                "torus patch {:?}: curved_cdt refused: {:?}; emitting nothing",
+                                face.id,
+                                e
+                            );
+                            "curved-CDT (refused, nothing emitted)"
+                        }
+                    }
+                } else {
+                    tessellate_toroidal_face(face, model, params, cache, mesh);
+                    "untrimmed grid"
+                };
+            if std::env::var_os("ROSHERA_TESS_TRACE").is_some() {
+                eprintln!("[tess] torus face {} meshed by the {path} path", face.id);
             }
         }
         // A `GeneralNurbsSurface` reports `type_name() == "NurbsSurface"`. A
@@ -4448,6 +4478,22 @@ fn tessellate_conical_with_apex(
     }
 }
 
+/// True when some edge of the face's loops is used only once by the face: a
+/// real trim boundary. A face bounded only by seams (each seam edge walked
+/// twice, once each way, like the commutator loop of a whole torus) has none.
+fn face_has_a_trim_edge(face: &Face, model: &BRepModel) -> bool {
+    let mut uses: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for l in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+        let Some(lp) = model.loops.get(l) else {
+            continue;
+        };
+        for &e in &lp.edges {
+            *uses.entry(e).or_default() += 1;
+        }
+    }
+    uses.values().any(|&n| n == 1)
+}
+
 /// Estimate cone height from v parameter range
 fn estimate_cone_height(surface: &dyn Surface, v_min: f64, v_max: f64) -> f64 {
     if let (Ok(p1), Ok(p2)) = (surface.point_at(0.0, v_min), surface.point_at(0.0, v_max)) {
@@ -4539,6 +4585,22 @@ fn tessellate_toroidal_trimmed(
         };
         let ex = span(&|p| p.x).max(span(&|p| p.y));
         if ex > 1.8 * big_r {
+            return false;
+        }
+        // The membership test below is a half-space per oval: it is only
+        // right when the rim is a FLAT cut (a boolean's planar cutting face).
+        // A rim that is not planar -- a fillet patch bounded by ring and tube
+        // arcs -- is not an oval; decline so the patch is meshed from its edges.
+        let Some(rim_normal) = newell_normal(&rim_pos) else {
+            return false;
+        };
+        let np = rim_pos.len() as f64;
+        let mid = rim_pos.iter().fold(Vector3::ZERO, |a, p| a + p.to_vec()) * (1.0 / np);
+        let off_plane = rim_pos
+            .iter()
+            .map(|p| (p.to_vec() - mid).dot(&rim_normal).abs())
+            .fold(0.0_f64, f64::max);
+        if off_plane > 1e-3 * small_r {
             return false;
         }
         let pts: Vec<(Point3, u32)> = rim_pos
@@ -8152,8 +8214,8 @@ fn v_of_row(j: usize, jlo: usize, jhi: usize, v_lo: f64, v_hi: f64) -> f64 {
 ///     its existing path;
 ///   * no inner loops;
 ///   * boundary is exactly two OPEN arc edges (`> 2` cached samples, distinct
-///     endpoints — NOT a closed full-circle seam) plus one or more straight
-///     rails, and the two arcs carry equal sample counts.
+///     endpoints — NOT a closed full-circle seam) plus exactly two straight
+///     rails (each one edge), and the two arcs carry equal sample counts.
 /// Anything else declines and falls through to `curved_cdt`.
 fn tessellate_cylinder_edge_band_conforming(
     face: &Face,
@@ -8197,7 +8259,12 @@ fn tessellate_cylinder_edge_band_conforming(
             straight += 1;
         }
     }
-    if arcs.len() != 2 || straight == 0 {
+    // Exactly two rails, each ONE straight edge: the stitch's first and last
+    // rulings ARE the rails, so a rail split into several edges (other faces
+    // meeting it part-way) would lose its split vertices and leave a
+    // T-junction against those faces. Such a band goes to curved-CDT, which
+    // keeps every boundary sample.
+    if arcs.len() != 2 || straight != 2 {
         return false;
     }
     let a0: Vec<Point3> = (*arcs[0]).clone();

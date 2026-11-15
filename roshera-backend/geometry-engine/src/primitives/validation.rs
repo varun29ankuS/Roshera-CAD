@@ -884,7 +884,16 @@ impl ParallelValidator {
                                     .map(|sp| p.distance(&sp))
                             })
                             .fold(0.0_f64, f64::max);
-                        if max_off > tolerance.distance() {
+                        // Judged at the EDGE'S OWN tolerance where that is
+                        // looser: an imported edge carries the file's declared
+                        // model uncertainty. Kernel-built edges carry the
+                        // default and are judged as strictly as before.
+                        let edge_tol = if edge.tolerance.is_finite() {
+                            edge.tolerance
+                        } else {
+                            0.0
+                        };
+                        if max_off > tolerance.distance().max(edge_tol) {
                             // 1a — BLOCKING (exact analytic closest_point).
                             errs.push(ValidationError::GeometryError {
                                 location: EntityLocation {
@@ -2055,7 +2064,12 @@ pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<Vali
             // ordered polygon so `outward_walk_is_forward` can decide the interior
             // side of each edge LOCALLY by a point-in-polygon test (exact for any
             // simple polygon), using the centroid only as a degenerate fallback.
+            // The outline is the loop's edges SAMPLED, not its vertices: an
+            // arc between two vertices is not its chord, and for an arc of
+            // more than 180 degrees the chord outline is not the face at all.
+            let sampled_outline = sampled_loop_outline(model, loop_data);
             let loop_polygon: Option<Vec<Vector3>> = match loop_data.vertices(&model.edges) {
+                _ if sampled_outline.is_some() => sampled_outline,
                 Ok(vids) if vids.len() >= 3 => {
                     let mut pts = Vec::with_capacity(vids.len());
                     for &vid in &vids {
@@ -2338,8 +2352,19 @@ fn outward_walk_is_forward(
     let b = model.vertices.get(edge.end_vertex)?.position;
     let a = Vector3::new(a[0], a[1], a[2]);
     let b = Vector3::new(b[0], b[1], b[2]);
-    let mid = (a + b) * 0.5;
-    let tangent = (b - a).normalize_or_zero(); // start->end
+    if (b - a).magnitude() < 1e-12 {
+        return None;
+    }
+    // The edge's own midpoint and direction there, ON the curve: the chord's
+    // midpoint of an arc lies off the boundary, inside or outside the face
+    // whichever way the test steps from it.
+    let (mid, tangent) = match edge_samples_start_to_end(model, edge_id) {
+        Some(pts) if pts.len() >= 3 => {
+            let k = pts.len() / 2;
+            (pts[k], (pts[k + 1] - pts[k - 1]).normalize_or_zero())
+        }
+        _ => ((a + b) * 0.5, (b - a).normalize_or_zero()),
+    };
     if tangent.magnitude() < 1e-12 {
         return None;
     }
@@ -2471,6 +2496,58 @@ fn outward_walk_is_forward(
         return None;
     }
     Some(signed > 0.0)
+}
+
+/// Samples along an edge from its start vertex to its end vertex (odd count,
+/// so the middle sample is the edge's parameter midpoint). The curve's own
+/// direction is not assumed: the samples are taken over the edge's parameter
+/// range and turned round when the range's start sits at the end vertex.
+/// `None` for a closed edge (start and end vertex coincide), whose direction
+/// cannot be read off its vertices, or when the curve cannot be evaluated.
+fn edge_samples_start_to_end(model: &BRepModel, edge_id: EdgeId) -> Option<Vec<Vector3>> {
+    const SAMPLES: usize = 33;
+    let edge = model.edges.get(edge_id)?;
+    let curve = model.curves.get(edge.curve_id)?;
+    let a = model.vertices.get(edge.start_vertex)?.position;
+    let b = model.vertices.get(edge.end_vertex)?.position;
+    let a = Vector3::new(a[0], a[1], a[2]);
+    let b = Vector3::new(b[0], b[1], b[2]);
+    if (b - a).magnitude() < 1e-12 {
+        return None;
+    }
+    let r = edge.param_range;
+    let mut pts = Vec::with_capacity(SAMPLES);
+    for i in 0..SAMPLES {
+        let t = r.start + (r.end - r.start) * i as f64 / (SAMPLES - 1) as f64;
+        pts.push(curve.evaluate(t).ok()?.position.to_vec());
+    }
+    let (first, last) = (pts[0], pts[SAMPLES - 1]);
+    if (first - b).magnitude() + (last - a).magnitude()
+        < (first - a).magnitude() + (last - b).magnitude()
+    {
+        pts.reverse();
+    }
+    Some(pts)
+}
+
+/// The loop's outline as points along its edges in walk order, each edge's
+/// samples taken start-to-end and reversed where the loop walks it backward.
+/// `None` when any edge cannot be sampled (a closed edge among them), so the
+/// caller falls back to the vertex polygon.
+fn sampled_loop_outline(
+    model: &BRepModel,
+    loop_data: &crate::primitives::r#loop::Loop,
+) -> Option<Vec<Vector3>> {
+    let mut out = Vec::new();
+    for (i, &edge_id) in loop_data.edges.iter().enumerate() {
+        let mut pts = edge_samples_start_to_end(model, edge_id)?;
+        if !loop_data.orientations.get(i).copied().unwrap_or(true) {
+            pts.reverse();
+        }
+        pts.pop(); // shared with the next edge's first sample
+        out.extend(pts);
+    }
+    (out.len() >= 3).then_some(out)
 }
 
 /// Point-in-polygon test for a planar 3D loop, used to decide which side of an

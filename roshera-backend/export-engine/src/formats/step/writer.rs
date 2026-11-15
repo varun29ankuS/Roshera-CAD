@@ -743,7 +743,13 @@ impl<W: Write> StepWriter<W> {
                 // A revolution profile is an OPEN generating curve, never the
                 // closed iso-`v` case, so `closed = false`.
                 let curve_id = self.write_curve(profile, &empty_map, false)?;
-                let axis_id = self.write_axis1_placement(axis_origin, axis_direction)?;
+                // The kernel's revolution normal is the reverse of ISO
+                // 10303-42's (its u and v are swapped), so the axis is
+                // written NEGATED: about it, STEP's normal is the kernel's and
+                // every face's `same_sense` stays true to the solid. The
+                // importer negates it back (`handlers/tier2/swept.rs`).
+                let step_axis = [-axis_direction[0], -axis_direction[1], -axis_direction[2]];
+                let axis_id = self.write_axis1_placement(axis_origin, &step_axis)?;
                 let id = self.next_id();
                 writeln!(
                     self.writer,

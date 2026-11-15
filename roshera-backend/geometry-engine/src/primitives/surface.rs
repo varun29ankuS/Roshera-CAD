@@ -3990,11 +3990,11 @@ impl Torus {
                 "Radii must be positive".to_string(),
             ));
         }
-        if minor_radius >= major_radius {
-            return Err(MathError::InvalidParameter(
-                "Minor radius must be less than major radius".to_string(),
-            ));
-        }
+        // A horn (minor = major) or spindle (minor > major) torus is a valid
+        // surface: STEP allows it and Open CASCADE builds it (a fillet
+        // rounding a cylinder's end down to the axis is a horn torus). It
+        // pinches to a point on the axis where R + r cos v = 0; see
+        // `evaluate_full` for the normal there.
 
         let axis = axis.normalize()?;
         let ref_dir = axis.perpendicular().normalize()?;
@@ -4081,8 +4081,14 @@ impl Surface for Torus {
 
         let dv = radial_dir * (-self.minor_radius * sin_v) + z_dir * (self.minor_radius * cos_v);
 
-        // Normal (outward)
-        let normal = du.cross(&dv).normalize()?;
+        // Normal: du x dv = r (R + r cos v) * n_tube, where n_tube points out
+        // of the tube. So the parametric normal is n_tube, flipped where
+        // R + r cos v < 0 (a spindle torus's inner lobe). At the pinch of a
+        // horn / spindle torus (R + r cos v = 0) du vanishes and du x dv is
+        // undefined; the tube normal is the limit from the ring side.
+        let n_tube = radial_dir * cos_v + z_dir * sin_v;
+        let ring = self.major_radius + self.minor_radius * cos_v;
+        let normal = if ring < 0.0 { -n_tube } else { n_tube };
 
         // Second derivatives
         let duu = x_dir * (-self.major_radius * cos_u - self.minor_radius * cos_v * cos_u)
@@ -4096,8 +4102,20 @@ impl Surface for Torus {
         // Principal curvatures (outward normal). Along the major direction
         // κ₁ = cos v / (R + r cos v); along the minor (tube) circle κ₂ = 1/r.
         // do Carmo, *Differential Geometry of Curves and Surfaces* §3.3.
-        let k1 = -cos_v / (self.major_radius + self.minor_radius * cos_v);
-        let k2 = -1.0 / self.minor_radius;
+        // Curvatures with respect to the tube normal (do Carmo §3.3): along
+        // the major direction cos v / (R + r cos v), along the tube 1 / r,
+        // negated for the outward normal; both flip with the normal on a
+        // spindle's inner lobe. At the pinch the major curvature is
+        // unbounded: report the largest finite value, keeping its sign.
+        let tiny = f64::EPSILON * self.major_radius.max(self.minor_radius);
+        let ring_safe = if ring.abs() < tiny {
+            tiny.copysign(if ring == 0.0 { 1.0 } else { ring })
+        } else {
+            ring
+        };
+        let flip = if ring < 0.0 { -1.0 } else { 1.0 };
+        let k1 = flip * (-cos_v / ring_safe);
+        let k2 = flip * (-1.0 / self.minor_radius);
 
         Ok(SurfacePoint {
             position,
@@ -5748,7 +5766,9 @@ impl Surface for SurfaceOfRevolution {
     }
 
     fn is_closed_u(&self) -> bool {
-        false // Profile curve is generally open
+        // Closed in u exactly when the profile is: a revolved circle (a
+        // round as STEP writers emit it) meets itself at u = 0 and u = 1.
+        self.profile_curve.is_closed()
     }
 
     fn is_closed_v(&self) -> bool {
