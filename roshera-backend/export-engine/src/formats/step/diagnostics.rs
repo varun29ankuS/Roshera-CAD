@@ -117,6 +117,13 @@ pub enum HealingKind {
     /// tolerance it exceeded. A gap beyond the cap is refused instead (a
     /// warning, and the edge keeps the declared tolerance).
     EdgeToleranceRaised,
+    /// A face walked most of its shared edges the SAME way as the
+    /// neighbouring face using each edge, while two faces of a consistently
+    /// oriented shell walk a shared edge in opposite directions: its loops
+    /// were written backwards. They were reversed (OCCT's
+    /// `ShapeFix_Shell::FixFaceOrientation`). `deviation` is the number of
+    /// shared edges walked the same way, `tolerance` the face's shared edges.
+    LoopReversedToMatchNeighbours,
 }
 
 /// A structured healing event applied during dispatch. Logged on

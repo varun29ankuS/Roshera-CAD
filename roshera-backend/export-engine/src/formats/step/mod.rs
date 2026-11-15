@@ -179,6 +179,7 @@ pub fn import_step_text_uncertified(
     report.roots_resolved = roots_with_solids;
     report.solids_in_roots = total_root_solids;
     raise_edge_tolerances_to_measured_gaps(&mut model, &caches, &mut report);
+    reverse_loops_walking_against_neighbours(&mut model, &caches, &mut report);
 
     // Place assembly instances from the product tree, then give every solid
     // and face its identity — PIDs keyed by this file's CONTENT and the STEP
@@ -274,6 +275,87 @@ fn extract_file_schema(exchange: &ruststep::ast::Exchange) -> Option<String> {
         }
     }
     None
+}
+
+/// Reverse the loops of any face that walks MOST of its shared edges the same
+/// way as the neighbouring face using each edge. Two faces of a consistently
+/// oriented shell walk a shared edge in opposite directions; a face against
+/// the majority of its neighbours had its loops written backwards (its sense
+/// still agrees with theirs -- its mesh faces out of the solid -- so only the
+/// loops are wrong). Each reversal is recorded as a
+/// [`diagnostics::HealingKind::LoopReversedToMatchNeighbours`]. Decided on the
+/// file's topology before any reversal, in face-id order, so the outcome is
+/// deterministic. A seam edge (used twice by one loop) does not vote.
+fn reverse_loops_walking_against_neighbours(
+    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
+    caches: &context::ResolutionCaches,
+    report: &mut ImportReport,
+) {
+    use std::collections::HashMap;
+    let instance_of: HashMap<u32, u64> = caches
+        .faces
+        .iter()
+        .map(|(inst, &fid)| (fid, *inst))
+        .collect();
+    // edge -> every (face, walks it start->end) use.
+    let mut uses: HashMap<u32, Vec<(u32, bool)>> = HashMap::new();
+    let mut face_loops: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (fid, face) in model.faces.iter() {
+        let loops: Vec<u32> = std::iter::once(face.outer_loop)
+            .chain(face.inner_loops.iter().copied())
+            .collect();
+        for &l in &loops {
+            let Some(lp) = model.loops.get(l) else {
+                continue;
+            };
+            let mut count: HashMap<u32, usize> = HashMap::new();
+            for &e in &lp.edges {
+                *count.entry(e).or_default() += 1;
+            }
+            for (k, &e) in lp.edges.iter().enumerate() {
+                if count.get(&e).copied().unwrap_or(0) > 1 {
+                    continue;
+                }
+                uses.entry(e)
+                    .or_default()
+                    .push((fid, lp.orientations.get(k).copied().unwrap_or(true)));
+            }
+        }
+        face_loops.push((fid, loops));
+    }
+    // Per face: shared edges walked the same way as the neighbour, and all shared.
+    let mut tally: HashMap<u32, (usize, usize)> = HashMap::new();
+    for w in uses.values().filter(|w| w.len() == 2) {
+        let same = w[0].1 == w[1].1;
+        for &(f, _) in w {
+            let t = tally.entry(f).or_default();
+            t.1 += 1;
+            if same {
+                t.0 += 1;
+            }
+        }
+    }
+    face_loops.sort_by_key(|(f, _)| *f);
+    for (fid, loops) in face_loops {
+        let Some(&(same, shared)) = tally.get(&fid) else {
+            continue;
+        };
+        if 2 * same <= shared {
+            continue;
+        }
+        for l in loops {
+            if let Some(lp) = model.loops.get_mut(l) {
+                lp.reverse();
+            }
+        }
+        report.healings.push(diagnostics::Healing {
+            kind: diagnostics::HealingKind::LoopReversedToMatchNeighbours,
+            entity: "ADVANCED_FACE".into(),
+            instance: instance_of.get(&fid).copied().unwrap_or(0),
+            deviation: same as f64,
+            tolerance: shared as f64,
+        });
+    }
 }
 
 /// The largest gap between an edge and a face's surface that the importer
