@@ -2474,7 +2474,9 @@ impl Cylinder {
 
             // Using law of cosines to find intersection angles
             let cos_angle1 = (r1 * r1 + d * d - r2 * r2) / (2.0 * r1 * d);
-            let angle1 = cos_angle1.acos();
+            // The distance guards above admit tangency within tolerance, where
+            // rounding can leave the cosine a hair past +/-1 (acos -> NaN).
+            let angle1 = cos_angle1.clamp(-1.0, 1.0).acos();
 
             // Direction from self to other cylinder
             let center_dir = match connecting.normalize() {
@@ -2881,8 +2883,12 @@ impl Surface for Sphere {
         let local_y = to_point_norm.dot(&y_dir);
         let local_z = to_point_norm.dot(&z_dir);
 
-        // Convert to spherical coordinates
-        let v = local_z.acos(); // latitude: 0 at north pole, π at south pole
+        // Convert to spherical coordinates. The colatitude is
+        // atan2(hypot(x, y), z), NOT acos(z): acos is ill-conditioned at the
+        // poles (one ulp of rounding moves v by ~1.5e-8) and returns NaN when
+        // rounding pushes z a hair past 1 -- which any rotation or mirror of
+        // the sphere does to its own pole point. atan2 is accurate everywhere.
+        let v = local_x.hypot(local_y).atan2(local_z); // 0 at north pole, π at south pole
         let u = local_y.atan2(local_x); // longitude
 
         // Normalize u to [0, 2π)
@@ -3650,7 +3656,8 @@ impl Cone {
 
         // Get angle between cone axis and plane normal
         let axis_dot_normal = self.axis.dot(&plane.normal);
-        let axis_angle = axis_dot_normal.acos();
+        // A dot of unit vectors: past +/-1 only by rounding (acos -> NaN).
+        let axis_angle = axis_dot_normal.clamp(-1.0, 1.0).acos();
 
         // Distance from apex to plane
         let apex_to_plane = self.apex - plane.origin;
@@ -3658,35 +3665,42 @@ impl Cone {
 
         // Check if apex is on the plane
         if apex_distance.abs() < tolerance.distance() {
-            // Degenerate case - point or two lines through apex
-            if (axis_angle - consts::FRAC_PI_2).abs() < tolerance.angle() {
-                // Apex on plane, axis perpendicular - single point
+            // A plane through the apex meets the cone in generator lines. Let
+            // beta be the angle between the axis and the PLANE, alpha the half
+            // angle: steeper than alpha (beta > alpha, e.g. a plane
+            // perpendicular to the axis) touches only the apex; beta == alpha
+            // touches along one generator; shallower cuts two. In the plane,
+            // with p the axis projected onto it and q = n x p, a generator is
+            // d = cos(phi) p +- sin(phi) q with cos(phi) = cos(alpha)/cos(beta):
+            // then d lies in the plane and d . axis = cos(alpha).
+            let n = plane.normal;
+            let a_dot_n = self.axis.dot(&n);
+            let a_in_plane = self.axis - n * a_dot_n;
+            let cos_beta = a_in_plane.magnitude();
+            let beta = a_dot_n.abs().atan2(cos_beta);
+            if beta > self.half_angle + tolerance.angle() {
                 return vec![SurfaceIntersectionResult::Point(self.apex)];
-            } else {
-                // Two lines through apex
-                // Find the two generator directions
-                let perp_in_plane = match plane.normal.cross(&self.axis).normalize() {
-                    Ok(perp) => perp,
-                    Err(_) => return vec![], // Should not happen
-                };
-                let angle_in_plane = (self.half_angle / axis_angle.sin()).asin();
-
-                let dir1 = self.axis * angle_in_plane.cos() + perp_in_plane * angle_in_plane.sin();
-                let dir2 = self.axis * angle_in_plane.cos() - perp_in_plane * angle_in_plane.sin();
-
-                // Create two rays from apex
-                let line1 = crate::primitives::curve::Line::new(
-                    self.apex,
-                    self.apex + dir1 * 100.0, // Large extent
-                );
-                let line2 =
-                    crate::primitives::curve::Line::new(self.apex, self.apex + dir2 * 100.0);
-
-                return vec![
-                    SurfaceIntersectionResult::Curve(Box::new(line1)),
-                    SurfaceIntersectionResult::Curve(Box::new(line2)),
-                ];
             }
+            let Ok(p) = a_in_plane.normalize() else {
+                return vec![SurfaceIntersectionResult::Point(self.apex)];
+            };
+            let q = n.cross(&p);
+            let cos_phi = (self.half_angle.cos() / cos_beta).min(1.0);
+            let sin_phi = (1.0 - cos_phi * cos_phi).max(0.0).sqrt();
+            let line = |d: Vector3| {
+                SurfaceIntersectionResult::Curve(Box::new(crate::primitives::curve::Line::new(
+                    self.apex,
+                    self.apex + d * 100.0, // Large extent
+                )))
+            };
+            if (beta - self.half_angle).abs() <= tolerance.angle() {
+                // Tangent plane: the one generator it touches along.
+                return vec![line(p * cos_phi)];
+            }
+            return vec![
+                line(p * cos_phi + q * sin_phi),
+                line(p * cos_phi - q * sin_phi),
+            ];
         }
 
         // Classify conic section type by comparing the plane-to-axis angle
@@ -4366,7 +4380,8 @@ impl Torus {
 
         // Angle between torus axis and plane normal
         let axis_dot_normal = self.axis.dot(&plane.normal);
-        let axis_angle = axis_dot_normal.acos();
+        // A dot of unit vectors: past +/-1 only by rounding (acos -> NaN).
+        let axis_angle = axis_dot_normal.clamp(-1.0, 1.0).acos();
 
         // Check if plane is too far from torus
         if distance > self.major_radius + self.minor_radius + tolerance.distance() {

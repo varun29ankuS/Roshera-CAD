@@ -2639,7 +2639,12 @@ fn create_cylinder_parallel_intersection_lines(
     // Chord half-angle from the perpendicular axis→plane distance measured
     // along n_perp (the geometrically exact value; the caller's chord
     // criterion distance matches it up to the near-parallel tolerance band).
-    let chord_half_angle = (d_signed.abs() / cylinder.radius).acos();
+    // The caller admits planes within the tangency tolerance of the radius,
+    // where the ratio can be a hair past 1: that is TANGENT (one generator,
+    // two coincident chord lines -- what the tangency witness relies on),
+    // not NaN. Beyond the tolerance the caller has already returned no
+    // intersection.
+    let chord_half_angle = (d_signed.abs() / cylinder.radius).min(1.0).acos();
 
     // Calculate intersection points
     let cos_angle = chord_half_angle.cos();
@@ -22954,6 +22959,35 @@ mod tests {
     use crate::math::{Point3, Tolerance, Vector3};
     use crate::primitives::surface::{Cylinder, Plane, Sphere};
     use crate::primitives::topology_builder::{BRepModel, TopologyBuilder};
+
+    /// A plane TANGENT to a cylinder -- its distance from the axis equal to the
+    /// radius up to rounding -- meets it in one generator, which the chord
+    /// formula gives as two coincident lines (acos(1) = 0); the tangency
+    /// witness relies on exactly that. One ulp past the radius, acos(d / r)
+    /// was NaN and both chord lines were NaN.
+    #[test]
+    fn a_plane_tangent_to_a_cylinder_gives_its_generator_not_nan() {
+        let cyl = Cylinder::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("cylinder");
+        for eps in [0.0, 1e-15, 1e-13] {
+            let touch = Point3::new(2.0 * (1.0 + eps), 0.0, 0.0);
+            let lines = create_cylinder_parallel_intersection_lines(&cyl, Vector3::X, touch)
+                .expect("tangent plane intersects");
+            assert_eq!(lines.len(), 2, "two (coincident) chord lines");
+            for l in &lines {
+                for t in [0.0, 0.5, 1.0] {
+                    let p = l.curve.evaluate(t).expect("evaluates").position;
+                    assert!(
+                        p.x.is_finite() && p.y.is_finite() && p.z.is_finite(),
+                        "eps {eps}: the tangent generator is {p:?}"
+                    );
+                    assert!(
+                        (p.x - 2.0).abs() < 1e-9 && p.y.abs() < 1e-6,
+                        "eps {eps}: off the generator at {p:?}"
+                    );
+                }
+            }
+        }
+    }
 
     /// Task 47 -- the tangency refusal must name the dimensions that ACTUALLY
     /// failed, not a fixed five.

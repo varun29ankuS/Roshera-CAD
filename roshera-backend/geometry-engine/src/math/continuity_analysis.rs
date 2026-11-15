@@ -312,8 +312,12 @@ pub fn analyze_surface_continuity(
         // drift on a normalized vector can push |n1·n2| just outside [0, 1] and
         // produce NaN, which would then poison `max_tangent_error` and the
         // continuity classification below.
-        let normal_dot = normal1.dot(&normal2).abs().clamp(0.0, 1.0);
-        let normal_angle = (1.0 - normal_dot).acos();
+        // The angle between the normals (either sense): atan2(|n1 x n2|,
+        // |n1 . n2|) -- exact near 0, where acos(dot) loses half its digits.
+        // It was acos(1 - dot), which reads parallel normals as 90 degrees
+        // and classified every smooth joint as G0.
+        let normal_dot = normal1.dot(&normal2).abs();
+        let normal_angle = normal1.cross(&normal2).magnitude().atan2(normal_dot);
         max_tangent_error = f64::max(max_tangent_error, normal_angle);
 
         if normal_angle > tolerance.angle() {

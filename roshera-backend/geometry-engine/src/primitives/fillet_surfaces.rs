@@ -1291,7 +1291,9 @@ impl Surface for SphericalFillet {
         let phi_range = self.v_bounds.1 - self.v_bounds.0;
 
         // Convert direction to spherical coordinates
-        let theta = dir.z.acos(); // polar angle
+        // Polar angle as atan2(hypot(x, y), z): acos(z) loses half its
+        // digits near the pole (1e-6 rad came back 1.8e-10 off).
+        let theta = dir.x.hypot(dir.y).atan2(dir.z);
         let phi = dir.y.atan2(dir.x); // azimuthal angle
         let phi = if phi < 0.0 {
             phi + std::f64::consts::TAU
