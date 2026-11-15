@@ -3,6 +3,7 @@ import { useWSStore } from '@/stores/ws-store'
 import { useSceneStore } from '@/stores/scene-store'
 import { useActionErrorStore } from '@/stores/action-error-store'
 import { useDocumentStore } from '@/stores/document-store'
+import { isCurrentScope, scopeToken } from '@/lib/document-scope'
 import { cn } from '@/lib/utils'
 import { tryReadJson, refusalMessage } from '@/lib/backend-refusal'
 import {
@@ -1007,12 +1008,16 @@ export function Timeline() {
 
   const fetchHistory = useCallback(async () => {
     if (previewMode) return // hold the mock data steady in preview mode
+    // The history poll keeps running through a document switch; an answer
+    // started in the previous document must not repaint the new one's strip.
+    const scope = scopeToken()
     try {
       setLoading(true)
       const [histResp, branchResp] = await Promise.all([
         fetch(`/api/timeline/history/${activeBranchId}`),
         fetch('/api/branches'),
       ])
+      if (!isCurrentScope(scope)) return
       let branchList: BranchView[] | null = null
       if (branchResp.ok) {
         const data = await branchResp.json()
@@ -1061,9 +1066,18 @@ export function Timeline() {
   const documentEpoch = useDocumentStore((s) => s.epoch)
   useEffect(() => {
     if (documentEpoch === 0) return // initial mount, not a switch
+    // Everything this strip shows belongs to the document just left: the
+    // steps, the branches, the decisions, the restore notice. Clear it all
+    // now so none of it reads as the new document's while that loads.
     setEvents([])
-    setActiveBranchId(MAIN_BRANCH_ID)
-    void fetchHistory()
+    setBranches([])
+    setCheckpoints([])
+    setDurability(null)
+    // On another branch, moving to main changes `fetchHistory` and the
+    // effect below fetches main's history; fetching here too would ask the
+    // new document for the OLD branch's id (twice the requests, one wrong).
+    if (activeBranchId === MAIN_BRANCH_ID) void fetchHistory()
+    else setActiveBranchId(MAIN_BRANCH_ID)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [documentEpoch])
 
@@ -1082,9 +1096,10 @@ export function Timeline() {
   // leaning on the limiter.
   const fetchCheckpoints = useCallback(async () => {
     if (previewMode) return
+    const scope = scopeToken()
     try {
       const resp = await fetch('/api/timeline/checkpoints')
-      if (!resp.ok) return
+      if (!resp.ok || !isCurrentScope(scope)) return
       const data = await resp.json()
       if (Array.isArray(data)) setCheckpoints(data as CheckpointSummary[])
     } catch {

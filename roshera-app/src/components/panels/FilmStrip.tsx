@@ -22,6 +22,8 @@ import { Box, ChevronRight, Pause, Play, ToolIcons, X } from '@/components/ui/ic
 import { frameIndexAt, stepTo } from '@/lib/history-view'
 import { nextPlayIndex } from '@/lib/slider'
 import { prefetchStep, useHistoryView } from '@/stores/history-view-store'
+import { DocumentScopedCache, scopeToken } from '@/lib/document-scope'
+import { useDocumentStore } from '@/stores/document-store'
 
 // Compact clips (Varun 2026-11-13): the viewport is the viewer; the track is
 // an index.
@@ -36,20 +38,11 @@ const PLAY_STEP_MS = 850
 
 /** Pictures already fetched, by branch, step and pixel size: a picture seen
  *  once shows instantly after. Bounded; an evicted picture's object URL is
- *  released. */
+ *  released. Scoped to the open document (`lib/document-scope.ts`): every
+ *  document numbers its history from step 0, and keyed by step alone the
+ *  strip showed the previous document's pictures after a tab switch. */
 const MAX_PICTURES = 300
-const pictures = new Map<string, string>()
-
-function keepPicture(key: string, url: string) {
-  pictures.set(key, url)
-  while (pictures.size > MAX_PICTURES) {
-    const oldest = pictures.keys().next().value
-    if (oldest === undefined) break
-    const old = pictures.get(oldest)
-    pictures.delete(oldest)
-    if (old) URL.revokeObjectURL(old)
-  }
-}
+const pictures = new DocumentScopedCache<string>(MAX_PICTURES, (url) => URL.revokeObjectURL(url))
 
 function prefersReducedMotion(): boolean {
   return typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
@@ -75,25 +68,35 @@ export function FramePicture({
 }) {
   const scale = typeof window !== 'undefined' && window.devicePixelRatio > 1 ? 2 : 1
   const key = `${branch}:${seq}:${px * scale}`
-  const [url, setUrl] = useState<string | null>(() => pictures.get(key) ?? null)
-  const [failed, setFailed] = useState(false)
+  // The same step number is a different picture in another document, so
+  // what this frame loaded is tagged with the document it was loaded in
+  // (`epoch`) and shown only while that is still the open one -- never the
+  // previous document's picture under the new tab.
+  const documentGeneration = useDocumentStore((s) => s.epoch)
+  const loadKey = `${documentGeneration}|${key}`
+  const [loaded, setLoaded] = useState<{ key: string; url: string | null; failed: boolean } | null>(null)
+  const kept = pictures.get(key)
+  const url = kept ?? (loaded?.key === loadKey ? loaded.url : null)
+  const failed = !kept && loaded?.key === loadKey && loaded.failed
   useEffect(() => {
     if (pictures.has(key)) return
     let live = true
+    const token = scopeToken()
     fetch(framePictureUrl(branch, seq, px * scale))
       .then((r) => (r.ok ? r.blob() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((blob) => {
         const objectUrl = URL.createObjectURL(blob)
-        keepPicture(key, objectUrl)
-        if (live) setUrl(objectUrl)
+        // Fetched for a document that is no longer open: shown nowhere.
+        if (!pictures.setIfCurrent(token, key, objectUrl)) return
+        if (live) setLoaded({ key: loadKey, url: objectUrl, failed: false })
       })
       .catch(() => {
-        if (live) setFailed(true)
+        if (live) setLoaded({ key: loadKey, url: null, failed: true })
       })
     return () => {
       live = false
     }
-  }, [branch, seq, px, scale, key])
+  }, [branch, seq, px, scale, key, loadKey])
   if (failed) {
     return <span className="flex h-full w-full items-center justify-center text-[11px] text-muted-foreground">no picture</span>
   }

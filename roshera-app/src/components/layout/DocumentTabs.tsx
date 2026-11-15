@@ -326,7 +326,7 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
           `elementFromPoint` hit the panel behind it). The `+` button and
           its dropdown below live OUTSIDE this scroller so they're never
           clipped. */}
-      <div className="flex items-center gap-0.5 h-full overflow-x-auto min-w-0" role="tablist" aria-label="Open documents">
+      <div className="flex items-center gap-1 h-full overflow-x-auto min-w-0" role="tablist" aria-label="Open documents">
       {tabs.map((doc) => {
         const isSwitchingHere = switchingId === doc.id
         const onlyTab = tabs.length === 1
@@ -335,23 +335,34 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
             key={doc.id}
             role="tab"
             aria-selected={doc.active}
+            aria-busy={isSwitchingHere || undefined}
+            data-active={doc.active || undefined}
+            data-switching={isSwitchingHere || undefined}
             onClick={() => void handleSwitch(doc)}
             onContextMenu={(e) => handleContextMenu(e, doc)}
             title={`${doc.name} — created ${formatShortDate(doc.createdAt)} · ${doc.id} — its own Blackboard notes, timeline, and model. Switching loads that document's notebook, not this one's.`}
             className={cn(
-              'group relative flex items-center gap-1.5 py-1 pl-2.5 pr-1 rounded-t text-[12px] shrink-0 max-w-[180px] cursor-pointer transition-colors border-b-2',
+              // The active tab is read at a glance, the established CAD way:
+              // it takes the viewport's own ground (it is the document the
+              // canvas below is showing), stands in a drawn frame
+              // (`--border-strong`, kept for the few things that genuinely
+              // want a drawn edge), carries the selection underline TabChip
+              // uses (status-pill.tsx) and the strongest text on the strip.
+              // Inactive tabs recede to muted text on the bar, no fill, no
+              // frame. The old treatment
+              // (a 10% wash of a near-black primary over a near-white bar, a
+              // solid dot) read as a hover state, and the dot reads as
+              // "unsaved" in every editor an engineer has used.
+              'group relative flex h-7 items-center gap-1.5 pl-2.5 pr-1 rounded-t border text-[12px] shrink-0 max-w-[180px] cursor-pointer transition-colors',
+              'after:pointer-events-none after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:content-[""]',
               doc.active
-                ? 'bg-primary/10 text-foreground font-semibold border-primary'
-                : 'text-muted-foreground hover:text-foreground hover:bg-accent/30 border-transparent',
-              switchingId && !isSwitchingHere && 'pointer-events-none opacity-60',
+                ? 'bg-background border-border-strong/70 text-foreground font-semibold shadow-sm after:bg-primary'
+                : isSwitchingHere
+                  ? 'border-transparent text-foreground after:bg-primary/60 after:animate-pulse'
+                  : 'border-transparent text-muted-foreground hover:text-foreground hover:bg-accent/40 after:bg-transparent',
+              switchingId && !isSwitchingHere && !doc.active && 'pointer-events-none opacity-60',
             )}
           >
-            {doc.active && !isSwitchingHere && (
-              <span
-                aria-hidden
-                className="inline-block w-2 h-2 rounded-full bg-primary ring-2 ring-primary/25 shrink-0"
-              />
-            )}
             {isSwitchingHere && (
               <span
                 aria-hidden

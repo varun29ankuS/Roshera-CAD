@@ -8,6 +8,7 @@
 import { create } from 'zustand'
 import type { CADObject } from '@/stores/scene-store'
 import { fetchScrub } from '@/lib/history-view'
+import { DocumentScopedCache, onDocumentChange, scopeToken } from '@/lib/document-scope'
 
 interface HistoryViewState {
   /** The step being shown, or null for the live part. */
@@ -30,9 +31,12 @@ interface HistoryViewState {
 let request = 0
 
 /** Steps already fetched, newest last: sliding back and forth re-reads them.
- *  Bounded (a step's meshes can be several MB); the oldest is dropped. */
+ *  Bounded (a step's meshes can be several MB); the oldest is dropped.
+ *  Scoped to the open document (`lib/document-scope.ts`): every document
+ *  numbers its history from step 0, so a step kept for one document must
+ *  never be shown for another. */
 const MAX_KEPT = 16
-const kept = new Map<string, CADObject[]>()
+const kept = new DocumentScopedCache<CADObject[]>(MAX_KEPT)
 const inFlight = new Map<string, Promise<CADObject[]>>()
 
 function keyOf(branch: string, step: number): string {
@@ -42,25 +46,19 @@ function keyOf(branch: string, step: number): string {
 function load(branch: string, step: number): Promise<CADObject[]> {
   const key = keyOf(branch, step)
   const have = kept.get(key)
-  if (have) {
-    // Refresh its place as the most recently used.
-    kept.delete(key)
-    kept.set(key, have)
-    return Promise.resolve(have)
-  }
+  if (have) return Promise.resolve(have)
   const pending = inFlight.get(key)
   if (pending) return pending
+  const token = scopeToken()
   const p = fetchScrub(branch, step)
     .then((objects) => {
-      kept.set(key, objects)
-      while (kept.size > MAX_KEPT) {
-        const oldest = kept.keys().next().value
-        if (oldest === undefined) break
-        kept.delete(oldest)
-      }
+      // Fetched for a document that is no longer open: kept nowhere.
+      kept.setIfCurrent(token, key, objects)
       return objects
     })
-    .finally(() => inFlight.delete(key))
+    .finally(() => {
+      if (inFlight.get(key) === p) inFlight.delete(key)
+    })
   inFlight.set(key, p)
   return p
 }
@@ -108,3 +106,19 @@ export const useHistoryView = create<HistoryViewState>((set) => ({
       })
   },
 }))
+
+// Another document: its history is not this one's. Go back to the live part,
+// drop the selection, and let any answer still in flight for the old document
+// land nowhere (`request` moves on, so `view`'s guard refuses it).
+onDocumentChange(() => {
+  request += 1
+  inFlight.clear()
+  useHistoryView.setState({
+    step: null,
+    label: null,
+    objects: [],
+    loading: false,
+    error: null,
+    selectedChapter: null,
+  })
+})

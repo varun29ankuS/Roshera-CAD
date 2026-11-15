@@ -54,6 +54,7 @@ import { createDocument, listDocuments, openDocument, renameDocument, type Docum
 import { refreshSceneFromServer } from '@/lib/ws-bridge'
 import { syncNotebook } from '@/lib/blackboard-api'
 import { establishAcpSession, getAcpSessionId, resetAcpClient } from '@/lib/acp-blackboard'
+import { enterDocument } from '@/lib/document-scope'
 
 export interface DocumentSwitchResult {
   success: boolean
@@ -146,6 +147,9 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
       // Otherwise the active document IS where this browser is working --
       // unless a return to the last document is still pending (or failed).
       const active = docs.find((d) => d.active)
+      // The history caches belong to whatever the server has open -- also
+      // when something other than this tab strip (an agent over MCP) moved it.
+      if (active && !get().switchingId) enterDocument(active.id)
       if (active && !restorePending && !get().switchingId) writeLastDocument(active.id)
     } catch {
       // Backend not reachable yet — leave the previous list (possibly
@@ -170,14 +174,39 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
       // document is active by the time that call happens.
       const hadAgentSession = getAcpSessionId() !== null
       resetAcpClient()
+      // The backend has CONFIRMED: from here on this is the active document,
+      // so say so at once -- the tab, the history caches (`document-scope`)
+      // and `epoch`. Every panel that hydrates on `epoch` (history, chapters,
+      // checkpoints, datums, units, drawings, restore status) then loads IN
+      // PARALLEL with the scene below, instead of waiting behind the
+      // snapshot -- the largest payload of the switch, megabytes of mesh on
+      // an imported document. Still never optimistic: nothing here moves
+      // before `openDocument` returned 200.
+      enterDocument(id, { reopened: true })
+      set((state) => ({
+        documents: state.documents.map((d) => ({ ...d, active: d.id === id })),
+        epoch: state.epoch + 1,
+      }))
+      writeLastDocument(id)
       // Re-hydrate the stores that own server-sourced state. A failure in
       // any one of these is reported by that primitive itself (scene sync
       // already posts a Blackboard line on failure); we still complete the
       // switch rather than leaving the UI half-migrated, since the backend
       // has already committed to the new document regardless.
-      const [docs] = await Promise.all([listDocuments(), refreshSceneFromServer(), syncNotebook()])
-      set((state) => ({ documents: docs, switchingId: null, epoch: state.epoch + 1 }))
-      writeLastDocument(id)
+      // `switchingId` stays set until the model is on screen: the tab shows
+      // it is still loading, and a second switch cannot start mid-load.
+      try {
+        // A failed re-list keeps the locally confirmed list above: the switch
+        // itself has landed and is not reported as failed.
+        const [docs] = await Promise.all([
+          listDocuments().catch(() => null),
+          refreshSceneFromServer(),
+          syncNotebook(),
+        ])
+        if (docs) set({ documents: docs })
+      } finally {
+        set({ switchingId: null })
+      }
       // Open the fresh session NOW if the agent was connected before the
       // switch, rather than lazily on the next message: in between, the
       // header read "no session" and the AI chip went red as if the provider
