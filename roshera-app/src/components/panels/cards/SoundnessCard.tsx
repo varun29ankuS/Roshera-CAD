@@ -3,7 +3,11 @@ import {
   Droplet,
   ShieldCheck,
 } from '@/components/ui/icons'
-import type { SoundnessCard as SoundnessCardData } from '@/lib/blackboard-cards'
+import {
+  invariantState,
+  type InvariantValue,
+  type SoundnessCard as SoundnessCardData,
+} from '@/lib/blackboard-cards'
 import { CardShell, Chip, Claim, ClaimBadge, KV, type CardAccent } from './card-chrome'
 import { eulerGenus, fmtNum } from './format'
 
@@ -15,7 +19,9 @@ import { eulerGenus, fmtNum } from './format'
  * failed, or NOT RUN — and the three are rendered distinctly because a check
  * that did not run is not a check that passed. `sound` is the authoritative
  * conjunction only when the full certificate ran; a partial certificate is
- * shown as partial, never rounded up.
+ * shown as partial, never rounded up. The consistency conjuncts have a
+ * fourth state, not_applicable (nothing to check on this part): a grey "n/a",
+ * neither a tick nor a cross, and not counted as not-run.
  *
  * The nine invariants render as a wrapped row of compact `ClaimBadge`s (not
  * a vertical list — Varun, 2026-08-01: a sound part should read as one
@@ -35,8 +41,29 @@ import { eulerGenus, fmtNum } from './format'
  * an abstract B-Rep/topology term with no real-world icon at all, so all
  * nine keep short text labels rather than inventing glyphs for them.
  */
+type InvariantKey =
+  | 'brep_valid'
+  | 'watertight'
+  | 'manifold'
+  | 'shells_outward'
+  | 'self_intersection_free'
+  | 'construction_consistent'
+  | 'labels_consistent'
+  | 'tessellation_clean'
+  | 'mesh_quality_clean'
+  | 'eyes_consistent'
+
+/** Badge status and hover word per state. `na` is its own state: the check
+ *  had nothing to judge on this part, which is neither a pass nor a fail. */
+const BADGE: Record<ReturnType<typeof invariantState>, { status: boolean | null | 'na'; word: string }> = {
+  pass: { status: true, word: 'proven' },
+  fail: { status: false, word: 'FAILED' },
+  na: { status: 'na', word: 'not applicable to this part' },
+  not_run: { status: null, word: 'not run — not-run is not a pass' },
+}
+
 const INVARIANTS: ReadonlyArray<{
-  key: keyof SoundnessCardData & string
+  key: InvariantKey
   /** Visible badge text (or nothing, if `glyph` is set). */
   label: string
   /** Full claim name — hover/`aria-label` only, never truncated. */
@@ -58,14 +85,23 @@ const INVARIANTS: ReadonlyArray<{
 export function SoundnessCard({ card }: { card: SoundnessCardData }) {
   const sound = card.sound ?? null
   const accent: CardAccent = sound === true ? 'pass' : sound === false ? 'fail' : 'neutral'
-  const notRun = INVARIANTS.filter((inv) => (card[inv.key] ?? null) === null).length
+  const stateOf = (key: InvariantKey) => invariantState(card[key] as InvariantValue)
+  const notRun = INVARIANTS.filter((inv) => stateOf(inv.key) === 'not_run').length
   const genus = card.euler_characteristic != null ? eulerGenus(card.euler_characteristic) : null
 
   return (
     <CardShell
       accent={accent}
       icon={ShieldCheck}
-      title={card.part ? <>Soundness — {card.part}</> : 'Soundness certificate'}
+      title={
+        card.part ? (
+          <>Soundness — {card.part}</>
+        ) : card.part_id != null ? (
+          <>Soundness — part {card.part_id}</>
+        ) : (
+          'Soundness certificate'
+        )
+      }
       chip={
         sound === true ? (
           <Chip accent="pass" title="Every certified invariant holds — the kernel asserts a closed, sound solid">
@@ -82,22 +118,20 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
     >
       <div className="mt-1.5 flex flex-wrap items-center gap-1">
         {INVARIANTS.map(({ key, label, long, glyph }) => {
-          const value = (card[key] ?? null) as boolean | null
+          const badge = BADGE[stateOf(key)]
           return (
             <ClaimBadge
               key={key}
-              status={value}
+              status={badge.status}
               label={label}
               glyph={glyph}
-              detail={
-                value === null
-                  ? `${long}: not run — not-run is not a pass`
-                  : `${long}: ${value ? 'proven' : 'FAILED'}`
-              }
+              detail={`${long}: ${badge.word}`}
             />
           )
         })}
       </div>
+
+      {card.verdict && <div className="mt-1.5 text-[11px] text-foreground/80">{card.verdict}</div>}
 
       <div className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-0.5">
         {card.euler_characteristic != null && (

@@ -18,7 +18,7 @@
  * honest fallback over a fabricated rendering.
  *
  * # Payload provenance — read from the real wire shapes, not invented
- * - `roshera:dfm`      → `RuleVerdict` verbatim (geometry-engine/src/dfm/
+ * - `roshera:dfm`      → a `DfmReport` or one `RuleVerdict`, verbatim (geometry-engine/src/dfm/
  *   report.rs: `Verdict`, `DfmValue`, `Derivation`, `DfmBound`,
  *   `UnverifiableReason`; provenance.rs: `RuleProvenance`). serde tagging is
  *   `#[serde(tag = "kind", rename_all = "snake_case")]` throughout.
@@ -38,7 +38,8 @@
  *   `construction_consistent`, `labels_consistent`, `tessellation_clean`,
  *   `mesh_quality_clean`, `euler_characteristic`, `eyes_consistent`,
  *   `open_edges`, `nonmanifold_edges`, `face_count`, `volume`, `errors`) —
- *   tri-state per invariant: true / false / null-means-not-run.
+ *   tri-state per invariant: true / false / null-means-not-run; the
+ *   consistency conjuncts arrive as consistent / inconsistent / not_applicable.
  * - `roshera:refusal`  → the refusal wire the backend already speaks: a
  *   verbatim `message` from a 409/422 (never paraphrased — gdt.ts surfaces
  *   it as `REFUSED: <msg>`), plus optional next actions. A refusal is a
@@ -150,7 +151,7 @@ const ruleProvenanceSchema = z.discriminatedUnion('kind', [
 ])
 
 /** `RuleVerdict` verbatim + authoring annotations (`unit`, `note`). */
-export const dfmCardSchema = z.object({
+const dfmRuleCardSchema = z.object({
   rule: z.string(),
   verdict: dfmVerdictSchema,
   provenance: ruleProvenanceSchema,
@@ -160,7 +161,36 @@ export const dfmCardSchema = z.object({
   note: z.string().optional(),
 })
 
+/** `DfmSummary` (report.rs): the pack-level fold. Inconclusive is never a pass. */
+const dfmSummarySchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('pass') }).passthrough(),
+  z.object({ kind: z.literal('violations'), count: z.number().int().nonnegative() }).passthrough(),
+  z.object({ kind: z.literal('inconclusive'), unverifiable: z.number().int().nonnegative() }).passthrough(),
+])
+
+/** `DfmReport` verbatim — what dfm_check returns and the agent forwards. */
+const dfmReportCardSchema = z.object({
+  pack: z.string(),
+  /** `PackParams`, tagged by `pack`; echoed, not interpreted here. */
+  params: z.object({ pack: z.string() }).passthrough(),
+  verdicts: z.array(
+    z.object({ rule: z.string(), verdict: dfmVerdictSchema, provenance: ruleProvenanceSchema }).passthrough(),
+  ),
+  summary: dfmSummarySchema,
+  note: z.string().optional(),
+})
+
+/** A `roshera:dfm` fence carries either a whole `DfmReport` or one `RuleVerdict`. */
+export const dfmCardSchema = z.union([dfmReportCardSchema, dfmRuleCardSchema])
+
 export type DfmCard = z.infer<typeof dfmCardSchema>
+export type DfmRuleCard = z.infer<typeof dfmRuleCardSchema>
+export type DfmReportCard = z.infer<typeof dfmReportCardSchema>
+export type DfmCardSummary = z.infer<typeof dfmSummarySchema>
+
+export function isDfmReport(card: DfmCard): card is DfmReportCard {
+  return 'verdicts' in card
+}
 export type DfmCardVerdict = z.infer<typeof dfmVerdictSchema>
 export type DfmCardValue = z.infer<typeof dfmValueSchema>
 export type DfmUnverifiableReason = z.infer<typeof unverifiableReasonSchema>
@@ -391,28 +421,78 @@ export type MergeConflictWitness = z.infer<typeof conflictWitnessSchema>
 /** true / false / null — null means NOT RUN, and not-run ≠ passed. */
 const triState = z.boolean().nullish()
 
-export const soundnessCardSchema = z.object({
-  /** Authoring annotation: the part's display name. */
-  part: z.string().optional(),
-  sound: triState,
-  brep_valid: triState,
-  watertight: triState,
-  manifold: triState,
-  /** Every shell faces out of the material (bodies enclose positive volume, voids negative). */
-  shells_outward: triState,
-  self_intersection_free: triState,
-  construction_consistent: triState,
-  labels_consistent: triState,
-  tessellation_clean: triState,
-  mesh_quality_clean: triState,
-  eyes_consistent: triState,
-  euler_characteristic: z.number().nullish(),
-  open_edges: z.number().nullish(),
-  nonmanifold_edges: z.number().nullish(),
-  face_count: z.number().nullish(),
-  volume: z.number().nullish(),
-  errors: z.array(z.string()).nullish(),
-})
+/** The consistency conjuncts (`ConstructionConsistency`, `LabelsConsistency`,
+ *  `EyesConsistency` in provenance.rs) arrive as their `label()` words.
+ *  Only `inconsistent` is unsound; `not_applicable` means there was nothing
+ *  to check. Booleans are still accepted for older transcripts. */
+const consistency = z
+  .union([z.enum(['consistent', 'inconsistent', 'not_applicable']), z.boolean()])
+  .nullish()
+
+export type InvariantValue = boolean | 'consistent' | 'inconsistent' | 'not_applicable' | null | undefined
+export type InvariantState = 'pass' | 'fail' | 'na' | 'not_run'
+
+/** How one invariant reads: proven, failed, not applicable, or not run. */
+export function invariantState(v: InvariantValue): InvariantState {
+  if (v === true || v === 'consistent') return 'pass'
+  if (v === false || v === 'inconsistent') return 'fail'
+  if (v === 'not_applicable') return 'na'
+  return 'not_run'
+}
+
+const asRecord = (v: unknown): Record<string, unknown> | null =>
+  v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
+
+/** verify_part names watertightness `brep_watertight` and nests the full
+ *  certificate under `cert`. Fill the card's fields from those when the
+ *  top-level ones are absent; a top-level value always wins. */
+function liftSoundnessAliases(input: unknown): unknown {
+  const top = asRecord(input)
+  if (!top) return input
+  const cert = asRecord(top.cert)
+  const out: Record<string, unknown> = { ...top }
+  const fill = (key: string, value: unknown) => {
+    if (out[key] == null && value != null) out[key] = value
+  }
+  fill('watertight', top.brep_watertight)
+  if (cert) {
+    fill('watertight', cert.watertight)
+    fill('euler_characteristic', cert.euler_characteristic)
+    fill('open_edges', cert.boundary_edges)
+    fill('nonmanifold_edges', cert.nonmanifold_edges)
+    fill('errors', cert.errors)
+  }
+  return out
+}
+
+export const soundnessCardSchema = z.preprocess(
+  liftSoundnessAliases,
+  z.object({
+    /** Authoring annotation: the part's display name. */
+    part: z.string().optional(),
+    part_id: z.number().nullish(),
+    sound: triState,
+    brep_valid: triState,
+    watertight: triState,
+    manifold: triState,
+    /** Every shell faces out of the material (bodies enclose positive volume, voids negative). */
+    shells_outward: triState,
+    self_intersection_free: triState,
+    construction_consistent: consistency,
+    labels_consistent: consistency,
+    tessellation_clean: triState,
+    mesh_quality_clean: triState,
+    eyes_consistent: consistency,
+    euler_characteristic: z.number().nullish(),
+    open_edges: z.number().nullish(),
+    nonmanifold_edges: z.number().nullish(),
+    face_count: z.number().nullish(),
+    volume: z.number().nullish(),
+    errors: z.array(z.string()).nullish(),
+    /** The kernel's one-line verdict, verbatim. */
+    verdict: z.string().nullish(),
+  }),
+)
 
 export type SoundnessCard = z.infer<typeof soundnessCardSchema>
 
@@ -476,7 +556,10 @@ export function parseCard(kind: CardKind, source: string): CardParseResult {
   })
   switch (kind) {
     case 'dfm': {
-      const r = dfmCardSchema.safeParse(json)
+      // Pick the shape first so a broken payload reports its own fields,
+      // not a bare "Invalid input" from the union.
+      const isReport = asRecord(json) !== null && 'verdicts' in (json as Record<string, unknown>)
+      const r = (isReport ? dfmReportCardSchema : dfmRuleCardSchema).safeParse(json)
       return r.success ? { ok: true, card: { kind, card: r.data } } : fail(r)
     }
     case 'fcf': {

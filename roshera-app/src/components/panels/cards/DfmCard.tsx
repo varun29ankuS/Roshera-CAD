@@ -4,20 +4,24 @@ import {
   FlaskConical,
   X,
 } from '@/components/ui/icons'
-import type {
-  DfmCard as DfmCardData,
-  DfmCardValue,
-  DfmRuleProvenance,
-  DfmUnverifiableReason,
+import {
+  isDfmReport,
+  type DfmCard as DfmCardData,
+  type DfmCardSummary,
+  type DfmCardValue,
+  type DfmCardVerdict,
+  type DfmReportCard,
+  type DfmRuleProvenance,
+  type DfmUnverifiableReason,
 } from '@/lib/blackboard-cards'
 import { CardShell, Chip, KV, type CardAccent } from './card-chrome'
 import { fmtNum } from './format'
 
 /**
- * DFM RULE VERDICT CARD
- * =====================
- * One rule's certified outcome, rendered from the `RuleVerdict` wire shape
- * (geometry-engine/src/dfm/report.rs) without reinterpretation:
+ * DFM CARD
+ * ========
+ * A whole `DfmReport` (summary, then one row per rule) or a single rule's
+ * `RuleVerdict` (geometry-engine/src/dfm/report.rs), without reinterpretation:
  *   - Pass       → the proven margin, with its derivation;
  *   - Violation  → measured vs limit (both provenance-carrying) + the
  *                  witness faces;
@@ -110,84 +114,160 @@ function FaceChips({ label, faces }: { label: string; faces: number[] }) {
   )
 }
 
-export function DfmCard({ card }: { card: DfmCardData }) {
-  const unit = card.unit ? ` ${card.unit}` : ''
-  const v = card.verdict
-  const accent: CardAccent =
-    v.kind === 'pass' ? 'pass' : v.kind === 'violation' ? 'fail' : 'warn'
-  const prov = provenanceLine(card.provenance)
+function accentOf(v: DfmCardVerdict): CardAccent {
+  return v.kind === 'pass' ? 'pass' : v.kind === 'violation' ? 'fail' : 'warn'
+}
 
+function VerdictChip({ verdict }: { verdict: DfmCardVerdict }) {
+  if (verdict.kind === 'pass') {
+    return (
+      <Chip accent="pass">
+        <Check size={9} /> pass — proven
+      </Chip>
+    )
+  }
+  if (verdict.kind === 'violation') {
+    return (
+      <Chip accent="fail">
+        <X size={9} /> violation — proven
+      </Chip>
+    )
+  }
+  return (
+    <Chip accent="warn" title="An honest refusal to decide — not an error, and never folded to a pass">
+      <CircleSlash size={9} /> unverifiable
+    </Chip>
+  )
+}
+
+function VerdictBody({ verdict: v, unit }: { verdict: DfmCardVerdict; unit: string }) {
+  return (
+    <div className="mt-1.5 space-y-0.5">
+      {v.kind === 'pass' && (
+        <>
+          <KV label="margin">
+            ≥ {fmtNum(v.margin.value)}
+            {unit}
+          </KV>
+          {boundSuffix(v.margin, unit) !== null && (
+            <div className="text-[11px] text-muted-foreground">{boundSuffix(v.margin, unit)}</div>
+          )}
+          <div className="text-[11px] text-muted-foreground">{derivationLine(v.margin)}</div>
+        </>
+      )}
+
+      {v.kind === 'violation' && (
+        <>
+          <KV label="measured">
+            {fmtNum(v.measured.value)}
+            {unit}
+          </KV>
+          <KV label="limit">
+            {fmtNum(v.limit.value)}
+            {unit}
+          </KV>
+          {boundSuffix(v.measured, unit) !== null && (
+            <div className="text-[11px] text-muted-foreground">
+              measured {boundSuffix(v.measured, unit)}
+            </div>
+          )}
+          <div className="text-[11px] text-muted-foreground">
+            measured: {derivationLine(v.measured)} · limit: {derivationLine(v.limit)}
+          </div>
+          <FaceChips label="witnesses" faces={v.witnesses} />
+        </>
+      )}
+
+      {v.kind === 'unverifiable' && (
+        <>
+          <div className="text-[11px] text-foreground/85">{reasonBlock(v.reason, unit)}</div>
+          <FaceChips label="regions" faces={v.regions} />
+        </>
+      )}
+    </div>
+  )
+}
+
+function ProvenanceFooter({ provenance }: { provenance: DfmRuleProvenance }) {
+  const prov = provenanceLine(provenance)
+  return (
+    <div className="mt-1.5 flex flex-wrap items-baseline gap-1.5 border-t border-border/50 pt-1 text-[11px] text-muted-foreground">
+      <span className="rounded border border-border px-1 py-px font-mono uppercase tracking-wide">
+        {prov.label}
+      </span>
+      <span>{prov.text}</span>
+    </div>
+  )
+}
+
+/** The pack-level fold, verbatim: inconclusive keeps its count and is never a pass. */
+function SummaryChip({ summary }: { summary: DfmCardSummary }) {
+  if (summary.kind === 'pass') {
+    return (
+      <Chip accent="pass" title="Every rule in the pack is proven to pass">
+        <Check size={9} /> pass — every rule proven
+      </Chip>
+    )
+  }
+  if (summary.kind === 'violations') {
+    return (
+      <Chip accent="fail">
+        <X size={9} /> {summary.count} {summary.count === 1 ? 'violation' : 'violations'}
+      </Chip>
+    )
+  }
+  return (
+    <Chip accent="warn" title="No violation was proven, but some rules could not be checked — not a pass">
+      <CircleSlash size={9} /> inconclusive · {summary.unverifiable} unverifiable
+    </Chip>
+  )
+}
+
+function summaryAccent(summary: DfmCardSummary): CardAccent {
+  return summary.kind === 'pass' ? 'pass' : summary.kind === 'violations' ? 'fail' : 'warn'
+}
+
+function DfmReportView({ card }: { card: DfmReportCard }) {
   return (
     <CardShell
-      accent={accent}
+      accent={summaryAccent(card.summary)}
+      icon={FlaskConical}
+      title={
+        <>
+          DFM — <span className="cad-readout">{card.pack}</span>
+        </>
+      }
+      chip={<SummaryChip summary={card.summary} />}
+    >
+      <div className="mt-1.5 flex flex-col gap-1.5">
+        {card.verdicts.map((rv, i) => (
+          <div key={`${rv.rule}-${i}`} className="rounded border border-border/60 px-1.5 py-1">
+            <div className="flex flex-wrap items-center justify-between gap-1">
+              <span className="cad-readout text-[11px] text-foreground/90">{rv.rule}</span>
+              <VerdictChip verdict={rv.verdict} />
+            </div>
+            <VerdictBody verdict={rv.verdict} unit="" />
+            <ProvenanceFooter provenance={rv.provenance} />
+          </div>
+        ))}
+      </div>
+      {card.note && <div className="mt-1 text-[11px] text-foreground/70">{card.note}</div>}
+    </CardShell>
+  )
+}
+
+export function DfmCard({ card }: { card: DfmCardData }) {
+  if (isDfmReport(card)) return <DfmReportView card={card} />
+  const unit = card.unit ? ` ${card.unit}` : ''
+  return (
+    <CardShell
+      accent={accentOf(card.verdict)}
       icon={FlaskConical}
       title={<span className="cad-readout">{card.rule}</span>}
-      chip={
-        v.kind === 'pass' ? (
-          <Chip accent="pass">
-            <Check size={9} /> pass — proven
-          </Chip>
-        ) : v.kind === 'violation' ? (
-          <Chip accent="fail">
-            <X size={9} /> violation — proven
-          </Chip>
-        ) : (
-          <Chip accent="warn" title="An honest refusal to decide — not an error, and never folded to a pass">
-            <CircleSlash size={9} /> unverifiable
-          </Chip>
-        )
-      }
+      chip={<VerdictChip verdict={card.verdict} />}
     >
-      <div className="mt-1.5 space-y-0.5">
-        {v.kind === 'pass' && (
-          <>
-            <KV label="margin">
-              ≥ {fmtNum(v.margin.value)}
-              {unit}
-            </KV>
-            {boundSuffix(v.margin, unit) !== null && (
-              <div className="text-[11px] text-muted-foreground">{boundSuffix(v.margin, unit)}</div>
-            )}
-            <div className="text-[11px] text-muted-foreground">{derivationLine(v.margin)}</div>
-          </>
-        )}
-
-        {v.kind === 'violation' && (
-          <>
-            <KV label="measured">
-              {fmtNum(v.measured.value)}
-              {unit}
-            </KV>
-            <KV label="limit">
-              {fmtNum(v.limit.value)}
-              {unit}
-            </KV>
-            {boundSuffix(v.measured, unit) !== null && (
-              <div className="text-[11px] text-muted-foreground">
-                measured {boundSuffix(v.measured, unit)}
-              </div>
-            )}
-            <div className="text-[11px] text-muted-foreground">
-              measured: {derivationLine(v.measured)} · limit: {derivationLine(v.limit)}
-            </div>
-            <FaceChips label="witnesses" faces={v.witnesses} />
-          </>
-        )}
-
-        {v.kind === 'unverifiable' && (
-          <>
-            <div className="text-[11px] text-foreground/85">{reasonBlock(v.reason, unit)}</div>
-            <FaceChips label="regions" faces={v.regions} />
-          </>
-        )}
-      </div>
-
-      <div className="mt-1.5 flex flex-wrap items-baseline gap-1.5 border-t border-border/50 pt-1 text-[11px] text-muted-foreground">
-        <span className="rounded border border-border px-1 py-px font-mono uppercase tracking-wide">
-          {prov.label}
-        </span>
-        <span>{prov.text}</span>
-      </div>
+      <VerdictBody verdict={card.verdict} unit={unit} />
+      <ProvenanceFooter provenance={card.provenance} />
       {card.note && <div className="mt-1 text-[11px] text-foreground/70">{card.note}</div>}
     </CardShell>
   )

@@ -420,6 +420,88 @@ const SOUNDNESS_PARTIAL = card('soundness', {
   face_count: 24,
 })
 
+// verify_part output as the agent forwards it today: consistency conjuncts
+// as words, watertight as `brep_watertight`, the full cert nested.
+const SOUNDNESS_VERIFY_PART = card('soundness', {
+  part_id: 12,
+  sound: true,
+  brep_valid: true,
+  brep_watertight: true,
+  manifold: true,
+  shells_outward: true,
+  misoriented_shells: [],
+  self_intersection_free: true,
+  tessellation_clean: true,
+  mesh_quality_clean: true,
+  construction_consistent: 'not_applicable',
+  eyes_consistent: 'consistent',
+  verdict:
+    'SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)',
+  cert: {
+    sound: true,
+    brep_valid: true,
+    watertight: true,
+    manifold: true,
+    oriented: true,
+    self_intersection_free: true,
+    euler_characteristic: -8,
+    boundary_edges: 0,
+    nonmanifold_edges: 0,
+    inconsistent_directed_edges: 0,
+    errors: [],
+    model_debris_orphan_faces: 0,
+  },
+})
+
+// dfm_check output: the whole DfmReport, two rules unverifiable, one pass.
+const DFM_REPORT_INCONCLUSIVE = card('dfm', {
+  pack: 'fdm',
+  params: { pack: 'fdm', nozzle_diameter: 0.4, build_direction: [0, 0, 1] },
+  verdicts: [
+    {
+      rule: 'fdm.overhang',
+      verdict: {
+        kind: 'unverifiable',
+        regions: [58, 59, 60, 61, 63, 64, 65],
+        reason: {
+          kind: 'unsupported_surface',
+          surface_type: 'cylinder',
+          analyzer: 'face_orientation_field',
+        },
+      },
+      provenance: { kind: 'shop_practice', note: '45° overhang; practice-derived, no governing standard' },
+    },
+    {
+      rule: 'fdm.min_wall',
+      verdict: {
+        kind: 'unverifiable',
+        regions: [56, 57, 62, 63, 64, 65],
+        reason: {
+          kind: 'unsupported_topology',
+          detail: 'candidate wall pair is not two parallel planes',
+        },
+      },
+      provenance: { kind: 'shop_practice', note: 'wall thickness >= 2x nozzle diameter' },
+    },
+    {
+      rule: 'fdm.trapped_volume',
+      verdict: {
+        kind: 'pass',
+        margin: {
+          value: 0,
+          derivation: {
+            kind: 'analytic',
+            surface_type: 'plane',
+            method: 'fdm.trapped_volume: no enclosed voids found',
+          },
+        },
+      },
+      provenance: { kind: 'shop_practice', note: 'enclosed voids trap support material' },
+    },
+  ],
+  summary: { kind: 'inconclusive', unverifiable: 3 },
+})
+
 const CARD_FIXTURES: Array<{ title: string; note: string; source: string }> = [
   {
     title: 'FCF — certified, in spec',
@@ -465,6 +547,11 @@ const CARD_FIXTURES: Array<{ title: string; note: string; source: string }> = [
     title: 'DFM — proven pass',
     note: 'Bounded-analytic margin with its enclosure and handbook provenance.',
     source: DFM_PASS,
+  },
+  {
+    title: 'DFM — full report, inconclusive',
+    note: 'The whole DfmReport dfm_check returns: the summary chip keeps its count, unverifiable rows stay amber with regions and reason, never a pass.',
+    source: DFM_REPORT_INCONCLUSIVE,
   },
   {
     title: 'Choices — open question',
@@ -515,6 +602,11 @@ const CARD_FIXTURES: Array<{ title: string; note: string; source: string }> = [
     title: 'Soundness — partial (tri-state)',
     note: 'Cheap hot-path verdict: not-run invariants render dashed — a check that did not run is not a check that passed.',
     source: SOUNDNESS_PARTIAL,
+  },
+  {
+    title: 'Soundness — verify_part output (consistency as words)',
+    note: 'construction_consistent "not_applicable" renders grey n/a (neither tick nor cross); eyes_consistent "consistent" renders a tick; watertight comes from brep_watertight.',
+    source: SOUNDNESS_VERIFY_PART,
   },
 ]
 

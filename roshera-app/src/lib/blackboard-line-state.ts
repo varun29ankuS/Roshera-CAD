@@ -1,4 +1,4 @@
-import { cardKindFromLanguage, parseCard, type BlackboardCard } from './blackboard-cards'
+import { cardKindFromLanguage, isDfmReport, parseCard, type BlackboardCard } from './blackboard-cards'
 
 /**
  * LINE VERDICT — the fixed-gutter marker's colour input
@@ -61,6 +61,13 @@ function cardVerdict(card: BlackboardCard): LineVerdict | null {
       return 'inconclusive'
     }
     case 'dfm': {
+      if (isDfmReport(card.card)) {
+        // The kernel's own fold: violations dominate, inconclusive is never a pass.
+        const s = card.card.summary.kind
+        if (s === 'pass') return 'pass'
+        if (s === 'violations') return 'fail'
+        return 'inconclusive' // s === 'inconclusive'
+      }
       const kind = card.card.verdict.kind
       if (kind === 'pass') return 'pass'
       if (kind === 'violation') return 'fail'

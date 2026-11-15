@@ -200,7 +200,9 @@ export function ClaimBadge({
   detail,
   glyph: Glyph,
 }: {
-  status: boolean | null
+  /** `'na'`: the check does not apply to this part — neither a pass nor a
+   *  fail, and not a missing run either. Shown plain grey with "n/a". */
+  status: boolean | null | 'na'
   /** Short text shown when no `glyph` is supplied — also always the
    *  accessible name, so an icon-only badge is never unlabelled. */
   label: string
@@ -218,6 +220,7 @@ export function ClaimBadge({
         status === false && 'border-red-500/40 bg-red-500/10 text-red-800 dark:text-red-300',
         status === null &&
           'border-dashed border-caution-border bg-caution-wash text-caution ',
+        status === 'na' && 'border-border bg-transparent text-muted-foreground',
       )}
     >
       <span
@@ -226,9 +229,18 @@ export function ClaimBadge({
           status === true && 'text-emerald-600 dark:text-emerald-400',
           status === false && 'text-red-600 dark:text-red-400',
           status === null && 'text-caution ',
+          status === 'na' && 'font-mono text-[10px] text-muted-foreground',
         )}
       >
-        {status === true ? <Check size={10} /> : status === false ? <X size={10} /> : <CircleSlash size={10} />}
+        {status === true ? (
+          <Check size={10} />
+        ) : status === false ? (
+          <X size={10} />
+        ) : status === 'na' ? (
+          'n/a'
+        ) : (
+          <CircleSlash size={10} />
+        )}
       </span>
       {Glyph ? <Glyph size={10} /> : <span>{label}</span>}
     </span>
