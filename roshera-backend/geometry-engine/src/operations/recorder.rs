@@ -1283,6 +1283,7 @@ mod tests {
             mesh_quality: MeshQuality::empty(),
             errors: vec![],
             model_debris_orphan_faces: 0,
+            blocking: vec![],
             peer_count: 0,
         }
     }

@@ -125,6 +125,13 @@ pub struct ManifoldReport {
     /// V − E + F over the welded mesh. For `c` disjoint genus-0 shells this is
     /// `2c`; a single closed genus-0 solid is `2`.
     pub euler_characteristic: i64,
+    /// Per B-Rep face (from the mesh's `face_map`): its open (boundary) mesh
+    /// edges, sorted by face id. Empty when the mesh carries no face map.
+    pub boundary_edges_by_face: Vec<(u32, usize)>,
+    /// Per face: its mesh edges shared by three or more triangles.
+    pub nonmanifold_edges_by_face: Vec<(u32, usize)>,
+    /// Per face: its directed mesh edges walked the same way by a neighbour.
+    pub inconsistent_edges_by_face: Vec<(u32, usize)>,
     /// Vertices the TESSELLATOR's weld could not address
     /// (`TriangleMesh::weld_refusals`), so it left them un-welded.
     ///
@@ -207,7 +214,11 @@ pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<Manifo
         }
     };
 
-    for tri in &mesh.triangles {
+    // The face of each directed edge's triangles (first and last seen), so a
+    // defect can be put on the face it is on without a second pass.
+    let mut edge_face: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+    let has_faces = mesh.face_map.len() == mesh.triangles.len();
+    for (ti, tri) in mesh.triangles.iter().enumerate() {
         let a = welded_index[tri[0] as usize];
         let b = welded_index[tri[1] as usize];
         let c = welded_index[tri[2] as usize];
@@ -219,6 +230,13 @@ pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<Manifo
         for &(u, v) in &[(a, b), (b, c), (c, a)] {
             *directed.entry((u, v)).or_insert(0) += 1;
             union(&mut parent, u, v);
+            if has_faces {
+                let f = mesh.face_map[ti];
+                edge_face
+                    .entry((u, v))
+                    .and_modify(|e| e.1 = f)
+                    .or_insert((f, f));
+            }
         }
     }
 
@@ -235,13 +253,52 @@ pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<Manifo
 
     let mut boundary_edges = 0usize;
     let mut nonmanifold_edges = 0usize;
-    for &incident in undirected.values() {
+    let mut open_by_face: HashMap<u32, usize> = HashMap::new();
+    let mut fan_by_face: HashMap<u32, usize> = HashMap::new();
+    let mut flip_by_face: HashMap<u32, usize> = HashMap::new();
+    // The faces on either directed side of the undirected edge (u, v).
+    let faces_of = |u: u32, v: u32| -> Vec<u32> {
+        let mut out = Vec::new();
+        for k in [(u, v), (v, u)] {
+            if let Some(&(f0, f1)) = edge_face.get(&k) {
+                out.push(f0);
+                if f1 != f0 {
+                    out.push(f1);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    };
+    for (&(u, v), &incident) in &undirected {
         if incident == 1 {
             boundary_edges += 1;
+            for f in faces_of(u, v) {
+                *open_by_face.entry(f).or_insert(0) += 1;
+            }
         } else if incident > 2 {
             nonmanifold_edges += 1;
+            for f in faces_of(u, v) {
+                *fan_by_face.entry(f).or_insert(0) += 1;
+            }
         }
     }
+    for (&(u, v), &count) in &directed {
+        if count > 1 {
+            if let Some(&(f0, f1)) = edge_face.get(&(u, v)) {
+                *flip_by_face.entry(f0).or_insert(0) += 1;
+                if f1 != f0 {
+                    *flip_by_face.entry(f1).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let sorted = |m: HashMap<u32, usize>| {
+        let mut v: Vec<(u32, usize)> = m.into_iter().collect();
+        v.sort_unstable();
+        v
+    };
 
     // Components over vertices actually referenced by a live triangle.
     let mut roots = std::collections::HashSet::new();
@@ -279,6 +336,9 @@ pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<Manifo
         inconsistent_directed_edges,
         components,
         euler_characteristic,
+        boundary_edges_by_face: sorted(open_by_face),
+        nonmanifold_edges_by_face: sorted(fan_by_face),
+        inconsistent_edges_by_face: sorted(flip_by_face),
         refused_weld_vertices,
         closed: boundary_edges == 0 && refused_weld_vertices == 0,
         manifold: nonmanifold_edges == 0,
@@ -903,6 +963,31 @@ pub(crate) fn u_is_degenerate_at(surface: &dyn Surface, v: f64, p: f64) -> bool 
     step <= 1e-9 || step <= reference * 1e-6
 }
 
+/// True when `q` sits ON a pole of `surface`: a domain end in v where every
+/// u maps to one point (a sphere's poles). Judged by position, not by the v a
+/// projection returns -- projecting the pole point lands a hair off the pole
+/// in v, where [`u_is_degenerate_at`] no longer reads it as one, while its u
+/// is still arbitrary.
+fn at_pole_point(surface: &dyn Surface, q: crate::math::Point3, p: f64) -> bool {
+    let (_, (v_lo, v_hi)) = surface.parameter_bounds();
+    let v_mid = 0.5 * (v_lo + v_hi);
+    // The surface's own size: how far a quarter period carries a point at mid v.
+    let size = match (
+        surface.point_at(0.0, v_mid),
+        surface.point_at(0.25 * p, v_mid),
+    ) {
+        (Ok(a), Ok(b)) if v_mid.is_finite() => (b - a).magnitude(),
+        _ => return false,
+    };
+    [v_lo, v_hi].iter().filter(|v| v.is_finite()).any(|&v| {
+        u_is_degenerate_at(surface, v, p)
+            && surface
+                .point_at(0.0, v)
+                .map(|pole| pole.distance(&q) <= size * 1e-6)
+                .unwrap_or(false)
+    })
+}
+
 /// Each periodic face's u-extent, measured from the tessellated vertices.
 ///
 /// Deliberately NOT read from `Face::uv_bounds`: on the boolean-produced faces
@@ -915,6 +1000,17 @@ pub(crate) fn u_is_degenerate_at(surface: &dyn Surface, v: f64, p: f64) -> bool 
 /// `periodic_coverage` is: a face straddling the seam has vertices at both ends
 /// of the domain, and `max - min` would read the full period for a face that
 /// occupies a sliver of it.
+/// A point's (u, v) on `surface`: its projection, so it is in THAT surface's
+/// own chart whatever a welded mesh vertex happens to have stored.
+fn project_uv(
+    surface: &dyn crate::primitives::surface::Surface,
+    p: crate::math::Point3,
+) -> Option<(f64, f64)> {
+    surface
+        .closest_point(&p, crate::math::Tolerance::default())
+        .ok()
+}
+
 fn measure_face_u_spans(
     mesh: &TriangleMesh,
     model: &BRepModel,
@@ -930,8 +1026,14 @@ fn measure_face_u_spans(
             .and_then(|s| s.period_u());
         let Some(p) = periodic else { continue };
         let entry = us_by_face.entry(fid).or_default();
+        let surface = model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id));
         for &vi in tri.iter() {
-            if let Some(uv) = mesh.vertices[vi as usize].uv {
+            if let Some(uv) =
+                surface.and_then(|s| project_uv(s, mesh.vertices[vi as usize].position))
+            {
                 entry.push(uv.0.rem_euclid(p));
             }
         }
@@ -1006,6 +1108,46 @@ pub fn mesh_quality_with_normals(
     // facet alone, and this is the only thing that separates the two readings.
     let face_spans = measure_face_u_spans(&mesh, model, has_faces);
 
+    // How far a facet's centroid may sit off the true surface and still be
+    // ON it: the mesh's own chord -- the default chord, floored to the part's
+    // size exactly as `tessellate_solid` floors it.
+    let on_surface_tol = {
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for v in &mesh.vertices {
+            for (k, c) in [v.position.x, v.position.y, v.position.z]
+                .into_iter()
+                .enumerate()
+            {
+                lo[k] = lo[k].min(c);
+                hi[k] = hi[k].max(c);
+            }
+        }
+        let diag = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
+        TessellationParams::default()
+            .chord_tolerance
+            .max(if diag.is_finite() { diag * 5.0e-4 } else { 0.0 })
+    };
+    // A facet off the surface normal is a FOLD only if it also LEAVES the
+    // surface -- its centroid farther off than the chord, as a facet bridging
+    // a bore does. A near-degenerate sliver lying on the surface has a
+    // meaningless plane, not a fold; its shape is reported by the aspect
+    // ratio and minimum angle, which are readouts, not gates.
+    let leaves_surface = |fid: u32, c: crate::math::Point3| -> bool {
+        let Some(face) = model.faces.get(fid) else {
+            return true;
+        };
+        let Some(surface) = model.surfaces.get(face.surface_id) else {
+            return true;
+        };
+        match surface
+            .closest_point(&c, crate::math::Tolerance::default())
+            .and_then(|(u, v)| surface.point_at(u, v))
+        {
+            Ok(q) => q.distance(&c) > on_surface_tol,
+            Err(_) => true,
+        }
+    };
+
     // Per face: (worst_aspect, min_angle_deg, max_normal_dev_deg, boundary_cross).
     let mut per_face: HashMap<u32, (f64, f64, f64, usize)> = HashMap::new();
     let mut worst_aspect = 1.0_f64;
@@ -1052,14 +1194,32 @@ pub fn mesh_quality_with_normals(
             .flatten()
             .and_then(|n| facet_deviation_deg(&geo, &n))
         {
-            max_dev = max_dev.max(dev);
-            entry.2 = entry.2.max(dev);
+            let centroid = crate::math::Point3::new(
+                (p0.x + p1.x + p2.x) / 3.0,
+                (p0.y + p1.y + p2.y) / 3.0,
+                (p0.z + p1.z + p2.z) / 3.0,
+            );
+            let counts = dev <= MeshQuality::MAX_NORMAL_DEVIATION_DEG
+                || !has_faces
+                || leaves_surface(fid, centroid);
+            if counts {
+                max_dev = max_dev.max(dev);
+                entry.2 = entry.2.max(dev);
+            }
         }
 
         // Boundary conformance: a facet bridging across a periodic/closed lateral.
-        if let (Some(face), Some(uv0), Some(uv1), Some(uv2)) =
-            (model.faces.get(fid), v0.uv, v1.uv, v2.uv)
-        {
+        // Where the corners ARE on this face's own surface: a vertex shared
+        // with a neighbour carries ONE face's stored (u, v) after the shell
+        // weld (a torus rim vertex kept its cylinder's v = -45), so the
+        // stored value is not this face's chart. Project instead.
+        let face_surface = model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id).map(|s| (f, s)));
+        let projected = face_surface
+            .and_then(|(_, s)| Some((project_uv(s, p0)?, project_uv(s, p1)?, project_uv(s, p2)?)));
+        if let (Some((face, _)), Some((uv0, uv1, uv2))) = (face_surface, projected) {
             if let Some(surface) = model.surfaces.get(face.surface_id) {
                 if let Some(p) = surface.period_u() {
                     // The face's own u-extent is the discriminator — see
@@ -1074,7 +1234,8 @@ pub fn mesh_quality_with_normals(
                     // nothing on the common path.
                     let at_singularity = [uv0, uv1, uv2]
                         .iter()
-                        .any(|uv| u_is_degenerate_at(surface, uv.1, p));
+                        .any(|uv| u_is_degenerate_at(surface, uv.1, p))
+                        || [p0, p1, p2].iter().any(|&q| at_pole_point(surface, q, p));
                     if !at_singularity && is_bridging_facet(uv0.0, uv1.0, uv2.0, p, span) {
                         boundary_crossing += 1;
                         entry.3 += 1;
@@ -1123,16 +1284,18 @@ pub fn mesh_quality_with_normals(
             )
             .then(a.face_id.cmp(&b.face_id))
     });
-    let worst_face = defects.into_iter().next();
+    let worst_face = defects.first().cloned();
 
-    Some(MeshQuality::evaluate(
+    let mut quality = MeshQuality::evaluate(
         mesh.triangles.len(),
         worst_aspect,
         min_angle,
         max_dev,
         boundary_crossing,
         worst_face,
-    ))
+    );
+    quality.defects = defects;
+    Some(quality)
 }
 
 /// Pure per-mesh tessellation-quality scoring — the heart of

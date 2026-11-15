@@ -3218,6 +3218,16 @@ impl BRepModel {
         lap("manifold+orientation mesh", t);
         let shells_measured = report.is_some();
         let shells_outward = shells_measured && misoriented_shells.is_empty();
+        let (open_by_face, fan_by_face, flip_by_face) = report
+            .as_ref()
+            .map(|r| {
+                (
+                    r.boundary_edges_by_face.clone(),
+                    r.nonmanifold_edges_by_face.clone(),
+                    r.inconsistent_edges_by_face.clone(),
+                )
+            })
+            .unwrap_or_default();
         let (watertight, manifold, oriented, euler, be, rf, nm, ide) = match report {
             Some(r) => (
                 // `r.closed`, not `r.boundary_edges == 0`: the report's
@@ -3480,7 +3490,26 @@ impl BRepModel {
             .get(solid_id)
             .map(|s| s.peer_count())
             .unwrap_or(0);
+        let blocking = blocking_evidence(&BlockingInputs {
+            brep_valid,
+            brep_errors: brep_errors.len(),
+            watertight,
+            open_by_face: &open_by_face,
+            refused_weld_vertices: rf,
+            manifold,
+            fan_by_face: &fan_by_face,
+            oriented,
+            flip_by_face: &flip_by_face,
+            shells_outward,
+            misoriented_shells: &misoriented_shells,
+            self_intersection_free,
+            construction_consistent: construction_consistent.is_sound(),
+            eyes_consistent: eyes_consistent.is_sound(),
+            tessellation: &tessellation,
+            mesh_quality: &mesh_quality,
+        });
         ValidityCertificate {
+            blocking,
             peer_count,
             brep_valid,
             watertight,
@@ -7836,6 +7865,152 @@ impl<'a> TopologyBuilder<'a> {
 /// solid, to stderr. Off by default.
 fn cert_profile_enabled() -> bool {
     std::env::var_os("ROSHERA_CERT_PROFILE").is_some_and(|v| !v.is_empty())
+}
+
+/// What [`blocking_evidence`] reads: each gated check's verdict and the
+/// per-face measurements behind it.
+struct BlockingInputs<'a> {
+    brep_valid: bool,
+    brep_errors: usize,
+    watertight: bool,
+    open_by_face: &'a [(u32, usize)],
+    refused_weld_vertices: usize,
+    manifold: bool,
+    fan_by_face: &'a [(u32, usize)],
+    oriented: bool,
+    flip_by_face: &'a [(u32, usize)],
+    shells_outward: bool,
+    misoriented_shells: &'a [crate::primitives::provenance::MisorientedShell],
+    self_intersection_free: bool,
+    construction_consistent: bool,
+    eyes_consistent: bool,
+    tessellation: &'a crate::primitives::provenance::TessellationQuality,
+    mesh_quality: &'a crate::primitives::provenance::MeshQuality,
+}
+
+/// Every gated check that fails, on the faces it is on. A check that fails
+/// with no face to name is kept on the solid (`face: None`) -- the list is
+/// empty exactly when every gated check passes.
+fn blocking_evidence(
+    x: &BlockingInputs<'_>,
+) -> Vec<crate::primitives::provenance::BlockingEvidence> {
+    use crate::primitives::provenance::BlockingEvidence;
+    let mut out: Vec<BlockingEvidence> = Vec::new();
+    let on_solid =
+        |out: &mut Vec<BlockingEvidence>, conjunct: &str, measured: Vec<(String, f64)>| {
+            out.push(BlockingEvidence {
+                conjunct: conjunct.to_string(),
+                face: None,
+                measured,
+            });
+        };
+    let per_face =
+        |out: &mut Vec<BlockingEvidence>, conjunct: &str, key: &str, faces: &[(u32, usize)]| {
+            for &(f, n) in faces {
+                out.push(BlockingEvidence {
+                    conjunct: conjunct.to_string(),
+                    face: Some(f),
+                    measured: vec![(key.to_string(), n as f64)],
+                });
+            }
+        };
+    if !x.brep_valid {
+        on_solid(
+            &mut out,
+            "brep_valid",
+            vec![("errors".into(), x.brep_errors as f64)],
+        );
+    }
+    if !x.watertight {
+        per_face(&mut out, "watertight", "open_edges", x.open_by_face);
+        if x.open_by_face.is_empty() || x.refused_weld_vertices > 0 {
+            on_solid(
+                &mut out,
+                "watertight",
+                vec![(
+                    "refused_weld_vertices".into(),
+                    x.refused_weld_vertices as f64,
+                )],
+            );
+        }
+    }
+    if !x.manifold {
+        per_face(&mut out, "manifold", "nonmanifold_edges", x.fan_by_face);
+        if x.fan_by_face.is_empty() {
+            on_solid(&mut out, "manifold", Vec::new());
+        }
+    }
+    if !x.oriented {
+        per_face(&mut out, "oriented", "same_way_edges", x.flip_by_face);
+        if x.flip_by_face.is_empty() {
+            on_solid(&mut out, "oriented", Vec::new());
+        }
+    }
+    if !x.shells_outward {
+        if x.misoriented_shells.is_empty() {
+            on_solid(&mut out, "shells_outward", Vec::new());
+        }
+        for m in x.misoriented_shells {
+            on_solid(
+                &mut out,
+                "shells_outward",
+                vec![
+                    ("shell".into(), m.shell_id as f64),
+                    ("signed_volume".into(), m.signed_volume),
+                ],
+            );
+        }
+    }
+    if !x.self_intersection_free {
+        on_solid(&mut out, "self_intersection_free", Vec::new());
+    }
+    if !x.construction_consistent {
+        on_solid(&mut out, "construction_consistent", Vec::new());
+    }
+    if !x.eyes_consistent {
+        on_solid(&mut out, "eyes_consistent", Vec::new());
+    }
+    if !x.tessellation.clean {
+        match &x.tessellation.worst_face {
+            Some(d) => out.push(BlockingEvidence {
+                conjunct: "tessellation".into(),
+                face: Some(d.face_id as u32),
+                measured: vec![
+                    ("degenerate_triangles".into(), d.degenerate_triangles as f64),
+                    ("normal_agreement".into(), d.normal_agreement),
+                    (
+                        "analytic_normal_agreement".into(),
+                        d.analytic_normal_agreement,
+                    ),
+                ],
+            }),
+            None => on_solid(&mut out, "tessellation", Vec::new()),
+        }
+    }
+    if !x.mesh_quality.clean {
+        let mut named = false;
+        for d in x.mesh_quality.defects.iter().filter(|d| d.blocks()) {
+            named = true;
+            out.push(BlockingEvidence {
+                conjunct: "mesh_quality".into(),
+                face: Some(d.face_id as u32),
+                measured: vec![
+                    (
+                        "boundary_crossing_facets".into(),
+                        d.boundary_crossing_facets as f64,
+                    ),
+                    (
+                        "max_normal_deviation_deg".into(),
+                        d.max_normal_deviation_deg,
+                    ),
+                ],
+            });
+        }
+        if !named {
+            on_solid(&mut out, "mesh_quality", Vec::new());
+        }
+    }
+    out
 }
 
 #[cfg(test)]

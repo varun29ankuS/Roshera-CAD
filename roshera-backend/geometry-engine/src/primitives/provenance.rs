@@ -458,6 +458,10 @@ pub struct MeshQuality {
     pub boundary_crossing_facets: usize,
     /// The single worst face, the agent's pointer to the defect. `None` if clean.
     pub worst_face: Option<MeshFaceQualityDefect>,
+    /// Every face with a defect, worst first (`worst_face` is the first).
+    /// Includes faces over the readout-only shape limits; a face blocks the
+    /// verdict only on the gated rules (see [`MeshFaceQualityDefect::blocks`]).
+    pub defects: Vec<MeshFaceQualityDefect>,
     /// `true` when no facet crosses a boundary and the worst normal deviation is
     /// within [`Self::MAX_NORMAL_DEVIATION_DEG`].
     pub clean: bool,
@@ -506,6 +510,7 @@ impl MeshQuality {
             min_angle_deg,
             max_normal_deviation_deg,
             boundary_crossing_facets,
+            defects: worst_face.iter().cloned().collect(),
             worst_face,
             clean,
         }
@@ -521,9 +526,32 @@ impl MeshQuality {
             max_normal_deviation_deg: 0.0,
             boundary_crossing_facets: 0,
             worst_face: None,
+            defects: Vec::new(),
             clean: true,
         }
     }
+}
+
+impl MeshFaceQualityDefect {
+    /// The face breaks a GATED mesh rule (a facet crossing a boundary, or one
+    /// folded past [`MeshQuality::MAX_NORMAL_DEVIATION_DEG`]), not only a
+    /// readout limit.
+    pub fn blocks(&self) -> bool {
+        self.boundary_crossing_facets > 0
+            || self.max_normal_deviation_deg > MeshQuality::MAX_NORMAL_DEVIATION_DEG
+    }
+}
+
+/// Why an unsound certificate is unsound, on the entity to look at: one
+/// failing check, the face it is on (`None` when no single face can be blamed,
+/// e.g. a shell turned inside out as a whole), and what was measured. The
+/// Kernel Lens turns these into `Blocking` events.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockingEvidence {
+    /// The failing check, as the certificate names it (`"watertight"`, ...).
+    pub conjunct: String,
+    pub face: Option<crate::primitives::face::FaceId>,
+    pub measured: Vec<(String, f64)>,
 }
 
 /// Which boundary a shell is within its solid — and therefore which sign the
@@ -650,6 +678,11 @@ pub struct ValidityCertificate {
     /// surfaced here instead, so a part's certificate reflects only ITS OWN
     /// topology while the debris stays loudly visible. `0` on a clean model.
     pub model_debris_orphan_faces: usize,
+    /// Every check that makes this certificate unsound, with the faces it is
+    /// on. Empty exactly when the certificate is sound on its gated checks;
+    /// a failing check no face can be blamed for is kept on the solid
+    /// (`face: None`), never dropped.
+    pub blocking: Vec<BlockingEvidence>,
     /// MULTI-BODY DISCLOSURE — how many ADDITIONAL disjoint bodies this solid
     /// carries beyond the one bounded by its outer shell
     /// (`Solid::peer_shells.len()`). `0` for an ordinary single-lump part.
@@ -882,6 +915,7 @@ impl ValidityCertificate {
             model_debris_orphan_faces: 0,
             // A single-lump part: no sibling bodies to disclose.
             peer_count: 0,
+            blocking: vec![],
         }
     }
 }
