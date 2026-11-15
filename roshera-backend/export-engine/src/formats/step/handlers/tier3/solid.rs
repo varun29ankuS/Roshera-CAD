@@ -139,17 +139,30 @@ fn resolve_void_shell(
     if let Some(entity) = registry.get(instance) {
         if let crate::formats::step::registry::EntityKind::Simple(rec) = &entity.kind {
             if rec.name.eq_ignore_ascii_case("ORIENTED_CLOSED_SHELL") {
-                // ORIENTED_CLOSED_SHELL('label', #closed_shell, orientation)
+                // ORIENTED_CLOSED_SHELL('label', *, #closed_shell, orientation):
+                // the second field is the derived `cfs_faces` (`*`), the shell
+                // is the third (ISO 10303-42; OCCT writes exactly this).
                 if let Parameter::List(items) = &rec.parameter {
-                    if let Some(inner) = items.get(1) {
-                        if let Ok(inner_ref) = params::as_entity_ref(
-                            inner,
+                    let inner_ref = items.iter().skip(1).find_map(|p| {
+                        params::as_entity_ref(
+                            p,
                             "ORIENTED_CLOSED_SHELL",
                             instance,
                             "closed_shell_element",
-                        ) {
-                            return resolve_shell(inner_ref, registry, dispatch, ctx);
+                        )
+                        .ok()
+                    });
+                    let reversed = items.last().and_then(|p| {
+                        params::as_bool(p, "ORIENTED_CLOSED_SHELL", instance, "orientation")
+                            .ok()
+                            .flatten()
+                    }) == Some(false);
+                    if let Some(inner_ref) = inner_ref {
+                        let shell = resolve_shell(inner_ref, registry, dispatch, ctx)?;
+                        if reversed {
+                            turn_shell_inside_out(shell, instance, ctx);
                         }
+                        return Some(shell);
                     }
                 }
             }
@@ -164,6 +177,52 @@ fn resolve_void_shell(
         ctx,
     );
     ctx.caches.shells.get(&instance).copied()
+}
+
+/// An ORIENTED_CLOSED_SHELL marked .F. is its shell used inside out: every
+/// face reversed (its sense flipped, its loops walked backwards so they keep
+/// the kernel's convention about the new outward side). A void's faces then
+/// face into the cavity. Refused, with a warning, when a face of the shell
+/// also belongs to another shell -- reversing it would reverse that shell too.
+fn turn_shell_inside_out(
+    shell: geometry_engine::primitives::shell::ShellId,
+    instance: u64,
+    ctx: &mut ImportContext<'_>,
+) {
+    let Some(faces) = ctx.model.shells.get(shell).map(|s| s.faces.clone()) else {
+        return;
+    };
+    let shared = ctx
+        .model
+        .shells
+        .iter()
+        .filter(|(id, _)| *id != shell)
+        .any(|(_, other)| other.faces.iter().any(|f| faces.contains(f)));
+    if shared {
+        ctx.report.push_warning(Warning {
+            severity: Severity::Warn,
+            entity: "ORIENTED_CLOSED_SHELL".into(),
+            instance: Some(instance),
+            message: "a reversed shell shares faces with another shell; left as written".into(),
+        });
+        return;
+    }
+    for f in faces {
+        let loops = match ctx.model.faces.get_mut(f) {
+            Some(face) => {
+                face.orientation = face.orientation.flipped();
+                std::iter::once(face.outer_loop)
+                    .chain(face.inner_loops.iter().copied())
+                    .collect::<Vec<_>>()
+            }
+            None => continue,
+        };
+        for l in loops {
+            if let Some(lp) = ctx.model.loops.get_mut(l) {
+                lp.reverse();
+            }
+        }
+    }
 }
 
 /// Register the void-solid handler.
@@ -259,6 +318,82 @@ mod tests {
         s += "#145=ADVANCED_FACE('',(#115),#135,.T.);#146=ADVANCED_FACE('',(#116),#136,.T.);";
         s += "#151=CLOSED_SHELL('outer',(#141,#142,#143,#144,#145,#146));";
         s
+    }
+
+    /// The cube of [`unit_cube_shell`] shrunk to [0.25, 0.75] and renumbered
+    /// by +1000 -- a separate inner cube for a void.
+    fn inner_cube_shell() -> String {
+        let mut s = unit_cube_shell();
+        for (a, b) in [
+            ("(0.,0.,0.)", "(0.25,0.25,0.25)"),
+            ("(1.,0.,0.)", "(0.75,0.25,0.25)"),
+            ("(1.,1.,0.)", "(0.75,0.75,0.25)"),
+            ("(0.,1.,0.)", "(0.25,0.75,0.25)"),
+            ("(0.,0.,1.)", "(0.25,0.25,0.75)"),
+            ("(1.,0.,1.)", "(0.75,0.25,0.75)"),
+            ("(1.,1.,1.)", "(0.75,0.75,0.75)"),
+            ("(0.,1.,1.)", "(0.25,0.75,0.75)"),
+        ] {
+            s = s.replace(
+                &format!("CARTESIAN_POINT('',{a})"),
+                &format!("CARTESIAN_POINT('',{b})"),
+            );
+        }
+        s = s
+            .replace("VECTOR('',#21,1.)", "VECTOR('',#21,0.5)")
+            .replace("VECTOR('',#22,1.)", "VECTOR('',#22,0.5)")
+            .replace("VECTOR('',#23,1.)", "VECTOR('',#23,0.5)");
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            out.push(c);
+            if c == '#' {
+                let mut n = String::new();
+                while let Some(d) = chars.peek().copied().filter(char::is_ascii_digit) {
+                    n.push(d);
+                    chars.next();
+                }
+                let id: u64 = n.parse().unwrap_or(0);
+                out += &(id + 1000).to_string();
+            }
+        }
+        out
+    }
+
+    /// A void written as ORIENTED_CLOSED_SHELL('', *, #shell, .F.) -- the
+    /// closed shell is its THIRD field (the second is the derived `*`), and
+    /// .F. turns the shell inside out so its faces face into the cavity. The
+    /// third field was read from the second, the void never resolved, and
+    /// one CADGenBench part's solid was lost.
+    #[test]
+    fn an_oriented_void_shell_resolves_and_faces_into_the_cavity() {
+        let mut s = unit_cube_shell();
+        s += &inner_cube_shell();
+        s += "#170=ORIENTED_CLOSED_SHELL('',*,#1151,.F.);";
+        s += "#171=BREP_WITH_VOIDS('hollow',#151,(#170));";
+        let (model, report, caches) = run(&s);
+        let solid_id = caches
+            .solids
+            .get(&171)
+            .copied()
+            .unwrap_or_else(|| panic!("BREP_WITH_VOIDS must resolve: {:?}", report.warnings));
+        let solid = model.solids.get(solid_id).expect("solid present");
+        assert_eq!(
+            solid.inner_shells.len(),
+            1,
+            "the void shell is recorded: {:?}",
+            report.warnings
+        );
+        let void = model.shells.get(solid.inner_shells[0]).expect("void shell");
+        assert_eq!(void.faces.len(), 6);
+        for &f in &void.faces {
+            let face = model.faces.get(f).expect("face");
+            assert_eq!(
+                face.orientation,
+                geometry_engine::primitives::face::FaceOrientation::Backward,
+                "a void face faces into the cavity"
+            );
+        }
     }
 
     /// An outer unit-cube shell with one inner void shell (the inner
