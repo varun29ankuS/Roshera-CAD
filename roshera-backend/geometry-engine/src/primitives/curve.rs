@@ -3994,7 +3994,9 @@ impl Curve for Ellipse {
     }
 
     fn is_closed(&self) -> bool {
-        true
+        // Closed only when the range spans the whole ellipse; an imported
+        // edge trims it to an arc.
+        (self.range.end - self.range.start - consts::TWO_PI).abs() < 1e-9
     }
 
     fn is_periodic(&self) -> bool {

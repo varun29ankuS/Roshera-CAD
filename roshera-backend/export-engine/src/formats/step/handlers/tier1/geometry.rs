@@ -40,7 +40,7 @@ use geometry_engine::primitives::{
 };
 
 use crate::formats::step::{
-    context::{Axis2Placement, ImportContext, StepCircleGeom, StepLineGeom},
+    context::{Axis2Placement, ImportContext, StepCircleGeom, StepEllipseGeom, StepLineGeom},
     diagnostics::{Severity, Warning},
     dispatch::{EntityDispatch, EntityHandler, HandlerOutcome, Phase},
     registry::EntityRegistry,
@@ -60,6 +60,7 @@ mod names {
     pub const AXIS2_PLACEMENT_3D: &str = "AXIS2_PLACEMENT_3D";
     pub const LINE: &str = "LINE";
     pub const CIRCLE: &str = "CIRCLE";
+    pub const ELLIPSE: &str = "ELLIPSE";
     pub const PLANE: &str = "PLANE";
     pub const CYLINDRICAL_SURFACE: &str = "CYLINDRICAL_SURFACE";
     pub const VERTEX_POINT: &str = "VERTEX_POINT";
@@ -568,6 +569,106 @@ impl EntityHandler for CircleHandler {
 }
 
 // =========================================================================
+// ELLIPSE
+// =========================================================================
+
+/// `ELLIPSE('label', #axis2_placement, semi_axis_1, semi_axis_2)`. Stored as
+/// a template at `caches.step_ellipses`; each EDGE_CURVE that references it
+/// trims its own kernel `Ellipse` to its vertices. An oblique cut through a
+/// cylinder (an angled hole, a chamfered pin) produces these edges.
+pub struct EllipseHandler;
+/// Static binding consumed by [`register`].
+pub static ELLIPSE_HANDLER: EllipseHandler = EllipseHandler;
+
+impl EntityHandler for EllipseHandler {
+    fn names(&self) -> &'static [&'static str] {
+        &[names::ELLIPSE]
+    }
+    fn phase(&self) -> Phase {
+        Phase::Geometry
+    }
+    fn handle(
+        &self,
+        instance: u64,
+        record: &Record,
+        registry: &EntityRegistry,
+        dispatch: &EntityDispatch,
+        ctx: &mut ImportContext<'_>,
+    ) -> HandlerOutcome {
+        let fields = match params::record_fields(&record.parameter, names::ELLIPSE, instance) {
+            Ok(f) => f,
+            Err(e) => {
+                ctx.report.push_warning(e.into_warning());
+                return HandlerOutcome::Failed {
+                    message: "bad record shape".into(),
+                };
+            }
+        };
+        if fields.len() < 4 {
+            return field_count_error(
+                ctx,
+                names::ELLIPSE,
+                instance,
+                "expected (label, position, semi_axis_1, semi_axis_2)",
+            );
+        }
+        let placement_ref =
+            match params::as_entity_ref(&fields[1], names::ELLIPSE, instance, "position") {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad placement ref".into(),
+                    };
+                }
+            };
+        let mut axes = [0.0_f64; 2];
+        for (k, (field, name)) in [(&fields[2], "semi_axis_1"), (&fields[3], "semi_axis_2")]
+            .into_iter()
+            .enumerate()
+        {
+            match params::as_real(field, names::ELLIPSE, instance, name) {
+                Ok(v) if v > 0.0 => axes[k] = v,
+                Ok(v) => {
+                    ctx.report.push_warning(Warning {
+                        severity: Severity::Warn,
+                        entity: names::ELLIPSE.into(),
+                        instance: Some(instance),
+                        message: format!("non-positive {name} {v}; ELLIPSE skipped"),
+                    });
+                    return HandlerOutcome::Failed {
+                        message: "non-positive semi-axis".into(),
+                    };
+                }
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad semi-axis".into(),
+                    };
+                }
+            }
+        }
+        let placement = match resolve_placement(placement_ref, registry, dispatch, ctx) {
+            Some(p) => p,
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "placement unresolved".into(),
+                }
+            }
+        };
+        ctx.caches.step_ellipses.insert(
+            instance,
+            StepEllipseGeom {
+                placement,
+                semi_axis_1: axes[0] * ctx.unit.length,
+                semi_axis_2: axes[1] * ctx.unit.length,
+            },
+        );
+        HandlerOutcome::Resolved
+    }
+}
+
+// =========================================================================
 // PLANE
 // =========================================================================
 
@@ -927,6 +1028,7 @@ pub fn register(dispatch: &mut EntityDispatch) {
     dispatch.register(&AXIS2_PLACEMENT_3D_HANDLER);
     dispatch.register(&LINE_HANDLER);
     dispatch.register(&CIRCLE_HANDLER);
+    dispatch.register(&ELLIPSE_HANDLER);
     dispatch.register(&PLANE_HANDLER);
     dispatch.register(&CYLINDRICAL_SURFACE_HANDLER);
     dispatch.register(&VERTEX_POINT_HANDLER);
@@ -1020,6 +1122,66 @@ mod tests {
         let (_m, _r, c, _) = run_with_unit("#1=CARTESIAN_POINT('',(1.,0.,0.));", unit);
         let p = c.points.get(&1).unwrap();
         assert!((p[0] - 25.4).abs() < 1e-12);
+    }
+
+    /// Every coordinate is read EXACTLY: the f64 the kernel holds is the
+    /// correctly-rounded value of the text in the file (bit for bit), in all
+    /// three axes, for the vertex too -- and a unit conversion is one exact
+    /// multiply, nothing else. Real files carry 15+ significant digits
+    /// (`11.5911099154688`, `1.00256949132362E-07`).
+    #[test]
+    fn coordinates_are_read_bit_exactly_in_all_three_axes() {
+        let texts = [
+            (
+                "11.5911099154688",
+                "-0.0815298178894195",
+                "1.00256949132362E-07",
+            ),
+            ("123456.789012345", "-123.456789012345678", "1.E-3"),
+            ("0.1", "-0.", "3."),
+            ("6.02214076E23", "-1.7976931348623157E308", "4.9E-324"),
+        ];
+        let mut body = String::new();
+        for (i, (x, y, z)) in texts.iter().enumerate() {
+            body += &format!("#{}=CARTESIAN_POINT('',({x},{y},{z}));", i + 1);
+            body += &format!("#{}=VERTEX_POINT('',#{});", i + 101, i + 1);
+        }
+        let exact = |t: &str| -> f64 {
+            // STEP reals: Rust's parser rounds the decimal text correctly.
+            let t = if t.ends_with('.') {
+                format!("{t}0")
+            } else {
+                t.replace(".E", ".0E")
+            };
+            t.parse::<f64>().unwrap()
+        };
+        for unit in [1.0_f64, 25.4] {
+            let (model, _r, c, _) = run_with_unit(
+                &body,
+                UnitScale {
+                    length: unit,
+                    angle_radians_per_source: 1.0,
+                },
+            );
+            for (i, (x, y, z)) in texts.iter().enumerate() {
+                let want = [exact(x) * unit, exact(y) * unit, exact(z) * unit];
+                let got = c.points.get(&(i as u64 + 1)).expect("point read");
+                for k in 0..3 {
+                    assert_eq!(
+                        got[k].to_bits(),
+                        want[k].to_bits(),
+                        "point {i} axis {k}: got {:e}, want {:e} (unit {unit})",
+                        got[k],
+                        want[k]
+                    );
+                }
+                let vid = *c.vertices.get(&(i as u64 + 101)).expect("vertex read");
+                let v = model.vertices.get_position(vid).expect("vertex position");
+                for k in 0..3 {
+                    assert_eq!(v[k].to_bits(), want[k].to_bits(), "vertex {i} axis {k}");
+                }
+            }
+        }
     }
 
     #[test]

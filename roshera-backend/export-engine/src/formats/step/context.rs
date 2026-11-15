@@ -80,6 +80,19 @@ pub struct StepCircleGeom {
     pub radius: f64,
 }
 
+/// Parameterless ellipse geometry: oriented placement + the two semi-axes.
+/// `semi_axis_1` lies along the placement's `x`, `semi_axis_2` along
+/// `z × x` (ISO 10303-42 `ellipse`). Same rationale as [`StepCircleGeom`]:
+/// the edge handler trims it to each edge's vertices.
+#[derive(Debug, Clone, Copy)]
+pub struct StepEllipseGeom {
+    pub placement: Axis2Placement,
+    /// Semi-axis along the placement `x`, millimetres after unit scaling.
+    pub semi_axis_1: f64,
+    /// Semi-axis along `z × x`, millimetres after unit scaling.
+    pub semi_axis_2: f64,
+}
+
 /// Orthonormal frame derived from a STEP `AXIS2_PLACEMENT_3D`.
 ///
 /// `AXIS2_PLACEMENT_3D(location, axis, ref_direction)`:
@@ -182,6 +195,8 @@ pub struct ResolutionCaches {
     /// Source `#N` → `CIRCLE` geometry (placement + radius). Same
     /// rationale as [`Self::step_lines`].
     pub step_circles: HashMap<u64, StepCircleGeom>,
+    /// Source `#N` → `ELLIPSE` geometry (placement + semi-axes).
+    pub step_ellipses: HashMap<u64, StepEllipseGeom>,
     /// The product structure (parts, assembly occurrences, placements),
     /// read by the tier-3 product handlers and consumed after dispatch by
     /// the assembly-placement pass (`super::assembly_placement`).

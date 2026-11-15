@@ -64,7 +64,7 @@ use ruststep::ast::Record;
 
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::primitives::{
-    curve::{Arc, Circle, Curve, Line, ParameterRange},
+    curve::{Arc, Circle, Curve, Ellipse, Line, ParameterRange},
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceOrientation},
     r#loop::{Loop, LoopId, LoopType},
@@ -74,7 +74,7 @@ use geometry_engine::primitives::{
 };
 
 use crate::formats::step::{
-    context::{ImportContext, StepCircleGeom, StepLineGeom},
+    context::{ImportContext, StepCircleGeom, StepEllipseGeom, StepLineGeom},
     diagnostics::{Severity, Warning},
     dispatch::{EntityDispatch, EntityHandler, HandlerOutcome, Phase},
     registry::{EntityKind, EntityRegistry},
@@ -332,6 +332,18 @@ impl EntityHandler for EdgeCurveHandler {
                     }
                 }
             }
+        } else if let Some(ellipse_geom) = ctx.caches.step_ellipses.get(&geom_ref).copied() {
+            match build_ellipse_curve(ellipse_geom, start_pos, end_pos, same_sense, instance, ctx) {
+                Some((c, range)) => {
+                    edge_param_range = range;
+                    c
+                }
+                None => {
+                    return HandlerOutcome::Failed {
+                        message: "kernel rejected ellipse".into(),
+                    }
+                }
+            }
         } else if let Some(curve_id) = ctx.caches.curves.get(&geom_ref).copied() {
             // Free-form edge backed by an already-materialised kernel
             // curve (B-spline / NURBS). Clone it so this edge owns an
@@ -362,7 +374,7 @@ impl EntityHandler for EdgeCurveHandler {
                 instance: Some(instance),
                 message: format!(
                     "edge_geometry #{geom_ref} did not resolve to a supported curve \
-                     (LINE / CIRCLE / B_SPLINE_CURVE_WITH_KNOTS / rational B-spline)"
+                     (LINE / CIRCLE / ELLIPSE / B_SPLINE_CURVE_WITH_KNOTS / rational B-spline)"
                 ),
             });
             return HandlerOutcome::Failed {
@@ -417,6 +429,62 @@ impl EntityHandler for EdgeCurveHandler {
         ctx.caches.edges.insert(instance, edge_id);
         HandlerOutcome::Resolved
     }
+}
+
+/// Construct a kernel `Ellipse` trimmed to the edge: it runs from `start` to
+/// `end` in the edge's direction of travel, parameterised by angle (`t` = 0
+/// on the major semi-axis), and the returned range is that trimmed span.
+///
+/// Same convention as [`build_circle_curve`]: an EDGE_CURVE with
+/// `same_sense = .F.` traverses the basis ellipse backwards, so the frame's
+/// second axis is flipped -- the counter-clockwise sweep in the flipped frame
+/// is the clockwise one in the basis frame. `start == end` is a seam: the
+/// whole ellipse.
+fn build_ellipse_curve(
+    ellipse: StepEllipseGeom,
+    start: [f64; 3],
+    end: [f64; 3],
+    same_sense: bool,
+    instance: u64,
+    ctx: &mut ImportContext<'_>,
+) -> Option<(Box<dyn Curve>, ParameterRange)> {
+    let p = ellipse.placement;
+    let center = Point3::new(p.origin[0], p.origin[1], p.origin[2]);
+    let x = Vector3::new(p.x[0], p.x[1], p.x[2]);
+    let z = Vector3::new(p.z[0], p.z[1], p.z[2]);
+    let mut y = z.cross(&x);
+    if !same_sense {
+        y = Vector3::new(-y.x, -y.y, -y.z);
+    }
+    let (a, b) = (ellipse.semi_axis_1, ellipse.semi_axis_2);
+    let angle = |q: [f64; 3]| -> f64 {
+        let d = Vector3::new(q[0] - center.x, q[1] - center.y, q[2] - center.z);
+        (d.dot(&y) / b).atan2(d.dot(&x) / a)
+    };
+    let t0 = angle(start);
+    let seam = {
+        let d = [start[0] - end[0], start[1] - end[1], start[2] - end[2]];
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() < ctx.default_tolerance
+    };
+    let mut t1 = if seam { t0 + TAU } else { angle(end) };
+    while t1 <= t0 {
+        t1 += TAU;
+    }
+    let mut curve = match Ellipse::new(center, x, y, a, b) {
+        Ok(c) => c,
+        Err(e) => {
+            ctx.report.push_warning(Warning {
+                severity: Severity::Warn,
+                entity: names::EDGE_CURVE.into(),
+                instance: Some(instance),
+                message: format!("kernel rejected Ellipse: {e}"),
+            });
+            return None;
+        }
+    };
+    let range = ParameterRange::new(t0, t1);
+    curve.range = range;
+    Some((Box::new(curve), range))
 }
 
 /// Construct a `Line` curve sized to the edge's two vertex positions.
@@ -1706,6 +1774,93 @@ mod tests {
         let mid = curve_box.evaluate(0.5).unwrap().position;
         assert!((mid.x).abs() < 1e-9);
         assert!((mid.y.abs() - 1.0).abs() < 1e-9);
+    }
+
+    /// ELLIPSE edges (an oblique cut through a cylinder: angled holes,
+    /// chamfered pins). The GrabCAD bench vice carries 77 of them; none were
+    /// read, and the vice's main body never imported.
+    const ELLIPSE_FRAME: &str = "#3=CARTESIAN_POINT('',(0.,0.,0.));\
+         #21=DIRECTION('',(0.,0.,1.));\
+         #22=DIRECTION('',(1.,0.,0.));\
+         #31=AXIS2_PLACEMENT_3D('',#3,#21,#22);\
+         #41=ELLIPSE('',#31,2.,1.);";
+
+    /// Position on the edge at fraction `f` of its parameter range.
+    fn edge_point(model: &BRepModel, eid: u32, f: f64) -> [f64; 3] {
+        let edge = model.edges.get(eid).unwrap();
+        let curve = model.curves.get(edge.curve_id).unwrap();
+        let r = edge.param_range;
+        let p = curve
+            .evaluate(r.start + f * (r.end - r.start))
+            .unwrap()
+            .position;
+        [p.x, p.y, p.z]
+    }
+
+    fn near(a: [f64; 3], b: [f64; 3]) -> bool {
+        (a[0] - b[0]).hypot(a[1] - b[1]).hypot(a[2] - b[2]) < 1e-9
+    }
+
+    #[test]
+    fn edge_curve_ellipse_quarter_arc() {
+        let (model, _r, c) = run(&format!(
+            "{ELLIPSE_FRAME}\
+             #1=CARTESIAN_POINT('',(2.,0.,0.));\
+             #2=CARTESIAN_POINT('',(0.,1.,0.));\
+             #11=VERTEX_POINT('',#1);\
+             #12=VERTEX_POINT('',#2);\
+             #51=EDGE_CURVE('',#11,#12,#41,.T.);"
+        ));
+        let eid = *c.edges.get(&51).expect("ellipse edge imported");
+        assert!(near(edge_point(&model, eid, 0.0), [2.0, 0.0, 0.0]));
+        assert!(near(edge_point(&model, eid, 1.0), [0.0, 1.0, 0.0]));
+        // Half-way along the quarter arc: angle π/4 on x²/4 + y² = 1.
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        assert!(near(edge_point(&model, eid, 0.5), [2.0 * h, h, 0.0]));
+        let edge = model.edges.get(eid).unwrap();
+        assert!(
+            !model.curves.get(edge.curve_id).unwrap().is_closed(),
+            "a quarter arc is open"
+        );
+    }
+
+    #[test]
+    fn edge_curve_ellipse_reversed_sense_goes_the_other_way() {
+        // Same vertices, .F.: the edge runs the basis ellipse backwards from
+        // (2,0,0) to (0,1,0) -- the 270° arc through (-√2, -√2/2).
+        let (model, _r, c) = run(&format!(
+            "{ELLIPSE_FRAME}\
+             #1=CARTESIAN_POINT('',(2.,0.,0.));\
+             #2=CARTESIAN_POINT('',(0.,1.,0.));\
+             #11=VERTEX_POINT('',#1);\
+             #12=VERTEX_POINT('',#2);\
+             #51=EDGE_CURVE('',#11,#12,#41,.F.);"
+        ));
+        let eid = *c.edges.get(&51).expect("ellipse edge imported");
+        assert!(near(edge_point(&model, eid, 0.0), [2.0, 0.0, 0.0]));
+        assert!(near(edge_point(&model, eid, 1.0), [0.0, 1.0, 0.0]));
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        assert!(
+            near(edge_point(&model, eid, 0.5), [-2.0 * h, -h, 0.0]),
+            "mid {:?}",
+            edge_point(&model, eid, 0.5)
+        );
+    }
+
+    #[test]
+    fn edge_curve_seam_ellipse_is_the_whole_ellipse() {
+        let (model, _r, c) = run(&format!(
+            "{ELLIPSE_FRAME}\
+             #1=CARTESIAN_POINT('',(0.,1.,0.));\
+             #11=VERTEX_POINT('',#1);\
+             #51=EDGE_CURVE('',#11,#11,#41,.T.);"
+        ));
+        let eid = *c.edges.get(&51).expect("seam ellipse imported");
+        assert!(near(edge_point(&model, eid, 0.0), [0.0, 1.0, 0.0]));
+        assert!(near(edge_point(&model, eid, 1.0), [0.0, 1.0, 0.0]));
+        assert!(near(edge_point(&model, eid, 0.5), [0.0, -1.0, 0.0]));
+        let edge = model.edges.get(eid).unwrap();
+        assert!(model.curves.get(edge.curve_id).unwrap().is_closed());
     }
 
     #[test]
