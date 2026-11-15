@@ -165,7 +165,7 @@ pub fn import_step_text_uncertified(
     handlers::register_all(&mut dispatch);
 
     let t = std::time::Instant::now();
-    let (resolved, roots_with_solids, total_root_solids, caches) = {
+    let (resolved, roots_with_solids, total_root_solids, mut caches) = {
         let mut ctx = ImportContext::new(&mut model, &mut report);
         let resolved = dispatch.run_all(&registry, &mut ctx);
         let roots_with_solids = ctx.caches.roots.values().filter(|v| !v.is_empty()).count();
@@ -178,8 +178,8 @@ pub fn import_step_text_uncertified(
     }
     report.roots_resolved = roots_with_solids;
     report.solids_in_roots = total_root_solids;
-    raise_edge_tolerances_to_measured_gaps(&mut model, &caches, &mut report);
-    reverse_loops_walking_against_neighbours(&mut model, &caches, &mut report);
+    raise_edge_tolerances_to_measured_gaps(&mut model, &mut caches, &mut report);
+    reverse_loops_walking_against_neighbours(&mut model, &mut caches, &mut report);
 
     // Place assembly instances from the product tree, then give every solid
     // and face its identity — PIDs keyed by this file's CONTENT and the STEP
@@ -288,7 +288,7 @@ fn extract_file_schema(exchange: &ruststep::ast::Exchange) -> Option<String> {
 /// deterministic. A seam edge (used twice by one loop) does not vote.
 fn reverse_loops_walking_against_neighbours(
     model: &mut geometry_engine::primitives::topology_builder::BRepModel,
-    caches: &context::ResolutionCaches,
+    caches: &mut context::ResolutionCaches,
     report: &mut ImportReport,
 ) {
     use std::collections::HashMap;
@@ -355,6 +355,16 @@ fn reverse_loops_walking_against_neighbours(
             deviation: same as f64,
             tolerance: shared as f64,
         });
+        if let Some(&n) = instance_of.get(&fid) {
+            caches.record_lens(
+                n,
+                geometry_engine::lens::Stage::Repair,
+                geometry_engine::lens::EventKind::LoopReversedToMatchNeighbours,
+                Some(n),
+                "walked most of its shared edges the same way as its neighbours; its loops were reversed",
+                &[("same_way_edges", same as f64), ("shared_edges", shared as f64)],
+            );
+        }
     }
 }
 
@@ -375,9 +385,14 @@ pub const EDGE_GAP_REPAIR_CAP: f64 = 0.01;
 /// openly.
 fn raise_edge_tolerances_to_measured_gaps(
     model: &mut geometry_engine::primitives::topology_builder::BRepModel,
-    caches: &context::ResolutionCaches,
+    caches: &mut context::ResolutionCaches,
     report: &mut ImportReport,
 ) {
+    use std::collections::HashMap;
+    let face_instance: HashMap<u32, u64> = caches.faces.iter().map(|(n, &fid)| (fid, *n)).collect();
+    // Per edge: each face using it and the edge's gap from THAT face, so a
+    // raise is recorded on the face it is off, not its neighbours.
+    let mut edge_faces: HashMap<u32, Vec<(u32, f64)>> = HashMap::new();
     use geometry_engine::math::Tolerance;
     let instance_of: std::collections::HashMap<u32, u64> = caches
         .edges
@@ -385,7 +400,7 @@ fn raise_edge_tolerances_to_measured_gaps(
         .map(|(inst, &eid)| (eid, *inst))
         .collect();
     let mut gap: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
-    for (_, face) in model.faces.iter() {
+    for (fid, face) in model.faces.iter() {
         let Some(surface) = model.surfaces.get(face.surface_id) else {
             continue;
         };
@@ -420,6 +435,7 @@ fn raise_edge_tolerances_to_measured_gaps(
                 }
                 let g = gap.entry(eid).or_insert(0.0);
                 *g = g.max(worst);
+                edge_faces.entry(eid).or_default().push((fid, worst));
             }
         }
     }
@@ -446,6 +462,21 @@ fn raise_edge_tolerances_to_measured_gaps(
                 deviation: g,
                 tolerance: declared,
             });
+            for (f, off) in edge_faces.get(&eid).into_iter().flatten() {
+                if *off <= declared {
+                    continue;
+                }
+                if let Some(&n) = face_instance.get(f) {
+                    caches.record_lens(
+                        n,
+                        geometry_engine::lens::Stage::Repair,
+                        geometry_engine::lens::EventKind::EdgeToleranceRaised,
+                        Some(instance),
+                        "edge lay farther off this face than the file's declared accuracy; its tolerance was raised to the measured gap",
+                        &[("gap_mm", *off), ("declared_mm", declared)],
+                    );
+                }
+            }
         } else {
             report.push_warning(diagnostics::Warning {
                 severity: diagnostics::Severity::Warn,

@@ -1323,12 +1323,30 @@ impl EntityHandler for AdvancedFaceHandler {
         // files, a loop taken reversed exactly when its bound is .F. always
         // winds counter-clockwise about the face's outward normal. Ignoring
         // the flag left 2,815 of them backwards.
-        for &(loop_id, _, forward) in &bounds {
+        for (k, &(loop_id, _, forward)) in bounds.iter().enumerate() {
             if !forward {
                 if let Some(lp) = ctx.model.loops.get_mut(loop_id) {
                     lp.reverse();
                 }
+                ctx.caches.record_lens(
+                    instance,
+                    geometry_engine::lens::Stage::Import,
+                    geometry_engine::lens::EventKind::LoopReversed,
+                    bound_refs.get(k).copied(),
+                    "FACE_BOUND marked .F.: walked reversed (ISO 10303-42)",
+                    &[],
+                );
             }
+        }
+        if ctx.caches.rescaled_surfaces.contains(&surf_ref) {
+            ctx.caches.record_lens(
+                instance,
+                geometry_engine::lens::Stage::Import,
+                geometry_engine::lens::EventKind::ProfileRescaled,
+                Some(surf_ref),
+                "swept-surface profile put on [0, 1] (exact B-spline knot rescale)",
+                &[],
+            );
         }
 
         // Find outer + collect inners.
@@ -1359,6 +1377,20 @@ impl EntityHandler for AdvancedFaceHandler {
                 .or_else(|| bounds.first().map(|(l, _, _)| *l))
             {
                 Some(o) => {
+                    if let Some(k) = bounds
+                        .iter()
+                        .position(|(l, _, _)| *l == o)
+                        .filter(|&k| k > 0)
+                    {
+                        ctx.caches.record_lens(
+                            instance,
+                            geometry_engine::lens::Stage::Import,
+                            geometry_engine::lens::EventKind::OuterLoopChosen,
+                            bound_refs.get(k).copied(),
+                            "no FACE_OUTER_BOUND: the loop enclosing the others is the outer one",
+                            &[("bound_position", k as f64)],
+                        );
+                    }
                     ctx.report.push_warning(Warning {
                         severity: Severity::Warn,
                         entity: names::ADVANCED_FACE.into(),

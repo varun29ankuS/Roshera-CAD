@@ -118,6 +118,42 @@ pub enum StepOpenConicGeom {
     },
 }
 
+/// A Kernel Lens decision recorded during dispatch, before its face has a
+/// persistent id (see [`ResolutionCaches::lens_pending`]).
+#[derive(Debug, Clone)]
+pub struct PendingLensEvent {
+    pub stage: geometry_engine::lens::Stage,
+    pub kind: geometry_engine::lens::EventKind,
+    /// The STEP entity the decision concerned (a bound, an edge, a surface).
+    pub step_instance: Option<u64>,
+    pub why: String,
+    pub measured: Vec<(String, f64)>,
+}
+
+impl ResolutionCaches {
+    /// Record a decision about the face written as `ADVANCED_FACE #face`.
+    pub fn record_lens(
+        &mut self,
+        face: u64,
+        stage: geometry_engine::lens::Stage,
+        kind: geometry_engine::lens::EventKind,
+        step_instance: Option<u64>,
+        why: &str,
+        measured: &[(&str, f64)],
+    ) {
+        self.lens_pending
+            .entry(face)
+            .or_default()
+            .push(PendingLensEvent {
+                stage,
+                kind,
+                step_instance,
+                why: why.to_string(),
+                measured: measured.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            });
+    }
+}
+
 /// Orthonormal frame derived from a STEP `AXIS2_PLACEMENT_3D`.
 ///
 /// `AXIS2_PLACEMENT_3D(location, axis, ref_direction)`:
@@ -224,6 +260,12 @@ pub struct ResolutionCaches {
     pub step_ellipses: HashMap<u64, StepEllipseGeom>,
     /// Source `#N` → `HYPERBOLA` / `PARABOLA` geometry.
     pub step_open_conics: HashMap<u64, StepOpenConicGeom>,
+    /// Kernel Lens decisions awaiting their face's persistent id, by the
+    /// `ADVANCED_FACE` `#N` they concern. Ids exist only once the assembly
+    /// is placed; each placed copy of the face then gets every event.
+    pub lens_pending: HashMap<u64, Vec<PendingLensEvent>>,
+    /// Swept-surface `#N`s whose profile was put on [0, 1].
+    pub rescaled_surfaces: std::collections::HashSet<u64>,
     /// The product structure (parts, assembly occurrences, placements),
     /// read by the tier-3 product handlers and consumed after dispatch by
     /// the assembly-placement pass (`super::assembly_placement`).

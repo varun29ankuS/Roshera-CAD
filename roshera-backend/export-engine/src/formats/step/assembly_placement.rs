@@ -87,6 +87,8 @@ struct Ids<'a> {
     step_solid: HashMap<SolidId, u64>,
     step_face: HashMap<FaceId, u64>,
     product: &'a ProductStructure,
+    /// Kernel Lens decisions by the `ADVANCED_FACE` `#N` they concern.
+    lens_pending: &'a HashMap<u64, Vec<crate::formats::step::context::PendingLensEvent>>,
 }
 
 /// Place assembly instances and stamp identity. Returns the final model.
@@ -103,6 +105,7 @@ pub(crate) fn finalize(
         step_solid: caches.solids.iter().map(|(n, s)| (*s, *n)).collect(),
         step_face: caches.faces.iter().map(|(n, f)| (*f, *n)).collect(),
         product: &caches.product,
+        lens_pending: &caches.lens_pending,
     };
 
     let Some(instances) = plan(caches, registry, report) else {
@@ -111,7 +114,7 @@ pub(crate) fn finalize(
         for sid in solids {
             let faces: Vec<(FaceId, FaceId)> =
                 solid_faces(&src, sid).into_iter().map(|f| (f, f)).collect();
-            stamp(&mut src, sid, sid, &faces, &[], &ids);
+            stamp(&mut src, sid, sid, &faces, &[], &ids, &mut report.lens);
         }
         return src;
     };
@@ -180,7 +183,15 @@ pub(crate) fn finalize(
                 }
             }
             let faces: Vec<(FaceId, FaceId)> = face_map.iter().map(|(s, d)| (*d, *s)).collect();
-            stamp(&mut out, sid, part_solid, &faces, &inst.path, &ids);
+            stamp(
+                &mut out,
+                sid,
+                part_solid,
+                &faces,
+                &inst.path,
+                &ids,
+                &mut report.lens,
+            );
             if let Some(occ) = occurrence_of(inst, base_name.as_deref(), ids.product, source) {
                 out.set_solid_occurrence(sid, occ);
             }
@@ -196,7 +207,15 @@ pub(crate) fn finalize(
     for part_solid in free {
         if let Some((sid, face_map)) = copy_solid(&mut out, &src, part_solid, None) {
             let faces: Vec<(FaceId, FaceId)> = face_map.iter().map(|(s, d)| (*d, *s)).collect();
-            stamp(&mut out, sid, part_solid, &faces, &[], &ids);
+            stamp(
+                &mut out,
+                sid,
+                part_solid,
+                &faces,
+                &[],
+                &ids,
+                &mut report.lens,
+            );
         }
     }
     out
@@ -212,6 +231,7 @@ fn stamp(
     faces: &[(FaceId, FaceId)],
     path: &[u64],
     ids: &Ids<'_>,
+    journal: &mut geometry_engine::lens::LensJournal,
 ) {
     let base_solid = match ids.step_solid.get(&src_solid) {
         Some(n) => entity_pid(ids.file_root, &format!("solid#{n}")),
@@ -236,7 +256,26 @@ fn stamp(
                 },
             ),
         };
-        model.set_face_pid(*face, placed_pid(base_face, &label));
+        let pid = placed_pid(base_face, &label);
+        model.set_face_pid(*face, pid);
+        // Every decision the importer recorded about this STEP face, on this
+        // copy of it (a part placed N times gets them N times, once per body).
+        if let Some(events) = ids
+            .step_face
+            .get(src_face)
+            .and_then(|n| ids.lens_pending.get(n))
+        {
+            for e in events {
+                journal.push(geometry_engine::lens::LensEvent {
+                    entity: geometry_engine::lens::EntityRef::Face(pid),
+                    stage: e.stage,
+                    kind: e.kind.clone(),
+                    step_instance: e.step_instance,
+                    why: e.why.clone(),
+                    measured: e.measured.clone(),
+                });
+            }
+        }
     }
     model.set_solid_provenance(sid, OperationKind::Imported("step".into()), Vec::new());
 }

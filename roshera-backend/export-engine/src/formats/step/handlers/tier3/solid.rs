@@ -207,6 +207,20 @@ fn turn_shell_inside_out(
         });
         return;
     }
+    let instance_of: std::collections::HashMap<u32, u64> =
+        ctx.caches.faces.iter().map(|(n, &fid)| (fid, *n)).collect();
+    for &f in &faces {
+        if let Some(&n) = instance_of.get(&f) {
+            ctx.caches.record_lens(
+                n,
+                geometry_engine::lens::Stage::Import,
+                geometry_engine::lens::EventKind::VoidShellReversed,
+                Some(instance),
+                "ORIENTED_CLOSED_SHELL marked .F.: the void's faces turned to face into the cavity",
+                &[],
+            );
+        }
+    }
     for f in faces {
         let loops = match ctx.model.faces.get_mut(f) {
             Some(face) => {

@@ -650,3 +650,43 @@ fn a_flawed_part_is_still_placed() {
         "the flaw is still reported by the certificate, not hidden by placing it"
     );
 }
+
+/// Kernel Lens: a decision the importer makes about one face of a PART is
+/// recorded on every placed copy of that face -- each body in the assembly
+/// is its own entity with its own persistent id, and the person or agent
+/// looking at either copy sees why the kernel did what it did there.
+#[test]
+fn lens_events_follow_every_placed_copy() {
+    // Bound #111 marked .F.: the importer walks its loop reversed.
+    let text = two_instance_assembly().replacen(
+        "#111=FACE_OUTER_BOUND('',#101,.T.);",
+        "#111=FACE_OUTER_BOUND('',#101,.F.);",
+        1,
+    );
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&text), "asm")
+        .expect("imports");
+    assert_eq!(model.solids.len(), 2, "two placed copies");
+    let reversed: Vec<_> = report
+        .lens
+        .events()
+        .iter()
+        .filter(|e| e.kind == geometry_engine::lens::EventKind::LoopReversed)
+        .collect();
+    assert_eq!(
+        reversed.len(),
+        2,
+        "once per placed copy: {:#?}",
+        report.lens.events()
+    );
+    let entities: std::collections::HashSet<_> =
+        reversed.iter().map(|e| format!("{:?}", e.entity)).collect();
+    assert_eq!(
+        entities.len(),
+        2,
+        "each copy's own face, by its own persistent id"
+    );
+    for e in reversed {
+        assert_eq!(e.step_instance, Some(111), "the bound is named");
+    }
+}

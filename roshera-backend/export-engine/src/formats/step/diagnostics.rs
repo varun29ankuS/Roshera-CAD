@@ -249,6 +249,10 @@ pub struct ImportReport {
     pub warnings: Vec<Warning>,
     /// Structured healing events applied during dispatch.
     pub healings: Vec<Healing>,
+    /// Kernel Lens: what the importer decided, per face (by persistent id),
+    /// with the rule it followed and what it measured.
+    #[serde(default)]
+    pub lens: geometry_engine::lens::LensJournal,
     /// Manifold-validation issues raised against closed shells.
     pub manifold_warnings: Vec<ManifoldWarning>,
     /// AP detected from the FILE_SCHEMA header, when present.

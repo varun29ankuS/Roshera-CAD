@@ -149,7 +149,12 @@ impl EntityHandler for SurfaceOfRevolutionHandler {
         };
 
         let profile = match resolve_profile_curve(curve_ref, registry, dispatch, ctx) {
-            Some(c) => c,
+            Some((c, rescaled)) => {
+                if rescaled {
+                    ctx.caches.rescaled_surfaces.insert(instance);
+                }
+                c
+            }
             None => {
                 warn(
                     ctx,
@@ -286,7 +291,12 @@ impl EntityHandler for SurfaceOfLinearExtrusionHandler {
         };
 
         let profile = match resolve_profile_curve(curve_ref, registry, dispatch, ctx) {
-            Some(c) => c,
+            Some((c, rescaled)) => {
+                if rescaled {
+                    ctx.caches.rescaled_surfaces.insert(instance);
+                }
+                c
+            }
             None => {
                 warn(
                     ctx,
@@ -355,19 +365,19 @@ fn resolve_profile_curve(
     registry: &EntityRegistry,
     dispatch: &EntityDispatch,
     ctx: &mut ImportContext<'_>,
-) -> Option<Box<dyn Curve>> {
+) -> Option<(Box<dyn Curve>, bool)> {
     let curve = resolve_profile_curve_native(instance, registry, dispatch, ctx)?;
     let r = curve.parameter_range();
     let unit = (r.start).abs() < 1e-12 && (r.end - 1.0).abs() < 1e-12;
     if unit {
-        return Some(curve);
+        return Some((curve, false));
     }
     if let Some(n) = curve.as_any().downcast_ref::<NurbsCurve>() {
         let (a, b) = (r.start, r.end);
         if b > a && a.is_finite() && b.is_finite() {
             let knots: Vec<f64> = n.knots.iter().map(|k| (k - a) / (b - a)).collect();
             match NurbsCurve::new(n.degree, n.control_points.clone(), n.weights.clone(), knots) {
-                Ok(c) => return Some(Box::new(c)),
+                Ok(c) => return Some((Box::new(c), true)),
                 Err(e) => warn(
                     ctx,
                     names::SURFACE_OF_REVOLUTION,

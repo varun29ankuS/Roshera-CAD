@@ -15,6 +15,7 @@ pub mod drawing;
 pub mod gdt;
 pub mod harness;
 pub mod labels;
+pub mod lens;
 pub mod math;
 pub mod operations;
 pub mod perception;
