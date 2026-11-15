@@ -600,6 +600,49 @@ fn build_open_conic_curve(
     }
 }
 
+/// Which of a face's bounds is its OUTER loop, when the file does not say.
+/// STEP marks it with FACE_OUTER_BOUND, but writers may not (OCCT never does)
+/// and list bounds in any order, so the first bound is no evidence. A face's
+/// outer loop encloses its holes, so it has the greatest extent: the loop
+/// whose sampled edges span the largest box. `None` when no loop is clearly
+/// the largest (a cylinder band's two equal rims) -- the caller then keeps
+/// the file's order, as any choice is then as good as another.
+fn enclosing_loop(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    bounds: &[(LoopId, bool, bool)],
+) -> Option<LoopId> {
+    if bounds.len() < 2 {
+        return None;
+    }
+    let extent = |lid: LoopId| -> Option<f64> {
+        let lp = model.loops.get(lid)?;
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for &e in &lp.edges {
+            let edge = model.edges.get(e)?;
+            let curve = model.curves.get(edge.curve_id)?;
+            let r = edge.param_range;
+            for k in 0..=8 {
+                let t = r.start + (r.end - r.start) * k as f64 / 8.0;
+                let p = curve.evaluate(t).ok()?.position;
+                for (i, c) in [p.x, p.y, p.z].into_iter().enumerate() {
+                    lo[i] = lo[i].min(c);
+                    hi[i] = hi[i].max(c);
+                }
+            }
+        }
+        let d: f64 = (0..3).map(|i| (hi[i] - lo[i]).powi(2)).sum::<f64>().sqrt();
+        d.is_finite().then_some(d)
+    };
+    let mut sized: Vec<(LoopId, f64)> = Vec::with_capacity(bounds.len());
+    for &(lid, _, _) in bounds {
+        sized.push((lid, extent(lid)?));
+    }
+    sized.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (largest, next) = (sized[0], sized[1]);
+    // Clearly the largest: more than a part in a million beyond the next.
+    (largest.1 > next.1 * (1.0 + 1e-6)).then_some(largest.0)
+}
+
 /// The part of a shared curve an edge uses: the parameter span between its
 /// two vertices. STEP writers reuse one long curve (an intersection curve, a
 /// spline through several faces) for several edges, each a piece of it, so
@@ -1272,6 +1315,22 @@ impl EntityHandler for AdvancedFaceHandler {
             }
         }
 
+        // A FACE_BOUND with orientation .F. is walked REVERSED (ISO 10303-42
+        // face_bound). The kernel keeps every loop so the face lies to its
+        // left seen from the face's OUTWARD side (surface normal x the face's
+        // sense) -- the convention the meshers and the certificate read --
+        // and that is ISO's: measured on 6,292 planar outer loops of OCCT
+        // files, a loop taken reversed exactly when its bound is .F. always
+        // winds counter-clockwise about the face's outward normal. Ignoring
+        // the flag left 2,815 of them backwards.
+        for &(loop_id, _, forward) in &bounds {
+            if !forward {
+                if let Some(lp) = ctx.model.loops.get_mut(loop_id) {
+                    lp.reverse();
+                }
+            }
+        }
+
         // Find outer + collect inners.
         let mut outer: Option<LoopId> = None;
         let mut inners: Vec<LoopId> = Vec::new();
@@ -1296,13 +1355,17 @@ impl EntityHandler for AdvancedFaceHandler {
         // outer flag, and downstream geometry assumes one outer loop.
         let outer = match outer {
             Some(o) => o,
-            None => match bounds.first().map(|(l, _, _)| *l) {
+            None => match enclosing_loop(ctx.model, &bounds)
+                .or_else(|| bounds.first().map(|(l, _, _)| *l))
+            {
                 Some(o) => {
                     ctx.report.push_warning(Warning {
                         severity: Severity::Warn,
                         entity: names::ADVANCED_FACE.into(),
                         instance: Some(instance),
-                        message: "no FACE_OUTER_BOUND; promoting first FACE_BOUND".into(),
+                        message:
+                            "no FACE_OUTER_BOUND; the loop enclosing the others is the outer one"
+                                .into(),
                     });
                     // Re-classify: the promoted first must not also
                     // appear in inners.
@@ -2385,6 +2448,88 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.entity == "ADVANCED_FACE" && w.message.contains("no FACE_OUTER_BOUND")));
+    }
+
+    /// With no FACE_OUTER_BOUND -- OCCT never writes one, and writes a face's
+    /// bounds in no particular order -- the outer loop is the one that
+    /// encloses the others, not whichever bound comes first. In one
+    /// CADGenBench submission 227 faces in 49 parts list a hole first; taken
+    /// as the outer loop it turned the face inside out (OCCT re-decides it
+    /// geometrically, ShapeFix_Face::FixOrientation).
+    #[test]
+    fn advanced_face_without_an_outer_bound_takes_the_enclosing_loop() {
+        let (model, r, c) = run("#1000=CARTESIAN_POINT('',(0.0,0.0,0.));#1010=VERTEX_POINT('',#1000);#1001=CARTESIAN_POINT('',(10.0,0.0,0.));#1011=VERTEX_POINT('',#1001);#1002=CARTESIAN_POINT('',(10.0,10.0,0.));#1012=VERTEX_POINT('',#1002);#1003=CARTESIAN_POINT('',(0.0,10.0,0.));#1013=VERTEX_POINT('',#1003);#1020=DIRECTION('',(1.0,0.0,0.));#1030=VECTOR('',#1020,10.0);#1040=LINE('',#1000,#1030);#1050=EDGE_CURVE('',#1010,#1011,#1040,.T.);#1060=ORIENTED_EDGE('',*,*,#1050,.T.);#1021=DIRECTION('',(0.0,1.0,0.));#1031=VECTOR('',#1021,10.0);#1041=LINE('',#1001,#1031);#1051=EDGE_CURVE('',#1011,#1012,#1041,.T.);#1061=ORIENTED_EDGE('',*,*,#1051,.T.);#1022=DIRECTION('',(-1.0,0.0,0.));#1032=VECTOR('',#1022,10.0);#1042=LINE('',#1002,#1032);#1052=EDGE_CURVE('',#1012,#1013,#1042,.T.);#1062=ORIENTED_EDGE('',*,*,#1052,.T.);#1023=DIRECTION('',(0.0,-1.0,0.));#1033=VECTOR('',#1023,10.0);#1043=LINE('',#1003,#1033);#1053=EDGE_CURVE('',#1013,#1010,#1043,.T.);#1063=ORIENTED_EDGE('',*,*,#1053,.T.);#1070=EDGE_LOOP('',(#1060,#1061,#1062,#1063));#2000=CARTESIAN_POINT('',(4.0,4.0,0.));#2010=VERTEX_POINT('',#2000);#2001=CARTESIAN_POINT('',(6.0,4.0,0.));#2011=VERTEX_POINT('',#2001);#2002=CARTESIAN_POINT('',(6.0,6.0,0.));#2012=VERTEX_POINT('',#2002);#2003=CARTESIAN_POINT('',(4.0,6.0,0.));#2013=VERTEX_POINT('',#2003);#2020=DIRECTION('',(1.0,0.0,0.));#2030=VECTOR('',#2020,2.0);#2040=LINE('',#2000,#2030);#2050=EDGE_CURVE('',#2010,#2011,#2040,.T.);#2060=ORIENTED_EDGE('',*,*,#2050,.T.);#2021=DIRECTION('',(0.0,1.0,0.));#2031=VECTOR('',#2021,2.0);#2041=LINE('',#2001,#2031);#2051=EDGE_CURVE('',#2011,#2012,#2041,.T.);#2061=ORIENTED_EDGE('',*,*,#2051,.T.);#2022=DIRECTION('',(-1.0,0.0,0.));#2032=VECTOR('',#2022,2.0);#2042=LINE('',#2002,#2032);#2052=EDGE_CURVE('',#2012,#2013,#2042,.T.);#2062=ORIENTED_EDGE('',*,*,#2052,.T.);#2023=DIRECTION('',(0.0,-1.0,0.));#2033=VECTOR('',#2023,2.0);#2043=LINE('',#2003,#2033);#2053=EDGE_CURVE('',#2013,#2010,#2043,.T.);#2063=ORIENTED_EDGE('',*,*,#2053,.T.);#2070=EDGE_LOOP('',(#2060,#2061,#2062,#2063));#3001=FACE_BOUND('',#2070,.F.);#3002=FACE_BOUND('',#1070,.T.);#3010=CARTESIAN_POINT('',(0.,0.,0.));#3011=DIRECTION('',(0.,0.,1.));#3012=DIRECTION('',(1.,0.,0.));#3013=AXIS2_PLACEMENT_3D('',#3010,#3011,#3012);#3014=PLANE('',#3013);#3020=ADVANCED_FACE('',(#3001,#3002),#3014,.T.);");
+        let fid = *c
+            .faces
+            .get(&3020)
+            .unwrap_or_else(|| panic!("face built: {:#?}", r.warnings));
+        let face = model.faces.get(fid).expect("face");
+        let outer = *c.loops.get(&1070).expect("plate loop cached");
+        let hole = *c.loops.get(&2070).expect("hole loop cached");
+        assert_eq!(
+            face.outer_loop, outer,
+            "the 10 x 10 plate's loop is the outer one"
+        );
+        assert_eq!(face.inner_loops, vec![hole], "the 2 x 2 loop is the hole");
+    }
+
+    /// A FACE_BOUND marked .F. is walked reversed, and only then: the kernel
+    /// keeps a face's outer loop counter-clockwise seen from its OUTWARD side
+    /// (surface normal x face sense), as ISO does. OCCT writes both cases
+    /// below; measured on 6,292 planar outer loops of one CADGenBench
+    /// submission, the loop reversed exactly when its bound is .F. always
+    /// winds counter-clockwise about the face's outward normal. Ignoring the
+    /// flag left 2,815 of those loops backwards.
+    #[test]
+    fn a_face_bound_marked_f_is_walked_reversed() {
+        // `body` writes its square CLOCKWISE about +Z on a +Z plane.
+        let body = "#4000=CARTESIAN_POINT('',(0.0,0.0,0.));#4010=VERTEX_POINT('',#4000);#4001=CARTESIAN_POINT('',(0.0,10.0,0.));#4011=VERTEX_POINT('',#4001);#4002=CARTESIAN_POINT('',(10.0,10.0,0.));#4012=VERTEX_POINT('',#4002);#4003=CARTESIAN_POINT('',(10.0,0.0,0.));#4013=VERTEX_POINT('',#4003);#4020=DIRECTION('',(0.0,1.0,0.));#4030=VECTOR('',#4020,10.0);#4040=LINE('',#4000,#4030);#4050=EDGE_CURVE('',#4010,#4011,#4040,.T.);#4060=ORIENTED_EDGE('',*,*,#4050,.T.);#4021=DIRECTION('',(1.0,0.0,0.));#4031=VECTOR('',#4021,10.0);#4041=LINE('',#4001,#4031);#4051=EDGE_CURVE('',#4011,#4012,#4041,.T.);#4061=ORIENTED_EDGE('',*,*,#4051,.T.);#4022=DIRECTION('',(0.0,-1.0,0.));#4032=VECTOR('',#4022,10.0);#4042=LINE('',#4002,#4032);#4052=EDGE_CURVE('',#4012,#4013,#4042,.T.);#4062=ORIENTED_EDGE('',*,*,#4052,.T.);#4023=DIRECTION('',(-1.0,0.0,0.));#4033=VECTOR('',#4023,10.0);#4043=LINE('',#4003,#4033);#4053=EDGE_CURVE('',#4013,#4010,#4043,.T.);#4063=ORIENTED_EDGE('',*,*,#4053,.T.);#4070=EDGE_LOOP('',(#4060,#4061,#4062,#4063));#5001=FACE_BOUND('',#4070,.T.);#5010=CARTESIAN_POINT('',(0.,0.,0.));#5011=DIRECTION('',(0.,0.,1.));#5012=DIRECTION('',(1.,0.,0.));#5013=AXIS2_PLACEMENT_3D('',#5010,#5011,#5012);#5014=PLANE('',#5013);#5020=ADVANCED_FACE('',(#5001),#5014,.F.);";
+        let winding_about_face_normal = |bound: &str, sense: &str| -> f64 {
+            let text = body
+                .replace(
+                    "#5001=FACE_BOUND('',#4070,.T.);",
+                    &format!("#5001=FACE_BOUND('',#4070,{bound});"),
+                )
+                .replace(
+                    "#5020=ADVANCED_FACE('',(#5001),#5014,.F.);",
+                    &format!("#5020=ADVANCED_FACE('',(#5001),#5014,{sense});"),
+                );
+            let (model, r, c) = run(&text);
+            let fid = *c
+                .faces
+                .get(&5020)
+                .unwrap_or_else(|| panic!("face built: {:#?}", r.warnings));
+            let face = model.faces.get(fid).expect("face");
+            let lp = model.loops.get(face.outer_loop).expect("outer loop");
+            let mut pts = Vec::new();
+            for (k, &e) in lp.edges.iter().enumerate() {
+                let ed = model.edges.get(e).expect("edge");
+                let v = if lp.orientations[k] {
+                    ed.start_vertex
+                } else {
+                    ed.end_vertex
+                };
+                pts.push(model.vertices.get_position(v).expect("vertex"));
+            }
+            let mut area_z = 0.0;
+            for i in 0..pts.len() {
+                let (p, q) = (pts[i], pts[(i + 1) % pts.len()]);
+                area_z += p[0] * q[1] - p[1] * q[0];
+            }
+            // The face's outward normal is +Z for .T., -Z for .F.
+            area_z * face.orientation.sign()
+        };
+        // Clockwise about +Z, face sense .F. (outward -Z), bound .T.: kept --
+        // already counter-clockwise seen from outside (an Inventor cap screw).
+        assert!(
+            winding_about_face_normal(".T.", ".F.") > 0.0,
+            "bound .T. must be kept as written"
+        );
+        // Clockwise about +Z, face sense .T. (outward +Z), bound .F.: reversed.
+        assert!(
+            winding_about_face_normal(".F.", ".T.") > 0.0,
+            "bound .F. must be walked reversed"
+        );
     }
 
     #[test]

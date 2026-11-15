@@ -147,3 +147,42 @@ async fn an_exported_revolution_wall_reads_back_facing_out() {
     }
     assert_eq!(walls, 1, "the vase has one revolution wall");
 }
+
+/// A revolution whose profile is a B-spline on its OWN parameter domain --
+/// here [3pi/2, 2pi], the domain OCCT gave every revolution profile of one
+/// CADGenBench part -- is the surface that profile sweeps. The kernel's
+/// surface of revolution reads its profile on [0, 1]; given this curve
+/// as-is it evaluated at 0..1, clamped to the curve's start point, and the
+/// whole wall collapsed onto one circle.
+#[test]
+fn a_revolution_of_a_spline_on_its_own_domain_is_the_swept_surface() {
+    let body = WALL.replace(
+        "#7=SURFACE_OF_REVOLUTION('',#4,#6);",
+        "#8=CARTESIAN_POINT('',(10.,0.,5.));\n\
+         #9=B_SPLINE_CURVE_WITH_KNOTS('',1,(#1,#8),.UNSPECIFIED.,.F.,.F.,(2,2),\
+         (4.71238898038469,6.28318530717959),.UNSPECIFIED.);\n\
+         #7=SURFACE_OF_REVOLUTION('',#9,#6);",
+    );
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&body), "rev")
+        .expect("imports");
+    let faces: Vec<_> = model.faces.iter().collect();
+    assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
+    let surface = model.surfaces.get(faces[0].1.surface_id).expect("surface");
+    for z in [0.5, 2.5, 4.5] {
+        let p = geometry_engine::math::Point3::new(
+            10.0 * std::f64::consts::FRAC_1_SQRT_2,
+            10.0 * std::f64::consts::FRAC_1_SQRT_2,
+            z,
+        );
+        let (u, v) = surface
+            .closest_point(&p, geometry_engine::math::Tolerance::default())
+            .expect("projects");
+        let q = surface.point_at(u, v).expect("evaluates");
+        assert!(
+            q.distance(&p) < 1e-6,
+            "the wall point {p:?} is {:.3} off the imported surface (nearest {q:?})",
+            q.distance(&p)
+        );
+    }
+}

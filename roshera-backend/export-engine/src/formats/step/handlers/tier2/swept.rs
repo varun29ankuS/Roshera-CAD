@@ -41,7 +41,7 @@ use ruststep::ast::Record;
 
 use geometry_engine::math::{Matrix4, Point3, Vector3};
 use geometry_engine::primitives::{
-    curve::{Circle, Curve, Line},
+    curve::{Circle, Curve, Line, NurbsCurve},
     surface::{RuledSurface, SurfaceOfRevolution},
 };
 
@@ -343,8 +343,57 @@ impl EntityHandler for SurfaceOfLinearExtrusionHandler {
 // Shared helpers
 // =========================================================================
 
-/// Resolve a profile-curve reference into a concrete kernel curve.
+/// Resolve a profile-curve reference into a kernel curve parameterised on
+/// [0, 1], the domain the kernel's swept surfaces read their profile over.
+/// STEP keeps a B-spline on its own knot domain (OCCT writes revolution
+/// profiles on [3pi/2, 2pi], [0, pi/2] ...); read on [0, 1] as-is, it was
+/// clamped to its start point and the swept surface collapsed. A B-spline is
+/// rescaled exactly (its knots, linearly; the shape is unchanged). Any other
+/// curve on another domain is refused with a warning, never swept wrongly.
 fn resolve_profile_curve(
+    instance: u64,
+    registry: &EntityRegistry,
+    dispatch: &EntityDispatch,
+    ctx: &mut ImportContext<'_>,
+) -> Option<Box<dyn Curve>> {
+    let curve = resolve_profile_curve_native(instance, registry, dispatch, ctx)?;
+    let r = curve.parameter_range();
+    let unit = (r.start).abs() < 1e-12 && (r.end - 1.0).abs() < 1e-12;
+    if unit {
+        return Some(curve);
+    }
+    if let Some(n) = curve.as_any().downcast_ref::<NurbsCurve>() {
+        let (a, b) = (r.start, r.end);
+        if b > a && a.is_finite() && b.is_finite() {
+            let knots: Vec<f64> = n.knots.iter().map(|k| (k - a) / (b - a)).collect();
+            match NurbsCurve::new(n.degree, n.control_points.clone(), n.weights.clone(), knots) {
+                Ok(c) => return Some(Box::new(c)),
+                Err(e) => warn(
+                    ctx,
+                    names::SURFACE_OF_REVOLUTION,
+                    instance,
+                    format!("profile #{instance} could not be put on [0, 1]: {e}"),
+                ),
+            }
+            return None;
+        }
+    }
+    warn(
+        ctx,
+        names::SURFACE_OF_REVOLUTION,
+        instance,
+        format!(
+            "profile #{instance} ({}) is parameterised on [{}, {}], not [0, 1]; refused",
+            curve.type_name(),
+            r.start,
+            r.end
+        ),
+    );
+    None
+}
+
+/// The profile curve as the file defines it, on its native domain.
+fn resolve_profile_curve_native(
     instance: u64,
     registry: &EntityRegistry,
     dispatch: &EntityDispatch,
