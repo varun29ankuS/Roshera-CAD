@@ -5637,6 +5637,20 @@ impl SurfaceOfRevolution {
         })
     }
 
+    /// The profile parameter for surface parameter `u`: wrapped into
+    /// [0, 1) when the profile is closed (the surface is periodic in u with
+    /// period 1, `is_closed_u`), as is. A closed profile's curve CLAMPS a
+    /// parameter outside [0, 1], so u = -0.01 used to evaluate at the seam
+    /// (u = 0) instead of at u = 0.99: every point a mesher placed just
+    /// below the seam collapsed onto the seam ring (CADGenBench part 146).
+    fn wrap_profile_parameter(&self, u: f64) -> f64 {
+        if self.profile_curve.is_closed() && u.is_finite() && !(0.0..=1.0).contains(&u) {
+            u.rem_euclid(1.0)
+        } else {
+            u
+        }
+    }
+
     /// Decompose a profile point into height along axis and radial components
     fn decompose_profile_point(&self, profile_point: Point3) -> (f64, f64, Vector3) {
         let to_point = profile_point - self.axis_origin;
@@ -5667,7 +5681,10 @@ impl Surface for SurfaceOfRevolution {
     }
 
     fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
-        // Map u to profile curve parameter
+        // Map u to profile curve parameter (wrapped across the seam of a
+        // closed profile, see `wrap_profile_parameter`).
+        let closed = self.profile_curve.is_closed();
+        let u = self.wrap_profile_parameter(u);
         let profile_point = self.profile_curve.point_at(u)?;
         let (height, radius, radial_dir) = self.decompose_profile_point(profile_point);
 
@@ -5683,10 +5700,19 @@ impl Surface for SurfaceOfRevolution {
         // Partial derivative w.r.t. u (along profile)
         // We need dP/du of the profile curve, then decompose and rotate
         let h = 1e-7;
-        let u_plus = (u + h).min(1.0);
-        let u_minus = (u - h).max(0.0);
-        let p_plus = self.profile_curve.point_at(u_plus)?;
-        let p_minus = self.profile_curve.point_at(u_minus)?;
+        // On a closed profile the difference runs ACROSS the seam (both
+        // sides are the surface); on an open one it stops at the ends.
+        let (u_plus, u_minus) = if closed {
+            (u + h, u - h)
+        } else {
+            ((u + h).min(1.0), (u - h).max(0.0))
+        };
+        let p_plus = self
+            .profile_curve
+            .point_at(self.wrap_profile_parameter(u_plus))?;
+        let p_minus = self
+            .profile_curve
+            .point_at(self.wrap_profile_parameter(u_minus))?;
         let du_scale = 1.0 / (u_plus - u_minus);
 
         // The radial-direction component of the decomposition (`rd_*`) is
@@ -5721,9 +5747,9 @@ impl Surface for SurfaceOfRevolution {
         // available analytically via the rotation derivative below, so we
         // only need finite differences in u for `pos_uu`.
         let pos_uu = {
-            let p1 = self.profile_curve.point_at(u_plus)?;
-            let p0 = self.profile_curve.point_at(u)?;
-            let pm = self.profile_curve.point_at(u_minus)?;
+            let p1 = p_plus;
+            let p0 = profile_point;
+            let pm = p_minus;
 
             let (h1, r1, _) = self.decompose_profile_point(p1);
             let (h0, r0, _) = self.decompose_profile_point(p0);
@@ -5780,7 +5806,9 @@ impl Surface for SurfaceOfRevolution {
     /// nozzle (Move-3 hang). Overriding `point_at` with the closed-form position
     /// (one profile eval + one rotation) removes that overhead at the source.
     fn point_at(&self, u: f64, v: f64) -> MathResult<Point3> {
-        let profile_point = self.profile_curve.point_at(u)?;
+        let profile_point = self
+            .profile_curve
+            .point_at(self.wrap_profile_parameter(u))?;
         let (height, radius, radial_dir) = self.decompose_profile_point(profile_point);
         let binormal = self.axis_direction.cross(&radial_dir);
         let radial_v = radial_dir * v.cos() + binormal * v.sin();

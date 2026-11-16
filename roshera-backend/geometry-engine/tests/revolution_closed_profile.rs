@@ -54,3 +54,31 @@ fn a_revolved_open_profile_stays_open_in_u() {
     assert!(!s.is_closed_u());
     assert_eq!(s.period_u(), None);
 }
+
+/// A surface periodic in u must WRAP a parameter past its seam, not clamp
+/// it: u = -0.01 is u = 0.99. Clamped, every point a mesher places just
+/// below the seam collapsed onto the seam ring (CADGenBench part 146: a
+/// revolution face whose interior the seam crosses came out with flat
+/// facets stacked on that ring, wound at random).
+#[test]
+fn a_closed_profile_revolution_wraps_u_past_its_seam() {
+    let s = revolved_circle();
+    for k in 0..8 {
+        let v = std::f64::consts::TAU * k as f64 / 8.0;
+        for (below, wrapped) in [(-0.01, 0.99), (-0.25, 0.75), (1.1, 0.1)] {
+            let a = s.point_at(below, v).expect("past the seam");
+            let b = s.point_at(wrapped, v).expect("inside");
+            assert!(
+                a.distance(&b) < 1e-9,
+                "u = {below} must be u = {wrapped} at v = {v}: {a:?} vs {b:?}"
+            );
+            let ea = s.evaluate_full(below, v).expect("full, past the seam");
+            let eb = s.evaluate_full(wrapped, v).expect("full, inside");
+            assert!(
+                ea.position.distance(&eb.position) < 1e-9
+                    && (ea.normal - eb.normal).magnitude() < 1e-6,
+                "evaluate_full must wrap too at u = {below}, v = {v}"
+            );
+        }
+    }
+}
