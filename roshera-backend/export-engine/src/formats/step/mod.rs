@@ -179,6 +179,7 @@ pub fn import_step_text_uncertified(
     report.roots_resolved = roots_with_solids;
     report.solids_in_roots = total_root_solids;
     merge_vertices_a_loop_passes_between(&mut model, &mut caches, &mut report);
+    rebuild_edges_onto_face_intersections(&mut model, &mut caches, &mut report);
     raise_edge_tolerances_to_measured_gaps(&mut model, &mut caches, &mut report);
     reverse_loops_walking_against_neighbours(&mut model, &mut caches, &mut report);
 
@@ -509,6 +510,241 @@ fn reverse_loops_walking_against_neighbours(
 /// repairs by raising the edge's tolerance (mm). Beyond it an edge is not on
 /// its face and the part is refused, with the gap in the report.
 pub const EDGE_GAP_REPAIR_CAP: f64 = 0.01;
+
+/// The farthest the importer moves any point of an edge to put it on the
+/// intersection of its two faces (mm). The file's curve is the evidence of
+/// WHICH intersection branch the edge is: an edge that would have to move
+/// farther is not an approximation of that intersection, and is left alone.
+pub const EDGE_REBUILD_CAP: f64 = 0.1;
+
+/// Samples per rebuilt edge to start with; the fitted cubic interpolates
+/// them all, and they double until the edge lies on both faces to
+/// [`EDGE_REBUILD_TARGET`] or reach [`EDGE_REBUILD_MAX_SAMPLES`].
+const EDGE_REBUILD_SAMPLES: usize = 33;
+const EDGE_REBUILD_MAX_SAMPLES: usize = 513;
+
+/// How closely a rebuilt edge must lie on both faces (mm).
+const EDGE_REBUILD_TARGET: f64 = 1e-6;
+
+/// Rebuild every edge whose 3D curve lies off one of its two faces ON the
+/// intersection of those faces: sample the file's curve, carry each sample
+/// onto both surfaces by alternating projection, and interpolate the
+/// converged points with a cubic whose ends are the edge's vertices.
+///
+/// An edge is, by definition, where its two faces meet. Writers can still
+/// give it a 3D curve that only approximates the intersection -- Open
+/// CASCADE keeps the exact edge in pcurves and a per-edge tolerance it does
+/// not export, and writes a rough companion curve (CADGenBench part 231:
+/// plain cubic Beziers for torus-plane cuts, 0.022 mm off the torus).
+/// Kernels that heal this (OCCT's `ShapeFix`, ACIS and Parasolid tolerant
+/// edges) widen the edge's tolerance around the wrong curve; this puts the
+/// edge where it belongs. Done only when every sample converges onto both
+/// surfaces and moves at most [`EDGE_REBUILD_CAP`]; the result is
+/// re-measured and kept only if it lies on both faces more closely than the
+/// file's curve did. Each rebuild is a
+/// [`diagnostics::HealingKind::EdgeRebuiltOnFaceIntersection`] (the gap
+/// before as `deviation`, after as `tolerance`) and a Lens event on both
+/// faces. What cannot be rebuilt is left to
+/// [`raise_edge_tolerances_to_measured_gaps`].
+fn rebuild_edges_onto_face_intersections(
+    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
+    caches: &mut context::ResolutionCaches,
+    report: &mut ImportReport,
+) {
+    use geometry_engine::math::{Point3, Tolerance};
+    use std::collections::{BTreeMap, HashMap};
+    let tol = Tolerance::default();
+    // Edge -> the distinct faces using it. A seam (used twice by one face)
+    // or an edge with any other count is not a two-face intersection.
+    let mut users: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (fid, face) in model.faces.iter() {
+        for l in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+            let Some(lp) = model.loops.get(l) else {
+                continue;
+            };
+            for &e in &lp.edges {
+                users.entry(e).or_default().push(fid);
+            }
+        }
+    }
+    let face_instance: HashMap<u32, u64> = caches.faces.iter().map(|(n, &f)| (f, *n)).collect();
+    let edge_instance: HashMap<u32, u64> = caches.edges.iter().map(|(n, &e)| (e, *n)).collect();
+    for (eid, faces) in users {
+        let [fa, fb] = faces[..] else {
+            continue;
+        };
+        if fa == fb {
+            continue;
+        }
+        let (Some(face_a), Some(face_b)) = (model.faces.get(fa), model.faces.get(fb)) else {
+            continue;
+        };
+        let (Some(sa), Some(sb)) = (
+            model.surfaces.get(face_a.surface_id),
+            model.surfaces.get(face_b.surface_id),
+        ) else {
+            continue;
+        };
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        if edge.start_vertex == edge.end_vertex {
+            continue;
+        }
+        let declared = edge.tolerance;
+        // The distance from `p` to a surface, and the surface point.
+        let foot = |s: &dyn geometry_engine::primitives::surface::Surface, p: Point3| {
+            s.closest_point(&p, tol)
+                .ok()
+                .and_then(|(u, v)| s.point_at(u, v).ok())
+                .map(|q| (q, (q - p).magnitude()))
+        };
+        let gap_of = |p: Point3| -> Option<f64> { Some(foot(sa, p)?.1.max(foot(sb, p)?.1)) };
+        let sample = |n: usize| -> Option<Vec<Point3>> {
+            (0..n)
+                .map(|k| edge.evaluate(k as f64 / (n - 1) as f64, &model.curves).ok())
+                .collect()
+        };
+        let Some(probe) = sample(EDGE_REBUILD_SAMPLES) else {
+            continue;
+        };
+        let Some(before) = probe
+            .iter()
+            .map(|&p| gap_of(p))
+            .try_fold(0.0_f64, |m, g| g.map(|g| m.max(g)))
+        else {
+            continue;
+        };
+        if !(before > declared.max(1e-7)) {
+            continue;
+        }
+        let (Some(vs), Some(ve)) = (
+            model.vertices.get(edge.start_vertex).map(|v| v.position),
+            model.vertices.get(edge.end_vertex).map(|v| v.position),
+        ) else {
+            continue;
+        };
+        // Carry `n` samples onto both surfaces and interpolate them; `None`
+        // when any sample does not converge or would move too far.
+        use geometry_engine::primitives::curve::Curve;
+        let attempt = |n: usize| -> Option<(
+            geometry_engine::primitives::curve::NurbsCurve,
+            f64,
+            f64,
+            f64,
+        )> {
+            let samples = sample(n)?;
+            let mut on_both = Vec::with_capacity(n);
+            for &p in &samples {
+                let eps = 1e-9 * (1.0 + (p - Point3::new(0.0, 0.0, 0.0)).magnitude());
+                let mut q = p;
+                let mut converged = false;
+                for _ in 0..200 {
+                    let (a, _) = foot(sa, q)?;
+                    let (b, _) = foot(sb, a)?;
+                    q = b;
+                    if foot(sa, q).is_some_and(|(_, d)| d <= eps) {
+                        converged = true;
+                        break;
+                    }
+                }
+                if !converged || (q - p).magnitude() > EDGE_REBUILD_CAP {
+                    return None;
+                }
+                on_both.push(q);
+            }
+            // The ends are the edge's vertices: the edges meeting there use them.
+            let last = on_both.len() - 1;
+            on_both[0] = Point3::new(vs[0], vs[1], vs[2]);
+            on_both[last] = Point3::new(ve[0], ve[1], ve[2]);
+            let fit = geometry_engine::math::nurbs::interpolate_nurbs_curve(
+                &on_both,
+                3,
+                geometry_engine::math::nurbs::ParameterizationType::ChordLength,
+            )
+            .ok()?;
+            let knots = fit.knots.values().to_vec();
+            let (k0, k1) = (*knots.first()?, *knots.last()?);
+            let curve = geometry_engine::primitives::curve::NurbsCurve::new(
+                fit.degree,
+                fit.control_points.clone(),
+                fit.weights.clone(),
+                knots,
+            )
+            .ok()?;
+            // Measured between the interpolated samples too.
+            let m = 4 * (n - 1);
+            let after = (0..=m)
+                .map(|k| {
+                    curve
+                        .point_at(k0 + (k1 - k0) * k as f64 / m as f64)
+                        .ok()
+                        .and_then(gap_of)
+                })
+                .try_fold(0.0_f64, |acc, g| g.map(|g| acc.max(g)))?;
+            Some((curve, k0, k1, after))
+        };
+        // Double the samples until the rebuilt edge lies on both faces to
+        // the target, or the attempts run out; keep the best.
+        let target = EDGE_REBUILD_TARGET.max(declared);
+        let mut best: Option<(
+            geometry_engine::primitives::curve::NurbsCurve,
+            f64,
+            f64,
+            f64,
+        )> = None;
+        let mut n = EDGE_REBUILD_SAMPLES;
+        while n <= EDGE_REBUILD_MAX_SAMPLES {
+            let Some(got) = attempt(n) else { break };
+            let done = got.3 <= target;
+            if best.as_ref().is_none_or(|b| got.3 < b.3) {
+                best = Some(got);
+            }
+            if done {
+                break;
+            }
+            n = 2 * n - 1;
+        }
+        let Some((curve, k0, k1, after)) = best else {
+            continue;
+        };
+        if !(after < before) {
+            continue;
+        }
+        let curve_id = model.curves.add(Box::new(curve));
+        let Some(edge) = model.edges.get_mut(eid) else {
+            continue;
+        };
+        edge.curve_id = curve_id;
+        edge.param_range = geometry_engine::primitives::curve::ParameterRange::new(k0, k1);
+        edge.orientation = geometry_engine::primitives::edge::EdgeOrientation::Forward;
+        edge.pcurves.clear();
+        edge.invalidate_length_cache();
+        if after > edge.tolerance {
+            edge.set_tolerance(after * (1.0 + 1e-6));
+        }
+        let instance = edge_instance.get(&eid).copied().unwrap_or(0);
+        report.healings.push(diagnostics::Healing {
+            kind: diagnostics::HealingKind::EdgeRebuiltOnFaceIntersection,
+            entity: "EDGE_CURVE".into(),
+            instance,
+            deviation: before,
+            tolerance: after,
+        });
+        for f in [fa, fb] {
+            if let Some(&n) = face_instance.get(&f) {
+                caches.record_lens(
+                    n,
+                    geometry_engine::lens::Stage::Repair,
+                    geometry_engine::lens::EventKind::EdgeRebuiltOnIntersection,
+                    Some(instance),
+                    "the file's edge curve lay off this face; the edge was rebuilt on the intersection of its two faces",
+                    &[("gap_before_mm", before), ("gap_after_mm", after)],
+                );
+            }
+        }
+    }
+}
 
 /// Measure every edge's gap from the ANALYTIC surfaces of the faces using it
 /// (plane, cylinder, cone, sphere, torus -- the surfaces the validator judges

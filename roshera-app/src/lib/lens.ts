@@ -16,6 +16,7 @@ export type LensKind =
   | 'loop_reversed_to_match_neighbours'
   | 'void_shell_reversed'
   | 'vertices_merged'
+  | 'edge_rebuilt_on_intersection'
   | { blocking: { conjunct: string } }
 
 export interface LensEvent {
@@ -81,6 +82,7 @@ const TITLES: Record<string, string> = {
   loop_reversed_to_match_neighbours: 'Loop reversed to match its neighbours',
   void_shell_reversed: 'Void shell turned inside out',
   vertices_merged: 'Duplicate vertices merged to close a loop',
+  edge_rebuilt_on_intersection: 'Edge rebuilt where its two faces meet',
 }
 
 export interface LensStoryRow {

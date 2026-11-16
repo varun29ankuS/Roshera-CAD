@@ -57,6 +57,8 @@ pub enum EventKind {
     /// Two vertices at one point, which the face's loop passed between, made
     /// one so the loop chains.
     VerticesMerged,
+    /// The edge's curve rebuilt on the intersection of its two faces.
+    EdgeRebuiltOnIntersection,
     /// A certificate check this entity blocks.
     Blocking { conjunct: String },
 }
@@ -72,6 +74,7 @@ impl EventKind {
             EventKind::LoopReversedToMatchNeighbours => "loop_reversed_to_match_neighbours",
             EventKind::VoidShellReversed => "void_shell_reversed",
             EventKind::VerticesMerged => "vertices_merged",
+            EventKind::EdgeRebuiltOnIntersection => "edge_rebuilt_on_intersection",
             EventKind::Blocking { .. } => "blocking",
         }
     }

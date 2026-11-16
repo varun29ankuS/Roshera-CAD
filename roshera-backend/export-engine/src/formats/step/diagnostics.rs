@@ -131,6 +131,11 @@ pub enum HealingKind {
     /// one point that no loop passes between are left apart. `deviation` is
     /// the distance between the two, `tolerance` the bound it met.
     VerticesMergedToCloseLoop,
+    /// An edge whose 3D curve lay off one of its two faces was rebuilt on
+    /// the intersection of those faces (alternating projection, cubic
+    /// interpolation), so it lies on both. `deviation` is the file's gap,
+    /// `tolerance` the rebuilt edge's.
+    EdgeRebuiltOnFaceIntersection,
 }
 
 /// A structured healing event applied during dispatch. Logged on
