@@ -18,7 +18,6 @@
 //! tier-1 geometry, every entity we care about is the simple form.
 
 use ruststep::ast::{EntityInstance, Exchange, Record};
-use std::collections::HashMap;
 
 /// One indexed entry per `#N=...;` statement in the source file.
 #[derive(Debug, Clone)]
@@ -52,17 +51,21 @@ impl EntityKind {
     }
 }
 
-/// `#N` → entity index.
+/// `#N` → entity index, in `#N` order. Ordered, not hashed: dispatch walks
+/// this map, and the walk order decides the order solids, faces and edges
+/// are created in -- so a hashed map gave the same file different face ids on
+/// every import.
 #[derive(Debug, Default)]
 pub struct EntityRegistry {
-    by_id: HashMap<u64, IndexedEntity>,
+    by_id: std::collections::BTreeMap<u64, IndexedEntity>,
 }
 
 impl EntityRegistry {
     /// Build an index from a parsed [`Exchange`]. Flattens all data
     /// sections into a single map.
     pub fn build(exchange: &Exchange) -> Self {
-        let mut by_id: HashMap<u64, IndexedEntity> = HashMap::new();
+        let mut by_id: std::collections::BTreeMap<u64, IndexedEntity> =
+            std::collections::BTreeMap::new();
         for section in &exchange.data {
             for inst in &section.entities {
                 let entry = match inst {
@@ -86,7 +89,7 @@ impl EntityRegistry {
         self.by_id.get(&instance)
     }
 
-    /// Iterate every entry. Order is unspecified (HashMap-backed).
+    /// Iterate every entry, in `#N` order.
     pub fn iter(&self) -> impl Iterator<Item = &IndexedEntity> {
         self.by_id.values()
     }
