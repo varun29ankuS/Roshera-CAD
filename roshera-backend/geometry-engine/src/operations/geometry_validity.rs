@@ -28,6 +28,13 @@ use crate::primitives::topology_builder::BRepModel;
 /// edges need densifying to expose a bulge that crosses a neighbour.
 const CURVED_SAMPLES: usize = 16;
 
+/// A curved boundary edge's chords are halved until each lies within this
+/// distance of the curve (mm)...
+const SAGITTA_TOL: f64 = 1e-5;
+
+/// ...or this many halvings deep (2^14 per initial chord at most).
+const SUBDIVISION_DEPTH: usize = 14;
+
 /// The planar faces of `solid` whose outer boundary loop is geometrically
 /// self-intersecting (two non-adjacent boundary segments properly cross when the
 /// loop is projected into the face's own plane). An empty result means every
@@ -75,7 +82,10 @@ fn is_line_edge(model: &BRepModel, edge: &crate::primitives::edge::Edge) -> bool
 
 /// True when the planar `face`'s outer loop, projected into its best-fit plane
 /// with curved edges densified, is NOT a simple polygon.
-fn planar_face_self_intersects(model: &BRepModel, fid: FaceId) -> bool {
+/// Whether planar face `fid`'s outer loop crosses itself (its boundary sampled
+/// in loop order, curves followed to within `SAGITTA_TOL`). The per-face test
+/// behind [`self_overlapping_planar_faces`].
+pub fn planar_face_self_intersects(model: &BRepModel, fid: FaceId) -> bool {
     let Some(face) = model.faces.get(fid) else {
         return false;
     };
@@ -96,17 +106,53 @@ fn planar_face_self_intersects(model: &BRepModel, fid: FaceId) -> bool {
         let Some(edge) = model.edges.get(eid) else {
             continue;
         };
-        let n = if is_line_edge(model, edge) {
-            1
-        } else {
-            CURVED_SAMPLES
-        };
-        for j in 0..n {
-            let s = j as f64 / n as f64;
-            let t = if fwd { s } else { 1.0 - s };
+        if is_line_edge(model, edge) {
+            let t = if fwd { 0.0 } else { 1.0 };
             if let Ok(p) = edge.evaluate(t, &model.curves) {
                 pts.push(p);
             }
+            continue;
+        }
+        // A curved edge is followed until each chord lies within
+        // SAGITTA_TOL of the curve. A fixed 16 chords made two curves that
+        // meet at a shallow angle cross in the CHORD polygon although the
+        // curves themselves do not (CADGenBench parts 131, 134, 249: a
+        // false "self-overlaps" on a planar face).
+        let at = |s: f64| {
+            edge.evaluate(if fwd { s } else { 1.0 - s }, &model.curves)
+                .ok()
+        };
+        for j in 0..CURVED_SAMPLES {
+            let (s0, s1) = (
+                j as f64 / CURVED_SAMPLES as f64,
+                (j + 1) as f64 / CURVED_SAMPLES as f64,
+            );
+            let (Some(p0), Some(p1)) = (at(s0), at(s1)) else {
+                continue;
+            };
+            pts.push(p0);
+            // Depth-first subdivision of [s0, s1], emitting interior points
+            // in order.
+            let mut stack = vec![(s0, p0, s1, p1, 0usize)];
+            let mut interior: Vec<(f64, Point3)> = Vec::new();
+            while let Some((a, pa, b, pb, depth)) = stack.pop() {
+                let m = 0.5 * (a + b);
+                let Some(pm) = at(m) else {
+                    continue;
+                };
+                let mid = Point3::new(
+                    0.5 * (pa.x + pb.x),
+                    0.5 * (pa.y + pb.y),
+                    0.5 * (pa.z + pb.z),
+                );
+                if depth < SUBDIVISION_DEPTH && (pm - mid).magnitude() > SAGITTA_TOL {
+                    stack.push((a, pa, m, pm, depth + 1));
+                    stack.push((m, pm, b, pb, depth + 1));
+                    interior.push((m, pm));
+                }
+            }
+            interior.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+            pts.extend(interior.into_iter().map(|(_, p)| p));
         }
     }
     let m = pts.len();
