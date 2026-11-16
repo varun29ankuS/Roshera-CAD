@@ -35,6 +35,7 @@ mod bounded_exec;
 #[cfg(test)]
 mod branch_switch_tests;
 mod branches;
+mod change_ledger;
 mod csketch;
 mod documents;
 mod documents_tests;
@@ -1758,6 +1759,22 @@ fn certified_response_given(
                     "recording_failures_unlisted".to_string(),
                     serde_json::json!(lost.unlisted),
                 );
+            }
+        }
+    }
+
+    // What this operation changed, by persistent id: faces and solids
+    // created, deleted and modified since this model's previous mutating
+    // response (`change_ledger`). Lets the agent act on the faces it just
+    // made without re-querying; `baseline: false` on a model's first report.
+    if let serde_json::Value::Object(map) = &mut base {
+        let delta = change_ledger::report(model_arc, model);
+        match serde_json::to_value(&delta) {
+            Ok(value) => {
+                map.insert("changes".to_string(), value);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "change set failed to serialize; omitted");
             }
         }
     }

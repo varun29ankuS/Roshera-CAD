@@ -941,6 +941,13 @@ async fn restore_blackboard(state: &AppState, document_id: &str) {
 pub async fn boot_replay(state: &AppState) -> DurabilityStatus {
     let status = boot_replay_inner(state).await;
     *state.durability_status.write().await = status.clone();
+    // The document as replayed is the baseline its first operation's change
+    // set is measured against (`change_ledger`): without this, that first
+    // response could only say it had no baseline.
+    {
+        let model = state.model.read().await;
+        crate::change_ledger::rebase(&state.model, &model);
+    }
     status
 }
 

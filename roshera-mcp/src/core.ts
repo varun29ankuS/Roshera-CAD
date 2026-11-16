@@ -546,6 +546,12 @@ function perceptionFromBody(r: any): { perception: any; certified: boolean } | u
     // that deliberately omitted it (main.rs:1276-1279), would be the silent
     // pass this disclosure exists to end.
     fidelity: r.fidelity ?? r.perception?.fidelity ?? undefined,
+    // WHAT CHANGED, by persistent id: faces and solids this operation created,
+    // deleted and modified (`change_ledger`, api-server). The ids are the ones
+    // to act on next -- "fillet the face you just made" needs no re-query.
+    // Passed through verbatim; `baseline: false` means the model's first
+    // report, with nothing to compare against -- not "nothing changed".
+    changes: r.changes ?? r.perception?.changes ?? undefined,
     verdict: certified
       ? ((r.verdict ?? r.perception?.verdict) ??
         (sound ? "SOUND — full kernel certificate clean" : "UNSOUND — see verify_part"))

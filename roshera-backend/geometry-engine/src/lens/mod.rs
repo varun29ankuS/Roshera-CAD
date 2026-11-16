@@ -13,6 +13,8 @@
 //! [`FaceStatus`], a story per face); the agent reads the same journal over
 //! MCP.
 
+pub mod changes;
+
 use serde::{Deserialize, Serialize};
 
 use crate::primitives::persistent_id::PersistentId;

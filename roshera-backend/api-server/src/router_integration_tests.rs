@@ -13174,3 +13174,83 @@ async fn unknown_solid_is_a_404_not_an_empty_lens() {
     let (status, _) = dispatch(&state, lens_get(&format!("/api/lens/{part}/face/987654"))).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "a face not on the part");
 }
+
+// =====================================================================
+// Tests — what changed, by persistent id, on a mutating response
+// =====================================================================
+
+/// A mutating response tells the agent what the operation changed, by
+/// persistent id. The model's first report has nothing to compare with and
+/// says so; the next fillet reports its roll face as created and the part as
+/// modified -- through the live router, as an agent receives it.
+#[tokio::test]
+async fn a_fillet_response_names_the_faces_it_created() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, top) = seed_cylinder(&state, 5.0, 10.0).await;
+    let bottom = {
+        let model = state.model.read().await;
+        find_top_rim_edge(&model, 0.0).expect("bottom rim")
+    };
+
+    let (status, first) = dispatch(
+        &state,
+        fillet_post(json!({ "object": uuid.to_string(), "edges": [top], "radius": 0.5 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first fillet; body = {first}");
+    let changes = &first["perception"]["changes"];
+    assert_eq!(
+        changes["baseline"], false,
+        "the first report has no baseline; changes = {changes}"
+    );
+
+    let object = first["object"]["id"]
+        .as_str()
+        .unwrap_or(&uuid.to_string())
+        .to_string();
+    let (status, second) = dispatch(
+        &state,
+        fillet_post(json!({ "object": object, "edges": [bottom], "radius": 0.5 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second fillet; body = {second}");
+    let changes = &second["perception"]["changes"];
+    assert_eq!(changes["baseline"], true, "changes = {changes}");
+    let created = changes["faces_created"].as_array().expect("faces_created");
+    assert_eq!(created.len(), 1, "one roll face; changes = {changes}");
+    assert_eq!(
+        created[0]["pid"].as_str().map(str::len),
+        Some(32),
+        "a persistent id as 32 hex digits; changes = {changes}"
+    );
+    assert_eq!(
+        changes["solids_modified"].as_array().map(Vec::len),
+        Some(1),
+        "the part was modified, not replaced; changes = {changes}"
+    );
+}
+
+/// After a document is opened (replayed), its first operation is compared
+/// with what was opened: the change set has a baseline and names the faces
+/// the operation made, instead of reporting that there was nothing to
+/// compare with.
+#[tokio::test]
+async fn the_first_operation_after_opening_a_document_has_a_baseline() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, top) = seed_cylinder(&state, 5.0, 10.0).await;
+    // Opening a document ends in this replay (`documents::open_document`).
+    crate::durability::boot_replay(&state).await;
+    let (status, body) = dispatch(
+        &state,
+        fillet_post(json!({ "object": uuid.to_string(), "edges": [top], "radius": 0.5 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fillet; body = {body}");
+    let changes = &body["perception"]["changes"];
+    assert_eq!(changes["baseline"], true, "changes = {changes}");
+    assert_eq!(
+        changes["faces_created"].as_array().map(Vec::len),
+        Some(1),
+        "the roll face; changes = {changes}"
+    );
+}
