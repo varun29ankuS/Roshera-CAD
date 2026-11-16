@@ -1260,6 +1260,93 @@ impl MeshChart for DevelopedChart<'_> {
     }
 }
 
+/// A doubly curved face meshed in its native `(u, v)` rescaled so a unit
+/// step is about the same length on the surface in both directions: `x =
+/// su * u`, `y = sv * v`, with `su`, `sv` the face's mean `|dP/du|`,
+/// `|dP/dv|` over its boundary samples. Delaunay maximises the minimum angle
+/// IN THE CHART, so in a chart stretched 60 times one way (CADGenBench part
+/// 146: a 0.03-0.3 mm wide, 18 mm long NURBS blend strip spanning 64 units
+/// of u across its width and 23 of v along it) the "best" triangles are
+/// needles on the surface; on a strip curving hard across its width the
+/// needles tilt over and come out wound against the surface. Used only when
+/// the stretch exceeds [`ANISOTROPY_LIMIT`]; otherwise the native chart
+/// stands, byte for byte.
+pub(crate) struct ScaledChart<'a> {
+    inner: &'a dyn Surface,
+    su: f64,
+    sv: f64,
+}
+
+/// Above this ratio of mean `|dP/du|` to mean `|dP/dv|` (either way) a
+/// face is meshed in its [`ScaledChart`].
+const ANISOTROPY_LIMIT: f64 = 4.0;
+
+impl<'a> ScaledChart<'a> {
+    /// `uv_points`: the face's projected boundary samples (native chart).
+    pub(crate) fn for_face(inner: &'a dyn Surface, uv_points: &[(f64, f64)]) -> Option<Self> {
+        // Not for a developable (it has its own development) nor a surface
+        // that closes on itself: the seam and period handling of a torus or
+        // revolution lives in native coordinates, and rescaling those faces
+        // was measured to break their meshes (part 146's tori and revolution
+        // patches opened and folded).
+        if inner.is_developable() || inner.period_u().is_some() || inner.period_v().is_some() {
+            return None;
+        }
+        let (mut su, mut sv, mut n) = (0.0, 0.0, 0usize);
+        for &(u, v) in uv_points.iter().step_by((uv_points.len() / 64).max(1)) {
+            if let Ok(e) = Surface::evaluate_full(inner, u, v) {
+                let (a, b) = (e.du.magnitude(), e.dv.magnitude());
+                if a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0 {
+                    su += a;
+                    sv += b;
+                    n += 1;
+                }
+            }
+        }
+        if n == 0 {
+            return None;
+        }
+        let (su, sv) = (su / n as f64, sv / n as f64);
+        let ratio = (su / sv).max(sv / su);
+        (ratio > ANISOTROPY_LIMIT).then_some(Self { inner, su, sv })
+    }
+
+    /// Native `(u, v)` -> chart.
+    pub(crate) fn to_chart(&self, (u, v): (f64, f64)) -> (f64, f64) {
+        (u * self.su, v * self.sv)
+    }
+}
+
+impl MeshChart for ScaledChart<'_> {
+    fn evaluate_full(&self, x: f64, y: f64) -> MathResult<SurfacePoint> {
+        let mut e = Surface::evaluate_full(self.inner, x / self.su, y / self.sv)?;
+        e.du = e.du * (1.0 / self.su);
+        e.dv = e.dv * (1.0 / self.sv);
+        e.duu = e.duu * (1.0 / (self.su * self.su));
+        e.duv = e.duv * (1.0 / (self.su * self.sv));
+        e.dvv = e.dvv * (1.0 / (self.sv * self.sv));
+        Ok(e)
+    }
+    fn point_at(&self, x: f64, y: f64) -> MathResult<Point3> {
+        Surface::point_at(self.inner, x / self.su, y / self.sv)
+    }
+    fn normal_at(&self, x: f64, y: f64) -> MathResult<Vector3> {
+        Surface::normal_at(self.inner, x / self.su, y / self.sv)
+    }
+    fn is_developable(&self) -> bool {
+        false
+    }
+    fn type_name(&self) -> &'static str {
+        Surface::type_name(self.inner)
+    }
+    fn native_uv(&self, x: f64, y: f64) -> (f64, f64) {
+        (x / self.su, y / self.sv)
+    }
+    fn rulings_along_v(&self) -> bool {
+        false
+    }
+}
+
 /// Compute the "chart handedness" of a surface at the centre of an
 /// unwrapped UV bbox. Returns `+1` if `(∂P/∂u × ∂P/∂v)` is parallel
 /// to the face's outward normal at that point, `-1` if anti-parallel.
@@ -3237,6 +3324,25 @@ pub(crate) fn tessellate_curved_cdt(
         .copied()
         .collect();
     if let Some(chart) = DevelopedChart::for_face(surface, &all_uv) {
+        for lp in std::iter::once(&mut outer).chain(inners.iter_mut()) {
+            for p in &mut lp.points_uv {
+                *p = chart.to_chart(*p);
+            }
+        }
+        let bbox = outer.points_uv.iter().fold(
+            (
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ),
+            |(ul, uh, vl, vh), &(u, v)| (ul.min(u), uh.max(u), vl.min(v), vh.max(v)),
+        );
+        return mesh_in_chart(&chart, face, params, mesh, outer, inners, bbox);
+    }
+    // A doubly curved face whose chart is strongly stretched one way is
+    // meshed in the chart rescaled to equal step lengths (`ScaledChart`).
+    if let Some(chart) = ScaledChart::for_face(surface, &all_uv) {
         for lp in std::iter::once(&mut outer).chain(inners.iter_mut()) {
             for p in &mut lp.points_uv {
                 *p = chart.to_chart(*p);
