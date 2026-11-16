@@ -2398,6 +2398,149 @@ fn triangle_fails_fidelity<S: MeshChart + ?Sized>(
     chord_fail || angle_fail
 }
 
+/// Whether a facet's own plane faces against the surface, judged as the
+/// emitted mesh will be: a triangle counter-clockwise in the chart is
+/// emitted facing `chart_sign`'s side of the surface's own normal, so with
+/// `face_normal` the ORIENTED normal at the facet's centre (the surface
+/// normal times `face_sign`) the two must agree. A sliver whose corner
+/// normals all agree can still have its plane turned over -- an interior
+/// point a hair inside a boundary lies beyond the chord of its two boundary
+/// neighbours (CADGenBench part 142).
+fn facet_turned_against_chart(
+    corners_uv: [(f64, f64); 3],
+    plane_normal: Vector3,
+    face_normal: Vector3,
+    chart_sign: i32,
+    face_sign: f64,
+) -> bool {
+    let [a, b, c] = corners_uv;
+    let area_uv = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+    if area_uv == 0.0 {
+        return false;
+    }
+    area_uv.signum() * f64::from(chart_sign) * face_sign * plane_normal.dot(&face_normal) < 0.0
+}
+
+/// Rounds of [`drop_points_under_turned_facets`].
+const TURNED_FACET_PASSES: usize = 4;
+
+/// The facets of `triangles` turned against the surface, with the interior
+/// point to drop for each: the corner opposite the facet's longest 3D edge
+/// (a sliver's middle point), when that corner is not a boundary point.
+fn turned_facets<S: MeshChart + ?Sized>(
+    triangles: &[[usize; 3]],
+    pts2d: &[(f64, f64)],
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    surface: &S,
+    face: &Face,
+    chart_sign: i32,
+    cache: &mut FidelityCache,
+) -> (usize, std::collections::HashSet<(u64, u64)>) {
+    let boundary = outer.points_3d.len() + inners.iter().map(|l| l.points_3d.len()).sum::<usize>();
+    let mut turned = 0usize;
+    let mut drop = std::collections::HashSet::new();
+    for tri in triangles {
+        let corners = (
+            cache.position(tri[0], outer, inners, pts2d, surface),
+            cache.position(tri[1], outer, inners, pts2d, surface),
+            cache.position(tri[2], outer, inners, pts2d, surface),
+        );
+        let (Ok(p0), Ok(p1), Ok(p2)) = corners else {
+            continue;
+        };
+        let Ok(n) = (p1 - p0).cross(&(p2 - p0)).normalize() else {
+            continue;
+        };
+        let (a, b, c) = (pts2d[tri[0]], pts2d[tri[1]], pts2d[tri[2]]);
+        // The same centroid the refinement scan evaluated: a cache hit.
+        let (u, v) = ((a.0 + b.0 + c.0) / 3.0, (a.1 + b.1 + c.1) / 3.0);
+        let Ok(face_normal) = cache.normal(surface, face, u, v) else {
+            continue;
+        };
+        if !facet_turned_against_chart(
+            [a, b, c],
+            n,
+            face_normal,
+            chart_sign,
+            face.orientation.sign(),
+        ) {
+            continue;
+        }
+        turned += 1;
+        let lengths = [
+            (p1 - p2).magnitude(),
+            (p2 - p0).magnitude(),
+            (p0 - p1).magnitude(),
+        ];
+        let mut k = 0;
+        for j in 1..3 {
+            if lengths[j] > lengths[k] {
+                k = j;
+            }
+        }
+        if tri[k] >= boundary {
+            drop.insert(FidelityCache::key(pts2d[tri[k]]));
+        }
+    }
+    (turned, drop)
+}
+
+/// A facet turned against the surface cannot be fixed by inserting a point:
+/// it is a sliver whose middle corner -- an interior point a hair inside a
+/// curved boundary -- lies beyond the chord of its two boundary neighbours
+/// in 3D (CADGenBench part 142), and its circumcentre is outside the face.
+/// The point itself is the defect, so it is removed and the face
+/// re-triangulated; a round is kept only if it leaves fewer turned facets.
+fn drop_points_under_turned_facets<S: MeshChart + ?Sized>(
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    inner_polygons: &[Vec<(f64, f64)>],
+    pts2d: Vec<(f64, f64)>,
+    triangles: Vec<[usize; 3]>,
+    surface: &S,
+    face: &Face,
+    chart_sign: i32,
+    cache: &mut FidelityCache,
+) -> (Vec<(f64, f64)>, Vec<[usize; 3]>) {
+    let boundary = outer.points_3d.len() + inners.iter().map(|l| l.points_3d.len()).sum::<usize>();
+    let (mut pts2d, mut triangles) = (pts2d, triangles);
+    let (mut turned, mut drop) = turned_facets(
+        &triangles, &pts2d, outer, inners, surface, face, chart_sign, cache,
+    );
+    for _ in 0..TURNED_FACET_PASSES {
+        if turned == 0 || drop.is_empty() || boundary > pts2d.len() {
+            break;
+        }
+        let steiner: Vec<(f64, f64)> = pts2d[boundary..]
+            .iter()
+            .copied()
+            .filter(|&p| !drop.contains(&FidelityCache::key(p)))
+            .collect();
+        let Ok((next_pts, next_tris)) = run_cdt(&outer.points_uv, inner_polygons, &steiner) else {
+            break;
+        };
+        let (next_turned, next_drop) = turned_facets(
+            &next_tris, &next_pts, outer, inners, surface, face, chart_sign, cache,
+        );
+        if next_turned >= turned {
+            break;
+        }
+        pts2d = next_pts;
+        triangles = next_tris;
+        turned = next_turned;
+        drop = next_drop;
+    }
+    if std::env::var("ROSHERA_TESS_TRACE").is_ok() && turned > 0 {
+        eprintln!(
+            "[turned] {} {turned} of {} facet(s) still turned against the surface",
+            surface.type_name(),
+            triangles.len()
+        );
+    }
+    (pts2d, triangles)
+}
+
 /// Phase H — Step 4 refinement. For each output triangle, evaluate
 /// the UV centroid, lift it to 3D, and compare against the planar
 /// triangle formed by the three corner 3D positions. If chord error
@@ -3225,7 +3368,8 @@ fn refine_to_convergence<S: MeshChart + ?Sized>(
         );
         if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
             eprintln!(
-                "[refine] pass={} tris={} steiner={} budget={} boundary={} new={} converged={}",
+                "[refine] face={} pass={} tris={} steiner={} budget={} boundary={} new={} converged={}",
+                face.id,
                 _pass,
                 triangles.len(),
                 steiner.len(),
@@ -3256,7 +3400,8 @@ fn refine_to_convergence<S: MeshChart + ?Sized>(
         if steiner.len() > steiner_budget {
             if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
                 eprintln!(
-                    "[refine] BUDGET FREEZE at pass={} steiner={} budget={}",
+                    "[refine] face={} BUDGET FREEZE at pass={} steiner={} budget={}",
+                    face.id,
                     _pass,
                     steiner.len(),
                     steiner_budget
@@ -3461,6 +3606,17 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
         surface,
         face,
         params,
+        &mut cache,
+    );
+    let (final_pts2d, final_triangles) = drop_points_under_turned_facets(
+        &outer,
+        &inners,
+        &inner_polygons,
+        final_pts2d,
+        final_triangles,
+        surface,
+        face,
+        chart_sign,
         &mut cache,
     );
 
@@ -5291,7 +5447,10 @@ mod refinement_cost_tests {
     }
 
     fn sphere_patch_mesh(chart: &Counting<'_>) -> TriangleMesh {
-        let (u0, u1, v0, v1) = (0.3, 1.3, -0.5, 0.5);
+        // v is the angle from the pole (0..pi): the patch stays clear of it.
+        // (It once ran v = -0.5..0.5, through the pole, where the chart
+        // folds and half the patch meshed inside out.)
+        let (u0, u1, v0, v1) = (0.3, 1.3, 0.6, 1.6);
         let n = 24;
         let mut uv = Vec::new();
         for i in 0..n {
@@ -5517,6 +5676,82 @@ mod outer_keepout_tests {
         assert!(
             worst > 1e-9,
             "an interior grid point lies on the outer boundary (distance {worst:.3e})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod turned_facet_tests {
+    use super::{
+        drop_points_under_turned_facets, run_cdt, turned_facets, FidelityCache, LoopType,
+        ProjectedLoop,
+    };
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::face::{Face, FaceOrientation};
+    use crate::primitives::surface::{Plane, Surface};
+
+    /// A boundary point's 3D position is its edge's own sample, which may
+    /// sit up to the edge's tolerance off the surface. Here the corner at
+    /// uv (1, 0) sits 2 micrometres inward in 3D, and an interior point
+    /// lies 0.5 micrometres inside the bottom edge: in 3D it is beyond the
+    /// chord from (0, 0) to that corner, so the facet joining them faces
+    /// down. Inserting points cannot fix it; dropping the interior point
+    /// does.
+    #[test]
+    fn an_interior_point_beyond_a_boundary_chord_is_dropped() {
+        let plane = Plane::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, Vector3::X).expect("plane");
+        let surface: &dyn Surface = &plane;
+        let face = Face::new(0, 0, 0, FaceOrientation::Forward);
+        let outer_uv = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let outer = ProjectedLoop {
+            points_3d: vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.002, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+            ],
+            points_uv: outer_uv.clone(),
+            loop_type: LoopType::Outer,
+        };
+        let steiner = vec![(0.5, 0.0005), (0.5, 0.5)];
+        let (pts2d, triangles) = run_cdt(&outer_uv, &[], &steiner).expect("cdt");
+        let mut cache = FidelityCache::default();
+        let (before, _) = turned_facets(
+            &triangles,
+            &pts2d,
+            &outer,
+            &[],
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        assert!(before > 0, "the fixture has a turned facet");
+        let (pts2d, triangles) = drop_points_under_turned_facets(
+            &outer,
+            &[],
+            &[],
+            pts2d,
+            triangles,
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        let (after, _) = turned_facets(
+            &triangles,
+            &pts2d,
+            &outer,
+            &[],
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        assert_eq!(after, 0, "no facet is left turned ({before} before)");
+        assert!(
+            pts2d.contains(&(0.5, 0.5)),
+            "the well-placed interior point is kept"
         );
     }
 }
