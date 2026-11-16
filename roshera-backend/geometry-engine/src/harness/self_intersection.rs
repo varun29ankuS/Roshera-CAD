@@ -325,6 +325,50 @@ pub fn mesh_self_intersects(model: &BRepModel, solid: SolidId, chord: f64) -> bo
     })
 }
 
+/// The FACE pairs whose triangles cross, for a self-intersection the
+/// confirmation keeps (empty when [`mesh_self_intersects`] would say `false`).
+/// Each pair is `(lower id, higher id)`, sorted; a face crossing itself
+/// appears as `(f, f)`. Same meshes and the same verdict as
+/// [`mesh_self_intersects`] -- this only names where it is.
+pub fn self_intersecting_faces(model: &BRepModel, solid: SolidId, chord: f64) -> Vec<(u32, u32)> {
+    let Some(solid_ref) = model.solids.get(solid) else {
+        return Vec::new();
+    };
+    let params = TessellationParams {
+        chord_tolerance: chord,
+        ..TessellationParams::audit()
+    };
+    let mesh = tessellate_solid(solid_ref, model, &params);
+    let pairs = crossing_pairs(&mesh, CONFIRM_PAIR_CAP);
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let finer = TessellationParams {
+        chord_tolerance: chord / 16.0,
+        max_angle_deviation: params.max_angle_deviation / 4.0,
+        max_segments: params.max_segments * 4,
+        ..params
+    };
+    let confirmed = confirm_crossings(model, &mesh, &pairs, &finer, &|face_id, p, cache, out| {
+        if let Some(face) = model.faces.get(face_id) {
+            crate::tessellation::surface::tessellate_face(face, model, p, cache, out);
+        }
+    });
+    if !confirmed {
+        return Vec::new();
+    }
+    let mut faces: Vec<(u32, u32)> = pairs
+        .iter()
+        .filter_map(|&(i, j)| {
+            let (a, b) = (*mesh.face_map.get(i)?, *mesh.face_map.get(j)?);
+            Some((a.min(b), a.max(b)))
+        })
+        .collect();
+    faces.sort_unstable();
+    faces.dedup();
+    faces
+}
+
 /// Most coarse crossing pairs collected for the confirmation step.
 const CONFIRM_PAIR_CAP: usize = 4096;
 /// Most distinct faces a confirmation re-tessellates; a crossing spread over

@@ -146,3 +146,40 @@ fn closest_point_then_normal_at_survives_apex_region() {
         "apex-region footpoint must land near the apex; got {foot_pos:?} (u={u:.4})"
     );
 }
+
+/// The POINT at a pole is well defined -- the apex itself -- so `point_at`
+/// there must return it. Before, `point_at` went through `evaluate_full`,
+/// which normalised `du x dv` and failed on the zero cross product: every
+/// point on the pole row was an error (CADGenBench part 104: a NURBS face
+/// whose outline touches its pole could not be projected, and meshed to
+/// nothing).
+#[test]
+fn point_at_on_the_collapsed_row_is_the_apex() {
+    let s = collapsed_apex_patch();
+    for v in [0.0, 0.3, 0.5, 1.0] {
+        let p = s
+            .point_at(1.0, v)
+            .unwrap_or_else(|e| panic!("point_at(1, {v}) on the pole: {e:?}"));
+        assert!(
+            (p - Point3::new(0.0, 1.0, 1.4)).magnitude() < 1e-12,
+            "the pole row is the apex: {p:?}"
+        );
+    }
+}
+
+/// `evaluate_full` on the pole returns the point, its partials (one of them
+/// zero, honestly) and the LIMITING normal -- never an error.
+#[test]
+fn evaluate_full_on_the_collapsed_row_carries_the_limiting_normal() {
+    let s = collapsed_apex_patch();
+    let e = s
+        .evaluate_full(1.0, 0.5)
+        .unwrap_or_else(|err| panic!("evaluate_full on the pole: {err:?}"));
+    let limit = s.normal_at(1.0, 0.5).expect("limiting normal");
+    assert!(
+        (e.normal - limit).magnitude() < 1e-12,
+        "{:?} vs {limit:?}",
+        e.normal
+    );
+    assert!(e.dv.magnitude() < 1e-12, "dv is zero on the collapsed row");
+}

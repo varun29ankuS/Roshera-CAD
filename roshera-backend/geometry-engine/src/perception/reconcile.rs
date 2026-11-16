@@ -870,6 +870,7 @@ mod reconcile_full_tests {
             degenerate_triangles: 0,
             normal_agreement: 0.4,
             analytic_normal_agreement: 0.4,
+            off_surface_facets: 0,
         });
         let report = reconcile_full(
             7,

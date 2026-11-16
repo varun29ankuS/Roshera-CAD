@@ -314,6 +314,10 @@ pub struct TessFaceDefect {
     /// ground-truth check: a scribble whose stored normals are wrong-but-self-
     /// consistent scores `1.0` on `normal_agreement` yet drops here.
     pub analytic_normal_agreement: f64,
+    /// Facets on this face whose winding normal points away from the true
+    /// surface normal. One is enough to fail the check, so one is enough to
+    /// name the face.
+    pub off_surface_facets: usize,
 }
 
 /// Display-tessellation quality — the render-mesh analogue of B-Rep soundness.
@@ -353,6 +357,8 @@ pub struct TessellationQuality {
     /// The single worst face by normal disagreement — the agent's pointer to the
     /// defect. `None` when the mesh is clean.
     pub worst_face: Option<TessFaceDefect>,
+    /// Every defective face, worst first (`worst_face` is the first).
+    pub defects: Vec<TessFaceDefect>,
     /// `true` when there are no degenerate facets, normal agreement clears
     /// [`Self::MIN_NORMAL_AGREEMENT`], and there are zero off-surface facets.
     /// Conservative (gross-defect only) so a clean part at a coarse chord never
@@ -392,6 +398,7 @@ impl TessellationQuality {
             analytic_normal_agreement,
             inconsistent_facets,
             off_surface_facets,
+            defects: worst_face.iter().cloned().collect(),
             worst_face,
             clean,
         }
@@ -409,6 +416,7 @@ impl TessellationQuality {
             inconsistent_facets: 0,
             off_surface_facets: 0,
             worst_face: None,
+            defects: Vec::new(),
             clean: true,
         }
     }

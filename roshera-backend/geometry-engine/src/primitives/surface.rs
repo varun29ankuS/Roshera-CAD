@@ -5170,8 +5170,13 @@ impl Surface for GeneralNurbsSurface {
             MathError::InvalidParameter("Failed to compute v derivative".to_string())
         })?;
 
-        // Compute normal
-        let normal = du.cross(&dv).normalize()?;
+        // The normal. On a parametric pole (a collapsed control row) du x dv
+        // is zero: the point and its partials are still exact, so take the
+        // LIMITING normal there instead of failing the whole evaluation.
+        let normal = match du.cross(&dv).normalize() {
+            Ok(n) => n,
+            Err(_) => self.robust_normal(u, v)?,
+        };
 
         // Get second derivatives from evaluation result
         let duu = eval_result.duu.unwrap_or(Vector3::ZERO);
@@ -5236,6 +5241,12 @@ impl Surface for GeneralNurbsSurface {
 
     fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
         self.nurbs.parameter_bounds()
+    }
+
+    /// The point alone. The default goes through `evaluate_full`, whose
+    /// normal is undefined on a pole; the point there is not.
+    fn point_at(&self, u: f64, v: f64) -> MathResult<Point3> {
+        Ok(self.nurbs.evaluate_derivatives(u, v, 0, 0).point)
     }
 
     /// Degeneracy-robust normal. Identical to the default (`du × dv`

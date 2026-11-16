@@ -316,3 +316,116 @@ fn a_backward_conical_revolution_band_meshes_facing_the_axis() {
         mesh.triangles.len()
     );
 }
+
+/// A revolution of a CIRCLE (radius 5, centred `d` from the axis): a
+/// torus-like, doubly curved wall. The patch runs from the profile's outer
+/// equator (radius d + 5) up to its top (radius d), a quarter turn round
+/// the axis. Its rims have different radii, so they can carry different
+/// sample counts.
+fn bulge_band(d: f64) -> String {
+    let (ro, ri) = (d + 5.0, d);
+    format!(
+        "#5=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#30=DIRECTION('',(1.,0.,0.));
+#6=AXIS1_PLACEMENT('',#5,#2);
+#100=CARTESIAN_POINT('',({ri:.3},0.,0.));
+#101=DIRECTION('',(0.,-1.,0.));
+#102=AXIS2_PLACEMENT_3D('',#100,#101,#30);
+#103=CIRCLE('',#102,5.);
+#7=SURFACE_OF_REVOLUTION('',#103,#6);
+#11=CARTESIAN_POINT('',({ro:.3},0.,0.));
+#12=CARTESIAN_POINT('',(0.,{ro:.3},0.));
+#13=CARTESIAN_POINT('',(0.,{ri:.3},5.));
+#14=CARTESIAN_POINT('',({ri:.3},0.,5.));
+#21=VERTEX_POINT('',#11);
+#22=VERTEX_POINT('',#12);
+#23=VERTEX_POINT('',#13);
+#24=VERTEX_POINT('',#14);
+#31=AXIS2_PLACEMENT_3D('',#5,#2,#30);
+#32=CIRCLE('',#31,{ro:.3});
+#33=CARTESIAN_POINT('',(0.,0.,5.));
+#34=AXIS2_PLACEMENT_3D('',#33,#2,#30);
+#35=CIRCLE('',#34,{ri:.3});
+#110=CARTESIAN_POINT('',(0.,{ri:.3},0.));
+#111=DIRECTION('',(0.,1.,0.));
+#112=AXIS2_PLACEMENT_3D('',#110,#30,#111);
+#38=CIRCLE('',#112,5.);
+#51=EDGE_CURVE('',#21,#22,#32,.T.);
+#52=EDGE_CURVE('',#22,#23,#38,.T.);
+#53=EDGE_CURVE('',#24,#23,#35,.T.);
+#54=EDGE_CURVE('',#21,#24,#103,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#62=ORIENTED_EDGE('',*,*,#52,.T.);
+#63=ORIENTED_EDGE('',*,*,#53,.F.);
+#64=ORIENTED_EDGE('',*,*,#54,.F.);
+#70=EDGE_LOOP('',(#61,#62,#63,#64));
+#71=FACE_OUTER_BOUND('',#70,.T.);
+#80=ADVANCED_FACE('',(#71),#7,.T.);
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));"
+    )
+}
+
+/// That band, at several sizes. Where its two rims get different sample
+/// counts it reaches the unequal-count branch -- which triangulated the
+/// BOUNDARY ONLY, right for a cone or cylinder band (straight meridians) but
+/// not a curved one: its triangles cut straight across the wall, standing up
+/// to 89 degrees off the surface and through neighbouring faces (CADGenBench
+/// part 104: two such faces crossed a torus).
+#[test]
+fn a_doubly_curved_revolution_band_meshes_on_its_surface() {
+    use geometry_engine::tessellation::{
+        edge_cache::EdgeSampleCache, tessellate_face, TessellationParams, TriangleMesh,
+    };
+    let params = TessellationParams::default();
+    let mut unequal = 0;
+    let mut bad = Vec::new();
+    for d in [6.0_f64, 8.0, 12.0, 20.0, 40.0, 80.0] {
+        let (model, report) = ExportEngine::new()
+            .import_step_content(&envelope(&bulge_band(d)), "bulge")
+            .expect("imports");
+        let faces: Vec<_> = model.faces.iter().collect();
+        assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
+        let (_, face) = faces[0];
+        let cache = EdgeSampleCache::new(&params);
+        // The rims are the loop's 1st and 3rd edges.
+        let lp = model.loops.get(face.outer_loop).expect("loop");
+        let counts: Vec<usize> = lp
+            .edges
+            .iter()
+            .map(|&e| cache.get_or_compute(e, &model).len())
+            .collect();
+        if counts[0] != counts[2] || counts[1] != counts[3] {
+            unequal += 1;
+        }
+        let mut mesh = TriangleMesh::new();
+        tessellate_face(face, &model, &params, &cache, &mut mesh);
+        assert!(!mesh.triangles.is_empty(), "d {d}: the band meshes");
+        // The wall's true normal: away from the profile circle's centre,
+        // which turns with the point round the axis at radius d.
+        let mut worst = 0.0_f64;
+        for t in &mesh.triangles {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+            let m = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+            let rad = (m.x * m.x + m.y * m.y).sqrt();
+            let core = geometry_engine::math::Point3::new(m.x * d / rad, m.y * d / rad, 0.0);
+            let n = (m - core).normalize().expect("off the core");
+            let Ok(w) = (b - a).cross(&(c - a)).normalize() else {
+                continue;
+            };
+            worst = worst.max(w.dot(&n).abs().clamp(-1.0, 1.0).acos().to_degrees());
+        }
+        if worst > 40.0 {
+            bad.push((d, counts, worst, mesh.triangles.len()));
+        }
+    }
+    assert!(
+        unequal > 0,
+        "the fixture never reaches the unequal-count branch"
+    );
+    assert!(
+        bad.is_empty(),
+        "facets standing off the wall (d, rim counts, worst deg, tris): {bad:?}"
+    );
+}

@@ -662,9 +662,14 @@ pub fn tessellation_quality_with_normals(
             } else {
                 an_a as f64 / cmp as f64
             };
+            // A face with ANY off-surface facet is a defect: the verdict
+            // fails on one such facet, so the face it is on is named, however
+            // many good facets dilute its agreement ratio.
+            let off = cmp.saturating_sub(an_a);
             let clean_face = degen == 0
                 && na >= TessellationQuality::MIN_NORMAL_AGREEMENT
-                && aa >= TessellationQuality::MIN_ANALYTIC_AGREEMENT;
+                && aa >= TessellationQuality::MIN_ANALYTIC_AGREEMENT
+                && off == 0;
             if clean_face {
                 return None;
             }
@@ -674,6 +679,7 @@ pub fn tessellation_quality_with_normals(
                 degenerate_triangles: degen,
                 normal_agreement: na,
                 analytic_normal_agreement: aa,
+                off_surface_facets: off,
             })
         })
         .collect();
@@ -689,9 +695,9 @@ pub fn tessellation_quality_with_normals(
             .then(b.degenerate_triangles.cmp(&a.degenerate_triangles))
             .then(a.face_id.cmp(&b.face_id))
     });
-    let worst_face = defects.into_iter().next();
+    let worst_face = defects.first().cloned();
 
-    Some(TessellationQuality::evaluate(
+    let mut quality = TessellationQuality::evaluate(
         mesh.triangles.len(),
         degenerate_triangles,
         normal_agreement,
@@ -699,7 +705,9 @@ pub fn tessellation_quality_with_normals(
         inconsistent_facets,
         off_surface_facets,
         worst_face,
-    ))
+    );
+    quality.defects = defects;
+    Some(quality)
 }
 
 /// Each facet's TRUE surface normal at its centroid, oriented by face sense
@@ -1366,6 +1374,7 @@ pub fn score_mesh_tessellation(
                 // Mesh-only scorer has no surface access; analytic agreement is
                 // the full `tessellation_quality` path's job.
                 analytic_normal_agreement: 1.0,
+                off_surface_facets: 0,
             })
         })
         .collect();
@@ -1376,11 +1385,11 @@ pub fn score_mesh_tessellation(
             .then(b.degenerate_triangles.cmp(&a.degenerate_triangles))
             .then(a.face_id.cmp(&b.face_id))
     });
-    let worst_face = defects.into_iter().next();
+    let worst_face = defects.first().cloned();
 
     // Mesh-only verdict: analytic agreement defaults to perfect (no surface
     // access here); off-surface facets = 0.
-    TessellationQuality::evaluate(
+    let mut quality = TessellationQuality::evaluate(
         mesh.triangles.len(),
         degenerate_triangles,
         normal_agreement,
@@ -1388,7 +1397,9 @@ pub fn score_mesh_tessellation(
         inconsistent_facets,
         0,
         worst_face,
-    )
+    );
+    quality.defects = defects;
+    quality
 }
 
 /// Convenience: is `solid` a valid closed, oriented 2-manifold at the given

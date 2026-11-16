@@ -363,11 +363,140 @@ pub(crate) fn project_loop_to_uv(
         }
     }
 
+    // Samples on a pole -- where the surface collapses so that sweeping u
+    // (or v) over its whole domain does not move the point -- get an
+    // arbitrary footpoint parameter. Take it from the loop's neighbours.
+    let ((u_lo, u_hi), (v_lo, v_hi)) = surface.parameter_bounds();
+    let finite = |a: f64, b: f64| a.is_finite() && b.is_finite() && b > a;
+    let collapsed = |u: f64, v: f64| -> (bool, bool) {
+        let Ok(p) = surface.point_at(u, v) else {
+            return (false, false);
+        };
+        let tol = POLE_DISTANCE_RATIO * (1.0 + p.magnitude());
+        let still = |q: MathResult<Point3>| q.is_ok_and(|q| (q - p).magnitude() <= tol);
+        let free_u = finite(u_lo, u_hi)
+            && still(surface.point_at(u_lo, v))
+            && still(surface.point_at(0.5 * (u_lo + u_hi), v))
+            && still(surface.point_at(u_hi, v));
+        let free_v = finite(v_lo, v_hi)
+            && still(surface.point_at(u, v_lo))
+            && still(surface.point_at(u, 0.5 * (v_lo + v_hi)))
+            && still(surface.point_at(u, v_hi));
+        (free_u, free_v)
+    };
+    // A sample OFF the pole whose footpoint search stalled ON it (the search
+    // cannot tell which way to leave a pole): search again from its nearest
+    // neighbours that are not on the pole, keeping the closer footpoint.
+    let residual = |i: usize, (u, v): (f64, f64)| -> f64 {
+        surface
+            .point_at(u, v)
+            .map_or(f64::INFINITY, |q| (q - points_3d[i]).magnitude())
+    };
+    let n_pts = points_uv.len();
+    let on_pole: Vec<bool> = points_uv
+        .iter()
+        .map(|&(u, v)| {
+            let (fu, fv) = collapsed(u, v);
+            fu || fv
+        })
+        .collect();
+    for i in 0..n_pts {
+        if !on_pole[i] {
+            continue;
+        }
+        let here = residual(i, points_uv[i]);
+        if here <= POLE_DISTANCE_RATIO * (1.0 + points_3d[i].magnitude()) * 1e3 {
+            continue; // genuinely on the pole
+        }
+        let neighbour = |step: isize| -> Option<(f64, f64)> {
+            (1..n_pts as isize).find_map(|k| {
+                let j = (i as isize + step * k).rem_euclid(n_pts as isize) as usize;
+                (!on_pole[j]).then(|| points_uv[j])
+            })
+        };
+        let mut best = (here, points_uv[i]);
+        for seed in [neighbour(-1), neighbour(1)].into_iter().flatten() {
+            if let Ok(uv) = surface.closest_point_near(&points_3d[i], seed, Tolerance::default()) {
+                let r = residual(i, uv);
+                if r < best.0 {
+                    best = (r, uv);
+                }
+            }
+        }
+        points_uv[i] = best.1;
+    }
+    let flags: Vec<(bool, bool)> = points_uv.iter().map(|&(u, v)| collapsed(u, v)).collect();
+    let free_u: Vec<bool> = flags.iter().map(|f| f.0).collect();
+    let free_v: Vec<bool> = flags.iter().map(|f| f.1).collect();
+    take_pole_parameters_from_neighbours(&mut points_uv, &free_u, true);
+    take_pole_parameters_from_neighbours(&mut points_uv, &free_v, false);
+
     Ok(ProjectedLoop {
         points_3d,
         points_uv,
         loop_type: loop_data.loop_type,
     })
+}
+
+/// A boundary sample is ON A POLE in u when sweeping u over its whole domain
+/// moves the point less than this fraction of its distance from the origin
+/// (plus one, so the bound is absolute near the origin).
+const POLE_DISTANCE_RATIO: f64 = 1e-9;
+
+/// Give every run of consecutive pole samples (`free[i]`: the parameter does
+/// not move the point there) the parameter of its loop neighbours: the run's
+/// first sample takes the incoming neighbour's value, its last the outgoing
+/// neighbour's, the ones between are spaced evenly; a lone pole sample takes
+/// the mean. The loop is closed. `along_u` picks which coordinate is free.
+///
+/// A pole's footpoint parameter is arbitrary, so the projection returns
+/// whatever the solver lands on. On CADGenBench part 104 a NURBS patch with a
+/// pole along v = 1 got u = 0.0 for the sample on the pole while its
+/// neighbours sat at u = 1.0 and 0.0: the outline crossed itself and the face
+/// meshed to nothing.
+pub(crate) fn take_pole_parameters_from_neighbours(
+    uv: &mut [(f64, f64)],
+    free: &[bool],
+    along_u: bool,
+) {
+    let n = uv.len().min(free.len());
+    if n < 3 || free.iter().take(n).all(|&f| f) || !free.iter().take(n).any(|&f| f) {
+        return;
+    }
+    let get = |p: (f64, f64)| if along_u { p.0 } else { p.1 };
+    // Start just after a fixed sample so a run never wraps mid-walk.
+    let Some(start) = (0..n).find(|&i| !free[i]) else {
+        return;
+    };
+    let mut k = 1;
+    while k <= n {
+        let i = (start + k) % n;
+        if !free[i] {
+            k += 1;
+            continue;
+        }
+        let mut len = 0;
+        while len < n && free[(start + k + len) % n] {
+            len += 1;
+        }
+        let before = get(uv[(start + k - 1) % n]);
+        let after = get(uv[(start + k + len) % n]);
+        for m in 0..len {
+            let t = if len == 1 {
+                0.5
+            } else {
+                m as f64 / (len - 1) as f64
+            };
+            let value = before + (after - before) * t;
+            let idx = (start + k + m) % n;
+            if along_u {
+                uv[idx].0 = value;
+            } else {
+                uv[idx].1 = value;
+            }
+        }
+        k += len;
+    }
 }
 
 /// The footpoint of a loop sample, marching from the previous one.
@@ -1981,6 +2110,27 @@ fn triangulate_segments(
     )
     .map_err(CurvedCdtError::CdtFailed)?;
     if conflicts > 0 {
+        if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+            // Name the crossing boundary segments (index pairs and uv ends).
+            let cross = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+                (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+            };
+            for (i, &[a, b]) in segments.iter().enumerate() {
+                for &[c, d] in segments.iter().skip(i + 1) {
+                    if a == c || a == d || b == c || b == d {
+                        continue;
+                    }
+                    let (pa, pb, pc, pd) = (pts[a], pts[b], pts[c], pts[d]);
+                    if cross(pa, pb, pc) * cross(pa, pb, pd) < 0.0
+                        && cross(pc, pd, pa) * cross(pc, pd, pb) < 0.0
+                    {
+                        eprintln!(
+                            "[tess] crossing: seg {a}-{b} {pa:?}->{pb:?} x seg {c}-{d} {pc:?}->{pd:?}"
+                        );
+                    }
+                }
+            }
+        }
         return Err(CurvedCdtError::OutlineCrossesItself { conflicts });
     }
     if cdt.num_vertices() != pts.len() {
@@ -4975,5 +5125,62 @@ mod refinement_cost_tests {
              refinement is re-evaluating unchanged work",
             evals as f64 / tris as f64
         );
+    }
+}
+
+#[cfg(test)]
+mod pole_parameter_tests {
+    use super::take_pole_parameters_from_neighbours;
+
+    fn crosses(p: (f64, f64), q: (f64, f64), r: (f64, f64), s: (f64, f64)) -> bool {
+        let c = |a: (f64, f64), b: (f64, f64), x: (f64, f64)| {
+            (b.0 - a.0) * (x.1 - a.1) - (b.1 - a.1) * (x.0 - a.0)
+        };
+        c(p, q, r) * c(p, q, s) < 0.0 && c(r, s, p) * c(r, s, q) < 0.0
+    }
+
+    /// CADGenBench part 104's outline at its pole (v = 1): pole samples
+    /// projected to u = 0.0 and 0.3 between neighbours at u = 1.0 (incoming)
+    /// and u ~ 0 (outgoing), so the outline crossed itself.
+    #[test]
+    fn pole_samples_take_their_neighbours_parameter() {
+        let mut uv = vec![
+            (0.0, 1.0),
+            (0.3, 1.0),
+            (1.365_657_655_601_313_5e-6, 0.937_500_451_091_535_7),
+            (0.0, 0.5),
+            (1.0, 0.5),
+            (1.0, 0.979_166_666_666_676),
+        ];
+        let n = uv.len();
+        assert!(crosses(uv[1], uv[2], uv[n - 1], uv[0]), "the input crosses");
+        let free = [true, true, false, false, false, false];
+        take_pole_parameters_from_neighbours(&mut uv, &free, true);
+        assert_eq!(uv[0].0, 1.0, "the first pole sample takes the incoming u");
+        assert!(
+            uv[1].0.abs() < 1e-5,
+            "the last takes the outgoing u: {:?}",
+            uv[1]
+        );
+        assert_eq!((uv[0].1, uv[1].1), (1.0, 1.0), "v is untouched");
+        for i in 0..n {
+            for j in i + 2..n {
+                if (j + 1) % n == i {
+                    continue;
+                }
+                assert!(
+                    !crosses(uv[i], uv[(i + 1) % n], uv[j], uv[(j + 1) % n]),
+                    "segments {i} and {j} cross: {uv:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_loop_with_no_pole_is_untouched() {
+        let before = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let mut uv = before.clone();
+        take_pole_parameters_from_neighbours(&mut uv, &[false; 4], true);
+        assert_eq!(uv, before);
     }
 }

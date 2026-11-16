@@ -349,6 +349,8 @@ pub fn tessellate_face(
                     "blend conforming"
                 } else if tessellate_toroidal_trimmed(face, model, surface, cache, params, mesh) {
                     "trimmed"
+                } else if tessellate_torus_quad_patch(face, model, surface, cache, mesh) {
+                    "quad patch"
                 } else if face_has_a_trim_edge(face, model) {
                     // A patch of the torus (a fillet quarter bounded by arcs):
                     // the untrimmed grid would mesh the WHOLE torus and ignore
@@ -5301,6 +5303,207 @@ fn tessellate_torus_two_circle_band(
     true
 }
 
+/// A four-sided torus patch -- two arcs round the ring (constant tube angle)
+/// and two arcs across the tube (constant ring angle), alternating -- as
+/// every STEP writer emits a rolled edge. When opposite sides carry the same
+/// number of samples the patch is meshed as a STRUCTURED grid: all four sides
+/// verbatim from the shared edge samples (so it welds to its neighbours bit
+/// for bit), interior nodes on the exact torus at the sides' ring and tube
+/// angles, two triangles per cell wound to face out of the face.
+///
+/// Every cell spans one sample step in each direction, so no facet can fold.
+/// The general triangulator could: on a thin tube along a long ring
+/// (CADGenBench part 102: ring 107 mm, tube 1 mm, rim chords 4.2 mm) it put an
+/// interior point 0.02 mm inside a rim chord, on the chord's far side in 3D,
+/// and the facet faced away from the surface. Returns `false` (the caller
+/// falls back) for any other shape or unequal opposite sides.
+fn tessellate_torus_quad_patch(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Torus;
+    let Some(torus) = surface.as_any().downcast_ref::<Torus>() else {
+        return false;
+    };
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    let Some(lp) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    if lp.edges.len() != 4 {
+        return false;
+    }
+    let Ok(axis) = torus.axis.normalize() else {
+        return false;
+    };
+    let (center, big_r, small_r) = (torus.center, torus.major_radius, torus.minor_radius);
+    if !(small_r > 0.0) || !(big_r > small_r) {
+        return false;
+    }
+    let tol = Tolerance::default()
+        .distance()
+        .max(1e-6 * (big_r + small_r));
+    let tau = std::f64::consts::TAU;
+    let pi = std::f64::consts::PI;
+
+    // Each side's samples in loop order.
+    let sides: Vec<Vec<Point3>> = lp
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(i, &eid)| {
+            let samples = cache.get_or_compute(eid, model);
+            if lp.orientations.get(i).copied().unwrap_or(true) {
+                samples.iter().copied().collect()
+            } else {
+                samples.iter().rev().copied().collect()
+            }
+        })
+        .collect();
+    if sides.iter().any(|s| s.len() < 2) {
+        return false;
+    }
+    // Consecutive sides meet.
+    for k in 0..4 {
+        let (Some(&end), Some(&start)) = (sides[k].last(), sides[(k + 1) % 4].first()) else {
+            return false;
+        };
+        if (end - start).magnitude() > tol {
+            return false;
+        }
+    }
+
+    let frame = |p: Point3| {
+        let w = p - center;
+        let a = w.dot(&axis);
+        (a, w - axis * a)
+    };
+    let Ok(e1) = frame(sides[0][0]).1.normalize() else {
+        return false;
+    };
+    let e2 = axis.cross(&e1);
+    let ring_angle = |p: Point3| {
+        let (_, rad) = frame(p);
+        rad.dot(&e2).atan2(rad.dot(&e1))
+    };
+    let tube_angle = |p: Point3| {
+        let (a, rad) = frame(p);
+        a.atan2(rad.magnitude() - big_r)
+    };
+    let on_torus = |p: Point3| {
+        let (a, rad) = frame(p);
+        (((rad.magnitude() - big_r).powi(2) + a * a).sqrt() - small_r).abs() <= tol
+    };
+    // A side round the ring keeps its axial height and radius; a side across
+    // the tube keeps its ring angle.
+    let round_the_ring = |s: &[Point3]| {
+        let (a0, r0) = frame(s[0]);
+        let rho0 = r0.magnitude();
+        s.iter().all(|&p| {
+            let (a, r) = frame(p);
+            on_torus(p) && (a - a0).abs() <= tol && (r.magnitude() - rho0).abs() <= tol
+        })
+    };
+    let across_the_tube = |s: &[Point3]| {
+        let u0 = ring_angle(s[0]);
+        s.iter().all(|&p| {
+            let d = (ring_angle(p) - u0 + pi).rem_euclid(tau) - pi;
+            on_torus(p) && d.abs() * frame(p).1.magnitude() <= tol
+        })
+    };
+    // Rotate so side 0 runs round the ring.
+    let first = if round_the_ring(&sides[0]) && across_the_tube(&sides[1]) {
+        0
+    } else if round_the_ring(&sides[1]) && across_the_tube(&sides[0]) {
+        1
+    } else {
+        return false;
+    };
+    let side = |k: usize| &sides[(first + k) % 4];
+    if !(round_the_ring(side(2)) && across_the_tube(side(3)) && across_the_tube(side(1))) {
+        return false;
+    }
+    let (nu, nv) = (side(0).len(), side(1).len());
+    if side(2).len() != nu || side(3).len() != nv {
+        return false;
+    }
+
+    // Grid node (i, j): i along side 0 (round the ring), j along side 1
+    // (across the tube). Side 2 runs back along the ring, side 3 back across
+    // the tube, so they are read reversed.
+    let unwrap_from = |base: f64, x: f64| base + (x - base + pi).rem_euclid(tau) - pi;
+    let us: Vec<f64> = (0..nu)
+        .map(|i| {
+            let a = ring_angle(side(0)[i]);
+            let b = unwrap_from(a, ring_angle(side(2)[nu - 1 - i]));
+            0.5 * (a + b)
+        })
+        .collect();
+    let vs: Vec<f64> = (0..nv)
+        .map(|j| {
+            let a = tube_angle(side(1)[j]);
+            let b = unwrap_from(a, tube_angle(side(3)[nv - 1 - j]));
+            0.5 * (a + b)
+        })
+        .collect();
+    let osign = face.orientation.sign();
+    let outward = |p: Point3| -> Vector3 {
+        let (_, rad) = frame(p);
+        let core = center + rad.normalize().unwrap_or(torus.ref_dir) * big_r;
+        (p - core).normalize().unwrap_or(axis) * osign
+    };
+    let point = |u: f64, v: f64| {
+        let e = e1 * u.cos() + e2 * u.sin();
+        center + e * (big_r + small_r * v.cos()) + axis * (small_r * v.sin())
+    };
+    let mut ids = vec![vec![0u32; nv]; nu];
+    for i in 0..nu {
+        for j in 0..nv {
+            let p = if j == 0 {
+                side(0)[i]
+            } else if i == nu - 1 {
+                side(1)[j]
+            } else if j == nv - 1 {
+                side(2)[nu - 1 - i]
+            } else if i == 0 {
+                side(3)[nv - 1 - j]
+            } else {
+                point(us[i], vs[j])
+            };
+            ids[i][j] = mesh.add_vertex(MeshVertex {
+                position: p,
+                normal: outward(p),
+                uv: None,
+            });
+        }
+    }
+    for i in 0..nu - 1 {
+        for j in 0..nv - 1 {
+            let (a, b, c, d) = (ids[i][j], ids[i + 1][j], ids[i + 1][j + 1], ids[i][j + 1]);
+            let pa = mesh.vertices[a as usize].position;
+            let pb = mesh.vertices[b as usize].position;
+            let pc = mesh.vertices[c as usize].position;
+            let mid = Point3::new(
+                (pa.x + pc.x) * 0.5,
+                (pa.y + pc.y) * 0.5,
+                (pa.z + pc.z) * 0.5,
+            );
+            if (pb - pa).cross(&(pc - pa)).dot(&outward(mid)) >= 0.0 {
+                mesh.add_triangle(a, b, c);
+                mesh.add_triangle(a, c, d);
+            } else {
+                mesh.add_triangle(a, c, b);
+                mesh.add_triangle(a, d, c);
+            }
+        }
+    }
+    true
+}
+
 /// Conforming tessellation of a fillet-BLEND torus (cylinder-rim or cone-rim
 /// quarter-torus produced by `cylinder_rim_fillet` / `cone_rim_fillet`).
 ///
@@ -5887,6 +6090,156 @@ fn tessellate_surface_grid(
     }
 }
 
+/// A doubly curved four-sided revolution band whose rims carry different
+/// sample counts: two rings (constant profile position, sweeping the angle)
+/// and two meridians (constant angle, along the profile). Rows run from one
+/// ring to the other: the rings verbatim from the shared edge samples, the
+/// interior rows the left meridian's sample ROTATED about the axis -- the
+/// exact surface point -- at the denser ring's angles, ending on the right
+/// meridian's sample. Consecutive rows are stitched with a strip that takes
+/// any count on either side; every triangle is wound to face the face's
+/// outward side. Declines (returns `false`, nothing emitted) unless the two
+/// meridians carry the same count.
+///
+/// Before, this case was triangulated from the boundary alone -- exact for a
+/// cone or cylinder band, whose meridians are straight, but on a revolved
+/// circle the triangles cut straight across the wall, up to 89 degrees off
+/// the surface and through the neighbouring faces (CADGenBench part 104).
+fn tessellate_revolution_band_stitched(
+    face: &Face,
+    model: &BRepModel,
+    chains: [&Vec<Point3>; 4],
+    mesh: &mut TriangleMesh,
+) -> bool {
+    let Some(surf) = model.surfaces.get(face.surface_id) else {
+        return false;
+    };
+    let Some(sr) = surf
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::SurfaceOfRevolution>()
+    else {
+        return false;
+    };
+    let origin = sr.axis_origin;
+    let Ok(axis) = sr.axis_direction.normalize() else {
+        return false;
+    };
+    let radial = |p: Point3| -> Vector3 {
+        let w = p - origin;
+        w - axis * w.dot(&axis)
+    };
+    // Signed angle from radial direction r0 to p's radial direction.
+    let angle_from = |r0: Vector3, p: Point3| -> f64 {
+        let r = radial(p);
+        r0.cross(&r).dot(&axis).atan2(r0.dot(&r))
+    };
+    let rotate = |p: Point3, ang: f64| -> Point3 {
+        let w = p - origin;
+        let along = axis * w.dot(&axis);
+        let r = w - along;
+        let t = axis.cross(&r);
+        origin + along + r * ang.cos() + t * ang.sin()
+    };
+    let sweep = |ch: &[Point3]| -> f64 {
+        let r0 = radial(ch[0]);
+        ch.iter()
+            .map(|&p| angle_from(r0, p).abs())
+            .fold(0.0_f64, f64::max)
+    };
+    // Rings sweep the angle; meridians do not. Label them so `ring0` runs
+    // c0 -> c1, `mer_r` c1 -> c2, `ring1` c2 -> c3 and `mer_l` c3 -> c0.
+    let [a, b, c, d] = chains;
+    let (ring0, mer_r, ring1, mer_l) = if sweep(a) >= sweep(b) {
+        (a, b, c, d)
+    } else {
+        (b, c, d, a)
+    };
+    let m = mer_r.len();
+    if m < 2 || mer_l.len() != m || ring0.len() < 2 || ring1.len() < 2 {
+        return false;
+    }
+
+    // Row j (0..m): from the left meridian's sample to the right one's.
+    // Row 0 is ring0 (c0 -> c1); row m-1 is ring1 reversed (c3 -> c2).
+    let ring1_rev: Vec<Point3> = ring1.iter().rev().copied().collect();
+    let (dense, dense_start) = if ring0.len() >= ring1.len() {
+        (ring0.as_slice(), ring0[0])
+    } else {
+        (ring1_rev.as_slice(), ring1_rev[0])
+    };
+    let r_start = radial(dense_start);
+    let total = angle_from(r_start, dense[dense.len() - 1]);
+    if total.abs() < 1e-12 {
+        return false;
+    }
+    let fractions: Vec<f64> = dense
+        .iter()
+        .map(|&p| angle_from(r_start, p) / total)
+        .collect();
+    let mut rows: Vec<Vec<Point3>> = Vec::with_capacity(m);
+    for j in 0..m {
+        let left = mer_l[m - 1 - j];
+        let right = mer_r[j];
+        let row = if j == 0 {
+            ring0.clone()
+        } else if j == m - 1 {
+            ring1_rev.clone()
+        } else {
+            let span = angle_from(radial(left), right);
+            let mut row: Vec<Point3> = fractions.iter().map(|&f| rotate(left, f * span)).collect();
+            let last = row.len() - 1;
+            row[0] = left;
+            row[last] = right;
+            row
+        };
+        rows.push(row);
+    }
+
+    let sign = face.orientation.sign();
+    let outward = |p: Point3| -> Option<Vector3> {
+        let (u, v) = surf.closest_point(&p, Tolerance::default()).ok()?;
+        surf.normal_at(u, v)
+            .ok()?
+            .normalize()
+            .ok()
+            .map(|n| n * sign)
+    };
+    let ids: Vec<Vec<u32>> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|&p| {
+                    mesh.add_vertex(MeshVertex {
+                        position: p,
+                        normal: outward(p).unwrap_or(Vector3::Z),
+                        uv: None,
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    let first_tri = mesh.triangles.len();
+    for j in 0..m - 1 {
+        stitch_open_band(&ids[j], &ids[j + 1], true, mesh);
+    }
+    // Wind every new triangle to face the face's outward side.
+    for t in first_tri..mesh.triangles.len() {
+        let tri = mesh.triangles[t];
+        let [p0, p1, p2] = tri.map(|i| mesh.vertices[i as usize].position);
+        let centroid = Point3::new(
+            (p0.x + p1.x + p2.x) / 3.0,
+            (p0.y + p1.y + p2.y) / 3.0,
+            (p0.z + p1.z + p2.z) / 3.0,
+        );
+        if let Some(out) = outward(centroid) {
+            if (p1 - p0).cross(&(p2 - p0)).dot(&out) < 0.0 {
+                mesh.triangles[t] = [tri[0], tri[2], tri[1]];
+            }
+        }
+    }
+    true
+}
+
 /// Tessellate a single `SurfaceOfRevolution` wedge face as a structured grid
 /// whose four boundary edges are sampled from the `EdgeSampleCache` (so shared
 /// seams are bit-exact with neighbours) and whose interior is a transfinite
@@ -6203,6 +6556,28 @@ fn tessellate_revolution_wedge(
     // only the 2D triangulation connectivity is computed in (u,v). Boundary-
     // only (no interior Steiner) — exact for the developable band.
     if a.len() != c.len() || b.len() != d.len() {
+        // Boundary-only is exact only for a DEVELOPABLE band: one opposite pair
+        // of sides is straight (a cone or cylinder band's meridians). On a
+        // doubly curved band (a revolved circle) its triangles cut straight
+        // across the wall -- up to 89 degrees off the surface and through the
+        // neighbouring faces (CADGenBench part 104). Decline those; the caller
+        // meshes them with interior points.
+        let straight = |ch: &[Point3]| -> bool {
+            let (p0, p1) = (ch[0], ch[ch.len() - 1]);
+            let span = p1 - p0;
+            let len = span.magnitude();
+            if len <= 0.0 {
+                return false;
+            }
+            let dir = span * (1.0 / len);
+            ch.iter().all(|&p| {
+                let w = p - p0;
+                (w - dir * w.dot(&dir)).magnitude() <= 1e-6 * (1.0 + len)
+            })
+        };
+        if !((straight(a) && straight(c)) || (straight(b) && straight(d))) {
+            return tessellate_revolution_band_stitched(face, model, [a, b, c, d], mesh);
+        }
         let mut p3: Vec<Point3> = Vec::new();
         let mut puv: Vec<Point3> = Vec::new();
         // a: v=0, u 0→1 ; b: u=1, v 0→1 ; c: v=1, u 1→0 ; d: u=0, v 1→0.
