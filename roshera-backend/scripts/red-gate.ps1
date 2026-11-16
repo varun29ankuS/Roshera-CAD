@@ -243,9 +243,21 @@ if ($blocks.Count -ne $orderedBinaries.Count) {
 # the ordinary `cargo test --lib` developer/CI flow); recognizing their
 # blocks here exists to keep the positional pairing aligned, not to judge
 # them.
+# Out of scope is NOT silent: a lib or doctest failure in the run is printed
+# as OUT_OF_SCOPE_RED below, so a "GATE PASSED" verdict can never hide a red
+# that ran in front of it (observed 2026-11-16: a lib test red all day under
+# two gate runs that reported only their integration reds).
+$outOfScopeFails = [string[]]@()
 for ($bi = 0; $bi -lt $blocks.Count; $bi++) {
     $binary = $orderedBinaries[$bi]
-    if ($binary -eq "__lib__" -or $binary -eq "__doctest__") { continue }
+    if ($binary -eq "__lib__" -or $binary -eq "__doctest__") {
+        foreach ($rawLine in $blocks[$bi]) {
+            if ($rawLine.Trim() -match "^test\s+(.+?)\s+\.\.\.\s+FAILED$") {
+                $outOfScopeFails += "$binary::$($Matches[1])"
+            }
+        }
+        continue
+    }
 
     $inFailuresList = $false
 
@@ -326,6 +338,12 @@ foreach ($key in $allowlist.Keys) {
 
 Write-Host ""
 Write-Host "=== red-gate results ===" -ForegroundColor Cyan
+
+if ($outOfScopeFails.Count -gt 0) {
+    Write-Host ("OUT_OF_SCOPE_RED -- {0} lib/doctest failure(s) ran in this sweep; this gate does not judge them, but they are red:" -f $outOfScopeFails.Count) -ForegroundColor Red
+    foreach ($k in $outOfScopeFails) { Write-Host "  $k" -ForegroundColor Red }
+    Write-Host ""
+}
 
 if ($observedFails.Count -eq 0) {
     Write-Host "Observed failures: none" -ForegroundColor Green
