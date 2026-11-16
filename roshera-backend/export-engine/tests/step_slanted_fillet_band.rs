@@ -140,7 +140,105 @@ fn a_band_between_parallel_slanted_cuts_meshes_along_its_own_rails() {
     band_meshes_along_its_rails(&parallel_slanted_band());
 }
 
-fn band_meshes_along_its_rails(body: &str) {
+/// The quarter of the radius-2 cylinder about +Z between two cut planes
+/// z = c0 + k0 x (bottom) and z = c1 + k1 x (top): each end is the ellipse
+/// where its plane meets the cylinder. Bottom arc A(2,0,c0+2k0)-B(0,2,c0),
+/// rail B-C(0,2,c1), top arc C-D(2,0,c1+2k1), rail D-A.
+fn band_between_cuts(c0: f64, k0: f64, c1: f64, k1: f64) -> String {
+    let ellipse = |id: u32, place: u32, centre: u32, c: f64, k: f64| {
+        let s = (1.0 + k * k).sqrt();
+        format!(
+            "#{centre}=CARTESIAN_POINT('',(0.,0.,{c:.17}));
+#{n}=DIRECTION('',({nx:.17},0.,{nz:.17}));
+#{x}=DIRECTION('',({xx:.17},0.,{xz:.17}));
+#{place}=AXIS2_PLACEMENT_3D('',#{centre},#{n},#{x});
+#{id}=ELLIPSE('',#{place},{a:.17},2.);
+",
+            n = place + 1,
+            x = place + 2,
+            nx = -k / s,
+            nz = 1.0 / s,
+            xx = 1.0 / s,
+            xz = k / s,
+            a = 2.0 * s
+        )
+    };
+    format!(
+        "#1=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#3=DIRECTION('',(1.,0.,0.));
+#4=AXIS2_PLACEMENT_3D('',#1,#2,#3);
+#5=CYLINDRICAL_SURFACE('',#4,2.);
+#11=CARTESIAN_POINT('',(2.,0.,{za:.17}));
+#12=CARTESIAN_POINT('',(0.,2.,{c0:.17}));
+#13=CARTESIAN_POINT('',(0.,2.,{c1:.17}));
+#14=CARTESIAN_POINT('',(2.,0.,{zd:.17}));
+#21=VERTEX_POINT('',#11);
+#22=VERTEX_POINT('',#12);
+#23=VERTEX_POINT('',#13);
+#24=VERTEX_POINT('',#14);
+{bottom}{top}#33=VECTOR('',#2,1.);
+#34=LINE('',#12,#33);
+#35=LINE('',#11,#33);
+#51=EDGE_CURVE('',#21,#22,#31,.T.);
+#52=EDGE_CURVE('',#22,#23,#34,.T.);
+#53=EDGE_CURVE('',#24,#23,#32,.T.);
+#54=EDGE_CURVE('',#21,#24,#35,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#62=ORIENTED_EDGE('',*,*,#52,.T.);
+#63=ORIENTED_EDGE('',*,*,#53,.F.);
+#64=ORIENTED_EDGE('',*,*,#54,.F.);
+#70=EDGE_LOOP('',(#61,#62,#63,#64));
+#71=FACE_OUTER_BOUND('',#70,.T.);
+#80=ADVANCED_FACE('',(#71),#5,.T.);
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));",
+        za = c0 + 2.0 * k0,
+        zd = c1 + 2.0 * k1,
+        bottom = ellipse(31, 100, 110, c0, k0),
+        top = ellipse(32, 200, 210, c1, k1),
+    )
+}
+
+/// A band whose top is cut by a SHALLOW slanted plane and whose bottom by a
+/// steep one (CADGenBench part 130: a radius-2 quarter band, top arc rising
+/// 0.9 mm over the quarter turn). The two ends carry different sample
+/// counts, so the general triangulator took it; on a cylinder it adds no
+/// interior points along the axis, and it joined samples of the shallow top
+/// arc to each other across the curve -- a facet lying flat across the wall,
+/// 77 degrees off it. Every facet must lie along the wall.
+#[test]
+fn a_band_with_a_shallow_slanted_end_has_every_facet_along_the_wall() {
+    for (c0, k0, c1, k1) in [
+        (0.0, 3.0, 60.0, 0.46),
+        (5.0, 2.8, 60.5, 0.46),
+        (0.0, 0.0, 50.0, 0.3),
+    ] {
+        let mesh = band_meshes_along_its_rails(&band_between_cuts(c0, k0, c1, k1));
+        let mut worst = 0.0_f64;
+        for t in &mesh.triangles {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+            let Ok(n) = (b - a).cross(&(c - a)).normalize() else {
+                continue;
+            };
+            let m = Point3::new(
+                (a.x + b.x + c.x) / 3.0,
+                (a.y + b.y + c.y) / 3.0,
+                (a.z + b.z + c.z) / 3.0,
+            );
+            let radial = geometry_engine::math::Vector3::new(m.x, m.y, 0.0)
+                .normalize()
+                .expect("off the axis");
+            worst = worst.max(n.dot(&radial).abs().clamp(0.0, 1.0).acos().to_degrees());
+        }
+        assert!(
+            worst <= 40.0,
+            "cuts z = {c0} + {k0}x and z = {c1} + {k1}x: a facet lies {worst:.1} degrees off the wall"
+        );
+    }
+}
+
+fn band_meshes_along_its_rails(body: &str) -> TriangleMesh {
     let (model, report) = ExportEngine::new()
         .import_step_content(&envelope(body), "band")
         .expect("imports");
@@ -192,4 +290,5 @@ fn band_meshes_along_its_rails(body: &str) {
         holes, 0,
         "{holes} edge(s) inside the band used by one triangle only"
     );
+    mesh
 }

@@ -8695,9 +8695,41 @@ fn tessellate_cylinder_edge_band_conforming(
     // 11.9 mm from the wrong end), and a nearest-end pairing stitched the band
     // diagonally, leaving both rails unmeshed.
     let a1: Vec<Point3> = arcs[1].1.iter().rev().copied().collect();
-    if a0.len() != a1.len() || a0.len() < 2 {
+    if a0.len() < 2 || a1.len() < 2 {
         return false;
     }
+    // Where each arc sample sits round the axis, as a fraction of the band's
+    // sweep from its first rail (0) to its second (1). Rails are rulings, so
+    // both arcs start and end at the same angles.
+    let Ok(axis) = cyl.axis.normalize() else {
+        return false;
+    };
+    let radial = |p: Point3| {
+        let w = p - cyl.origin;
+        w - axis * w.dot(&axis)
+    };
+    let r_start = radial(a0[0]);
+    let angle = |p: Point3| {
+        let r = radial(p);
+        r_start.cross(&r).dot(&axis).atan2(r_start.dot(&r))
+    };
+    let sweep = angle(a0[a0.len() - 1]);
+    if sweep.abs() < 1e-12 {
+        return false;
+    }
+    // Each arc must turn one way round the axis for the walk below.
+    let fractions = |arc: &[Point3]| -> Option<Vec<f64>> {
+        let f: Vec<f64> = arc.iter().map(|&p| angle(p) / sweep).collect();
+        f.windows(2).all(|w| w[1] > w[0]).then_some(f)
+    };
+    let (f0, f1) = if a0.len() == a1.len() {
+        (Vec::new(), Vec::new())
+    } else {
+        let (Some(f0), Some(f1)) = (fractions(&a0), fractions(&a1)) else {
+            return false;
+        };
+        (f0, f1)
+    };
 
     let orient_sign = face.orientation.sign();
     let row = |mesh: &mut TriangleMesh, ring: &[Point3]| -> Vec<u32> {
@@ -8721,9 +8753,35 @@ fn tessellate_cylinder_edge_band_conforming(
     let r0 = row(mesh, &a0);
     let r1 = row(mesh, &a1);
     // Open-band stitch (no wraparound — the ruled band is not closed in θ).
-    for i in 0..r0.len() - 1 {
-        emit_outward_triangle(mesh, r0[i], r0[i + 1], r1[i + 1]);
-        emit_outward_triangle(mesh, r0[i], r1[i + 1], r1[i]);
+    if r0.len() == r1.len() {
+        for i in 0..r0.len() - 1 {
+            emit_outward_triangle(mesh, r0[i], r0[i + 1], r1[i + 1]);
+            emit_outward_triangle(mesh, r0[i], r1[i + 1], r1[i]);
+        }
+        return true;
+    }
+    // Different counts: walk both arcs round the axis together, advancing
+    // whichever's next sample comes first, so every triangle spans the band
+    // along the wall's straight rulings. Joining samples of one arc to each
+    // other instead (what the general triangulator did on CADGenBench part
+    // 130, whose top arc rises 0.9 mm over the quarter turn) cuts a facet
+    // flat across the curve, 77 degrees off the wall.
+    let (mut i, mut j) = (0usize, 0usize);
+    while i + 1 < r0.len() || j + 1 < r1.len() {
+        let advance0 = if i + 1 >= r0.len() {
+            false
+        } else if j + 1 >= r1.len() {
+            true
+        } else {
+            f0[i + 1] <= f1[j + 1]
+        };
+        if advance0 {
+            emit_outward_triangle(mesh, r0[i], r0[i + 1], r1[j]);
+            i += 1;
+        } else {
+            emit_outward_triangle(mesh, r0[i], r1[j + 1], r1[j]);
+            j += 1;
+        }
     }
     true
 }
