@@ -8651,9 +8651,11 @@ fn tessellate_cylinder_edge_band_conforming(
         Some(l) => l,
         None => return false,
     };
-    let mut arcs: Vec<std::sync::Arc<Vec<Point3>>> = Vec::new();
+    // Each edge's samples as the loop walks it, and the loop positions of the
+    // arcs (more than two samples) and of the straight rails.
+    let mut arcs: Vec<(usize, Vec<Point3>)> = Vec::new();
     let mut straight = 0usize;
-    for &eid in &outer.edges {
+    for (k, &eid) in outer.edges.iter().enumerate() {
         let e = match model.edges.get(eid) {
             Some(e) => e,
             None => return false,
@@ -8665,7 +8667,11 @@ fn tessellate_cylinder_edge_band_conforming(
         }
         let s = cache.get_or_compute(eid, model);
         if s.len() > 2 {
-            arcs.push(s);
+            let mut walked: Vec<Point3> = (*s).clone();
+            if !outer.orientations.get(k).copied().unwrap_or(true) {
+                walked.reverse();
+            }
+            arcs.push((k, walked));
         } else {
             straight += 1;
         }
@@ -8674,22 +8680,23 @@ fn tessellate_cylinder_edge_band_conforming(
     // rulings ARE the rails, so a rail split into several edges (other faces
     // meeting it part-way) would lose its split vertices and leave a
     // T-junction against those faces. Such a band goes to curved-CDT, which
-    // keeps every boundary sample.
-    if arcs.len() != 2 || straight != 2 {
+    // keeps every boundary sample. The arcs must be opposite (arc, rail, arc,
+    // rail round the loop) so each rail joins one end of each arc.
+    if arcs.len() != 2 || straight != 2 || arcs[1].0 != arcs[0].0 + 2 {
         return false;
     }
-    let a0: Vec<Point3> = (*arcs[0]).clone();
-    let mut a1: Vec<Point3> = (*arcs[1]).clone();
+    let a0: Vec<Point3> = arcs[0].1.clone();
+    // The loop walks arc 0, a rail, arc 1, the other rail: arc 0's end joins
+    // arc 1's start and arc 1's end joins arc 0's start. So arc 1 read
+    // backwards pairs sample for sample with arc 0. The pairing comes from the
+    // loop, never from which ends are nearest: on a band cut by slanted planes
+    // a corner can be nearer the far end of the other arc than the end its
+    // rail runs to (CADGenBench part 108: rails 6.6 and 17.0 mm long, corner
+    // 11.9 mm from the wrong end), and a nearest-end pairing stitched the band
+    // diagonally, leaving both rails unmeshed.
+    let a1: Vec<Point3> = arcs[1].1.iter().rev().copied().collect();
     if a0.len() != a1.len() || a0.len() < 2 {
         return false;
-    }
-    // Align a1 to a0's parametric direction: the two arcs sit at opposite axial
-    // ends and are walked in opposite θ senses by the closed loop, so a0[0] pairs
-    // with whichever a1 endpoint the (short) rail connects it to.
-    let d_fwd = a0[0].distance(&a1[0]);
-    let d_rev = a0[0].distance(&a1[a1.len() - 1]);
-    if d_rev < d_fwd {
-        a1.reverse();
     }
 
     let orient_sign = face.orientation.sign();

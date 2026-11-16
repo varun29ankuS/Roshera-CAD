@@ -77,10 +77,72 @@ fn slanted_band() -> String {
     )
 }
 
+/// The same quarter cylinder between two PARALLEL slanted planes, z = 3x and
+/// z = 3x + 10: both ends are the same ellipse, so they carry the same number
+/// of samples (as on CADGenBench part 108, 57 and 57) and the band stitcher
+/// takes the face. Bottom arc A(2,0,6)-B(0,2,0), rail B-C(0,2,10), top arc
+/// C-D(2,0,16), rail D-A. Both rails are 10 long, but A is only 4.9 from C:
+/// pairing the ends by distance joins A to C, across the band.
+fn parallel_slanted_band() -> String {
+    let r10 = 10f64.sqrt();
+    format!(
+        "#1=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#3=DIRECTION('',(1.,0.,0.));
+#4=AXIS2_PLACEMENT_3D('',#1,#2,#3);
+#5=CYLINDRICAL_SURFACE('',#4,2.);
+#11=CARTESIAN_POINT('',(2.,0.,6.));
+#12=CARTESIAN_POINT('',(0.,2.,0.));
+#13=CARTESIAN_POINT('',(0.,2.,10.));
+#14=CARTESIAN_POINT('',(2.,0.,16.));
+#21=VERTEX_POINT('',#11);
+#22=VERTEX_POINT('',#12);
+#23=VERTEX_POINT('',#13);
+#24=VERTEX_POINT('',#14);
+#41=DIRECTION('',({nx:.17},0.,{nz:.17}));
+#42=DIRECTION('',({xx:.17},0.,{xz:.17}));
+#44=AXIS2_PLACEMENT_3D('',#1,#41,#42);
+#31=ELLIPSE('',#44,{a:.17},2.);
+#40=CARTESIAN_POINT('',(0.,0.,10.));
+#43=AXIS2_PLACEMENT_3D('',#40,#41,#42);
+#32=ELLIPSE('',#43,{a:.17},2.);
+#33=VECTOR('',#2,1.);
+#34=LINE('',#12,#33);
+#35=LINE('',#11,#33);
+#51=EDGE_CURVE('',#21,#22,#31,.T.);
+#52=EDGE_CURVE('',#22,#23,#34,.T.);
+#53=EDGE_CURVE('',#24,#23,#32,.T.);
+#54=EDGE_CURVE('',#21,#24,#35,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#62=ORIENTED_EDGE('',*,*,#52,.T.);
+#63=ORIENTED_EDGE('',*,*,#53,.F.);
+#64=ORIENTED_EDGE('',*,*,#54,.F.);
+#70=EDGE_LOOP('',(#61,#62,#63,#64));
+#71=FACE_OUTER_BOUND('',#70,.T.);
+#80=ADVANCED_FACE('',(#71),#5,.T.);
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));",
+        nx = -3.0 / r10,
+        nz = 1.0 / r10,
+        xx = 1.0 / r10,
+        xz = 3.0 / r10,
+        a = 2.0 * r10
+    )
+}
+
 #[test]
 fn a_slanted_fillet_band_meshes_along_its_own_rails() {
+    band_meshes_along_its_rails(&slanted_band());
+}
+
+#[test]
+fn a_band_between_parallel_slanted_cuts_meshes_along_its_own_rails() {
+    band_meshes_along_its_rails(&parallel_slanted_band());
+}
+
+fn band_meshes_along_its_rails(body: &str) {
     let (model, report) = ExportEngine::new()
-        .import_step_content(&envelope(&slanted_band()), "band")
+        .import_step_content(&envelope(body), "band")
         .expect("imports");
     let faces: Vec<_> = model.faces.iter().collect();
     assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
