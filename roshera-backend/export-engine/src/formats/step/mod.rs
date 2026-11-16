@@ -638,8 +638,13 @@ const EDGE_REBUILD_TARGET: f64 = 1e-6;
 /// Golden-section steps per sample across the edge.
 const EDGE_REBUILD_ITERATIONS: usize = 120;
 
+/// A closest approach found within this fraction of [`EDGE_REBUILD_CAP`] of
+/// the search's bound is taken as the bound itself: no minimum in reach.
+const EDGE_REBUILD_BOUND_FRACTION: f64 = 0.99;
+
 /// A rebuilt edge is kept only if its gap is at most this fraction of the
-/// file curve's.
+/// file curve's (or, for an edge beyond [`EDGE_GAP_REPAIR_CAP`], if it
+/// brings the edge within it).
 const EDGE_REBUILD_MIN_GAIN: f64 = 0.1;
 
 /// Rebuild every edge whose 3D curve lies off one of its two faces ON the
@@ -753,6 +758,13 @@ fn rebuild_edges_onto_face_intersections(
             let samples = sample(n)?;
             let mut on_both = Vec::with_capacity(n);
             for (i, &p) in samples.iter().enumerate() {
+                // The ends become the edge's vertices below; nothing to walk
+                // (and at a pole or apex there is no step across to take:
+                // CADGenBench part 205).
+                if i == 0 || i + 1 == samples.len() {
+                    on_both.push(p);
+                    continue;
+                }
                 // Walk ACROSS the edge on the surface the file's curve lies
                 // nearer (its "home" face) to the point that comes closest to
                 // the other face. Where the faces cross that point is on
@@ -807,7 +819,17 @@ fn rebuild_edges_onto_face_intersections(
                         break;
                     }
                 }
-                let q = on_home(0.5 * (lo + hi))?;
+                // A minimum AT the search bound is not a closest approach: the
+                // faces run alongside each other without meeting within reach
+                // (CADGenBench part 229: two faces 3e-3 mm apart, the gap
+                // shrinking by a tenth over the whole 0.1 mm walk). The edge
+                // is then the foot on its home face, and their separation
+                // becomes its tolerance.
+                let mut s_best = 0.5 * (lo + hi);
+                if s_best.abs() >= EDGE_REBUILD_BOUND_FRACTION * EDGE_REBUILD_CAP {
+                    s_best = 0.0;
+                }
+                let q = on_home(s_best)?;
                 if (q - p).magnitude() > EDGE_REBUILD_CAP {
                     return None;
                 }
@@ -878,7 +900,10 @@ fn rebuild_edges_onto_face_intersections(
         // file's curve: on a tangent contact the rebuilt edge need not be
         // exact, but it must be a real improvement, and within the repair
         // cap (its tolerance is what it reached).
-        if !(after <= before * EDGE_REBUILD_MIN_GAIN && after <= EDGE_GAP_REPAIR_CAP) {
+        // An edge beyond the repair cap refuses the part, so any rebuild that
+        // brings it within the cap is kept.
+        let gain = after <= before * EDGE_REBUILD_MIN_GAIN || before > EDGE_GAP_REPAIR_CAP;
+        if !(gain && after <= EDGE_GAP_REPAIR_CAP) {
             continue;
         }
         let curve_id = model.curves.add(Box::new(curve));
