@@ -12,7 +12,7 @@
 //! Only entities reachable from a solid are copied; orphan geometry the
 //! importer left behind (templates, dangling sub-records) is intentionally
 //! dropped. The function returns the target solid ids of the merged
-//! solids in source order, so the caller can register UUIDs / broadcast
+//! solids in splice (persistent-id) order, so the caller can register UUIDs / broadcast
 //! them.
 
 use std::collections::HashMap;
@@ -41,7 +41,8 @@ struct Remap {
 }
 
 /// Merge every solid of `src` into `dst`, returning the new (target)
-/// solid ids in source order.
+/// solid ids in splice order — persistent-id order (see the body), so one
+/// file always splices the same way.
 ///
 /// Identity travels with the geometry: each merged solid keeps its source
 /// provenance, and its solid and face [`PersistentId`]s are carried over, so
@@ -54,7 +55,18 @@ struct Remap {
 pub fn merge_solids_into(dst: &mut BRepModel, src: &BRepModel) -> Vec<SolidId> {
     let mut remap = Remap::default();
     let mut out = Vec::new();
-    let solid_ids: Vec<SolidId> = src.solids.iter().map(|(id, _)| id).collect();
+    let mut solid_ids: Vec<SolidId> = src.solids.iter().map(|(id, _)| id).collect();
+    // Splice in persistent-id order, not in the order the importer happened
+    // to build the solids: that order is not stable from one import of a
+    // file to the next (measured: a two-part file's parts swapped kernel ids
+    // across imports), while the PIDs derive from the file's content. So the
+    // same file always lands with the same solid, face and edge ids — which
+    // is what lets a document's history re-import it and get the same parts
+    // back. Solids without a PID keep their relative order, after the rest.
+    solid_ids.sort_by_key(|&sid| match src.solid_pid(sid) {
+        Some(pid) => (0u8, pid.as_u128()),
+        None => (1u8, 0),
+    });
     for sid in solid_ids {
         if let Some(new_sid) = merge_one_solid(dst, src, sid, &mut remap, None) {
             carry_identity(dst, src, sid, new_sid, &remap.faces);

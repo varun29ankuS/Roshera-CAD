@@ -368,6 +368,26 @@ pub fn certify_rebuild_with_frames(
     (model, cert)
 }
 
+/// [`certify_rebuild_with_frames`] plus the replay's recorded → live id remap.
+///
+/// The returned model IS what [`crate::frames::FrameCache::replay`] (and so
+/// [`crate::replay::rebuild_model_from_events`]) builds from `events` — the
+/// certificate is computed on it, read-only — so a caller that certifies a
+/// history and then needs that same history's model (a document open) can
+/// install this one instead of replaying the history a second time. The
+/// remap is what re-keys the side channels (colours, profiles) onto it.
+pub fn certify_rebuild_with_frames_and_remap(
+    events: &[TimelineEvent],
+    target_sequence: Option<u64>,
+    frames: &crate::frames::FrameCache,
+) -> (BRepModel, RebuildCertificate, HashMap<u64, u64>) {
+    let (model, outcome, per_event, drawings) = replay_with_report_frames(events, frames);
+    let id_remap = outcome.id_remap.clone();
+    let (model, cert, _drawings) =
+        build_certificate(events, target_sequence, model, outcome, per_event, drawings);
+    (model, cert, id_remap)
+}
+
 /// [`replay_with_report`] through `frames`. The whole history is replayed in
 /// the frames slice -- the same slice the live reconcile replays, so it finds
 /// these frames stored -- and every event gets exactly the verdict the full

@@ -62,11 +62,18 @@ mod geometry_routes_coverage_tests;
 mod goose_acp;
 mod handlers;
 mod idempotency;
+mod import_blobs;
+#[cfg(test)]
+mod import_durability_tests;
+#[cfg(test)]
+mod import_perf_probe_tests;
 #[cfg(test)]
 mod intent_required_mode_tests;
 mod kernel_state;
 mod lens_routes;
 mod metrics;
+#[cfg(test)]
+mod open_snapshot_tests;
 mod part_mgr;
 mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transport)
 mod reconcile_task;
@@ -5701,8 +5708,10 @@ async fn import_step_geometry(
     let path_field = payload.get("path").and_then(|v| v.as_str());
     let content_field = payload.get("content").and_then(|v| v.as_str());
 
-    let content: String = if let Some(c) = content_field {
-        c.to_string()
+    // `raw` is the file's exact bytes — what the document stores and what a
+    // replay of this import re-reads; `content` is their decoded text.
+    let (content, raw): (String, Vec<u8>) = if let Some(c) = content_field {
+        (c.to_string(), c.as_bytes().to_vec())
     } else if let Some(p) = path_field {
         let metadata = tokio::fs::metadata(p).await.map_err(|e| {
             ApiError::new(
@@ -5734,7 +5743,10 @@ async fn import_step_geometry(
                 format!("failed to read STEP file at {p:?}: {e}"),
             )
         })?;
-        export_engine::formats::step::parser::decode_step_bytes(bytes)
+        (
+            export_engine::formats::step::parser::decode_step_bytes(bytes.clone()),
+            bytes,
+        )
     } else {
         return Err(ApiError::missing_field(
             "content or path (STEP file text or a server-readable file location)",
@@ -5766,10 +5778,11 @@ async fn import_step_geometry(
     // not an async worker. A request dropped here lands nothing: the model
     // is untouched until the splice below.
     let engine = state.export_engine.clone();
+    let import_label = source_label.clone();
     let (imported, mut report) = tokio::task::spawn_blocking(move || {
         // Certified ONCE, below, in the document the parts land in --
         // not here as well (that ran every check twice).
-        engine.import_step_content_uncertified(&content, &source_label)
+        engine.import_step_content_uncertified(&content, &import_label)
     })
     .await
     .map_err(|e| ApiError::new(ErrorCode::Internal, format!("STEP import task failed: {e}")))?
@@ -5790,13 +5803,27 @@ async fn import_step_geometry(
         ));
     }
 
+    // The file's exact bytes go into the document's store BEFORE the model
+    // is touched: the history names them, and replaying it re-imports from
+    // them. A store that cannot keep them refuses the import.
+    let stored = import_blobs::store(
+        &state,
+        import_blobs::ImportFormat::Step,
+        raw,
+        &source_label,
+        base_name.as_deref(),
+    )
+    .await?;
+
     // Splice the reconstructed solids into the live session model
-    // (remapping ids so they don't collide with existing parts), then
-    // register + broadcast each one exactly like a primitive create.
+    // (remapping ids so they don't collide with existing parts), record the
+    // import step, then register + broadcast each one exactly like a
+    // primitive create.
     let (objects, certificates) = splice_imported_model(
         &state,
         &model_handle,
         imported,
+        stored,
         base_name,
         "import_step",
         "step_import",
@@ -5830,16 +5857,31 @@ async fn splice_imported_model(
     state: &AppState,
     model_handle: &reconcile_task::ModelHandle,
     imported: geometry_engine::primitives::topology_builder::BRepModel,
+    stored: import_blobs::StoredImport,
     base_name: Option<String>,
     object_type: &'static str,
     source: &'static str,
 ) -> Result<(Vec<serde_json::Value>, ImportCertificates), error_catalog::ApiError> {
     let state = state.clone();
     let model_handle = model_handle.clone();
-    tokio::spawn(async move {
+    // The request's bound document (`X-Roshera-Document`) is a task-local of
+    // the REQUEST task; it does not cross `tokio::spawn`. Carried into the
+    // detached task so the import step and its `set_name` steps persist under
+    // the same document `import_blobs::store` kept the file's bytes under —
+    // otherwise the step would land in the ambient document, the blob in the
+    // bound one, and the next open of either would refuse the import.
+    let bound_document = timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE
+        .try_with(Clone::clone)
+        .ok();
+    let splice = async move {
         let new_solid_ids: Vec<u32> = {
             let mut model = model_handle.write().await;
-            export_engine::formats::step::merge_solids_into(&mut model, &imported)
+            let ids = export_engine::formats::step::merge_solids_into(&mut model, &imported);
+            // The import step, under the same lock as the merge so no other
+            // operation's event can land between the parts and their step,
+            // and before the `set_name` steps that name them.
+            import_blobs::record(&state, &stored, &model, &ids);
+            ids
         };
         register_imported_solids(
             &state,
@@ -5850,6 +5892,16 @@ async fn splice_imported_model(
             source,
         )
         .await
+    };
+    tokio::spawn(async move {
+        match bound_document {
+            Some(document) => {
+                timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE
+                    .scope(document, splice)
+                    .await
+            }
+            None => splice.await,
+        }
     })
     .await
     .map_err(|e| {
@@ -5892,8 +5944,6 @@ async fn register_imported_solids(
     object_type: &str,
     source: &str,
 ) -> (Vec<serde_json::Value>, ImportCertificates) {
-    use geometry_engine::tessellation::{tessellate_solids, TessellationParams};
-
     // Read once for the whole splice — the document's durability status
     // cannot change mid-request.
     let durability = durability::disclosure(state).await;
@@ -5930,44 +5980,81 @@ async fn register_imported_solids(
         record_set_name(state, *solid_id, name);
     }
 
-    // The heavy half — volumes, one batch certificate, display meshes, the
-    // perception blocks — on the blocking pool under ONE write lock.
+    // The heavy half — volumes, one batch certificate, display meshes — on
+    // the blocking pool, under a READ lock wherever the kernel allows, so the
+    // scene, the parts list and drawings keep reading while a large import
+    // certifies (one write lock for all of it froze the app for minutes).
+    // Only the installs take the write lock, briefly:
+    //   1. read:  measure mass properties (the measuring half of
+    //             `calculate_solid_volumes`);
+    //   2. write: install them — a mutable touch that clears a certificate,
+    //             so it comes BEFORE certifying — then DOWNGRADE to read
+    //             atomically (no writer can land between install and certify);
+    //   3. read:  certify the batch (`certify_solids_shared`, the same single
+    //             computation as `certify_solids`) and tessellate, seeding each
+    //             part's cached display mesh;
+    //   4. write: the perception blocks, from those caches (cache hits; a part
+    //             another request changed in between is simply recomputed).
+    // A measurement or mesh of a part touched in between is dropped by its
+    // mutation epoch, never installed as the part's own. Results are the ones
+    // the single-lock version produced: same certificates, meshes and ids.
     let ids: Vec<u32> = named.iter().map(|(id, ..)| *id).collect();
-    let mut guard = model_handle.clone().write_owned().await;
     let heavy_state = state.clone();
     let heavy_handle = model_handle.clone();
     let heavy_durability = durability.clone();
-    let heavy = tokio::task::spawn_blocking(move || {
-        let model = &mut *guard;
-        // Mass properties first: installing that cache is a mutable touch
-        // that would clear a certificate computed before it. One batch on
-        // a bounded pool, not one part at a time (IMP-2).
-        model.calculate_solid_volumes(&ids);
-        let certs = model.certify_solids(&ids);
-        let certified: Vec<u32> = certs.iter().map(|(id, _)| *id).collect();
-        let mut meshes: std::collections::HashMap<u32, _> =
-            tessellate_solids(model, &certified, &TessellationParams::default())
-                .into_iter()
-                .collect();
-        let mut out = Vec::with_capacity(certs.len());
-        for (id, cert) in certs {
-            let Some(tri_mesh) = meshes.remove(&id) else {
-                continue;
+    let heavy = async {
+        let read = model_handle.clone().read_owned().await;
+        let measure_ids = ids.clone();
+        let measured =
+            tokio::task::spawn_blocking(move || read.measure_solid_volumes(&measure_ids)).await?;
+
+        let mut write = model_handle.clone().write_owned().await;
+        write.install_measured_volumes(measured);
+        let read = write.downgrade();
+        let cert_ids = ids.clone();
+        let (shared_certs, meshes) = tokio::task::spawn_blocking(move || {
+            let model = &*read;
+            let certs = model.certify_solids_shared(&cert_ids);
+            let meshes = display_meshes(model, &cert_ids);
+            (certs, meshes)
+        })
+        .await?;
+        // `None`: the model carries labels, whose consistency check needs
+        // `&mut` — certified under the write lock below instead.
+        let labelled = shared_certs.is_none();
+
+        let mut guard = model_handle.clone().write_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let model = &mut *guard;
+            // Cache hits for every part certified above; the authoritative
+            // read of each verdict under the lock the response is built in.
+            let certs = model.certify_solids(&ids);
+            let mut meshes = if labelled {
+                display_meshes(model, &ids)
+            } else {
+                meshes
             };
-            let perception = certified_response_given(
-                model,
-                &heavy_handle,
-                &heavy_state,
-                id,
-                &tri_mesh,
-                true,
-                heavy_durability.clone(),
-                Some(cert.brep_valid),
-            );
-            out.push((id, tri_mesh, perception, cert));
-        }
-        out
-    })
+            let mut out = Vec::with_capacity(certs.len());
+            for (id, cert) in certs {
+                let Some(tri_mesh) = meshes.remove(&id) else {
+                    continue;
+                };
+                let perception = certified_response_given(
+                    model,
+                    &heavy_handle,
+                    &heavy_state,
+                    id,
+                    &tri_mesh,
+                    true,
+                    heavy_durability.clone(),
+                    Some(cert.brep_valid),
+                );
+                out.push((id, tri_mesh, perception, cert));
+            }
+            out
+        })
+        .await
+    }
     .await;
     let heavy = match heavy {
         Ok(heavy) => heavy,
@@ -6060,6 +6147,18 @@ pub(crate) async fn read_ros_import_request(
     state: &AppState,
     payload: &serde_json::Value,
 ) -> Result<export_engine::formats::ros::RosImport, error_catalog::ApiError> {
+    read_ros_import_request_with_bytes(state, payload)
+        .await
+        .map(|(ros, _bytes, _label)| ros)
+}
+
+/// [`read_ros_import_request`] plus the file's exact bytes and the name it
+/// was read under — what the geometry-splice route stores with the document
+/// so the import step can be replayed.
+pub(crate) async fn read_ros_import_request_with_bytes(
+    state: &AppState,
+    payload: &serde_json::Value,
+) -> Result<(export_engine::formats::ros::RosImport, Vec<u8>, String), error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
 
     // Same sanity ceiling as the STEP route: generous for any real .ros
@@ -6068,6 +6167,28 @@ pub(crate) async fn read_ros_import_request(
     const MAX_ROS_FILE_BYTES: u64 = 512 * 1024 * 1024; // 512MB
 
     let password = payload.get("password").and_then(|v| v.as_str());
+    // Read the bytes once, then decode them with the same reader the file
+    // routes used (`import_ros_bytes` is `import_ros` minus the file read).
+    let decode = |path: &std::path::Path, bytes: std::io::Result<Vec<u8>>, label: String| {
+        let bytes = bytes.map_err(|_| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    ".ros import failed: Failed to read file: {}",
+                    path.to_string_lossy()
+                ),
+            )
+        })?;
+        let ros = export_engine::formats::ros::import_ros_bytes(bytes.clone(), password).map_err(
+            |e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(".ros import failed: {e}"),
+                )
+            },
+        )?;
+        Ok((ros, bytes, label))
+    };
 
     if let Some(p) = payload.get("path").and_then(|v| v.as_str()) {
         let metadata = tokio::fs::metadata(p).await.map_err(|e| {
@@ -6091,14 +6212,12 @@ pub(crate) async fn read_ros_import_request(
                 ),
             ));
         }
-        export_engine::formats::ros::import_ros(std::path::Path::new(p), password)
-            .await
-            .map_err(|e| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!(".ros import failed: {e}"),
-                )
-            })
+        let path = std::path::Path::new(p);
+        let label = path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.to_string());
+        decode(path, tokio::fs::read(path).await, label)
     } else if let Some(f) = payload.get("filename").and_then(|v| v.as_str()) {
         // Same traversal guard as `/api/download/{filename}` — the value
         // is resolved inside the export directory, never outside it.
@@ -6111,16 +6230,8 @@ pub(crate) async fn read_ros_import_request(
                 ),
             ));
         }
-        state
-            .export_engine
-            .import_ros(f, password)
-            .await
-            .map_err(|e| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!(".ros import failed: {e}"),
-                )
-            })
+        let path = state.export_engine.output_path(f);
+        decode(&path, tokio::fs::read(&path).await, f.to_string())
     } else {
         Err(ApiError::missing_field(
             "path or filename (a server-readable .ros file location, or a file \
@@ -6192,7 +6303,29 @@ async fn import_ros_geometry(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let ros = read_ros_import_request(&state, &payload).await?;
+    let (ros, raw, source_label) = read_ros_import_request_with_bytes(&state, &payload).await?;
+
+    // An encrypted file cannot be part of a document's history: replaying
+    // the history re-imports the stored bytes, which needs the password, and
+    // the password is never stored. Splicing it anyway would land parts the
+    // next open refuses. Refused here, with the routes that do work.
+    if durability::durability_enabled()
+        && export_engine::formats::ros::ros_bytes_encrypted(&raw).map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(".ros import failed: {e}"),
+            )
+        })?
+    {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "an encrypted .ros file cannot be spliced into a document: the document's \
+             history re-imports the stored file when it is rebuilt, and that needs the \
+             password, which is never stored. Open it as its own document with \
+             POST /api/documents/import_ros, or splice an unencrypted copy."
+                .to_string(),
+        ));
+    }
 
     // What the file's mandatory HIST/PROV chunks carried — surfaced
     // verbatim in the response below so the caller can tell a
@@ -6235,10 +6368,19 @@ async fn import_ros_geometry(
     // BRepModel→BRepModel splice (it lives in `formats::step` because the
     // STEP route grew it first; nothing about it is STEP-specific).
     // Each object's perception already carries its certificate.
+    let stored = import_blobs::store(
+        &state,
+        import_blobs::ImportFormat::Ros,
+        raw,
+        &source_label,
+        base_name.as_deref(),
+    )
+    .await?;
     let (objects, _certificates) = splice_imported_model(
         &state,
         &model_handle,
         imported,
+        stored,
         base_name,
         "import_ros",
         "ros_import",
@@ -7752,6 +7894,48 @@ async fn scene_snapshot(
     }
 }
 
+/// Display meshes (DEFAULT tessellation parameters — what the snapshot and
+/// the viewport broadcasts carry) for `ids`: each solid's cached mesh where
+/// it still has one, the rest tessellated in one parallel batch and cached on
+/// the solid for the next reader. The cache is cleared by every mutation seam
+/// that clears the solid's certificate (`Solid::invalidate_certificate`), and
+/// a mesh is only stored if the solid was not touched while it was being
+/// built, so a cached mesh is always the mesh of the solid as it stands.
+/// Ids not in the model are skipped.
+pub(crate) fn display_meshes(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    ids: &[u32],
+) -> HashMap<u32, Arc<geometry_engine::tessellation::TriangleMesh>> {
+    use geometry_engine::tessellation::{tessellate_solids, TessellationParams};
+    let mut out = HashMap::with_capacity(ids.len());
+    let mut cold: Vec<u32> = Vec::new();
+    let mut epochs: HashMap<u32, u64> = HashMap::new();
+    for &id in ids {
+        let Some(solid) = model.solids.get(id) else {
+            continue;
+        };
+        match solid.cached_display_mesh() {
+            Some(mesh) => {
+                out.insert(id, mesh);
+            }
+            None => {
+                epochs.insert(id, solid.mutation_epoch());
+                cold.push(id);
+            }
+        }
+    }
+    if !cold.is_empty() {
+        for (id, mesh) in tessellate_solids(model, &cold, &TessellationParams::default()) {
+            let mesh = Arc::new(mesh);
+            if let (Some(solid), Some(&epoch)) = (model.solids.get(id), epochs.get(&id)) {
+                solid.store_display_mesh(Arc::clone(&mesh), epoch);
+            }
+            out.insert(id, mesh);
+        }
+    }
+    out
+}
+
 /// The scene snapshot's body: every registered part with its mesh, placement,
 /// verdict and colour, plus the imported uses that built no solid.
 fn scene_snapshot_body(
@@ -7759,8 +7943,6 @@ fn scene_snapshot_body(
     local_to_uuid: &DashMap<u32, uuid::Uuid>,
     solid_colors: &DashMap<u32, [u8; 3]>,
 ) -> serde_json::Value {
-    use geometry_engine::tessellation::{tessellate_solids, TessellationParams};
-
     let registered: Vec<(u32, uuid::Uuid)> = model
         .solids
         .iter()
@@ -7771,10 +7953,9 @@ fn scene_snapshot_body(
         })
         .collect();
     let ids: Vec<u32> = registered.iter().map(|(id, _)| *id).collect();
-    let mut meshes: std::collections::HashMap<u32, _> =
-        tessellate_solids(model, &ids, &TessellationParams::default())
-            .into_iter()
-            .collect();
+    // Each part's cached display mesh; only parts that changed since their
+    // last one (or never had one) are tessellated, and their meshes cached.
+    let mut meshes = display_meshes(model, &ids);
     let mut objects: Vec<serde_json::Value> = Vec::with_capacity(registered.len());
 
     for (solid_id, uuid) in registered {
@@ -10306,6 +10487,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize export engine
     let export_engine = Arc::new(export_engine::ExportEngine::new());
+    // Import steps in a document's history replay by re-importing their
+    // stored files; this process is the one that holds the store.
+    import_blobs::install();
 
     // Initialize full integration executor (needs timeline and export engine)
     let full_integration_executor = Arc::new(FullIntegrationExecutor::new(

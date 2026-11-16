@@ -1020,6 +1020,27 @@ pub async fn import_ros(
     password: Option<&str>,
 ) -> Result<RosImport, shared_types::ExportError> {
     let buffer = read_file_bytes(path).await?;
+    import_ros_bytes(buffer, password)
+}
+
+/// Does this `.ros` file's header say its chunks are encrypted? Reads only the
+/// header (CRC-checked); no password, no chunk is decoded.
+pub fn ros_bytes_encrypted(bytes: &[u8]) -> Result<bool, shared_types::ExportError> {
+    let mut cursor = Cursor::new(bytes);
+    let header =
+        ros_format::FileHeader::read_from(&mut cursor).map_err(|e| ExportError::ExportFailed {
+            reason: format!("Failed to read header: {}", e),
+        })?;
+    Ok(header.feature_flags.encrypted())
+}
+
+/// [`import_ros`] over a file's bytes already in memory — the same audit and
+/// decode, no file I/O. A document stores an imported `.ros` file's exact
+/// bytes and re-imports through this when its history replays.
+pub fn import_ros_bytes(
+    buffer: Vec<u8>,
+    password: Option<&str>,
+) -> Result<RosImport, shared_types::ExportError> {
     let RosAudited {
         mut cursor,
         header,

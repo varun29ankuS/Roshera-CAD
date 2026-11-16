@@ -15,7 +15,7 @@
 //!    mappings, branches, and the drawing registry are restored.
 //!
 //! Honesty contract (spec §5): a booted model is *proven*, not assumed. Boot
-//! runs `certify_rebuild` (soundness re-measured from the rebuilt B-Rep) and,
+//! runs `certify_rebuild_with_frames` (soundness re-measured from the rebuilt B-Rep) and,
 //! if the log contains an event the current kernel cannot faithfully replay
 //! (an unknown kind, a sweep/loft, a corrupt row), the affected document is
 //! **quarantined**: the clean prefix up to the first break is served, the
@@ -31,8 +31,8 @@ use std::sync::Arc;
 use serde::Serialize;
 use session_manager::{BranchRecord, DatabasePersistence, TimelineEventData};
 use timeline_engine::{
-    certify_rebuild, rebuild_model_from_events, recorded_solid_outputs, Author, Branch, BranchId,
-    BranchState, EventSink, Operation, RedoTailDiscard, TimelineEvent,
+    recorded_solid_outputs, Author, Branch, BranchId, BranchState, EventSink, Operation,
+    RedoTailDiscard, TimelineEvent,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -511,7 +511,7 @@ pub(crate) async fn persist_appended(
 /// sends no binding header, and the WS branch-create path which has no
 /// request task at all) → the process-global `active_document`, byte-for-byte
 /// the previous behaviour.
-async fn write_document(state: &AppState) -> String {
+pub(crate) async fn write_document(state: &AppState) -> String {
     match timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE.try_with(Clone::clone) {
         Ok(bound) => bound,
         Err(_) => state.active_document.read().await.clone(),
@@ -1102,6 +1102,13 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         }
     }
 
+    // 3b. Imported files: every import step re-imports its stored bytes when
+    //     it replays, and replay is synchronous — so the bytes of every
+    //     import step on any branch are read from this document's store now.
+    //     A blob the store does not hold makes that step refuse (typed), it
+    //     is never skipped.
+    crate::import_blobs::preload(state, &document_id, by_seq.values()).await;
+
     // 4. Every branch's history, by the in-memory rules: the index the fork
     //    left it (persisted, or the fork rule for rows that predate that),
     //    its own events, and the sequences merges inserted into it.
@@ -1122,7 +1129,34 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         .iter()
         .filter_map(|seq| by_seq.get(seq).cloned())
         .collect();
-    let (_probe, cert) = certify_rebuild(&live_events, None);
+    // ONE replay of the live history serves both the certificate and the
+    // live model: the certified model is exactly what `frames.replay` (and
+    // `rebuild_model_from_events`) builds from the same slice, so when the
+    // whole history is served (no break, no undone tail) it is installed as
+    // the live model below instead of replaying the history a second time.
+    // The replay leaves its frames, so a served prefix (quarantine / undone
+    // tail) and the sheet rebuild read them instead of replaying again.
+    // Minutes of CPU on a large document: the blocking pool, not an async
+    // worker.
+    let (probe, cert, probe_remap) = {
+        let frames = Arc::clone(&state.frames);
+        let events = live_events.clone();
+        match tokio::task::spawn_blocking(move || {
+            timeline_engine::rebuild_certificate::certify_rebuild_with_frames_and_remap(
+                &events, None, &frames,
+            )
+        })
+        .await
+        {
+            Ok(certified) => certified,
+            Err(e) => {
+                tracing::error!(target: "durability", error = %e, "durability: history replay task failed");
+                return DurabilityStatus::Failed {
+                    reason: format!("history replay task failed: {e}"),
+                };
+            }
+        }
+    };
     let replay_break = cert
         .first_break()
         .map(|v| (v.sequence, v.kind.clone(), format!("{:?}", v.status)));
@@ -1395,19 +1429,47 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         }
     };
 
-    // 8. Replay the served events into the live model, then rebuild the
-    //    uuid↔solid registry so every restored solid is addressable by uuid.
-    //    `rebuild_model_from_events` detaches/reattaches the recorder for the
-    //    duration, so this replay does not re-record (or re-persist) anything.
-    //    The replay `id_remap` (recorded solid id → live solid id) is kept for
-    //    the Slice-3 side-channel restore below.
+    // 8. Install the served events' model as the live model — the certified
+    //    model when the whole history is served, else the served prefix from
+    //    the frames the certify pass stored — then rebuild the uuid↔solid
+    //    registry so every restored solid is addressable by uuid. Both are
+    //    built with no recorder attached, so nothing is re-recorded (or
+    //    re-persisted). The replay `id_remap` (recorded solid id → live solid
+    //    id) is kept for the Slice-3 side-channel restore below.
+    let whole_history_served = served.len() == live_events.len()
+        && served
+            .iter()
+            .zip(&live_events)
+            .all(|(a, b)| a.sequence_number == b.sequence_number);
+    let (rebuilt, id_remap) = if whole_history_served {
+        (probe, probe_remap)
+    } else {
+        drop(probe);
+        // A prefix of the history the certify pass just replayed: its frame
+        // is stored, so this is a copy, not a replay.
+        let frames = Arc::clone(&state.frames);
+        let events = served.clone();
+        match tokio::task::spawn_blocking(move || frames.replay(&events)).await {
+            Ok((model, outcome, _stats)) => (model, outcome.id_remap),
+            Err(e) => {
+                tracing::error!(target: "durability", error = %e, "durability: served-prefix replay task failed");
+                return DurabilityStatus::Failed {
+                    reason: format!("served-prefix replay task failed: {e}"),
+                };
+            }
+        }
+    };
     let id_remap = {
         let mut model = state.model.write().await;
-        let outcome = rebuild_model_from_events(&mut model, &served);
+        // Install the rebuilt model, keeping whatever recorder the live
+        // model has (a fresh model carries none — without it every later
+        // operation would record and persist nothing).
+        let recorder = model.attach_recorder(None);
+        *model = rebuilt;
+        model.attach_recorder(recorder);
         tracing::info!(
             target: "durability",
-            applied = outcome.events_applied,
-            skipped = outcome.events_skipped,
+            events = served.len(),
             solids = model.solids.len(),
             "durability: geometry replay complete"
         );
@@ -1421,7 +1483,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
             let uuid = Uuid::new_v4();
             state.register_id_mapping(uuid, solid_id);
         }
-        outcome.id_remap
+        id_remap
     };
 
     // 9. DURABILITY Slice 3 (#39, spec §2.3): re-attach the unrecorded-mutation

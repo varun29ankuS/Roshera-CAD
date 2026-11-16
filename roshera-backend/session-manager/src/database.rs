@@ -411,6 +411,34 @@ pub trait DatabasePersistence: Send + Sync {
     /// here, so this method has no opinion about which document it is
     /// asked to delete.
     async fn delete_document(&self, id: &str) -> Result<(), SessionError>;
+
+    // Import blobs: the exact bytes of every file imported into a document,
+    // content-addressed by their sha256 (lowercase hex). An import is recorded
+    // in the timeline as a step that NAMES its blob; replaying the step
+    // re-runs the import from these bytes, so the parts come back exactly.
+    // Keyed by (document, sha256): a document's blobs are removed with it by
+    // `delete_document`. Saving the same (document, sha256) twice is a no-op —
+    // content addressing makes the two byte strings identical.
+    async fn save_import_blob(&self, blob: &ImportBlobRecord) -> Result<(), SessionError>;
+    /// The stored blob `sha256` of document `session_id`, or `None` when that
+    /// document holds no such blob. The caller re-verifies the digest.
+    async fn load_import_blob(
+        &self,
+        session_id: &str,
+        sha256: &str,
+    ) -> Result<Option<ImportBlobRecord>, SessionError>;
+}
+
+/// The exact bytes of one imported file, stored with the document it was
+/// imported into (see [`DatabasePersistence::save_import_blob`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportBlobRecord {
+    pub session_id: String,
+    /// Lowercase-hex sha256 of `bytes` — the address the timeline names.
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+    /// Milliseconds since the Unix epoch.
+    pub created_at: i64,
 }
 
 /// Session metadata
@@ -928,6 +956,25 @@ impl PostgresDatabase {
         .await
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create documents table: {}", e),
+        })?;
+
+        // Import blobs: the exact bytes of each imported file, addressed by
+        // sha256, scoped by document (see `save_import_blob`).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS import_blobs (
+                session_id VARCHAR(255) NOT NULL,
+                sha256 VARCHAR(64) NOT NULL,
+                bytes BYTEA NOT NULL,
+                created_at BIGINT NOT NULL,
+                PRIMARY KEY (session_id, sha256)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create import_blobs table: {}", e),
         })?;
 
         // Durable token revocations (Task 72) — same DDL as SQLite.
@@ -2106,6 +2153,14 @@ impl DatabasePersistence for PostgresDatabase {
                 ),
             })?;
 
+        sqlx::query("DELETE FROM import_blobs WHERE session_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to delete import_blobs for document '{id}': {}", e),
+            })?;
+
         sqlx::query("DELETE FROM documents WHERE id = $1")
             .bind(id)
             .execute(&mut *tx)
@@ -2121,6 +2176,74 @@ impl DatabasePersistence for PostgresDatabase {
             })?;
         Ok(())
     }
+
+    async fn save_import_blob(&self, blob: &ImportBlobRecord) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO import_blobs (session_id, sha256, bytes, created_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (session_id, sha256) DO NOTHING
+            "#,
+        )
+        .bind(&blob.session_id)
+        .bind(&blob.sha256)
+        .bind(&blob.bytes)
+        .bind(blob.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save import blob {}: {}", blob.sha256, e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_import_blob(
+        &self,
+        session_id: &str,
+        sha256: &str,
+    ) -> Result<Option<ImportBlobRecord>, SessionError> {
+        let row = sqlx::query(
+            "SELECT session_id, sha256, bytes, created_at FROM import_blobs \
+             WHERE session_id = $1 AND sha256 = $2",
+        )
+        .bind(session_id)
+        .bind(sha256)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load import blob {sha256}: {}", e),
+        })?;
+        row.map(|r| row_to_import_blob(&r)).transpose()
+    }
+}
+
+/// Decode an `import_blobs` row. Generic over the backend, like
+/// [`row_to_revoked_token`]: an unreadable cell is a typed error, never a
+/// default — a blob read back as something else is an import lost.
+fn row_to_import_blob<R>(row: &R) -> Result<ImportBlobRecord, SessionError>
+where
+    R: Row,
+    for<'r> String: sqlx::Decode<'r, <R as Row>::Database>,
+    String: sqlx::Type<<R as Row>::Database>,
+    for<'r> Vec<u8>: sqlx::Decode<'r, <R as Row>::Database>,
+    Vec<u8>: sqlx::Type<<R as Row>::Database>,
+    for<'r> i64: sqlx::Decode<'r, <R as Row>::Database>,
+    i64: sqlx::Type<<R as Row>::Database>,
+    &'static str: sqlx::ColumnIndex<R>,
+{
+    let unreadable = |field: &str, e: sqlx::Error| SessionError::PersistenceError {
+        reason: format!("Failed to decode import_blobs.{field}: {e}"),
+    };
+    Ok(ImportBlobRecord {
+        session_id: row
+            .try_get("session_id")
+            .map_err(|e| unreadable("session_id", e))?,
+        sha256: row.try_get("sha256").map_err(|e| unreadable("sha256", e))?,
+        bytes: row.try_get("bytes").map_err(|e| unreadable("bytes", e))?,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|e| unreadable("created_at", e))?,
+    })
 }
 
 /// Map a `documents` row into a [`DocumentRecord`] (PostgreSQL).
@@ -2503,6 +2626,24 @@ impl SqliteDatabase {
         .await
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create documents table: {}", e),
+        })?;
+
+        // Import blobs — SQLite twin of the PostgreSQL `import_blobs` table.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS import_blobs (
+                session_id TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                bytes BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (session_id, sha256)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create import_blobs table: {}", e),
         })?;
 
         // Durable token revocations (Task 72) — same DDL as PostgreSQL. The
@@ -3631,6 +3772,14 @@ impl DatabasePersistence for SqliteDatabase {
                 ),
             })?;
 
+        sqlx::query("DELETE FROM import_blobs WHERE session_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to delete import_blobs for document '{id}': {}", e),
+            })?;
+
         sqlx::query("DELETE FROM documents WHERE id = ?1")
             .bind(id)
             .execute(&mut *tx)
@@ -3645,6 +3794,45 @@ impl DatabasePersistence for SqliteDatabase {
                 reason: format!("Failed to commit document delete transaction: {}", e),
             })?;
         Ok(())
+    }
+
+    async fn save_import_blob(&self, blob: &ImportBlobRecord) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO import_blobs (session_id, sha256, bytes, created_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT (session_id, sha256) DO NOTHING
+            "#,
+        )
+        .bind(&blob.session_id)
+        .bind(&blob.sha256)
+        .bind(&blob.bytes)
+        .bind(blob.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save import blob {}: {}", blob.sha256, e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_import_blob(
+        &self,
+        session_id: &str,
+        sha256: &str,
+    ) -> Result<Option<ImportBlobRecord>, SessionError> {
+        let row = sqlx::query(
+            "SELECT session_id, sha256, bytes, created_at FROM import_blobs \
+             WHERE session_id = ?1 AND sha256 = ?2",
+        )
+        .bind(session_id)
+        .bind(sha256)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load import blob {sha256}: {}", e),
+        })?;
+        row.map(|r| row_to_import_blob(&r)).transpose()
     }
 }
 

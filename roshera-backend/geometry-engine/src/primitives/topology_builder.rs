@@ -3567,6 +3567,55 @@ impl BRepModel {
         &mut self,
         solid_ids: &[SolidId],
     ) -> Vec<(SolidId, crate::primitives::provenance::ValidityCertificate)> {
+        // The labels dimension is the only part needing `&mut` (selector
+        // re-runs warm a centroid cache); computed only when some solid
+        // actually needs certifying, exactly as before the split.
+        let any_cold = solid_ids.iter().any(|&id| {
+            self.solids
+                .get(id)
+                .is_some_and(|s| s.cached_certificate().is_none())
+        });
+        let labels = if any_cold {
+            let t = std::time::Instant::now();
+            let labels = self.labels_consistency();
+            if cert_profile_enabled() {
+                eprintln!("[cert-profile] labels: {:?}", t.elapsed());
+            }
+            labels
+        } else {
+            crate::primitives::provenance::LabelsConsistency::NotApplicable
+        };
+        self.certify_solids_given_labels(solid_ids, labels)
+    }
+
+    /// [`Self::certify_solids`] through a SHARED borrow, for a caller that
+    /// holds the model under a read lock (so readers are not blocked while a
+    /// batch of imported parts certifies). The certificates are the ones
+    /// [`Self::certify_solids`] computes — same cache contract, same single
+    /// computation — and are stored the same way (the cache is interior-
+    /// mutable). `None` when the model carries labels: their consistency
+    /// re-runs selectors that need `&mut`, and a certificate with that
+    /// dimension skipped would be a subset passed off as the full verdict.
+    pub fn certify_solids_shared(
+        &self,
+        solid_ids: &[SolidId],
+    ) -> Option<Vec<(SolidId, crate::primitives::provenance::ValidityCertificate)>> {
+        if !self.labels.is_empty() {
+            return None;
+        }
+        Some(self.certify_solids_given_labels(
+            solid_ids,
+            crate::primitives::provenance::LabelsConsistency::NotApplicable,
+        ))
+    }
+
+    /// The one batch-certification body behind [`Self::certify_solids`] and
+    /// [`Self::certify_solids_shared`], given the model's labels verdict.
+    fn certify_solids_given_labels(
+        &self,
+        solid_ids: &[SolidId],
+        labels: crate::primitives::provenance::LabelsConsistency,
+    ) -> Vec<(SolidId, crate::primitives::provenance::ValidityCertificate)> {
         use crate::primitives::validation::{scoped_errors_by_solid, ValidationLevel};
         let present: Vec<SolidId> = solid_ids
             .iter()
@@ -3590,11 +3639,6 @@ impl BRepModel {
             eprintln!("[cert-profile] orphan scan: {:?}", t.elapsed());
         }
         if !cold.is_empty() {
-            let t = std::time::Instant::now();
-            let labels = self.labels_consistency();
-            if prof {
-                eprintln!("[cert-profile] labels: {:?}", t.elapsed());
-            }
             let t = std::time::Instant::now();
             let errors =
                 scoped_errors_by_solid(self, &cold, self.tolerance, ValidationLevel::Standard);
@@ -3664,9 +3708,20 @@ impl BRepModel {
                     cert.model_debris_orphan_faces = debris;
                     out.push((id, cert));
                 }
-                // A cache cleared since the batch pass (a mutable touch while
-                // computing labels) is recomputed alone, never dropped.
-                None => out.push((id, self.certify_solid(id))),
+                // A cache cleared since the batch pass (a funnel invalidation
+                // through a shared borrow) is recomputed alone, never dropped
+                // -- stored and marked verified as `certificate` does.
+                None => {
+                    let computed = self.compute_certificate_with_labels(id, labels);
+                    if let Some(solid) = self.solids.get(id) {
+                        solid.store_certificate(computed.clone());
+                        solid.mark_verified(computed.clone());
+                    }
+                    let mut cert = computed;
+                    cert.model_debris_orphan_faces =
+                        crate::primitives::validation::count_orphan_faces(self);
+                    out.push((id, cert));
+                }
             }
         }
         out
@@ -4810,50 +4865,82 @@ impl BRepModel {
             .copied()
             .filter(|&id| self.solids.get(id).is_some())
             .collect();
-        let cold: Vec<SolidId> = present
-            .iter()
-            .copied()
-            .filter(|&id| {
-                self.solids
-                    .get(id)
-                    .map(|s| s.cached_mass_props_ref().is_none())
-                    .unwrap_or(false)
-            })
-            .collect();
-        let mut measured: std::collections::HashMap<SolidId, Option<f64>> =
-            std::collections::HashMap::with_capacity(cold.len());
-        if !cold.is_empty() {
-            let this: &Self = self;
-            let work = || {
-                use rayon::prelude::*;
-                cold.par_iter()
-                    .map(|&id| (id, this.measure_mass_properties(id)))
-                    .collect::<Vec<_>>()
-            };
-            let threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .clamp(1, MASS_PROPERTIES_BATCH_THREADS);
-            let computed = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
-                Ok(pool) => pool.install(work),
-                Err(_) => work(),
-            };
-            for (id, props) in computed {
-                // Same as the solo call: a refused measurement installs
-                // nothing and reads back `None`.
-                measured.insert(id, props.as_ref().map(|p| p.volume));
-                if let (Some(props), Some(solid)) = (props, self.solids.get_mut(id)) {
-                    solid.install_mass_props_cache(props);
-                }
-            }
-        }
+        let measured = self.measure_solid_volumes(&present);
+        let volumes = self.install_measured_volumes(measured);
         present
             .into_iter()
-            .map(|id| match measured.get(&id) {
+            .map(|id| match volumes.get(&id) {
                 Some(volume) => (id, *volume),
                 None => (id, self.calculate_solid_volume(id)),
             })
             .collect()
+    }
+
+    /// The measuring half of [`Self::calculate_solid_volumes`], through a
+    /// SHARED borrow: the mass properties of every listed solid whose cache is
+    /// empty, measured in parallel on the same bounded pool, each paired with
+    /// the solid's [`Solid::mutation_epoch`](crate::primitives::solid::Solid::mutation_epoch)
+    /// as it was when measuring began. A caller holding the model under a
+    /// read lock measures here, then installs with
+    /// [`Self::install_measured_volumes`] under a short write lock.
+    pub fn measure_solid_volumes(&self, solid_ids: &[SolidId]) -> MeasuredVolumes {
+        let cold: Vec<(SolidId, u64)> = solid_ids
+            .iter()
+            .filter_map(|&id| {
+                let solid = self.solids.get(id)?;
+                solid
+                    .cached_mass_props_ref()
+                    .is_none()
+                    .then(|| (id, solid.mutation_epoch()))
+            })
+            .collect();
+        if cold.is_empty() {
+            return MeasuredVolumes(Vec::new());
+        }
+        let work = || {
+            use rayon::prelude::*;
+            cold.par_iter()
+                .map(|&(id, epoch)| (id, epoch, self.measure_mass_properties(id)))
+                .collect::<Vec<_>>()
+        };
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, MASS_PROPERTIES_BATCH_THREADS);
+        MeasuredVolumes(
+            match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+                Ok(pool) => pool.install(work),
+                Err(_) => work(),
+            },
+        )
+    }
+
+    /// Install what [`Self::measure_solid_volumes`] measured, exactly as the
+    /// solo call installs it — a refused measurement installs nothing and
+    /// reads back `None` — but ONLY for a solid untouched since it was
+    /// measured (same mutation epoch, cache still empty): a measurement of a
+    /// shape the solid no longer has is dropped, never cached as its own.
+    /// Returns the volume of every measurement it installed (or that read back
+    /// `None`). Installing is a mutable touch that clears the solid's cached
+    /// certificate, so certify AFTER installing.
+    pub fn install_measured_volumes(
+        &mut self,
+        measured: MeasuredVolumes,
+    ) -> std::collections::HashMap<SolidId, Option<f64>> {
+        let mut volumes = std::collections::HashMap::with_capacity(measured.0.len());
+        for (id, epoch, props) in measured.0 {
+            let fresh = self.solids.get(id).is_some_and(|s| {
+                s.mutation_epoch() == epoch && s.cached_mass_props_ref().is_none()
+            });
+            if !fresh {
+                continue;
+            }
+            volumes.insert(id, props.as_ref().map(|p| p.volume));
+            if let (Some(props), Some(solid)) = (props, self.solids.get_mut(id)) {
+                solid.install_mass_props_cache(props);
+            }
+        }
+        volumes
     }
 
     /// Attempt an EXACT analytic mass-properties result for an untrimmed
@@ -7863,6 +7950,19 @@ impl<'a> TopologyBuilder<'a> {
 
 /// `ROSHERA_CERT_PROFILE=1` prints how long each certificate step took, per
 /// solid, to stderr. Off by default.
+/// Mass properties measured through a shared borrow by
+/// [`BRepModel::measure_solid_volumes`], waiting to be installed by
+/// [`BRepModel::install_measured_volumes`]. Opaque: only the kernel's own
+/// measurement can be installed as a solid's mass properties.
+#[derive(Debug)]
+pub struct MeasuredVolumes(
+    Vec<(
+        SolidId,
+        u64,
+        Option<crate::primitives::solid::SolidMassProperties>,
+    )>,
+);
+
 fn cert_profile_enabled() -> bool {
     std::env::var_os("ROSHERA_CERT_PROFILE").is_some_and(|v| !v.is_empty())
 }
@@ -7971,11 +8071,12 @@ fn blocking_evidence(
         on_solid(&mut out, "eyes_consistent", Vec::new());
     }
     if !x.tessellation.clean {
-        match &x.tessellation.worst_face {
-            Some(d) => out.push(BlockingEvidence {
+        for d in &x.tessellation.defects {
+            out.push(BlockingEvidence {
                 conjunct: "tessellation".into(),
                 face: Some(d.face_id as u32),
                 measured: vec![
+                    ("off_surface_facets".into(), d.off_surface_facets as f64),
                     ("degenerate_triangles".into(), d.degenerate_triangles as f64),
                     ("normal_agreement".into(), d.normal_agreement),
                     (
@@ -7983,8 +8084,10 @@ fn blocking_evidence(
                         d.analytic_normal_agreement,
                     ),
                 ],
-            }),
-            None => on_solid(&mut out, "tessellation", Vec::new()),
+            });
+        }
+        if x.tessellation.defects.is_empty() {
+            on_solid(&mut out, "tessellation", Vec::new());
         }
     }
     if !x.mesh_quality.clean {

@@ -758,4 +758,17 @@ impl DatabasePersistence for GatedStore {
     async fn delete_document(&self, id: &str) -> Result<(), SessionError> {
         self.inner.delete_document(id).await
     }
+    async fn save_import_blob(
+        &self,
+        blob: &session_manager::ImportBlobRecord,
+    ) -> Result<(), SessionError> {
+        self.inner.save_import_blob(blob).await
+    }
+    async fn load_import_blob(
+        &self,
+        session_id: &str,
+        sha256: &str,
+    ) -> Result<Option<session_manager::ImportBlobRecord>, SessionError> {
+        self.inner.load_import_blob(session_id, sha256).await
+    }
 }

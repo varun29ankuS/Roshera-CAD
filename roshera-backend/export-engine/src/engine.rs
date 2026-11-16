@@ -150,6 +150,12 @@ impl ExportEngine {
         crate::formats::ros::import_ros(&filepath, password).await
     }
 
+    /// Where a file named `filename` lives in the export directory — the
+    /// file [`Self::import_ros`] reads for that name.
+    pub fn output_path(&self, filename: &str) -> PathBuf {
+        self.output_dir.join(filename)
+    }
+
     /// Verify a `.ros` file in the export directory WITHOUT its password.
     ///
     /// Returns the signature verdict, the header facts and the chunk

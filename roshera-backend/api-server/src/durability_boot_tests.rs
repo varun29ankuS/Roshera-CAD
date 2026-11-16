@@ -2716,6 +2716,19 @@ impl DatabasePersistence for FailingSaves {
     async fn delete_document(&self, id: &str) -> Result<(), session_manager::SessionError> {
         self.inner.delete_document(id).await
     }
+    async fn save_import_blob(
+        &self,
+        blob: &session_manager::ImportBlobRecord,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.save_import_blob(blob).await
+    }
+    async fn load_import_blob(
+        &self,
+        session_id: &str,
+        sha256: &str,
+    ) -> Result<Option<session_manager::ImportBlobRecord>, session_manager::SessionError> {
+        self.inner.load_import_blob(session_id, sha256).await
+    }
 }
 
 /// The stable wire code a swallowed persistence failure must now carry.

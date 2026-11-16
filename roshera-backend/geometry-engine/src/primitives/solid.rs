@@ -620,6 +620,19 @@ pub struct Solid {
     /// [`crate::primitives::topology_builder::BRepModel::certificate`]'s
     /// cold path every time it genuinely recomputes.
     verified_certificate: RwLock<Option<crate::primitives::provenance::ValidityCertificate>>,
+    /// The solid's DISPLAY mesh at the default tessellation parameters — what
+    /// the scene snapshot and the viewport broadcast send. Rides the exact
+    /// invalidation of `cached_certificate`: every seam that dirties the
+    /// certificate (the `get_mut` backstop, the `record_operation` funnel)
+    /// goes through [`Self::invalidate_certificate`], which clears this too —
+    /// a mesh is a function of the same geometry a certificate is. Behind a
+    /// [`RwLock`] for the same two reasons (`Sync`, filled through `&self`
+    /// under a model READ lock).
+    display_mesh: RwLock<Option<Arc<crate::tessellation::TriangleMesh>>>,
+    /// Bumped by every [`Self::invalidate_certificate`]: a reader that
+    /// computed something from this solid can tell whether it was touched
+    /// since. Starts at 0; only compared, never interpreted.
+    mutation_epoch: std::sync::atomic::AtomicU64,
     /// Parent assembly (if part of assembly)
     pub parent_assembly: Option<u32>,
     /// Parametric history
@@ -751,6 +764,8 @@ impl Clone for Solid {
             cached_stats: self.cached_stats.clone(),
             cached_certificate: RwLock::new(self.cached_certificate.read().clone()),
             verified_certificate: RwLock::new(self.verified_certificate.read().clone()),
+            display_mesh: RwLock::new(self.display_mesh.read().clone()),
+            mutation_epoch: std::sync::atomic::AtomicU64::new(self.mutation_epoch()),
             parent_assembly: self.parent_assembly,
             history: self.history.clone(),
             collision_tree: self.collision_tree.clone(),
@@ -790,6 +805,8 @@ impl Solid {
             cached_stats: None,
             cached_certificate: RwLock::new(None),
             verified_certificate: RwLock::new(None),
+            display_mesh: RwLock::new(None),
+            mutation_epoch: std::sync::atomic::AtomicU64::new(0),
             parent_assembly: None,
             history: Arc::new(RwLock::new(Vec::new())),
             collision_tree: None,
@@ -842,6 +859,8 @@ impl Solid {
             cached_stats: self.cached_stats.clone(),
             cached_certificate: RwLock::new(self.cached_certificate.read().clone()),
             verified_certificate: RwLock::new(self.verified_certificate.read().clone()),
+            display_mesh: RwLock::new(self.display_mesh.read().clone()),
+            mutation_epoch: std::sync::atomic::AtomicU64::new(self.mutation_epoch()),
             parent_assembly: self.parent_assembly,
             history: Arc::new(RwLock::new(history_snapshot)),
             collision_tree: self.collision_tree.clone(),
@@ -1459,6 +1478,46 @@ impl Solid {
     /// recomputes from scratch. Idempotent.
     pub(crate) fn invalidate_certificate(&self) {
         *self.cached_certificate.write() = None;
+        // Bump under the mesh slot's write guard: a concurrent
+        // `store_display_mesh` either lands first (and is cleared here) or
+        // sees the new epoch and refuses — never stores a mesh of the shape
+        // this call is retiring.
+        let mut mesh = self.display_mesh.write();
+        self.mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        *mesh = None;
+    }
+
+    /// How many times this solid has been touched (every
+    /// [`Self::invalidate_certificate`]). Compare two readings to learn
+    /// whether anything computed from the solid in between is still about it.
+    pub fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The cached display mesh (default tessellation parameters), or `None`
+    /// when the solid changed since one was stored, or none ever was.
+    pub fn cached_display_mesh(&self) -> Option<Arc<crate::tessellation::TriangleMesh>> {
+        self.display_mesh.read().clone()
+    }
+
+    /// Store this solid's display mesh — tessellated at the DEFAULT
+    /// parameters from the solid as it stood at `epoch` (its
+    /// [`Self::mutation_epoch`] when the tessellation began). Refused (returns
+    /// `false`, nothing stored) when the solid was touched since: a mesh of an
+    /// older shape is never served as this one's.
+    pub fn store_display_mesh(
+        &self,
+        mesh: Arc<crate::tessellation::TriangleMesh>,
+        epoch: u64,
+    ) -> bool {
+        let mut slot = self.display_mesh.write();
+        if self.mutation_epoch() != epoch {
+            return false;
+        }
+        *slot = Some(mesh);
+        true
     }
 
     /// The cached certificate snapshot, or `None` when dirty / never computed.

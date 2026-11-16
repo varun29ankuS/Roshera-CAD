@@ -158,6 +158,22 @@ pub enum ReplayError {
         /// Why it was skipped (no B-Rep replay arm; the geometry is unaffected).
         reason: String,
     },
+
+    /// An import step (`import_step` / `import_ros`) whose recorded file could
+    /// not be re-imported: its bytes are not stored, they no longer hash to the
+    /// recorded sha256, no import replayer is installed in this process, or
+    /// the re-import no longer yields the parts it recorded. The parts are
+    /// REFUSED, never silently dropped: this is a `Failed` verdict, so a
+    /// rebuild quarantines at this step and names the file.
+    #[error("import {kind} cannot be replayed (sha256 {sha256}): {reason}")]
+    ImportUnreplayable {
+        /// The import kind (`import_step`, `import_ros`).
+        kind: String,
+        /// The sha256 the step recorded for its file.
+        sha256: String,
+        /// Why the re-import could not run or did not reproduce the step.
+        reason: String,
+    },
 }
 
 /// Assembly documents rebuilt by replay (kinematic-assembly campaign,
@@ -2510,6 +2526,88 @@ fn dispatch_generic(
                     kind: kind.to_string(),
                     reason: "missing/malformed `rgb` [r,g,b]".to_string(),
                 });
+            }
+            Ok(())
+        }
+
+        // An imported file (`crate::import_replay`): re-run the import from
+        // the stored bytes the step names and splice the parts exactly as the
+        // live route did. Every recorded output maps, in splice order, to the
+        // part the re-import produced -- so the `set_name` steps after it, and
+        // every later op on an imported part, resolve. Anything short of the
+        // recorded parts is a typed refusal, never a partial import.
+        "import_step" | "import_ros" => {
+            let unreplayable = |sha256: &str, reason: String| ReplayError::ImportUnreplayable {
+                kind: kind.to_string(),
+                sha256: sha256.to_string(),
+                reason,
+            };
+            let record = crate::import_replay::ImportRecord::from_params(inner)
+                .map_err(|reason| unreplayable("unknown", reason))?;
+            let replayer = crate::import_replay::import_replayer().ok_or_else(|| {
+                unreplayable(
+                    &record.sha256,
+                    "no import replayer is installed in this process".to_string(),
+                )
+            })?;
+            let recorded_solids: Vec<u64> = parameters
+                .get("outputs")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| parse_entity_ref(v, "solid"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // The replayer re-imports off to the side and splices into
+            // `model` only when the file still yields the recorded parts.
+            let new_solids = replayer
+                .replay_import(model, &record, recorded_solids.len())
+                .map_err(|e| unreplayable(&record.sha256, e.to_string()))?;
+            if new_solids.len() != recorded_solids.len() {
+                return Err(unreplayable(
+                    &record.sha256,
+                    format!(
+                        "the re-import produced {} parts, the step recorded {}",
+                        new_solids.len(),
+                        recorded_solids.len()
+                    ),
+                ));
+            }
+            // Which re-imported part is which recorded part: by the part's
+            // persistent id (content-derived), never by the order the
+            // importer emitted them in -- that order is not stable from one
+            // import of a file to the next (measured: a two-part file's parts
+            // came back swapped, names and all). A step recorded without
+            // PIDs, or whose parts carry none (a `.ros` snapshot), pairs
+            // positionally.
+            if record.solid_pids.len() == recorded_solids.len()
+                && record.solid_pids.iter().all(|p| !p.is_empty())
+            {
+                let by_pid: HashMap<String, SolidId> = new_solids
+                    .iter()
+                    .filter_map(|&s| {
+                        model
+                            .solid_pid(s)
+                            .map(|p| (crate::import_replay::pid_hex(p), s))
+                    })
+                    .collect();
+                for (recorded, pid) in recorded_solids.iter().zip(&record.solid_pids) {
+                    let new = by_pid.get(pid).ok_or_else(|| {
+                        unreplayable(
+                            &record.sha256,
+                            format!(
+                                "the re-import has no part with persistent id {pid} \
+                                 (recorded as solid:{recorded})"
+                            ),
+                        )
+                    })?;
+                    id_remap.insert(*recorded, *new as u64);
+                }
+            } else {
+                for (recorded, new) in recorded_solids.iter().zip(&new_solids) {
+                    id_remap.insert(*recorded, *new as u64);
+                }
             }
             Ok(())
         }
@@ -5650,6 +5748,14 @@ mod tests {
                     .into_iter()
                     .filter(|s| s.starts_with("delete_") && s.ends_with("_cascade"))
                     .collect()
+            }),
+            // `RecordedOperation::new(stored.format.kind())`: an import step
+            // records one of the two import kinds (`crate::import_replay`).
+            ("api-server/src/import_blobs.rs", "stored", |_code| {
+                vec![
+                    crate::import_replay::IMPORT_STEP_KIND.to_string(),
+                    crate::import_replay::IMPORT_ROS_KIND.to_string(),
+                ]
             }),
             // `record_csketch_op(state, "<kind>", …)` call sites.
             ("api-server/src/csketch.rs", "kind", |code| {
