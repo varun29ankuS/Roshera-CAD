@@ -6240,6 +6240,83 @@ fn tessellate_revolution_band_stitched(
     true
 }
 
+/// Whether a four-sided patch of a `SurfaceOfRevolution` is bounded the way
+/// the axis tiles it: one opposite pair of sides RINGS (each keeps its height
+/// on the axis and its radius) and the other pair MERIDIANS (each lies in one
+/// half-plane through the axis). Measured against the surface's own axis, to
+/// within 1e-4 of the patch's size.
+///
+/// The structured and stitched revolution meshers fill the patch by turning a
+/// side about the axis, which lands on the face only for such a patch. A patch
+/// cut from the surface by other curves -- sides that rise and fall round the
+/// axis -- was filled anyway: the turned side passed outside the face and its
+/// cells folded back over the rims (CADGenBench part 146: two faces wound
+/// against themselves along 26 mesh edges and against their neighbours along
+/// 11 more).
+fn revolution_patch_is_rings_and_meridians(
+    face: &Face,
+    model: &BRepModel,
+    sides: [&Vec<Point3>; 4],
+) -> bool {
+    let Some(sr) = model.surfaces.get(face.surface_id).and_then(|s| {
+        s.as_any()
+            .downcast_ref::<crate::primitives::surface::SurfaceOfRevolution>()
+    }) else {
+        return false;
+    };
+    let Ok(axis) = sr.axis_direction.normalize() else {
+        return false;
+    };
+    let origin = sr.axis_origin;
+    let split = |p: Point3| {
+        let w = p - origin;
+        let h = w.dot(&axis);
+        (h, w - axis * h)
+    };
+    // The patch's size: its largest radius and its height on the axis.
+    let (mut hlo, mut hhi, mut rmax) = (f64::MAX, f64::MIN, 0.0_f64);
+    for side in sides {
+        for &p in side.iter() {
+            let (h, r) = split(p);
+            hlo = hlo.min(h);
+            hhi = hhi.max(h);
+            rmax = rmax.max(r.magnitude());
+        }
+    }
+    let tol = 1e-4 * (rmax + (hhi - hlo)).max(1.0);
+    let ring = |side: &[Point3]| {
+        let (h0, r0) = split(side[0]);
+        let r0 = r0.magnitude();
+        side.iter().all(|&p| {
+            let (h, r) = split(p);
+            (h - h0).abs() <= tol && (r.magnitude() - r0).abs() <= tol
+        })
+    };
+    let meridian = |side: &[Point3]| {
+        // The half-plane through the axis and the sample farthest from it.
+        let Some(e) = side
+            .iter()
+            .map(|&p| split(p).1)
+            .max_by(|x, y| {
+                x.magnitude()
+                    .partial_cmp(&y.magnitude())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .and_then(|r| r.normalize().ok())
+        else {
+            return false;
+        };
+        let across = axis.cross(&e);
+        side.iter().all(|&p| {
+            let r = split(p).1;
+            r.dot(&across).abs() <= tol && r.dot(&e) >= -tol
+        })
+    };
+    let [a, b, c, d] = sides;
+    (ring(a) && ring(c) && meridian(b) && meridian(d))
+        || (meridian(a) && meridian(c) && ring(b) && ring(d))
+}
+
 /// Tessellate a single `SurfaceOfRevolution` wedge face as a structured grid
 /// whose four boundary edges are sampled from the `EdgeSampleCache` (so shared
 /// seams are bit-exact with neighbours) and whose interior is a transfinite
@@ -6538,6 +6615,13 @@ fn tessellate_revolution_wedge(
         || !close(c[c.len() - 1], d[0])
         || !close(d[d.len() - 1], a[0])
     {
+        return false;
+    }
+    // Every path below fills the patch by turning a side about the axis, so it
+    // needs a patch the axis tiles: two opposite sides rings, the other two
+    // meridians. A patch cut from the surface by other curves is declined to
+    // the general mesher.
+    if !revolution_patch_is_rings_and_meridians(face, model, [a, b, c, d]) {
         return false;
     }
 

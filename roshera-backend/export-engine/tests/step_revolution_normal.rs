@@ -429,3 +429,172 @@ fn a_doubly_curved_revolution_band_meshes_on_its_surface() {
         "facets standing off the wall (d, rim counts, worst deg, tris): {bad:?}"
     );
 }
+
+/// A four-sided patch of the radius-10 sphere, built as a revolution of a
+/// semicircle about +Z (an exact rational quadratic on the x > 0 side, so
+/// every point of the sphere has one parameter pair), between the meridians at 0 and 90 degrees. Its other
+/// two sides are NOT rings: each is the sphere's circle through
+/// (8, 0, -+6), (0, 8, -+6) and a point at 45 degrees `bow` nearer the
+/// equator, so it rises and falls round the axis. (CADGenBench part 146 has
+/// such patches: no side keeps one height on the axis.)
+fn tilted_rim_patch(bow_bottom: f64, bow_top: f64) -> String {
+    use geometry_engine::math::{Point3, Vector3};
+    let r = 10.0_f64;
+    let h = 6.0_f64;
+    let x0 = (r * r - h * h).sqrt();
+    // The sphere's circle through a, b and the point at 45 degrees and
+    // height z45: (centre, axis making a -> mid -> b counter-clockwise,
+    // radius).
+    let circle = |a: Point3, b: Point3, z45: f64| {
+        let rho = (r * r - z45 * z45).sqrt();
+        let m = Point3::new(rho / 2f64.sqrt(), rho / 2f64.sqrt(), z45);
+        let n = (m - a).cross(&(b - m)).normalize().expect("a plane");
+        // The plane's point nearest the sphere's centre (the origin).
+        let c = n * n.dot(&(a - Point3::new(0.0, 0.0, 0.0)));
+        let centre = Point3::new(c.x, c.y, c.z);
+        let radius = (a - centre).magnitude();
+        (centre, n, radius)
+    };
+    let a = Point3::new(x0, 0.0, -h);
+    let b = Point3::new(0.0, x0, -h);
+    let c = Point3::new(0.0, x0, h);
+    let d = Point3::new(x0, 0.0, h);
+    let (cb, nb, rb) = circle(a, b, -h + bow_bottom);
+    let (ct, nt, rt) = circle(d, c, h - bow_top);
+    let xb = (a - cb).normalize().expect("ref");
+    let xt = (d - ct).normalize().expect("ref");
+    let p = |v: Point3| format!("({:.17},{:.17},{:.17})", v.x, v.y, v.z);
+    let q = |v: Vector3| format!("({:.17},{:.17},{:.17})", v.x, v.y, v.z);
+    format!(
+        "#1=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#3=DIRECTION('',(1.,0.,0.));
+#4=CARTESIAN_POINT('',(0.,0.,-{r:.1}));
+#5=CARTESIAN_POINT('',({r:.1},0.,-{r:.1}));
+#9=CARTESIAN_POINT('',({r:.1},0.,0.));
+#10=CARTESIAN_POINT('',({r:.1},0.,{r:.1}));
+#15=CARTESIAN_POINT('',(0.,0.,{r:.1}));
+#6=( BOUNDED_CURVE() B_SPLINE_CURVE(2,(#4,#5,#9,#10,#15),.UNSPECIFIED.,.F.,.F.)
+ B_SPLINE_CURVE_WITH_KNOTS((3,2,3),(0.,0.5,1.),.UNSPECIFIED.) CURVE()
+ GEOMETRIC_REPRESENTATION_ITEM()
+ RATIONAL_B_SPLINE_CURVE((1.,{w:.17},1.,{w:.17},1.)) REPRESENTATION_ITEM('') );
+#7=AXIS1_PLACEMENT('',#1,#2);
+#8=SURFACE_OF_REVOLUTION('',#6,#7);
+#11=CARTESIAN_POINT('',{pa});
+#12=CARTESIAN_POINT('',{pb});
+#13=CARTESIAN_POINT('',{pc});
+#14=CARTESIAN_POINT('',{pd});
+#21=VERTEX_POINT('',#11);
+#22=VERTEX_POINT('',#12);
+#23=VERTEX_POINT('',#13);
+#24=VERTEX_POINT('',#14);
+#30=CARTESIAN_POINT('',{pcb});
+#31=DIRECTION('',{qnb});
+#32=DIRECTION('',{qxb});
+#33=AXIS2_PLACEMENT_3D('',#30,#31,#32);
+#34=CIRCLE('',#33,{rb:.17});
+#35=CARTESIAN_POINT('',{pct});
+#36=DIRECTION('',{qnt});
+#37=DIRECTION('',{qxt});
+#38=AXIS2_PLACEMENT_3D('',#35,#36,#37);
+#39=CIRCLE('',#38,{rt:.17});
+#40=DIRECTION('',(1.,0.,0.));
+#41=DIRECTION('',(0.,1.,0.));
+#42=DIRECTION('',(0.,-1.,0.));
+#43=DIRECTION('',(0.8,0.,-0.6));
+#44=DIRECTION('',(0.,0.8,-0.6));
+#45=AXIS2_PLACEMENT_3D('',#1,#40,#44);
+#46=CIRCLE('',#45,{r:.1});
+#47=AXIS2_PLACEMENT_3D('',#1,#42,#43);
+#48=CIRCLE('',#47,{r:.1});
+#51=EDGE_CURVE('',#21,#22,#34,.T.);
+#52=EDGE_CURVE('',#22,#23,#46,.T.);
+#53=EDGE_CURVE('',#24,#23,#39,.T.);
+#54=EDGE_CURVE('',#21,#24,#48,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#62=ORIENTED_EDGE('',*,*,#52,.T.);
+#63=ORIENTED_EDGE('',*,*,#53,.F.);
+#64=ORIENTED_EDGE('',*,*,#54,.F.);
+#70=EDGE_LOOP('',(#61,#62,#63,#64));
+#71=FACE_OUTER_BOUND('',#70,.T.);
+#80=ADVANCED_FACE('',(#71),#8,.T.);
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));",
+        pa = p(a),
+        pb = p(b),
+        pc = p(c),
+        pd = p(d),
+        pcb = p(cb),
+        qnb = q(nb),
+        qxb = q(xb),
+        pct = p(ct),
+        qnt = q(nt),
+        qxt = q(xt),
+        w = 0.5_f64.sqrt(),
+    )
+}
+
+/// The revolution meshers fill a four-sided patch by turning one side about
+/// the axis, which is exact only when the other two sides are rings. On a
+/// patch whose sides rise and fall round the axis the turned side passes
+/// outside the face, and its cells fold back over the rims: on CADGenBench
+/// part 146 two such faces wound against themselves along 26 mesh edges and
+/// against their neighbours along 11 more. Every facet must lie along the
+/// sphere and the face must wind one way throughout.
+#[test]
+fn a_revolution_patch_whose_sides_are_not_rings_meshes_on_its_surface() {
+    use geometry_engine::tessellation::{
+        edge_cache::EdgeSampleCache, tessellate_face, TessellationParams, TriangleMesh,
+    };
+    use std::collections::HashMap;
+    let params = TessellationParams::default();
+    let mut bad = Vec::new();
+    for (bow_bottom, bow_top) in [(1.5_f64, 1.5_f64), (1.5, 0.5)] {
+        let (model, report) = ExportEngine::new()
+            .import_step_content(&envelope(&tilted_rim_patch(bow_bottom, bow_top)), "patch")
+            .expect("imports");
+        let faces: Vec<_> = model.faces.iter().collect();
+        assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
+        let (_, face) = faces[0];
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_face(face, &model, &params, &cache, &mut mesh);
+        assert!(!mesh.triangles.is_empty(), "the patch meshes");
+        let key = |p: geometry_engine::math::Point3| {
+            (
+                (p.x * 1e6).round() as i64,
+                (p.y * 1e6).round() as i64,
+                (p.z * 1e6).round() as i64,
+            )
+        };
+        let mut directed: HashMap<_, usize> = HashMap::new();
+        let mut worst = 0.0_f64;
+        let mut worst_facet = None;
+        for t in &mesh.triangles {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+            for (u, v) in [(a, b), (b, c), (c, a)] {
+                *directed.entry((key(u), key(v))).or_default() += 1;
+            }
+            let Ok(w) = (b - a).cross(&(c - a)).normalize() else {
+                continue;
+            };
+            let m = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+            let n = (m - geometry_engine::math::Point3::new(0.0, 0.0, 0.0))
+                .normalize()
+                .expect("off the centre");
+            let dev = w.dot(&n).abs().clamp(0.0, 1.0).acos().to_degrees();
+            if dev > worst {
+                worst = dev;
+                worst_facet = Some([a, b, c]);
+            }
+        }
+        let same_way = directed.values().filter(|&&n| n > 1).count();
+        if same_way > 0 || worst > 40.0 {
+            bad.push((bow_bottom, bow_top, same_way, worst, worst_facet));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "(bow bottom, bow top, mesh edges walked twice the same way, worst facet deg, its corners): {bad:?}"
+    );
+}
