@@ -59,6 +59,8 @@ pub enum EventKind {
     VerticesMerged,
     /// The edge's curve rebuilt on the intersection of its two faces.
     EdgeRebuiltOnIntersection,
+    /// An edge shorter than its tolerance collapsed to a point.
+    SmallEdgeCollapsed,
     /// A certificate check this entity blocks.
     Blocking { conjunct: String },
 }
@@ -75,6 +77,7 @@ impl EventKind {
             EventKind::VoidShellReversed => "void_shell_reversed",
             EventKind::VerticesMerged => "vertices_merged",
             EventKind::EdgeRebuiltOnIntersection => "edge_rebuilt_on_intersection",
+            EventKind::SmallEdgeCollapsed => "small_edge_collapsed",
             EventKind::Blocking { .. } => "blocking",
         }
     }

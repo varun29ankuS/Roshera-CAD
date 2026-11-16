@@ -136,6 +136,11 @@ pub enum HealingKind {
     /// interpolation), so it lies on both. `deviation` is the file's gap,
     /// `tolerance` the rebuilt edge's.
     EdgeRebuiltOnFaceIntersection,
+    /// An edge shorter than its own tolerance was collapsed to a point:
+    /// its vertices merged and it was taken out of every loop (OCCT's
+    /// `ShapeFix_Wire::FixSmall`). `deviation` is its extent, `tolerance`
+    /// the bound.
+    SmallEdgeCollapsed,
 }
 
 /// A structured healing event applied during dispatch. Logged on

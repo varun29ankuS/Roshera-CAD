@@ -29,22 +29,29 @@ fn envelope(body: &str) -> String {
 /// written as a cubic Bezier whose handles are `k` of the radius (the exact
 /// quarter circle needs k = 0.5523; 0.5504 puts it ~0.02 mm off the torus).
 fn torus_cut_by_a_plane(k: f64) -> String {
-    let rho = 20.0 + 3f64.sqrt();
+    torus_cut_at(1.0, k)
+}
+
+/// The same fixture with the plane at height `z` (0 < z <= 2): the cut is
+/// the circle of radius 20 + sqrt(4 - z^2). At z = 2 the plane touches the
+/// top of the tube -- a TANGENT cut, as where a fillet meets a flat face.
+fn torus_cut_at(z: f64, k: f64) -> String {
+    let rho = 20.0 + (4.0 - z * z).max(0.0).sqrt();
     format!(
         "#1=CARTESIAN_POINT('',(0.,0.,0.));
 #2=DIRECTION('',(0.,0.,1.));
 #3=DIRECTION('',(1.,0.,0.));
 #4=AXIS2_PLACEMENT_3D('',#1,#2,#3);
 #5=TOROIDAL_SURFACE('',#4,20.,2.);
-#6=CARTESIAN_POINT('',(0.,0.,1.));
+#6=CARTESIAN_POINT('',(0.,0.,{z:.15}));
 #7=AXIS2_PLACEMENT_3D('',#6,#2,#3);
 #8=PLANE('',#7);
 #11=CARTESIAN_POINT('',(22.,0.,0.));
 #12=CARTESIAN_POINT('',(0.,22.,0.));
-#13=CARTESIAN_POINT('',({rho:.15},0.,1.));
-#14=CARTESIAN_POINT('',(0.,{rho:.15},1.));
-#15=CARTESIAN_POINT('',(25.,0.,1.));
-#16=CARTESIAN_POINT('',(0.,25.,1.));
+#13=CARTESIAN_POINT('',({rho:.15},0.,{z:.15}));
+#14=CARTESIAN_POINT('',(0.,{rho:.15},{z:.15}));
+#15=CARTESIAN_POINT('',(25.,0.,{z:.15}));
+#16=CARTESIAN_POINT('',(0.,25.,{z:.15}));
 #21=VERTEX_POINT('',#11);
 #22=VERTEX_POINT('',#12);
 #23=VERTEX_POINT('',#13);
@@ -60,10 +67,10 @@ fn torus_cut_by_a_plane(k: f64) -> String {
 #37=DIRECTION('',(0.,1.,0.));
 #38=AXIS2_PLACEMENT_3D('',#36,#3,#37);
 #39=CIRCLE('',#38,2.);
-#41=CARTESIAN_POINT('',({rho:.15},0.,1.));
-#42=CARTESIAN_POINT('',({rho:.15},{kr:.15},1.));
-#43=CARTESIAN_POINT('',({kr:.15},{rho:.15},1.));
-#44=CARTESIAN_POINT('',(0.,{rho:.15},1.));
+#41=CARTESIAN_POINT('',({rho:.15},0.,{z:.15}));
+#42=CARTESIAN_POINT('',({rho:.15},{kr:.15},{z:.15}));
+#43=CARTESIAN_POINT('',({kr:.15},{rho:.15},{z:.15}));
+#44=CARTESIAN_POINT('',(0.,{rho:.15},{z:.15}));
 #45=B_SPLINE_CURVE_WITH_KNOTS('',3,(#41,#42,#43,#44),.UNSPECIFIED.,.F.,.F.,(4,4),(0.,1.),.UNSPECIFIED.);
 #46=CIRCLE('',#7,25.);
 #47=VECTOR('',#37,1.);
@@ -99,7 +106,14 @@ fn torus_cut_by_a_plane(k: f64) -> String {
 
 /// The largest distance from the shared cut's samples to each face's surface.
 fn cut_gaps(model: &geometry_engine::primitives::topology_builder::BRepModel) -> (f64, f64) {
-    let rho = 20.0 + 3f64.sqrt();
+    cut_gaps_at(model, 1.0)
+}
+
+fn cut_gaps_at(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    z: f64,
+) -> (f64, f64) {
+    let rho = 20.0 + (4.0 - z * z).max(0.0).sqrt();
     let near = |v: u32, p: [f64; 3]| {
         model.vertices.get(v).is_some_and(|x| {
             (x.position[0] - p[0]).abs() < 1e-6
@@ -110,7 +124,7 @@ fn cut_gaps(model: &geometry_engine::primitives::topology_builder::BRepModel) ->
     let (eid, edge) = model
         .edges
         .iter()
-        .find(|(_, e)| near(e.start_vertex, [rho, 0.0, 1.0]) && near(e.end_vertex, [0.0, rho, 1.0]))
+        .find(|(_, e)| near(e.start_vertex, [rho, 0.0, z]) && near(e.end_vertex, [0.0, rho, z]))
         .expect("the shared cut");
     let _ = eid;
     let mut gaps = Vec::new();
@@ -188,6 +202,33 @@ fn an_exact_edge_is_not_rebuilt() {
             .iter()
             .all(|h| format!("{:?}", h.kind) != "EdgeRebuiltOnFaceIntersection"),
         "nothing to rebuild: {:?}",
+        report.healings
+    );
+}
+
+/// Where a fillet meets a flat face the two surfaces are TANGENT along the
+/// edge, and alternating projection between them closes in slowly: on
+/// CADGenBench part 205 (a torus blending into a plane, the file's edge
+/// 0.0114 mm off the torus) it reached 1e-5 mm, short of the 1e-9 the rebuild
+/// demanded, so the edge was left 0.0114 off and the part invalid. A rebuild
+/// that fits both faces a thousand times better than the file's curve is
+/// kept, with the edge's tolerance at what it reached.
+#[test]
+fn an_edge_where_a_fillet_meets_a_face_tangentially_is_rebuilt() {
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&torus_cut_at(2.0, 0.5504)), "tangent")
+        .expect("imports");
+    let (torus, plane) = cut_gaps_at(&model, 2.0);
+    assert!(
+        torus <= 1e-4 && plane <= 1e-4,
+        "the tangent cut must lie on both faces: torus gap {torus:.3e}, plane gap {plane:.3e}"
+    );
+    assert!(
+        report
+            .healings
+            .iter()
+            .any(|h| format!("{:?}", h.kind) == "EdgeRebuiltOnFaceIntersection"),
+        "the rebuild is reported: {:?}",
         report.healings
     );
 }
