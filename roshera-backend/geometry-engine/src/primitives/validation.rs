@@ -2093,6 +2093,9 @@ pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<Vali
                 }
                 c * (1.0 / pts.len() as f64)
             });
+            // The surface normal round the loop, for the geometric arm's
+            // faithful-projection gate (`outward_walk_is_forward`).
+            let loop_normals = loop_surface_normals(model, face, loop_polygon.as_deref());
 
             // --- Chain integrity: the loop's directed half-edges (each edge taken
             // in its stored sense, tail -> head) must form ONE closed walk — every
@@ -2273,6 +2276,7 @@ pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<Vali
                     edge_id,
                     centroid.as_ref(),
                     loop_polygon.as_deref(),
+                    &loop_normals,
                     is_inner,
                 ) {
                     edge_walks
@@ -2326,6 +2330,39 @@ fn orientation_err(
     }
 }
 
+/// A loop projected along the normal at one of its edges pictures the face
+/// faithfully only while every part of it faces that way by at least this
+/// cosine (about 78 degrees): nearer edge-on, the projected outline can pinch
+/// and cross.
+const FAITHFUL_PROJECTION_MIN_COS: f64 = 0.2;
+
+/// The unit surface normal of `face`'s surface (raw, before the face's sense)
+/// at up to 24 points round the loop outline `polygon`; empty when it cannot
+/// be measured, which leaves the geometric check as it always was.
+fn loop_surface_normals(
+    model: &BRepModel,
+    face: &crate::primitives::face::Face,
+    polygon: Option<&[Vector3]>,
+) -> Vec<Vector3> {
+    let (Some(poly), Some(surface)) = (polygon, model.surfaces.get(face.surface_id)) else {
+        return Vec::new();
+    };
+    if poly.is_empty() {
+        return Vec::new();
+    }
+    let step = poly.len().div_ceil(24).max(1);
+    poly.iter()
+        .step_by(step)
+        .filter_map(|p| {
+            let (u, v) = surface
+                .closest_point(&Point3::new(p.x, p.y, p.z), Tolerance::default())
+                .ok()?;
+            let n = surface.normal_at(u, v).ok()?.normalize_or_zero();
+            (n.magnitude() > 0.5).then_some(n)
+        })
+        .collect()
+}
+
 /// Does `face` traverse `edge` in its `start_vertex -> end_vertex` direction
 /// within the face's OUTWARD-oriented boundary?
 ///
@@ -2344,6 +2381,7 @@ fn outward_walk_is_forward(
     edge_id: EdgeId,
     centroid: Option<&Vector3>,
     loop_polygon: Option<&[Vector3]>,
+    loop_normals: &[Vector3],
     is_inner: bool,
 ) -> Option<bool> {
     let centroid = centroid?;
@@ -2436,6 +2474,21 @@ fn outward_walk_is_forward(
         (Some(en), None) => en,
         (None, None) => return None,
     };
+    // Faithful-projection gate. The inside of the face is decided below by
+    // projecting the loop along this edge's normal; that picture is the face
+    // only if no part of the loop is seen edge-on or from behind. A 45-degree
+    // half-cone (a chamfer a STEP writer split in two) is exactly edge-on at
+    // its far seam: the outline pinches and crosses there, the in/out count
+    // flips, and two halves whose loops oppose were reported as walking
+    // their seams the same way (CADGenBench parts 218, 231). Undecidable
+    // geometry states nothing, as every other `None` here: the loop senses
+    // and the mesh orientation oracles still judge the edge.
+    if loop_normals
+        .iter()
+        .any(|n| n.dot(&raw) < FAITHFUL_PROJECTION_MIN_COS)
+    {
+        return None;
+    }
     let outward = raw * face.orientation.sign();
     if outward.magnitude() < 1e-12 {
         return None;
