@@ -1289,7 +1289,8 @@ impl<'a> ScaledChart<'a> {
         // revolution lives in native coordinates, and rescaling those faces
         // was measured to break their meshes (part 146's tori and revolution
         // patches opened and folded).
-        if inner.is_developable() || inner.period_u().is_some() || inner.period_v().is_some() {
+        let periodic = inner.period_u().is_some() || inner.period_v().is_some();
+        if inner.is_developable() || (periodic && inner.type_name() != "NurbsSurface") {
             return None;
         }
         let (mut su, mut sv, mut n) = (0.0, 0.0, 0usize);
