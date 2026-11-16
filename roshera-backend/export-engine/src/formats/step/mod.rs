@@ -178,6 +178,7 @@ pub fn import_step_text_uncertified(
     }
     report.roots_resolved = roots_with_solids;
     report.solids_in_roots = total_root_solids;
+    merge_vertices_a_loop_passes_between(&mut model, &mut caches, &mut report);
     raise_edge_tolerances_to_measured_gaps(&mut model, &mut caches, &mut report);
     reverse_loops_walking_against_neighbours(&mut model, &mut caches, &mut report);
 
@@ -275,6 +276,142 @@ fn extract_file_schema(exchange: &ruststep::ast::Exchange) -> Option<String> {
         }
     }
     None
+}
+
+/// Make one vertex of any two that a loop passes from one to the other at the
+/// same point: one edge of the loop ends at the first, the next edge starts at
+/// the second, and the two lie within the larger of the edges' tolerances.
+/// Some writers emit a `VERTEX_POINT` per edge end rather than per corner
+/// (CADGenBench part 132 has two at exactly (-40, 2.36e-13, 128)); the loop
+/// then does not chain and the B-Rep is invalid. Only vertices a loop joins
+/// are merged: two corners that merely touch (bodies meeting at a point) stay
+/// two vertices. Every edge is pointed at the kept vertex (the lower id, so
+/// the outcome is deterministic); each merge is recorded as a
+/// [`diagnostics::HealingKind::VerticesMergedToCloseLoop`] and, on each face
+/// whose loop it closed, in the Lens journal.
+fn merge_vertices_a_loop_passes_between(
+    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
+    caches: &mut context::ResolutionCaches,
+    report: &mut ImportReport,
+) {
+    use std::collections::{BTreeMap, HashMap};
+    let floor = geometry_engine::math::Tolerance::default().distance();
+    // Union-find over vertex ids; the root of a set is its lowest id.
+    let mut parent: HashMap<u32, u32> = HashMap::new();
+    fn root(parent: &HashMap<u32, u32>, mut v: u32) -> u32 {
+        while let Some(&p) = parent.get(&v) {
+            if p == v {
+                break;
+            }
+            v = p;
+        }
+        v
+    }
+    // (kept, merged) -> (distance, bound, faces whose loop broke there).
+    let mut merges: BTreeMap<(u32, u32), (f64, f64, Vec<u32>)> = BTreeMap::new();
+    let mut faces: Vec<u32> = model.faces.iter().map(|(fid, _)| fid).collect();
+    faces.sort_unstable();
+    for fid in faces {
+        let Some(face) = model.faces.get(fid) else {
+            continue;
+        };
+        let loops: Vec<u32> = std::iter::once(face.outer_loop)
+            .chain(face.inner_loops.iter().copied())
+            .collect();
+        for l in loops {
+            let Some(lp) = model.loops.get(l) else {
+                continue;
+            };
+            // Each edge as walked: (start, end, tolerance).
+            let walked: Vec<(u32, u32, f64)> = lp
+                .edges
+                .iter()
+                .enumerate()
+                .filter_map(|(k, &e)| {
+                    let edge = model.edges.get(e)?;
+                    let fwd = lp.orientations.get(k).copied().unwrap_or(true);
+                    Some(if fwd {
+                        (edge.start_vertex, edge.end_vertex, edge.tolerance)
+                    } else {
+                        (edge.end_vertex, edge.start_vertex, edge.tolerance)
+                    })
+                })
+                .collect();
+            if walked.len() != lp.edges.len() {
+                continue;
+            }
+            for k in 0..walked.len() {
+                let (_, end, tol_a) = walked[k];
+                let (start, _, tol_b) = walked[(k + 1) % walked.len()];
+                let (ra, rb) = (root(&parent, end), root(&parent, start));
+                if ra == rb {
+                    continue;
+                }
+                let (Some(pa), Some(pb)) = (model.vertices.get(ra), model.vertices.get(rb)) else {
+                    continue;
+                };
+                let d = ((pa.position[0] - pb.position[0]).powi(2)
+                    + (pa.position[1] - pb.position[1]).powi(2)
+                    + (pa.position[2] - pb.position[2]).powi(2))
+                .sqrt();
+                let bound = tol_a.max(tol_b).max(floor);
+                if !(d <= bound) {
+                    continue;
+                }
+                let (kept, merged) = (ra.min(rb), ra.max(rb));
+                parent.insert(merged, kept);
+                parent.entry(kept).or_insert(kept);
+                merges
+                    .entry((kept, merged))
+                    .or_insert((d, bound, Vec::new()))
+                    .2
+                    .push(fid);
+            }
+        }
+    }
+    if merges.is_empty() {
+        return;
+    }
+    let edge_ids: Vec<u32> = model.edges.iter().map(|(eid, _)| eid).collect();
+    for eid in edge_ids {
+        if let Some(edge) = model.edges.get_mut(eid) {
+            edge.start_vertex = root(&parent, edge.start_vertex);
+            edge.end_vertex = root(&parent, edge.end_vertex);
+        }
+    }
+    let vertex_instance: HashMap<u32, u64> =
+        caches.vertices.iter().map(|(n, &vid)| (vid, *n)).collect();
+    for v in caches.vertices.values_mut() {
+        *v = root(&parent, *v);
+    }
+    let face_instance: HashMap<u32, u64> = caches.faces.iter().map(|(n, &fid)| (fid, *n)).collect();
+    for ((kept, merged), (d, bound, broke)) in merges {
+        let merged_instance = vertex_instance.get(&merged).copied();
+        report.healings.push(diagnostics::Healing {
+            kind: diagnostics::HealingKind::VerticesMergedToCloseLoop,
+            entity: "VERTEX_POINT".into(),
+            instance: merged_instance.unwrap_or(0),
+            deviation: d,
+            tolerance: bound,
+        });
+        let kept_instance = vertex_instance.get(&kept).copied().unwrap_or(0) as f64;
+        for fid in broke {
+            if let Some(&n) = face_instance.get(&fid) {
+                caches.record_lens(
+                    n,
+                    geometry_engine::lens::Stage::Repair,
+                    geometry_engine::lens::EventKind::VerticesMerged,
+                    merged_instance,
+                    "its loop passed between two vertices at one point; they were made one",
+                    &[
+                        ("gap_mm", d),
+                        ("bound_mm", bound),
+                        ("kept_vertex", kept_instance),
+                    ],
+                );
+            }
+        }
+    }
 }
 
 /// Reverse the loops of any face that walks MOST of its shared edges the same

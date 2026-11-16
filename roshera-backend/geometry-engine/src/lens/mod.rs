@@ -52,6 +52,9 @@ pub enum EventKind {
     LoopReversedToMatchNeighbours,
     /// A void shell turned inside out (`ORIENTED_CLOSED_SHELL .F.`).
     VoidShellReversed,
+    /// Two vertices at one point, which the face's loop passed between, made
+    /// one so the loop chains.
+    VerticesMerged,
     /// A certificate check this entity blocks.
     Blocking { conjunct: String },
 }
@@ -66,6 +69,7 @@ impl EventKind {
             EventKind::EdgeToleranceRaised => "edge_tolerance_raised",
             EventKind::LoopReversedToMatchNeighbours => "loop_reversed_to_match_neighbours",
             EventKind::VoidShellReversed => "void_shell_reversed",
+            EventKind::VerticesMerged => "vertices_merged",
             EventKind::Blocking { .. } => "blocking",
         }
     }

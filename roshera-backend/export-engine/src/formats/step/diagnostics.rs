@@ -124,6 +124,13 @@ pub enum HealingKind {
     /// `ShapeFix_Shell::FixFaceOrientation`). `deviation` is the number of
     /// shared edges walked the same way, `tolerance` the face's shared edges.
     LoopReversedToMatchNeighbours,
+    /// Two `VERTEX_POINT`s at the same point (within the edges' tolerance)
+    /// that a loop passed from one to the other -- one edge ending at the
+    /// first, the next starting at the second -- were made one vertex, so
+    /// the loop chains (OCCT's `ShapeFix_Wire::FixConnected`). Vertices at
+    /// one point that no loop passes between are left apart. `deviation` is
+    /// the distance between the two, `tolerance` the bound it met.
+    VerticesMergedToCloseLoop,
 }
 
 /// A structured healing event applied during dispatch. Logged on
