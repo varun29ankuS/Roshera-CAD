@@ -732,6 +732,34 @@ impl ParallelValidator {
                         && surface.is_closed_u()
                         && surface.is_closed_v();
                     if !is_commutator_loop {
+                        // The loop's EXTENT: both ends of every edge and
+                        // points along its curve. The stored start vertices
+                        // alone are not it -- a cone running to its point is
+                        // a closed base circle plus the seam up and back,
+                        // and all three edge-uses store the circle's vertex
+                        // as their start, so the face read as zero size
+                        // (CADGenBench parts 120, 126, 147).
+                        let mut extent_pts = loop_pts.clone();
+                        if let Some(lp) = model.loops.get(face.outer_loop) {
+                            for &eid in &lp.edges {
+                                let Some(e) = model.edges.get(eid) else {
+                                    continue;
+                                };
+                                if let Some(v) = model.vertices.get(e.end_vertex) {
+                                    extent_pts.push(v.point());
+                                }
+                                if let Some(curve) = model.curves.get(e.curve_id) {
+                                    let r = e.param_range;
+                                    for f in [0.25_f64, 0.5, 0.75] {
+                                        let t = r.start + (r.end - r.start) * f;
+                                        if let Ok(cp) = curve.evaluate(t) {
+                                            extent_pts.push(cp.position);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let loop_pts = extent_pts;
                         let mut mn = loop_pts[0];
                         let mut mx = loop_pts[0];
                         for p in &loop_pts {
