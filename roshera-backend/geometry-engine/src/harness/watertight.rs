@@ -1010,13 +1010,36 @@ fn at_pole_point(surface: &dyn Surface, q: crate::math::Point3, p: f64) -> bool 
 /// occupies a sliver of it.
 /// A point's (u, v) on `surface`: its projection, so it is in THAT surface's
 /// own chart whatever a welded mesh vertex happens to have stored.
+///
+/// The vertex's stored (u, v) -- or the face's previous projection -- seeds
+/// a local solve first, kept only when it lands within a hair of the point:
+/// a vertex
+/// meshed on this face carries this face's parameters, and a global search for
+/// every corner of every facet made the certificate's per-facet checks six
+/// global searches per facet (120 200 for a 20 000-facet NURBS wall). A
+/// stored value from a neighbour's chart (a welded rim vertex) does not land
+/// on the point, and the global search runs as before.
 fn project_uv(
     surface: &dyn crate::primitives::surface::Surface,
     p: crate::math::Point3,
+    stored: Option<(f64, f64)>,
 ) -> Option<(f64, f64)> {
-    surface
-        .closest_point(&p, crate::math::Tolerance::default())
-        .ok()
+    let tol = crate::math::Tolerance::default();
+    if let Some(seed) = stored {
+        let hair = 1e-6 * (1.0 + (p - crate::math::Point3::new(0.0, 0.0, 0.0)).magnitude());
+        // A mesh vertex lies ON the surface, so a solve that lands back on
+        // it is its parameter: no normality test, which a sub-micron miss
+        // (pure solver noise) would fail at random.
+        if let Ok(uv) = surface.closest_point_near(&p, seed, tol) {
+            if surface
+                .point_at(uv.0, uv.1)
+                .is_ok_and(|q| q.distance(&p) <= hair)
+            {
+                return Some(uv);
+            }
+        }
+    }
+    surface.closest_point(&p, tol).ok()
 }
 
 fn measure_face_u_spans(
@@ -1025,6 +1048,9 @@ fn measure_face_u_spans(
     has_faces: bool,
 ) -> HashMap<u32, f64> {
     let mut us_by_face: HashMap<u32, Vec<f64>> = HashMap::new();
+    // The last projection on each face seeds the next vertex's (see
+    // `project_uv`): consecutive facets of a face are neighbours.
+    let mut last_seed: HashMap<u32, (f64, f64)> = HashMap::new();
     for (i, tri) in mesh.triangles.iter().enumerate() {
         let fid = if has_faces { mesh.face_map[i] } else { 0 };
         let periodic = model
@@ -1039,9 +1065,10 @@ fn measure_face_u_spans(
             .get(fid)
             .and_then(|f| model.surfaces.get(f.surface_id));
         for &vi in tri.iter() {
-            if let Some(uv) =
-                surface.and_then(|s| project_uv(s, mesh.vertices[vi as usize].position))
-            {
+            let v = mesh.vertices[vi as usize];
+            let seed = v.uv.or_else(|| last_seed.get(&fid).copied());
+            if let Some(uv) = surface.and_then(|s| project_uv(s, v.position, seed)) {
+                last_seed.insert(fid, uv);
                 entry.push(uv.0.rem_euclid(p));
             }
         }
@@ -1162,6 +1189,8 @@ pub fn mesh_quality_with_normals(
     let mut min_angle = 180.0_f64;
     let mut max_dev = 0.0_f64;
     let mut boundary_crossing = 0usize;
+    // The last projection on each face seeds the next (see `project_uv`).
+    let mut crossing_seed: HashMap<u32, (f64, f64)> = HashMap::new();
 
     for (i, tri) in mesh.triangles.iter().enumerate() {
         let v0 = mesh.vertices[tri[0] as usize];
@@ -1225,8 +1254,18 @@ pub fn mesh_quality_with_normals(
             .faces
             .get(fid)
             .and_then(|f| model.surfaces.get(f.surface_id).map(|s| (f, s)));
-        let projected = face_surface
-            .and_then(|(_, s)| Some((project_uv(s, p0)?, project_uv(s, p1)?, project_uv(s, p2)?)));
+        let projected = face_surface.and_then(|(_, s)| {
+            let seed = |v: crate::tessellation::MeshVertex, last: &HashMap<u32, (f64, f64)>| {
+                v.uv.or_else(|| last.get(&fid).copied())
+            };
+            let uv0 = project_uv(s, p0, seed(v0, &crossing_seed))?;
+            crossing_seed.insert(fid, uv0);
+            let uv1 = project_uv(s, p1, seed(v1, &crossing_seed))?;
+            crossing_seed.insert(fid, uv1);
+            let uv2 = project_uv(s, p2, seed(v2, &crossing_seed))?;
+            crossing_seed.insert(fid, uv2);
+            Some((uv0, uv1, uv2))
+        });
         if let (Some((face, _)), Some((uv0, uv1, uv2))) = (face_surface, projected) {
             if let Some(surface) = model.surfaces.get(face.surface_id) {
                 if let Some(p) = surface.period_u() {
