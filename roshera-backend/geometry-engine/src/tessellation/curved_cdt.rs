@@ -1290,7 +1290,9 @@ impl<'a> ScaledChart<'a> {
         // was measured to break their meshes (part 146's tori and revolution
         // patches opened and folded).
         let periodic = inner.period_u().is_some() || inner.period_v().is_some();
-        if inner.is_developable() || (periodic && inner.type_name() != "NurbsSurface") {
+        if inner.is_developable()
+            || (periodic && !matches!(inner.type_name(), "NurbsSurface" | "SurfaceOfRevolution"))
+        {
             return None;
         }
         let (mut su, mut sv, mut n) = (0.0, 0.0, 0usize);
