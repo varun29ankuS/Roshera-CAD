@@ -599,6 +599,25 @@ pub fn tessellation_quality_with_normals(
     let mut stored_agree = 0usize;
     let mut analytic_agree = 0usize;
     let mut comparable = 0usize;
+    let mut sub_tolerance_facets = 0usize;
+    // A facet narrower than this has no direction to judge (see
+    // `TessellationQuality::sub_tolerance_facets`).
+    let sliver = {
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for v in &mesh.vertices {
+            let p = [v.position.x, v.position.y, v.position.z];
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        let diag = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
+        if diag.is_finite() {
+            diag * 1e-6
+        } else {
+            0.0
+        }
+    };
 
     for (i, tri) in mesh.triangles.iter().enumerate() {
         let v0 = mesh.vertices[tri[0] as usize];
@@ -611,6 +630,15 @@ pub fn tessellation_quality_with_normals(
         if geo.magnitude() <= 1e-12 {
             degenerate_triangles += 1;
             entry.1 += 1;
+            continue;
+        }
+        // Its smallest altitude: twice the area over the longest edge.
+        let longest = (v1.position - v0.position)
+            .magnitude()
+            .max((v2.position - v1.position).magnitude())
+            .max((v0.position - v2.position).magnitude());
+        if longest > 0.0 && geo.magnitude() / longest < sliver {
+            sub_tolerance_facets += 1;
             continue;
         }
         comparable += 1;
@@ -707,6 +735,7 @@ pub fn tessellation_quality_with_normals(
         worst_face,
     );
     quality.defects = defects;
+    quality.sub_tolerance_facets = sub_tolerance_facets;
     Some(quality)
 }
 
@@ -1991,5 +2020,65 @@ mod facet_footpoint_tests {
             tq.off_surface_facets, 0,
             "a clean barrel has no off-surface facets"
         );
+    }
+}
+
+#[cfg(test)]
+mod sub_tolerance_facet_tests {
+    use super::tessellation_quality_with_normals;
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::topology_builder::BRepModel;
+    use crate::tessellation::{MeshVertex, TriangleMesh};
+
+    fn vertex(x: f64, y: f64) -> MeshVertex {
+        MeshVertex {
+            position: Point3::new(x, y, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        }
+    }
+
+    /// A 10 mm square of the plane z = 0 (normal +Z), meshed as two
+    /// triangles, plus one extra triangle wound against +Z: either a sliver
+    /// whose width is far below the part's tolerance or an ordinary one.
+    fn mesh_with_inverted(width: f64) -> (TriangleMesh, Vec<Option<Vector3>>) {
+        let mut m = TriangleMesh::new();
+        let a = m.add_vertex(vertex(0.0, 0.0));
+        let b = m.add_vertex(vertex(10.0, 0.0));
+        let c = m.add_vertex(vertex(10.0, 10.0));
+        let d = m.add_vertex(vertex(0.0, 10.0));
+        m.add_triangle(a, b, c);
+        m.add_triangle(a, c, d);
+        // Along the bottom edge, wound clockwise seen from +Z.
+        let p = m.add_vertex(vertex(2.0, 0.0));
+        let q = m.add_vertex(vertex(5.0, width));
+        let r = m.add_vertex(vertex(8.0, 0.0));
+        m.add_triangle(p, q, r);
+        let normals = vec![Some(Vector3::Z); 3];
+        (m, normals)
+    }
+
+    /// A facet thinner than the part's tolerance has no meaningful
+    /// direction: its winding is decided by noise in its vertices (two edges
+    /// meeting a few hundredths of a micron apart, CADGenBench part 146's
+    /// tori). It is reported, not judged as turned against the surface.
+    #[test]
+    fn a_sub_tolerance_sliver_is_reported_not_judged() {
+        let (mesh, normals) = mesh_with_inverted(1e-9);
+        let q =
+            tessellation_quality_with_normals(&BRepModel::new(), &mesh, &normals).expect("quality");
+        assert_eq!(q.off_surface_facets, 0, "the sliver is not judged: {q:?}");
+        assert_eq!(q.sub_tolerance_facets, 1, "but it is reported: {q:?}");
+        assert!(q.clean, "{q:?}");
+    }
+
+    /// An ordinary facet wound against the surface is still a defect.
+    #[test]
+    fn an_inverted_facet_of_real_width_still_fails() {
+        let (mesh, normals) = mesh_with_inverted(1.0);
+        let q =
+            tessellation_quality_with_normals(&BRepModel::new(), &mesh, &normals).expect("quality");
+        assert_eq!(q.off_surface_facets, 1, "{q:?}");
+        assert!(!q.clean, "{q:?}");
     }
 }

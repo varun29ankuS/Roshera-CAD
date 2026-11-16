@@ -354,6 +354,11 @@ pub struct TessellationQuality {
     /// Facets pointing into the wrong hemisphere of the TRUE surface normal — the
     /// off-radial scribble count. The decisive signal for an inner-bore defect.
     pub off_surface_facets: usize,
+    /// Facets narrower than the part's tolerance (smallest altitude below
+    /// 1e-6 of the mesh's diagonal): their winding is decided by noise in
+    /// their vertices, so they are counted here and NOT judged against the
+    /// surface normal. A readout, not a gate.
+    pub sub_tolerance_facets: usize,
     /// The single worst face by normal disagreement — the agent's pointer to the
     /// defect. `None` when the mesh is clean.
     pub worst_face: Option<TessFaceDefect>,
@@ -398,6 +403,7 @@ impl TessellationQuality {
             analytic_normal_agreement,
             inconsistent_facets,
             off_surface_facets,
+            sub_tolerance_facets: 0,
             defects: worst_face.iter().cloned().collect(),
             worst_face,
             clean,
@@ -415,6 +421,7 @@ impl TessellationQuality {
             analytic_normal_agreement: 1.0,
             inconsistent_facets: 0,
             off_surface_facets: 0,
+            sub_tolerance_facets: 0,
             worst_face: None,
             defects: Vec::new(),
             clean: true,
