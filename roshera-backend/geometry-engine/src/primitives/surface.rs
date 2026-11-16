@@ -5833,9 +5833,28 @@ impl Surface for SurfaceOfRevolution {
         let radial = to_point - self.axis_direction * height;
         let radius = radial.magnitude();
 
-        // Reference meridian direction (profile plane at v = 0).
-        let p0 = self.profile_curve.point_at(0.0)?;
-        let (_, _, ref_dir) = self.decompose_profile_point(p0);
+        // Reference meridian direction (profile plane at v = 0), read at a
+        // profile point OFF the axis. A profile that starts on the axis (a
+        // cone's apex, a dome's pole) has no direction at u = 0 -- there
+        // `decompose_profile_point` picks an arbitrary perpendicular -- and
+        // angles measured from it were wrong by however far that is from the
+        // profile's real half-plane: the projection then searched the wrong
+        // meridian and returned a point up to a diameter away, as success.
+        let ref_dir = {
+            let mut found = None;
+            for u in [0.0, 0.5, 1.0, 0.25, 0.75, 0.125, 0.875] {
+                let p = self.profile_curve.point_at(u)?;
+                let (_, r, dir) = self.decompose_profile_point(p);
+                if r > 1e-12 * (1.0 + (p - self.axis_origin).magnitude()) {
+                    found = Some(dir);
+                    break;
+                }
+            }
+            match found {
+                Some(d) => d,
+                None => self.axis_direction.perpendicular(),
+            }
+        };
 
         // Find v (rotation angle) from the radial direction, measured from the
         // reference meridian.
