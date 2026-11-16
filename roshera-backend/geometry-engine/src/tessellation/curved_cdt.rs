@@ -2897,6 +2897,149 @@ fn scan_one_pass<S: MeshChart + ?Sized>(
     }
 }
 
+/// A developable facet standing more than this far off its surface (degrees)
+/// is split. Long thin facets along a cylinder's or cone's rulings lie on the
+/// wall and are left alone; a facet this far off cuts across the curve. Kept
+/// below the certificate's mesh-quality bound (40 degrees).
+const DEVELOPABLE_FACET_OFF_WALL_DEG: f64 = 30.0;
+
+/// At most this many split-and-retriangulate passes on a developable face.
+const DEVELOPABLE_SPLIT_PASSES: usize = 4;
+
+/// The one refinement a developable face gets: split every facet standing
+/// more than [`DEVELOPABLE_FACET_OFF_WALL_DEG`] off the surface at its centre,
+/// and triangulate again, for a few passes.
+///
+/// Developables skip Ruppert refinement because their first triangulation is
+/// usually already faithful and refinement only multiplied triangles (the bore
+/// wall that doubled every pass, BOOL #86). But it is not always faithful:
+/// with no interior points along the rulings, the triangulator can join
+/// samples of a shallow slanted rim -- or a notch corner and a row of grid
+/// points -- straight across the curve, a facet lying flat across the wall
+/// (CADGenBench part 130, 77 degrees; part 146, 51). Only those facets are
+/// split, at their centroid, which is inside the facet and so inside the face;
+/// faithful facets, however thin, are untouched. On a retriangulation failure
+/// the last good triangulation stands.
+#[allow(clippy::too_many_arguments)]
+fn split_developable_facets_off_the_wall<S: MeshChart + ?Sized>(
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    inner_polygons: &[Vec<(f64, f64)>],
+    initial_steiner: Vec<(f64, f64)>,
+    initial_pts2d: Vec<(f64, f64)>,
+    initial_triangles: Vec<[usize; 3]>,
+    surface: &S,
+    face: &Face,
+) -> (Vec<(f64, f64)>, Vec<[usize; 3]>) {
+    let keepout = boundary_keepout_uv(outer);
+    let hole_refs: Vec<&[(f64, f64)]> = inners.iter().map(|p| p.points_uv.as_slice()).collect();
+    let domain = TrimIndex::new(&outer.points_uv, &hole_refs);
+    let limit = DEVELOPABLE_FACET_OFF_WALL_DEG.to_radians().cos();
+    let mut steiner = initial_steiner;
+    let mut pts2d = initial_pts2d;
+    let mut triangles = initial_triangles;
+    for _pass in 0..DEVELOPABLE_SPLIT_PASSES {
+        let mut splits: Vec<(f64, f64)> = Vec::new();
+        for tri in &triangles {
+            let (ia, ib, ic) = (tri[0], tri[1], tri[2]);
+            if ia >= pts2d.len() || ib >= pts2d.len() || ic >= pts2d.len() {
+                continue;
+            }
+            let (Ok(pa), Ok(pb), Ok(pc)) = (
+                resolve_position_3d(ia, outer, inners, &pts2d, surface),
+                resolve_position_3d(ib, outer, inners, &pts2d, surface),
+                resolve_position_3d(ic, outer, inners, &pts2d, surface),
+            ) else {
+                continue;
+            };
+            let Ok(facet) = (pb - pa).cross(&(pc - pa)).normalize() else {
+                continue;
+            };
+            let centre = (
+                (pts2d[ia].0 + pts2d[ib].0 + pts2d[ic].0) / 3.0,
+                (pts2d[ia].1 + pts2d[ib].1 + pts2d[ic].1) / 3.0,
+            );
+            let Ok(n) = oriented_normal(surface, face, centre.0, centre.1) else {
+                continue;
+            };
+            // Either winding: the facet's tilt, not its side, is judged here.
+            if facet.dot(&n).abs() >= limit {
+                continue;
+            }
+            // Such a facet lies flat along a rim: its corners are rim samples
+            // or close to the rim. A point at its centre is close to the rim
+            // too and only makes smaller flat facets, so the new point goes
+            // DOWN THE RULING (the chart's v), about the facet's own length
+            // into the face -- the rim samples then join a point below them
+            // and the facets stand along the wall. Halved until it lands
+            // inside the face; the centre is the last resort.
+            let length = (pb - pa)
+                .magnitude()
+                .max((pc - pb).magnitude())
+                .max((pa - pc).magnitude());
+            let along_v = surface
+                .evaluate_full(centre.0, centre.1)
+                .map(|sp| sp.dv.magnitude())
+                .unwrap_or(0.0);
+            // A new point too close to an existing one only makes a sliver:
+            // keep a quarter of the facet's length (in the chart) clear of
+            // every point, old or new this pass.
+            let chart_length = {
+                let d = |i: usize, j: usize| {
+                    ((pts2d[i].0 - pts2d[j].0).powi(2) + (pts2d[i].1 - pts2d[j].1).powi(2)).sqrt()
+                };
+                d(ia, ib).max(d(ib, ic)).max(d(ic, ia))
+            };
+            let clear_sq = (0.25 * chart_length).powi(2);
+            let clear = |p: (f64, f64)| {
+                pts2d
+                    .iter()
+                    .chain(splits.iter())
+                    .all(|q| (q.0 - p.0).powi(2) + (q.1 - p.1).powi(2) >= clear_sq)
+            };
+            let usable = |p: (f64, f64)| domain.inside(p) && !domain.near(p, keepout) && clear(p);
+            let mut chosen = None;
+            if along_v > 0.0 && length > 0.0 {
+                let step = length / along_v;
+                'search: for t in [1.0, 0.5, 0.25] {
+                    for sign in [1.0, -1.0] {
+                        let p = (centre.0, centre.1 + sign * t * step);
+                        if usable(p) {
+                            chosen = Some(p);
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            if chosen.is_none() && usable(centre) {
+                chosen = Some(centre);
+            }
+            if let Some(p) = chosen {
+                splits.push(p);
+            }
+        }
+        if splits.is_empty() {
+            break;
+        }
+        if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+            eprintln!(
+                "[developable] face {:?} pass {_pass}: {} facet(s) off the wall split",
+                face.id,
+                splits.len()
+            );
+        }
+        steiner.extend(splits);
+        match run_cdt(&outer.points_uv, inner_polygons, &steiner) {
+            Ok((next_pts, next_tris)) => {
+                pts2d = next_pts;
+                triangles = next_tris;
+            }
+            Err(_) => break,
+        }
+    }
+    (pts2d, triangles)
+}
+
 /// Ruppert-style iterative refinement to convergence (or
 /// [`RUPPERT_MAX_PASSES`] cap, whichever comes first).
 ///
@@ -2936,7 +3079,16 @@ fn refine_to_convergence<S: MeshChart + ?Sized>(
     // through and refine; correctness on these laterals is held by the curved
     // poke matrix + analytic-watertight + HARNESS-1000 gates.
     if surface.is_developable() {
-        return (initial_pts2d, initial_triangles);
+        return split_developable_facets_off_the_wall(
+            outer,
+            inners,
+            inner_polygons,
+            initial_steiner,
+            initial_pts2d,
+            initial_triangles,
+            surface,
+            face,
+        );
     }
     let outer_uv_len = outer.points_uv.len();
     let inner_uv_lens: Vec<usize> = inners.iter().map(|p| p.points_uv.len()).collect();

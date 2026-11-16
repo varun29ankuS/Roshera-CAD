@@ -238,6 +238,70 @@ fn a_band_with_a_shallow_slanted_end_has_every_facet_along_the_wall() {
     }
 }
 
+/// [`band_between_cuts`] with its top arc written as TWO edges, split at 45
+/// degrees -- five sides, so neither band stitcher takes it and the general
+/// triangulator meshes it.
+fn band_with_a_split_top(c0: f64, k0: f64, c1: f64, k1: f64) -> String {
+    let s = band_between_cuts(c0, k0, c1, k1);
+    let r2 = 2f64.sqrt();
+    let split = format!(
+        "#15=CARTESIAN_POINT('',({r2:.17},{r2:.17},{z:.17}));
+#25=VERTEX_POINT('',#15);
+         #55=EDGE_CURVE('',#24,#25,#32,.T.);
+#56=EDGE_CURVE('',#25,#23,#32,.T.);
+         #65=ORIENTED_EDGE('',*,*,#56,.F.);
+#66=ORIENTED_EDGE('',*,*,#55,.F.);
+",
+        z = c1 + k1 * r2
+    );
+    s.replace(
+        "#70=EDGE_LOOP('',(#61,#62,#63,#64));",
+        &format!("{split}#70=EDGE_LOOP('',(#61,#62,#65,#66,#64));"),
+    )
+}
+
+/// The general triangulator adds no interior points along a cylinder's axis
+/// and skips refinement there, trusting the first triangulation to follow
+/// the wall. Beside a shallow slanted rim it does not: it joins rim samples
+/// across the curve, a facet flat across the wall. Every facet must lie along
+/// the wall whichever mesher takes the face (CADGenBench parts 130 and 146).
+#[test]
+fn a_five_sided_band_with_a_shallow_slanted_end_has_every_facet_along_the_wall() {
+    for (c0, k0, c1, k1) in [(0.0, 3.0, 60.0, 0.46), (0.0, 0.0, 50.0, 0.3)] {
+        let mesh = band_meshes_along_its_rails(&band_with_a_split_top(c0, k0, c1, k1));
+        let (worst, facet) = worst_facet_off_the_wall(&mesh);
+        assert!(
+            worst <= 40.0,
+            "cuts z = {c0} + {k0}x and z = {c1} + {k1}x, top split: a facet lies {worst:.1} degrees off the wall: {facet:?}"
+        );
+    }
+}
+
+/// The largest angle between a facet and the radius-2 cylinder about +Z, in
+/// degrees, and that facet's corners.
+fn worst_facet_off_the_wall(mesh: &TriangleMesh) -> (f64, Option<[Point3; 3]>) {
+    let mut worst = (0.0_f64, None);
+    for t in &mesh.triangles {
+        let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+        let Ok(n) = (b - a).cross(&(c - a)).normalize() else {
+            continue;
+        };
+        let m = Point3::new(
+            (a.x + b.x + c.x) / 3.0,
+            (a.y + b.y + c.y) / 3.0,
+            (a.z + b.z + c.z) / 3.0,
+        );
+        let radial = geometry_engine::math::Vector3::new(m.x, m.y, 0.0)
+            .normalize()
+            .expect("off the axis");
+        let dev = n.dot(&radial).abs().clamp(0.0, 1.0).acos().to_degrees();
+        if dev > worst.0 {
+            worst = (dev, Some([a, b, c]));
+        }
+    }
+    worst
+}
+
 fn band_meshes_along_its_rails(body: &str) -> TriangleMesh {
     let (model, report) = ExportEngine::new()
         .import_step_content(&envelope(body), "band")
