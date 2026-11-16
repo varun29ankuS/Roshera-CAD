@@ -1719,6 +1719,12 @@ fn generate_steiner_candidates<S: MeshChart + ?Sized>(
     let outer_only = TrimIndex::new(outer_polygon, &[]);
     let near_inner_edge =
         |u: f64, v: f64| -> bool { holes_only.as_ref().is_some_and(|h| h.near((u, v), keepout)) };
+    // The OUTER boundary too: a notched face's outer loop runs through the
+    // middle of its box, and a grid column can land ON one of its segments
+    // (CADGenBench part 116: a point on a cylinder's straight rail, 7e-15
+    // off it, joined its two neighbours along the rail into a zero-area
+    // facet). The bbox-boundary skip below only guards a rectangular trim.
+    let near_outer_edge = |u: f64, v: f64| -> bool { outer_only.near((u, v), keepout) };
 
     // Generate interior grid (skip the four corners so we don't
     // collide with boundary samples that may sit on the bbox edge).
@@ -1749,7 +1755,7 @@ fn generate_steiner_candidates<S: MeshChart + ?Sized>(
             if !domain.inside((u, v)) {
                 continue;
             }
-            if near_inner_edge(u, v) {
+            if near_inner_edge(u, v) || near_outer_edge(u, v) {
                 continue;
             }
             candidates.push((u, v));
@@ -1768,7 +1774,6 @@ fn generate_steiner_candidates<S: MeshChart + ?Sized>(
     // — and strictly interior (keepout from every boundary edge) so no Steiner
     // lands on a fixed edge. A no-op on a clean rectangular wall (no intermediate
     // heights), so the lean clean-cylinder mesh is unchanged.
-    let near_outer_edge = |u: f64, v: f64| -> bool { outer_only.near((u, v), keepout) };
     let v_eps = v_span * 1e-3;
     // Grid-row keepout (Task 4C sliver factory). A boundary vertex whose
     // TRUE height coincides with a main grid row projects with
@@ -5443,5 +5448,75 @@ mod pole_parameter_tests {
         let mut uv = before.clone();
         take_pole_parameters_from_neighbours(&mut uv, &[false; 4], true);
         assert_eq!(uv, before);
+    }
+}
+
+#[cfg(test)]
+mod outer_keepout_tests {
+    use super::generate_steiner_candidates;
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::surface::{Plane, Surface};
+    use crate::tessellation::TessellationParams;
+
+    fn distance_to_segment(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 {
+            (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (cx, cy) = (a.0 + t * dx, a.1 + t * dy);
+        ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
+    }
+
+    /// No interior grid point may sit ON the face's outer boundary. A
+    /// notched face's outer loop runs through the middle of its box; the
+    /// grid used to keep clear of holes and of the box's own edges only, so
+    /// a grid column could land on a notch segment and the triangulator
+    /// joined it to its neighbours along that segment -- a zero-area facet
+    /// (CADGenBench part 116).
+    #[test]
+    fn interior_grid_points_keep_clear_of_a_notched_outer_boundary() {
+        use crate::primitives::surface::Cylinder;
+        let cyl = Cylinder::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 10.0).expect("cylinder");
+        let surface: &dyn Surface = &cyl;
+        let _ = Plane::new;
+        let params = TessellationParams::default();
+        let (u1, z1) = (std::f64::consts::FRAC_PI_2, 10.0);
+        // Learn where the grid's columns fall on the plain quarter wall,
+        // then notch it with a straight rail (along the axis, like part
+        // 116's) a hair BEYOND one column, so grid points sit just inside.
+        let wall = vec![(0.0, 0.0), (u1, 0.0), (u1, z1), (0.0, z1)];
+        let grid = generate_steiner_candidates(surface, (0.0, u1, 0.0, z1), &wall, &[], &params);
+        let mut us: Vec<f64> = grid.iter().map(|p| p.0).collect();
+        us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        us.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+        assert!(us.len() > 2, "grid columns: {}", us.len());
+        let un = us[us.len() / 2] + 1e-13;
+        // The notch: the region u > un, z > 5 is cut away.
+        let outer = vec![
+            (0.0, 0.0),
+            (u1, 0.0),
+            (u1, 5.0),
+            (un, 5.0),
+            (un, z1),
+            (0.0, z1),
+        ];
+        let candidates =
+            generate_steiner_candidates(surface, (0.0, u1, 0.0, z1), &outer, &[], &params);
+        assert!(!candidates.is_empty(), "the L gets interior points");
+        let worst = candidates
+            .iter()
+            .map(|&p| {
+                (0..outer.len())
+                    .map(|k| distance_to_segment(p, outer[k], outer[(k + 1) % outer.len()]))
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            worst > 1e-9,
+            "an interior grid point lies on the outer boundary (distance {worst:.3e})"
+        );
     }
 }
