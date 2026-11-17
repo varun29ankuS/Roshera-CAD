@@ -178,6 +178,7 @@ pub fn import_step_text_uncertified(
     }
     report.roots_resolved = roots_with_solids;
     report.solids_in_roots = total_root_solids;
+    fit_linear_extrusions_to_faces(&mut model, &mut caches);
     merge_vertices_a_loop_passes_between(&mut model, &mut caches, &mut report);
     collapse_edges_shorter_than_their_tolerance(&mut model, &mut caches, &mut report);
     rebuild_edges_onto_face_intersections(&mut model, &mut caches, &mut report);
@@ -667,6 +668,108 @@ const EDGE_REBUILD_MIN_GAIN: f64 = 0.1;
 /// before as `deviation`, after as `tolerance`) and a Lens event on both
 /// faces. What cannot be rebuilt is left to
 /// [`raise_edge_tolerances_to_measured_gaps`].
+/// Span every `SURFACE_OF_LINEAR_EXTRUSION` over the faces that use it.
+///
+/// STEP's linear extrusion `C(u) + v V` is unbounded in `v`; the kernel
+/// builds it as a `RuledSurface` between `C` and `C + V`, a strip one
+/// extrusion vector long whose `v` is clamped to [0, 1]. OCCT writes `V` as
+/// a unit vector, so every extruded face more than 1 mm deep lay mostly off
+/// its own surface: CADGenBench part 211's edges measured 11 mm off a strip
+/// they sit exactly on in the file (OCCT measures 0.03 mm), and the part
+/// could not certify.
+///
+/// A point `C(u) + s d` of the extrusion (`d` the unit direction) has `|s|`
+/// at most its distance from the profile, so projecting every boundary point
+/// of the faces onto a strip that wide reads each one's offset `s`; the
+/// surface is rebuilt between `C + s_min d` and `C + s_max d` (a hair wider),
+/// keeping `v` along `+V` so the faces' sense is unchanged.
+fn fit_linear_extrusions_to_faces(
+    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
+    caches: &mut context::ResolutionCaches,
+) {
+    use geometry_engine::math::{Matrix4, Point3, Tolerance};
+    use geometry_engine::primitives::surface::{RuledSurface, Surface};
+    use std::collections::HashMap;
+    const EDGE_SAMPLES: usize = 9;
+    let extrusions = std::mem::take(&mut caches.linear_extrusions);
+    if extrusions.is_empty() {
+        return;
+    }
+    let mut faces_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (fid, face) in model.faces.iter() {
+        if extrusions.contains_key(&face.surface_id) {
+            faces_of.entry(face.surface_id).or_default().push(fid);
+        }
+    }
+    let translated = |c: &dyn geometry_engine::primitives::curve::Curve,
+                      by: geometry_engine::math::Vector3| {
+        c.transform(&Matrix4::translation(by.x, by.y, by.z))
+    };
+    for (sid, (profile, vector)) in &extrusions {
+        let Some(fids) = faces_of.get(sid) else {
+            continue;
+        };
+        let Ok(dir) = vector.normalize() else {
+            continue;
+        };
+        let mut points: Vec<Point3> = Vec::new();
+        for &fid in fids {
+            let Some(face) = model.faces.get(fid) else {
+                continue;
+            };
+            for l in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+                let Some(lp) = model.loops.get(l) else {
+                    continue;
+                };
+                for &e in &lp.edges {
+                    let Some(edge) = model.edges.get(e) else {
+                        continue;
+                    };
+                    for k in 0..EDGE_SAMPLES {
+                        let t = k as f64 / (EDGE_SAMPLES - 1) as f64;
+                        if let Ok(p) = edge.evaluate(t, &model.curves) {
+                            points.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        let profile_pts: Vec<Point3> = (0..=32)
+            .filter_map(|k| profile.point_at(k as f64 / 32.0).ok())
+            .collect();
+        let (Some(&origin), false) = (profile_pts.first(), points.is_empty()) else {
+            continue;
+        };
+        let farthest = |ps: &[Point3]| {
+            ps.iter()
+                .map(|p| (*p - origin).magnitude())
+                .fold(0.0, f64::max)
+        };
+        let reach = farthest(&points) + farthest(&profile_pts) + 1.0;
+        let wide = RuledSurface::new(
+            translated(profile.as_ref(), dir * -reach),
+            translated(profile.as_ref(), dir * reach),
+        );
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for p in &points {
+            if let Ok((_, v)) = wide.closest_point(p, Tolerance::default()) {
+                let s = -reach + 2.0 * reach * v;
+                lo = lo.min(s);
+                hi = hi.max(s);
+            }
+        }
+        if !(hi > lo) {
+            continue;
+        }
+        let margin = 1e-3 * (hi - lo) + 1e-6;
+        let fitted = RuledSurface::new(
+            translated(profile.as_ref(), dir * (lo - margin)),
+            translated(profile.as_ref(), dir * (hi + margin)),
+        );
+        model.surfaces.replace(*sid, Box::new(fitted));
+    }
+}
+
 /// Whether an edge `gap` mm off its faces is beyond any rebuild. Every
 /// rebuilt sample stays within [`EDGE_REBUILD_CAP`] of the file's curve and
 /// the result is kept only within [`EDGE_GAP_REPAIR_CAP`] of both faces, so
@@ -1521,5 +1624,82 @@ mod imp1_tests {
                 "a {hopeless} mm gap cannot be closed by a {EDGE_REBUILD_CAP} mm move"
             );
         }
+    }
+
+    /// A face on a SURFACE_OF_LINEAR_EXTRUSION that reaches 12 mm along a
+    /// unit extrusion vector lies on its surface: the strip the kernel
+    /// builds is one vector long, and before the fit the far edge measured
+    /// 11 mm off it (CADGenBench part 211).
+    #[test]
+    fn a_face_deeper_than_its_extrusion_vector_lies_on_its_surface() {
+        use geometry_engine::math::{Matrix4, Point3, Tolerance, Vector3};
+        use geometry_engine::primitives::curve::{Curve, Line};
+        use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+        use geometry_engine::primitives::face::{Face, FaceOrientation};
+        use geometry_engine::primitives::r#loop::{Loop, LoopType};
+        use geometry_engine::primitives::surface::RuledSurface;
+        use geometry_engine::primitives::topology_builder::BRepModel;
+
+        let mut model = BRepModel::new();
+        // Profile: a 10 mm line along x; extruded along +z by a UNIT vector.
+        let profile: Box<dyn Curve> = Box::new(Line::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(10.0, 0.0, 0.0),
+        ));
+        let unit = Vector3::new(0.0, 0.0, 1.0);
+        let strip = RuledSurface::new(
+            profile.clone_box(),
+            profile.transform(&Matrix4::translation(0.0, 0.0, 1.0)),
+        );
+        let sid = model.surfaces.add(Box::new(strip));
+        let mut caches = context::ResolutionCaches::default();
+        caches.linear_extrusions.insert(sid, (profile, unit));
+
+        // The face: the rectangle x 0..10, z 0..12 on that extrusion.
+        let corners = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(10.0, 0.0, 0.0),
+            Point3::new(10.0, 0.0, 12.0),
+            Point3::new(0.0, 0.0, 12.0),
+        ];
+        let vs: Vec<_> = corners
+            .iter()
+            .map(|p| model.vertices.add(p.x, p.y, p.z))
+            .collect();
+        let mut outer = Loop::new(0, LoopType::Outer);
+        for k in 0..4 {
+            let c = model
+                .curves
+                .add(Box::new(Line::new(corners[k], corners[(k + 1) % 4])));
+            let e = model.edges.add(Edge::new_auto_range(
+                0,
+                vs[k],
+                vs[(k + 1) % 4],
+                c,
+                EdgeOrientation::Forward,
+            ));
+            outer.add_edge(e, true);
+        }
+        let lid = model.loops.add(outer);
+        model
+            .faces
+            .add(Face::new(0, sid, lid, FaceOrientation::Forward));
+
+        fit_linear_extrusions_to_faces(&mut model, &mut caches);
+
+        let surface = model.surfaces.get(sid).expect("surface");
+        let worst = (0..=12)
+            .map(|k| {
+                let p = Point3::new(5.0, 0.0, f64::from(k));
+                let (u, v) = surface
+                    .closest_point(&p, Tolerance::default())
+                    .expect("projects");
+                surface.point_at(u, v).expect("evaluates").distance(&p)
+            })
+            .fold(0.0, f64::max);
+        assert!(
+            worst < 1e-9,
+            "points of the face up to 12 mm along the extrusion lie {worst:.3e} mm off its surface"
+        );
     }
 }

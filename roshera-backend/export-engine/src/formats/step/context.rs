@@ -228,6 +228,18 @@ pub struct ResolutionCaches {
     /// consumed by the root handler when walking a representation's
     /// items list.
     pub mapped_solids: HashMap<u64, Vec<SolidId>>,
+    /// Kernel surface -> the `SURFACE_OF_LINEAR_EXTRUSION` it was built from:
+    /// its profile and extrusion vector. STEP's extrusion is unbounded along
+    /// the vector, the kernel's `RuledSurface` a finite strip between the
+    /// profile and one translate of it, so
+    /// [`super::fit_linear_extrusions_to_faces`] spans each over its faces.
+    pub linear_extrusions: HashMap<
+        SurfaceId,
+        (
+            Box<dyn geometry_engine::primitives::curve::Curve>,
+            geometry_engine::math::Vector3,
+        ),
+    >,
     /// Source `#N` of a root representation (`SHAPE_REPRESENTATION` /
     /// `ADVANCED_BREP_SHAPE_REPRESENTATION`) → the kernel solid ids
     /// produced by its items list. Populated by the root handlers in

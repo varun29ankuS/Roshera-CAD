@@ -342,8 +342,11 @@ impl EntityHandler for SurfaceOfLinearExtrusionHandler {
         // rigid translate by the extrusion vector.
         let xlate = Matrix4::translation(disp.x, disp.y, disp.z);
         let translated = profile.transform(&xlate);
+        let kept = profile.clone_box();
         let surf = RuledSurface::new(profile, translated);
         let sid = ctx.model.surfaces.add(Box::new(surf));
+        // Spanned over its faces once they exist (the strip is one vector long).
+        ctx.caches.linear_extrusions.insert(sid, (kept, disp));
         ctx.caches.surfaces.insert(instance, sid);
         HandlerOutcome::Resolved
     }
