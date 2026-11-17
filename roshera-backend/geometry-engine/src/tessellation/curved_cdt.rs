@@ -1281,6 +1281,10 @@ pub(crate) struct ScaledChart<'a> {
 /// face is meshed in its [`ScaledChart`].
 const ANISOTROPY_LIMIT: f64 = 4.0;
 
+/// Total turning (radians) below which a parameter line across the whole
+/// face counts as straight.
+const STRAIGHT_TURNING: f64 = 1e-6;
+
 impl<'a> ScaledChart<'a> {
     /// `uv_points`: the face's projected boundary samples (native chart).
     pub(crate) fn for_face(inner: &'a dyn Surface, uv_points: &[(f64, f64)]) -> Option<Self> {
@@ -1311,7 +1315,35 @@ impl<'a> ScaledChart<'a> {
         }
         let (su, sv) = (su / n as f64, sv / n as f64);
         let ratio = (su / sv).max(sv / su);
-        (ratio > ANISOTROPY_LIMIT).then_some(Self { inner, su, sv })
+        if ratio <= ANISOTROPY_LIMIT {
+            return None;
+        }
+        // The native chart stretches its triangles along the long-step
+        // direction. Where that direction is a straight line on the surface
+        // (a fillet cylinder's axis) the stretch is the right shape, and an
+        // equal-step chart only multiplies the triangles needed across the
+        // curve until refinement hits its budget: a trimmed r = 1 fillet
+        // froze at 3.5e-3 mm chord error against a 1e-4 tolerance (the
+        // chamfer-crosses-fillet volume gates).
+        let long_u = su > sv;
+        let (mut lo, mut hi, mut turning) = (f64::INFINITY, f64::NEG_INFINITY, 0.0f64);
+        for &(u, v) in uv_points.iter().step_by((uv_points.len() / 64).max(1)) {
+            let w = if long_u { u } else { v };
+            lo = lo.min(w);
+            hi = hi.max(w);
+            if let Ok(e) = Surface::evaluate_full(inner, u, v) {
+                let (d, dd) = if long_u { (e.du, e.duu) } else { (e.dv, e.dvv) };
+                let m = d.magnitude();
+                if m > 0.0 {
+                    turning = turning.max(d.cross(&dd).magnitude() / (m * m * m));
+                }
+            }
+        }
+        let extent = (hi - lo) * if long_u { su } else { sv };
+        if turning * extent <= STRAIGHT_TURNING {
+            return None;
+        }
+        Some(Self { inner, su, sv })
     }
 
     /// Native `(u, v)` -> chart.
