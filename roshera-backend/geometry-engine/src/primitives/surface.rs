@@ -5112,8 +5112,27 @@ impl GeneralNurbsSurface {
             if !(det.abs() > f64::EPSILON * scale_eg * scale_eg) {
                 break;
             }
-            let step_u = -(g * gu - f * gv) / det;
-            let step_v = -(e * gv - f * gu) / det;
+            let mut step_u = -(g * gu - f * gv) / det;
+            let mut step_v = -(e * gv - f * gu) / det;
+            // Projected Newton: a parameter at its bound with the step pushing
+            // out of the domain is held there, and the other takes its own
+            // one-dimensional Newton step. Clamping the joint step instead
+            // keeps the wrong half of it, no step improves, and the search
+            // stops short of a footpoint that lies on the patch's edge.
+            let out_u = (u <= u_min && step_u < 0.0) || (u >= u_max && step_u > 0.0);
+            let out_v = (v <= v_min && step_v < 0.0) || (v >= v_max && step_v > 0.0);
+            match (out_u, out_v) {
+                (true, true) => break,
+                (false, true) => {
+                    step_v = 0.0;
+                    step_u = if e > 0.0 { -gu / e } else { 0.0 };
+                }
+                (true, false) => {
+                    step_u = 0.0;
+                    step_v = if g > 0.0 { -gv / g } else { 0.0 };
+                }
+                (false, false) => {}
+            }
             // Backtrack until the step brings the surface point closer.
             let mut factor = 1.0;
             let mut accepted = None;
@@ -5391,18 +5410,46 @@ impl Surface for GeneralNurbsSurface {
         let ((u_min, u_max), (v_min, v_max)) = self.parameter_bounds();
         const GRID: usize = 10;
         const SEEDS: usize = 3;
-        let mut seeds: Vec<(f64, f64, f64)> = Vec::with_capacity((GRID + 1) * (GRID + 1));
+        // Grid nodes closer than this (mm) are one point (a pole's row).
+        const SEED_SEPARATION: f64 = 1e-9;
+        let mut seeds: Vec<(f64, f64, f64, Point3)> = Vec::with_capacity((GRID + 1) * (GRID + 1));
         for i in 0..=GRID {
             let u = u_min + (u_max - u_min) * (i as f64) / (GRID as f64);
             for j in 0..=GRID {
                 let v = v_min + (v_max - v_min) * (j as f64) / (GRID as f64);
-                let d = point.distance(&self.nurbs.evaluate(u, v).point);
-                seeds.push((d, u, v));
+                let q = self.nurbs.evaluate(u, v).point;
+                seeds.push((point.distance(&q), u, v, q));
             }
         }
         seeds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // The seeds must be DISTINCT points. Along a collapsed side (a pole)
+        // every grid node of that row is the same point; when it is the
+        // nearest node, three copies of it were all the seeds, and the solver
+        // cannot leave a pole (its metric is degenerate there), so the pole
+        // came back as the footpoint -- 0.23 mm off on CADGenBench part 229.
+        // The nearest nodes are all kept, copies included: a seam's two
+        // sides are one point at two parameters, and both are needed to
+        // land a point on the right side of it (CADGenBench part 147). Only
+        // when the nearest nodes are fewer than SEEDS distinct points are
+        // further distinct nodes added.
+        let mut chosen: Vec<(f64, f64, Point3)> = Vec::with_capacity(2 * SEEDS);
+        let mut distinct = 0usize;
+        for (k, &(_, u, v, q)) in seeds.iter().enumerate() {
+            let new_point = chosen.iter().all(|c| c.2.distance(&q) > SEED_SEPARATION);
+            if k < SEEDS {
+                chosen.push((u, v, q));
+                if new_point {
+                    distinct += 1;
+                }
+            } else if distinct >= SEEDS {
+                break;
+            } else if new_point {
+                chosen.push((u, v, q));
+                distinct += 1;
+            }
+        }
         let mut best: Option<(f64, f64, f64)> = None;
-        for &(_, u, v) in seeds.iter().take(SEEDS) {
+        for &(u, v, _) in &chosen {
             let (fu, fv, d) = self.footpoint_from(point, (u, v), tolerance);
             if best.map_or(true, |(bd, _, _)| d < bd) {
                 best = Some((d, fu, fv));

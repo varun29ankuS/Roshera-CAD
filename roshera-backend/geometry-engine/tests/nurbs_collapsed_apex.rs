@@ -183,3 +183,99 @@ fn evaluate_full_on_the_collapsed_row_carries_the_limiting_normal() {
     );
     assert!(e.dv.magnitude() < 1e-12, "dv is zero on the collapsed row");
 }
+
+/// When the apex is the grid node nearest the query, every node of its row is
+/// that same point: the global footpoint search used to take three copies of
+/// it as its seeds, and the solver cannot leave a pole (its metric is
+/// degenerate there), so the APEX came back as the footpoint (CADGenBench
+/// part 229: 0.23 mm off, read as an 85 deg facet-normal deviation). The
+/// seeds are distinct points, so the true footpoint is found.
+#[test]
+fn closest_point_is_not_trapped_at_the_apex_when_it_is_the_nearest_grid_node() {
+    // A flat triangle: P(u, v) = (1 - u) (10 v, 10, 0), the u = 1 row
+    // collapsed to the origin.
+    let apex = Point3::new(0.0, 0.0, 0.0);
+    let nurbs = NurbsSurface::new(
+        vec![
+            vec![Point3::new(0.0, 10.0, 0.0), Point3::new(10.0, 10.0, 0.0)],
+            vec![apex, apex],
+        ],
+        vec![vec![1.0; 2]; 2],
+        vec![0.0, 0.0, 1.0, 1.0],
+        vec![0.0, 0.0, 1.0, 1.0],
+        1,
+        1,
+    )
+    .expect("a valid bilinear patch");
+    let patch = GeneralNurbsSurface { nurbs };
+    // 0.5 from the apex (the nearest grid node); its footpoint is on the
+    // v = 1 side (the line y = x), 0.1 / sqrt(2) away.
+    let query = Point3::new(0.4, 0.3, 0.0);
+    let (u, v) = patch
+        .closest_point(&query, Tolerance::default())
+        .expect("projects");
+    let found = patch.point_at(u, v).expect("evaluates").distance(&query);
+    let exact = 0.1 / 2f64.sqrt();
+    assert!(
+        (found - exact).abs() < 1e-6,
+        "footpoint at distance {found:.6} (u {u:.4}, v {v:.4}); the true one is {exact:.6}"
+    );
+}
+
+/// A closed surface's seam is one point at two parameters, u_min and u_max.
+/// When the nearest grid nodes are on the seam, both copies must be seeds: a
+/// query just short of the seam on the u_max side is reached only from the
+/// u_max copy, because the solver does not wrap round the seam. Keeping one
+/// copy of each point dropped it, and the footpoint stuck at u_min, 0.2 mm
+/// off (CADGenBench part 147: a NURBS face's boundary points lost, leaving
+/// open edges against its cone neighbour).
+#[test]
+fn closest_point_reaches_a_point_just_short_of_a_closed_surfaces_seam() {
+    // A radius-10 cylinder, z 0..10, u round a rational full circle that
+    // starts and ends at (10, 0, z).
+    let h = std::f64::consts::FRAC_1_SQRT_2;
+    let ring = [
+        (1.0, 0.0, 1.0),
+        (1.0, 1.0, h),
+        (0.0, 1.0, 1.0),
+        (-1.0, 1.0, h),
+        (-1.0, 0.0, 1.0),
+        (-1.0, -1.0, h),
+        (0.0, -1.0, 1.0),
+        (1.0, -1.0, h),
+        (1.0, 0.0, 1.0),
+    ];
+    let control_points = ring
+        .iter()
+        .map(|&(x, y, _)| {
+            vec![
+                Point3::new(10.0 * x, 10.0 * y, 0.0),
+                Point3::new(10.0 * x, 10.0 * y, 10.0),
+            ]
+        })
+        .collect();
+    let weights = ring.iter().map(|&(_, _, w)| vec![w, w]).collect();
+    let nurbs = NurbsSurface::new(
+        control_points,
+        weights,
+        vec![
+            0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+        ],
+        vec![0.0, 0.0, 1.0, 1.0],
+        2,
+        1,
+    )
+    .expect("a valid rational cylinder");
+    let cylinder = GeneralNurbsSurface { nurbs };
+    // On the surface, 0.02 rad before the seam going round the u direction.
+    let a = -0.02f64;
+    let query = Point3::new(10.0 * a.cos(), 10.0 * a.sin(), 5.05);
+    let (u, v) = cylinder
+        .closest_point(&query, Tolerance::default())
+        .expect("projects");
+    let found = cylinder.point_at(u, v).expect("evaluates").distance(&query);
+    assert!(
+        found < 1e-6,
+        "the query is on the surface, but its footpoint is {found:.6} away (u {u:.5}, v {v:.5})"
+    );
+}
