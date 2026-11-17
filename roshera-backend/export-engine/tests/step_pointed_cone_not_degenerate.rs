@@ -77,3 +77,24 @@ fn a_cone_running_to_its_point_is_not_a_degenerate_face() {
         "the cone face spans its base circle and apex: {degenerate:?}"
     );
 }
+
+/// The same cone meshes to its base circle and the part closes. The cap
+/// mesher for a cone running to its point refused a loop whose seam runs up
+/// to the apex and back -- every boundary sample had to stay off the apex --
+/// so the face fell to the untrimmed grid, which ignores the circle the base
+/// shares: CADGenBench part 217's drill-point cones left 81 open edges each,
+/// and their holes' walls 100.
+#[test]
+fn a_cone_running_to_its_point_meshes_to_its_base_circle() {
+    let (mut model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&pointed_cone()), "cone")
+        .expect("imports");
+    let solids: Vec<u32> = model.solids.iter().map(|(id, _)| id).collect();
+    assert_eq!(solids.len(), 1, "one solid: {:#?}", report.warnings);
+    let cert = model.certify_solid(solids[0]);
+    assert!(
+        cert.is_sound(),
+        "the pointed cone on its base disk certifies sound: {:?}",
+        cert.errors
+    );
+}

@@ -4195,7 +4195,30 @@ fn tessellate_cone_apex_cap(
     let Ok(axis) = cone.axis.normalize() else {
         return false;
     };
-    let rim = loop_rim_samples(lp, model, cache);
+    // A seam -- an edge the loop walks out along and back -- bounds nothing:
+    // on a cone that runs to its point it is the ruling from the rim up to
+    // the apex and down again (a drill point, CADGenBench part 217), and its
+    // samples reaching the apex refused the cap. The rim is the rest.
+    let is_seam = |e: &u32| lp.edges.iter().filter(|f| *f == e).count() > 1;
+    let rim_loop = if lp.edges.iter().any(is_seam) {
+        let mut kept = lp.clone();
+        let (edges, orientations): (Vec<u32>, Vec<bool>) = lp
+            .edges
+            .iter()
+            .zip(lp.orientations.iter())
+            .filter(|(e, _)| !is_seam(e))
+            .map(|(&e, &o)| (e, o))
+            .unzip();
+        if edges.is_empty() {
+            return false;
+        }
+        kept.edges = edges;
+        kept.orientations = orientations;
+        kept
+    } else {
+        lp.clone()
+    };
+    let rim = loop_rim_samples(&rim_loop, model, cache);
     if rim.len() < 3 {
         return false;
     }
