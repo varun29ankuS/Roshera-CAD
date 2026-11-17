@@ -308,34 +308,64 @@ pub fn tessellate_solids(
     }
 }
 
+/// The parameters [`tessellate_solid`] actually meshes `solid` with.
+///
+/// Size-relative chord FLOOR. An absolute chord (the 0.001 mm default) is a
+/// size-blind deviation: on a 178 mm part it is 178000:1, which both wastes
+/// wall-clock (build jitter) and pushes adjacent analytic bands into a
+/// non-conforming fine-density regime (KNOWN_BUGS REVOLVE-TESS-SEAM). The
+/// chord is floored at a small fraction of the part's size so it can only get
+/// COARSER, never finer -- coarse explicit chords (manifold_report's 0.5,
+/// preview's 0.01) are above the floor and untouched; only pathological
+/// over-tessellation is clamped. ~5e-4 * diagonal is about a 6 deg facet on the
+/// part's gross radius -- smooth for display AND watertight for export. Two
+/// requests with equal effective parameters mesh to the same mesh.
+pub(crate) fn effective_params(
+    solid: &Solid,
+    model: &BRepModel,
+    params: &TessellationParams,
+) -> TessellationParams {
+    const REL_FLOOR: f64 = 5.0e-4;
+    let floor = solid_extent(solid, model) * REL_FLOOR;
+    if params.chord_tolerance > 0.0 && params.chord_tolerance < floor {
+        TessellationParams {
+            chord_tolerance: floor,
+            ..params.clone()
+        }
+    } else {
+        params.clone()
+    }
+}
+
+/// `params` as comparable bits: equal keys, equal meshes.
+pub(crate) fn params_key(params: &TessellationParams) -> [u64; 5] {
+    [
+        params.max_edge_length.to_bits(),
+        params.max_angle_deviation.to_bits(),
+        params.chord_tolerance.to_bits(),
+        params.min_segments as u64,
+        params.max_segments as u64,
+    ]
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every `tessellate_solid` call on this thread: the solid and the
+    /// effective parameters (test instrumentation -- a caller must not mesh
+    /// the same solid twice at the same parameters).
+    pub(crate) static TESSELLATIONS: std::cell::RefCell<Vec<(u32, [u64; 5])>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub fn tessellate_solid(
     solid: &Solid,
     model: &BRepModel,
     params: &TessellationParams,
 ) -> TriangleMesh {
-    // Size-relative chord FLOOR. An absolute chord (the 0.001 mm default) is a
-    // size-blind deviation: on a 178 mm part it is 178000:1, which both wastes
-    // wall-clock (build jitter) and pushes adjacent analytic bands into a
-    // non-conforming fine-density regime (KNOWN_BUGS REVOLVE-TESS-SEAM). Floor
-    // the chord at a small fraction of the part's size so it can only get
-    // COARSER, never finer — coarse explicit chords (manifold_report's 0.5,
-    // preview's 0.01) are above the floor and untouched; only pathological
-    // over-tessellation is clamped. ~5e-4·diagonal ≈ a 6° facet on the part's
-    // gross radius — smooth for display AND watertight for export.
-    let floored;
-    let params = {
-        const REL_FLOOR: f64 = 5.0e-4;
-        let floor = solid_extent(solid, model) * REL_FLOOR;
-        if params.chord_tolerance > 0.0 && params.chord_tolerance < floor {
-            floored = TessellationParams {
-                chord_tolerance: floor,
-                ..params.clone()
-            };
-            &floored
-        } else {
-            params
-        }
-    };
+    // Size-relative chord FLOOR: see `effective_params`.
+    let params = &effective_params(solid, model, params);
+    #[cfg(test)]
+    TESSELLATIONS.with(|t| t.borrow_mut().push((solid.id, params_key(params))));
     let mut mesh = TriangleMesh::new();
 
     // A single canonical edge-sample cache is shared by every face of
@@ -1293,5 +1323,44 @@ mod parallel_shell_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod certificate_mesh_reuse_tests {
+    use super::*;
+    use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+    /// The self-certificate meshes a solid for its topology checks and again
+    /// for its display-quality checks. On a part large enough that its size
+    /// floor lifts the display chord to the certification chord, the two
+    /// meshes are the same mesh, and it was built twice (CADGenBench part 211:
+    /// 46 s + 27 s). No two meshings of one solid at equal effective
+    /// parameters.
+    #[test]
+    fn certifying_a_large_part_meshes_it_once_per_parameter_set() {
+        let mut model = BRepModel::new();
+        let solid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(300.0, 300.0, 300.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            other => panic!("a box is a solid: {other:?}"),
+        };
+        TESSELLATIONS.with(|t| t.borrow_mut().clear());
+        let cert = model.certify_solid(solid);
+        assert!(
+            cert.is_sound(),
+            "the box certifies sound: {:?}",
+            cert.errors
+        );
+        let calls = TESSELLATIONS.with(|t| t.borrow().clone());
+        let mut seen = std::collections::HashSet::new();
+        let repeats: Vec<_> = calls.iter().filter(|c| !seen.insert(**c)).collect();
+        assert!(
+            repeats.is_empty(),
+            "the certificate meshed one solid twice at the same parameters: {repeats:?} (all: {calls:?})"
+        );
     }
 }

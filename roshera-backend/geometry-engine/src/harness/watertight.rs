@@ -395,8 +395,24 @@ pub fn manifold_and_shell_orientation_report(
         ..TessellationParams::default()
     };
     let mesh = tessellate_solid(solid_ref, model, &params);
-    let report = manifold_report_mesh(&mesh, weld_eps)?;
-    let witnesses = misoriented_shells(model, solid, &mesh);
+    manifold_and_shell_orientation_report_of_mesh(model, solid, &mesh, weld_eps)
+}
+
+/// [`manifold_and_shell_orientation_report`] of a mesh the caller already
+/// has: `mesh` must be `solid`'s own tessellation (the certificate passes its
+/// display mesh when both checks would mesh the solid at the same effective
+/// parameters).
+pub fn manifold_and_shell_orientation_report_of_mesh(
+    model: &BRepModel,
+    solid: SolidId,
+    mesh: &TriangleMesh,
+    weld_eps: f64,
+) -> Option<(
+    ManifoldReport,
+    Vec<crate::primitives::provenance::MisorientedShell>,
+)> {
+    let report = manifold_report_mesh(mesh, weld_eps)?;
+    let witnesses = misoriented_shells(model, solid, mesh);
     Some((report, witnesses))
 }
 

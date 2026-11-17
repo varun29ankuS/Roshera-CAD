@@ -3205,16 +3205,43 @@ impl BRepModel {
         // a shell turned inside-out as a whole keeps every triangle consistent
         // with its neighbours. It rides on the SAME certification mesh (one
         // tessellation feeds both reports).
-        let (report, misoriented_shells) =
-            match crate::harness::watertight::manifold_and_shell_orientation_report(
+        // The certification mesh and the display mesh below are the SAME mesh
+        // whenever the part's size floor lifts the display chord to the
+        // certification chord (parts larger than ~200 mm): equal effective
+        // parameters mesh identically. Then the solid is meshed once and that
+        // mesh serves both -- CADGenBench part 211 meshed twice for 46 + 27 s.
+        let display_params = crate::tessellation::TessellationParams::default();
+        let certificate_params = crate::tessellation::TessellationParams {
+            chord_tolerance: CERTIFICATE_MESH_CHORD,
+            ..crate::tessellation::TessellationParams::default()
+        };
+        let shared_mesh = self.solids.get(solid_id).and_then(|s| {
+            let key = |p: &crate::tessellation::TessellationParams| {
+                crate::tessellation::params_key(&crate::tessellation::effective_params(s, self, p))
+            };
+            (key(&display_params) == key(&certificate_params))
+                .then(|| crate::tessellation::tessellate_solid(s, self, &display_params))
+        });
+        let analysed = match &shared_mesh {
+            Some(mesh) => {
+                crate::harness::watertight::manifold_and_shell_orientation_report_of_mesh(
+                    self,
+                    solid_id,
+                    mesh,
+                    CERTIFICATE_MESH_WELD_EPS,
+                )
+            }
+            None => crate::harness::watertight::manifold_and_shell_orientation_report(
                 self,
                 solid_id,
                 CERTIFICATE_MESH_CHORD,
                 CERTIFICATE_MESH_WELD_EPS,
-            ) {
-                Some((r, w)) => (Some(r), w),
-                None => (None, Vec::new()),
-            };
+            ),
+        };
+        let (report, misoriented_shells) = match analysed {
+            Some((r, w)) => (Some(r), w),
+            None => (None, Vec::new()),
+        };
         lap("manifold+orientation mesh", t);
         let shells_measured = report.is_some();
         let shells_outward = shells_measured && misoriented_shells.is_empty();
@@ -3269,12 +3296,10 @@ impl BRepModel {
         // One display-resolution mesh feeds both quality checks below: meshing
         // an imported part can take tens of seconds, and each check used to
         // mesh it again on its own.
-        let display_mesh = self.solids.get(solid_id).map(|s| {
-            crate::tessellation::tessellate_solid(
-                &s,
-                self,
-                &crate::tessellation::TessellationParams::default(),
-            )
+        let display_mesh = shared_mesh.or_else(|| {
+            self.solids
+                .get(solid_id)
+                .map(|s| crate::tessellation::tessellate_solid(&s, self, &display_params))
         });
         lap("display mesh", t);
         let t = std::time::Instant::now();
