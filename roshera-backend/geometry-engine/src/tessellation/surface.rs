@@ -3547,6 +3547,8 @@ fn tessellate_spherical_with_poles(
     near_south_pole: bool,
     mesh: &mut TriangleMesh,
 ) {
+    // The face's trim polygons, projected once for every point below.
+    let membership = FaceMembership::new(face, model);
     let mut vertex_grid = Vec::new();
 
     // Generate vertices with special pole handling
@@ -3564,7 +3566,7 @@ fn tessellate_spherical_with_poles(
                 surface.point_at(u, v),
                 face.normal_at(u, v, &model.surfaces),
             ) {
-                if is_point_inside_face(u, v, face, model) {
+                if membership.contains(u, v) {
                     let index = mesh.add_vertex(MeshVertex {
                         position: point,
                         normal,
@@ -3578,7 +3580,7 @@ fn tessellate_spherical_with_poles(
             for u_idx in 0..=u_steps {
                 let u = u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64);
 
-                let inside = is_point_inside_face(u, v, face, model);
+                let inside = membership.contains(u, v);
                 if inside {
                     if let (Ok(point), Ok(normal)) = (
                         surface.point_at(u, v),
@@ -3728,6 +3730,8 @@ fn tessellate_spherical_regular(
     _v_steps: usize,
     mesh: &mut TriangleMesh,
 ) {
+    // The face's trim polygons, projected once for every point below.
+    let membership = FaceMembership::new(face, model);
     // Use adaptive tessellation for better quality
     let tessellator = AdaptiveTessellator::new(TessellationParams::default());
     let temp_mesh = tessellator.tessellate_patch(surface, (u_min, u_max), (v_min, v_max));
@@ -3745,7 +3749,7 @@ fn tessellate_spherical_regular(
     for vertex in &temp_mesh.vertices {
         // Check if vertex is inside face boundaries
         if let Some((u, v)) = vertex.uv {
-            if is_point_inside_face(u, v, face, model) {
+            if membership.contains(u, v) {
                 let index = mesh.add_vertex(MeshVertex {
                     position: vertex.position,
                     normal: vertex.normal,
@@ -6038,6 +6042,8 @@ fn tessellate_surface_grid(
     v_steps: usize,
     mesh: &mut TriangleMesh,
 ) {
+    // The face's trim polygons, projected once for every point below.
+    let membership = FaceMembership::new(face, model);
     let mut vertex_grid = Vec::new();
 
     // Generate vertices
@@ -6048,7 +6054,7 @@ fn tessellate_surface_grid(
         for u_idx in 0..=u_steps {
             let u = u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64);
 
-            if is_point_inside_face(u, v, face, model) {
+            if membership.contains(u, v) {
                 if let (Ok(point), Ok(normal)) = (
                     surface.point_at(u, v),
                     face.normal_at(u, v, &model.surfaces),
@@ -10593,17 +10599,107 @@ pub(crate) fn face_uv_domain_is_rectangular(face: &Face, model: &BRepModel) -> b
 
 /// Check if a parameter point is inside face boundaries using winding number algorithm
 pub(crate) fn is_point_inside_face(u: f64, v: f64, face: &Face, model: &BRepModel) -> bool {
-    // Robust path for a sphere trimmed by coplanar cut circles: an
-    // iso-parametric cut circle has zero `(u, v)` area, so the winding test
-    // below degenerates (a cap renders as the whole sphere; a multi-hole
-    // central region cannot be expressed). Test the circle-plane half-spaces
-    // instead. `None` (non-sphere, or non-circular trims) falls through to the
-    // legacy winding test, so existing faces are unaffected.
-    if let Some(surface) = model.surfaces.get(face.surface_id) {
+    FaceMembership::new(face, model).contains(u, v)
+}
+
+/// [`is_point_inside_face`] for many points of one face. A loop's `(u, v)`
+/// polygon is found by sampling every one of its edges and projecting each
+/// sample onto the surface; that is the same for every point asked about,
+/// so it is done once here, not once per point. Built per point, it was the
+/// whole cost of meshing a trimmed sphere: 109 229 membership tests on one
+/// face of CADGenBench part 208 at 0.15-0.22 ms each, 24.4 s of its 24.4 s.
+pub(crate) struct FaceMembership<'a> {
+    face: &'a Face,
+    model: &'a BRepModel,
+    surface: Option<&'a dyn Surface>,
+    period_u: Option<f64>,
+    period_v: Option<f64>,
+    outer: LoopMembership,
+    holes: Vec<LoopMembership>,
+}
+
+/// One loop of a [`FaceMembership`].
+enum LoopMembership {
+    /// The loop decides nothing by position: missing (`false`), or a
+    /// degenerate polygon -- fewer than 3 samples or no area, the canonical
+    /// case a sphere face whose outer loop is one seam edge traversed out
+    /// and back -- which an outer loop reads as the whole domain (`true`)
+    /// and a hole as no hole (`false`).
+    Fixed(bool),
+    /// The loop's polygon in the surface's universal cover.
+    Polygon(Vec<(f64, f64)>),
+}
+
+impl LoopMembership {
+    fn build(
+        loop_id: crate::primitives::r#loop::LoopId,
+        model: &BRepModel,
+        surface: Option<&dyn Surface>,
+    ) -> Self {
+        let (Some(loop_data), Some(surface)) = (model.loops.get(loop_id), surface) else {
+            return Self::Fixed(false);
+        };
+        let polygon = get_loop_polygon_2d(loop_data, model, surface);
+        // Well below any realistic face area in radians^2 (a 1-arc-second
+        // square loop has area ~2.3e-11) yet above the f64 round-off of the
+        // `closest_point` projections (~2e-14).
+        const DEGENERATE_AREA_TOL: f64 = 1e-12;
+        let is_outer = matches!(
+            loop_data.loop_type,
+            crate::primitives::r#loop::LoopType::Outer
+        );
+        if polygon.len() < 3 || polygon_signed_area_uv(&polygon).abs() < DEGENERATE_AREA_TOL {
+            return Self::Fixed(is_outer);
+        }
+        Self::Polygon(polygon)
+    }
+
+    /// Winding-number membership (Sunday 2001). The polygon lives in the
+    /// universal cover (`project_loop_uv_unwrapped`); `u`/`v` arrive
+    /// canonicalised from `closest_point`/`exact_uv` -- see
+    /// `winding_membership_periodic`.
+    fn contains(&self, u: f64, v: f64, period_u: Option<f64>, period_v: Option<f64>) -> bool {
+        match self {
+            Self::Fixed(inside) => *inside,
+            Self::Polygon(polygon) => {
+                winding_membership_periodic(u, v, polygon, period_u, period_v)
+            }
+        }
+    }
+}
+
+impl<'a> FaceMembership<'a> {
+    pub(crate) fn new(face: &'a Face, model: &'a BRepModel) -> Self {
+        let surface = model.surfaces.get(face.surface_id);
+        Self {
+            face,
+            model,
+            surface,
+            period_u: surface.and_then(|s| s.period_u()),
+            period_v: surface.and_then(|s| s.period_v()),
+            outer: LoopMembership::build(face.outer_loop, model, surface),
+            holes: face
+                .inner_loops
+                .iter()
+                .map(|&hole| LoopMembership::build(hole, model, surface))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn contains(&self, u: f64, v: f64) -> bool {
+        // Robust path for a sphere trimmed by coplanar cut circles: an
+        // iso-parametric cut circle has zero `(u, v)` area, so the winding
+        // test below degenerates (a cap renders as the whole sphere; a
+        // multi-hole central region cannot be expressed). Test the
+        // circle-plane half-spaces instead. `None` (non-sphere, or
+        // non-circular trims) falls through to the winding test.
+        let Some(surface) = self.surface else {
+            return false;
+        };
         if let Ok(p) = surface.point_at(u, v) {
             if let Some(inside) = crate::operations::boolean::spherical_circular_membership(
-                model,
-                face,
+                self.model,
+                self.face,
                 surface,
                 &p,
                 &crate::math::Tolerance::default(),
@@ -10611,117 +10707,49 @@ pub(crate) fn is_point_inside_face(u: f64, v: f64, face: &Face, model: &BRepMode
                 return inside;
             }
         }
-    }
-
-    let inside_at = |u: f64, v: f64| {
-        // Outer loop: the point must be inside it; inner loops (holes): it
-        // must be outside every one.
-        is_point_inside_loop(u, v, face.outer_loop, face, model)
-            && !face
-                .inner_loops
-                .iter()
-                .any(|&hole| is_point_inside_loop(u, v, hole, face, model))
-    };
-    if inside_at(u, v) {
-        return true;
-    }
-    // On a periodic surface (u + period is the same point) a loop's unwrapped
-    // polygon may sit a period away from the `(u, v)` asked about, and a point
-    // exactly on the seam read as outside its own face: a ray hitting a
-    // fillet torus at u = 0 passed straight through it.
-    let Some(surface) = model.surfaces.get(face.surface_id) else {
-        return false;
-    };
-    // A point ON the seam lies on the loop polygon's own seam edge in every
-    // image, and the winding test reads an on-edge point as outside; a seam
-    // is no boundary of a periodic face, so a hair to either side of it
-    // decides.
-    let shifts = |period: Option<f64>| -> Vec<f64> {
-        match period {
-            Some(p) if p.is_finite() && p > 0.0 => {
-                let hair = p * 1.0e-9;
-                [0.0, p, -p]
-                    .iter()
-                    .flat_map(|&k| [k, k + hair, k - hair])
-                    .collect()
-            }
-            _ => vec![0.0],
+        let (pu, pv) = (self.period_u, self.period_v);
+        // Inside the outer loop and outside every hole.
+        let inside_at = |u: f64, v: f64| {
+            self.outer.contains(u, v, pu, pv)
+                && !self.holes.iter().any(|h| h.contains(u, v, pu, pv))
+        };
+        if inside_at(u, v) {
+            return true;
         }
-    };
-    let (su, sv) = (shifts(surface.period_u()), shifts(surface.period_v()));
-    su.iter()
-        .flat_map(|&du| sv.iter().map(move |&dv| (du, dv)))
-        .filter(|&(du, dv)| du != 0.0 || dv != 0.0)
-        .any(|(du, dv)| inside_at(u + du, v + dv))
-}
-
-/// Check if a point is inside a loop using winding number algorithm.
-///
-/// Handles three cases explicitly:
-///
-/// 1. **Non-degenerate polygon** — winding-number test (Sunday 2001).
-///    A non-zero winding number indicates the point is enclosed.
-///
-/// 2. **Degenerate polygon** (fewer than 3 distinct samples, or
-///    near-zero signed area) — the loop is a topological seam, not a
-///    meaningful boundary in parameter space. The canonical case is a
-///    sphere face whose outer loop is a single seam edge traversed
-///    forward then reversed; in `(u, v)` it collapses onto the line
-///    `u = 0`. For an **outer** loop this means the face covers the
-///    full parametric domain — accept any point. For an **inner** loop
-///    (a hole) it means there is effectively no hole — reject any
-///    point as not-in-hole.
-///
-/// 3. **Missing loop / surface** — return `false` for safety.
-fn is_point_inside_loop(
-    u: f64,
-    v: f64,
-    loop_id: crate::primitives::r#loop::LoopId,
-    face: &Face,
-    model: &BRepModel,
-) -> bool {
-    let loop_data = match model.loops.get(loop_id) {
-        Some(l) => l,
-        None => return false,
-    };
-
-    let surface = match model.surfaces.get(face.surface_id) {
-        Some(s) => s,
-        None => return false,
-    };
-
-    let polygon = get_loop_polygon_2d(loop_data, model, surface);
-
-    // Degenerate-polygon fallback. Tolerance chosen well below any
-    // realistic face area in radians² (a 1-arc-second-square loop has
-    // area ≈ 2.3e-11) yet large enough to absorb f64 round-off in
-    // `closest_point` projections (~1e-15 per sample × 20 samples per
-    // edge × O(1) edges ≈ 2e-14 noise floor).
-    const DEGENERATE_AREA_TOL: f64 = 1e-12;
-    let is_outer = matches!(
-        loop_data.loop_type,
-        crate::primitives::r#loop::LoopType::Outer
-    );
-    if polygon.len() < 3 {
-        return is_outer;
+        // On a periodic surface (u + period is the same point) a loop's
+        // unwrapped polygon may sit a period away from the `(u, v)` asked
+        // about, and a point exactly on the seam read as outside its own
+        // face: a ray hitting a fillet torus at u = 0 passed straight
+        // through it. A point ON the seam lies on the loop polygon's own
+        // seam edge in every image, and the winding test reads an on-edge
+        // point as outside; a seam is no boundary of a periodic face, so a
+        // hair to either side of it decides.
+        let shifts = |period: Option<f64>| -> Vec<f64> {
+            match period {
+                Some(p) if p.is_finite() && p > 0.0 => {
+                    let hair = p * 1.0e-9;
+                    [0.0, p, -p]
+                        .iter()
+                        .flat_map(|&k| [k, k + hair, k - hair])
+                        .collect()
+                }
+                _ => vec![0.0],
+            }
+        };
+        let (su, sv) = (shifts(pu), shifts(pv));
+        su.iter()
+            .flat_map(|&du| sv.iter().map(move |&dv| (du, dv)))
+            .filter(|&(du, dv)| du != 0.0 || dv != 0.0)
+            .any(|(du, dv)| inside_at(u + du, v + dv))
     }
-    if polygon_signed_area_uv(&polygon).abs() < DEGENERATE_AREA_TOL {
-        return is_outer;
-    }
-
-    // The polygon lives in the surface's universal cover (that is what
-    // `project_loop_uv_unwrapped` is for); `u`/`v` arrive canonicalised from
-    // `closest_point`/`exact_uv`. Compare them on every branch that could
-    // reach the polygon — see `winding_membership_periodic`.
-    winding_membership_periodic(u, v, &polygon, surface.period_u(), surface.period_v())
 }
 
 /// Cache of a loop's projected UV polygon (see [`project_loop_uv_unwrapped`])
 /// and its derived trim-membership data, keyed by [`crate::primitives::r#loop::LoopId`].
 ///
-/// `is_point_inside_loop` rebuilds this polygon from scratch on EVERY call — 20
-/// boundary samples per edge, each a `Surface::closest_point` solve — which is
-/// cheap in isolation but ruinous when the same handful of faces are probed
+/// Building this polygon takes 20 boundary samples per edge, each a
+/// `Surface::closest_point` solve — cheap once per face (`FaceMembership`)
+/// but ruinous when the same handful of faces are probed
 /// thousands of times per drawing view (HLR's broad-phase occlusion grid,
 /// `drawing::visibility::OcclusionGrid`). That repetition is inherent, not a
 /// bug: a genuinely visible sample point has no occluder, so the occlusion
@@ -10756,7 +10784,7 @@ pub(crate) struct CachedLoopUv {
     v_reject: Option<[f64; 3]>,
     /// The owning surface's periods, carried so `classify_cached` can run the
     /// same universal-cover membership test as the uncached
-    /// `is_point_inside_loop` — see [`winding_membership_periodic`]. Without
+    /// `FaceMembership` — see [`winding_membership_periodic`]. Without
     /// these the cached path would reject canonical query parameters that the
     /// uncached path accepts, and the two would silently disagree.
     period_u: Option<f64>,
@@ -10884,7 +10912,7 @@ pub(crate) fn point_inside_face_uv_cached(
 /// Get loop as 2D polygon in parameter space.
 ///
 /// Thin wrapper over `project_loop_uv_unwrapped`; kept as a named entry
-/// point for the winding-number test in `is_point_inside_loop`.
+/// point for the winding-number test in `LoopMembership`.
 fn get_loop_polygon_2d(
     loop_data: &crate::primitives::r#loop::Loop,
     model: &BRepModel,
@@ -10970,7 +10998,7 @@ pub(crate) fn project_loop_uv_unwrapped(
         // sphere face's seam-edge-traversed-twice loop projects as
         // *forward + forward* in (u, v) and accumulates a non-zero
         // signed area. The degenerate-loop fallback in
-        // `is_point_inside_loop` would then fail to fire and the
+        // `LoopMembership::build` would then fail to fire and the
         // winding-number test rejects most interior samples.
         let forward = loop_data
             .orientations
@@ -11022,7 +11050,7 @@ pub(crate) fn project_loop_uv_unwrapped(
 
 /// Compute the signed area of a closed `(u, v)` polygon (shoelace).
 ///
-/// Used by the degenerate-loop fallback in `is_point_inside_loop` to
+/// Used by the degenerate-loop fallback in `LoopMembership::build` to
 /// detect seam-only outer loops (sphere) whose unwrapped projection
 /// still collapses onto a single line in parameter space.
 pub(crate) fn polygon_signed_area_uv(polygon: &[(f64, f64)]) -> f64 {
@@ -13513,5 +13541,161 @@ mod uv_domain_measurement_tests {
         // the `< 3 samples` branch, not this one.
         let empty = Loop::new(0, LoopType::Outer);
         assert!(!loop_is_a_pure_seam_system(&empty));
+    }
+}
+
+#[cfg(test)]
+mod face_membership_cost_tests {
+    use super::*;
+    use crate::primitives::curve::Line;
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    use crate::primitives::face::FaceOrientation;
+    use crate::primitives::r#loop::{Loop, LoopType};
+    use crate::primitives::surface::{
+        OffsetSurface, Sphere, SurfaceIntersectionResult, SurfacePoint, SurfaceType,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A sphere that counts its `closest_point` solves -- the cost of
+    /// projecting a trim loop to its `(u, v)` polygon. It is not a
+    /// `Sphere` to a downcast, so the analytic cap / circle paths decline
+    /// and the face goes to the membership-gated grid.
+    #[derive(Debug, Clone)]
+    struct CountingSphere {
+        inner: Sphere,
+        projections: Arc<AtomicUsize>,
+    }
+
+    impl Surface for CountingSphere {
+        fn surface_type(&self) -> SurfaceType {
+            self.inner.surface_type()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn clone_box(&self) -> Box<dyn Surface> {
+            Box::new(self.clone())
+        }
+        fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
+            self.inner.evaluate_full(u, v)
+        }
+        fn point_at(&self, u: f64, v: f64) -> MathResult<Point3> {
+            self.inner.point_at(u, v)
+        }
+        fn normal_at(&self, u: f64, v: f64) -> MathResult<Vector3> {
+            self.inner.normal_at(u, v)
+        }
+        fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
+            self.inner.parameter_bounds()
+        }
+        fn is_closed_u(&self) -> bool {
+            self.inner.is_closed_u()
+        }
+        fn is_closed_v(&self) -> bool {
+            self.inner.is_closed_v()
+        }
+        fn is_periodic_u(&self) -> bool {
+            self.inner.is_periodic_u()
+        }
+        fn is_periodic_v(&self) -> bool {
+            self.inner.is_periodic_v()
+        }
+        fn period_u(&self) -> Option<f64> {
+            self.inner.period_u()
+        }
+        fn period_v(&self) -> Option<f64> {
+            self.inner.period_v()
+        }
+        fn transform(&self, matrix: &crate::math::Matrix4) -> Box<dyn Surface> {
+            self.inner.transform(matrix)
+        }
+        fn type_name(&self) -> &'static str {
+            "Sphere"
+        }
+        fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
+            self.projections.fetch_add(1, Ordering::Relaxed);
+            self.inner.closest_point(point, tolerance)
+        }
+        fn offset(&self, distance: f64) -> Box<dyn Surface> {
+            self.inner.offset(distance)
+        }
+        fn offset_exact(&self, distance: f64, tolerance: Tolerance) -> MathResult<OffsetSurface> {
+            self.inner.offset_exact(distance, tolerance)
+        }
+        fn offset_variable(
+            &self,
+            distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+            tolerance: Tolerance,
+        ) -> MathResult<Box<dyn Surface>> {
+            self.inner.offset_variable(distance_fn, tolerance)
+        }
+        fn intersect(
+            &self,
+            other: &dyn Surface,
+            tolerance: Tolerance,
+        ) -> Vec<SurfaceIntersectionResult> {
+            self.inner.intersect(other, tolerance)
+        }
+    }
+
+    /// Meshing a trimmed sphere face projects its trim loop a few times,
+    /// not once per grid point: the membership test built the loop's
+    /// polygon afresh for every point it was asked about, and on
+    /// CADGenBench part 208 that was 109 229 projections of the loop for
+    /// one face -- 24 s of meshing for 10 632 triangles.
+    #[test]
+    fn a_trimmed_sphere_projects_its_trim_once_not_per_grid_point() {
+        let projections = Arc::new(AtomicUsize::new(0));
+        let sphere = CountingSphere {
+            inner: Sphere::new(Point3::new(0.0, 0.0, 0.0), 10.0).expect("sphere"),
+            projections: Arc::clone(&projections),
+        };
+        // A four-sided patch clear of the poles (v is the polar angle).
+        let corners: Vec<Point3> = [(0.3, 1.0), (1.3, 1.0), (1.3, 2.0), (0.3, 2.0)]
+            .iter()
+            .map(|&(u, v)| sphere.inner.point_at(u, v).expect("on the sphere"))
+            .collect();
+        let mut model = BRepModel::new();
+        let surface_id = model.surfaces.add(Box::new(sphere));
+        let vertices: Vec<_> = corners
+            .iter()
+            .map(|p| model.vertices.add(p.x, p.y, p.z))
+            .collect();
+        let mut outer = Loop::new(0, LoopType::Outer);
+        for k in 0..4 {
+            let (a, b) = (corners[k], corners[(k + 1) % 4]);
+            let curve = model.curves.add(Box::new(Line::new(a, b)));
+            let edge = model.edges.add(Edge::new_auto_range(
+                0,
+                vertices[k],
+                vertices[(k + 1) % 4],
+                curve,
+                EdgeOrientation::Forward,
+            ));
+            outer.add_edge(edge, true);
+        }
+        let outer_id = model.loops.add(outer);
+        let face_id = model
+            .faces
+            .add(Face::new(0, surface_id, outer_id, FaceOrientation::Forward));
+        let face = model.faces.get(face_id).expect("face").clone();
+
+        // What one projection of the trim costs.
+        let _ = FaceMembership::new(&face, &model);
+        let per_trim = projections.swap(0, Ordering::Relaxed);
+        assert!(per_trim > 0, "the trim is projected through closest_point");
+
+        let params = TessellationParams::default();
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_face(&face, &model, &params, &cache, &mut mesh);
+        let used = projections.load(Ordering::Relaxed);
+        assert!(!mesh.triangles.is_empty(), "the patch meshes");
+        assert!(
+            used <= 4 * per_trim,
+            "meshing made {used} projections for {} triangles; one trim projection is {per_trim}",
+            mesh.triangles.len()
+        );
     }
 }
