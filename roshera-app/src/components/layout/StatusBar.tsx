@@ -5,6 +5,7 @@ import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useCursorStore } from '@/stores/cursor-store'
 import { useChapters } from '@/hooks/use-chapters'
 import { formatPoint, soundLabel, underCursorLabel } from '@/lib/status-bar'
+import { AgentSeesChip } from '@/components/layout/AgentSeesChip'
 
 const PICKS: { mode: SelectionMode; label: string; key: string }[] = [
   { mode: 'object', label: 'Part', key: '1' },
@@ -107,6 +108,8 @@ export function StatusBar() {
           {underCursorLabel(hit && hitName ? { part: hitName, faceId: hit.faceId } : null)}
         </span>
       </span>
+      <Divider />
+      <AgentSeesChip />
 
       <div className="flex-1" />
 

@@ -245,6 +245,7 @@ const READ_ONLY = new Set<string>([
   "verify_part",
   "mass_properties",
   "get_pointer",
+  "user_context",
   "select_face",
   "select_edge",
   "get_face",

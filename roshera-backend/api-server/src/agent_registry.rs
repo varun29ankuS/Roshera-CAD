@@ -748,6 +748,14 @@ fn raw_tools() -> Vec<ToolSpec> {
             json!({"type": "object", "properties": {}, "required": []}),
         ),
         t(
+            "user_context",
+            Core,
+            Stable,
+            Curated,
+            "The PERSON's live attention in their open app, by persistent id: the part/face/edge/vertex under their cursor and the ones they picked, plus active tool and history feature. state live|stale|paused|none; an entity that no longer resolves says why. Read it before acting on 'this', 'here', 'that one'.",
+            json!({"type": "object", "properties": {}, "required": []}),
+        ),
+        t(
             "timeline_mould",
             Timeline,
             Experimental,
@@ -2292,7 +2300,9 @@ mod tests {
         // user's app to show them something (POST /api/agent/show).
         // 113 -> 115 (2026-11-15): lens_explain + lens_why_not_sound -- the
         // agent reads the Kernel Lens journal (GET /api/lens/{part}).
-        assert_eq!(tools.len(), 115, "expected 115 tools, got {}", tools.len());
+        // 115 -> 116 (2026-11-17): user_context -- the agent reads what the
+        // person hovers and has selected (GET /api/agent/user-context).
+        assert_eq!(tools.len(), 116, "expected 116 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

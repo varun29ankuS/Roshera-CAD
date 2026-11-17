@@ -56,6 +56,12 @@ export interface SubElementSelection {
    * curve; otherwise it falls back to outlining the picked triangle.
    */
   polyline?: number[]
+  /**
+   * True once the kernel answered the pick: `index` is then its own id for
+   * the entity. An edge or vertex pick is stored first with the picked
+   * triangle's index, which is not an id anything else can use.
+   */
+  resolved?: boolean
 }
 
 // ─── Transform tools ─────────────────────────────────────────────────

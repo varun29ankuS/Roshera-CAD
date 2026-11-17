@@ -1,4 +1,5 @@
 import { useCursorStore } from '@/stores/cursor-store'
+import { useUserContextStore } from '@/stores/user-context-store'
 import { useSketchBench } from '@/stores/sketch-bench-store'
 import { INSTANCE_PREFIX } from '@/lib/assembly-pose'
 import { isNearestHit } from '@/lib/status-bar'
@@ -27,6 +28,8 @@ function reportPointer(
   faceId: number | undefined,
   position: [number, number, number],
 ) {
+  // Paused: nothing the person points at leaves the app.
+  if (!useUserContextStore.getState().sharing) return
   void fetch(`${API_BASE}/agent/pointer`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

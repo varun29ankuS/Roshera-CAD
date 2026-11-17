@@ -239,6 +239,17 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
       z.object({ action: z.literal('step'), sequence: z.number(), caption: z.string().nullish() }),
     ]),
   }),
+  // An agent read the person's context (GET /api/agent/user-context,
+  // user_context.rs): shown by the status bar's "Agent sees" chip.
+  z.object({
+    type: z.literal('AgentLooked'),
+    payload: z.object({
+      agent: z.string(),
+      document_id: z.string(),
+      seq: z.number(),
+      saw: z.enum(['live', 'stale', 'paused']),
+    }),
+  }),
   z.object({
     type: z.literal('SessionUpdate'),
     payload: z.object({ session_id: z.string() }),

@@ -24,6 +24,7 @@ import { CommandPalette } from '@/components/CommandPalette'
 import { LoginDialog } from '@/components/LoginDialog'
 import { cn } from '@/lib/utils'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
+import { useUserContextPublisher } from '@/hooks/use-user-context-publisher'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
@@ -97,6 +98,10 @@ export function App() {
       return () => teardownWebSocket()
     }
   }, [route])
+
+  // What the person points at and has selected, reported to the server so
+  // an agent can read it while it works (the status bar's "Agent sees").
+  useUserContextPublisher(route === 'workspace')
 
   // Start the agent session when the workspace mounts, rather than
   // waiting for the user's first blackboard message.

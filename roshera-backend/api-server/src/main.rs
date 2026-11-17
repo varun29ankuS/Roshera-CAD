@@ -90,6 +90,7 @@ mod transactions;
 mod unsound_base_gate_tests;
 #[cfg(test)]
 mod unsound_solid_sheet_gate_tests;
+mod user_context;
 mod verification_scope;
 mod verification_scope_tests;
 mod viewport_bridge;
@@ -11830,6 +11831,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/agent/hover/{id}", get(handlers::agent::query_hover))
         // The agent shows the user something in the app (agent_show.rs).
         .route("/api/agent/show", post(agent_show::show))
+        // The person's live context -- hover, selection, tool, camera --
+        // reported by the app and read by agents (user_context.rs).
+        .route(
+            "/api/agent/user-context",
+            get(user_context::read).post(user_context::publish),
+        )
         // Session endpoints
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route(

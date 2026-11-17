@@ -150,6 +150,9 @@ pub struct ViewportBridge {
     /// Deliberately a single latest-wins slot, not a queue: pointer
     /// state is attention, and attention has no backlog.
     pub pointer: parking_lot::Mutex<Option<PointerEvent>>,
+    /// The person's live context per document -- hover, selection, tool,
+    /// camera -- as the app last reported it (`user_context.rs`).
+    pub user_context: crate::user_context::UserContextStore,
 }
 
 /// One pointer interaction reported by the viewport.

@@ -344,6 +344,7 @@ fn endpoints() -> Value {
             "kernel_state": "GET /api/kernel/state",
             "frame":        "GET /api/frame",
             "lens":         "GET /api/lens/{part}, GET /api/lens/{part}/face/{face_id}",
+            "user_context": "GET /api/agent/user-context (what the person points at and selects), POST /api/agent/user-context (the app reports it)",
             "health":       "GET /health"
         },
         "timeline": {

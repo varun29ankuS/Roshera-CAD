@@ -744,6 +744,7 @@ fn describe_operation(method: &Method, path: &str, body: Option<&Value>) -> Opti
         ["agent", "edges", _] => "edge query",
         ["agent", "hover", _] => "hover query",
         ["agent", "pointer"] => "pointer query",
+        ["agent", "user-context"] if get => "user context query",
         ["agent", "parts", _, "size-tolerance"] => "size tolerance",
         ["agent", "parts", _, "edges", _, "tolerance"]
         | ["agent", "parts", _, "faces", _, "tolerance"] => "tolerance spec",

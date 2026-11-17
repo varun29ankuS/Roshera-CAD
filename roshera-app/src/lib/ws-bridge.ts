@@ -4,6 +4,8 @@
  * and converts backend CADObject format to the scene store format.
  */
 import { useAgentShowStore } from '@/stores/agent-show-store'
+import { useUserContextStore } from '@/stores/user-context-store'
+import { currentDocument } from '@/lib/document-scope'
 import { DEFAULT_PART_MATERIAL } from '@/lib/part-material'
 import { wsClient, setResyncHook } from './ws-client'
 import { useWSStore } from '@/stores/ws-store'
@@ -400,6 +402,16 @@ function handleServerMessage(msg: ServerMessage) {
       break
     }
 
+    case 'AgentLooked': {
+      // An agent read what the person is pointing at. Only this app's
+      // document counts: another document's read is not about this view.
+      const here = currentDocument()
+      if (here === null || here === msg.payload.document_id) {
+        useUserContextStore.getState().agentLooked({ agent: msg.payload.agent, atMs: Date.now(), seq: msg.payload.seq })
+      }
+      break
+    }
+
     case 'AgentShow': {
       // The agent drives the app to show the user something.
       void useAgentShowStore.getState().receive(msg.payload)
@@ -464,6 +476,9 @@ function handleServerMessage(msg: ServerMessage) {
           type: el.type,
           index: el.index,
           polyline: el.polyline,
+          // The kernel's own id for the picked entity, not the optimistic
+          // triangle index the click stored.
+          resolved: true,
         })
       }
       break

@@ -267,6 +267,7 @@ const BENCH_OF: Record<string, Bench> = {
   import_step: "core",
   export_part: "core",
   get_pointer: "core",
+  user_context: "core",
   // timeline — history/branching/certification, a distinct concern from
   // geometry creation (see the Bench doc comment below).
   timeline_mould: "timeline",

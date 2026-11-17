@@ -274,6 +274,19 @@ export function registerPerceptionTools(server: ToolHost) {
   );
 
   server.tool(
+    "user_context",
+    "The PERSON's live attention in their open app, by persistent id: the part/face/edge/vertex under their cursor and the ones they picked, plus active tool and history feature. state live|stale|paused|none; an entity that no longer resolves says why. Read it before acting on 'this', 'here', 'that one'.",
+    {},
+    async () => {
+      try {
+        return ok(await api("GET", "/api/agent/user-context"));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
     "section_view",
     "CUTAWAY: slice a part with a plane (point `p` + `normal`); returns the " +
       "cross-section image + section area. SEE a hollow interior, wall thickness, bores.",
