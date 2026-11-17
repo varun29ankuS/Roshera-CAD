@@ -1524,7 +1524,25 @@ fn annulus_radial_strip(
     let (os, oe) = outer?;
     let (is_, ie) = inner?;
 
+    // The ring's AREA centroid in its plane, which does not move with how
+    // its samples are spaced: the mean of the samples is pulled toward a
+    // densely sampled arc, and an evenly concentric annulus whose outer loop
+    // was sampled unevenly read as off-centre and lost the strip.
+    let unit_normal = normal.normalize().unwrap_or(Vector3::Z);
     let centroid = |s: usize, e: usize| -> Point3 {
+        let p0 = vertices[s];
+        let (mut weighted, mut total) = (Vector3::ZERO, 0.0);
+        for k in s + 1..e.saturating_sub(1) {
+            let (a, b) = (vertices[k], vertices[k + 1]);
+            let w = (a - p0).cross(&(b - p0)).dot(&unit_normal);
+            weighted = weighted
+                + (Vector3::new(p0.x + a.x + b.x, p0.y + a.y + b.y, p0.z + a.z + b.z)) * (w / 3.0);
+            total += w;
+        }
+        if total.abs() > 1e-300 {
+            let c = weighted * (1.0 / total);
+            return Point3::new(c.x, c.y, c.z);
+        }
         let mut c = Vector3::ZERO;
         for p in &vertices[s..e] {
             c = c + Vector3::new(p.x, p.y, p.z);
@@ -1591,6 +1609,22 @@ fn annulus_radial_strip(
     o_order.sort_by(|&x, &y| angle_of(x, oc).total_cmp(&angle_of(y, oc)));
     let mut i_order: Vec<usize> = (is_..ie).collect();
     i_order.sort_by(|&x, &y| angle_of(x, ic).total_cmp(&angle_of(y, ic)));
+    // The strip's rims are the rings in angle order, so it bounds the face
+    // only if that IS each loop's own order (either way round). A loop that
+    // doubles back in angle -- a notch, a slot -- would be rimmed by chords
+    // the loop does not have, and its neighbours would open.
+    let in_loop_order = |order: &[usize], s: usize, e: usize| -> bool {
+        let n = e - s;
+        let Some(start) = order.first().map(|&v| v - s) else {
+            return false;
+        };
+        let forward = (0..n).all(|k| order[k] - s == (start + k) % n);
+        let backward = (0..n).all(|k| order[k] - s == (start + n - k) % n);
+        forward || backward
+    };
+    if !in_loop_order(&o_order, os, oe) || !in_loop_order(&i_order, is_, ie) {
+        return None;
+    }
     let o0 = angle_of(o_order[0], oc);
     let ang_dist = |a: f64, b: f64| -> f64 {
         let mut d = (a - b).abs();
@@ -1610,6 +1644,28 @@ fn annulus_radial_strip(
     let m = i_order.len();
     let oidx = |k: usize| o_order[k % n];
     let iidx = |k: usize| i_order[k % m];
+    // Advance by ANGLE about the shared centre, measured from the outer
+    // ring's first sample: index fraction is right only when both rings are
+    // sampled evenly, and an imported outer loop rarely is (CADGenBench part
+    // 249's face 48: 11, 4, 6, 7, 17, 101 ... samples per edge). There a
+    // spoke from 22 degrees landed on the inner circle at 47 and the strip
+    // covered 1927.5 mm^2 of a 1893.9 mm^2 face.
+    let tau = std::f64::consts::TAU;
+    let o_angle: Vec<f64> = o_order
+        .iter()
+        .map(|&v| (angle_of(v, oc) - o0).rem_euclid(tau))
+        .collect();
+    let mut i_angle: Vec<f64> = i_order
+        .iter()
+        .map(|&v| (angle_of(v, ic) - o0).rem_euclid(tau))
+        .collect();
+    // The inner ring was rotated to start nearest the outer start; a first
+    // sample just short of it reads as nearly a full turn, not as ~0.
+    if let Some(first) = i_angle.first_mut() {
+        if *first > std::f64::consts::PI {
+            *first -= tau;
+        }
+    }
     let mut tris: Vec<[usize; 3]> = Vec::with_capacity(n + m);
     let (mut i, mut j) = (0usize, 0usize);
     for _ in 0..(n + m) {
@@ -1618,7 +1674,7 @@ fn annulus_radial_strip(
         } else if j == m {
             true
         } else {
-            (i as f64 / n as f64) <= (j as f64 / m as f64)
+            o_angle[i] <= i_angle[j]
         };
         let (a, b, c) = if advance_outer {
             let t = (oidx(i), oidx(i + 1), iidx(j));
@@ -14127,6 +14183,104 @@ mod ring_stitch_tests {
         assert!(
             (area - lateral).abs() <= 0.02 * lateral,
             "the band covers {area:.3} mm^2 of the tube's {lateral:.3}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod annulus_strip_tests {
+    use super::*;
+
+    fn shoelace(pts: &[Point3]) -> f64 {
+        (0..pts.len())
+            .map(|k| {
+                let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
+                a.x * b.y - b.x * a.y
+            })
+            .sum::<f64>()
+            .abs()
+            * 0.5
+    }
+
+    /// A planar ring with a circular hole whose outer loop is sampled
+    /// unevenly -- a long arc densely, the rest sparsely -- as CADGenBench
+    /// part 249's face 48 is (edge sample counts 11, 4, 6, 7, 17, 101, ...).
+    /// The radial strip advanced both rings by index fraction, joining an
+    /// outer point at 22 degrees to an inner one at 47; the spokes crossed
+    /// and the triangles covered 1927.5 mm^2 of a 1893.9 mm^2 face. Advanced
+    /// by angle about the shared centre, the strip tiles the annulus once.
+    #[test]
+    fn an_unevenly_sampled_annulus_is_tiled_once_by_angle() {
+        let tau = std::f64::consts::TAU;
+        let mut vertices = Vec::new();
+        // Outer, r = 20: 101 samples over 300 degrees, 3 over the last 60.
+        for k in 0..101 {
+            let a = (300.0f64).to_radians() * k as f64 / 101.0;
+            vertices.push(Point3::new(20.0 * a.cos(), 20.0 * a.sin(), 0.0));
+        }
+        for k in 0..3 {
+            let a = (300.0f64 + 20.0 * k as f64).to_radians();
+            vertices.push(Point3::new(20.0 * a.cos(), 20.0 * a.sin(), 0.0));
+        }
+        let n_outer = vertices.len();
+        // Inner, r = 10: 48 even samples, the other way round.
+        for k in 0..48 {
+            let a = tau - tau * k as f64 / 48.0;
+            vertices.push(Point3::new(10.0 * a.cos(), 10.0 * a.sin(), 0.0));
+        }
+        let loops = [(0, n_outer, true), (n_outer, vertices.len(), false)];
+        let tris = annulus_radial_strip(&vertices, &loops, &Vector3::Z)
+            .expect("a concentric annulus takes the radial strip");
+        let covered: f64 = tris
+            .iter()
+            .map(|t| {
+                let (a, b, c) = (vertices[t[0]], vertices[t[1]], vertices[t[2]]);
+                0.5 * (b - a).cross(&(c - a)).magnitude()
+            })
+            .sum();
+        let annulus = shoelace(&vertices[..n_outer]) - shoelace(&vertices[n_outer..]);
+        assert!(
+            (covered - annulus).abs() <= 1e-6 * annulus,
+            "the strip covers {covered:.4} mm^2 of the annulus's {annulus:.4}"
+        );
+    }
+
+    /// The same unevenly sampled outer loop round a NARROW band (2 mm, like
+    /// part 249's 5 mm ring): paired by index fraction, a spoke from the
+    /// dense arc lands tens of degrees round the inner circle and crosses its
+    /// neighbours; paired by angle, the strip tiles the band once.
+    #[test]
+    fn a_narrow_unevenly_sampled_annulus_is_tiled_once_by_angle() {
+        let tau = std::f64::consts::TAU;
+        let mut vertices = Vec::new();
+        for k in 0..101 {
+            let a = (300.0f64).to_radians() * k as f64 / 101.0;
+            vertices.push(Point3::new(12.0 * a.cos(), 12.0 * a.sin(), 0.0));
+        }
+        for k in 0..3 {
+            let a = (300.0f64 + 20.0 * k as f64).to_radians();
+            vertices.push(Point3::new(12.0 * a.cos(), 12.0 * a.sin(), 0.0));
+        }
+        let n_outer = vertices.len();
+        for k in 0..48 {
+            let a = tau - tau * k as f64 / 48.0;
+            vertices.push(Point3::new(10.0 * a.cos(), 10.0 * a.sin(), 0.0));
+        }
+        let loops = [(0, n_outer, true), (n_outer, vertices.len(), false)];
+        let tris = annulus_radial_strip(&vertices, &loops, &Vector3::Z)
+            .expect("a concentric annulus takes the radial strip");
+        let covered: f64 = tris
+            .iter()
+            .map(|t| {
+                let (a, b, c) = (vertices[t[0]], vertices[t[1]], vertices[t[2]]);
+                0.5 * (b - a).cross(&(c - a)).magnitude()
+            })
+            .sum();
+        let annulus = shoelace(&vertices[..n_outer]) - shoelace(&vertices[n_outer..]);
+        assert!(
+            (covered - annulus).abs() <= 1e-6 * annulus,
+            "the strip covers {covered:.4} mm^2 of the narrow annulus's {annulus:.4}"
         );
     }
 }
