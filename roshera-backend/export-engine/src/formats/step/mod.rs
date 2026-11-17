@@ -667,6 +667,18 @@ const EDGE_REBUILD_MIN_GAIN: f64 = 0.1;
 /// before as `deviation`, after as `tolerance`) and a Lens event on both
 /// faces. What cannot be rebuilt is left to
 /// [`raise_edge_tolerances_to_measured_gaps`].
+/// Whether an edge `gap` mm off its faces is beyond any rebuild. Every
+/// rebuilt sample stays within [`EDGE_REBUILD_CAP`] of the file's curve and
+/// the result is kept only within [`EDGE_GAP_REPAIR_CAP`] of both faces, so
+/// a gap above their sum cannot be closed; the factor of ten leaves room for
+/// the interpolated curve between samples. Attempting such edges anyway --
+/// up to 1025 samples each, each walked and projected -- was most of the
+/// import time of CADGenBench part 211, whose misplaced edges lie 11-124 mm
+/// off their faces.
+fn rebuild_cannot_reach_cap(gap: f64) -> bool {
+    gap > 10.0 * (EDGE_GAP_REPAIR_CAP + EDGE_REBUILD_CAP)
+}
+
 fn rebuild_edges_onto_face_intersections(
     model: &mut geometry_engine::primitives::topology_builder::BRepModel,
     caches: &mut context::ResolutionCaches,
@@ -737,7 +749,7 @@ fn rebuild_edges_onto_face_intersections(
         else {
             continue;
         };
-        if !(before > declared.max(1e-7)) {
+        if !(before > declared.max(1e-7)) || rebuild_cannot_reach_cap(before) {
             continue;
         }
         let (Some(vs), Some(ve)) = (
@@ -1483,5 +1495,31 @@ mod imp1_tests {
         assert!(report.certified);
         assert!(!report.ok, "an unsound part must make the import not ok");
         assert!(!report.validation[0].sound);
+    }
+
+    /// The rebuild is skipped only for a gap it provably cannot close: an
+    /// edge within the rebuild's reach (every sample may move up to
+    /// EDGE_REBUILD_CAP, and the result must land within
+    /// EDGE_GAP_REPAIR_CAP) is still attempted, and part 211's misplaced
+    /// edges (11 mm and more off their faces) are not.
+    #[test]
+    fn only_a_gap_beyond_the_rebuilds_reach_skips_the_rebuild() {
+        for reachable in [
+            1e-6,
+            EDGE_GAP_REPAIR_CAP,
+            EDGE_REBUILD_CAP,
+            EDGE_GAP_REPAIR_CAP + EDGE_REBUILD_CAP,
+        ] {
+            assert!(
+                !rebuild_cannot_reach_cap(reachable),
+                "a {reachable} mm gap is within the rebuild's reach and must be attempted"
+            );
+        }
+        for hopeless in [11.0, 123.86] {
+            assert!(
+                rebuild_cannot_reach_cap(hopeless),
+                "a {hopeless} mm gap cannot be closed by a {EDGE_REBUILD_CAP} mm move"
+            );
+        }
     }
 }
