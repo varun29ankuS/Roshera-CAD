@@ -1076,32 +1076,44 @@ fn measure_face_u_spans(
     model: &BRepModel,
     has_faces: bool,
 ) -> HashMap<u32, f64> {
-    let mut us_by_face: HashMap<u32, Vec<f64>> = HashMap::new();
-    // The last projection on each face seeds the next vertex's (see
-    // `project_uv`): consecutive facets of a face are neighbours.
-    let mut last_seed: HashMap<u32, (f64, f64)> = HashMap::new();
-    for (i, tri) in mesh.triangles.iter().enumerate() {
+    // Each periodic face's vertices are projected in that face's mesh order
+    // (the last projection seeds the next -- see `project_uv`), so faces run
+    // in parallel with every projection unchanged.
+    let mut face_order: HashMap<u32, usize> = HashMap::new();
+    let mut groups: Vec<(u32, Vec<usize>)> = Vec::new();
+    for i in 0..mesh.triangles.len() {
         let fid = if has_faces { mesh.face_map[i] } else { 0 };
-        let periodic = model
-            .faces
-            .get(fid)
-            .and_then(|f| model.surfaces.get(f.surface_id))
-            .and_then(|s| s.period_u());
-        let Some(p) = periodic else { continue };
-        let entry = us_by_face.entry(fid).or_default();
-        let surface = model
-            .faces
-            .get(fid)
-            .and_then(|f| model.surfaces.get(f.surface_id));
-        for &vi in tri.iter() {
-            let v = mesh.vertices[vi as usize];
-            let seed = v.uv.or_else(|| last_seed.get(&fid).copied());
-            if let Some(uv) = surface.and_then(|s| project_uv(s, v.position, seed)) {
-                last_seed.insert(fid, uv);
-                entry.push(uv.0.rem_euclid(p));
-            }
-        }
+        let slot = *face_order.entry(fid).or_insert_with(|| {
+            groups.push((fid, Vec::new()));
+            groups.len() - 1
+        });
+        groups[slot].1.push(i);
     }
+    let us_by_face: Vec<(u32, Vec<f64>)> = {
+        use rayon::prelude::*;
+        groups
+            .par_iter()
+            .filter_map(|(fid, tris)| {
+                let surface = model
+                    .faces
+                    .get(*fid)
+                    .and_then(|f| model.surfaces.get(f.surface_id))?;
+                let p = surface.period_u()?;
+                let mut last_seed: Option<(f64, f64)> = None;
+                let mut us = Vec::with_capacity(3 * tris.len());
+                for &i in tris {
+                    for &vi in mesh.triangles[i].iter() {
+                        let v = mesh.vertices[vi as usize];
+                        if let Some(uv) = project_uv(surface, v.position, v.uv.or(last_seed)) {
+                            last_seed = Some(uv);
+                            us.push(uv.0.rem_euclid(p));
+                        }
+                    }
+                }
+                Some((*fid, us))
+            })
+            .collect()
+    };
 
     let mut spans = HashMap::new();
     for (fid, mut us) in us_by_face {
@@ -1212,113 +1224,134 @@ pub fn mesh_quality_with_normals(
         }
     };
 
-    // Per face: (worst_aspect, min_angle_deg, max_normal_dev_deg, boundary_cross).
-    let mut per_face: HashMap<u32, (f64, f64, f64, usize)> = HashMap::new();
+    // Each face is judged on its own facets, in their mesh order: a face's
+    // projections seed only from that face's previous one, so faces run in
+    // parallel with every projection -- and so the verdict -- unchanged.
+    let mut face_order: HashMap<u32, usize> = HashMap::new();
+    let mut groups: Vec<(u32, Vec<usize>)> = Vec::new();
+    for i in 0..mesh.triangles.len() {
+        let fid = if has_faces { mesh.face_map[i] } else { 0 };
+        let slot = *face_order.entry(fid).or_insert_with(|| {
+            groups.push((fid, Vec::new()));
+            groups.len() - 1
+        });
+        groups[slot].1.push(i);
+    }
+    let judge_face = |fid: u32, tris: &[usize]| -> Option<(f64, f64, f64, usize)> {
+        // (worst_aspect, min_angle_deg, max_normal_dev_deg, boundary_cross)
+        let mut entry: Option<(f64, f64, f64, usize)> = None;
+        // The last projection on this face seeds the next (see `project_uv`).
+        let mut crossing_seed: Option<(f64, f64)> = None;
+        // Only a face that closes on itself (periodic in u) can be bridged;
+        // on any other the corner projections would be read by nothing.
+        let face_surface = model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))
+            .and_then(|s| s.period_u().map(|p| (s, p)));
+        for &i in tris {
+            let tri = mesh.triangles[i];
+            let v0 = mesh.vertices[tri[0] as usize];
+            let v1 = mesh.vertices[tri[1] as usize];
+            let v2 = mesh.vertices[tri[2] as usize];
+            let (p0, p1, p2) = (v0.position, v1.position, v2.position);
+            let geo = (p1 - p0).cross(&(p2 - p0));
+            if geo.magnitude() <= 1e-12 {
+                continue; // zero-area handled by TessellationQuality
+            }
+            let e = entry.get_or_insert((1.0, 180.0, 0.0, 0));
+
+            // Aspect ratio = longest edge / shortest edge.
+            let e0 = (p1 - p0).magnitude();
+            let e1 = (p2 - p1).magnitude();
+            let e2 = (p0 - p2).magnitude();
+            let lo = e0.min(e1).min(e2).max(1e-12);
+            let hi = e0.max(e1).max(e2);
+            e.0 = e.0.max(hi / lo);
+
+            // Smallest interior angle (law of cosines).
+            let ang = |a: f64, b: f64, c: f64| -> f64 {
+                (((a * a + b * b - c * c) / (2.0 * a * b)).clamp(-1.0, 1.0))
+                    .acos()
+                    .to_degrees()
+            };
+            let tmin = ang(e0, e2, e1).min(ang(e0, e1, e2)).min(ang(e1, e2, e0));
+            e.1 = e.1.min(tmin);
+
+            // Normal deviation from the true surface.
+            if let Some(dev) = true_normals
+                .get(i)
+                .copied()
+                .flatten()
+                .and_then(|n| facet_deviation_deg(&geo, &n))
+            {
+                let centroid = crate::math::Point3::new(
+                    (p0.x + p1.x + p2.x) / 3.0,
+                    (p0.y + p1.y + p2.y) / 3.0,
+                    (p0.z + p1.z + p2.z) / 3.0,
+                );
+                let counts = dev <= MeshQuality::MAX_NORMAL_DEVIATION_DEG
+                    || !has_faces
+                    || leaves_surface(fid, centroid);
+                if counts {
+                    e.2 = e.2.max(dev);
+                }
+            }
+
+            // Boundary conformance: a facet bridging across a periodic/closed
+            // lateral. Where the corners ARE on this face's own surface: a
+            // vertex shared with a neighbour carries ONE face's stored (u, v)
+            // after the shell weld (a torus rim vertex kept its cylinder's
+            // v = -45), so the stored value is not this face's chart. Project
+            // instead.
+            let Some((surface, p)) = face_surface else {
+                continue;
+            };
+            let mut corner = |v: crate::tessellation::MeshVertex| {
+                let uv = project_uv(surface, v.position, v.uv.or(crossing_seed))?;
+                crossing_seed = Some(uv);
+                Some(uv)
+            };
+            let Some((uv0, uv1, uv2)) = (|| Some((corner(v0)?, corner(v1)?, corner(v2)?)))() else {
+                continue;
+            };
+            // The face's own u-extent is the discriminator -- see
+            // `is_bridging_facet`. Absent a measurement, `p` reduces this to
+            // the plain half-period test.
+            let span = face_spans.get(&fid).copied().unwrap_or(p);
+            // A vertex at a u-singularity (a sphere's pole) has an ARBITRARY u,
+            // so the facet's apparent span is nominal and the test below would
+            // be reading noise. Checked only for facets that already passed the
+            // span screen -- 4 of 19800 on a sphere -- so the two extra surface
+            // evaluations cost nothing on the common path.
+            let at_singularity = [uv0, uv1, uv2]
+                .iter()
+                .any(|uv| u_is_degenerate_at(surface, uv.1, p))
+                || [p0, p1, p2].iter().any(|&q| at_pole_point(surface, q, p));
+            if !at_singularity && is_bridging_facet(uv0.0, uv1.0, uv2.0, p, span) {
+                e.3 += 1;
+            }
+        }
+        entry
+    };
+    let judged: Vec<(u32, (f64, f64, f64, usize))> = {
+        use rayon::prelude::*;
+        groups
+            .par_iter()
+            .filter_map(|(fid, tris)| judge_face(*fid, tris).map(|e| (*fid, e)))
+            .collect()
+    };
     let mut worst_aspect = 1.0_f64;
     let mut min_angle = 180.0_f64;
     let mut max_dev = 0.0_f64;
     let mut boundary_crossing = 0usize;
-    // The last projection on each face seeds the next (see `project_uv`).
-    let mut crossing_seed: HashMap<u32, (f64, f64)> = HashMap::new();
-
-    for (i, tri) in mesh.triangles.iter().enumerate() {
-        let v0 = mesh.vertices[tri[0] as usize];
-        let v1 = mesh.vertices[tri[1] as usize];
-        let v2 = mesh.vertices[tri[2] as usize];
-        let (p0, p1, p2) = (v0.position, v1.position, v2.position);
-        let geo = (p1 - p0).cross(&(p2 - p0));
-        if geo.magnitude() <= 1e-12 {
-            continue; // zero-area handled by TessellationQuality
-        }
-        let fid = if has_faces { mesh.face_map[i] } else { 0 };
-        let entry = per_face.entry(fid).or_insert((1.0, 180.0, 0.0, 0));
-
-        // Aspect ratio = longest edge / shortest edge.
-        let e0 = (p1 - p0).magnitude();
-        let e1 = (p2 - p1).magnitude();
-        let e2 = (p0 - p2).magnitude();
-        let lo = e0.min(e1).min(e2).max(1e-12);
-        let hi = e0.max(e1).max(e2);
-        let aspect = hi / lo;
-        worst_aspect = worst_aspect.max(aspect);
-        entry.0 = entry.0.max(aspect);
-
-        // Smallest interior angle (law of cosines).
-        let ang = |a: f64, b: f64, c: f64| -> f64 {
-            (((a * a + b * b - c * c) / (2.0 * a * b)).clamp(-1.0, 1.0))
-                .acos()
-                .to_degrees()
-        };
-        let tmin = ang(e0, e2, e1).min(ang(e0, e1, e2)).min(ang(e1, e2, e0));
-        min_angle = min_angle.min(tmin);
-        entry.1 = entry.1.min(tmin);
-
-        // Normal deviation from the true surface.
-        if let Some(dev) = true_normals
-            .get(i)
-            .copied()
-            .flatten()
-            .and_then(|n| facet_deviation_deg(&geo, &n))
-        {
-            let centroid = crate::math::Point3::new(
-                (p0.x + p1.x + p2.x) / 3.0,
-                (p0.y + p1.y + p2.y) / 3.0,
-                (p0.z + p1.z + p2.z) / 3.0,
-            );
-            let counts = dev <= MeshQuality::MAX_NORMAL_DEVIATION_DEG
-                || !has_faces
-                || leaves_surface(fid, centroid);
-            if counts {
-                max_dev = max_dev.max(dev);
-                entry.2 = entry.2.max(dev);
-            }
-        }
-
-        // Boundary conformance: a facet bridging across a periodic/closed lateral.
-        // Where the corners ARE on this face's own surface: a vertex shared
-        // with a neighbour carries ONE face's stored (u, v) after the shell
-        // weld (a torus rim vertex kept its cylinder's v = -45), so the
-        // stored value is not this face's chart. Project instead.
-        let face_surface = model
-            .faces
-            .get(fid)
-            .and_then(|f| model.surfaces.get(f.surface_id).map(|s| (f, s)));
-        let projected = face_surface.and_then(|(_, s)| {
-            let seed = |v: crate::tessellation::MeshVertex, last: &HashMap<u32, (f64, f64)>| {
-                v.uv.or_else(|| last.get(&fid).copied())
-            };
-            let uv0 = project_uv(s, p0, seed(v0, &crossing_seed))?;
-            crossing_seed.insert(fid, uv0);
-            let uv1 = project_uv(s, p1, seed(v1, &crossing_seed))?;
-            crossing_seed.insert(fid, uv1);
-            let uv2 = project_uv(s, p2, seed(v2, &crossing_seed))?;
-            crossing_seed.insert(fid, uv2);
-            Some((uv0, uv1, uv2))
-        });
-        if let (Some((face, _)), Some((uv0, uv1, uv2))) = (face_surface, projected) {
-            if let Some(surface) = model.surfaces.get(face.surface_id) {
-                if let Some(p) = surface.period_u() {
-                    // The face's own u-extent is the discriminator — see
-                    // `is_bridging_facet`. Absent a measurement, `p` reduces
-                    // this to the plain half-period test.
-                    let span = face_spans.get(&fid).copied().unwrap_or(p);
-                    // A vertex at a u-singularity (a sphere's pole) has an
-                    // ARBITRARY u, so the facet's apparent span is nominal and
-                    // the test below would be reading noise. Checked only for
-                    // facets that already passed the span screen — 4 of 19800
-                    // on a sphere — so the two extra surface evaluations cost
-                    // nothing on the common path.
-                    let at_singularity = [uv0, uv1, uv2]
-                        .iter()
-                        .any(|uv| u_is_degenerate_at(surface, uv.1, p))
-                        || [p0, p1, p2].iter().any(|&q| at_pole_point(surface, q, p));
-                    if !at_singularity && is_bridging_facet(uv0.0, uv1.0, uv2.0, p, span) {
-                        boundary_crossing += 1;
-                        entry.3 += 1;
-                    }
-                }
-            }
-        }
+    let mut per_face: HashMap<u32, (f64, f64, f64, usize)> = HashMap::new();
+    for (fid, e) in judged {
+        worst_aspect = worst_aspect.max(e.0);
+        min_angle = min_angle.min(e.1);
+        max_dev = max_dev.max(e.2);
+        boundary_crossing += e.3;
+        per_face.insert(fid, e);
     }
 
     let mut defects: Vec<MeshFaceQualityDefect> = per_face
@@ -2080,5 +2113,156 @@ mod sub_tolerance_facet_tests {
             tessellation_quality_with_normals(&BRepModel::new(), &mesh, &normals).expect("quality");
         assert_eq!(q.off_surface_facets, 1, "{q:?}");
         assert!(!q.clean, "{q:?}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod mesh_quality_cost_tests {
+    use super::*;
+    use crate::math::{MathResult, Matrix4, Point3, Tolerance, Vector3};
+    use crate::primitives::surface::{
+        OffsetSurface, Surface, SurfaceIntersectionResult, SurfacePoint, SurfaceType,
+    };
+    use crate::primitives::topology_builder::TopologyBuilder;
+    use crate::tessellation::{tessellate_solid, TessellationParams};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A surface that counts its footpoint projections and otherwise is the
+    /// surface it wraps.
+    #[derive(Debug)]
+    struct Counting {
+        inner: Box<dyn Surface>,
+        projections: Arc<AtomicUsize>,
+    }
+
+    impl Surface for Counting {
+        fn surface_type(&self) -> SurfaceType {
+            self.inner.surface_type()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn clone_box(&self) -> Box<dyn Surface> {
+            Box::new(Counting {
+                inner: self.inner.clone_box(),
+                projections: Arc::clone(&self.projections),
+            })
+        }
+        fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
+            self.inner.evaluate_full(u, v)
+        }
+        fn point_at(&self, u: f64, v: f64) -> MathResult<Point3> {
+            self.inner.point_at(u, v)
+        }
+        fn normal_at(&self, u: f64, v: f64) -> MathResult<Vector3> {
+            self.inner.normal_at(u, v)
+        }
+        fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
+            self.inner.parameter_bounds()
+        }
+        fn is_closed_u(&self) -> bool {
+            self.inner.is_closed_u()
+        }
+        fn is_closed_v(&self) -> bool {
+            self.inner.is_closed_v()
+        }
+        fn is_periodic_u(&self) -> bool {
+            self.inner.is_periodic_u()
+        }
+        fn is_periodic_v(&self) -> bool {
+            self.inner.is_periodic_v()
+        }
+        fn period_u(&self) -> Option<f64> {
+            self.inner.period_u()
+        }
+        fn period_v(&self) -> Option<f64> {
+            self.inner.period_v()
+        }
+        fn transform(&self, matrix: &Matrix4) -> Box<dyn Surface> {
+            self.inner.transform(matrix)
+        }
+        fn type_name(&self) -> &'static str {
+            self.inner.type_name()
+        }
+        fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
+            self.projections.fetch_add(1, Ordering::Relaxed);
+            self.inner.closest_point(point, tolerance)
+        }
+        fn closest_point_near(
+            &self,
+            point: &Point3,
+            seed: (f64, f64),
+            tolerance: Tolerance,
+        ) -> MathResult<(f64, f64)> {
+            self.projections.fetch_add(1, Ordering::Relaxed);
+            self.inner.closest_point_near(point, seed, tolerance)
+        }
+        fn offset(&self, distance: f64) -> Box<dyn Surface> {
+            self.inner.offset(distance)
+        }
+        fn offset_exact(&self, distance: f64, tolerance: Tolerance) -> MathResult<OffsetSurface> {
+            self.inner.offset_exact(distance, tolerance)
+        }
+        fn offset_variable(
+            &self,
+            distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+            tolerance: Tolerance,
+        ) -> MathResult<Box<dyn Surface>> {
+            self.inner.offset_variable(distance_fn, tolerance)
+        }
+        fn intersect(
+            &self,
+            other: &dyn Surface,
+            tolerance: Tolerance,
+        ) -> Vec<SurfaceIntersectionResult> {
+            self.inner.intersect(other, tolerance)
+        }
+    }
+
+    /// The mesh-quality pass projects facet corners onto the surface only to
+    /// test whether a facet bridges a CLOSED (periodic) face; on a face that
+    /// does not close on itself there is nothing to bridge. It projected all
+    /// three corners of every facet anyway -- most of its 9.2 s on
+    /// CADGenBench part 208. A box has no periodic face: no projections.
+    #[test]
+    fn mesh_quality_projects_nothing_on_faces_that_do_not_close() {
+        let mut model = BRepModel::new();
+        let solid = TopologyBuilder::new(&mut model)
+            .create_box_3d(20.0, 30.0, 10.0)
+            .expect("box");
+        let solid = match solid {
+            crate::primitives::topology_builder::GeometryId::Solid(s) => s,
+            other => panic!("a box is a solid: {other:?}"),
+        };
+        let projections = Arc::new(AtomicUsize::new(0));
+        let ids: Vec<_> = model.surfaces.iter().map(|(id, _)| id).collect();
+        for id in ids {
+            let inner = model.surfaces.get(id).expect("surface").clone_box();
+            model.surfaces.replace(
+                id,
+                Box::new(Counting {
+                    inner,
+                    projections: Arc::clone(&projections),
+                }),
+            );
+        }
+        let mesh = {
+            let s = model.solids.get(solid).expect("solid");
+            tessellate_solid(s, &model, &TessellationParams::default())
+        };
+        assert!(mesh.triangles.len() >= 12, "the box meshes");
+        let normals = facet_true_normals(&model, &mesh);
+        projections.store(0, Ordering::Relaxed);
+        let quality = mesh_quality_with_normals(&model, &mesh, &normals).expect("quality");
+        assert!(quality.clean, "a box's mesh is clean: {quality:?}");
+        let used = projections.load(Ordering::Relaxed);
+        assert_eq!(
+            used,
+            0,
+            "{used} projections for {} facets on faces that do not close",
+            mesh.triangles.len()
+        );
     }
 }
