@@ -1,0 +1,28 @@
+{
+  "about": "Ratchet list for test/registry_schema_parity.mjs. Each entry is a parameter difference between the MCP zod schema and the agent_registry.rs row that exists TODAY. kind=param: side is the copy that HAS the parameter. kind=required: side is the copy that REQUIRES it. kind=type: side is 'both' and detail is 'mcp=<types> backend=<types>'. A difference not listed fails; a listed entry that is no longer a difference fails. Delete lines as the copies are reconciled; never add one without a reason. Measured 2026-11-17: 23 entries across 17 tools (MCP audit 1.10). See roshera-eval/mcp/PARITY_TEST.md.",
+  "differences": [
+    { "tool": "boolean", "kind": "param", "field": "acknowledge_unsound", "side": "mcp", "reason": "MCP tool carries the sound-base gate bypass; the backend row lacks it (row not updated when the gate landed)." },
+    { "tool": "boolean_many", "kind": "param", "field": "acknowledge_unsound", "side": "mcp", "reason": "MCP tool carries the sound-base gate bypass; the backend row lacks it (row not updated when the gate landed)." },
+    { "tool": "chamfer_edges", "kind": "param", "field": "acknowledge_unsound", "side": "mcp", "reason": "MCP tool carries the sound-base gate bypass; the backend row lacks it (row not updated when the gate landed)." },
+    { "tool": "drill_pattern", "kind": "param", "field": "acknowledge_unsound", "side": "mcp", "reason": "MCP tool carries the sound-base gate bypass; the backend row lacks it (row not updated when the gate landed)." },
+    { "tool": "export_part", "kind": "param", "field": "acknowledge_unsound", "side": "mcp", "reason": "MCP tool carries the sound-base gate bypass; the backend row lacks it (row not updated when the gate landed)." },
+    { "tool": "fillet_edges", "kind": "param", "field": "acknowledge_unsound", "side": "mcp", "reason": "MCP tool carries the sound-base gate bypass; the backend row lacks it (row not updated when the gate landed)." },
+    { "tool": "make_drawing", "kind": "param", "field": "acknowledge_unsound", "side": "mcp", "reason": "MCP tool carries the sound-base gate bypass; the backend row lacks it (row not updated when the gate landed)." },
+    { "tool": "shell", "kind": "param", "field": "acknowledge_unsound", "side": "mcp", "reason": "MCP tool carries the sound-base gate bypass; the backend row lacks it (row not updated when the gate landed)." },
+    { "tool": "transform", "kind": "param", "field": "acknowledge_unsound", "side": "mcp", "reason": "MCP tool carries the sound-base gate bypass; the backend row lacks it (row not updated when the gate landed)." },
+    { "tool": "drawing_export_sheet", "kind": "param", "field": "acknowledge_unsound", "side": "mcp", "reason": "Sheet-export gate bypass (unsound base) exists only on the MCP tool; the backend row lacks it." },
+    { "tool": "drawing_export_sheet", "kind": "param", "field": "acknowledge_layout_issues", "side": "mcp", "reason": "Sheet-export gate bypass (layout defects) exists only on the MCP tool; the backend row lacks it." },
+    { "tool": "psketch_extrude", "kind": "param", "field": "plane", "side": "mcp", "reason": "MCP tool accepts a plane override; the backend row lacks it (row not updated)." },
+    { "tool": "psketch_extrude", "kind": "param", "field": "direction", "side": "mcp", "reason": "MCP tool accepts an extrude direction; the backend row lacks it (row not updated)." },
+    { "tool": "psketch_revolve", "kind": "param", "field": "plane", "side": "mcp", "reason": "MCP tool accepts a plane override; the backend row lacks it (row not updated)." },
+    { "tool": "timeline_checkpoint", "kind": "param", "field": "skip_verification", "side": "mcp", "reason": "Checkpoint verification escape (timeline_engine Checkpoint::skip_verification) exists only on the MCP tool; the backend row lacks it." },
+    { "tool": "blackboard_add_entry", "kind": "param", "field": "part_id", "side": "backend", "reason": "MCP removed part scoping deliberately (blackboard.ts header: notebook is per document); backend row still offers it." },
+    { "tool": "blackboard_add_entry", "kind": "param", "field": "scope", "side": "backend", "reason": "MCP removed part scoping deliberately (blackboard.ts header: notebook is per document); backend row still offers it." },
+    { "tool": "blackboard_edit_entry", "kind": "param", "field": "part_id", "side": "backend", "reason": "MCP removed part scoping deliberately (blackboard.ts header: notebook is per document); backend row still offers it." },
+    { "tool": "blackboard_edit_entry", "kind": "param", "field": "scope", "side": "backend", "reason": "MCP removed part scoping deliberately (blackboard.ts header: notebook is per document); backend row still offers it." },
+    { "tool": "blackboard_list", "kind": "param", "field": "part_id", "side": "backend", "reason": "MCP removed part scoping deliberately (blackboard.ts header: notebook is per document); backend row still offers it." },
+    { "tool": "blackboard_list", "kind": "param", "field": "scope", "side": "backend", "reason": "MCP removed part scoping deliberately (blackboard.ts header: notebook is per document); backend row still offers it." },
+    { "tool": "blackboard_clear", "kind": "param", "field": "part_id", "side": "backend", "reason": "MCP removed part scoping deliberately (blackboard.ts header: notebook is per document); backend row still offers it." },
+    { "tool": "blackboard_clear", "kind": "param", "field": "scope", "side": "backend", "reason": "MCP removed part scoping deliberately (blackboard.ts header: notebook is per document); backend row still offers it." }
+  ]
+}

@@ -308,3 +308,56 @@ fn a_sketch_feature_names_the_sketch_it_consumed() {
     assert_eq!(cs[1].sketch.as_deref(), Some("session-7"));
     assert_eq!(cs[2].sketch.as_deref(), Some("S9"));
 }
+
+/// The step a constrained-sketch revolve records, as `csketch_revolve`
+/// writes it (`sketch_revolve`: the frame, the regions, the axis, and the
+/// sketch it came from).
+fn sketch_revolve(seq: u64, sketch: &str, out: u64) -> TimelineEvent {
+    ev(
+        seq,
+        "sketch_revolve",
+        json!({
+            "params": {
+                "csketch_id": sketch,
+                "origin": [0.0, 0.0, 0.0],
+                "u_axis": [1.0, 0.0, 0.0],
+                "v_axis": [0.0, 0.0, 1.0],
+                "axis_origin": [0.0, 0.0],
+                "axis_direction": [0.0, 1.0],
+                "angle": 360.0,
+                "regions": []
+            },
+            "inputs": [], "outputs": [format!("solid:{out}")]
+        }),
+    )
+}
+
+/// A solid revolved from a sketch (what an agent's `psketch_revolve`
+/// records: `sketch_revolve`) is a REVOLVE in the tree -- the revolve icon,
+/// and the sketch it consumed named on it so "Edit sketch" is offered --
+/// exactly as a sketch extrude is an extrude. It showed as the raw step
+/// kind `sketch_revolve`: no icon, no sketch to edit.
+#[test]
+fn a_sketch_revolve_is_a_revolve_that_names_its_sketch() {
+    let cs = chapters(&[sketch_revolve(0, "R1", 0)]);
+    assert_eq!(cs.len(), 1, "{cs:#?}");
+    assert_eq!(cs[0].kind, "revolve", "{cs:#?}");
+    assert_eq!(cs[0].sketch.as_deref(), Some("R1"), "{cs:#?}");
+}
+
+/// The edits of a sketch fold into the revolve it became, as they fold into
+/// an extrude: one feature row, every step in it.
+#[test]
+fn sketch_edits_fold_into_the_revolve_their_sketch_became() {
+    let h = vec![
+        boxx(0, 0, 50.0),
+        sketch_op(1, "csketch_fillet", "R2"),
+        sketch_op(2, "csketch_trim", "R2"),
+        sketch_revolve(3, "R2", 1),
+    ];
+    let cs = chapters(&h);
+    let kinds: Vec<&str> = cs.iter().map(|c| c.kind.as_str()).collect();
+    assert_eq!(kinds, ["box", "revolve"], "{cs:#?}");
+    assert_eq!(cs[1].events, vec![1, 2, 3]);
+    assert_eq!(cs[1].sketch.as_deref(), Some("R2"));
+}

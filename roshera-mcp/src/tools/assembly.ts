@@ -339,7 +339,14 @@ export function registerAssemblyTools(server: ToolHost) {
       .describe("RAW coords (NOT durable); must sit on real geometry or certify refuses it"),
   });
 
-  async function makeConnector(assembly_id: string, spec: any): Promise<string> {
+  /** What the connector route answers
+   *  (`api-server/src/assembly_mates.rs::ConnectorResponse`). */
+  interface MadeConnector {
+    connector_id: string;
+    provenance: unknown;
+  }
+
+  async function makeConnector(assembly_id: string, spec: any): Promise<MadeConnector> {
     const body: any = { instance_id: spec.instance_id };
     if (spec.frame) {
       body.frame = spec.frame;
@@ -351,7 +358,49 @@ export function registerAssemblyTools(server: ToolHost) {
       };
     }
     const conn = await api("POST", `/api/assembly/${assembly_id}/connector`, body);
-    return conn.id;
+    // The id is what the mate is built on. An answer that does not name one
+    // is refused here: posting a mate with a missing side would be refused by
+    // the server for a reason that names neither the connector nor the cause.
+    if (typeof conn?.connector_id !== "string" || conn.connector_id.length === 0) {
+      throw new Error(
+        `POST /api/assembly/${assembly_id}/connector answered without a connector_id ` +
+          `(got keys: ${Object.keys(conn ?? {}).join(", ") || "none"}) — no mate was created`,
+      );
+    }
+    return { connector_id: conn.connector_id, provenance: conn.provenance };
+  }
+
+  /** Delete connectors made for a mate that was then not created, so a failed
+   *  `assembly_mate` leaves the assembly as it found it. Returns the ids that
+   *  could NOT be deleted (reported to the agent, never hidden). */
+  async function dropConnectors(assembly_id: string, ids: string[]): Promise<string[]> {
+    const left: string[] = [];
+    for (const id of ids) {
+      try {
+        await api("DELETE", `/api/assembly/${assembly_id}/connector/${id}`);
+      } catch {
+        left.push(id);
+      }
+    }
+    return left;
+  }
+
+  /** `fail(e)`, plus the connectors a failed create could not take back.
+   *  The server refuses to delete a connector a mate references, so a
+   *  connector left behind after a mate call that timed out may mean the mate
+   *  WAS created: the agent is told to look, not told it failed cleanly. */
+  function failCreate(e: unknown, left: string[]) {
+    const result = fail(e);
+    if (left.length > 0) {
+      result.content.push({
+        type: "text" as const,
+        text:
+          `CONNECTORS LEFT IN THE ASSEMBLY (could not be deleted): ${left.join(", ")}. ` +
+          `Read assembly_list_instances: if a mate references them the mate was ` +
+          `created despite this error; otherwise they are unused.`,
+      });
+    }
+    return result;
   }
 
   server.tool(
@@ -411,16 +460,26 @@ export function registerAssemblyTools(server: ToolHost) {
         }
         if (!a || !b || kind === undefined)
           return fail(new Error("create needs kind, a and b"));
-        const ca = await makeConnector(assembly_id, a);
-        const cb = await makeConnector(assembly_id, b);
-        return ok(
-          await api("POST", `/api/assembly/${assembly_id}/mate`, {
+        // A mate is one act to the agent and three writes to the server.
+        // Whatever fails, the connectors already made are taken back.
+        const made: MadeConnector[] = [];
+        try {
+          made.push(await makeConnector(assembly_id, a));
+          made.push(await makeConnector(assembly_id, b));
+          const mate = await api("POST", `/api/assembly/${assembly_id}/mate`, {
             kind,
-            a: ca,
-            b: cb,
+            a: made[0].connector_id,
+            b: made[1].connector_id,
             couples: couples ?? null,
-          }),
-        );
+          });
+          return ok({ ...mate, connectors: { a: made[0], b: made[1] } });
+        } catch (e) {
+          const orphaned = await dropConnectors(
+            assembly_id,
+            made.map((c) => c.connector_id),
+          );
+          return failCreate(e, orphaned);
+        }
       } catch (e) {
         return fail(e);
       }

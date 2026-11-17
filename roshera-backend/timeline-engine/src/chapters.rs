@@ -506,7 +506,13 @@ fn kind_of(s: &Step, tool: Option<&Step>) -> String {
             "create_cone_3d" => "cone",
             "create_torus_3d" => "torus",
             "transform_solid" => "transform",
-            _ if c.starts_with("revolve") => "revolve",
+            // A revolve, however it was made: the kernel's own
+            // (`revolve_face` / `revolve_typed` / `revolve_meridian`) or a
+            // sketch revolved (`sketch_revolve`, what `csketch_revolve`
+            // records) -- as `extrude` below takes `sketch_extrude`. The
+            // name decides the icon, whether the sketch's edits fold into
+            // the feature, and whether the app offers "Edit sketch".
+            _ if c.starts_with("revolve") || c == "sketch_revolve" => "revolve",
             _ if c.contains("extrude") => "extrude",
             _ if c.starts_with("fillet") => "fillet",
             _ if c.starts_with("chamfer") => "chamfer",

@@ -325,7 +325,7 @@ export function registerCreateTools(server: ToolHost) {
         })
         .strict(),
     },
-    async ({ radius, center }) => {
+    async ({ radius, center, name }) => {
       try {
         const r = await api("POST", "/api/geometry", {
           shape_type: "sphere",
@@ -334,11 +334,35 @@ export function registerCreateTools(server: ToolHost) {
           // (world-absolute), matching create_cylinder/create_cone.
           position: center ?? [0, 0, 0],
         });
+        const uuid: string | null = r.object?.id ?? null;
+        // `POST /api/geometry` takes no name (it names the part "Sphere <id>"),
+        // unlike the box/cylinder/cone routes. The name is applied through the
+        // part-name route. The sphere exists either way, so a name the server
+        // does not take is reported on the result, never dropped in silence
+        // and never turned into a failed create.
+        let naming: { name: string } | { name_not_applied: string } | null = null;
+        if (name !== undefined) {
+          if (uuid === null) {
+            naming = { name_not_applied: "the create answer named no object uuid to rename" };
+          } else {
+            try {
+              const renamed = await api(
+                "POST",
+                `/api/parts/uuid/${encodeURIComponent(uuid)}/name`,
+                { name },
+              );
+              naming = { name: typeof renamed?.name === "string" ? renamed.name : name };
+            } catch (e) {
+              naming = { name_not_applied: e instanceof Error ? e.message : String(e) };
+            }
+          }
+        }
         const id = await newestPartId();
         return await okp(
           {
-            object_uuid: r.object?.id ?? null, // operand for boolean / transform
+            object_uuid: uuid, // operand for boolean / transform
             part_id: id,
+            ...(naming ?? {}),
             placement: id !== null ? await placement(id) : null,
           },
           id,
