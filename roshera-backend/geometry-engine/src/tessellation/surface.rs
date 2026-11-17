@@ -1282,6 +1282,40 @@ fn fan_weakly_convex_polygon(
     (!tris.is_empty()).then_some(tris)
 }
 
+/// Whether `tris` cover the polygon -- the outer loop less its holes --
+/// exactly once: a triangulation of it has the same area (to round-off), and
+/// one that covers the wrong region (or part of the right one) does not.
+fn tiles_polygon(
+    pts2d: &[(f64, f64)],
+    tris: &[[usize; 3]],
+    outer: (usize, usize),
+    holes: &[(usize, usize)],
+) -> bool {
+    let loop_area = |(s, e): (usize, usize)| -> f64 {
+        (s..e)
+            .map(|i| {
+                let (a, b) = (pts2d[i], pts2d[if i + 1 == e { s } else { i + 1 }]);
+                a.0 * b.1 - b.0 * a.1
+            })
+            .sum::<f64>()
+            .abs()
+            * 0.5
+    };
+    let want = loop_area(outer) - holes.iter().map(|&h| loop_area(h)).sum::<f64>();
+    if !(want > 0.0) {
+        // Holes as large as the outer loop: nothing this check can judge.
+        return true;
+    }
+    let got: f64 = tris
+        .iter()
+        .map(|t| {
+            let (a, b, c) = (pts2d[t[0]], pts2d[t[1]], pts2d[t[2]]);
+            ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs() * 0.5
+        })
+        .sum();
+    (got - want).abs() <= 1e-9 * want
+}
+
 pub(crate) fn triangulate_planar_polygon(
     vertices: &[Point3],
     loop_boundaries: &[(usize, usize, bool)],
@@ -1364,7 +1398,36 @@ pub(crate) fn triangulate_planar_polygon(
         }
     };
     match outcome {
-        Ok(Ok(tris)) => tris.into_iter().map(|(a, b, c)| [a, b, c]).collect(),
+        Ok(Ok(tris)) => {
+            let tris: Vec<[usize; 3]> = tris.into_iter().map(|(a, b, c)| [a, b, c]).collect();
+            if tiles_polygon(&pts2d, &tris, outer_range, &inner_ranges) {
+                return tris;
+            }
+            // `cdt` can return Ok with the wrong region: CADGenBench part
+            // 249's C-shaped face came back as the two triangles of its
+            // cut-out once the projection axes turned 90 degrees (a Newell
+            // normal 5.6e-17 off -Z picks a different reference axis). The
+            // same contours in a turned frame are triangulated afresh, and
+            // only a result that tiles the polygon replaces the first.
+            for (c, s) in [(0.0, 1.0), (0.6, 0.8)] {
+                let turned: Vec<(f64, f64)> = pts2d
+                    .iter()
+                    .map(|&(x, y)| (c * x - s * y, s * x + c * y))
+                    .collect();
+                let retry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cdt::triangulate_contours(&turned, &contours)
+                }));
+                if let Ok(Ok(t)) = retry {
+                    let t: Vec<[usize; 3]> = t.into_iter().map(|(a, b, c)| [a, b, c]).collect();
+                    if tiles_polygon(&pts2d, &t, outer_range, &inner_ranges) {
+                        trace("did not tile its polygon; a turned frame did");
+                        return t;
+                    }
+                }
+            }
+            trace("did not tile its polygon in any frame");
+            tris
+        }
         Ok(Err(e)) => {
             trace(&format!("failed: {e:?}"));
             // ONLY `PointOnFixedEdge` is recovered. That refusal means a
@@ -13697,5 +13760,111 @@ mod face_membership_cost_tests {
             "meshing made {used} projections for {} triangles; one trim projection is {per_trim}",
             mesh.triangles.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod planar_c_shape_tests {
+    use super::*;
+
+    fn shoelace(p: &[(f64, f64)]) -> f64 {
+        (0..p.len())
+            .map(|i| {
+                let (a, b) = (p[i], p[(i + 1) % p.len()]);
+                a.0 * b.1 - b.0 * a.1
+            })
+            .sum::<f64>()
+            * 0.5
+    }
+
+    /// CADGenBench part 249's planar face 224: a C-shaped strip 143 by
+    /// 26 mm, its walls 2.5 and 0.54 mm thick, the open side closed by two
+    /// short arcs. A valid simple polygon -- no repeated point, no crossing
+    /// -- yet the planar triangulation came back as the two triangles of
+    /// its CUT-OUT (the material the C goes round) and none of the C, so
+    /// the face's mesh met none of its neighbours.
+    #[test]
+    fn a_c_shaped_face_is_triangulated_over_itself_not_its_cut_out() {
+        // The face's boundary samples exactly as the importer produced them.
+        let vertices: Vec<Point3> = vec![
+            Point3::new(-61.61141736861, 2.23875603876, -18.01894185452),
+            Point3::new(-61.61141736861, -23.76124396124, -18.01894185452),
+            Point3::new(-201.569717028, -23.76124396124, -18.01894185452),
+            Point3::new(-201.59063150882147, -23.665214992170583, -18.01894185452),
+            Point3::new(-201.61149922798376, -23.569175850642132, -18.01894185452),
+            Point3::new(-201.63232018062547, -23.473126559443998, -18.01894185452),
+            Point3::new(-201.65309436181005, -23.37706714134943, -18.01894185452),
+            Point3::new(-201.67382176661198, -23.280997619133736, -18.01894185452),
+            Point3::new(-201.69450239011684, -23.184918015574887, -18.01894185452),
+            Point3::new(-201.71513622742125, -23.088828353453252, -18.01894185452),
+            Point3::new(-201.73572327363306, -22.99272865555129, -18.01894185452),
+            Point3::new(-201.75626352387104, -22.89661894465413, -18.01894185452),
+            Point3::new(-201.77675697326518, -22.800499243549275, -18.01894185452),
+            Point3::new(-201.79720361695652, -22.70436957502632, -18.01894185452),
+            Point3::new(-201.81760345009718, -22.608229961877583, -18.01894185452),
+            Point3::new(-201.83795646785046, -22.512080426897377, -18.01894185452),
+            Point3::new(-201.85826266539067, -22.415920992882654, -18.01894185452),
+            Point3::new(-201.87852203790322, -22.319751682632685, -18.01894185452),
+            Point3::new(-201.89873458058472, -22.22357251894885, -18.01894185452),
+            Point3::new(-201.91890028864276, -22.127383524635185, -18.01894185452),
+            Point3::new(-201.93901915729617, -22.031184722497727, -18.01894185452),
+            Point3::new(-201.95909118177474, -21.93497613534509, -18.01894185452),
+            Point3::new(-201.97911635731944, -21.83875778598822, -18.01894185452),
+            Point3::new(-201.99909467918238, -21.7425296972401, -18.01894185452),
+            Point3::new(-202.01902614262673, -21.646291891916313, -18.01894185452),
+            Point3::new(-202.03891074292676, -21.550044392834693, -18.01894185452),
+            Point3::new(-202.05874847536788, -21.453787222815166, -18.01894185452),
+            Point3::new(-202.0785393352466, -21.357520404680272, -18.01894185452),
+            Point3::new(-202.0982833178, -21.26124396124, -18.01894185452),
+            Point3::new(-62.1526182761, -21.26124396124, -18.01894185452),
+            Point3::new(-62.1526182761, -0.261243961241, -18.01894185452),
+            Point3::new(-205.2591432562, -0.261243961241, -18.01894185452),
+            Point3::new(-205.26844819514045, -0.1651434162859573, -18.01894185452),
+            Point3::new(-205.2777071627509, -0.06903843125338582, -18.01894185452),
+            Point3::new(-205.28692015699735, 0.027070971857614978, -18.01894185452),
+            Point3::new(-205.29608717577176, 0.12318477105477399, -18.01894185452),
+            Point3::new(-205.3052082169764, 0.21930294434516995, -18.01894185452),
+            Point3::new(-205.31428327852421, 0.31542546973451735, -18.01894185452),
+            Point3::new(-205.32331235833857, 0.41155232522789476, -18.01894185452),
+            Point3::new(-205.33229545435344, 0.5076834888290378, -18.01894185452),
+            Point3::new(-205.34123256451332, 0.6038189385410426, -18.01894185452),
+            Point3::new(-205.3501236867731, 0.6999586523656838, -18.01894185452),
+            Point3::new(-205.3589688190983, 0.7961026083040998, -18.01894185452),
+            Point3::new(-205.36776795946497, 0.8922507843561149, -18.01894185452),
+            Point3::new(-205.37652110585967, 0.9884031585209421, -18.01894185452),
+            Point3::new(-205.38522825627945, 1.0845597087965508, -18.01894185452),
+            Point3::new(-205.3938894087319, 1.18072041317998, -18.01894185452),
+            Point3::new(-205.4025045612352, 1.276885249667565, -18.01894185452),
+            Point3::new(-205.41107371181795, 1.3730541962543548, -18.01894185452),
+            Point3::new(-205.4195968585193, 1.4692272309347985, -18.01894185452),
+            Point3::new(-205.42807399938903, 1.5654043317020623, -18.01894185452),
+            Point3::new(-205.43650513248733, 1.6615854765487441, -18.01894185452),
+            Point3::new(-205.44489025588493, 1.7577706434661486, -18.01894185452),
+            Point3::new(-205.45322936766317, 1.8539598104450192, -18.01894185452),
+            Point3::new(-205.46152246591382, 1.950152955474831, -18.01894185452),
+            Point3::new(-205.46976954873927, 2.046350056544508, -18.01894185452),
+            Point3::new(-205.4779706142523, 2.142551091641703, -18.01894185452),
+            Point3::new(-205.4861256605, 2.23875603876, -18.01894185452),
+        ];
+        let xy: Vec<(f64, f64)> = vertices.iter().map(|p| (p.x, p.y)).collect();
+        let want = shoelace(&xy).abs();
+        // The normal the planar mesher projects with: Newell's, from the
+        // samples themselves, signed by the face's (Backward) orientation.
+        let newell = newell_normal(&vertices).expect("a planar loop has a normal");
+        for normal in [newell, -newell] {
+            let tris = triangulate_planar_polygon(&vertices, &[(0, vertices.len(), true)], &normal);
+            let got: f64 = tris
+                .iter()
+                .map(|t| {
+                    let (a, b, c) = (xy[t[0]], xy[t[1]], xy[t[2]]);
+                    ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs() * 0.5
+                })
+                .sum();
+            assert!(
+                (got - want).abs() <= 1e-6 * want,
+                "normal {normal:?}: {} triangles cover {got:.4} mm^2 of the face's {want:.4}",
+                tris.len()
+            );
+        }
     }
 }
