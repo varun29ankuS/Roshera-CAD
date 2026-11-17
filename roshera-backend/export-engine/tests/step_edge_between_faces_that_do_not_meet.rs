@@ -144,3 +144,83 @@ fn an_edge_between_faces_that_do_not_meet_is_placed_on_its_nearer_face() {
         report.healings
     );
 }
+
+/// The edge rebuild computes every candidate edge in parallel and applies
+/// the results in edge-id order, so an import is the same however many
+/// threads run it: same healings, same rebuilt curves.
+#[test]
+fn the_edge_rebuild_gives_the_same_result_on_one_thread_and_on_many() {
+    let import = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("pool");
+        pool.install(|| {
+            let (model, report) = ExportEngine::new()
+                .import_step_content(&envelope(&two_copies()), "alongside twice")
+                .expect("imports");
+            let edges: Vec<String> = model
+                .edges
+                .iter()
+                .map(|(id, e)| {
+                    let samples: Vec<String> = (0..=16)
+                        .map(|k| {
+                            e.evaluate(k as f64 / 16.0, &model.curves)
+                                .map(|p| {
+                                    format!("{:?}", (p.x.to_bits(), p.y.to_bits(), p.z.to_bits()))
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    format!(
+                        "{id}: tol {:?} {}",
+                        e.tolerance.to_bits(),
+                        samples.join(",")
+                    )
+                })
+                .collect();
+            (format!("{:?}", report.healings), edges)
+        })
+    };
+    let (one_healings, one_edges) = import(1);
+    let (many_healings, many_edges) = import(4);
+    assert!(
+        one_healings
+            .matches("EdgeRebuiltOnFaceIntersection")
+            .count()
+            >= 2,
+        "the fixture rebuilds at least two edges, so their order is tested: {one_healings}"
+    );
+    assert_eq!(
+        one_healings, many_healings,
+        "healings differ by thread count"
+    );
+    assert_eq!(
+        one_edges, many_edges,
+        "rebuilt edges differ by thread count"
+    );
+}
+
+/// The fixture twice in one file (the second copy's entities renumbered),
+/// so the import rebuilds two edges and their order matters.
+fn two_copies() -> String {
+    let one = faces_alongside();
+    let mut second = String::with_capacity(one.len());
+    let mut chars = one.chars().peekable();
+    while let Some(c) = chars.next() {
+        second.push(c);
+        if c == '#' {
+            let mut digits = String::new();
+            while let Some(d) = chars.peek().copied().filter(char::is_ascii_digit) {
+                digits.push(d);
+                chars.next();
+            }
+            let n: u64 = digits.parse().expect("an entity number");
+            second.push_str(&(n + 100).to_string());
+        }
+    }
+    format!(
+        "{one}
+{second}"
+    )
+}

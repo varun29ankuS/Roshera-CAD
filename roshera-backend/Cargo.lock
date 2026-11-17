@@ -1861,6 +1861,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "geometry-engine",
+ "rayon",
  "rmp-serde",
  "ros-format",
  "ruststep",

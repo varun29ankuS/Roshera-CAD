@@ -178,12 +178,32 @@ pub fn import_step_text_uncertified(
     }
     report.roots_resolved = roots_with_solids;
     report.solids_in_roots = total_root_solids;
+    // Each repair pass is timed under ROSHERA_IMPORT_PROFILE: together they
+    // were most of an import (37.7 s of CADGenBench part 208's 38 s before
+    // certification) and none was measured on its own.
+    let lap = |label: &str, t: std::time::Instant| {
+        if prof {
+            eprintln!("[import-profile] repair: {label} {:?}", t.elapsed());
+        }
+    };
+    let t = std::time::Instant::now();
     fit_linear_extrusions_to_faces(&mut model, &mut caches);
+    lap("fit linear extrusions", t);
+    let t = std::time::Instant::now();
     merge_vertices_a_loop_passes_between(&mut model, &mut caches, &mut report);
+    lap("merge loop-crossed vertices", t);
+    let t = std::time::Instant::now();
     collapse_edges_shorter_than_their_tolerance(&mut model, &mut caches, &mut report);
+    lap("collapse short edges", t);
+    let t = std::time::Instant::now();
     rebuild_edges_onto_face_intersections(&mut model, &mut caches, &mut report);
+    lap("rebuild edges on face intersections", t);
+    let t = std::time::Instant::now();
     raise_edge_tolerances_to_measured_gaps(&mut model, &mut caches, &mut report);
+    lap("raise edge tolerances to gaps", t);
+    let t = std::time::Instant::now();
     reverse_loops_walking_against_neighbours(&mut model, &mut caches, &mut report);
+    lap("reverse loops against neighbours", t);
 
     // Place assembly instances from the product tree, then give every solid
     // and face its identity — PIDs keyed by this file's CONTENT and the STEP
@@ -805,222 +825,245 @@ fn rebuild_edges_onto_face_intersections(
     }
     let face_instance: HashMap<u32, u64> = caches.faces.iter().map(|(n, &f)| (f, *n)).collect();
     let edge_instance: HashMap<u32, u64> = caches.edges.iter().map(|(n, &e)| (e, *n)).collect();
-    for (eid, faces) in users {
-        let [fa, fb] = faces[..] else {
-            continue;
-        };
-        if fa == fb {
-            continue;
-        }
-        let (Some(face_a), Some(face_b)) = (model.faces.get(fa), model.faces.get(fb)) else {
-            continue;
-        };
-        let (Some(sa), Some(sb)) = (
-            model.surfaces.get(face_a.surface_id),
-            model.surfaces.get(face_b.surface_id),
-        ) else {
-            continue;
-        };
-        let Some(edge) = model.edges.get(eid) else {
-            continue;
-        };
-        // A closed edge (a full circle: one vertex at both ends) is rebuilt
-        // like any other -- its samples run round and both ends are that
-        // vertex. Fillet rims on cylinders and tori are such circles, and
-        // skipping them left most of CADGenBench's off-face edges unrepaired.
-        let declared = edge.tolerance;
-        // The distance from `p` to a surface, and the surface point.
-        let foot = |s: &dyn geometry_engine::primitives::surface::Surface, p: Point3| {
-            s.closest_point(&p, tol)
-                .ok()
-                .and_then(|(u, v)| s.point_at(u, v).ok())
-                .map(|q| (q, (q - p).magnitude()))
-        };
-        let gap_of = |p: Point3| -> Option<f64> { Some(foot(sa, p)?.1.max(foot(sb, p)?.1)) };
-        let sample = |n: usize| -> Option<Vec<Point3>> {
-            (0..n)
-                .map(|k| edge.evaluate(k as f64 / (n - 1) as f64, &model.curves).ok())
-                .collect()
-        };
-        let Some(probe) = sample(EDGE_REBUILD_SAMPLES) else {
-            continue;
-        };
-        let Some(before) = probe
-            .iter()
-            .map(|&p| gap_of(p))
-            .try_fold(0.0_f64, |m, g| g.map(|g| m.max(g)))
-        else {
-            continue;
-        };
-        if !(before > declared.max(1e-7)) || rebuild_cannot_reach_cap(before) {
-            continue;
-        }
-        let (Some(vs), Some(ve)) = (
-            model.vertices.get(edge.start_vertex).map(|v| v.position),
-            model.vertices.get(edge.end_vertex).map(|v| v.position),
-        ) else {
-            continue;
-        };
-        // Carry `n` samples onto both surfaces and interpolate them; `None`
-        // when any sample does not converge or would move too far.
-        use geometry_engine::primitives::curve::Curve;
-        let attempt = |n: usize| -> Option<(
-            geometry_engine::primitives::curve::NurbsCurve,
-            f64,
-            f64,
-            f64,
-        )> {
-            let samples = sample(n)?;
-            let mut on_both = Vec::with_capacity(n);
-            for (i, &p) in samples.iter().enumerate() {
-                // The ends become the edge's vertices below; nothing to walk
-                // (and at a pole or apex there is no step across to take:
-                // CADGenBench part 205).
-                if i == 0 || i + 1 == samples.len() {
-                    on_both.push(p);
-                    continue;
-                }
-                // Walk ACROSS the edge on the surface the file's curve lies
-                // nearer (its "home" face) to the point that comes closest to
-                // the other face. Where the faces cross that point is on
-                // both; where they touch TANGENTIALLY -- a fillet running
-                // onto a flat face -- it is the contact line, which
-                // alternating projection never reaches (both steps are near
-                // the shared normal, the error across the edge never shrinks:
-                // CADGenBench part 205); where they truly do not meet it is
-                // their real separation, which becomes the edge's tolerance.
-                let (home, other) = if foot(sa, p)?.1 <= foot(sb, p)?.1 {
-                    (sa, sb)
-                } else {
-                    (sb, sa)
+    // Each edge's rebuild reads only its own curve, its two faces' surfaces
+    // and its vertices -- none of which another edge's rebuild changes -- so
+    // every candidate is computed in parallel and the results are applied in
+    // edge-id order exactly as the serial walk applied them. (The rebuild
+    // was 73 s of CADGenBench part 208's import, one edge after another.)
+    let candidates: Vec<(u32, Vec<u32>)> = users.into_iter().collect();
+    let rebuilt: Vec<_> = {
+        use rayon::prelude::*;
+        let model: &geometry_engine::primitives::topology_builder::BRepModel = model;
+        candidates
+            .par_iter()
+            .map(|(eid, faces)| {
+                let eid = *eid;
+                let compute = || {
+                    let [fa, fb] = faces[..] else {
+                        return None;
+                    };
+                    if fa == fb {
+                        return None;
+                    }
+                    let (Some(face_a), Some(face_b)) = (model.faces.get(fa), model.faces.get(fb)) else {
+                        return None;
+                    };
+                    let (Some(sa), Some(sb)) = (
+                        model.surfaces.get(face_a.surface_id),
+                        model.surfaces.get(face_b.surface_id),
+                    ) else {
+                        return None;
+                    };
+                    let Some(edge) = model.edges.get(eid) else {
+                        return None;
+                    };
+                    // A closed edge (a full circle: one vertex at both ends) is rebuilt
+                    // like any other -- its samples run round and both ends are that
+                    // vertex. Fillet rims on cylinders and tori are such circles, and
+                    // skipping them left most of CADGenBench's off-face edges unrepaired.
+                    let declared = edge.tolerance;
+                    // The distance from `p` to a surface, and the surface point.
+                    let foot = |s: &dyn geometry_engine::primitives::surface::Surface, p: Point3| {
+                        s.closest_point(&p, tol)
+                            .ok()
+                            .and_then(|(u, v)| s.point_at(u, v).ok())
+                            .map(|q| (q, (q - p).magnitude()))
+                    };
+                    let gap_of = |p: Point3| -> Option<f64> { Some(foot(sa, p)?.1.max(foot(sb, p)?.1)) };
+                    let sample = |n: usize| -> Option<Vec<Point3>> {
+                        (0..n)
+                            .map(|k| edge.evaluate(k as f64 / (n - 1) as f64, &model.curves).ok())
+                            .collect()
+                    };
+                    let Some(probe) = sample(EDGE_REBUILD_SAMPLES) else {
+                        return None;
+                    };
+                    let Some(before) = probe
+                        .iter()
+                        .map(|&p| gap_of(p))
+                        .try_fold(0.0_f64, |m, g| g.map(|g| m.max(g)))
+                    else {
+                        return None;
+                    };
+                    if !(before > declared.max(1e-7)) || rebuild_cannot_reach_cap(before) {
+                        return None;
+                    }
+                    let (Some(vs), Some(ve)) = (
+                        model.vertices.get(edge.start_vertex).map(|v| v.position),
+                        model.vertices.get(edge.end_vertex).map(|v| v.position),
+                    ) else {
+                        return None;
+                    };
+                    // Carry `n` samples onto both surfaces and interpolate them; `None`
+                    // when any sample does not converge or would move too far.
+                    use geometry_engine::primitives::curve::Curve;
+                    let attempt = |n: usize| -> Option<(
+                        geometry_engine::primitives::curve::NurbsCurve,
+                        f64,
+                        f64,
+                        f64,
+                    )> {
+                        let samples = sample(n)?;
+                        let mut on_both = Vec::with_capacity(n);
+                        for (i, &p) in samples.iter().enumerate() {
+                            // The ends become the edge's vertices below; nothing to walk
+                            // (and at a pole or apex there is no step across to take:
+                            // CADGenBench part 205).
+                            if i == 0 || i + 1 == samples.len() {
+                                on_both.push(p);
+                                continue;
+                            }
+                            // Walk ACROSS the edge on the surface the file's curve lies
+                            // nearer (its "home" face) to the point that comes closest to
+                            // the other face. Where the faces cross that point is on
+                            // both; where they touch TANGENTIALLY -- a fillet running
+                            // onto a flat face -- it is the contact line, which
+                            // alternating projection never reaches (both steps are near
+                            // the shared normal, the error across the edge never shrinks:
+                            // CADGenBench part 205); where they truly do not meet it is
+                            // their real separation, which becomes the edge's tolerance.
+                            let (home, other) = if foot(sa, p)?.1 <= foot(sb, p)?.1 {
+                                (sa, sb)
+                            } else {
+                                (sb, sa)
+                            };
+                            let (u0, v0) = home.closest_point(&p, tol).ok()?;
+                            let e = home.evaluate_full(u0, v0).ok()?;
+                            let prev = samples[i.saturating_sub(1)];
+                            let next = samples[(i + 1).min(samples.len() - 1)];
+                            let along = (next - prev).normalize().ok()?;
+                            let across = e.normal.cross(&along).normalize().ok()?;
+                            // The parameter step that moves along `across` on `home`.
+                            let (g11, g12, g22) = (e.du.dot(&e.du), e.du.dot(&e.dv), e.dv.dot(&e.dv));
+                            let (r1, r2) = (e.du.dot(&across), e.dv.dot(&across));
+                            let det = g11 * g22 - g12 * g12;
+                            if !(det.abs() > 1e-300) {
+                                return None;
+                            }
+                            let (du, dv) = ((g22 * r1 - g12 * r2) / det, (g11 * r2 - g12 * r1) / det);
+                            let on_home = |s: f64| home.point_at(u0 + s * du, v0 + s * dv).ok();
+                            let gap = |s: f64| on_home(s).and_then(|q| foot(other, q)).map(|(_, d)| d);
+                            // Golden-section search for the closest approach.
+                            let phi = 0.5 * (5f64.sqrt() - 1.0);
+                            let (mut lo, mut hi) = (-EDGE_REBUILD_CAP, EDGE_REBUILD_CAP);
+                            let mut x1 = hi - phi * (hi - lo);
+                            let mut x2 = lo + phi * (hi - lo);
+                            let (mut f1, mut f2) = (gap(x1)?, gap(x2)?);
+                            for _ in 0..EDGE_REBUILD_ITERATIONS {
+                                if f1 <= f2 {
+                                    hi = x2;
+                                    x2 = x1;
+                                    f2 = f1;
+                                    x1 = hi - phi * (hi - lo);
+                                    f1 = gap(x1)?;
+                                } else {
+                                    lo = x1;
+                                    x1 = x2;
+                                    f1 = f2;
+                                    x2 = lo + phi * (hi - lo);
+                                    f2 = gap(x2)?;
+                                }
+                                if hi - lo < 1e-13 * (1.0 + EDGE_REBUILD_CAP) {
+                                    break;
+                                }
+                            }
+                            // A minimum AT the search bound is not a closest approach: the
+                            // faces run alongside each other without meeting within reach
+                            // (CADGenBench part 229: two faces 3e-3 mm apart, the gap
+                            // shrinking by a tenth over the whole 0.1 mm walk). The edge
+                            // is then the foot on its home face, and their separation
+                            // becomes its tolerance.
+                            let mut s_best = 0.5 * (lo + hi);
+                            if s_best.abs() >= EDGE_REBUILD_BOUND_FRACTION * EDGE_REBUILD_CAP {
+                                s_best = 0.0;
+                            }
+                            let q = on_home(s_best)?;
+                            if (q - p).magnitude() > EDGE_REBUILD_CAP {
+                                return None;
+                            }
+                            on_both.push(q);
+                        }
+                        // The ends are the edge's vertices: the edges meeting there use them.
+                        let last = on_both.len() - 1;
+                        on_both[0] = Point3::new(vs[0], vs[1], vs[2]);
+                        on_both[last] = Point3::new(ve[0], ve[1], ve[2]);
+                        let fit = geometry_engine::math::nurbs::interpolate_nurbs_curve(
+                            &on_both,
+                            3,
+                            geometry_engine::math::nurbs::ParameterizationType::ChordLength,
+                        )
+                        .ok()?;
+                        let knots = fit.knots.values().to_vec();
+                        let (k0, k1) = (*knots.first()?, *knots.last()?);
+                        let curve = geometry_engine::primitives::curve::NurbsCurve::new(
+                            fit.degree,
+                            fit.control_points.clone(),
+                            fit.weights.clone(),
+                            knots,
+                        )
+                        .ok()?;
+                        // Measured between the interpolated samples too.
+                        let m = 4 * (n - 1);
+                        let after = (0..=m)
+                            .map(|k| {
+                                curve
+                                    .point_at(k0 + (k1 - k0) * k as f64 / m as f64)
+                                    .ok()
+                                    .and_then(gap_of)
+                            })
+                            .try_fold(0.0_f64, |acc, g| g.map(|g| acc.max(g)))?;
+                        Some((curve, k0, k1, after))
+                    };
+                    // Double the samples until the rebuilt edge lies on both faces to
+                    // the target, or the attempts run out; keep the best.
+                    let target = EDGE_REBUILD_TARGET.max(declared);
+                    let mut best: Option<(
+                        geometry_engine::primitives::curve::NurbsCurve,
+                        f64,
+                        f64,
+                        f64,
+                    )> = None;
+                    let mut n = EDGE_REBUILD_SAMPLES;
+                    while n <= EDGE_REBUILD_MAX_SAMPLES {
+                        let Some(got) = attempt(n) else { break };
+                        let done = got.3 <= target;
+                        if best.as_ref().is_none_or(|b| got.3 < b.3) {
+                            best = Some(got);
+                        }
+                        if done {
+                            break;
+                        }
+                        n = 2 * n - 1;
+                    }
+                    if std::env::var_os("ROSHERA_REBUILD_TRACE").is_some() {
+                        eprintln!(
+                            "[rebuild] edge {eid}: before {before:.3e} best after {:?} (n up to {n})",
+                            best.as_ref().map(|b| b.3)
+                        );
+                    }
+                    let Some((curve, k0, k1, after)) = best else {
+                        return None;
+                    };
+                    // Kept only when it lies on both faces far more closely than the
+                    // file's curve: on a tangent contact the rebuilt edge need not be
+                    // exact, but it must be a real improvement, and within the repair
+                    // cap (its tolerance is what it reached).
+                    // An edge beyond the repair cap refuses the part, so any rebuild that
+                    // brings it within the cap is kept.
+                    let gain = after <= before * EDGE_REBUILD_MIN_GAIN || before > EDGE_GAP_REPAIR_CAP;
+                    if !(gain && after <= EDGE_GAP_REPAIR_CAP) {
+                        return None;
+                    }
+                    Some((fa, fb, curve, k0, k1, before, after))
                 };
-                let (u0, v0) = home.closest_point(&p, tol).ok()?;
-                let e = home.evaluate_full(u0, v0).ok()?;
-                let prev = samples[i.saturating_sub(1)];
-                let next = samples[(i + 1).min(samples.len() - 1)];
-                let along = (next - prev).normalize().ok()?;
-                let across = e.normal.cross(&along).normalize().ok()?;
-                // The parameter step that moves along `across` on `home`.
-                let (g11, g12, g22) = (e.du.dot(&e.du), e.du.dot(&e.dv), e.dv.dot(&e.dv));
-                let (r1, r2) = (e.du.dot(&across), e.dv.dot(&across));
-                let det = g11 * g22 - g12 * g12;
-                if !(det.abs() > 1e-300) {
-                    return None;
-                }
-                let (du, dv) = ((g22 * r1 - g12 * r2) / det, (g11 * r2 - g12 * r1) / det);
-                let on_home = |s: f64| home.point_at(u0 + s * du, v0 + s * dv).ok();
-                let gap = |s: f64| on_home(s).and_then(|q| foot(other, q)).map(|(_, d)| d);
-                // Golden-section search for the closest approach.
-                let phi = 0.5 * (5f64.sqrt() - 1.0);
-                let (mut lo, mut hi) = (-EDGE_REBUILD_CAP, EDGE_REBUILD_CAP);
-                let mut x1 = hi - phi * (hi - lo);
-                let mut x2 = lo + phi * (hi - lo);
-                let (mut f1, mut f2) = (gap(x1)?, gap(x2)?);
-                for _ in 0..EDGE_REBUILD_ITERATIONS {
-                    if f1 <= f2 {
-                        hi = x2;
-                        x2 = x1;
-                        f2 = f1;
-                        x1 = hi - phi * (hi - lo);
-                        f1 = gap(x1)?;
-                    } else {
-                        lo = x1;
-                        x1 = x2;
-                        f1 = f2;
-                        x2 = lo + phi * (hi - lo);
-                        f2 = gap(x2)?;
-                    }
-                    if hi - lo < 1e-13 * (1.0 + EDGE_REBUILD_CAP) {
-                        break;
-                    }
-                }
-                // A minimum AT the search bound is not a closest approach: the
-                // faces run alongside each other without meeting within reach
-                // (CADGenBench part 229: two faces 3e-3 mm apart, the gap
-                // shrinking by a tenth over the whole 0.1 mm walk). The edge
-                // is then the foot on its home face, and their separation
-                // becomes its tolerance.
-                let mut s_best = 0.5 * (lo + hi);
-                if s_best.abs() >= EDGE_REBUILD_BOUND_FRACTION * EDGE_REBUILD_CAP {
-                    s_best = 0.0;
-                }
-                let q = on_home(s_best)?;
-                if (q - p).magnitude() > EDGE_REBUILD_CAP {
-                    return None;
-                }
-                on_both.push(q);
-            }
-            // The ends are the edge's vertices: the edges meeting there use them.
-            let last = on_both.len() - 1;
-            on_both[0] = Point3::new(vs[0], vs[1], vs[2]);
-            on_both[last] = Point3::new(ve[0], ve[1], ve[2]);
-            let fit = geometry_engine::math::nurbs::interpolate_nurbs_curve(
-                &on_both,
-                3,
-                geometry_engine::math::nurbs::ParameterizationType::ChordLength,
-            )
-            .ok()?;
-            let knots = fit.knots.values().to_vec();
-            let (k0, k1) = (*knots.first()?, *knots.last()?);
-            let curve = geometry_engine::primitives::curve::NurbsCurve::new(
-                fit.degree,
-                fit.control_points.clone(),
-                fit.weights.clone(),
-                knots,
-            )
-            .ok()?;
-            // Measured between the interpolated samples too.
-            let m = 4 * (n - 1);
-            let after = (0..=m)
-                .map(|k| {
-                    curve
-                        .point_at(k0 + (k1 - k0) * k as f64 / m as f64)
-                        .ok()
-                        .and_then(gap_of)
-                })
-                .try_fold(0.0_f64, |acc, g| g.map(|g| acc.max(g)))?;
-            Some((curve, k0, k1, after))
-        };
-        // Double the samples until the rebuilt edge lies on both faces to
-        // the target, or the attempts run out; keep the best.
-        let target = EDGE_REBUILD_TARGET.max(declared);
-        let mut best: Option<(
-            geometry_engine::primitives::curve::NurbsCurve,
-            f64,
-            f64,
-            f64,
-        )> = None;
-        let mut n = EDGE_REBUILD_SAMPLES;
-        while n <= EDGE_REBUILD_MAX_SAMPLES {
-            let Some(got) = attempt(n) else { break };
-            let done = got.3 <= target;
-            if best.as_ref().is_none_or(|b| got.3 < b.3) {
-                best = Some(got);
-            }
-            if done {
-                break;
-            }
-            n = 2 * n - 1;
-        }
-        if std::env::var_os("ROSHERA_REBUILD_TRACE").is_some() {
-            eprintln!(
-                "[rebuild] edge {eid}: before {before:.3e} best after {:?} (n up to {n})",
-                best.as_ref().map(|b| b.3)
-            );
-        }
-        let Some((curve, k0, k1, after)) = best else {
+                (eid, compute())
+            })
+            .collect()
+    };
+    for (eid, rebuilt) in rebuilt {
+        let Some((fa, fb, curve, k0, k1, before, after)) = rebuilt else {
             continue;
         };
-        // Kept only when it lies on both faces far more closely than the
-        // file's curve: on a tangent contact the rebuilt edge need not be
-        // exact, but it must be a real improvement, and within the repair
-        // cap (its tolerance is what it reached).
-        // An edge beyond the repair cap refuses the part, so any rebuild that
-        // brings it within the cap is kept.
-        let gain = after <= before * EDGE_REBUILD_MIN_GAIN || before > EDGE_GAP_REPAIR_CAP;
-        if !(gain && after <= EDGE_GAP_REPAIR_CAP) {
-            continue;
-        }
         let curve_id = model.curves.add(Box::new(curve));
         let Some(edge) = model.edges.get_mut(eid) else {
             continue;
