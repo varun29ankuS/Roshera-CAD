@@ -178,46 +178,38 @@ fn weld_key(p: &crate::math::vector3::Point3, eps: f64) -> (i64, i64, i64) {
 /// This fn contains the entire connectivity analysis that was previously inlined
 /// in [`manifold_report`]; the wrapper now delegates here after tessellating.
 pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<ManifoldReport> {
+    use rayon::prelude::*;
     if mesh.triangles.is_empty() {
         return None;
     }
 
-    // Weld vertices by quantised position.
-    let mut weld_map: HashMap<(i64, i64, i64), u32> = HashMap::new();
-    let mut welded_index: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
-    for v in &mesh.vertices {
-        let key = weld_key(&v.position, weld_eps);
-        let next = weld_map.len() as u32;
-        let id = *weld_map.entry(key).or_insert(next);
-        welded_index.push(id);
+    // Weld by sorting the lattice keys: one id per distinct key. (Pairing by
+    // sort, not hashing: four hash maps over ~10 M directed edges took 4.1 s
+    // on CADGenBench part 208's 3.4 M triangles; sort-based half-edge pairing
+    // -- as the Manifold library does it -- is near-linear and parallel.)
+    let keys: Vec<(i64, i64, i64)> = mesh
+        .vertices
+        .par_iter()
+        .map(|v| weld_key(&v.position, weld_eps))
+        .collect();
+    let mut by_key: Vec<u32> = (0..keys.len() as u32).collect();
+    by_key.par_sort_unstable_by_key(|&i| keys[i as usize]);
+    let mut welded_index = vec![0u32; keys.len()];
+    let mut welded_vertices = 0usize;
+    for (k, &i) in by_key.iter().enumerate() {
+        let repeat = k > 0 && keys[by_key[k - 1] as usize] == keys[i as usize];
+        if !repeat {
+            welded_vertices += 1;
+        }
+        welded_index[i as usize] = (welded_vertices - 1) as u32;
     }
-    let welded_vertices = weld_map.len();
 
-    // Directed-edge multiset over welded indices; skip degenerate triangles.
-    let mut directed: HashMap<(u32, u32), u32> = HashMap::new();
+    // Directed half-edges (packed `from << 32 | to`) with their face, in
+    // triangle order.
+    let has_faces = mesh.face_map.len() == mesh.triangles.len();
+    let mut half_edges: Vec<(u64, u32)> = Vec::with_capacity(3 * mesh.triangles.len());
     let mut degenerate_triangles = 0usize;
     let mut live_triangles = 0usize;
-    // Union-find over welded vertices for component counting.
-    let mut parent: Vec<u32> = (0..welded_vertices as u32).collect();
-    fn find(parent: &mut Vec<u32>, mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            parent[x as usize] = parent[parent[x as usize] as usize];
-            x = parent[x as usize];
-        }
-        x
-    }
-    let union = |parent: &mut Vec<u32>, a: u32, b: u32| {
-        let ra = find(parent, a);
-        let rb = find(parent, b);
-        if ra != rb {
-            parent[ra as usize] = rb;
-        }
-    };
-
-    // The face of each directed edge's triangles (first and last seen), so a
-    // defect can be put on the face it is on without a second pass.
-    let mut edge_face: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
-    let has_faces = mesh.face_map.len() == mesh.triangles.len();
     for (ti, tri) in mesh.triangles.iter().enumerate() {
         let a = welded_index[tri[0] as usize];
         let b = welded_index[tri[1] as usize];
@@ -227,72 +219,107 @@ pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<Manifo
             continue;
         }
         live_triangles += 1;
-        for &(u, v) in &[(a, b), (b, c), (c, a)] {
-            *directed.entry((u, v)).or_insert(0) += 1;
-            union(&mut parent, u, v);
-            if has_faces {
-                let f = mesh.face_map[ti];
-                edge_face
-                    .entry((u, v))
-                    .and_modify(|e| e.1 = f)
-                    .or_insert((f, f));
-            }
+        let f = if has_faces { mesh.face_map[ti] } else { 0 };
+        for (u, v) in [(a, b), (b, c), (c, a)] {
+            half_edges.push(((u64::from(u) << 32) | u64::from(v), f));
         }
     }
+    // Stable: a directed edge's faces stay in triangle order, so its first
+    // and last face are the ones a walk over the triangles meets first/last.
+    half_edges.par_sort_by_key(|e| e.0);
 
-    // Aggregate undirected edges from the directed multiset.
-    let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+    // One entry per distinct directed edge: (from, to, uses, first face, last face).
+    let mut directed: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
+    for &(key, f) in &half_edges {
+        let (u, v) = ((key >> 32) as u32, key as u32);
+        match directed.last_mut() {
+            Some(d) if d.0 == u && d.1 == v => {
+                d.2 += 1;
+                d.4 = f;
+            }
+            _ => directed.push((u, v, 1, f, f)),
+        }
+    }
+    drop(half_edges);
+
+    let mut parent: Vec<u32> = (0..welded_vertices as u32).collect();
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            parent[x as usize] = parent[parent[x as usize] as usize];
+            x = parent[x as usize];
+        }
+        x
+    }
+    let mut used = vec![false; welded_vertices];
     let mut inconsistent_directed_edges = 0usize;
-    for (&(u, v), &count) in &directed {
-        if count > 1 {
-            inconsistent_directed_edges += 1;
-        }
-        let key = if u < v { (u, v) } else { (v, u) };
-        *undirected.entry(key).or_insert(0) += count;
-    }
-
-    let mut boundary_edges = 0usize;
-    let mut nonmanifold_edges = 0usize;
-    let mut open_by_face: HashMap<u32, usize> = HashMap::new();
-    let mut fan_by_face: HashMap<u32, usize> = HashMap::new();
     let mut flip_by_face: HashMap<u32, usize> = HashMap::new();
-    // The faces on either directed side of the undirected edge (u, v).
-    let faces_of = |u: u32, v: u32| -> Vec<u32> {
-        let mut out = Vec::new();
-        for k in [(u, v), (v, u)] {
-            if let Some(&(f0, f1)) = edge_face.get(&k) {
-                out.push(f0);
-                if f1 != f0 {
-                    out.push(f1);
-                }
-            }
+    for &(u, v, uses, f0, f1) in &directed {
+        let (ru, rv) = (find(&mut parent, u), find(&mut parent, v));
+        if ru != rv {
+            parent[ru as usize] = rv;
         }
-        out.sort_unstable();
-        out.dedup();
-        out
-    };
-    for (&(u, v), &incident) in &undirected {
-        if incident == 1 {
-            boundary_edges += 1;
-            for f in faces_of(u, v) {
-                *open_by_face.entry(f).or_insert(0) += 1;
-            }
-        } else if incident > 2 {
-            nonmanifold_edges += 1;
-            for f in faces_of(u, v) {
-                *fan_by_face.entry(f).or_insert(0) += 1;
-            }
-        }
-    }
-    for (&(u, v), &count) in &directed {
-        if count > 1 {
-            if let Some(&(f0, f1)) = edge_face.get(&(u, v)) {
+        used[u as usize] = true;
+        used[v as usize] = true;
+        if uses > 1 {
+            inconsistent_directed_edges += 1;
+            if has_faces {
                 *flip_by_face.entry(f0).or_insert(0) += 1;
                 if f1 != f0 {
                     *flip_by_face.entry(f1).or_insert(0) += 1;
                 }
             }
         }
+    }
+
+    // Undirected edges: both directions of a pair, grouped by sorting.
+    let mut undirected: Vec<(u64, u32)> = directed
+        .iter()
+        .enumerate()
+        .map(|(k, &(u, v, ..))| {
+            let (lo, hi) = if u < v { (u, v) } else { (v, u) };
+            ((u64::from(lo) << 32) | u64::from(hi), k as u32)
+        })
+        .collect();
+    undirected.par_sort_unstable();
+    let mut boundary_edges = 0usize;
+    let mut nonmanifold_edges = 0usize;
+    let mut undirected_edges = 0usize;
+    let mut open_by_face: HashMap<u32, usize> = HashMap::new();
+    let mut fan_by_face: HashMap<u32, usize> = HashMap::new();
+    let mut start = 0usize;
+    while start < undirected.len() {
+        let mut end = start + 1;
+        while end < undirected.len() && undirected[end].0 == undirected[start].0 {
+            end += 1;
+        }
+        undirected_edges += 1;
+        let group = &undirected[start..end];
+        let incident: u32 = group.iter().map(|&(_, k)| directed[k as usize].2).sum();
+        if incident == 1 || incident > 2 {
+            let mut faces: Vec<u32> = Vec::new();
+            if has_faces {
+                for &(_, k) in group {
+                    let d = directed[k as usize];
+                    faces.push(d.3);
+                    if d.4 != d.3 {
+                        faces.push(d.4);
+                    }
+                }
+                faces.sort_unstable();
+                faces.dedup();
+            }
+            let tally = if incident == 1 {
+                boundary_edges += 1;
+                &mut open_by_face
+            } else {
+                nonmanifold_edges += 1;
+                &mut fan_by_face
+            };
+            for f in faces {
+                *tally.entry(f).or_insert(0) += 1;
+            }
+        }
+        start = end;
     }
     let sorted = |m: HashMap<u32, usize>| {
         let mut v: Vec<(u32, usize)> = m.into_iter().collect();
@@ -302,23 +329,15 @@ pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<Manifo
 
     // Components over vertices actually referenced by a live triangle.
     let mut roots = std::collections::HashSet::new();
-    for (&(u, v), _) in &directed {
-        roots.insert(find(&mut parent, u));
-        roots.insert(find(&mut parent, v));
+    let mut v_count = 0i64;
+    for (x, &u) in used.iter().enumerate() {
+        if u {
+            v_count += 1;
+            roots.insert(find(&mut parent, x as u32));
+        }
     }
     let components = roots.len().max(1);
-
-    let v_count = {
-        let mut used = std::collections::HashSet::new();
-        for (&(u, v), _) in &directed {
-            used.insert(u);
-            used.insert(v);
-        }
-        used.len() as i64
-    };
-    let e_count = undirected.len() as i64;
-    let f_count = live_triangles as i64;
-    let euler_characteristic = v_count - e_count + f_count;
+    let euler_characteristic = v_count - undirected_edges as i64 + live_triangles as i64;
 
     // The tessellator's own weld reports what it could not address. This
     // analysis cannot rediscover that from the arrays - its `weld_key` lattice
@@ -330,7 +349,7 @@ pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<Manifo
         triangles: mesh.triangles.len(),
         degenerate_triangles,
         welded_vertices,
-        undirected_edges: undirected.len(),
+        undirected_edges,
         boundary_edges,
         nonmanifold_edges,
         inconsistent_directed_edges,
@@ -2280,5 +2299,257 @@ mod mesh_quality_cost_tests {
             "{used} projections for {} facets on faces that do not close",
             mesh.triangles.len()
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod manifold_report_sort_tests {
+    use super::*;
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+    // The hash-map implementation `manifold_report_mesh` replaced, kept
+    // verbatim as the oracle: the sort-based pairing must report exactly
+    // what it did.
+    fn reference(mesh: &TriangleMesh, weld_eps: f64) -> Option<ManifoldReport> {
+        if mesh.triangles.is_empty() {
+            return None;
+        }
+
+        // Weld vertices by quantised position.
+        let mut weld_map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+        let mut welded_index: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
+        for v in &mesh.vertices {
+            let key = weld_key(&v.position, weld_eps);
+            let next = weld_map.len() as u32;
+            let id = *weld_map.entry(key).or_insert(next);
+            welded_index.push(id);
+        }
+        let welded_vertices = weld_map.len();
+
+        // Directed-edge multiset over welded indices; skip degenerate triangles.
+        let mut directed: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut degenerate_triangles = 0usize;
+        let mut live_triangles = 0usize;
+        // Union-find over welded vertices for component counting.
+        let mut parent: Vec<u32> = (0..welded_vertices as u32).collect();
+        fn find(parent: &mut Vec<u32>, mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                parent[x as usize] = parent[parent[x as usize] as usize];
+                x = parent[x as usize];
+            }
+            x
+        }
+        let union = |parent: &mut Vec<u32>, a: u32, b: u32| {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[ra as usize] = rb;
+            }
+        };
+
+        // The face of each directed edge's triangles (first and last seen), so a
+        // defect can be put on the face it is on without a second pass.
+        let mut edge_face: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+        let has_faces = mesh.face_map.len() == mesh.triangles.len();
+        for (ti, tri) in mesh.triangles.iter().enumerate() {
+            let a = welded_index[tri[0] as usize];
+            let b = welded_index[tri[1] as usize];
+            let c = welded_index[tri[2] as usize];
+            if a == b || b == c || c == a {
+                degenerate_triangles += 1;
+                continue;
+            }
+            live_triangles += 1;
+            for &(u, v) in &[(a, b), (b, c), (c, a)] {
+                *directed.entry((u, v)).or_insert(0) += 1;
+                union(&mut parent, u, v);
+                if has_faces {
+                    let f = mesh.face_map[ti];
+                    edge_face
+                        .entry((u, v))
+                        .and_modify(|e| e.1 = f)
+                        .or_insert((f, f));
+                }
+            }
+        }
+
+        // Aggregate undirected edges from the directed multiset.
+        let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut inconsistent_directed_edges = 0usize;
+        for (&(u, v), &count) in &directed {
+            if count > 1 {
+                inconsistent_directed_edges += 1;
+            }
+            let key = if u < v { (u, v) } else { (v, u) };
+            *undirected.entry(key).or_insert(0) += count;
+        }
+
+        let mut boundary_edges = 0usize;
+        let mut nonmanifold_edges = 0usize;
+        let mut open_by_face: HashMap<u32, usize> = HashMap::new();
+        let mut fan_by_face: HashMap<u32, usize> = HashMap::new();
+        let mut flip_by_face: HashMap<u32, usize> = HashMap::new();
+        // The faces on either directed side of the undirected edge (u, v).
+        let faces_of = |u: u32, v: u32| -> Vec<u32> {
+            let mut out = Vec::new();
+            for k in [(u, v), (v, u)] {
+                if let Some(&(f0, f1)) = edge_face.get(&k) {
+                    out.push(f0);
+                    if f1 != f0 {
+                        out.push(f1);
+                    }
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
+        for (&(u, v), &incident) in &undirected {
+            if incident == 1 {
+                boundary_edges += 1;
+                for f in faces_of(u, v) {
+                    *open_by_face.entry(f).or_insert(0) += 1;
+                }
+            } else if incident > 2 {
+                nonmanifold_edges += 1;
+                for f in faces_of(u, v) {
+                    *fan_by_face.entry(f).or_insert(0) += 1;
+                }
+            }
+        }
+        for (&(u, v), &count) in &directed {
+            if count > 1 {
+                if let Some(&(f0, f1)) = edge_face.get(&(u, v)) {
+                    *flip_by_face.entry(f0).or_insert(0) += 1;
+                    if f1 != f0 {
+                        *flip_by_face.entry(f1).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let sorted = |m: HashMap<u32, usize>| {
+            let mut v: Vec<(u32, usize)> = m.into_iter().collect();
+            v.sort_unstable();
+            v
+        };
+
+        // Components over vertices actually referenced by a live triangle.
+        let mut roots = std::collections::HashSet::new();
+        for (&(u, v), _) in &directed {
+            roots.insert(find(&mut parent, u));
+            roots.insert(find(&mut parent, v));
+        }
+        let components = roots.len().max(1);
+
+        let v_count = {
+            let mut used = std::collections::HashSet::new();
+            for (&(u, v), _) in &directed {
+                used.insert(u);
+                used.insert(v);
+            }
+            used.len() as i64
+        };
+        let e_count = undirected.len() as i64;
+        let f_count = live_triangles as i64;
+        let euler_characteristic = v_count - e_count + f_count;
+
+        // The tessellator's own weld reports what it could not address. This
+        // analysis cannot rediscover that from the arrays - its `weld_key` lattice
+        // re-merges exactly the pairs the weld declined to - so the count is read
+        // from the mesh and gates the closure verdict.
+        let refused_weld_vertices = mesh.weld_refusals.total();
+
+        Some(ManifoldReport {
+            triangles: mesh.triangles.len(),
+            degenerate_triangles,
+            welded_vertices,
+            undirected_edges: undirected.len(),
+            boundary_edges,
+            nonmanifold_edges,
+            inconsistent_directed_edges,
+            components,
+            euler_characteristic,
+            boundary_edges_by_face: sorted(open_by_face),
+            nonmanifold_edges_by_face: sorted(fan_by_face),
+            inconsistent_edges_by_face: sorted(flip_by_face),
+            refused_weld_vertices,
+            closed: boundary_edges == 0 && refused_weld_vertices == 0,
+            manifold: nonmanifold_edges == 0,
+            oriented: inconsistent_directed_edges == 0,
+        })
+    }
+
+    fn same(mesh: &TriangleMesh, label: &str) {
+        let got = format!("{:?}", manifold_report_mesh(mesh, 1e-6));
+        let want = format!("{:?}", reference(mesh, 1e-6));
+        assert_eq!(
+            got, want,
+            "{label}: sort-based report differs from the reference"
+        );
+    }
+
+    fn solid_mesh(build: impl FnOnce(&mut TopologyBuilder) -> GeometryId) -> TriangleMesh {
+        let mut model = BRepModel::new();
+        let solid = match build(&mut TopologyBuilder::new(&mut model)) {
+            GeometryId::Solid(s) => s,
+            other => panic!("a solid: {other:?}"),
+        };
+        let s = model.solids.get(solid).expect("solid");
+        tessellate_solid(s, &model, &TessellationParams::default())
+    }
+
+    /// The sort-based pairing reports exactly what the hash-map pairing did:
+    /// on closed solids, and on meshes broken open, fanned, flipped and
+    /// stripped of their face map.
+    #[test]
+    fn sort_based_pairing_reports_what_the_hash_maps_did() {
+        let boxed = solid_mesh(|b| b.create_box_3d(20.0, 30.0, 10.0).expect("box"));
+        let cylinder = solid_mesh(|b| {
+            b.create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 7.0, 12.0)
+                .expect("cylinder")
+        });
+        for (label, mesh) in [("box", &boxed), ("cylinder", &cylinder)] {
+            same(mesh, label);
+
+            let mut open = mesh.clone();
+            open.triangles.remove(3);
+            open.face_map.remove(3);
+            same(&open, &format!("{label} with a facet removed"));
+
+            let mut fanned = mesh.clone();
+            let (t, f) = (fanned.triangles[2], fanned.face_map[2]);
+            fanned.triangles.push(t);
+            fanned.face_map.push(f);
+            same(&fanned, &format!("{label} with a facet doubled"));
+
+            let mut flipped = mesh.clone();
+            flipped.triangles[5].swap(1, 2);
+            same(&flipped, &format!("{label} with a facet flipped"));
+
+            let mut faceless = flipped.clone();
+            faceless.face_map.clear();
+            same(&faceless, &format!("{label} without a face map"));
+
+            let mut collapsed = mesh.clone();
+            let t = collapsed.triangles[0];
+            collapsed.triangles[1] = [t[0], t[0], t[1]];
+            same(&collapsed, &format!("{label} with a degenerate facet"));
+        }
+        // Two disjoint solids in one mesh: two components.
+        let mut two = boxed.clone();
+        let offset = two.vertices.len() as u32;
+        for v in &boxed.vertices {
+            let mut w = *v;
+            w.position = w.position + Vector3::new(100.0, 0.0, 0.0);
+            two.vertices.push(w);
+        }
+        for (t, f) in boxed.triangles.iter().zip(&boxed.face_map) {
+            two.triangles
+                .push([t[0] + offset, t[1] + offset, t[2] + offset]);
+            two.face_map.push(*f + 1000);
+        }
+        same(&two, "two boxes");
     }
 }
