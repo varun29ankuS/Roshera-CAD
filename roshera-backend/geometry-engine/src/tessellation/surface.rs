@@ -7186,8 +7186,16 @@ fn tessellate_nurbs_skin_lateral(
     }
     rows.push(push_ring(mesh, top_ring, 1.0));
 
+    // The rim rows are the edges' samples (any start, direction and
+    // spacing); the rows between are the surface's own grid from u = 0.
+    let last_band = rows.len() - 2;
     for band in 0..rows.len() - 1 {
-        stitch_closed_rings(&rows[band].clone(), &rows[band + 1].clone(), mesh);
+        let (lo, hi) = (rows[band].clone(), rows[band + 1].clone());
+        if band == 0 || band == last_band {
+            stitch_closed_rings(&lo, &hi, mesh);
+        } else {
+            stitch_closed_rings_by_index(&lo, &hi, mesh);
+        }
     }
     true
 }
@@ -9180,7 +9188,144 @@ fn tessellate_ruled_annular_band(
     true
 }
 
+/// Stitch two closed rings of mesh vertices into a band of triangles.
+///
+/// The rings need not start at the same place, run the same way, or be
+/// sampled alike: an imported face's rim is whatever its edge samples are
+/// (CADGenBench part 217's NURBS tube: one rim stored reversed, the seam at
+/// u = 0.018, the other rim sampled from 0.022 to 1.52 mm). Pairing them by
+/// index fraction then joined points on opposite sides of the tube -- 184 of
+/// 200 triangles in one band cut through it -- and per-triangle flipping hid
+/// the folds from the normal check.
+///
+/// So `hi` is first turned to run the same way as `lo` and rotated to start
+/// where `lo` does (the shift and direction with the least total distance
+/// between paired samples), each ring is parameterised by its arc-length
+/// fraction, the stitch advances whichever ring is behind (ties advance
+/// `lo`, as the index-fraction walk did, so uniform aligned rings stitch
+/// exactly as before), and the whole band is wound by one decision: the way
+/// most of its triangles agree with their vertices' normals.
 fn stitch_closed_rings(lo: &[u32], hi: &[u32], mesh: &mut TriangleMesh) {
+    let p = lo.len();
+    let q = hi.len();
+    if p < 2 || q < 2 {
+        return;
+    }
+    let pos = |i: u32| mesh.vertices[i as usize].position;
+    let hi = align_ring(lo, hi, &pos);
+    let t_lo = arc_fractions(lo, &pos);
+    let t_hi = arc_fractions(&hi, &pos);
+    const TIE: f64 = 1e-9;
+    let mut tris: Vec<[u32; 3]> = Vec::with_capacity(p + q);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < p || j < q {
+        let advance_lo = if i >= p {
+            false
+        } else if j >= q {
+            true
+        } else {
+            t_lo[i] <= t_hi[j] + TIE
+        };
+        if advance_lo {
+            tris.push([lo[i % p], lo[(i + 1) % p], hi[j % q]]);
+            i += 1;
+        } else {
+            tris.push([lo[i % p], hi[(j + 1) % q], hi[j % q]]);
+            j += 1;
+        }
+    }
+    let agree = tris
+        .iter()
+        .filter(|&&[a, b, c]| {
+            let (pa, pb, pc) = (pos(a), pos(b), pos(c));
+            let n = mesh.vertices[a as usize].normal
+                + mesh.vertices[b as usize].normal
+                + mesh.vertices[c as usize].normal;
+            (pb - pa).cross(&(pc - pa)).dot(&n) >= 0.0
+        })
+        .count();
+    let flip = 2 * agree < tris.len();
+    for [a, b, c] in tris {
+        if flip {
+            mesh.add_triangle(a, c, b);
+        } else {
+            mesh.add_triangle(a, b, c);
+        }
+    }
+}
+
+/// `hi` turned to run the same way as `lo` and rotated to start where `lo`
+/// does: of every start sample and both directions, the one whose samples,
+/// matched to `lo`'s by arc-length fraction, lie closest in total.
+fn align_ring(lo: &[u32], hi: &[u32], pos: &impl Fn(u32) -> Point3) -> Vec<u32> {
+    let q = hi.len();
+    let t_lo = arc_fractions(lo, pos);
+    let cost = |cand: &[u32]| -> f64 {
+        let t = arc_fractions(cand, pos);
+        let mut k = 0usize;
+        let mut sum = 0.0;
+        for (i, &a) in lo.iter().enumerate() {
+            while k + 1 < cand.len() && t[k + 1] <= t_lo[i] {
+                k += 1;
+            }
+            sum += (pos(a) - pos(cand[k])).magnitude();
+        }
+        sum
+    };
+    let rotated = |s: usize, rev: bool| -> Vec<u32> {
+        (0..q)
+            .map(|k| {
+                let idx = if rev { (s + q - k) % q } else { (s + k) % q };
+                hi[idx]
+            })
+            .collect()
+    };
+    let mut best = hi.to_vec();
+    let mut best_cost = cost(&best);
+    for rev in [false, true] {
+        for s in 0..q {
+            if !rev && s == 0 {
+                continue;
+            }
+            let cand = rotated(s, rev);
+            let c = cost(&cand);
+            if c < best_cost * (1.0 - 1e-9) {
+                best_cost = c;
+                best = cand;
+            }
+        }
+    }
+    best
+}
+
+/// Each sample's arc-length fraction round its closed ring, from 0 at the
+/// first sample (the closing segment counts toward the total).
+fn arc_fractions(ring: &[u32], pos: &impl Fn(u32) -> Point3) -> Vec<f64> {
+    let n = ring.len();
+    let mut t = Vec::with_capacity(n);
+    let mut acc = 0.0;
+    for k in 0..n {
+        t.push(acc);
+        acc += (pos(ring[(k + 1) % n]) - pos(ring[k])).magnitude();
+    }
+    if acc > 0.0 {
+        for v in &mut t {
+            *v /= acc;
+        }
+    } else {
+        for (k, v) in t.iter_mut().enumerate() {
+            *v = k as f64 / n as f64;
+        }
+    }
+    t
+}
+
+/// Stitch two rings that share one parameter grid -- the same number of
+/// samples starting at the same parameter, as the interior rows of a NURBS
+/// skin do -- pairing samples by index fraction, each triangle wound to its
+/// vertices' normals. Rings that do not share a grid go to
+/// [`stitch_closed_rings`].
+fn stitch_closed_rings_by_index(lo: &[u32], hi: &[u32], mesh: &mut TriangleMesh) {
     let p = lo.len();
     let q = hi.len();
     if p < 2 || q < 2 {
@@ -13889,5 +14034,99 @@ mod planar_c_shape_tests {
                 tris.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod ring_stitch_tests {
+    use super::*;
+
+    /// A ring of mesh vertices round a tube of radius `r` at height `z`:
+    /// angles from `angles`, normals pointing out.
+    fn ring(mesh: &mut TriangleMesh, r: f64, z: f64, angles: &[f64]) -> Vec<u32> {
+        angles
+            .iter()
+            .map(|&a| {
+                mesh.add_vertex(MeshVertex {
+                    position: Point3::new(r * a.cos(), r * a.sin(), z),
+                    normal: Vector3::new(a.cos(), a.sin(), 0.0),
+                    uv: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Two rims of one tube band as an imported face gives them (CADGenBench
+    /// part 217's NURBS tube 81): the bottom rim sampled unevenly from angle
+    /// 0, the top rim stored the other way round and starting 108 degrees
+    /// on. Stitched by index fraction, triangles joined opposite sides of the
+    /// tube (184 of 200 in one band, 13 mm across a 13.7 mm tube) and the
+    /// per-triangle flip hid the folds. The band must hug the tube, be wound
+    /// one way, and cover the tube's lateral area.
+    #[test]
+    fn two_rims_out_of_step_are_stitched_round_the_tube_not_across_it() {
+        let (r, h) = (5.0, 3.0);
+        let tau = std::f64::consts::TAU;
+        let mut mesh = TriangleMesh::new();
+        // Bottom: 60 samples, crowded into the first quarter, sparse after.
+        let bottom: Vec<f64> = (0..60)
+            .map(|k| {
+                let s = k as f64 / 60.0;
+                tau * (s + 0.12 * (tau * s).sin() / tau * 6.0).rem_euclid(1.0)
+            })
+            .collect();
+        let mut bottom = bottom;
+        bottom.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        // Top: 48 even samples, reversed, starting at 108 degrees.
+        let top: Vec<f64> = (0..48)
+            .map(|k| (0.3 * tau - k as f64 * tau / 48.0).rem_euclid(tau))
+            .collect();
+        let lo = ring(&mut mesh, r, 0.0, &bottom);
+        let hi = ring(&mut mesh, r, h, &top);
+        stitch_closed_rings(&lo, &hi, &mut mesh);
+
+        let pos = |i: u32| mesh.vertices[i as usize].position;
+        // The longest rim segment of either ring: a facet that stays on the
+        // tube never spans more than two of them across the band's height.
+        let rim_gap = |ids: &[u32]| {
+            (0..ids.len())
+                .map(|k| (pos(ids[(k + 1) % ids.len()]) - pos(ids[k])).magnitude())
+                .fold(0.0, f64::max)
+        };
+        let along = 2.0 * rim_gap(&lo).max(rim_gap(&hi));
+        let reach = (along * along + h * h).sqrt();
+        let mut area = 0.0;
+        let mut directed = std::collections::HashMap::new();
+        for t in &mesh.triangles {
+            let (a, b, c) = (pos(t[0]), pos(t[1]), pos(t[2]));
+            for (p, q) in [(a, b), (b, c), (c, a)] {
+                assert!(
+                    (q - p).magnitude() <= reach,
+                    "a facet edge {:.2} mm long spans the tube (band reach {reach:.2})",
+                    (q - p).magnitude()
+                );
+            }
+            area += 0.5 * (b - a).cross(&(c - a)).magnitude();
+            for (u, v) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *directed.entry((u, v)).or_insert(0usize) += 1;
+            }
+        }
+        let same_way = directed.values().filter(|&&n| n > 1).count();
+        assert_eq!(same_way, 0, "the band is wound one way");
+        let reversed_pairs = directed
+            .keys()
+            .filter(|&&(u, v)| directed.contains_key(&(v, u)))
+            .count();
+        let interior_edges = mesh.triangles.len() * 3 - lo.len() - hi.len();
+        assert_eq!(
+            reversed_pairs, interior_edges,
+            "every edge inside the band is walked once each way"
+        );
+        let lateral = tau * r * h;
+        assert!(
+            (area - lateral).abs() <= 0.02 * lateral,
+            "the band covers {area:.3} mm^2 of the tube's {lateral:.3}"
+        );
     }
 }
