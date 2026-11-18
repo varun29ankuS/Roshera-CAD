@@ -18,7 +18,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import { chapterIconKey, chapterTitle, framePictureUrl, type Chapter } from '@/lib/chapters-api'
-import { Box, ChevronRight, Pause, Play, ToolIcons, X } from '@/components/ui/icons'
+import { Box, Pause, Play, ToolIcons, X } from '@/components/ui/icons'
 import { frameIndexAt, stepTo } from '@/lib/history-view'
 import { nextPlayIndex } from '@/lib/slider'
 import { prefetchStep, useHistoryView } from '@/stores/history-view-store'
@@ -223,25 +223,10 @@ export function FilmStrip({
 
   return (
     <div className="flex min-w-0 items-center gap-1 pl-2">
-      <div className="flex shrink-0 items-center gap-0.5" role="group" aria-label="Transport">
-        <TransportButton
-          label="To the start"
-          onClick={() => {
-            stop()
-            show(0)
-          }}
-        >
-          <ChevronRight size={14} className="rotate-180" />
-        </TransportButton>
-        <TransportButton
-          label="Back one feature"
-          onClick={() => {
-            stop()
-            show(Math.max(0, at - 1))
-          }}
-        >
-          <ChevronRight size={12} className="rotate-180" />
-        </TransportButton>
+      {/* One Play button: the pictures get the bar (Varun 2026-11-18: "the
+          buttons to the left of pictures are taking up too much space").
+          Stepping is a click on a picture, the arrow keys, Home and End. */}
+      <div className="flex shrink-0 items-center" role="group" aria-label="Transport">
         <TransportButton
           label={playing ? 'Pause' : 'Play the history'}
           onClick={() => {
@@ -250,24 +235,6 @@ export function FilmStrip({
           }}
         >
           {playing ? <Pause size={16} /> : <Play size={16} />}
-        </TransportButton>
-        <TransportButton
-          label="Forward one feature"
-          onClick={() => {
-            stop()
-            show(Math.min(last, at + 1))
-          }}
-        >
-          <ChevronRight size={12} />
-        </TransportButton>
-        <TransportButton
-          label="To the end (the live part)"
-          onClick={() => {
-            stop()
-            show(last)
-          }}
-        >
-          <ChevronRight size={14} />
         </TransportButton>
       </div>
 

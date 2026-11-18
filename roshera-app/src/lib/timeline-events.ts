@@ -412,7 +412,7 @@ export function parseDurabilityStatus(payload: unknown): DurabilityStatus | null
 export interface DurabilityNotice {
   /** amber = history withheld · red = log unreadable · neutral = persistence off */
   tone: 'withheld' | 'failed' | 'off'
-  /** Short enough to sit in the strip and be read without a mouse. */
+  /** A chip: a few words, so the history's pictures keep the bar. */
   label: string
   /** The full account, for hover. */
   detail: string
@@ -435,11 +435,14 @@ export function durabilityNotice(
         // Leads with what was KEPT. "N of M operations missing" read as data
         // loss to everyone who saw it; what happened is a deliberate refusal
         // to guess, on a document whose saved history cannot all be rebuilt.
+        // A chip, not a sentence (Varun 2026-11-18: "warning cant take up 50%
+        // of timeline"); the full account is the hover.
         label:
           status.events_served === 0
-            ? `saved history not restored — ${status.events_total} steps set aside, not guessed`
-            : `history partly restored — ${status.events_served} of ${status.events_total} steps, the rest set aside`,
+            ? 'history set aside'
+            : `${status.events_total - status.events_served} steps set aside`,
         detail:
+          `History partly restored: ${status.events_served} of ${status.events_total} steps. ` +
           `This document's saved history could not all be rebuilt. Step #${status.first_break_sequence} ` +
           `(${status.first_break_kind}) cannot be replayed faithfully — ${status.reason} — so it and ` +
           `everything after it are set aside rather than guessed. The first ${status.events_served} of ` +
@@ -451,9 +454,9 @@ export function durabilityNotice(
         // Same missing-first frame so the three tones scan as one family, but
         // this one is allowed to read as broken, because unlike `withheld`
         // something actually did break.
-        label: 'history unreadable — no operations recovered',
+        label: 'history unreadable',
         detail:
-          `The event log could not be read at boot: ${status.reason}. ` +
+          `No operations recovered. The event log could not be read at boot: ${status.reason}. ` +
           `Serving a blank model rather than pretending the document is empty.`,
       }
     case 'disabled':
@@ -461,9 +464,9 @@ export function durabilityNotice(
         tone: 'off',
         // No honest count exists when nothing is being recorded, so this
         // states the capability gap rather than implying a number.
-        label: 'history off — nothing this session is kept',
+        label: 'history not saved',
         detail:
-          'ROSHERA_DURABILITY=off — nothing recorded this session survives a restart.',
+          'ROSHERA_DURABILITY=off — nothing recorded this session is kept or survives a restart.',
       }
     case 'active':
     case 'empty':
