@@ -132,6 +132,19 @@ passes, every planted lie is caught, AND no scored check ever touches an
 unscoreable gate. When the physics/printability scoring bridge lands, those
 declared criteria migrate from `unscored_criteria` into scored checks.
 
+### Part-family agent scenarios (20–22, 2026-11-18)
+
+`20-aerofoil-section`, `21-sheet-metal-bracket` and `22-mounting-plate` score an
+AGENT, not a scripted build: each carries ten natural-language `task_prompts`
+(fully specified, under-specified so the agent must ask and build nothing, and
+engineer's numbers that depart from a standard), a pure `oracle(t, transcript)`
+over the agent transcript described in `lib/agent_oracle.mjs`, and
+`unscored_criteria`. They pair with the kb_lookup part-family playbooks of the
+same names. They are NOT in `scenarios/index.mjs` (`run.mjs` drives scripted
+REST builds); `test/oracle-20.mjs`–`oracle-22.mjs` prove each oracle offline.
+Checks that read the conversation (did it ask, what did it claim) are labelled
+agent-transcript checks — the kernel cannot see a conversation.
+
 ## v2 direction
 
 - **LLM in the loop**: replace a scenario's scripted build steps with an

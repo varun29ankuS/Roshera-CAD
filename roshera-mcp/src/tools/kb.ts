@@ -33,6 +33,7 @@ import { ok } from "../core.js";
 import { typedErrorResult } from "../gates.js";
 import { PACK_CHUNKS, PLAYBOOK_CHUNKS } from "./kb_data.js";
 import { referenceLookup, REFERENCE_KEYS } from "./kb_reference.js";
+import { workedExample } from "./kb_examples.js";
 
 /** ceil(chars/4) — the house token proxy, applied to a chunk or payload. */
 const tokensOf = (s: string): number => Math.ceil(s.length / 4);
@@ -174,6 +175,39 @@ const PLAYBOOK_META: Record<string, PlaybookMeta> = {
     certification:
       "gdt_fcf verdicts (flatness, perpendicularity, parallelism, position — RFS only, NO MMC/LMC modifier today) are kernel-certified exact B-Rep measurements via gdt_datum + gdt_fcf. psketch_certify's DOF0 gate certifies dimension COMPLETENESS (no under- or over-constraint), not scheme correctness. The choice of datum/baseline vs chain vs ordinate, ISO 2768 general tolerances, and which faces are functional is drafting judgement captured in the model — real, but NOT a kernel verdict.",
   },
+  // PART-FAMILY playbooks — added 2026-11-18, not vault-doc-sourced (see
+  // kb_data.ts). Each also serves a worked_example (kb_examples.ts).
+  aerofoil_section: {
+    tool_sequence: [
+      "ask_choice", "kb_lookup", "timeline_checkpoint", "cad_program", "psketch_begin",
+      "psketch_add_entity", "psketch_extrude", "verify_part", "verify_claim",
+      "point_query", "ray_query", "gdt_datum", "gdt_fcf", "dfm_check",
+    ],
+    section: "part family 2026-11-18",
+    certification:
+      "kernel verdicts: verify_part soundness, verify_claim on the volume (the kernel built the polygon that was sent), point_query distances at the probe points (the as-built section's measured distance from the analytic profile THERE), ray_query walls, gdt_fcf verdicts, dfm_check(fdm) when printed. NOT kernel verdicts: the deviation between probes (the generator's dense-sample bound), the profile itself (a faceted polygon, never exact), a blunt trailing edge (a named departure from the designation), any non-FDM process, and aerodynamic performance — never claimed.",
+  },
+  sheet_metal_bracket: {
+    tool_sequence: [
+      "ask_choice", "kb_lookup", "timeline_checkpoint", "cad_program", "psketch_begin",
+      "psketch_add_entity", "psketch_extrude", "select_edge", "fillet_edges", "ray_query",
+      "select_face", "measure_faces", "create_cylinder", "boolean_many", "verify_part", "verify_claim",
+      "part_features", "gdt_datum", "gdt_fcf",
+    ],
+    section: "part family 2026-11-18",
+    certification:
+      "kernel verdicts: verify_part soundness, ray_query bend radii, measure_faces bend angle, verify_claim volume, part_features hole sizes, gdt_fcf verdicts. NOT kernel verdicts: the flat-pattern length (bend_allowance with the engineer's K — no unfold op exists), springback, bend-angle tolerance, relief need, and every sheet_metal pack number (dfm_check cannot run that pack).",
+  },
+  mounting_plate: {
+    tool_sequence: [
+      "ask_choice", "kb_lookup", "timeline_checkpoint", "cad_program", "create_box",
+      "select_edge", "fillet_edges", "create_cylinder", "boolean_many", "verify_part",
+      "part_features", "verify_claim", "gdt_datum", "gdt_fcf",
+    ],
+    section: "part family 2026-11-18",
+    certification:
+      "kernel verdicts: verify_part soundness, part_features hole sizes, verify_claim volume, gdt_fcf flatness and position per hole (RFS), dfm_check when FDM. NOT kernel verdicts: ISO 2768 general tolerances, edge-distance adequacy (a table comparison against EN 1993-1-8, not a load rating), threads, surface finish, and CNC/laser/waterjet process rules.",
+  },
 };
 
 const KB_DOC = "policy KB (vault Research/2026-07-31-policy-knowledge-base.md)";
@@ -190,7 +224,8 @@ export function registerKbTools(server: ToolHost): void {
       "playbook (hole, boss, rib, gusset, bearing_seat, flange, bolt_pattern, " +
       "snap_fit, dimensioning — datums vs chains, size vs location, one " +
       "dimension per DOF, ASME Y14.5/ISO 129 practice) with tool_sequence of " +
-      "real MCP tools in order. kind " +
+      "real MCP tools in order; part-family playbooks (aerofoil_section, " +
+      "sheet_metal_bracket, mounting_plate) also carry a worked_example. kind " +
       "'reference' = cited engineering data: clearance_hole (bolt clearance " +
       "diameter, ISO 273), tap_drill (tap drill size for a thread), " +
       "general_tolerance (ISO 2768 band), fit_class (ISO 286 hole/shaft fit " +
@@ -199,7 +234,8 @@ export function registerKbTools(server: ToolHost): void {
       "K-factor), drill_size (nearest standard drill), flange_dims (pipe " +
       "flange OD/thickness/bolt-circle/bolt-count/bolt-hole/raised-face for " +
       "ASME B16.5 Class 150 NPS 1/2-8 or EN 1092-1 PN16 DN15-200 — refuses " +
-      "outside that transcribed range). Every answer carries " +
+      "outside that transcribed range), naca_profile (NACA 4-digit section " +
+      "points + measured faceting), bolt_edge_distance (EN 1993-1-8). Every answer carries " +
       "{value, source} — NEVER a bare number; open house questions and " +
       "conflicting vendor data REFUSE by name instead of defaulting.",
     {
@@ -224,7 +260,7 @@ export function registerKbTools(server: ToolHost): void {
         if (text === undefined || meta === undefined) {
           return typedErrorResult({
             kind, key: k, refused: true,
-            reason: `unknown process pack '${k}' — the KB covers exactly the 8 processes listed; anything else is a sourcing question, not a guess`,
+            reason: `unknown process pack '${k}' — the KB covers exactly the ${Object.keys(PACK_CHUNKS).length} processes listed; anything else is a sourcing question, not a guess`,
             valid_keys: Object.keys(PACK_CHUNKS),
           });
         }
@@ -247,17 +283,26 @@ export function registerKbTools(server: ToolHost): void {
         if (text === undefined || meta === undefined) {
           return typedErrorResult({
             kind, key: k, refused: true,
-            reason: `unknown feature playbook '${k}' — the KB covers exactly the 8 feature types listed`,
+            reason: `unknown playbook '${k}' — the KB covers exactly the ${Object.keys(PLAYBOOK_CHUNKS).length} feature and part-family playbooks listed`,
             valid_keys: Object.keys(PLAYBOOK_CHUNKS),
           });
         }
+        // token_estimate stays the chunk's own (ceil(len/4) of `text`, pinned
+        // per playbook in test/kb_lookup.mjs); a part family's worked example
+        // is billed separately so the agent sees what opening it costs.
+        const example = workedExample(k);
         return ok({
           kind, key: k,
           text,
           tool_sequence: meta.tool_sequence,
           certification: meta.certification,
-          source: `${KB_DOC} ${meta.section}`,
+          source: meta.section.startsWith("§") ? `${KB_DOC} ${meta.section}` : `roshera-mcp kb_data.ts (${meta.section}; not vault-doc-sourced)`,
           token_estimate: tokensOf(text),
+          ...(example === null
+            ? {}
+            : "refused" in example
+              ? { worked_example: null, worked_example_refused: example.reason }
+              : { worked_example: example, worked_example_token_estimate: tokensOf(JSON.stringify(example)) }),
         });
       }
 

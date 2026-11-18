@@ -26,7 +26,10 @@ Before building any named feature (hole, boss, rib, gusset, bearing_seat, flange
 bolt_pattern, snap_fit): invoke kb_lookup(kind:"playbook", key:"<feature>") for its
 tool_sequence and DOF scheme, and kb_lookup(kind:"pack", key:"<process>") once per process
 before committing to a manufacturing process. This is your highest-value action -- it is
-why the knowledge base exists.
+why the knowledge base exists. A whole part of a covered family (aerofoil_section,
+sheet_metal_bracket, mounting_plate) has its own playbook under the same lookup, and it
+carries a worked_example: open it before you start, ask what its SPEC FIRST asks, and
+follow its order.
 
 Once the playbook has given you the sequence, run it as ONE cad_program rather than a call
 per operation. Every separate call is a round-trip that re-sends the whole conversation, so

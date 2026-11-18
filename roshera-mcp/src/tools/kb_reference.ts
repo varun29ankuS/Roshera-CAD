@@ -743,6 +743,377 @@ function pipeFlange(args: Record<string, unknown>): RefResult {
   );
 }
 
+// ─── naca_profile: NACA 4-digit section GENERATED from its designation ──────
+// Added 2026-11-18 (aerofoil_section playbook). Not a transcribed table: the
+// 4-digit family is defined by closed-form thickness and mean-line equations,
+// so the honest reference is the equations themselves, evaluated here.
+//
+//   thickness  yt = 5·t·(0.2969·√x − 0.1260·x − 0.3516·x² + 0.2843·x³ + a4·x⁴)
+//   mean line  x < p:  yc = m/p²·(2px − x²)           dyc/dx = 2m/p²·(p − x)
+//              x ≥ p:  yc = m/(1−p)²·(1 − 2p + 2px − x²)  dyc/dx = 2m/(1−p)²·(p − x)
+//   surfaces   xu = x − yt·sinθ, yu = yc + yt·cosθ;  xl = x + yt·sinθ, yl = yc − yt·cosθ
+//
+// (x as a fraction of chord, θ = atan(dyc/dx).) a4 = −0.1015 is the coefficient
+// of NACA Report 460 and leaves a finite trailing-edge gap; a4 = −0.1036 makes
+// the five coefficients sum to zero and closes the trailing edge — a later,
+// widely used modification that is NOT in Report 460, so a part built with it
+// is "NACA 2412 with closed trailing edge", and the source string says so.
+//
+// The output is a POLYGON (cosine-spaced vertices ON the analytic curve, faceted
+// between them). That is what psketch polyline extrudes, so the generator also
+// MEASURES the faceting — the maximum distance from the analytic curve to the
+// polygon (dense sampling between every vertex pair) — and hands the agent
+// analytic probe points at the worst facets so the kernel can measure the
+// as-built part (point_query) against the same numbers. The polygon is never
+// called the exact profile.
+
+const NACA_TE_MODES = ["sharp", "open", "blunt"] as const;
+type NacaTe = (typeof NACA_TE_MODES)[number];
+const A4_CLOSED = -0.1036;
+const A4_OPEN = -0.1015;
+
+interface NacaSpec {
+  m: number; // max camber, fraction of chord
+  p: number; // position of max camber, fraction of chord
+  t: number; // max thickness, fraction of chord
+  a4: number;
+  /** blunt TE only: half the stated TE thickness as a fraction of chord. */
+  rampHalf: number;
+}
+
+function nacaHalfThickness(s: NacaSpec, x: number): number {
+  const base =
+    5 * s.t * (0.2969 * Math.sqrt(x) - 0.126 * x - 0.3516 * x * x + 0.2843 * x ** 3 + s.a4 * x ** 4);
+  return base + s.rampHalf * x;
+}
+
+function nacaCamber(s: NacaSpec, x: number): { yc: number; dyc: number } {
+  if (s.m === 0) return { yc: 0, dyc: 0 };
+  if (x < s.p) {
+    return { yc: (s.m / (s.p * s.p)) * (2 * s.p * x - x * x), dyc: ((2 * s.m) / (s.p * s.p)) * (s.p - x) };
+  }
+  const q = (1 - s.p) * (1 - s.p);
+  return { yc: (s.m / q) * (1 - 2 * s.p + 2 * s.p * x - x * x), dyc: ((2 * s.m) / q) * (s.p - x) };
+}
+
+/** Surface point at chord fraction x, in chord units. side +1 upper, −1 lower. */
+function nacaSurface(s: NacaSpec, x: number, side: 1 | -1): [number, number] {
+  const yt = nacaHalfThickness(s, x);
+  const { yc, dyc } = nacaCamber(s, x);
+  const th = Math.atan(dyc);
+  return [x - side * yt * Math.sin(th), yc + side * yt * Math.cos(th)];
+}
+
+const cosineX = (beta: number) => (1 - Math.cos(beta)) / 2;
+const round4 = (v: number) => Math.round(v * 1e4) / 1e4;
+
+function segDistance(p: [number, number], a: [number, number], b: [number, number]): number {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const L2 = dx * dx + dy * dy;
+  let u = L2 > 0 ? ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L2 : 0;
+  u = Math.max(0, Math.min(1, u));
+  return Math.hypot(p[0] - (a[0] + u * dx), p[1] - (a[1] + u * dy));
+}
+
+function shoelace(pts: Array<[number, number]>): number {
+  let a = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const [x1, y1] = pts[i];
+    const [x2, y2] = pts[(i + 1) % pts.length];
+    a += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(a) / 2;
+}
+
+/** Closed loop in chord units: TE upper → LE → TE lower, LE vertex once, a
+ *  closed (zero-gap) TE vertex once. `exact` keeps full precision (quadrature);
+ *  otherwise the caller scales and rounds. Each vertex carries its (side, β). */
+function nacaLoop(s: NacaSpec, n: number): Array<{ pt: [number, number]; side: 1 | -1; beta: number }> {
+  const out: Array<{ pt: [number, number]; side: 1 | -1; beta: number }> = [];
+  for (let i = n; i >= 0; i--) {
+    const beta = (i * Math.PI) / n;
+    out.push({ pt: nacaSurface(s, cosineX(beta), 1), side: 1, beta });
+  }
+  const closedTe = Math.abs(nacaHalfThickness(s, 1)) < 1e-12;
+  const lastLower = closedTe ? n - 1 : n;
+  for (let i = 1; i <= lastLower; i++) {
+    const beta = (i * Math.PI) / n;
+    out.push({ pt: nacaSurface(s, cosineX(beta), -1), side: -1, beta });
+  }
+  return out;
+}
+
+/** World x (chord units) → chord-fraction parameter on one surface, by
+ *  bisection on xu/xl(x) = target (both run 0 → 1 over x ∈ [0, 1]). */
+function surfaceParamAtX(s: NacaSpec, target: number, side: 1 | -1): number {
+  let lo = 0;
+  let hi = 1;
+  for (let k = 0; k < 80; k++) {
+    const mid = (lo + hi) / 2;
+    if (nacaSurface(s, mid, side)[0] < target) lo = mid;
+    else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+function nacaProfile(args: Record<string, unknown>): RefResult {
+  const raw = String(args.designation ?? "").toUpperCase().replace(/^NACA/, "").replace(/[\s-]/g, "");
+  if (!/^\d+$/.test(raw)) {
+    return refuse(
+      `naca_profile needs args.designation — a NACA 4-digit designation like '2412' or '0012' (got '${String(args.designation ?? "")}')`,
+    );
+  }
+  if (raw.length === 5) {
+    return refuse(
+      `'${raw}' is a NACA 5-digit designation — the 5-digit mean line needs the tabulated r and k1 constants (NACA Report 537 / Abbott & von Doenhoff), which are not transcribed in this KB; a named gap, not a computed guess. Use a 4-digit section or supply the mean-line ordinates from the source`,
+      { valid_keys: ["4-digit designation, e.g. 2412"] },
+    );
+  }
+  if (raw.length !== 4) {
+    return refuse(`'${raw}' is not a NACA 4-digit designation (four digits: camber %, camber position /10, thickness %)`);
+  }
+  const m = Number(raw[0]) / 100;
+  const p = Number(raw[1]) / 10;
+  const t = Number(raw.slice(2)) / 100;
+  if (t <= 0) return refuse(`NACA ${raw} has zero thickness — not a section`);
+  if ((m === 0) !== (p === 0)) {
+    return refuse(
+      `NACA ${raw} is malformed: camber ${m * 100}% with camber position ${p * 10}/10 — a cambered section needs both digits non-zero, a symmetric one both zero`,
+    );
+  }
+
+  const chord = Number(args.chord_mm);
+  if (!Number.isFinite(chord) || chord <= 0) return refuse("naca_profile needs a positive args.chord_mm");
+
+  const teRaw = args.trailing_edge;
+  if (teRaw === undefined || teRaw === null || String(teRaw).trim().length === 0) {
+    return refuse(
+      "naca_profile needs args.trailing_edge — the engineer must choose: 'sharp' (a4 = -0.1036 closes the TE to a zero-thickness knife edge — a machining, printing and meshing hazard), 'open' (the published a4 = -0.1015, leaving a TE gap of 0.021·t·c) or 'blunt' with args.te_thickness_mm. Ask; never pick one silently",
+      { valid_keys: [...NACA_TE_MODES], open_question: "trailing-edge form is the engineer's decision" },
+    );
+  }
+  const te = String(teRaw).toLowerCase().trim() as NacaTe;
+  if (!NACA_TE_MODES.includes(te)) {
+    return refuse(`unknown trailing_edge '${String(teRaw)}'`, { valid_keys: [...NACA_TE_MODES] });
+  }
+  let rampHalf = 0;
+  if (te === "blunt") {
+    const teT = Number(args.te_thickness_mm);
+    if (args.te_thickness_mm === undefined || !Number.isFinite(teT) || teT <= 0) {
+      return refuse(
+        "trailing_edge 'blunt' needs a positive args.te_thickness_mm — the stated TE thickness is the engineer's number (e.g. 2x nozzle diameter for FDM, a cutter or stock limit for machining); this lookup will not default one",
+      );
+    }
+    if (teT >= t * chord) {
+      return refuse(`te_thickness_mm ${teT} is not below the section's maximum thickness (~${round4(t * chord)} mm) — not a trailing edge`);
+    }
+    rampHalf = teT / (2 * chord);
+  }
+  const spec: NacaSpec = { m, p, t, a4: te === "open" ? A4_OPEN : A4_CLOSED, rampHalf };
+
+  const nRaw = args.n_per_surface;
+  const n = nRaw === undefined ? 80 : Number(nRaw);
+  if (!Number.isInteger(n) || n < 10 || n > 400) {
+    return refuse(`n_per_surface must be an integer in [10, 400] (vertices per surface, cosine spaced); got ${String(nRaw)}`);
+  }
+
+  // Emitted polygon, in mm, rounded to 0.1 µm — every measurement below is
+  // taken against THIS rounded polygon, the one the kernel will receive.
+  const loop = nacaLoop(spec, n);
+  const points: Array<[number, number]> = loop.map(({ pt }) => [round4(pt[0] * chord), round4(pt[1] * chord)]);
+
+  // Faceting: dense samples of the analytic curve between each vertex pair,
+  // distance to that polygon edge. (The closing TE edge of an open/blunt TE is
+  // the straight TE base itself — not part of the analytic surfaces.)
+  const SAMPLES = 24;
+  const facets: Array<{ d: number; pt: [number, number]; side: 1 | -1 }> = [];
+  // Edge i joins vertex i to vertex i+1. The surface between them is the
+  // SECOND vertex's side (the upper run TE→LE ends at the LE vertex, β = 0,
+  // which is where the lower run LE→TE starts), with β interpolated. A closed
+  // TE adds one more surface edge: last lower vertex → the shared TE vertex
+  // (β → π on the lower surface). An open/blunt TE's closing edge is the
+  // straight TE base itself, not part of the analytic surfaces.
+  const closedTe = loop.length === 2 * n;
+  const edges: Array<[number, number, number, number, 1 | -1]> = [];
+  for (let i = 0; i < loop.length - 1; i++) {
+    edges.push([i, i + 1, loop[i].beta, loop[i + 1].beta, loop[i + 1].side]);
+  }
+  if (closedTe) edges.push([loop.length - 1, 0, loop[loop.length - 1].beta, Math.PI, -1]);
+  for (const [ia, ib, b0, b1, side] of edges) {
+    let worst = { d: 0, pt: points[ia] as [number, number], side };
+    for (let k = 1; k < SAMPLES; k++) {
+      const beta = b0 + (b1 - b0) * (k / SAMPLES);
+      const sp = nacaSurface(spec, cosineX(beta), side);
+      const q: [number, number] = [sp[0] * chord, sp[1] * chord];
+      const d = segDistance(q, points[ia], points[ib]);
+      if (d > worst.d) worst = { d, pt: q, side };
+    }
+    facets.push(worst);
+  }
+  const maxFacet = facets.reduce((acc, f) => (f.d > acc.d ? f : acc), facets[0]);
+
+  // Probes: the 8 worst facets plus the facets nearest x/c = 0.25 and 0.75 on
+  // each surface — analytic points the kernel can measure the built part at.
+  const order = facets.map((f, i) => ({ ...f, i })).sort((u, v) => v.d - u.d);
+  const picked = new Set<number>(order.slice(0, 8).map((f) => f.i));
+  for (const target of [0.25, 0.75]) {
+    for (const side of [1, -1] as const) {
+      let best = -1;
+      let bestErr = Infinity;
+      facets.forEach((f, i) => {
+        if (f.side !== side) return;
+        const err = Math.abs(f.pt[0] / chord - target);
+        if (err < bestErr) {
+          bestErr = err;
+          best = i;
+        }
+      });
+      if (best >= 0) picked.add(best);
+    }
+  }
+  const polyDistance = (q: [number, number]) => {
+    let d = Infinity;
+    for (let i = 0; i < points.length; i++) d = Math.min(d, segDistance(q, points[i], points[(i + 1) % points.length]));
+    return d;
+  };
+  const probes = [...picked]
+    .sort((a, b) => a - b)
+    .map((i) => {
+      const q: [number, number] = [round4(facets[i].pt[0]), round4(facets[i].pt[1])];
+      return { point: q, polygon_distance_mm: polyDistance(q) };
+    });
+
+  // Areas: the emitted polygon (shoelace) vs the analytic section by dense
+  // polygon quadrature, with the quadrature's own error estimate.
+  const polygonArea = shoelace(points);
+  const denseArea = (k: number) => shoelace(nacaLoop(spec, k).map(({ pt }) => [pt[0] * chord, pt[1] * chord]));
+  const aFine = denseArea(8000);
+  const aCoarse = denseArea(4000);
+
+  // Section characteristics from dense samples of the analytic curves.
+  let maxT = { v: 0, x: 0 };
+  let maxC = { v: 0, x: 0 };
+  for (let k = 0; k <= 20000; k++) {
+    const x = k / 20000;
+    const th = 2 * nacaHalfThickness(spec, x);
+    if (th > maxT.v) maxT = { v: th, x };
+    const { yc } = nacaCamber(spec, x);
+    if (Math.abs(yc) > Math.abs(maxC.v)) maxC = { v: yc, x };
+  }
+  const teThickness = 2 * nacaHalfThickness(spec, 1) * chord;
+
+  // Stations: analytic surface y at requested world x (vertical, as a ray
+  // along -y would see them), plus the mean line — for spar placement and
+  // kernel ray/point checks.
+  const stationsRaw = args.stations_x_mm;
+  const stations: Array<Record<string, number>> = [];
+  if (stationsRaw !== undefined) {
+    if (!Array.isArray(stationsRaw) || stationsRaw.length > 20) {
+      return refuse("stations_x_mm must be an array of at most 20 chordwise positions in mm");
+    }
+    for (const sx of stationsRaw) {
+      const x = Number(sx);
+      if (!Number.isFinite(x) || x <= 0 || x >= chord) {
+        return refuse(`station ${String(sx)} mm is not strictly inside the chord (0, ${chord}) mm`);
+      }
+      const xf = x / chord;
+      const yu = nacaSurface(spec, surfaceParamAtX(spec, xf, 1), 1)[1] * chord;
+      const yl = nacaSurface(spec, surfaceParamAtX(spec, xf, -1), -1)[1] * chord;
+      stations.push({
+        x_mm: x,
+        camber_y_mm: nacaCamber(spec, xf).yc * chord,
+        upper_y_mm: yu,
+        lower_y_mm: yl,
+        thickness_mm: yu - yl,
+      });
+    }
+  }
+
+  const designation = `NACA ${raw}`;
+  const departures: string[] = [];
+  if (te === "sharp") {
+    departures.push(
+      "a4 = -0.1036 (closed trailing edge) departs from NACA Report 460's a4 = -0.1015: the TE closes to a zero-thickness knife edge — a printing, machining and meshing hazard the engineer chose knowingly",
+    );
+  }
+  if (te === "blunt") {
+    departures.push(
+      `blunt TE ${round4(teThickness)} mm departs from the designation: half-thickness = closed-TE yt + ${round4(rampHalf * chord)}·(x/c) mm (a linear ramp, zero at the LE, measured normal to the mean line) — a Roshera construction for a stated TE thickness, not a NACA definition`,
+    );
+  }
+
+  return answer(
+    {
+      designation,
+      chord_mm: chord,
+      max_camber: { value_mm: round4(maxC.v * chord), at_x_mm: round4(maxC.x * chord), fraction_of_chord: m },
+      max_thickness: { value_mm: round4(maxT.v * chord), at_x_mm: round4(maxT.x * chord), measured: "2·yt, normal to the mean line" },
+      trailing_edge: te,
+      te_thickness_mm: Math.abs(teThickness) < 1e-12 ? 0 : teThickness,
+      coefficient_a4: spec.a4,
+      spacing: `cosine, ${n} intervals per surface`,
+      point_count: points.length,
+      points,
+      loop_order: "TE upper -> LE -> TE lower, closed:true closes it (no duplicate LE or closed-TE vertex); x along chord from the LE at (0,0), y up",
+      polygon_area_mm2: polygonArea,
+      analytic_area_mm2: aFine,
+      analytic_area_quadrature_error_mm2: Math.abs(aFine - aCoarse),
+      faceting: {
+        max_deviation_mm: maxFacet.d,
+        at_mm: [round4(maxFacet.pt[0]), round4(maxFacet.pt[1])],
+        method: `faceted polygon: vertices lie ON the analytic profile; between them the polygon is a chord. Max distance from the analytic curve to the polygon, ${SAMPLES - 1} samples per edge`,
+        statement: `the built section is a ${points.length}-vertex polygon within ${maxFacet.d.toExponential(2)} mm of ${designation} (generator measurement); confirm on the part with point_query at the probes — never call it exact`,
+      },
+      probes,
+      stations,
+      departures,
+    },
+    `${designation} 4-digit section equations — NACA Report 460 (Jacobs, Ward & Pinkerton, 1933) and Abbott & von Doenhoff, Theory of Wing Sections (1959) §6.4 — evaluated here: thickness a4 = ${spec.a4}${spec.a4 === A4_CLOSED ? " (-0.1036 is the later closed-trailing-edge modification, not in Report 460, which gives -0.1015)" : " (the Report 460 coefficient; the -0.1036 closed-TE modification is not in Report 460)"}; cosine spacing; areas by shoelace and dense-polygon quadrature`,
+    "analytic generator, not a transcribed table: vertices are exact to the 0.1 µm rounding, the polygon between them is faceted — see faceting; aerodynamic data (lift, drag, moment) is not part of this answer and is never claimed",
+  );
+}
+
+// ─── bolt_edge_distance: EN 1993-1-8 Table 3.3 minimum end/edge/spacing ─────
+// Added 2026-11-18 (mounting_plate playbook). The MINIMUM values of Table 3.3
+// for bolted connections in structural steel, as multiples of the hole
+// diameter d0. The table's MAXIMUM values depend on plate thickness and
+// exposure (corrosion) and are not transcribed — the answer says so.
+
+function boltEdgeDistance(args: Record<string, unknown>): RefResult {
+  let d0 = Number(args.hole_diameter_mm);
+  let holeSource = "caller-supplied hole diameter d0";
+  if (args.hole_diameter_mm === undefined) {
+    if (args.fastener === undefined) {
+      return refuse(
+        "bolt_edge_distance needs args.hole_diameter_mm (the hole d0) or args.fastener (e.g. 'M8', resolved through clearance_hole)",
+      );
+    }
+    const ch = clearanceHole({ fastener: args.fastener, class: args.class });
+    if ("refused" in ch) return ch;
+    d0 = Number(ch.value.diameter_mm);
+    holeSource = `d0 from ${ch.source}`;
+  }
+  if (!Number.isFinite(d0) || d0 <= 0) return refuse("bolt_edge_distance needs a positive hole diameter");
+  const r = (v: number) => Math.round(v * 1e6) / 1e6;
+  return answer(
+    {
+      hole_diameter_mm: d0,
+      e1_min_mm: r(1.2 * d0),
+      e2_min_mm: r(1.2 * d0),
+      p1_min_mm: r(2.2 * d0),
+      p2_min_mm: r(2.4 * d0),
+      meaning:
+        "e1 = hole centre to the end in the load direction, e2 = to the edge across it, p1 = spacing along the load, p2 = spacing across it",
+      maxima: "not transcribed — Table 3.3 maxima depend on plate thickness t and exposure; ask if the joint is near them",
+      scope:
+        "structural-steel bolted connections; for a machined plate it is a defensible floor, stated as such, not a rule the plate is governed by",
+    },
+    `EN 1993-1-8:2005 Table 3.3 (minimum end distance e1 = 1.2·d0, edge distance e2 = 1.2·d0, spacing p1 = 2.2·d0, p2 = 2.4·d0); ${holeSource}`,
+    TRANSCRIPTION_NOTE,
+  );
+}
+
 // ─── Dispatch ───────────────────────────────────────────────────────────────
 
 const REFERENCE_FNS: Record<string, (args: Record<string, unknown>) => RefResult> = {
@@ -755,6 +1126,8 @@ const REFERENCE_FNS: Record<string, (args: Record<string, unknown>) => RefResult
   bend_allowance: bendAllowance,
   drill_size: drillSize,
   flange_dims: pipeFlange,
+  naca_profile: nacaProfile,
+  bolt_edge_distance: boltEdgeDistance,
 };
 
 export const REFERENCE_KEYS = Object.keys(REFERENCE_FNS);

@@ -443,6 +443,12 @@ console.log("(2) TIER 2: playbook chunks + tool_sequence resolve against the tab
     flange: 372,
     bolt_pattern: 190,
     snap_fit: 206,
+    // Part-family playbooks (2026-11-18, authored in kb_data.ts, not the vault
+    // doc); their worked examples ride beside `text` and are billed separately
+    // (worked_example_token_estimate), so these pins cover the prose only.
+    aerofoil_section: 961,
+    sheet_metal_bracket: 845,
+    mounting_plate: 780,
   };
   for (const [key, tokens] of Object.entries(PLAYBOOK_TOKENS)) {
     const p = await lookup("playbook", key);
