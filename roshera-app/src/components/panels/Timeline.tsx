@@ -1,4 +1,4 @@
-import { Fragment, Suspense, lazy, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
+import { Suspense, lazy, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
 import { useWSStore } from '@/stores/ws-store'
 import { useSceneStore } from '@/stores/scene-store'
 import { useActionErrorStore } from '@/stores/action-error-store'
@@ -16,12 +16,6 @@ import {
   normalizeKind,
   symbolForOperation,
   shortLabel,
-  formatTimestamp,
-  relativeTime,
-  formatAuthor,
-  authorKind,
-  authorGlyph,
-  authorTextClass,
 } from '@/lib/timeline-events'
 import { DecisionRail, DurabilityChip } from './TimelineDecisions'
 import { FilmStrip } from './FilmStrip'
@@ -102,147 +96,23 @@ const MOCK_DURABILITY: DurabilityStatus = {
 // of this file so the bottom Timeline strip and the top-left Feature
 // Tree share a single rendering source-of-truth.
 
-// ─── Event node (3-line column) ─────────────────────────────────────
-
-function EventNode({
-  event,
-  isLatest,
-  now,
-  onContextMenu,
-}: {
-  event: EventSummary
-  isLatest: boolean
-  now: number // re-render anchor for relative time
-  onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
-}) {
-  const symbol = symbolForOperation(event.operation_type)
-  const label = shortLabel(event.operation_type)
-  const kind = authorKind(event.author, event.author_kind)
-  const glyph = authorGlyph(kind)
-  // `now` participates so this re-renders when the parent ticks.
-  void now
-  const rel = relativeTime(event.timestamp)
-  const symbolColor = authorTextClass(kind, isLatest)
-
-  return (
-    <div
-      onContextMenu={(e) => onContextMenu(e, event)}
-      className="flex flex-col items-center px-1 cursor-default select-none group"
-      title={`${event.operation_type}\n${formatAuthor(event.author)} · ${formatTimestamp(event.timestamp)} · #${event.sequence_number}`}
-    >
-      <div className={cn('text-base leading-none transition-colors', symbolColor)}>
-        {symbol}
-      </div>
-      <div
-        className={cn(
-          'text-[11px] leading-tight mt-0.5 min-w-[3ch] text-center transition-colors',
-          isLatest ? 'text-foreground/90' : 'text-foreground/50 group-hover:text-foreground/80',
-        )}
-      >
-        {label}
-      </div>
-      <div className="flex items-center gap-0.5 text-[11px] leading-tight mt-0.5">
-        <span className={authorTextClass(kind, isLatest)}>{glyph}</span>
-        <span className={isLatest ? 'text-foreground/70' : 'text-muted-foreground/60'}>{rel}</span>
-      </div>
-    </div>
-  )
-}
-
-// ─── Connector (── glyph aligned to symbol baseline) ────────────────
-
-function Connector() {
-  return (
-    <span className="text-muted-foreground/40 text-base leading-none self-start pt-[1px]">
-      ──
-    </span>
-  )
-}
-
-// ─── Recent-ops strip — the ambient surface, not the odometer ───────
+// ─── History status: what the strip says when it has no pictures ────
 //
-// Redesigned 2026-07-31 (Varun, after the map view shipped): "speedometer
-// vs map — GPS does not make the speedometer redundant." The strip's job
-// is ambient context (where am I, what just happened), not structure —
-// the map owns structure now (grouped by operation kind, branches as
-// lanes). Showing the full 40+ event log here was the odometer again in
-// a thinner band. This shows only the last few operations, most recent
-// nearest the eye (rightmost, at the strip's leading edge); the by-part /
-// by-time grouping toggle is gone with it — one less control, one less
-// decision, and full history is one click away in the map.
-const RECENT_OPS_COUNT = 5
-
-function RecentOpsStrip({
-  events,
-  now,
-  onContextMenu,
-  loading,
-  durability,
-  onOpenMap,
-}: {
-  events: EventSummary[]
-  now: number
-  onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
-  loading: boolean
-  durability: DurabilityStatus | null
-  onOpenMap?: () => void
-}) {
-  if (events.length === 0) {
-    // An empty strip must say the TRUE thing, and "no operations yet"
-    // is only true when the log really is empty. A failed boot read or
-    // disabled persistence are different facts with different stakes.
-    const line = loading
-      ? '⋯ loading'
-      : durability?.state === 'failed'
-        ? '∅ event log unreadable at boot — serving a blank model, not an empty document'
-        : durability?.state === 'disabled'
-          ? '∅ persistence off — operations recorded now will not survive a restart'
-          : '∅ no operations yet'
-    return (
-      <div className="text-[12px] text-muted-foreground/60 px-3 py-2">
-        {line}
-      </div>
-    )
+// The film strip of pictured chapters is the ONE history surface. While its
+// chapters load, or when there are none, the strip says so in one line --
+// it no longer falls back to the old diamond row of raw operations ("Name",
+// "IS"), which Varun took for "the old timeline" (2026-11-18). The line must
+// say the TRUE thing: a failed boot read or disabled persistence are
+// different facts from an empty document.
+function historyStatusLine(loading: boolean, durability: DurabilityStatus | null): string {
+  if (loading) return 'Loading the history…'
+  if (durability?.state === 'failed') {
+    return '∅ event log unreadable at boot — serving a blank model, not an empty document'
   }
-  const recent = events.slice(-RECENT_OPS_COUNT)
-  const hiddenCount = events.length - recent.length
-  return (
-    <div className="flex min-w-0 flex-1 items-center gap-0 overflow-x-auto whitespace-nowrap px-3 py-1.5">
-      {hiddenCount > 0 && (
-        <Fragment>
-          {onOpenMap ? (
-            <button
-              type="button"
-              onClick={onOpenMap}
-              title={`${hiddenCount} earlier operation${hiddenCount === 1 ? '' : 's'} — open the map for full history`}
-              className="shrink-0 px-1.5 py-0.5 rounded-full border border-border/60 text-[11px] leading-none text-foreground/80 hover:text-foreground hover:border-border hover:bg-accent/40 transition-colors"
-            >
-              +{hiddenCount} earlier
-            </button>
-          ) : (
-            <span
-              className="shrink-0 px-1.5 py-0.5 rounded-full border border-border/60 text-[11px] leading-none text-foreground/80"
-              title={`${hiddenCount} earlier operation${hiddenCount === 1 ? '' : 's'} — see the map for full history`}
-            >
-              +{hiddenCount} earlier
-            </span>
-          )}
-          <Connector />
-        </Fragment>
-      )}
-      {recent.map((event, i) => (
-        <Fragment key={event.id}>
-          {i > 0 && <Connector />}
-          <EventNode
-            event={event}
-            isLatest={i === recent.length - 1}
-            now={now}
-            onContextMenu={onContextMenu}
-          />
-        </Fragment>
-      ))}
-    </div>
-  )
+  if (durability?.state === 'disabled') {
+    return '∅ persistence off — operations recorded now will not survive a restart'
+  }
+  return '∅ no steps yet — build something and it appears here'
 }
 
 // ─── Header glyph button ────────────────────────────────────────────
@@ -1676,14 +1546,9 @@ export function Timeline() {
           />
         ) : (
           <div className="min-w-0 max-w-[36rem]">
-            <RecentOpsStrip
-              events={events}
-              now={now}
-              onContextMenu={handleEventContextMenu}
-              loading={loading}
-              durability={durability}
-              onOpenMap={() => setGraphOpen(true)}
-            />
+            <div className="px-3 py-2 text-[12px] text-muted-foreground/70">
+              {historyStatusLine(loading || chapterState.loading, durability)}
+            </div>
           </div>
         )}
 
