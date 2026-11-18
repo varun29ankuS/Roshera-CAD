@@ -67,7 +67,12 @@ export function BuildStepStrip({
   }
 
   return (
-    <div className="group/line flex items-start gap-2 px-3 py-1.5 hover:bg-accent/50 rounded-md">
+    <div
+      // Collapsed, the strip stands in for its lines in the DOM: an evidence
+      // mark pointing at one of them (`TurnEvidenceStrip.tsx`) finds it here.
+      data-line-ids={lines.map((l) => l.id).join(' ')}
+      className="group/line flex items-start gap-2 px-3 py-1.5 hover:bg-accent/50 rounded-md"
+    >
       {/* Same origin marker BlackboardLine uses for a system-authored line —
           a step strip is still app-generated bookkeeping, not the agent's
           own prose. */}

@@ -10,6 +10,8 @@ import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
 import { cancelAcpTurn } from '@/lib/acp-blackboard'
 import { groupBlackboardByCheckpoint, type CheckpointMarker } from '@/lib/blackboard-groups'
+import { evidenceByLastLine } from '@/lib/turn-evidence'
+import { isAtTail } from '@/lib/blackboard-scroll'
 import {
   loadDraft,
   saveDraft,
@@ -36,6 +38,7 @@ import {
   Check,
   X,
   CircleSlash,
+  ShieldCheck,
 } from '@/components/ui/icons'
 import { VendorMark } from '@/components/settings/vendor-marks'
 import { useAgentUiStore } from '@/stores/agent-ui-store'
@@ -341,14 +344,47 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
     setOverrideHeight(null)
   }, [])
 
-  // Auto-scroll to the newest content: new lines, streamed text growing the
-  // last line, and height changes (the geometry strip must show the latest
-  // line, not the top of the document).
+  // TAIL FOLLOWING (`lib/blackboard-scroll.ts`). The board scrolls to the
+  // newest content — new lines, streamed text growing the last line, height
+  // changes — ONLY while the reader is at the tail. Scrolling up to read a
+  // certificate pins the view there; the next "Created …" echo no longer
+  // throws the reader off it. "Jump to latest" (above the composer) and
+  // sending a prompt resume following. A ref, not state, decides: the
+  // scroll handler fires on every frame of a scroll and must not re-render
+  // the board; `awayFromTail` is state only for the button's visibility.
+  const followTailRef = useRef(true)
+  const [awayFromTail, setAwayFromTail] = useState(false)
+
+  const onBodyScroll = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const at = isAtTail(el)
+    followTailRef.current = at
+    setAwayFromTail(!at)
+  }, [])
+
+  const jumpToLatest = useCallback(() => {
+    followTailRef.current = true
+    setAwayFromTail(false)
+    const el = scrollRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [])
+
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
-    }
+    const el = scrollRef.current
+    if (el && followTailRef.current) el.scrollTop = el.scrollHeight
   }, [lines, agentAttention, overrideHeight, isProcessing])
+
+  // The kernel's answer to each turn (`lib/turn-evidence.ts`), computed
+  // over the WHOLE notebook rather than per checkpoint section: the agent
+  // declares checkpoints mid-turn, and the verdict must land after the last
+  // line of the work it covers, whichever section that line sits in.
+  // The streaming line is passed so a turn still in flight is not called
+  // "no certificate shown" before its certificate had the chance to arrive.
+  const evidence = useMemo(
+    () => evidenceByLastLine(lines, streamingLineId),
+    [lines, streamingLineId],
+  )
 
   useEffect(() => {
     if (isPanelOpen) {
@@ -373,9 +409,11 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
       // Routes to the agent via the existing ai-client path (wrapped for
       // queue visibility); the user's line lands in the notebook
       // immediately, the reply as an editable line — never a chat bubble.
+      // Asking is a return to the conversation's tail: follow it again.
+      jumpToLatest()
       void sendPrompt(text, processBlackboardMessage)
     },
-    [draft],
+    [draft, jumpToLatest],
   )
 
   const handleKeyDown = useCallback(
@@ -601,6 +639,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
           while dragging so the grip tracks the pointer exactly. */}
       <div
         ref={scrollRef}
+        onScroll={onBodyScroll}
         className="flex-1 overflow-y-auto min-h-0 scrollbar-thin"
         style={
           docked
@@ -637,7 +676,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
                   <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-accent">
                     <Bot size={10} className="text-foreground" />
                   </span>
-                  <span>the agent — reasoning, editable</span>
+                  <span>the agent — reasoning and the work it did</span>
                 </div>
                 {/* Drawn exactly like a real user line — indented, medium
                     weight, in its own shrink-wrapped container. The legend
@@ -671,6 +710,17 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
                     <span>— one row each, result on a click</span>
                   </span>
                 </div>
+                {/* The turn evidence strip, drawn as it really renders
+                    (`TurnEvidenceStrip.tsx`): every turn that built or
+                    checked geometry ends in the kernel's answer. */}
+                <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 border-l-2 border-l-emerald-500/70 pl-2">
+                  <ShieldCheck size={11} className="shrink-0" aria-hidden />
+                  <span>Kernel evidence</span>
+                  <span className="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-300">
+                    <Check size={10} /> sound
+                  </span>
+                  <span>— closes every turn that built or checked geometry; one built without a certificate says so</span>
+                </div>
                 <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
                   <span>marker colour is the verdict:</span>
                   <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
@@ -694,6 +744,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
               onDelete={deleteLine}
               streamingLineId={streamingLineId}
               onCancel={cancelAcpTurn}
+              evidence={evidence}
               // Earlier checkpoint sections open collapsed so a long
               // notebook lands the eye on CURRENT work, not on scrollback
               // — collapse is a click with a named header and a visible
@@ -730,13 +781,21 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
           the strip below makes that queue visible. */}
 
       <div className="shrink-0 border-t border-border">
+        {/* The reader scrolled up, so the board stopped following the tail.
+            The way back is a visible, labelled control, not a guess. */}
+        {awayFromTail && (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            className="cad-focus flex w-full items-center justify-center gap-1 border-b border-border py-1 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            <ChevronDown size={11} aria-hidden />
+            Jump to latest
+          </button>
+        )}
         {/* Someone watching the render rather than the transcript still has
             to learn the agent stopped and is waiting on them. */}
-        <PermissionStrip
-          onFocus={() => {
-            if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight
-          }}
-        />
+        <PermissionStrip onFocus={jumpToLatest} />
         {/* QUEUE STRIP — prompts received but not yet dispatched. Dashed
             amber is the app's existing "not run yet" grammar (ClaimBadge's
             null state in cards/card-chrome.tsx) — waiting is a state, so
@@ -809,7 +868,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
             className="max-h-40 min-h-12 resize-none overflow-y-auto bg-transparent px-2.5 pt-2 text-[12.5px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/70 scrollbar-thin"
           />
           <div className="flex items-center gap-2 px-2 pb-1.5">
-            <span className="text-[10.5px] text-muted-foreground/80">Enter sends · Shift+Enter new line</span>
+            <span className="text-[11px] text-muted-foreground/80">Enter sends · Shift+Enter new line</span>
             <span className="flex-1" />
             {/* A visible, labelled send control. Disabled only by an empty
                 draft, never by a turn in flight (that case queues, visibly). */}

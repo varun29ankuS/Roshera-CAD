@@ -119,12 +119,14 @@ function parseToolCallLine(text: string): ParsedToolCall | null {
 /**
  * TERMINAL-STATUS GLYPH
  * ----------------------
- * Prefixes a settled agent line with how its turn ended, using the exact
- * Check/X/CircleSlash + emerald/red/amber vocabulary `cards/card-chrome.tsx`'s
- * `Claim` already uses for certificate verdicts — one glyph language across
- * the app. This is NOT a geometry verdict: it says the turn completed,
- * failed, or was cancelled, nothing about whether the resulting part is
- * sound (that is the certificate cards' job, on their own line).
+ * Prefixes a settled agent line with how its turn ended, using the
+ * Check/X/CircleSlash glyphs of `cards/card-chrome.tsx`'s `Claim`. This is
+ * NOT a geometry verdict: it says the turn completed, failed, or was
+ * cancelled, nothing about whether the resulting part is sound. So a
+ * completed turn's tick is MUTED, never emerald (2026-11-18): an emerald
+ * tick beside the reply read as "certified" at a glance. Emerald is spent
+ * only on certificates — the cards, and the turn's evidence strip
+ * (`TurnEvidenceStrip.tsx`). Failed stays red, cancelled amber.
  */
 function TurnStatusGlyph({ status }: { status: AgentTurnStatus }) {
   const title =
@@ -137,7 +139,10 @@ function TurnStatusGlyph({ status }: { status: AgentTurnStatus }) {
     <span
       className={cn(
         'mt-0.5 inline-flex shrink-0',
-        status === 'completed' && 'text-emerald-600 dark:text-emerald-400',
+        // Muted, not emerald: "the turn ended" must not read as "the part
+        // is sound" at a glance. Emerald belongs to certificates alone —
+        // the turn's verdict is the evidence strip after its last line.
+        status === 'completed' && 'text-muted-foreground/70',
         status === 'failed' && 'text-red-600 dark:text-red-400',
         status === 'cancelled' && 'text-caution ',
       )}
@@ -344,6 +349,8 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
   const isUser = !isAgent && !isSystem
   return (
     <div
+      // The evidence strip's marks scroll to their card's line by this id.
+      data-line-id={line.id}
       className={cn(
         'group/line flex items-start gap-2 px-3 py-1.5 hover:bg-accent/50 rounded-md',
         isUser && 'ml-6',

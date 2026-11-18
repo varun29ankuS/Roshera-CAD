@@ -81,7 +81,8 @@ export type AgentAttention = 'idle' | 'writing' | 'geometry'
  * Set once on the agent's own line when its turn concludes — drives the
  * completed/cancelled/failed glyph in `BlackboardLine.tsx`, using the same
  * Check/X/CircleSlash vocabulary as `cards/card-chrome.tsx`'s `Claim`
- * (emerald / red / amber). This is a TURN-lifecycle marker, not a geometry
+ * (muted / red / amber — completed is deliberately not emerald, which is
+ * reserved for certificates). This is a TURN-lifecycle marker, not a geometry
  * verdict: `'completed'` means the agent's turn ended without erroring or
  * being cancelled — it says nothing about whether the resulting geometry is
  * sound. That verdict belongs to the certificate cards alone; never let this

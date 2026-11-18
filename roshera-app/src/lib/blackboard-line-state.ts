@@ -1,4 +1,4 @@
-import { cardKindFromLanguage, isDfmReport, parseCard, type BlackboardCard } from './blackboard-cards'
+import { cardKindFromLanguage, isDfmReport, parseCard, type BlackboardCard } from './blackboard-cards.ts'
 
 /**
  * LINE VERDICT — the fixed-gutter marker's colour input
@@ -37,7 +37,7 @@ export type LineVerdict = 'pass' | 'fail' | 'inconclusive'
  *  card renderer. */
 const FENCE_RE = /```\s*([^\s`\n]+)\n([\s\S]*?)```/g
 
-function cardsInText(text: string): BlackboardCard[] {
+export function cardsInText(text: string): BlackboardCard[] {
   const cards: BlackboardCard[] = []
   for (const match of text.matchAll(FENCE_RE)) {
     const kind = cardKindFromLanguage(match[1])
@@ -50,7 +50,7 @@ function cardsInText(text: string): BlackboardCard[] {
 
 /** One card's verdict, read only from the fields the kernel/API actually
  *  populate — never re-derived from a summary string. */
-function cardVerdict(card: BlackboardCard): LineVerdict | null {
+export function cardVerdict(card: BlackboardCard): LineVerdict | null {
   switch (card.kind) {
     case 'soundness': {
       const sound = card.card.sound

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import {
   ChevronDown,
   ChevronRight,
@@ -6,7 +6,9 @@ import {
 import { cn } from '@/lib/utils'
 import type { BlackboardSection as BlackboardSectionData } from '@/lib/blackboard-groups'
 import { BlackboardLine } from './BlackboardLine'
+import type { TurnEvidence } from '@/lib/turn-evidence'
 import { BuildStepStrip } from './BuildStepStrip'
+import { TurnEvidenceStrip } from './TurnEvidenceStrip'
 
 /**
  * One notebook section: a sticky, collapsible header naming the checkpoint
@@ -26,6 +28,7 @@ export function BlackboardSection({
   onDelete,
   streamingLineId,
   onCancel,
+  evidence,
   defaultCollapsed = false,
 }: {
   section: BlackboardSectionData
@@ -33,6 +36,10 @@ export function BlackboardSection({
   onDelete: (id: string) => void
   streamingLineId: string | null
   onCancel?: (() => void) | undefined
+  /** Each turn's kernel evidence, keyed by the turn's last line
+   *  (`lib/turn-evidence.ts`'s `evidenceByLastLine`, computed once over the
+   *  whole notebook by `Blackboard.tsx`). */
+  evidence: ReadonlyMap<string, TurnEvidence>
   /** Initial state only (Blackboard.tsx passes true for every checkpoint
    *  section except the last, so a long notebook opens on CURRENT work).
    *  The user's toggle always wins afterwards — this never forces a
@@ -52,27 +59,40 @@ export function BlackboardSection({
     0,
   )
 
+  // The turn that ends on this group, if any: its evidence strip is drawn
+  // right after it. A build strip can be a turn's last group (kernel echoes
+  // arrive after the reply), so every line it stands for is checked.
+  const turnEndingAt = (g: (typeof groups)[number]): TurnEvidence | undefined => {
+    if (g.kind === 'line') return evidence.get(g.line.id)
+    for (const l of g.lines) {
+      const t = evidence.get(l.id)
+      if (t) return t
+    }
+    return undefined
+  }
+
   const body = collapsed ? null : (
     <div>
-      {groups.map((g) =>
-        g.kind === 'build-strip' ? (
-          <BuildStepStrip
-            key={g.lines[0].id}
-            lines={g.lines}
-            onCommit={onCommit}
-            onDelete={onDelete}
-          />
-        ) : (
-          <BlackboardLine
-            key={g.line.id}
-            line={g.line}
-            onCommit={onCommit}
-            onDelete={onDelete}
-            streaming={g.line.id === streamingLineId}
-            onCancel={g.line.id === streamingLineId ? onCancel : undefined}
-          />
-        ),
-      )}
+      {groups.map((g) => {
+        const turn = turnEndingAt(g)
+        const key = g.kind === 'build-strip' ? g.lines[0].id : g.line.id
+        return (
+          <Fragment key={key}>
+            {g.kind === 'build-strip' ? (
+              <BuildStepStrip lines={g.lines} onCommit={onCommit} onDelete={onDelete} />
+            ) : (
+              <BlackboardLine
+                line={g.line}
+                onCommit={onCommit}
+                onDelete={onDelete}
+                streaming={g.line.id === streamingLineId}
+                onCancel={g.line.id === streamingLineId ? onCancel : undefined}
+              />
+            )}
+            {turn && <TurnEvidenceStrip evidence={turn} />}
+          </Fragment>
+        )
+      })}
     </div>
   )
 
