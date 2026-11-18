@@ -364,23 +364,44 @@ impl EntityHandler for EdgeCurveHandler {
             // independent curve instance and preserve its native domain.
             match ctx.model.curves.get(curve_id) {
                 Some(c) => {
-                    let domain = c.parameter_range();
-                    edge_param_range = match span_between_vertices(
-                        c, start_pos, end_pos, same_sense,
-                    ) {
-                        Ok(range) => range,
-                        Err(off) => {
-                            ctx.report.push_warning(Warning {
-                                severity: Severity::Warn,
-                                entity: names::EDGE_CURVE.into(),
-                                instance: Some(instance),
-                                message: format!(
-                                    "a vertex lies {off:.3e} off its curve #{geom_ref}; the edge                                      keeps the whole curve"
-                                ),
-                            });
-                            domain
-                        }
-                    };
+                    edge_param_range =
+                        match span_between_vertices(c, start_pos, end_pos, same_sense) {
+                            Ok(span) => {
+                                if span.off_curve > VERTEX_ON_CURVE {
+                                    ctx.report.push_warning(Warning {
+                                        severity: Severity::Warn,
+                                        entity: names::EDGE_CURVE.into(),
+                                        instance: Some(instance),
+                                        message: format!(
+                                            "a vertex lies {:.3e} off its curve #{geom_ref}; the \
+                                         edge, {:.3e} long, is trimmed at the curve's nearest \
+                                         point",
+                                            span.off_curve, span.length
+                                        ),
+                                    });
+                                }
+                                span.range
+                            }
+                            Err(refusal) => {
+                                // Reported here: an edge is usually reached
+                                // through its loop, and that path drops the
+                                // `Failed` message.
+                                ctx.report.push_warning(Warning {
+                                    severity: Severity::Warn,
+                                    entity: names::EDGE_CURVE.into(),
+                                    instance: Some(instance),
+                                    message: format!(
+                                        "a vertex lies {:.3e} off its curve #{geom_ref}, beyond \
+                                         the {:.3e} allowed for an edge {:.3e} long; the edge is \
+                                         refused",
+                                        refusal.distance, refusal.allowed, refusal.edge_length
+                                    ),
+                                });
+                                return HandlerOutcome::Failed {
+                                    message: "edge vertex too far from the edge's curve".into(),
+                                };
+                            }
+                        };
                     c.clone_box()
                 }
                 None => {
@@ -649,60 +670,223 @@ fn enclosing_loop(
 /// an edge is the curve BETWEEN its vertices, not the whole curve. A vertex
 /// at an end of the curve keeps that end exactly; a vertex inside it is
 /// projected onto the curve. A curve whose two ends meet (a closed spline)
-/// with both vertices there is the whole curve. `Err(distance)` when a
-/// vertex is farther than [`VERTEX_ON_CURVE`] from the curve.
+/// with both vertices there is the whole curve.
+///
+/// A vertex need not lie exactly on the curve: writers keep a tolerance on
+/// each vertex (on valid CADGenBench parts vertices sit up to 4.7e-2 off
+/// their curves), so the edge is trimmed at the curve's NEAREST point to the
+/// vertex and the distance is returned in [`EdgeSpan::off_curve`]. That
+/// distance is bounded by [`vertex_off_curve_allowance`]; a vertex farther
+/// off is not on this curve in any useful sense and the edge is refused. It
+/// is never widened to the whole curve, which lays it over its neighbours.
 fn span_between_vertices(
     curve: &dyn Curve,
     start: [f64; 3],
     end: [f64; 3],
     same_sense: bool,
-) -> Result<ParameterRange, f64> {
+) -> Result<EdgeSpan, VertexOffCurve> {
     let domain = curve.parameter_range();
     let at = |t: f64| curve.evaluate(t).ok().map(|p| p.position);
     let (Some(c0), Some(c1)) = (at(domain.start), at(domain.end)) else {
-        return Ok(domain);
+        return Ok(EdgeSpan {
+            range: domain,
+            off_curve: 0.0,
+            length: 0.0,
+        });
     };
     let to = |p: Point3, q: [f64; 3]| p.distance(&Point3::new(q[0], q[1], q[2]));
     let end_tol = VERTEX_ON_CURVE;
     let closed = c0.distance(&c1) <= end_tol;
-    let param = |q: [f64; 3]| -> Result<f64, f64> {
+    // The parameter of the curve's point nearest the vertex, and how far
+    // that point is from the vertex.
+    let param = |q: [f64; 3]| -> (f64, f64) {
         if to(c0, q) <= end_tol {
-            return Ok(domain.start);
+            return (domain.start, to(c0, q));
         }
         if to(c1, q) <= end_tol {
-            return Ok(domain.end);
+            return (domain.end, to(c1, q));
         }
         let target = Point3::new(q[0], q[1], q[2]);
-        match curve.closest_point(&target, Tolerance::from_distance(1e-10)) {
-            Ok((t, p)) if p.distance(&target) <= VERTEX_ON_CURVE => Ok(t),
-            Ok((_, p)) => Err(p.distance(&target)),
-            Err(_) => Err(f64::INFINITY),
+        let solved = curve
+            .closest_point(&target, Tolerance::from_distance(1e-10))
+            .ok()
+            .map(|(t, p)| (t, p.distance(&target)));
+        match solved {
+            Some(on) if on.1 <= VERTEX_ON_CURVE => on,
+            // The curve's own solver starts from a few samples and can stop
+            // at a far local minimum on a long spline. Before the vertex is
+            // called off the curve, the whole curve is searched.
+            _ => match (solved, nearest_on_curve(curve, target)) {
+                (Some(a), Some(b)) => {
+                    if a.1 <= b.1 {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => (domain.start, f64::INFINITY),
+            },
         }
     };
-    let ts = param(start)?;
-    let te = param(end)?;
-    if closed && (ts - te).abs() <= f64::EPSILON * (domain.end - domain.start).abs().max(1.0) {
-        // Both vertices at the closed curve's seam: the whole loop.
-        return Ok(domain);
+    let (ts, start_off) = param(start);
+    let (te, end_off) = param(end);
+    let range =
+        if closed && (ts - te).abs() <= f64::EPSILON * (domain.end - domain.start).abs().max(1.0) {
+            // Both vertices at one point of the closed curve: the whole loop.
+            domain
+        } else if closed {
+            // On a closed curve a vertex at the seam is at BOTH ends of the
+            // domain. Along the curve's direction the edge runs from its start
+            // vertex when `same_sense`, else from its end vertex: the leading
+            // vertex takes the domain's start, the trailing one its end.
+            let seam = |t: f64| t == domain.start || t == domain.end;
+            let (lead, trail) = if same_sense { (ts, te) } else { (te, ts) };
+            let lead = if seam(lead) { domain.start } else { lead };
+            let trail = if seam(trail) { domain.end } else { trail };
+            ParameterRange::new(lead.min(trail), lead.max(trail))
+        } else {
+            ParameterRange::new(ts.min(te), ts.max(te))
+        };
+    let off_curve = start_off.max(end_off);
+    if off_curve <= VERTEX_ON_CURVE {
+        return Ok(EdgeSpan {
+            range,
+            off_curve,
+            length: 0.0,
+        });
     }
-    if closed {
-        // On a closed curve a vertex at the seam is at BOTH ends of the
-        // domain. Along the curve's direction the edge runs from its start
-        // vertex when `same_sense`, else from its end vertex: the leading
-        // vertex takes the domain's start, the trailing one its end.
-        let seam = |t: f64| t == domain.start || t == domain.end;
-        let (lead, trail) = if same_sense { (ts, te) } else { (te, ts) };
-        let lead = if seam(lead) { domain.start } else { lead };
-        let trail = if seam(trail) { domain.end } else { trail };
-        return Ok(ParameterRange::new(lead.min(trail), lead.max(trail)));
+    let length = span_length(curve, range);
+    let allowed = vertex_off_curve_allowance(length);
+    if off_curve <= allowed {
+        Ok(EdgeSpan {
+            range,
+            off_curve,
+            length,
+        })
+    } else {
+        // Also where the distance is not a number.
+        Err(VertexOffCurve {
+            distance: off_curve,
+            allowed,
+            edge_length: length,
+        })
     }
-    Ok(ParameterRange::new(ts.min(te), ts.max(te)))
+}
+
+/// The span of its curve an edge uses, and how far the farther of its two
+/// vertices is from the curve there. `length` is the span's length, measured
+/// only when a vertex is more than [`VERTEX_ON_CURVE`] off (else zero).
+#[derive(Debug, Clone, Copy)]
+struct EdgeSpan {
+    range: ParameterRange,
+    off_curve: f64,
+    length: f64,
+}
+
+/// Why an edge was refused: a vertex is `distance` from the edge's curve,
+/// more than the `allowed` for an edge `edge_length` long.
+#[derive(Debug, Clone, Copy)]
+struct VertexOffCurve {
+    distance: f64,
+    allowed: f64,
+    edge_length: f64,
 }
 
 /// How far a vertex may sit from the curve its edge runs along and still
-/// be read as ON it (model units after scaling). STEP writers' own vertex
-/// tolerances are well inside this; a vertex farther off is broken data.
+/// be read as exactly ON it (model units after scaling): nothing is
+/// reported, and a vertex this close to an end of the curve is that end.
 const VERTEX_ON_CURVE: f64 = 1e-3;
+
+/// The most a vertex may sit off its edge's curve, as a share of the edge's
+/// own length: less than half. The distance is the vertex's tolerance, the
+/// radius of the ball in which the edge's end may be anywhere; at half the
+/// edge's length the balls of its two ends meet and nothing of the edge is
+/// left between them, so there is no honest place to trim. (On the valid
+/// CADGenBench parts the largest share is 0.35, a 3.1e-3 gap on an edge
+/// 9.0e-3 long; the largest gap, 4.7e-2, is 0.16 of its edge.)
+const VERTEX_OFF_CURVE_SHARE: f64 = 0.5;
+
+/// The most a vertex may sit off its edge's curve whatever the edge's
+/// length (model units, mm): about ten times a typical writer's stated
+/// accuracy, just above the largest gap on the valid CADGenBench parts
+/// (4.7e-2). Without it a long edge would accept any gap under half its
+/// length.
+const VERTEX_OFF_CURVE_CAP: f64 = 0.05;
+
+/// How far a vertex may be from the curve of an edge `edge_length` long and
+/// still end that edge at the curve's nearest point: under half the edge's
+/// length, and never more than [`VERTEX_OFF_CURVE_CAP`].
+fn vertex_off_curve_allowance(edge_length: f64) -> f64 {
+    VERTEX_ON_CURVE
+        .max(VERTEX_OFF_CURVE_SHARE * edge_length)
+        .min(VERTEX_OFF_CURVE_CAP)
+}
+
+/// The curve's nearest point to `target` over its whole domain, as
+/// (parameter, distance): the nearest of evenly spaced samples, narrowed
+/// between that sample's two neighbours by golden-section search. `None`
+/// when the curve cannot be evaluated.
+fn nearest_on_curve(curve: &dyn Curve, target: Point3) -> Option<(f64, f64)> {
+    const SAMPLES: usize = 512;
+    const NARROWINGS: usize = 80;
+    let domain = curve.parameter_range();
+    let step = (domain.end - domain.start) / SAMPLES as f64;
+    let distance = |t: f64| curve.evaluate(t).ok().map(|p| p.position.distance(&target));
+    let mut nearest = (domain.start, distance(domain.start)?);
+    for k in 1..=SAMPLES {
+        let t = domain.start + step * k as f64;
+        let d = distance(t)?;
+        if d < nearest.1 {
+            nearest = (t, d);
+        }
+    }
+    let mut lo = (nearest.0 - step).max(domain.start);
+    let mut hi = (nearest.0 + step).min(domain.end);
+    let golden = 0.5 * (5.0_f64.sqrt() - 1.0);
+    let mut a = hi - golden * (hi - lo);
+    let mut b = lo + golden * (hi - lo);
+    let (mut da, mut db) = (distance(a)?, distance(b)?);
+    for _ in 0..NARROWINGS {
+        if da <= db {
+            hi = b;
+            (b, db) = (a, da);
+            a = hi - golden * (hi - lo);
+            da = distance(a)?;
+        } else {
+            lo = a;
+            (a, da) = (b, db);
+            b = lo + golden * (hi - lo);
+            db = distance(b)?;
+        }
+    }
+    for candidate in [(a, da), (b, db)] {
+        if candidate.1 < nearest.1 {
+            nearest = candidate;
+        }
+    }
+    Some(nearest)
+}
+
+/// The length of the curve over `range`, as a polyline through evenly
+/// spaced points: the scale an edge's vertex tolerance is judged against.
+/// Zero when the curve cannot be evaluated, so nothing more is allowed.
+fn span_length(curve: &dyn Curve, range: ParameterRange) -> f64 {
+    const CHORDS: usize = 32;
+    let mut length = 0.0;
+    let mut previous: Option<Point3> = None;
+    for k in 0..=CHORDS {
+        let t = range.start + (range.end - range.start) * k as f64 / CHORDS as f64;
+        let Ok(point) = curve.evaluate(t) else {
+            return 0.0;
+        };
+        if let Some(p) = previous {
+            length += p.distance(&point.position);
+        }
+        previous = Some(point.position);
+    }
+    length
+}
 
 /// Construct a `Line` curve sized to the edge's two vertex positions.
 fn build_line_curve(_line: StepLineGeom, start: [f64; 3], end: [f64; 3]) -> Box<dyn Curve> {
@@ -1781,6 +1965,28 @@ mod tests {
         registry::EntityRegistry,
     };
     use geometry_engine::primitives::topology_builder::BRepModel;
+
+    /// A vertex's distance off its edge's curve is bounded twice: by half
+    /// the edge's length (the two ends' tolerance balls must not meet) AND
+    /// by a fixed cap in model units, so a long edge cannot absorb a large
+    /// gap. The largest gap on the valid CADGenBench parts is 4.7e-2.
+    #[test]
+    fn a_vertex_off_its_curve_is_bounded_by_the_edge_and_by_a_fixed_cap() {
+        // Short edge: the share rule binds (9e-3 long -> 4.5e-3).
+        assert!((vertex_off_curve_allowance(9.0e-3) - 4.5e-3).abs() < 1e-12);
+        // Very short edge: never below the on-curve tolerance.
+        assert!((vertex_off_curve_allowance(1.0e-4) - VERTEX_ON_CURVE).abs() < 1e-12);
+        // The corpus's largest real gap, on a long edge, is accepted ...
+        assert!(vertex_off_curve_allowance(10.0) >= 4.7e-2);
+        // ... but a long edge does not accept more than the fixed cap.
+        assert!(
+            vertex_off_curve_allowance(10.0) <= VERTEX_OFF_CURVE_CAP,
+            "a 10 mm edge allowed {} off its curve",
+            vertex_off_curve_allowance(10.0)
+        );
+        assert!(vertex_off_curve_allowance(1000.0) <= VERTEX_OFF_CURVE_CAP);
+        assert!(0.06 > vertex_off_curve_allowance(1000.0));
+    }
 
     fn wrap(body: &str) -> String {
         format!(
