@@ -61,9 +61,9 @@ export function App() {
   // can switch freely.
   const docMode = useDocModeStore((s) => s.mode) ?? 'part'
   // Drawing and Assembly bring their own workspace; the Part workspace stays
-  // mounted underneath, hidden (see below).
+  // mounted underneath, parked (see below).
   const sheetWorkspace = docMode === 'drawing' || docMode === 'assembly'
-  // Drawing and Assembly mount on first visit and then STAY mounted, hidden
+  // Drawing and Assembly mount on first visit and then STAY mounted, parked
   // when another tab is open: Assembly rebuilt its whole 3D view from every
   // part's mesh on each entry (a 15.9 s freeze, measured 2026-11-18).
   // (React's "adjust state while rendering" pattern: no effect, no extra frame.)
@@ -74,6 +74,13 @@ export function App() {
   if ((docMode === 'drawing' && !visited.drawing) || (docMode === 'assembly' && !visited.assembly)) {
     setVisited({ ...visited, [docMode]: true })
   }
+  // A workspace you have left is PARKED, not display:none: it keeps its full
+  // size behind the active one, invisible and out of reach of pointer and
+  // keyboard (`inert`). A display:none workspace measures 0 x 0, so its 3D
+  // canvas and camera framing were rebuilt from nothing on return (Varun
+  // 2026-11-18: "why is part always so zoomed in whenever I shift to part").
+  const parked = (away: boolean) =>
+    cn('flex min-h-0 min-w-0 flex-1', away && 'pointer-events-none invisible absolute inset-0')
   const [browserOpen, setBrowserOpen] = useState(true)
   // The viewport's overlay slots (see overlay-slots.tsx). Stable callback
   // refs: a fresh ref each render would detach and re-attach the slot and
@@ -186,19 +193,27 @@ export function App() {
       <div className="pointer-events-none relative z-50 h-0">
         <AgentShowBar />
       </div>
-      <div className="flex flex-1 min-h-0">
+      <div className="relative flex flex-1 min-h-0">
         {/* The Drawing workspace replaces the 3D pipeline entirely:
             no ToolBar (modelling primitives are irrelevant in a 2D
             sheet workspace), no PropertiesPanel, no Timeline strip.
             The kernel still drives the projection; this pane is the
             sheet inspector. */}
         {visited.drawing && (
-          <div hidden={docMode !== 'drawing'} className="flex min-h-0 min-w-0 flex-1">
+          <div
+            inert={docMode !== 'drawing'}
+            aria-hidden={docMode !== 'drawing'}
+            className={parked(docMode !== 'drawing')}
+          >
             <DrawingsWorkspace />
           </div>
         )}
         {visited.assembly && (
-          <div hidden={docMode !== 'assembly'} className="flex min-h-0 min-w-0 flex-1">
+          <div
+            inert={docMode !== 'assembly'}
+            aria-hidden={docMode !== 'assembly'}
+            className={parked(docMode !== 'assembly')}
+          >
             <AssemblyWorkspace />
           </div>
         )}
@@ -211,13 +226,13 @@ export function App() {
             <Blackboard docked />
           </div>
         )}
-        {/* The Part workspace is HIDDEN, never unmounted, while Drawing or
+        {/* The Part workspace is PARKED, never unmounted, while Drawing or
             Assembly is open: unmounting threw away the 3D scene and coming
             back rebuilt every part's mesh on the main thread -- an 11-14 s
             freeze on each return (Varun 2026-11-18: "it hangs every time i
             change the tab when it should be instant"). The canvas renders on
-            demand, so a hidden viewport costs nothing. */}
-        <div hidden={sheetWorkspace} className="flex min-h-0 min-w-0 flex-1">
+            demand, so a parked viewport costs nothing. */}
+        <div inert={sheetWorkspace} aria-hidden={sheetWorkspace} className={parked(sheetWorkspace)}>
           {/* The slots' provider wraps the tool rail too: its dialogs (fillet,
               chamfer, shell) go in the viewport's top slot. */}
           <OverlaySlotsContext.Provider value={slots}>

@@ -14,15 +14,17 @@
  * ★ Source of truth for WHICH DOCUMENTS EXIST is always `GET /api/documents`
  * (via `useDocumentStore`), never localStorage. A document created outside
  * this UI — by an agent over MCP, another browser, a fresh profile — must
- * still be reachable. localStorage here remembers only which tabs a user
- * has explicitly CLOSED (a per-browser view preference); the active
- * document is always shown regardless of that set, since hiding the tab
+ * still be reachable. localStorage here remembers only which documents this
+ * browser has OPEN as tabs (`lib/open-tabs.ts`, a per-browser view
+ * preference); the active document is always shown, since hiding the tab
  * you're standing in would make the document unreachable from the strip.
+ * Every other document is under the `+` menu's "Open existing" section
+ * (Varun 2026-11-18: a fresh browser opened onto "few 10's of tabs").
  *
- * Documents are durable: closing a tab only adds it to that closed-set.
+ * Documents are durable: closing a tab only takes it out of the open set.
  * The document itself stays registered on the backend and reappears under
- * the `+` menu's "Open existing" section — nothing here ever deletes
- * anything, and the wording below must never imply otherwise.
+ * `+` — nothing here ever deletes anything, and the wording below must
+ * never imply otherwise.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -34,26 +36,21 @@ import { cn } from '@/lib/utils'
 import { type DocumentInfo } from '@/lib/documents-api'
 import { useDocumentStore } from '@/stores/document-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
+import {
+  hiddenDocuments as hiddenDocumentsOf,
+  readOpenIds,
+  visibleTabs,
+  withClosed,
+  withOpened,
+  writeOpenIds,
+} from '@/lib/open-tabs'
 
-const CLOSED_TABS_KEY = 'roshera.tabs.closed.v1'
-
-function readClosedIds(): Set<string> {
+/** This browser's storage, or one that remembers nothing when blocked. */
+function tabStorage(): Pick<Storage, 'getItem' | 'setItem'> {
   try {
-    const raw = window.localStorage.getItem(CLOSED_TABS_KEY)
-    if (!raw) return new Set()
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? new Set(parsed.filter((x): x is string => typeof x === 'string')) : new Set()
+    return window.localStorage
   } catch {
-    return new Set()
-  }
-}
-
-function writeClosedIds(ids: Set<string>) {
-  try {
-    window.localStorage.setItem(CLOSED_TABS_KEY, JSON.stringify(Array.from(ids)))
-  } catch {
-    // Quota / private-mode failure — the strip still works for this
-    // session, it just won't remember closed tabs across a reload.
+    return { getItem: () => null, setItem: () => undefined }
   }
 }
 
@@ -103,7 +100,10 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
   const createAndSwitch = useDocumentStore((s) => s.createAndSwitch)
   const renameDoc = useDocumentStore((s) => s.rename)
 
-  const [closedIds, setClosedIdsState] = useState<Set<string>>(readClosedIds)
+  // The documents opened in THIS browser (lib/open-tabs.ts): only these, and
+  // the active one, are tabs (Varun 2026-11-18: "there are few 10's of tabs
+  // open" -- every document ever made used to be a tab).
+  const [openIds, setOpenIdsState] = useState<Set<string>>(() => readOpenIds(tabStorage()))
   const [addMenuOpen, setAddMenuOpen] = useState(false)
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const addMenuRef = useRef<HTMLDivElement | null>(null)
@@ -115,13 +115,24 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
   const [renameValue, setRenameValue] = useState('')
   const renameInputRef = useRef<HTMLInputElement | null>(null)
 
-  const setClosedIds = useCallback((updater: (prev: Set<string>) => Set<string>) => {
-    setClosedIdsState((prev) => {
+  const setOpenIds = useCallback((updater: (prev: Set<string>) => Set<string>) => {
+    setOpenIdsState((prev) => {
       const next = updater(prev)
-      writeClosedIds(next)
+      if (next !== prev) writeOpenIds(tabStorage(), next)
       return next
     })
   }, [])
+
+  // The document you are in -- switched to, created, or opened by an agent --
+  // joins the strip and stays until you close its tab.
+  useEffect(
+    () =>
+      useDocumentStore.subscribe((state) => {
+        const activeId = state.documents.find((d) => d.active)?.id
+        if (activeId) setOpenIds((prev) => withOpened(prev, activeId))
+      }),
+    [setOpenIds],
+  )
 
   useEffect(() => {
     void refresh()
@@ -145,22 +156,12 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
     }
   }, [addMenuOpen])
 
-  // Visible tabs = every document EXCEPT ones the user explicitly closed —
-  // and the active document is ALWAYS visible, closed-set or not, so the
-  // document you're standing in can never vanish from the strip.
-  const tabs = useMemo(
-    () => documents.filter((d) => d.active || !closedIds.has(d.id)),
-    [documents, closedIds],
-  )
+  // Visible tabs = the documents opened in this browser, and the active one
+  // ALWAYS, so the document you're standing in can never vanish.
+  const tabs = useMemo(() => visibleTabs(documents, openIds), [documents, openIds])
   // Newest first: the document someone wants back is almost always a recent
   // one, and the list holds every document ever made.
-  const hiddenDocuments = useMemo(
-    () =>
-      documents
-        .filter((d) => !d.active && closedIds.has(d.id))
-        .sort((a, b) => b.createdAt - a.createdAt),
-    [documents, closedIds],
-  )
+  const hiddenDocuments = useMemo(() => hiddenDocumentsOf(documents, openIds), [documents, openIds])
   const [showAllDocs, setShowAllDocs] = useState(false)
   const shownDocuments = showAllDocs
     ? hiddenDocuments
@@ -202,7 +203,7 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
   const closeTab = useCallback(
     async (doc: DocumentInfo) => {
       if (!doc.active) {
-        setClosedIds((prev) => new Set(prev).add(doc.id))
+        setOpenIds((prev) => withClosed(prev, doc.id))
         return
       }
       const idx = tabs.findIndex((d) => d.id === doc.id)
@@ -213,9 +214,9 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
         reportFailure(`Closing ${doc.name} (switching to ${neighbor.name})`, result.error)
         return
       }
-      setClosedIds((prev) => new Set(prev).add(doc.id))
+      setOpenIds((prev) => withClosed(prev, doc.id))
     },
-    [tabs, switchTo, setClosedIds],
+    [tabs, switchTo, setOpenIds],
   )
 
   const handleCloseClick = useCallback(
@@ -237,9 +238,9 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
           return
         }
       }
-      setClosedIds(() => new Set(documents.filter((d) => d.id !== keep.id).map((d) => d.id)))
+      setOpenIds(() => new Set([keep.id]))
     },
-    [documents, switchTo, setClosedIds],
+    [switchTo, setOpenIds],
   )
 
   const handleNew = useCallback(async () => {
@@ -251,18 +252,13 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
   const handleOpenExisting = useCallback(
     async (doc: DocumentInfo) => {
       setAddMenuOpen(false)
-      setClosedIds((prev) => {
-        if (!prev.has(doc.id)) return prev
-        const next = new Set(prev)
-        next.delete(doc.id)
-        return next
-      })
+      setOpenIds((prev) => withOpened(prev, doc.id))
       if (!doc.active) {
         const result = await switchTo(doc.id)
         if (!result.success) reportFailure(`Opening ${doc.name}`, result.error)
       }
     },
-    [switchTo, setClosedIds],
+    [switchTo, setOpenIds],
   )
 
   const handleContextMenu = useCallback((e: React.MouseEvent, doc: DocumentInfo) => {

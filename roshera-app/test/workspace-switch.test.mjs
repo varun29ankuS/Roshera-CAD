@@ -20,15 +20,26 @@ test('the 3D viewport is never unmounted by a workspace switch', () => {
     !/\?\s*\(\s*<>\s*\{docMode === 'drawing' \? <DrawingsWorkspace \/> : <AssemblyWorkspace \/>\}[\s\S]*?\)\s*:\s*\(/.test(app),
     'the Part workspace is not the else-branch of a drawing/assembly ternary',
   )
-  assert.ok(/hidden=\{sheetWorkspace\}/.test(app), 'the Part workspace is hidden, not unmounted, on other tabs')
+  assert.ok(/inert=\{sheetWorkspace\}[^>]*className=\{parked\(sheetWorkspace\)\}/.test(app), 'the Part workspace is parked, not unmounted, on other tabs')
   assert.equal((app.match(/<CADViewport \/>/g) ?? []).length, 1, 'one viewport, always mounted')
+})
+
+// Varun (2026-11-18): "why is part always so zoomed in whenever I shift to
+// part / from drawing". A `hidden` (display: none) workspace measures 0 x 0,
+// so its 3D canvas and camera framing were rebuilt from nothing on return.
+// A workspace you leave keeps its full size -- laid behind the active one,
+// invisible, out of reach of pointer and keyboard -- so nothing resizes.
+test('a workspace you leave keeps its size: parked, never display:none', () => {
+  assert.ok(!/<div hidden=\{/.test(app), 'no workspace is hidden with display:none')
+  assert.ok(/'pointer-events-none invisible absolute inset-0'/.test(app), 'parked = full size, invisible, unclickable')
+  assert.ok(/className="relative flex flex-1 min-h-0"/.test(app), 'the parked workspace fills the same area as the active one')
 })
 
 test('Drawing and Assembly stay mounted after their first visit', () => {
   // Assembly rebuilt its 3D view from every part's mesh on each entry: a
   // 15.9 s freeze measured live.
-  assert.ok(/visited\.assembly && \(\s*<div hidden=\{docMode !== 'assembly'\}/.test(app), 'Assembly is hidden, not unmounted')
-  assert.ok(/visited\.drawing && \(\s*<div hidden=\{docMode !== 'drawing'\}/.test(app), 'Drawing is hidden, not unmounted')
+  assert.ok(/visited\.assembly && \(\s*<div[^>]*inert=\{docMode !== 'assembly'\}/.test(app), 'Assembly is parked, not unmounted')
+  assert.ok(/visited\.drawing && \(\s*<div[^>]*inert=\{docMode !== 'drawing'\}/.test(app), 'Drawing is parked, not unmounted')
   assert.equal((app.match(/<AssemblyWorkspace \/>/g) ?? []).length, 1)
   assert.equal((app.match(/<DrawingsWorkspace \/>/g) ?? []).length, 1)
 })
