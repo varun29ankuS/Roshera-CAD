@@ -30,6 +30,7 @@ pub mod drawing_history;
 pub mod entity_mapping;
 pub mod event_certificate;
 pub mod execution;
+pub mod feature_graph;
 pub mod frames;
 pub mod import_replay;
 pub mod incremental;
