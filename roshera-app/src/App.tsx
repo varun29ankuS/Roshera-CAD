@@ -60,6 +60,20 @@ export function App() {
   // UI is never blank. The tab strip still mirrors the store so users
   // can switch freely.
   const docMode = useDocModeStore((s) => s.mode) ?? 'part'
+  // Drawing and Assembly bring their own workspace; the Part workspace stays
+  // mounted underneath, hidden (see below).
+  const sheetWorkspace = docMode === 'drawing' || docMode === 'assembly'
+  // Drawing and Assembly mount on first visit and then STAY mounted, hidden
+  // when another tab is open: Assembly rebuilt its whole 3D view from every
+  // part's mesh on each entry (a 15.9 s freeze, measured 2026-11-18).
+  // (React's "adjust state while rendering" pattern: no effect, no extra frame.)
+  const [visited, setVisited] = useState<{ drawing: boolean; assembly: boolean }>({
+    drawing: docMode === 'drawing',
+    assembly: docMode === 'assembly',
+  })
+  if ((docMode === 'drawing' && !visited.drawing) || (docMode === 'assembly' && !visited.assembly)) {
+    setVisited({ ...visited, [docMode]: true })
+  }
   const [browserOpen, setBrowserOpen] = useState(true)
   // The viewport's overlay slots (see overlay-slots.tsx). Stable callback
   // refs: a fresh ref each render would detach and re-attach the slot and
@@ -178,20 +192,34 @@ export function App() {
             sheet workspace), no PropertiesPanel, no Timeline strip.
             The kernel still drives the projection; this pane is the
             sheet inspector. */}
-        {docMode === 'drawing' || docMode === 'assembly' ? (
-          <>
-            {docMode === 'drawing' ? <DrawingsWorkspace /> : <AssemblyWorkspace />}
-            {/* The agent in every workspace (Varun 2026-11-14: "why is there
-                no Blackboard in other tabs ... users can't keep going back
-                and forth"). Docked as a column here, beside the sheet or
-                the assembly, so nothing of theirs sits under it. */}
-            <div className="flex w-[21rem] shrink-0 flex-col border-l border-border bg-background p-2">
-              <Blackboard docked />
-            </div>
-          </>
-        ) : (
-          // The slots' provider wraps the tool rail too: its dialogs (fillet,
-          // chamfer, shell) go in the viewport's top slot.
+        {visited.drawing && (
+          <div hidden={docMode !== 'drawing'} className="flex min-h-0 min-w-0 flex-1">
+            <DrawingsWorkspace />
+          </div>
+        )}
+        {visited.assembly && (
+          <div hidden={docMode !== 'assembly'} className="flex min-h-0 min-w-0 flex-1">
+            <AssemblyWorkspace />
+          </div>
+        )}
+        {sheetWorkspace && (
+          // The agent in every workspace (Varun 2026-11-14: "why is there no
+          // Blackboard in other tabs ... users can't keep going back and
+          // forth"). Docked as a column here, beside the sheet or the
+          // assembly, so nothing of theirs sits under it.
+          <div className="flex w-[21rem] shrink-0 flex-col border-l border-border bg-background p-2">
+            <Blackboard docked />
+          </div>
+        )}
+        {/* The Part workspace is HIDDEN, never unmounted, while Drawing or
+            Assembly is open: unmounting threw away the 3D scene and coming
+            back rebuilt every part's mesh on the main thread -- an 11-14 s
+            freeze on each return (Varun 2026-11-18: "it hangs every time i
+            change the tab when it should be instant"). The canvas renders on
+            demand, so a hidden viewport costs nothing. */}
+        <div hidden={sheetWorkspace} className="flex min-h-0 min-w-0 flex-1">
+          {/* The slots' provider wraps the tool rail too: its dialogs (fillet,
+              chamfer, shell) go in the viewport's top slot. */}
           <OverlaySlotsContext.Provider value={slots}>
             {/* DFM keeps the model and its history but not the modelling
                 tools: it is a check on the part, run on its own. */}
@@ -287,10 +315,15 @@ export function App() {
                   else is an instrument laid over it that the human can put
                   away. Bottom-left, clear of the tree's column, closable to a
                   pill. */}
-              {/* Docked on the right, full height (Varun 2026-11-13). */}
-              <div className="pointer-events-none absolute bottom-2 right-2 top-2 z-20 flex w-80 flex-col items-end justify-start">
-                <Blackboard docked />
-              </div>
+              {/* Docked on the right, full height (Varun 2026-11-13). Not
+                  mounted while another workspace docks its own: one
+                  Blackboard at a time (two would both poll and both own a
+                  composer). */}
+              {!sheetWorkspace && (
+                <div className="pointer-events-none absolute bottom-2 right-2 top-2 z-20 flex w-80 flex-col items-end justify-start">
+                  <Blackboard docked />
+                </div>
+              )}
 
               {/* The timeline is an overlay as well, starting to the RIGHT of
                   the tree's column. It was a full-width strip below the
@@ -319,7 +352,7 @@ export function App() {
               </div>
             </div>
           </OverlaySlotsContext.Provider>
-        )}
+        </div>
       </div>
       {/* Timeline — horizontal strip, full width. Hidden in Drawing
           mode where the sheet *is* the work product. */}
