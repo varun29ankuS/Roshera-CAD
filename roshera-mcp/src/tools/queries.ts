@@ -2,7 +2,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { api, ok, fail } from "../core.js";
+import { api, ok, fail, PART_ID_DOC } from "../core.js";
 
 export function registerQueryTools(server: ToolHost) {
   server.tool(
@@ -11,7 +11,7 @@ export function registerQueryTools(server: ToolHost) {
       "inside/outside/on, nearest face + exact closest point. Exact-analytic — a " +
       "point in a through-hole reads OUTSIDE.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       point: z
         .array(z.number()).length(3)
         .describe("world-space query point [x, y, z]"),
@@ -33,7 +33,7 @@ export function registerQueryTools(server: ToolHost) {
       "oriented normal, distance), near→far. Exact analytic, clipped to real " +
       "trim loops. Two crossings of a wall = its thickness; empty = missed.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       origin: z
         .array(z.number()).length(3)
         .describe("ray start point [x,y,z] mm (world)"),
@@ -77,7 +77,7 @@ export function registerQueryTools(server: ToolHost) {
         .number()
         .int()
         .optional()
-        .describe("restrict to one part; omit to scan every part"),
+        .describe(`${PART_ID_DOC}: restrict to one part; omit to scan every part`),
     },
     async ({ center, half_extents, radius, part_id }) => {
       try {

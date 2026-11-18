@@ -138,11 +138,15 @@ console.log("(s) SURFACE: kb_lookup in the FULL table only; minimal bill unmoved
   // Converged means (every constraint holds, rank pins every DOF) and that it
   // returns violations, dof and the certificate. +3 tokens on a resident
   // tool; kb_lookup is still in neither CORE_SURFACE nor META_SURFACE.
+  // Pin moved 7973 -> 7998 (2026-11-18): +14 clear_parts (its `confirm`
+  // argument: destructive tools refuse typed without confirm: true) and +11
+  // psketch_revolve (`angle_deg`, degrees like revolve, beside the deprecated
+  // radians `angle`). Neither touches kb_lookup.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
-  if (minimalBill === 7973)
-    pass(`minimal bill ${minimalBill} == pin 7973 (kb_lookup's zero marginal cost holds)`);
+  if (minimalBill === 7998)
+    pass(`minimal bill ${minimalBill} == pin 7998 (kb_lookup's zero marginal cost holds)`);
   else
-    fail(`minimal bill ${minimalBill} != 7973 — something moved the resident surface`);
+    fail(`minimal bill ${minimalBill} != 7998 — something moved the resident surface`);
 }
 
 // ── (p) PROVENANCE ──────────────────────────────────────────────────────────

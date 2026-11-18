@@ -9,7 +9,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { BASE, ok, fail, scopeHeaders, readRefusable } from "../core.js";
+import { BASE, ok, fail, scopeHeaders, readRefusable, PART_ID_DOC } from "../core.js";
 
 /** One event as `GET /api/lens/{part}/face/{face_id}` returns it. */
 export interface LensEventWire {
@@ -124,7 +124,7 @@ export function registerLensTools(server: ToolHost) {
       "blocking). With face_id: that face's story, each decision with its rule and " +
       "measured numbers (e.g. an edge gap in mm).",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       face_id: z.number().int().optional().describe("a face of the part, for its story"),
     },
     async ({ part_id, face_id }) => {
@@ -145,7 +145,7 @@ export function registerLensTools(server: ToolHost) {
     "KERNEL LENS: why a part is not sound. The failing certificate checks, each with " +
       "the faces it is on, what was measured, and what to look at next. Read-only: " +
       "propose any repair to the user, do not apply it.",
-    { part_id: z.number().int().describe("part id (list_parts)") },
+    { part_id: z.number().int().describe(PART_ID_DOC) },
     async ({ part_id }) => {
       try {
         const part = await getLens<PartLensWire>(`/api/lens/${part_id}`);

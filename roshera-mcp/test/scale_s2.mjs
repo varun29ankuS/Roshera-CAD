@@ -191,6 +191,9 @@ const table = buildTable();
   // pay for itself or re-open the budget decision.
   // 2026-11-07: 7973 — +3 psketch_solve (SK-C4: its description states what
   // Converged means and that violations/dof/certificate come back). 27 left.
+  // 2026-11-18: 7998 — +14 clear_parts (`confirm`) and +11 psketch_revolve
+  // (`angle_deg`); both new parameter texts were cut to the bone to fit.
+  // 2 left: the next resident growth re-opens the budget decision.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
   const fullBill = billFor(table, table.names());
   console.log(`      token bill: minimal=${minimalBill}, full=${fullBill}`);

@@ -254,7 +254,7 @@ pub async fn part_revolve_profile(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
-) -> Result<Json<Vec<[f64; 2]>>, StatusCode> {
+) -> Result<Json<Vec<[f64; 2]>>, ApiError> {
     // The persistent profile store is replay-proof; prefer it, then fall back to
     // the kernel construction geometry.
     if let Some(p) = state.solid_profiles.get(&id) {
@@ -263,7 +263,18 @@ pub async fn part_revolve_profile(
     let model = model_handle.read().await;
     geometry_engine::operations::revolve::get_revolve_meridian(&model, id)
         .map(|rz| Json(rz.into_iter().map(|(r, z)| [r, z]).collect()))
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| {
+            if model.solids.get(id).is_none() {
+                ApiError::solid_not_found(id)
+            } else {
+                // Same 404 as before, now with a body that says why.
+                ApiError::new(
+                    ErrorCode::SolidNotFound,
+                    format!("part {id} has no revolve profile: it was not made by a revolve"),
+                )
+                .with_details(serde_json::json!({ "solid_id": id, "has_profile": false }))
+            }
+        })
 }
 
 /// `GET /api/agent/parts/{id}/obb` — oriented bounding box (axes
@@ -451,9 +462,16 @@ pub async fn query_face(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
-) -> Result<Json<FaceReport>, StatusCode> {
+) -> Result<Json<FaceReport>, ApiError> {
     let mut model = model_handle.write().await;
-    model.query_face(id).map(Json).ok_or(StatusCode::NOT_FOUND)
+    model.query_face(id).map(Json).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("face {id} does not exist"),
+        )
+        .with_hint("face ids come from render_part 'ids', select_face or get_part")
+        .with_details(serde_json::json!({ "face_id": id }))
+    })
 }
 
 /// `GET /api/agent/edges/{id}` — per-edge report (curve kind, length,
@@ -1291,11 +1309,27 @@ pub struct ColorBody {
 /// `POST /api/agent/parts/{id}/color` — set a part's display colour, consumed by
 /// the scene-eye (`/api/agent/scene/orbit`) so the agent sees a coloured
 /// assembly. Registry-only (no geometry mutation); returns the stored colour.
+///
+/// An id that names no live solid is REFUSED (typed `solid_not_found`).
+/// Before 2026-11-18 any integer was accepted: the colour was stored, recorded
+/// as a durable history event, and reported `success: true` for a part that
+/// does not exist (MCP_AUDIT.md §2).
 pub async fn set_part_color(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Json(c): Json<ColorBody>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if model_handle
+        .read()
+        .await
+        .solids
+        .get(id as SolidId)
+        .is_none()
+    {
+        return Err(ApiError::solid_not_found(id)
+            .with_hint("set_part_color takes the integer part_id list_parts reports"));
+    }
     state.solid_colors.insert(id, [c.r, c.g, c.b]);
     // DURABILITY Slice 3 (#39): record the colour as a durable event so it
     // survives a replay-only boot. Before this, `solid_colors` was RAM-only and
@@ -1308,11 +1342,11 @@ pub async fn set_part_color(
     if let Some(uuid) = state.get_uuid(id) {
         crate::broadcast_object_color(&uuid.to_string(), [c.r, c.g, c.b]);
     }
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "success": true,
         "part_id": id,
         "color": [c.r, c.g, c.b],
-    }))
+    })))
 }
 
 /// `GET /api/agent/parts/{id}/color` — read a part's display colour. The read
@@ -1386,7 +1420,11 @@ pub async fn select_face(
     let mut model = model_handle.write().await;
     match resolve_face(&mut model, id as SolidId, &q) {
         Ok(fid) => {
-            let pid = model.face_pid(fid).map(|p| p.0.to_string());
+            // The canonical persistent-id wire form (32 lowercase hex digits),
+            // the one the connector route and the Kernel Lens speak.
+            let pid = model
+                .face_pid(fid)
+                .map(|p| crate::assembly_mates::pid_wire::render(p.0));
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1535,7 +1573,10 @@ pub async fn select_edge(
     let mut model = model_handle.write().await;
     match resolve_edge(&mut model, id as SolidId, &q) {
         Ok(eid) => {
-            let pid = model.edge_pid(eid).map(|p| p.0.to_string());
+            // Canonical persistent-id wire form; see select_face.
+            let pid = model
+                .edge_pid(eid)
+                .map(|p| crate::assembly_mates::pid_wire::render(p.0));
             (
                 StatusCode::OK,
                 Json(serde_json::json!({

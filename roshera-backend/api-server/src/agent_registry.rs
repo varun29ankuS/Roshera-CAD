@@ -497,8 +497,8 @@ fn raw_tools() -> Vec<ToolSpec> {
             Core,
             Stable,
             Curated,
-            "Delete every part (each deletion timeline-recorded, undo-safe).",
-            json!({"type": "object", "properties": {}, "required": []}),
+            "Delete every part (each deletion timeline-recorded, undo-safe). Needs confirm: true.",
+            json!({"type": "object", "properties": {"confirm": {"type": "boolean", "description": "must be true"}}, "required": []}),
         ),
         t(
             "list_parts",
@@ -825,7 +825,10 @@ fn raw_tools() -> Vec<ToolSpec> {
             "Reset a timeline branch to zero events and wipe the live model to match — destructive and irreversible.",
             json!({
                 "type": "object",
-                "properties": {"branch_id": {"type": "string", "default": "main", "description": "branch to clear; 'main' is the trunk"}},
+                "properties": {
+                    "branch_id": {"type": "string", "default": "main", "description": "branch to clear; 'main' is the trunk"},
+                    "confirm": {"type": "boolean", "description": "must be true"}
+                },
                 "required": []
             }),
         ),
@@ -1212,7 +1215,8 @@ fn raw_tools() -> Vec<ToolSpec> {
                     "csketch_id": {"type": "string", "format": "uuid", "description": "csketch_id from psketch_begin"},
                     "axis_origin": ntuple(2, "point on the axis, sketch-plane coords [x,y] mm"),
                     "axis_direction": ntuple(2, "axis direction in sketch-plane coords [x,y]"),
-                    "angle": {"type": "number", "description": "sweep angle in radians (default 2pi, full)"},
+                    "angle_deg": {"type": "number", "description": "degrees, default 360"},
+                    "angle": {"type": "number", "description": "radians, deprecated"},
                     "segments": {"type": "integer", "minimum": 3, "maximum": 512, "description": "angular tessellation count for sampled loops"},
                     "name": {"type": "string", "description": "display name for the part"}
                 },
@@ -1220,217 +1224,10 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         // ═══════════════════ ASSEMBLY ═══════════════════
-        t(
-            "assembly_verify",
-            Assembly,
-            Experimental,
-            Curated,
-            "One-shot kinematic assembly certificate from a self-contained spec (parts + mates + mechanisms inline); 5-dimension verdict.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ground": {"type": "integer", "description": "instance_id of the grounded (fixed reference) part"},
-                    "parts": {
-                        "type": "array",
-                        "description": "every part in the assembly, as an instance",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "object": {"type": "string", "description": "the part's object_uuid"},
-                                "instance_id": {"type": "integer", "description": "this occurrence's id, referenced by mates/mechanisms"},
-                                "translation": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "world position [x,y,z] mm"},
-                                "rotation": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "unit quaternion [x,y,z,w]"}
-                            },
-                            "required": ["object", "instance_id"]
-                        }
-                    },
-                    "mates": {"type": "array", "items": {"type": "object"}, "description": "mate constraints — see MATE format in the tool description"},
-                    "mechanisms": {"type": "array", "items": {"type": "object"}, "description": "mechanisms for swept-clearance — see MECHANISM format"},
-                    "epsilon": {"type": "number", "default": 0.0, "description": "tessellation deviation bound (mm)"}
-                },
-                "required": ["ground", "parts"]
-            }),
-        ),
-        t(
-            "assembly_create",
-            Assembly,
-            Stable,
-            Curated,
-            "Create a true assembly: a named scene of positioned part instances (not a boolean merge). Returns the assembly id.",
-            json!({
-                "type": "object",
-                "properties": {"name": {"type": "string", "minLength": 1, "description": "display name, e.g. 'gearbox'"}},
-                "required": ["name"]
-            }),
-        ),
-        t(
-            "assembly_add_instance",
-            Assembly,
-            Stable,
-            Curated,
-            "Place an instance of an existing part into an assembly at a world pose. Returns the instance id + assembly perception.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "assembly_id": {"type": "string", "description": "assembly id from assembly_create"},
-                    "object": {"type": "string", "description": "the part's object_uuid"},
-                    "position": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "world translation [x,y,z] mm"},
-                    "rotation_deg": {"type": "number", "description": "rotation angle about rotation_axis (degrees)"},
-                    "rotation_axis": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "unit rotation axis, e.g. [0,0,1]"},
-                    "transform": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}, "description": "raw row-major 4x4 pose (overrides position/rotation)"},
-                    "name": {"type": "string", "description": "placement name, e.g. 'wheel-FL'"},
-                    "color": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}, "minItems": 3, "maxItems": 3, "description": "per-instance display RGB (0-255)"}
-                },
-                "required": ["assembly_id", "object"]
-            }),
-        ),
-        t(
-            "assembly_list_instances",
-            Assembly,
-            Stable,
-            Curated,
-            "List an assembly's instances with perception: instance_count vs unique_part_count, per-instance soundness, combined bbox.",
-            json!({
-                "type": "object",
-                "properties": {"assembly_id": {"type": "string", "description": "assembly id from assembly_create"}},
-                "required": ["assembly_id"]
-            }),
-        ),
-        t(
-            "assembly_transform_instance",
-            Assembly,
-            Stable,
-            Curated,
-            "Re-pose one instance without touching the others or the referenced part. Returns the updated assembly perception.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "assembly_id": {"type": "string", "description": "assembly id from assembly_create"},
-                    "instance_id": {"type": "string", "description": "instance id from assembly_list_instances"},
-                    "position": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "world translation [x,y,z] mm"},
-                    "rotation_deg": {"type": "number", "description": "rotation angle about rotation_axis (degrees)"},
-                    "rotation_axis": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "unit rotation axis"},
-                    "transform": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}, "description": "raw row-major 4x4 pose"}
-                },
-                "required": ["assembly_id", "instance_id"]
-            }),
-        ),
-        t(
-            "assembly_view",
-            Assembly,
-            Stable,
-            Curated,
-            "See a whole assembly: composite every instance at its transform into one image from an orbit camera.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "assembly_id": {"type": "string", "description": "assembly id from assembly_create"},
-                    "az": {"type": "number", "default": 35, "description": "azimuth degrees around world Z"},
-                    "el": {"type": "number", "default": 20, "description": "elevation degrees above horizon"},
-                    "mode": {"type": "string", "enum": ["shaded", "ids", "depth", "normals", "diagnostic"], "default": "shaded", "description": "render channel"},
-                    "size": {"type": "integer", "minimum": 64, "maximum": 2048, "default": 720, "description": "image size in px"},
-                    "quality": {"type": "string", "enum": ["coarse", "medium", "fine"], "default": "medium", "description": "tessellation quality"}
-                },
-                "required": ["assembly_id"]
-            }),
-        ),
-        t(
-            "assembly_mate",
-            Assembly,
-            Experimental,
-            Curated,
-            "Mate two instances — connectors + mate in one call. A mate relates two coordinate frames and IS the joint.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "assembly_id": {"type": "string", "format": "uuid", "description": "assembly id from assembly_create"},
-                    "action": {"type": "string", "enum": ["create", "edit", "remove"], "default": "create", "description": "create a mate (+ connectors), edit its kind, or remove it"},
-                    "kind": {"description": "the mate kind, e.g. 'Fastened' or {Revolute:{limits:[-0.1,0.1]}} (required for create/edit)"},
-                    "a": {"type": "object", "description": "side A connector (required for create)"},
-                    "b": {"type": "object", "description": "side B connector (required for create)"},
-                    "couples": {"type": "array", "items": {"type": "string", "format": "uuid"}, "description": "for coupling kinds: the related mate ids"},
-                    "mate_id": {"type": "string", "format": "uuid", "description": "the mate to edit/remove"}
-                },
-                "required": ["assembly_id"]
-            }),
-        ),
-        t(
-            "assembly_solve",
-            Assembly,
-            Experimental,
-            Curated,
-            "Solve the mate system: parts are placed by their mates; returns solved poses, per-mate facts, and a compact verdict.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "assembly_id": {"type": "string", "format": "uuid", "description": "assembly id from assembly_create"},
-                    "ground": {"type": "string", "format": "uuid", "description": "instance that never moves (defaults to the first)"}
-                },
-                "required": ["assembly_id"]
-            }),
-        ),
-        t(
-            "assembly_certify",
-            Assembly,
-            Experimental,
-            Curated,
-            "The full assembly certificate — does this go together AND move without collision? is_sound = AND of mates/grounding/clearance dims.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "assembly_id": {"type": "string", "format": "uuid", "description": "assembly id from assembly_create"},
-                    "ground": {"type": "string", "format": "uuid", "description": "instance that never moves"},
-                    "epsilon": {"type": "number", "description": "clearance margin (mm); honoured only above the kernel floor"}
-                },
-                "required": ["assembly_id"]
-            }),
-        ),
-        t(
-            "assembly_dof",
-            Assembly,
-            Experimental,
-            Curated,
-            "DOF + per-instance constrainment: which instances are fully located, which still move (and how), which are over-constrained.",
-            json!({
-                "type": "object",
-                "properties": {"assembly_id": {"type": "string", "format": "uuid", "description": "assembly id from assembly_create"}},
-                "required": ["assembly_id"]
-            }),
-        ),
-        t(
-            "assembly_drag",
-            Assembly,
-            Experimental,
-            Curated,
-            "Drive a joint — your kinematic hand. Set a joint parameter and the affected chain re-solves; poses are written back.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "assembly_id": {"type": "string", "format": "uuid", "description": "assembly id from assembly_create"},
-                    "mate_id": {"type": "string", "format": "uuid", "description": "the joint to drive"},
-                    "param": {"type": "string", "enum": ["rotation", "translation"], "description": "rotation about the connector z, or translation along it"},
-                    "value": {"type": "number", "description": "target value (radians for rotation, mm for translation)"},
-                    "ground": {"type": "string", "format": "uuid", "description": "instance that never moves"}
-                },
-                "required": ["assembly_id", "mate_id", "param", "value"]
-            }),
-        ),
-        t(
-            "assembly_interference",
-            Assembly,
-            Experimental,
-            Curated,
-            "What touches, and at what angle: static overlaps + continuous-TOI joint sweeps, first_contact, min certified clearance.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "assembly_id": {"type": "string", "format": "uuid", "description": "assembly id from assembly_create"},
-                    "ground": {"type": "string", "format": "uuid", "description": "instance that never moves"},
-                    "epsilon": {"type": "number", "description": "clearance margin (mm) above the kernel floor"}
-                },
-                "required": ["assembly_id"]
-            }),
-        ),
+        // No rows here: the twelve assembly tools are DEFINED in
+        // `agent_tools/assembly.json` (single-registry stage 1) and
+        // `build_registry` serves them from there, so this table holds no
+        // second copy of their schemas.
         // ═══════════════════ DRAWING ═══════════════════
         t(
             "make_drawing",
@@ -2021,7 +1818,8 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "part_id": {"type": "string", "description": "clears only that part's notebook (UUID or integer id)"},
-                    "scope": {"type": "string", "description": "'document', 'part:<uuid>', or 'assembly:<uuid>'. Wins over part_id."}
+                    "scope": {"type": "string", "description": "'document', 'part:<uuid>', or 'assembly:<uuid>'. Wins over part_id."},
+                    "confirm": {"type": "boolean", "description": "must be true"}
                 },
                 "required": []
             }),
@@ -2173,6 +1971,29 @@ fn build_registry() -> Value {
         })
         .collect();
 
+    // The backend-owned definitions (`agent_tools`): their rows come from the
+    // ONE definition each tool has, never from a transcription in this file.
+    // A definition file that fails its own consistency checks is disclosed in
+    // the payload rather than silently leaving its bench out of the listing.
+    let mut served_error: Option<&'static str> = None;
+    match crate::agent_tools::registry_rows() {
+        Ok(rows) => {
+            for (name, bench, stability, purpose, schema) in rows {
+                let token_estimate = token_estimate(&name, &purpose, &schema);
+                tools.push(json!({
+                    "name": name,
+                    "bench": bench,
+                    "purpose": purpose,
+                    "input_schema": schema,
+                    "token_estimate": token_estimate,
+                    "stability": stability,
+                    "source": "served",
+                }));
+            }
+        }
+        Err(e) => served_error = Some(e),
+    }
+
     // Sort by name so the array order — and therefore the hash — is stable
     // regardless of the table's declaration order.
     tools.sort_by(|a, b| {
@@ -2206,14 +2027,18 @@ fn build_registry() -> Value {
         bench_counts.insert(bench.as_str().to_string(), json!(n));
     }
 
-    json!({
+    let mut payload = json!({
         "registry_hash": registry_hash,
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "hash_algorithm": "fnv1a-64",
         "tool_count": tools.len(),
         "bench_counts": Value::Object(bench_counts),
         "tools": tools,
-    })
+    });
+    if let (Some(e), Some(obj)) = (served_error, payload.as_object_mut()) {
+        obj.insert("served_definitions_error".to_string(), json!(e));
+    }
+    payload
 }
 
 /// `GET /api/agent/tool-registry` — the kernel-served agent tool registry.
@@ -2302,7 +2127,50 @@ mod tests {
         // agent reads the Kernel Lens journal (GET /api/lens/{part}).
         // 115 -> 116 (2026-11-17): user_context -- the agent reads what the
         // person hovers and has selected (GET /api/agent/user-context).
-        assert_eq!(tools.len(), 116, "expected 116 tools, got {}", tools.len());
+        // 116 -> 104 (2026-11-18): the twelve assembly tools moved out of this
+        // table into their backend-owned definitions (`agent_tools`); the
+        // served registry still lists 116 (pinned below).
+        assert_eq!(tools.len(), 104, "expected 104 tools, got {}", tools.len());
+    }
+
+    /// The served registry = this table + the backend-owned definitions, with
+    /// no name in both and each definition's schema served unchanged.
+    #[test]
+    fn served_registry_merges_the_owned_definitions() {
+        let registry = build_registry();
+        assert!(
+            registry.get("served_definitions_error").is_none(),
+            "definitions failed to load: {registry}"
+        );
+        let tools = registry
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(tools.len(), 116, "104 table rows + 12 assembly definitions");
+        let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
+        let Ok(defs) = crate::agent_tools::definitions() else {
+            unreachable!("definitions load");
+        };
+        for d in defs {
+            assert!(
+                !table.contains(d.name.as_str()),
+                "{} has two backend copies",
+                d.name
+            );
+            let row = tools
+                .iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some(d.name.as_str()));
+            let Some(row) = row else {
+                unreachable!("{} missing from the served registry", d.name);
+            };
+            assert_eq!(row.get("input_schema"), Some(&d.input_schema), "{}", d.name);
+            assert_eq!(
+                row.get("bench").and_then(Value::as_str),
+                Some(d.bench.as_str())
+            );
+            assert_eq!(row.get("source").and_then(Value::as_str), Some("served"));
+        }
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

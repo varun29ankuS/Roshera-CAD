@@ -52,6 +52,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { buildTable } from "./.build/surface.js";
 import { toolJsonSchema } from "./.build/registry.js";
+import { loadCheckedInDefs } from "./.build/served.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUST_PATH =
@@ -471,6 +472,17 @@ if (rows !== null && allow !== null) {
   else if (Number(countMatch[1]) !== rows.size)
     fail(`parsed ${rows.size} backend rows but agent_registry.rs asserts ${countMatch[1]} — parser out of step`);
   else pass(`parsed ${rows.size} backend rows (== the file's tools.len() assertion)`);
+
+  // (p1b) the backend-owned definitions (agent_tools/*.json) are the backend
+  // copy for the tools they define — served by `agent_registry::build_registry`
+  // from the same file. A tool may have ONE backend copy: a table row AND a
+  // definition would be the drift this design exists to end.
+  const servedDefs = loadCheckedInDefs().tools;
+  for (const def of servedDefs) {
+    if (rows.has(def.name)) fail(`${def.name} has a table row in agent_registry.rs AND a backend definition`);
+    rows.set(def.name, { name: def.name, schema: def.input_schema, source: "served" });
+  }
+  pass(`${servedDefs.length} backend-defined tools read from agent_tools/*.json`);
 
   // (p2) shared tools, one-sided tools (reported only).
   const table = buildTable();

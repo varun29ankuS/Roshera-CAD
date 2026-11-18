@@ -2,23 +2,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import {
-  api,
-  ok,
-  fail,
-  okp,
-  perceive,
-  compactVerdict,
-  perceptionField,
-  placement,
-  newestPartId,
-  uuidForPart,
-  allEdgeIds,
-  PlaneSchema,
-  resolvePlane,
-  cross3,
-  unit3,
-} from "../core.js";
+import { api, ok, fail, okp, withStructured, CONFIRM, confirmationRequired, perceive, compactVerdict, perceptionField, placement, newestPartId, uuidForPart, allEdgeIds, PlaneSchema, resolvePlane, cross3, unit3, PART_ID_DOC, UUID_NOTE } from "../core.js";
 import { typedErrorResult } from "../gates.js";
 
 /**
@@ -73,8 +57,9 @@ export function registerModifyTools(server: ToolHost) {
     "clear_parts",
     "Delete EVERY part (each deletion timeline-recorded, undo-safe). Safe to " +
       "build immediately after.",
-    {},
-    async () => {
+    { confirm: CONFIRM },
+    async ({ confirm }) => {
+      if (confirm !== true) return confirmationRequired("clear_parts", "deletes every part in the scene");
       try {
         return ok(await api("DELETE", "/api/agent/parts"));
       } catch (e) {
@@ -89,7 +74,7 @@ export function registerModifyTools(server: ToolHost) {
       "the listed cap faces. Identity-preserving (same uuid). Shelling can leave " +
       "a self-intersecting or open wall — ALWAYS verify_part.",
     {
-      object: z.string().uuid().describe("object_uuid of the solid to hollow"),
+      object: z.string().uuid().describe(`object_uuid of the solid to hollow; ${UUID_NOTE}`),
       thickness: z.number().describe("inward wall thickness (mm); must be non-zero"),
       faces_to_remove: z
         .array(z.number().int().nonnegative())
@@ -130,7 +115,7 @@ export function registerModifyTools(server: ToolHost) {
       "edge_ids to blend ALL edges (over-radius/seam edges are skipped rather " +
       "than refusing the whole op). Check the returned verdict before trusting it.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       radius: z.number().positive().describe("fillet radius (mm)"),
       edge_ids: z
         .array(z.number().int().nonnegative())
@@ -180,7 +165,7 @@ export function registerModifyTools(server: ToolHost) {
       "face. Identity-preserving. OMIT edge_ids to chamfer ALL edges. Chamfers " +
       "can self-intersect at tight corners — check the returned verdict.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       distance: z.number().positive().describe("setback distance on each face (mm)"),
       edge_ids: z
         .array(z.number().int().nonnegative())
@@ -274,7 +259,7 @@ export function registerModifyTools(server: ToolHost) {
       object_uuid: z
         .string()
         .uuid()
-        .describe("object_uuid of the solid to name — for a boolean, the RESULT's uuid, not an operand's (operands are consumed)"),
+        .describe(`object_uuid of the solid to name — for a boolean, the RESULT's uuid, not an operand's (operands are consumed); ${UUID_NOTE}`),
       name: z
         .string()
         .describe("what this solid IS, in the vocabulary of the design — 'piston body', 'ring groove z55'. Trimmed server-side; non-empty; ≤200 chars"),
@@ -303,7 +288,7 @@ export function registerModifyTools(server: ToolHost) {
       "consumed tools are gone.",
     {
       op: z.enum(["union", "difference"]).describe("operation applied at each step"),
-      base: z.string().uuid().describe("object_uuid of the base solid (kept)"),
+      base: z.string().uuid().describe(`object_uuid of the base solid (kept); ${UUID_NOTE}`),
       tools: z
         .array(z.string().uuid())
         .min(1)
@@ -377,7 +362,7 @@ export function registerModifyTools(server: ToolHost) {
       "call, but the backend runs TWO mutations + a certification PER hole " +
       "(cylinder then subtract — `count` holes = 2·count backend ops).",
     {
-      object: z.string().uuid().describe("object_uuid of the solid to drill"),
+      object: z.string().uuid().describe(`object_uuid of the solid to drill; ${UUID_NOTE}`),
       plane: PlaneSchema.default("xy").describe("ring plane when center/axis omitted"),
       center: z
         .array(z.number()).length(3)
@@ -537,7 +522,7 @@ export function registerModifyTools(server: ToolHost) {
       "— same uuid). Rotation (about optional center, default origin) applies " +
       "first, then translation.",
     {
-      object: z.string().uuid().describe("object_uuid of the solid to move"),
+      object: z.string().uuid().describe(`object_uuid of the solid to move; ${UUID_NOTE}`),
       translation: z
         .array(z.number()).length(3)
         .optional()
@@ -573,11 +558,22 @@ export function registerModifyTools(server: ToolHost) {
         }
         if (acknowledge_unsound) body.acknowledge_unsound = true;
         const r = await api("POST", "/api/geometry/transform", body);
-        return ok({
-          object_uuid: r.object ?? object,
-          moved: true,
-          note: "render_part to confirm the new position",
-        });
+        // The route answers the moved solid's id AND its certificate
+        // (`perception`, from `certified_response`). The verdict line rides
+        // in the text like every other mutating tool's (okp reuses the
+        // embedded certificate, no second fetch); the whole certificate
+        // rides in structuredContent. Before 2026-11-18 both were dropped
+        // and the tool answered `moved: true` (MCP_AUDIT.md 1.6).
+        const partId = typeof r?.solid_id === "number" ? r.solid_id : null;
+        const result = await okp(
+          { object_uuid: r?.object ?? object, part_id: partId, moved: true },
+          partId,
+        );
+        const shown = withStructured(result);
+        return {
+          ...shown,
+          structuredContent: { ...(shown.structuredContent ?? {}), certificate: r?.perception ?? null },
+        };
       } catch (e) {
         return fail(e);
       }

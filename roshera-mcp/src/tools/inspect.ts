@@ -2,16 +2,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import {
-  api,
-  ok,
-  fail,
-  BASE,
-  ApiError,
-  setDocumentUnitCache,
-  scopeHeaders,
-  readRefusable,
-} from "../core.js";
+import { api, ok, fail, BASE, ApiError, setDocumentUnitCache, scopeHeaders, readRefusable, PART_ID_DOC } from "../core.js";
 
 export function registerInspectTools(server: ToolHost) {
   server.tool(
@@ -126,7 +117,7 @@ export function registerInspectTools(server: ToolHost) {
     "get_revolve_profile",
     "RECOVER the editable [r,z] meridian a revolved part was built from. Read " +
       "it, edit a radius, call revolve again to REGENERATE. 404 if not a revolve.",
-    { part_id: z.number().int().describe("part id (list_parts)") },
+    { part_id: z.number().int().describe(PART_ID_DOC) },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/profile`));
@@ -155,8 +146,8 @@ export function registerInspectTools(server: ToolHost) {
     "MEASURE two parts from their world AABBs: gap (clearance), overlap " +
       "(penetration), centre distance, unit direction a→b. For clearance/nudge decisions.",
     {
-      part_a: z.number().int().describe("part id (list_parts)"),
-      part_b: z.number().int().describe("part id (list_parts)"),
+      part_a: z.number().int().describe(PART_ID_DOC),
+      part_b: z.number().int().describe(PART_ID_DOC),
     },
     async ({ part_a, part_b }) => {
       try {
@@ -172,7 +163,7 @@ export function registerInspectTools(server: ToolHost) {
     "READ analytic FEATURE sizes off the B-Rep: per-face feature dimensions " +
       "(cylinder diameters + axes for bores/bosses, plane normals) + a distinct-" +
       "diameter summary. Exact, never from pixels.",
-    { part_id: z.number().int().describe("part id (list_parts)") },
+    { part_id: z.number().int().describe(PART_ID_DOC) },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/features`));
@@ -199,7 +190,7 @@ export function registerInspectTools(server: ToolHost) {
       "derivation) plus a pack-level summary that is Pass ONLY if every rule " +
       "passed -- one unverifiable rule forces Inconclusive, never a silent Pass.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       pack: z
         .enum(["fdm", "injection_molding"])
         .describe("which rule pack to evaluate"),
@@ -246,7 +237,7 @@ export function registerInspectTools(server: ToolHost) {
     "Address a face by DESCRIPTION — resolves it or REFUSES (never picks among " +
       "equal matches). Returns face_id + persistent_id, or ambiguous / not_found.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       kind: z
         .enum(["any", "planar", "cylindrical", "spherical", "conical", "toroidal", "nurbs"])
         .default("any")
@@ -293,7 +284,7 @@ export function registerInspectTools(server: ToolHost) {
     "Address an EDGE by description — resolves or REFUSES. Returns edge_id + " +
       "persistent_id, or ambiguous / not_found.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       curve_kind: z
         .enum(["any", "line", "arc", "circle", "nurbs"])
         .default("any")
@@ -347,7 +338,7 @@ export function registerInspectTools(server: ToolHost) {
     "Set a part's display RGB for scene_view renders. Registry-only — does NOT " +
       "modify geometry.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       r: z.number().int().min(0).max(255).describe("red 0–255"),
       g: z.number().int().min(0).max(255).describe("green 0–255"),
       b: z.number().int().min(0).max(255).describe("blue 0–255"),

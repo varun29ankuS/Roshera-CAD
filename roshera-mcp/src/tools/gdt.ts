@@ -10,7 +10,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { api, ok, fail, BASE, ApiError, scopeHeaders } from "../core.js";
+import { api, ok, fail, BASE, ApiError, scopeHeaders, readRefusable, withStructured, TIMEOUT_MS, PART_ID_DOC } from "../core.js";
 
 // ─── Compact-verdict helpers ───────────────────────────────────────────
 
@@ -97,9 +97,12 @@ function refusalFrom(e: unknown): ReturnType<typeof fail> | null {
   try {
     const body = JSON.parse(e.body);
     const msg: string = body.message ?? body.error ?? e.body;
-    return fail(new Error(`REFUSED: ${msg}`));
+    // Keep the REFUSED marker (the refusal cache reads it) AND the body, so
+    // fail() surfaces the catalogue's error_code / details as structured
+    // content instead of prose (MCP_AUDIT.md §2).
+    return fail(new ApiError(`REFUSED: ${msg}`, e.status, e.body));
   } catch {
-    return fail(new Error(`REFUSED: ${e.body}`));
+    return fail(new ApiError(`REFUSED: ${e.body}`, e.status, e.body));
   }
 }
 
@@ -116,7 +119,7 @@ export function registerGdtTools(server: ToolHost): void {
       "axis; else REFUSED. Session-only. Target by face_id or `selector` " +
       "(select_face shape).",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       label: z
         .string()
         .optional()
@@ -179,6 +182,9 @@ export function registerGdtTools(server: ToolHost): void {
           {
             method: "POST",
             headers: { "Content-Type": "application/json", ...scopeHeaders() },
+            // Bounded like every api() call: a wedged server is a 504-shaped
+            // error, not a hang (MCP_AUDIT.md §2).
+            signal: AbortSignal.timeout(TIMEOUT_MS),
             body: JSON.stringify({
               label,
               face_id: face_id ?? null,
@@ -187,13 +193,10 @@ export function registerGdtTools(server: ToolHost): void {
           },
         );
 
-        const body = await res.json().catch(() => null);
-        if (!res.ok) {
-          const msg: string =
-            (body as any)?.message ?? (body as any)?.error ?? res.statusText;
-          return fail(new Error(`REFUSED: ${msg}`));
-        }
-        return ok(body);
+        // A non-2xx answer throws ApiError with the body; refusalFrom() below
+        // turns a 409/422 into a typed refusal.
+        const body = await readRefusable(res, `POST /api/agent/parts/${part_id}/datums`);
+        return withStructured(ok(body));
       } catch (e) {
         const r = refusalFrom(e);
         if (r !== null) return r;
@@ -215,7 +218,7 @@ export function registerGdtTools(server: ToolHost): void {
       "(bolt-circle) = axis B ∩ plane A. Verdicts DISCLOSE the DRF. datum_refs " +
       "must already exist (gdt_datum) or refused (422). Session-only.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       characteristic: z
         .enum(["flatness", "perpendicularity", "parallelism", "position"])
         .describe("GD&T characteristic to evaluate"),
@@ -274,6 +277,9 @@ export function registerGdtTools(server: ToolHost): void {
           {
             method: "POST",
             headers: { "Content-Type": "application/json", ...scopeHeaders() },
+            // Bounded like every api() call: a wedged server is a 504-shaped
+            // error, not a hang (MCP_AUDIT.md §2).
+            signal: AbortSignal.timeout(TIMEOUT_MS),
             body: JSON.stringify({
               characteristic,
               tolerance_mm,
@@ -285,21 +291,25 @@ export function registerGdtTools(server: ToolHost): void {
           },
         );
 
-        const body = await res.json().catch(() => null);
-        if (!res.ok) {
-          const msg: string =
-            (body as any)?.message ?? (body as any)?.error ?? res.statusText;
-          return fail(new Error(`REFUSED: ${msg}`));
-        }
+        const body: any = await readRefusable(res, `POST /api/agent/parts/${part_id}/fcf`);
 
-        const verdict: any = (body as any)?.verdict;
+        const verdict: any = body?.verdict;
         const line = verdict != null ? compactGdtVerdict(verdict) : "(no verdict)";
-        return ok({
-          part_id,
-          annotation_pid: (body as any)?.annotation_pid,
-          verdict: line,
-          persistence: (body as any)?.persistence ?? "session",
-        });
+        // `annotation_id` is the handle PATCH / DELETE .../fcf/{id} take and
+        // `modifier` qualifies the tolerance; both were dropped before
+        // 2026-11-18 (MCP_AUDIT.md 1.8). The compact line stays for reading;
+        // the verdict object rides beside it.
+        return withStructured(
+          ok({
+            part_id,
+            annotation_id: body?.annotation_id ?? null,
+            annotation_pid: body?.annotation_pid,
+            modifier: body?.modifier ?? null,
+            verdict: line,
+            verdict_detail: verdict ?? null,
+            persistence: body?.persistence ?? "session",
+          }),
+        );
       } catch (e) {
         const r = refusalFrom(e);
         if (r !== null) return r;
@@ -316,7 +326,7 @@ export function registerGdtTools(server: ToolHost): void {
       "compact verdict line per FCF annotation, re-evaluated live against the " +
       "B-Rep. Dangling reported honestly. Session-only (cleared on restart).",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
     },
     async ({ part_id }) => {
       try {

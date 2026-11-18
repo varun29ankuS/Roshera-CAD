@@ -1428,7 +1428,10 @@ pub async fn get_history(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
     axum::extract::Query(page): axum::extract::Query<HistoryQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Typed refusals (2026-11-18): this route used to answer a bare 400 /
+    // 404 / 500 with an empty body, so the agent's `timeline_history` saw
+    // "→ 404: " and nothing else (MCP_AUDIT.md §2).
     // Drain in-flight recorder ops so the response reflects every
     // kernel operation the client has issued, not just the ones the
     // background worker happened to drain by the time the request
@@ -1438,7 +1441,8 @@ pub async fn get_history(
     // Read once, guard dropped before any further `.await` below.
     let durability_status = state.durability_status.read().await.clone();
     let timeline = state.timeline.read().await;
-    let branch_id = resolve_branch_ref(&branch_id)?;
+    let reference = branch_id;
+    let branch_id = resolve_branch_ref_typed(&reference)?;
 
     let events = timeline
         .get_branch_events(
@@ -1446,7 +1450,7 @@ pub async fn get_history(
             Some(page.start.unwrap_or(0)),
             Some(page.limit.unwrap_or(100)),
         )
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(|_| branch_has_no_history(&reference))?;
 
     let summaries: Vec<EventSummary> = events
         .into_iter()
@@ -1473,12 +1477,12 @@ pub async fn get_history(
     let payload = match crate::durability::history_disclosure(&durability_status, &branch_id) {
         Some(status) => {
             let events =
-                serde_json::to_value(&summaries).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let durability =
-                serde_json::to_value(status).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                serde_json::to_value(&summaries).map_err(|_| not_serialisable("the history"))?;
+            let durability = serde_json::to_value(status)
+                .map_err(|_| not_serialisable("the durability status"))?;
             serde_json::json!({ "events": events, "durability": durability })
         }
-        None => serde_json::to_value(&summaries).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        None => serde_json::to_value(&summaries).map_err(|_| not_serialisable("the history"))?,
     };
 
     Ok(Json(payload))
@@ -3636,14 +3640,15 @@ pub async fn resketch_feature(
 pub async fn get_rebuild_certificate(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
-) -> Result<Json<RebuildCertificate>, StatusCode> {
+) -> Result<Json<RebuildCertificate>, ApiError> {
     let _ = state.timeline_recorder.settle().await;
-    let branch_id = resolve_branch_ref(&branch_id)?;
+    let reference = branch_id;
+    let branch_id = resolve_branch_ref_typed(&reference)?;
     let events = {
         let timeline = state.timeline.read().await;
         let mut all = timeline
             .get_branch_events(&branch_id, None, None)
-            .map_err(|_| StatusCode::NOT_FOUND)?;
+            .map_err(|_| branch_has_no_history(&reference))?;
         all.sort_by_key(|e| e.sequence_number);
         all
     };
@@ -4571,6 +4576,24 @@ fn resolve_branch_ref_typed(reference: &str) -> Result<BranchId, ApiError> {
     })
 }
 
+/// The typed 404 for a branch the timeline has no events for.
+fn branch_has_no_history(reference: &str) -> ApiError {
+    ApiError::new(
+        ErrorCode::BranchNotFound,
+        format!("branch '{reference}' has no history on this timeline"),
+    )
+    .with_hint("List branches with GET /api/branches; 'main' always exists.")
+    .with_details(serde_json::json!({ "branch": reference }))
+}
+
+/// The typed 500 for a response this server built but could not serialise.
+fn not_serialisable(what: &str) -> ApiError {
+    ApiError::new(
+        ErrorCode::Internal,
+        format!("the server could not serialise {what}"),
+    )
+}
+
 /// Checkpoint/tag a specific state
 ///
 /// AUTHORSHIP-A1: this handler previously required `author_id` +
@@ -5314,14 +5337,20 @@ async fn finish_undo_redo(
 pub async fn undo_operation(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = request
         .get("session_id")
         .and_then(|s| s.as_str())
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or_else(|| ApiError::missing_field("session_id"))?;
 
     // Parse session ID to UUID for timeline operations
-    let session_uuid = Uuid::parse_str(session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let session_uuid = Uuid::parse_str(session_id).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("session_id must be a UUID, got {session_id:?}"),
+        )
+        .with_details(serde_json::json!({ "parameter": "session_id" }))
+    })?;
 
     match perform_undo(&state, session_uuid).await {
         Ok(outcome) => Ok(Json(serde_json::json!({
@@ -5373,7 +5402,10 @@ pub async fn undo_operation(
                 error = %err,
                 "failed to seed session position; undo will fail"
             );
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(ApiError::new(
+                ErrorCode::Internal,
+                format!("undo: could not seed this session's undo position: {err}"),
+            ))
         }
         Err(UndoRedoError::Internal(err)) => {
             tracing::error!(
@@ -5382,7 +5414,10 @@ pub async fn undo_operation(
                 error = %err,
                 "internal invariant violated during undo"
             );
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(ApiError::new(
+                ErrorCode::Internal,
+                format!("undo: internal invariant violated during undo: {err}"),
+            ))
         }
     }
 }
@@ -5588,10 +5623,15 @@ pub struct ClearHistoryRequest {
 pub async fn clear_history(
     State(state): State<AppState>,
     Json(request): Json<ClearHistoryRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
-    let session_uuid = Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let session_uuid = Uuid::parse_str(&request.session_id).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("session_id must be a UUID, got {:?}", request.session_id),
+        )
+    })?;
     let branch_id = match request.branch_id.as_deref() {
-        Some(b) => resolve_branch_ref(b)?,
+        Some(b) => resolve_branch_ref_typed(b)?,
         None => BranchId::main(),
     };
 
@@ -5604,7 +5644,10 @@ pub async fn clear_history(
             error = %err,
             "failed to seed session position; clear aborted"
         );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(ApiError::new(
+            ErrorCode::Internal,
+            format!("clear refused before changing anything: could not seed the session position: {err}"),
+        ));
     }
 
     // A clear cannot be undone. Refuse it — nothing changed — when the
@@ -5630,7 +5673,7 @@ pub async fn clear_history(
                 error = %e,
                 "branch clear failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::new(ErrorCode::Internal, format!("branch clear failed: {e}"))
         })?
     };
 
@@ -5687,14 +5730,20 @@ pub async fn clear_history(
 pub async fn redo_operation(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = request
         .get("session_id")
         .and_then(|s| s.as_str())
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or_else(|| ApiError::missing_field("session_id"))?;
 
     // Parse session ID to UUID for timeline operations
-    let session_uuid = Uuid::parse_str(session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let session_uuid = Uuid::parse_str(session_id).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("session_id must be a UUID, got {session_id:?}"),
+        )
+        .with_details(serde_json::json!({ "parameter": "session_id" }))
+    })?;
 
     match perform_redo(&state, session_uuid).await {
         Ok(outcome) => Ok(Json(serde_json::json!({
@@ -5746,7 +5795,10 @@ pub async fn redo_operation(
                 error = %err,
                 "failed to seed session position; redo will fail"
             );
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(ApiError::new(
+                ErrorCode::Internal,
+                format!("redo: could not seed this session's redo position: {err}"),
+            ))
         }
         Err(UndoRedoError::Internal(err)) => {
             tracing::error!(
@@ -5755,7 +5807,10 @@ pub async fn redo_operation(
                 error = %err,
                 "internal invariant violated during redo"
             );
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(ApiError::new(
+                ErrorCode::Internal,
+                format!("redo: internal invariant violated during redo: {err}"),
+            ))
         }
     }
 }
@@ -6784,17 +6839,17 @@ pub async fn scrub_timeline(
     State(state): State<AppState>,
     Path((branch_ref, sequence)): Path<(String, u64)>,
     Query(q): Query<ScrubQuery>,
-) -> Result<axum::response::Response, StatusCode> {
+) -> Result<axum::response::Response, ApiError> {
     // Drain in-flight recorder ops so "as of event N" is exact even
     // for events recorded microseconds ago.
     let _ = state.timeline_recorder.settle().await;
 
     let (total, events) = {
         let timeline = state.timeline.read().await;
-        let branch_id = resolve_branch_ref(&branch_ref)?;
+        let branch_id = resolve_branch_ref_typed(&branch_ref)?;
         let mut all = timeline
             .get_branch_events(&branch_id, None, None)
-            .map_err(|_| StatusCode::NOT_FOUND)?;
+            .map_err(|_| branch_has_no_history(&branch_ref))?;
         all.sort_by_key(|e| e.sequence_number);
         let total = all.len();
         all.retain(|e| e.sequence_number <= sequence);
@@ -6843,7 +6898,12 @@ pub async fn scrub_timeline(
                     frames.store_presentation(bkey, scrub_binary(sequence, &meshes))
                 })
                 .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                .map_err(|_| {
+                    ApiError::new(
+                        ErrorCode::Internal,
+                        "scrub: building the frame at this step failed",
+                    )
+                })?;
                 (b, "miss")
             }
         };
@@ -6945,7 +7005,12 @@ pub async fn scrub_timeline(
                 (bytes, frames_json)
             })
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| {
+                ApiError::new(
+                    ErrorCode::Internal,
+                    "scrub: building the frame at this step failed",
+                )
+            })?;
             (bytes, frames_json)
         }
     };
@@ -6955,7 +7020,12 @@ pub async fn scrub_timeline(
         "events_total": total,
         "frames": frames_json,
     }))
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| {
+        ApiError::new(
+            ErrorCode::Internal,
+            "scrub: building the frame at this step failed",
+        )
+    })?;
     // `head` is a JSON object: open it, add the step's members, close it.
     let mut out = Vec::with_capacity(head.len() + fragment.len() + 2);
     out.extend_from_slice(head.get(..head.len().saturating_sub(1)).unwrap_or_default());

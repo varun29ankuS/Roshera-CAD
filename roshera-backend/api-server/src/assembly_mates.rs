@@ -40,13 +40,82 @@ use uuid::Uuid;
 
 // ── Wire types ──────────────────────────────────────────────────────
 
+/// The ONE wire form of a persistent id: 32 lowercase hex digits, the form
+/// `select_face` / `select_edge`, the Kernel Lens, `user_context` and the
+/// GD&T datum reports all hand out (`format!("{:032x}", pid)`).
+///
+/// Before 2026-11-18 the connector route read `pid` as a bare JSON integer
+/// (`Option<u128>`) while the server reported PIDs as a decimal string in one
+/// place and 32 hex digits in the others, so no agent could anchor on a PID
+/// at all: a string was refused, and JavaScript cannot emit a 128-bit
+/// integer. A decimal string is deliberately NOT accepted as a second form:
+/// a 32-digit decimal string is also valid hex, so accepting both would read
+/// one id two ways. Anything other than the canonical string is refused with
+/// a message that names the expected form.
+pub(crate) mod pid_wire {
+    use serde::de::{self, Deserializer, Visitor};
+    use std::fmt;
+
+    /// Parse the canonical form, or say exactly what was wrong with it.
+    pub(crate) fn parse(s: &str) -> Result<u128, String> {
+        let canonical = s.len() == 32
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !canonical {
+            return Err(format!(
+                "pid must be 32 lowercase hex digits (the form select_face, Kernel Lens and \
+                 user_context report), got {s:?}"
+            ));
+        }
+        u128::from_str_radix(s, 16).map_err(|e| format!("pid {s:?} is not hex: {e}"))
+    }
+
+    /// The canonical rendering — the inverse of [`parse`].
+    pub(crate) fn render(pid: u128) -> String {
+        format!("{pid:032x}")
+    }
+
+    struct PidVisitor;
+
+    impl<'de> Visitor<'de> for PidVisitor {
+        type Value = Option<u128>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a persistent id as 32 lowercase hex digits, or null")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_any(PidVisitor)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            parse(v).map(Some).map_err(E::custom)
+        }
+    }
+
+    /// `#[serde(default, deserialize_with = "pid_wire::option")]`
+    pub(crate) fn option<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u128>, D::Error> {
+        d.deserialize_option(PidVisitor)
+    }
+}
+
 /// How the caller names the face a connector anchors on. Exactly one of
 /// the fields must be set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FaceSelector {
     /// A label name (label → PID → face; the strongest agent anchor).
     pub label: Option<String>,
-    /// A raw persistent id.
+    /// A raw persistent id; on the wire, 32 lowercase hex digits
+    /// ([`pid_wire`]).
+    #[serde(default, deserialize_with = "pid_wire::option")]
     pub pid: Option<u128>,
     /// A live kernel face id. Anchor durability is derived: the face's
     /// PID when it has one, else a geometric FINGERPRINT (degraded —
@@ -89,6 +158,71 @@ pub struct CreateMateRequest {
     /// (2 for GearRatio/RackPinion, 1 for Screw). The reference joint
     /// parameters (`at`) are captured from the CURRENT configuration.
     pub couples: Option<Vec<Uuid>>,
+}
+
+/// One end of a joint, as an agent names it: an instance plus WHERE on it the
+/// connector frame sits — a face (by label, pid or live face id: the
+/// durability ladder) or a raw frame. Flattened so a caller sends one object
+/// per side; [`JointEnd::connector_request`] turns it into the connector
+/// route's own request, so both paths share one resolver.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JointEnd {
+    pub instance_id: Uuid,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default, deserialize_with = "pid_wire::option")]
+    pub pid: Option<u128>,
+    #[serde(default)]
+    pub face_id: Option<u32>,
+    #[serde(default)]
+    pub frame: Option<FrameSpec>,
+}
+
+impl JointEnd {
+    /// The connector request this end describes. A face selector is sent
+    /// only when the caller named a face; `create_connector_core` then
+    /// refuses an end that names both a face and a frame, or neither.
+    fn connector_request(&self) -> CreateConnectorRequest {
+        let names_face = self.label.is_some() || self.pid.is_some() || self.face_id.is_some();
+        CreateConnectorRequest {
+            instance_id: self.instance_id,
+            face: names_face.then(|| FaceSelector {
+                label: self.label.clone(),
+                pid: self.pid,
+                face_id: self.face_id,
+            }),
+            frame: self.frame.clone(),
+        }
+    }
+}
+
+/// `POST /api/assembly/{id}/joint` — two connectors and the mate between
+/// them, as ONE change. Either all three land or none does.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateJointRequest {
+    pub kind: DocMateKind,
+    pub a: JointEnd,
+    pub b: JointEnd,
+    #[serde(default)]
+    pub couples: Option<Vec<Uuid>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JointConnectors {
+    pub a: ConnectorResponse,
+    pub b: ConnectorResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JointResponse {
+    pub mate_id: Uuid,
+    pub kind: DocMateKind,
+    pub a: Uuid,
+    pub b: Uuid,
+    pub at: Vec<f64>,
+    pub connectors: JointConnectors,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1309,6 +1443,76 @@ pub(crate) fn dof_core(
     }
 }
 
+/// Two connectors and the mate between them, as one change to `doc`.
+///
+/// Runs under the caller's single write lock on the document, so no other
+/// request can observe the connectors before the mate exists. On any refusal
+/// the connectors this call added are removed again before the error is
+/// returned — the document is left exactly as it was found, and the caller
+/// records nothing. (The earlier MCP-side composition made three REST calls
+/// and deleted the connectors afterwards; a failed delete there left them in
+/// the document AND in the history.)
+pub(crate) fn create_joint_core<F>(
+    model: &mut BRepModel,
+    resolve_part: F,
+    doc: &mut InstancedAssembly,
+    req: &CreateJointRequest,
+) -> Result<(MateConnector, MateConnector, DocMate), ApiError>
+where
+    F: Fn(Uuid) -> Option<u32>,
+{
+    let side_a = create_connector_core(model, &resolve_part, doc, &req.a.connector_request())
+        .map_err(|e| joint_note(e, "side a of the joint was refused; nothing was added"))?;
+    let side_b = match create_connector_core(model, &resolve_part, doc, &req.b.connector_request())
+    {
+        Ok(c) => c,
+        Err(e) => {
+            doc.remove_connector(side_a.id);
+            return Err(joint_note(
+                e,
+                "side b of the joint was refused; nothing was added",
+            ));
+        }
+    };
+    let mate_req = CreateMateRequest {
+        kind: req.kind.clone(),
+        a: side_a.id.0,
+        b: side_b.id.0,
+        couples: req.couples.clone(),
+    };
+    match create_mate_core(model, doc, &mate_req) {
+        Ok(mate) => Ok((side_a, side_b, mate)),
+        Err(e) => {
+            doc.remove_connector(side_b.id);
+            doc.remove_connector(side_a.id);
+            Err(joint_note(
+                e,
+                "the mate was refused; its two connectors were not kept",
+            ))
+        }
+    }
+}
+
+/// Say which part of a joint was refused without losing a hint the core
+/// already attached.
+fn joint_note(mut e: ApiError, note: &str) -> ApiError {
+    let hint = match e.hint.take() {
+        Some(h) => format!("{h} ({note})"),
+        None => note.to_string(),
+    };
+    e.with_hint(hint)
+}
+
+fn connector_response(c: &MateConnector) -> ConnectorResponse {
+    ConnectorResponse {
+        connector_id: c.id.0,
+        instance_id: c.instance.0,
+        provenance: c.anchor.provenance(),
+        frame: c.frame,
+        radius: c.radius,
+    }
+}
+
 // ── Route handlers ──────────────────────────────────────────────────
 
 fn assembly_not_found(id: Uuid) -> ApiError {
@@ -1323,8 +1527,9 @@ pub async fn create_connector(
     State(state): State<AppState>,
     crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
     Path(id): Path<Uuid>,
-    Json(req): Json<CreateConnectorRequest>,
+    body: Result<Json<CreateConnectorRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ConnectorResponse>, ApiError> {
+    let Json(req) = body.map_err(body_refused)?;
     let handle = state
         .instanced_assemblies
         .get(&id)
@@ -1442,6 +1647,59 @@ pub async fn delete_mate(
         .instanced_assemblies
         .record_event(op_mate_remove(id, mid));
     Ok(Json(serde_json::json!({ "success": true, "mate_id": mid })))
+}
+
+/// A request body that does not deserialize, as a typed catalogue error that
+/// names the field serde stopped at (axum's own rejection is a bare 422 with
+/// plain text, which reaches an agent as transport noise).
+fn body_refused(rejection: axum::extract::rejection::JsonRejection) -> ApiError {
+    bad(format!("request body refused: {}", rejection.body_text()))
+        .with_hint("check the field the message names against the tool's input schema")
+}
+
+/// `POST /api/assembly/{id}/joint` — connectors + mate in one change.
+///
+/// The agent-facing `assembly_mate` (action `create`) calls this. The two
+/// connectors and the mate are added under ONE write lock on the document
+/// and recorded only once all three exist, so a refusal leaves neither the
+/// document nor the history changed.
+pub async fn create_joint(
+    State(state): State<AppState>,
+    crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
+    Path(id): Path<Uuid>,
+    body: Result<Json<CreateJointRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<JointResponse>, ApiError> {
+    let Json(req) = body.map_err(body_refused)?;
+    let handle = state
+        .instanced_assemblies
+        .get(&id)
+        .ok_or_else(|| assembly_not_found(id))?;
+    let mut doc = handle.write().await;
+    let mut model = model_handle.write().await;
+    let (side_a, side_b, mate) =
+        create_joint_core(&mut model, |part| state.get_local_id(&part), &mut doc, &req)?;
+    drop(model);
+    drop(doc);
+    state
+        .instanced_assemblies
+        .record_event(op_connector_add(id, &side_a));
+    state
+        .instanced_assemblies
+        .record_event(op_connector_add(id, &side_b));
+    state
+        .instanced_assemblies
+        .record_event(op_mate_add(id, &mate));
+    Ok(Json(JointResponse {
+        mate_id: mate.id.0,
+        kind: mate.kind.clone(),
+        a: mate.a.0,
+        b: mate.b.0,
+        at: mate.at.clone(),
+        connectors: JointConnectors {
+            a: connector_response(&side_a),
+            b: connector_response(&side_b),
+        },
+    }))
 }
 
 // (tests at the bottom of this file)
@@ -3052,5 +3310,174 @@ mod tests {
         assert_eq!(response.converged, Some(false));
         assert_eq!(response.witnesses.len(), 1);
         assert_eq!(response.witnesses[0].mates, vec![m1, m2]);
+    }
+
+    // ── The pid wire form + the one-change joint (2026-11-18) ──────────
+
+    /// A persistent id travels as 32 lowercase hex digits and nothing else:
+    /// the form `select_face` and the Kernel Lens hand out is the form the
+    /// connector route reads back. RED before `pid_wire`: the field was a
+    /// bare `Option<u128>`, so every string below was refused.
+    #[test]
+    fn a_face_selector_reads_the_canonical_hex_pid() {
+        let pid: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677;
+        let wire = pid_wire::render(pid);
+        assert_eq!(wire, "0123456789abcdef0011223344556677");
+        let sel: Result<FaceSelector, _> =
+            serde_json::from_value(serde_json::json!({ "pid": wire }));
+        let Ok(sel) = sel else {
+            unreachable!("the canonical form must deserialize: {sel:?}");
+        };
+        assert_eq!(sel.pid, Some(pid), "hex round-trips to the same id");
+
+        // Absent and null both mean "no pid" (the app sends `{face_id}` only).
+        let absent: Result<FaceSelector, _> =
+            serde_json::from_value(serde_json::json!({ "face_id": 3 }));
+        assert!(
+            matches!(absent, Ok(FaceSelector { pid: None, .. })),
+            "{absent:?}"
+        );
+        let null: Result<FaceSelector, _> =
+            serde_json::from_value(serde_json::json!({ "pid": null }));
+        assert!(
+            matches!(null, Ok(FaceSelector { pid: None, .. })),
+            "{null:?}"
+        );
+
+        // Every other form is refused, and the refusal names the form wanted.
+        for bad_form in [
+            serde_json::json!("0123456789ABCDEF0011223344556677"), // upper case
+            serde_json::json!("0x0123456789abcdef0011223344556677"), // prefixed
+            serde_json::json!("1512366075204170929049582354406559215"), // decimal
+            serde_json::json!("123abc"),                           // short
+            serde_json::json!(12345),                              // bare integer
+        ] {
+            let r: Result<FaceSelector, _> =
+                serde_json::from_value(serde_json::json!({ "pid": bad_form.clone() }));
+            let Err(e) = r else {
+                unreachable!("{bad_form} must be refused, got {r:?}");
+            };
+            assert!(
+                e.to_string().contains("32 lowercase hex"),
+                "the refusal for {bad_form} must name the canonical form: {e}"
+            );
+        }
+    }
+
+    /// The boss wall's own PID, sent in the wire form, anchors a joint end
+    /// at the `Pid` rung, and the joint lands as two connectors + one mate.
+    #[test]
+    fn a_joint_anchors_on_the_pid_select_face_reports() {
+        let mut rig = boss_and_bracket();
+        let Some(wall) = cylindrical_face(&rig.model, rig.host_solid) else {
+            unreachable!("a cylinder always has its side wall");
+        };
+        let Some(pid) = rig.model.face_pid(wall) else {
+            unreachable!("primitive faces mint PIDs");
+        };
+        let req: Result<CreateJointRequest, _> = serde_json::from_value(serde_json::json!({
+            "kind": { "Cylindrical": { "rot_limits": null, "trans_limits": null } },
+            "a": { "instance_id": rig.host_instance, "pid": pid_wire::render(pid.0) },
+            "b": {
+                "instance_id": rig.bracket_instance,
+                "frame": { "origin": [0.0, 0.0, 0.0], "z_axis": [0.0, 0.0, 1.0], "x_axis": [1.0, 0.0, 0.0] }
+            }
+        }));
+        let Ok(req) = req else {
+            unreachable!("the joint body must deserialize: {req:?}");
+        };
+        let parts = rig.parts.clone();
+        let made = create_joint_core(
+            &mut rig.model,
+            |p| parts.get(&p).copied(),
+            &mut rig.doc,
+            &req,
+        );
+        let Ok((side_a, side_b, mate)) = made else {
+            unreachable!("a pid-anchored joint must be accepted: {made:?}");
+        };
+        assert_eq!(side_a.anchor.provenance(), AnchorProvenance::Pid);
+        assert_eq!(side_b.anchor.provenance(), AnchorProvenance::Raw);
+        assert_eq!(rig.doc.connectors().len(), 2);
+        assert_eq!(rig.doc.mates().len(), 1);
+        assert_eq!((mate.a, mate.b), (side_a.id, side_b.id));
+    }
+
+    /// Unknown fields on a joint end are refused, not dropped: a misspelt
+    /// anchor would otherwise silently become "no anchor".
+    #[test]
+    fn a_joint_end_with_an_unknown_field_is_refused() {
+        let r: Result<CreateJointRequest, _> = serde_json::from_value(serde_json::json!({
+            "kind": "Fastened",
+            "a": { "instance_id": Uuid::new_v4(), "lable": "boss_wall" },
+            "b": { "instance_id": Uuid::new_v4(), "face_id": 1 }
+        }));
+        assert!(r.is_err(), "a misspelt field must refuse the body: {r:?}");
+    }
+
+    /// Whichever step refuses, the document is left exactly as it was: no
+    /// connector from a joint that did not land.
+    #[test]
+    fn a_refused_joint_leaves_the_document_as_it_found_it() {
+        let raw = |instance: Uuid, x_axis: [f64; 3]| JointEnd {
+            instance_id: instance,
+            label: None,
+            pid: None,
+            face_id: None,
+            frame: Some(FrameSpec {
+                origin: [0.0, 0.0, 0.0],
+                z_axis: [0.0, 0.0, 1.0],
+                x_axis,
+            }),
+        };
+
+        // Side b refused (axes not perpendicular) after side a was made.
+        let mut rig = boss_and_bracket();
+        let parts = rig.parts.clone();
+        let req = CreateJointRequest {
+            kind: DocMateKind::Fastened,
+            a: raw(rig.host_instance, [1.0, 0.0, 0.0]),
+            b: raw(rig.bracket_instance, [0.0, 0.0, 1.0]),
+            couples: None,
+        };
+        let r = create_joint_core(
+            &mut rig.model,
+            |p| parts.get(&p).copied(),
+            &mut rig.doc,
+            &req,
+        );
+        let Err(e) = r else {
+            unreachable!("a degenerate frame must refuse the joint: {r:?}");
+        };
+        assert!(e.error.contains("perpendicular"), "{e:?}");
+        assert!(
+            e.hint.as_deref().unwrap_or("").contains("side b"),
+            "the refusal says which end failed: {e:?}"
+        );
+        assert!(rig.doc.connectors().is_empty(), "side a was taken back");
+        assert!(rig.doc.mates().is_empty());
+
+        // The mate refused (both ends on ONE instance) after both connectors
+        // were made.
+        let mut rig = boss_and_bracket();
+        let parts = rig.parts.clone();
+        let req = CreateJointRequest {
+            kind: DocMateKind::Fastened,
+            a: raw(rig.host_instance, [1.0, 0.0, 0.0]),
+            b: raw(rig.host_instance, [0.0, 1.0, 0.0]),
+            couples: None,
+        };
+        let r = create_joint_core(
+            &mut rig.model,
+            |p| parts.get(&p).copied(),
+            &mut rig.doc,
+            &req,
+        );
+        assert!(r.is_err(), "a mate on one instance must be refused: {r:?}");
+        assert!(
+            rig.doc.connectors().is_empty(),
+            "both connectors were taken back"
+        );
+        assert!(rig.doc.mates().is_empty());
     }
 }

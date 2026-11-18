@@ -6,7 +6,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { api, ok, fail, BASE, scopeHeaders, readRefusable } from "../core.js";
+import { api, ok, fail, BASE, scopeHeaders, readRefusable, PART_ID_DOC } from "../core.js";
 
 export function registerLabelTools(server: ToolHost) {
   server.tool(
@@ -15,7 +15,7 @@ export function registerLabelTools(server: ToolHost) {
       "by DESCRIPTION (`selector`, select_face/select_edge shape), or as a " +
       "section (kind:'section' + origin + normal). Re-using a name REPLACES it.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       name: z.string().min(1).describe("the label, e.g. 'throat' (unique per part)"),
       kind: z
         .enum(["vertex", "edge", "face", "section"])
@@ -79,7 +79,7 @@ export function registerLabelTools(server: ToolHost) {
     "label_list",
     "LIST a part's labels: name, kind, world anchor, colour, kernel-MEASURED key " +
       "dimension (e.g. Ø2.00 mm), GD&T verdict, staleness, description.",
-    { part_id: z.number().int().describe("part id (list_parts)") },
+    { part_id: z.number().int().describe(PART_ID_DOC) },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/labels`));
@@ -94,7 +94,7 @@ export function registerLabelTools(server: ToolHost) {
     "RESOLVE a label name to the live entity id or section plane it pins. " +
       "REFUSES not_found / dangling — never a wrong entity.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       name: z.string().min(1).describe("the label name to resolve"),
     },
     async ({ part_id, name }) => {
@@ -115,7 +115,7 @@ export function registerLabelTools(server: ToolHost) {
     "AUTO-PROPOSE labels: the kernel recognizes features (throat, exit, chamber, " +
       "fillet) and SUGGESTS name + pinning `selector` — does NOT apply them. " +
       "Confirm one via label_create with the returned selector.",
-    { part_id: z.number().int().describe("part id (list_parts)") },
+    { part_id: z.number().int().describe(PART_ID_DOC) },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/propose-labels`));
@@ -129,7 +129,7 @@ export function registerLabelTools(server: ToolHost) {
     "label_delete",
     "REMOVE a label by name. deleted:true when it existed; 404 when not.",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       name: z.string().min(1).describe("the label to remove"),
     },
     async ({ part_id, name }) => {
@@ -151,7 +151,7 @@ export function registerLabelTools(server: ToolHost) {
     "RENAME a label, preserving its binding. 404 if old unknown; 409 if new name " +
       "is taken by a different label (never clobbers).",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       name: z.string().min(1).describe("the existing label name"),
       new_name: z.string().min(1).describe("the new name (unique per part)"),
     },

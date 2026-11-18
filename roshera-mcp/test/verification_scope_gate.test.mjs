@@ -483,7 +483,7 @@ check("get_part / list_parts / mass_properties do not clear the gate", () => {
 resetSessionGates();
 await checkpoint("scrap block for a boolean rehearsal");
 await call("create_box", { plane: "xy", cx: 0, cy: 0, width: 9, depth: 9, height: 9 });
-const cleared = await call("clear_timeline", {});
+const cleared = await call("clear_timeline", { confirm: true });
 check("clear_timeline is never gated — the ledger the work lives in is going", () => {
   assert.equal(firstJson(cleared).refused, undefined);
 });
@@ -572,7 +572,7 @@ check("S7: delete_part after verify_part re-arms gate 6", () => {
 resetSessionGates();
 await checkpoint("scrap block for a third rehearsal");
 await call("create_box", { plane: "xy", cx: 0, cy: 0, width: 2, depth: 2, height: 2 }); // never verified
-await call("clear_parts", {}); // wipes the unverified box along with it
+await call("clear_parts", { confirm: true }); // wipes the unverified box along with it
 const cpAfterUnverifiedClear = await checkpoint("next feature, 9mm boss");
 check(
   "M1 CLOSED: clear_parts wipes UNVERIFIED work along with the parts it deletes — the closing checkpoint proceeds with no verify_part call at all",
@@ -589,7 +589,7 @@ resetSessionGates();
 await checkpoint("scrap block for a fourth rehearsal");
 await call("create_box", { plane: "xy", cx: 0, cy: 0, width: 2, depth: 2, height: 2 });
 await call("verify_part", { part_id: 1 });
-await call("clear_parts", {});
+await call("clear_parts", { confirm: true });
 const cpAfterClearParts = await checkpoint("next feature, 10mm boss");
 check(
   "M1 CLOSED: clear_parts after verify_part does not re-arm gate 6 — the next checkpoint closes freely",

@@ -584,6 +584,77 @@ export function ok(data: unknown) {
 }
 
 /**
+ * THE TWO ID SPACES, said where an agent reads them. A part has an integer
+ * `part_id` (the kernel SolidId: list_parts, render/inspect/label/GD&T tools)
+ * and a string `object_uuid` (the scene identity: boolean, shell, transform,
+ * export, assembly tools). Every create/boolean result carries both, and a
+ * boolean mints a NEW part_id while keeping the base's object_uuid. The full
+ * rule is in the server `instructions` (index.ts); these are the per-parameter
+ * reminders.
+ */
+export const PART_ID_DOC = "integer part_id (list_parts), not object_uuid";
+export const UUID_NOTE = "not the integer part_id";
+export const ID_SPACES_INSTRUCTIONS =
+  "Ids: a part has an integer part_id (list_parts; render/inspect/label/GD&T tools) and a string " +
+  "object_uuid (boolean, shell, transform, export, assembly tools). Every create/boolean result " +
+  "returns both; a boolean mints a NEW part_id and keeps the base's object_uuid. Units: mm; angles " +
+  "in degrees where the parameter says _deg, radians only where a schema says radians.";
+
+/**
+ * The `confirm` argument every destructive tool takes. Optional in the
+ * schema so a bare call reaches the handler and is refused TYPED (with the
+ * reason and the fix) instead of failing schema validation with a generic
+ * message.
+ */
+export const CONFIRM = z
+  .boolean()
+  .optional()
+  .describe("must be true");
+
+/**
+ * The typed refusal for a destructive call made without `confirm: true`.
+ * Nothing is sent to the server. `refused: true` lets the refusal cache and
+ * cad_program treat it like any other refusal (cad_program stops at it).
+ */
+export function confirmationRequired(tool: string, destroys: string) {
+  const payload = {
+    refused: true,
+    error_code: "confirmation_required",
+    tool,
+    reason: `${tool} ${destroys}; call it again with confirm: true to run it`,
+    retryable: false,
+    hint: "say confirm: true only when destroying this work is what the user asked for",
+  };
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+    isError: true as const,
+    structuredContent: payload,
+  };
+}
+
+/**
+ * `result` with its first JSON text block ALSO carried as `structuredContent`
+ * — the typed facts a client can read without re-parsing prose. The text
+ * block is unchanged (cad_program's ledger and older clients read it).
+ */
+export function withStructured<T extends { content: any[] }>(
+  result: T,
+): T & { structuredContent?: Record<string, unknown> } {
+  for (const c of result.content) {
+    if (c?.type !== "text" || typeof c.text !== "string") continue;
+    try {
+      const data = JSON.parse(c.text);
+      if (data && typeof data === "object" && !Array.isArray(data)) {
+        return { ...result, structuredContent: data };
+      }
+    } catch {
+      // not JSON — keep looking
+    }
+  }
+  return result;
+}
+
+/**
  * Parsed shape of the backend's structured error catalog wire body
  * (`api-server/src/error_catalog.rs` — `ApiError`'s `Serialize` impl):
  * `{ success: false, error_code, error, retryable, hint?, details? }`.

@@ -22,7 +22,7 @@ import { registerTimelineTools } from "./tools/timeline.js";
 import { registerBlackboardTools } from "./tools/blackboard.js";
 import { registerLabelTools } from "./tools/labels.js";
 import { registerLensTools } from "./tools/lens.js";
-import { registerAssemblyTools } from "./tools/assembly.js";
+import { registerServedTools, loadCheckedInDefs, type ServedRegistry } from "./served.js";
 import { registerGdtTools } from "./tools/gdt.js";
 import { registerDrawingTools } from "./tools/drawing.js";
 import { registerKbTools } from "./tools/kb.js";
@@ -124,7 +124,7 @@ export const MINIMAL_SURFACE = [...CORE_SURFACE, ...META_SURFACE];
  * wires to the live server's enable/disable). The test suite and the thin
  * `buildTable()` alias use only the table.
  */
-export function buildTableWithControls(): {
+export function buildTableWithControls(served: ServedRegistry | null = loadCheckedInDefs()): {
   table: ToolTable;
   workbench: Workbench;
 } {
@@ -140,7 +140,10 @@ export function buildTableWithControls(): {
   registerBlackboardTools(table);
   registerLabelTools(table);
   registerLensTools(table);
-  registerAssemblyTools(table);
+  // The backend-defined tools (the assembly bench): registered generically
+  // from their served definitions — no per-tool TypeScript (served.ts).
+  // `null` = no definitions could be loaded; index.ts says so at startup.
+  if (served !== null) registerServedTools(table, served);
   registerGdtTools(table);
   registerDrawingTools(table);
   // kb_lookup — FULL table only, by design (policy KB §1.1): never added to

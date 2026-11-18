@@ -133,6 +133,7 @@
 
 import { api, PERCEPTION_TIMEOUT_MS, statedSoundness } from "./core.js";
 import { canonicalJson, fnv1a64hex } from "./registry.js";
+import { servedMeta } from "./served_meta.js";
 
 // ─── Typed refusal shape ────────────────────────────────────────────────────
 
@@ -278,11 +279,8 @@ const READ_ONLY = new Set<string>([
   "lens_explain",
   "lens_why_not_sound",
   "blackboard_list",
-  "assembly_list_instances",
-  "assembly_view",
-  "assembly_dof",
-  "assembly_interference",
-  "assembly_verify",
+  // Backend-served tools (the assembly bench) are not listed: their
+  // definition declares `effects`, read by isReadOnly() below.
   "drawing_query",
   "drawing_read_semantics",
   "gdt_report",
@@ -294,6 +292,11 @@ const READ_ONLY = new Set<string>([
   "workbench",
   "cad_program",
 ]);
+
+/** Read-only: listed above, or a served tool whose definition says so. */
+function isReadOnly(tool: string): boolean {
+  return READ_ONLY.has(tool) || servedMeta(tool)?.effects === "read_only";
+}
 
 /**
  * Solid-mutating verbs the intent gate covers: everything that creates,
@@ -1405,7 +1408,7 @@ export function recordDispatchOutcome(
     }
     return;
   }
-  if (!READ_ONLY.has(tool)) refusalCache.clear();
+  if (!isReadOnly(tool)) refusalCache.clear();
   if (result?.isError !== true) {
     if (tool === "timeline_checkpoint") {
       const name =

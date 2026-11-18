@@ -18,6 +18,7 @@
 import { z } from "zod";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
 import { nextTurn } from "./core.js";
+import { servedMeta } from "./served_meta.js";
 import {
   preDispatchGate,
   recordDispatchOutcome,
@@ -61,6 +62,12 @@ export interface RegisteredTool {
    *  so the one handler that needs it never has to fall back to re-deriving
    *  the same fact itself. */
   handler: (args: any, extra?: any, decision?: GateDecision) => any;
+  /** MCP tool annotations (read-only / destructive / idempotent hints). Set
+   *  for backend-served tools from their declared effects (served.ts). */
+  annotations?: Record<string, unknown>;
+  /** The backend definition a served tool was registered from (served.ts);
+   *  absent for a hand-written tool. */
+  served?: unknown;
 }
 
 /** True when `v` is a Zod schema (as opposed to a raw `{key: zodType}` shape). */
@@ -91,7 +98,14 @@ export class ToolTable implements ToolHost {
         : isZodSchema(raw)
           ? raw
           : z.object(raw);
-    this.add({ name, description: config.description ?? "", schema, handler });
+    this.add({
+      name,
+      description: config.description ?? "",
+      schema,
+      handler,
+      ...(config.annotations ? { annotations: config.annotations } : {}),
+      ...(config.served !== undefined ? { served: config.served } : {}),
+    });
   }
 
   private add(t: RegisteredTool): void {
@@ -213,13 +227,6 @@ const EXPERIMENTAL = new Set<string>([
   "timeline_undo",
   "timeline_redo",
   "psketch_op",
-  "assembly_verify",
-  "assembly_mate",
-  "assembly_solve",
-  "assembly_certify",
-  "assembly_dof",
-  "assembly_drag",
-  "assembly_interference",
   "drawing_read_semantics",
   "drawing_query",
   "drawing_set_dimension",
@@ -309,19 +316,9 @@ const BENCH_OF: Record<string, Bench> = {
   // that needs to anchor it to a face, and an unlisted tool is one it will not
   // reach for. Landing in the fallback is why the surface counts moved.
   psketch_plane_from_face: "sketch",
-  // assembly
-  assembly_verify: "assembly",
-  assembly_create: "assembly",
-  assembly_add_instance: "assembly",
-  assembly_list_instances: "assembly",
-  assembly_transform_instance: "assembly",
-  assembly_view: "assembly",
-  assembly_mate: "assembly",
-  assembly_solve: "assembly",
-  assembly_certify: "assembly",
-  assembly_dof: "assembly",
-  assembly_drag: "assembly",
-  assembly_interference: "assembly",
+  // assembly: none here. The assembly tools are defined by the backend
+  // (agent_tools/assembly.json) and classified from that definition
+  // (served.ts / served_meta.ts), never from a copy in this table.
   // drawing
   make_drawing: "drawing",
   drawing_read_semantics: "drawing",
@@ -370,6 +367,9 @@ const BENCH_OF: Record<string, Bench> = {
 
 /** Bench + stability for a tool name. Meta-tools default to the `meta` bench. */
 export function metaFor(name: string): ToolMeta {
+  // A backend-served tool is classified by its own definition.
+  const served = servedMeta(name);
+  if (served) return { bench: served.bench as Bench, stability: served.stability };
   return {
     bench: BENCH_OF[name] ?? "meta",
     stability: EXPERIMENTAL.has(name) ? "experimental" : "stable",

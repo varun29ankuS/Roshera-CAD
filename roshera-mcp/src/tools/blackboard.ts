@@ -26,7 +26,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { api, ok, fail } from "../core.js";
+import { api, ok, fail, CONFIRM, confirmationRequired } from "../core.js";
 import { typedErrorResult } from "../gates.js";
 
 /** Wire shape of one Blackboard line (mirrors the frontend store). */
@@ -239,9 +239,10 @@ export function registerBlackboardTools(server: ToolHost) {
     "blackboard_clear",
     "CLEAR the Blackboard notebook (every line + its event log), including " +
       "any legacy per-part notes it currently unions in. Destructive; no " +
-      "geometry change.",
-    {},
-    async () => {
+      "geometry change. Needs confirm: true.",
+    { confirm: CONFIRM },
+    async ({ confirm }) => {
+      if (confirm !== true) return confirmationRequired("blackboard_clear", "erases every notebook line and its event log");
       try {
         return ok(await api("POST", "/api/blackboard/clear", {}));
       } catch (e) {

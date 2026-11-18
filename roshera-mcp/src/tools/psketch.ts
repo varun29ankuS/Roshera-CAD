@@ -2,7 +2,8 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { api, ok, fail, okp, newestPartId } from "../core.js";
+import { api, ok, fail, okp, newestPartId, withStructured } from "../core.js";
+import { typedErrorResult } from "../gates.js";
 
 /** Wire shape of a sketch plane: a standard-plane string or a custom
  * orthonormal frame (as returned by psketch_plane_from_face). The
@@ -143,21 +144,28 @@ export function registerPsketchTools(server: ToolHost) {
         const summary = await api("GET", `/api/csketch/${csketch_id}`);
         // SK-C4: the verdict is rank-adjudicated server-side; hand the
         // agent the evidence behind it, not the status word alone.
-        return ok({
-          status: report.status,
-          violations: report.violations,
-          dof: report.dof
-            ? {
-                status: report.dof.status,
-                redundant: report.dof.redundant,
-                conflicts: report.dof.conflicts,
-                unsupported: report.dof.unsupported,
-                singular_configuration: report.dof.singular_configuration,
-              }
-            : null,
-          certificate: report.certificate,
-          points: summary.points,
-        });
+        // `entities_skipped` (entities the solver did not handle) and
+        // `dof.unverified_components` are what QUALIFY "converged": dropping
+        // them reported a partial solve as a whole one (MCP_AUDIT.md 1.7).
+        return withStructured(
+          ok({
+            status: report.status,
+            violations: report.violations,
+            entities_skipped: report.entities_skipped ?? [],
+            dof: report.dof
+              ? {
+                  status: report.dof.status,
+                  redundant: report.dof.redundant,
+                  conflicts: report.dof.conflicts,
+                  unsupported: report.dof.unsupported,
+                  singular_configuration: report.dof.singular_configuration,
+                  unverified_components: report.dof.unverified_components ?? [],
+                }
+              : null,
+            certificate: report.certificate,
+            points: summary.points,
+          }),
+        );
       } catch (e) {
         return fail(e);
       }
@@ -349,7 +357,8 @@ export function registerPsketchTools(server: ToolHost) {
       axis_direction: z
         .array(z.number()).length(2)
         .describe("axis direction in sketch-plane coords [x,y]"),
-      angle: z.number().optional().describe("sweep angle in radians (default 2π, full)"),
+      angle_deg: z.number().optional().describe("degrees, default 360"),
+      angle: z.number().optional().describe("radians, deprecated"),
       segments: z
         .number()
         .int()
@@ -359,13 +368,27 @@ export function registerPsketchTools(server: ToolHost) {
         .describe("angular tessellation count for sampled loops"),
       name: z.string().optional().describe("display name"),
     },
-    async ({ csketch_id, plane, axis_origin, axis_direction, angle, segments, name }) => {
+    async ({ csketch_id, plane, axis_origin, axis_direction, angle_deg, angle, segments, name }) => {
+      // ONE angle unit for both revolve tools: DEGREES (`revolve.angle_deg`,
+      // `transform.rotation.angle_deg`). `angle` (radians) is the pre-2026-11-18
+      // name, still accepted so an existing caller keeps working; naming both
+      // is refused rather than guessing which one was meant.
+      if (angle_deg !== undefined && angle !== undefined) {
+        return typedErrorResult({
+          refused: true,
+          error_code: "invalid_parameter",
+          reason: "psketch_revolve: give angle_deg (degrees) OR the deprecated angle (radians), not both",
+          retryable: false,
+        });
+      }
+      const radians = angle_deg !== undefined ? (angle_deg * Math.PI) / 180 : angle;
       try {
         const r = await api("POST", `/api/csketch/${csketch_id}/revolve`, {
           plane: plane ?? undefined,
           axis_origin,
           axis_direction,
-          angle: angle ?? undefined,
+          // The route's own unit is radians (csketch.rs revolve request).
+          angle: radians ?? undefined,
           segments: segments ?? undefined,
           name: name ?? null,
         });

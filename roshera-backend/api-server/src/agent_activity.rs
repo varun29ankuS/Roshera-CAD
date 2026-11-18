@@ -855,6 +855,7 @@ fn describe_operation(method: &Method, path: &str, body: Option<&Value>) -> Opti
         ["assembly"] if post => "create assembly",
         ["assembly", _, "instance"] if post => "add assembly instance",
         ["assembly", _, "mate"] if post => "add mate",
+        ["assembly", _, "joint"] if post => "add mate",
         ["assembly", _, "solve"] if post => "solve assembly",
         ["assembly", _, "certify"] if post => "certify assembly",
         ["assembly", _, "dof"] if get => "assembly degrees-of-freedom query",

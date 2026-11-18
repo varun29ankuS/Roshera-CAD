@@ -12,6 +12,7 @@ import {
   PlaneSchema,
   resolvePlane,
   cross3,
+  UUID_NOTE,
 } from "../core.js";
 
 export function registerCreateTools(server: ToolHost) {
@@ -135,7 +136,7 @@ export function registerCreateTools(server: ToolHost) {
     "Derive a sketch plane FROM an existing planar face ('sketch on this face'). " +
       "Returns {origin, u_axis, v_axis} to pass as a `plane` to create_*/create_sketch.",
     {
-      object_id: z.string().uuid().describe("the part's public object UUID"),
+      object_id: z.string().uuid().describe(`the part's object_uuid; ${UUID_NOTE}`),
       face_id: z
         .number()
         .int()

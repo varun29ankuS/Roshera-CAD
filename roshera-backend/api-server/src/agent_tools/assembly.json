@@ -1,0 +1,1038 @@
+{
+  "registry_version": "2.0.0",
+  "note": "Agent tool definitions owned by api-server (single-registry design, stage 1). Served at GET /api/agent/tools; roshera-mcp registers these generically. Edit here, nowhere else.",
+  "tools": [
+    {
+      "name": "assembly_verify",
+      "bench": "assembly",
+      "stability": "experimental",
+      "effects": "read_only",
+      "idempotent": true,
+      "summary": "One-shot kinematic assembly certificate from a self-contained spec (parts + mates + mechanisms inline); 5-dimension verdict.",
+      "description": "One-shot kinematic assembly certificate from a self-contained spec (no prior assembly_create). Declare parts + mates + mechanisms inline; returns a 5-dim verdict: mates_consistent, fully_grounded (no floating part), dof+mobility, no_static_interference, swept_clearance_ok (Parry CCD, conservative by `epsilon`). is_sound = AND of all five.\nMATE: {kind:'Concentric'|'Coincident'|'Fixed', a:<iid>, feature_a:{Axis:{origin,direction}}|{Face:{point,normal}}, b, feature_b} (Concentric=2 Axis; Coincident=2 Face, antiparallel).\nMECHANISM: {moving:<iid>, joint:{Revolute:{axis_origin,axis_dir}}|{Prismatic:{…}}|{Spherical:{center}}|'Fixed', base_translation, base_rotation:[x,y,z,w], range:[lo,hi], samples}.\nPersistent workflow: assembly_create + assembly_mate + assembly_certify.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ground": {
+            "type": "integer",
+            "description": "instance_id of the grounded (fixed reference) part"
+          },
+          "parts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "object": {
+                  "type": "string",
+                  "description": "the part's object_uuid"
+                },
+                "instance_id": {
+                  "type": "integer",
+                  "description": "this occurrence's id, referenced by mates/mechanisms"
+                },
+                "translation": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3,
+                  "description": "world position [x,y,z] mm (default origin)"
+                },
+                "rotation": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 4,
+                  "maxItems": 4,
+                  "description": "unit quaternion [x,y,z,w] (default identity)"
+                }
+              },
+              "required": [
+                "object",
+                "instance_id"
+              ],
+              "additionalProperties": false
+            },
+            "description": "every part in the assembly, as an instance"
+          },
+          "mates": {
+            "type": "array",
+            "description": "mate constraints — see MATE format in the description"
+          },
+          "mechanisms": {
+            "type": "array",
+            "description": "mechanisms for swept-clearance — see MECHANISM format"
+          },
+          "epsilon": {
+            "type": "number",
+            "default": 0,
+            "description": "tessellation deviation bound (mm); certified clearance = parry_distance − epsilon"
+          }
+        },
+        "required": [
+          "ground",
+          "parts"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "POST",
+        "path": "/api/assembly/verify",
+        "body": {
+          "ground": {
+            "$arg": "ground"
+          },
+          "parts": {
+            "$arg": "parts"
+          },
+          "mates": {
+            "$arg": "mates",
+            "default": []
+          },
+          "mechanisms": {
+            "$arg": "mechanisms",
+            "default": []
+          },
+          "epsilon": {
+            "$arg": "epsilon",
+            "default": 0
+          }
+        }
+      },
+      "examples": [
+        {
+          "title": "two parts, one fixed mate",
+          "args": {
+            "ground": 1,
+            "parts": [
+              {
+                "object": "55555555-5555-4555-8555-555555555555",
+                "instance_id": 1
+              },
+              {
+                "object": "55555555-5555-4555-8555-555555555555",
+                "instance_id": 2,
+                "translation": [
+                  0,
+                  0,
+                  20
+                ]
+              }
+            ],
+            "mates": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_create",
+      "bench": "assembly",
+      "stability": "stable",
+      "effects": "mutates",
+      "idempotent": false,
+      "summary": "Create a true assembly: a named scene of positioned part instances (not a boolean merge). Returns the assembly id.",
+      "description": "Create a TRUE assembly: a named scene of positioned part INSTANCES (not a boolean merge). Instances reference parts by id and reuse geometry — the same part can be placed many times. Returns the assembly id.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "display name, e.g. 'gearbox'"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "POST",
+        "path": "/api/assembly",
+        "body": {
+          "name": {
+            "$arg": "name"
+          }
+        },
+        "result": {
+          "rename": {
+            "id": "assembly_id"
+          },
+          "echo": [
+            "name"
+          ]
+        }
+      },
+      "examples": [
+        {
+          "title": "a gearbox",
+          "args": {
+            "name": "gearbox"
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_add_instance",
+      "bench": "assembly",
+      "stability": "stable",
+      "effects": "mutates",
+      "idempotent": false,
+      "summary": "Place an instance of an existing part into an assembly at a world pose. Returns the instance id + assembly perception.",
+      "description": "Place an INSTANCE of an existing part into an assembly at a world pose (same object twice = two instances, no copy). Returns the instance id + assembly perception.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "assembly_id": {
+            "type": "string",
+            "description": "assembly id"
+          },
+          "object": {
+            "type": "string",
+            "description": "the part's object_uuid (from a create_* or boolean result); not the integer part_id"
+          },
+          "position": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "world translation [x,y,z] mm"
+          },
+          "rotation_deg": {
+            "type": "number",
+            "description": "rotation angle about rotation_axis (degrees)"
+          },
+          "rotation_axis": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "unit rotation axis, e.g. [0,0,1]"
+          },
+          "transform": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 4,
+              "maxItems": 4
+            },
+            "minItems": 4,
+            "maxItems": 4,
+            "description": "raw row-major 4×4 pose (overrides position/rotation)"
+          },
+          "name": {
+            "type": "string",
+            "description": "placement name, e.g. 'wheel-FL'"
+          },
+          "color": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "per-instance display RGB (0–255)"
+          }
+        },
+        "required": [
+          "assembly_id",
+          "object"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "POST",
+        "path": "/api/assembly/{assembly_id}/instance",
+        "body": {
+          "part_id": {
+            "$arg": "object"
+          },
+          "transform": {
+            "$pose": {
+              "matrix": "transform",
+              "position": "position",
+              "angle_deg": "rotation_deg",
+              "axis": "rotation_axis"
+            }
+          },
+          "name": {
+            "$arg": "name"
+          },
+          "color": {
+            "$arg": "color"
+          }
+        }
+      },
+      "examples": [
+        {
+          "title": "place a wheel, turned 90 degrees",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111",
+            "object": "55555555-5555-4555-8555-555555555555",
+            "position": [
+              100,
+              0,
+              0
+            ],
+            "rotation_deg": 90,
+            "rotation_axis": [
+              0,
+              0,
+              1
+            ],
+            "name": "wheel-FL"
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_list_instances",
+      "bench": "assembly",
+      "stability": "stable",
+      "effects": "read_only",
+      "idempotent": true,
+      "summary": "List an assembly's instances with perception: instance_count vs unique_part_count, per-instance soundness, combined bbox.",
+      "description": "List an assembly's instances with PERCEPTION: instance_count vs unique_part_count (the gap is the reuse), each instance's part/transform/soundness, combined bbox, all_sound.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "assembly_id": {
+            "type": "string",
+            "description": "assembly id"
+          }
+        },
+        "required": [
+          "assembly_id"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "GET",
+        "path": "/api/assembly/{assembly_id}"
+      },
+      "examples": [
+        {
+          "title": "what is in the assembly",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111"
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_transform_instance",
+      "bench": "assembly",
+      "stability": "stable",
+      "effects": "mutates",
+      "idempotent": true,
+      "summary": "Re-pose one instance without touching the others or the referenced part. Returns the updated assembly perception.",
+      "description": "Re-pose ONE instance without touching the others or the referenced part. Returns the updated assembly perception.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "assembly_id": {
+            "type": "string",
+            "description": "assembly id"
+          },
+          "instance_id": {
+            "type": "string",
+            "description": "instance id from assembly_list_instances"
+          },
+          "position": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "world translation [x,y,z] mm"
+          },
+          "rotation_deg": {
+            "type": "number",
+            "description": "rotation angle about rotation_axis (degrees)"
+          },
+          "rotation_axis": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "unit rotation axis, e.g. [0,0,1]"
+          },
+          "transform": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 4,
+              "maxItems": 4
+            },
+            "minItems": 4,
+            "maxItems": 4,
+            "description": "raw row-major 4×4 pose (overrides position/rotation)"
+          }
+        },
+        "required": [
+          "assembly_id",
+          "instance_id"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "PATCH",
+        "path": "/api/assembly/{assembly_id}/instance/{instance_id}",
+        "body": {
+          "transform": {
+            "$pose": {
+              "matrix": "transform",
+              "position": "position",
+              "angle_deg": "rotation_deg",
+              "axis": "rotation_axis"
+            }
+          }
+        }
+      },
+      "examples": [
+        {
+          "title": "move one instance up 10 mm",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111",
+            "instance_id": "22222222-2222-4222-8222-222222222222",
+            "position": [
+              0,
+              0,
+              10
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_view",
+      "bench": "assembly",
+      "stability": "stable",
+      "effects": "read_only",
+      "idempotent": true,
+      "summary": "See a whole assembly: composite every instance at its transform into one image from an orbit camera.",
+      "description": "SEE A WHOLE ASSEMBLY: composite every instance at its transform into one image from an orbit camera (world-Z up). mode 'diagnostic' highlights open (red) / non-manifold (magenta) edges.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "assembly_id": {
+            "type": "string",
+            "description": "assembly id"
+          },
+          "az": {
+            "type": "number",
+            "default": 35,
+            "description": "azimuth degrees around world Z"
+          },
+          "el": {
+            "type": "number",
+            "default": 20,
+            "description": "elevation degrees above horizon"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "shaded",
+              "ids",
+              "depth",
+              "normals",
+              "diagnostic"
+            ],
+            "default": "shaded",
+            "description": "render channel"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 64,
+            "maximum": 2048,
+            "default": 720,
+            "description": "image size in px"
+          },
+          "quality": {
+            "type": "string",
+            "enum": [
+              "coarse",
+              "medium",
+              "fine"
+            ],
+            "default": "medium",
+            "description": "tessellation quality"
+          }
+        },
+        "required": [
+          "assembly_id"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "GET",
+        "path": "/api/assembly/{assembly_id}/view",
+        "query": [
+          "az",
+          "el",
+          "mode",
+          "size",
+          "quality"
+        ],
+        "result": {
+          "image": "png_base64",
+          "caption": "assembly az={az}° el={el}° instances={$instance_count} distinct_parts={$unique_part_count} open={$open_edges} nm={$nonmanifold_edges}"
+        }
+      },
+      "examples": [
+        {
+          "title": "a diagnostic view",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111",
+            "mode": "diagnostic"
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_mate",
+      "bench": "assembly",
+      "stability": "experimental",
+      "effects": "mutates",
+      "idempotent": false,
+      "summary": "Mate two instances — connectors + mate in one call. A mate relates two coordinate frames and IS the joint.",
+      "description": "MATE two instances — connectors + mate in ONE call. A mate relates two FRAMES and IS the joint (exact DOF by construction).\nJOINTS: Fastened (0 DOF) · Revolute{limits} (1 rot/z) · Slider{limits} (1 trans/z) · Cylindrical{rot_limits,trans_limits} · Planar (2 trans+spin) · Ball (3 rot) · PinSlot{slot_dir_x,limits}. OVERLAYS: Distance{value} mm · Angle{value} rad · Parallel · Tangent. COUPLINGS (pass `couples` = related mate ids): GearRatio{ratio} & RackPinion{pinion_radius} take 2, Screw{lead} takes 1.\nREFUSED (typed): Cam, Path, Symmetric.\nLIMITS (rot=rad, trans=mm) give assembly_certify a finite range: a rotation without limits sweeps a full turn; a translation without limits refuses certification.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "assembly_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "assembly id"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "create",
+              "edit",
+              "remove"
+            ],
+            "default": "create",
+            "description": "create a mate (+ its connectors), edit its kind, or remove it"
+          },
+          "kind": {
+            "description": "the mate kind, e.g. 'Fastened' or {Revolute:{limits:[-0.1,0.1]}} (required for create/edit)"
+          },
+          "a": {
+            "type": "object",
+            "properties": {
+              "instance_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "the instance this frame sits on"
+              },
+              "label": {
+                "type": "string",
+                "description": "DURABLE (best): a face label; follows the face through edits"
+              },
+              "pid": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "description": "raw persistent face id, 32 lowercase hex digits as select_face / Kernel Lens / user_context report it (durable, unnamed)"
+              },
+              "face_id": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "live kernel face id; durability derived (PID if any, else fingerprint)"
+              },
+              "frame": {
+                "type": "object",
+                "properties": {
+                  "origin": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": "origin [x,y,z] mm"
+                  },
+                  "z_axis": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": "z axis (the joint axis)"
+                  },
+                  "x_axis": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": "x axis"
+                  }
+                },
+                "required": [
+                  "origin",
+                  "z_axis",
+                  "x_axis"
+                ],
+                "additionalProperties": false,
+                "description": "RAW coords (NOT durable); must sit on real geometry or certify refuses it"
+              }
+            },
+            "required": [
+              "instance_id"
+            ],
+            "additionalProperties": false,
+            "description": "side A connector (required for create)"
+          },
+          "b": {
+            "type": "object",
+            "properties": {
+              "instance_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "the instance this frame sits on"
+              },
+              "label": {
+                "type": "string",
+                "description": "DURABLE (best): a face label; follows the face through edits"
+              },
+              "pid": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "description": "raw persistent face id, 32 lowercase hex digits as select_face / Kernel Lens / user_context report it (durable, unnamed)"
+              },
+              "face_id": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "live kernel face id; durability derived (PID if any, else fingerprint)"
+              },
+              "frame": {
+                "type": "object",
+                "properties": {
+                  "origin": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": "origin [x,y,z] mm"
+                  },
+                  "z_axis": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": "z axis (the joint axis)"
+                  },
+                  "x_axis": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": "x axis"
+                  }
+                },
+                "required": [
+                  "origin",
+                  "z_axis",
+                  "x_axis"
+                ],
+                "additionalProperties": false,
+                "description": "RAW coords (NOT durable); must sit on real geometry or certify refuses it"
+              }
+            },
+            "required": [
+              "instance_id"
+            ],
+            "additionalProperties": false,
+            "description": "side B connector (required for create)"
+          },
+          "couples": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "for coupling kinds: the related mate ids"
+          },
+          "mate_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "the mate to edit/remove"
+          }
+        },
+        "required": [
+          "assembly_id"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "switch": "action",
+        "cases": {
+          "create": {
+            "requires": [
+              "kind",
+              "a",
+              "b"
+            ],
+            "method": "POST",
+            "path": "/api/assembly/{assembly_id}/joint",
+            "body": {
+              "kind": {
+                "$arg": "kind"
+              },
+              "a": {
+                "$arg": "a"
+              },
+              "b": {
+                "$arg": "b"
+              },
+              "couples": {
+                "$arg": "couples",
+                "default": null
+              }
+            }
+          },
+          "edit": {
+            "requires": [
+              "mate_id",
+              "kind"
+            ],
+            "method": "PATCH",
+            "path": "/api/assembly/{assembly_id}/mate/{mate_id}",
+            "body": {
+              "kind": {
+                "$arg": "kind"
+              }
+            }
+          },
+          "remove": {
+            "requires": [
+              "mate_id"
+            ],
+            "method": "DELETE",
+            "path": "/api/assembly/{assembly_id}/mate/{mate_id}"
+          }
+        }
+      },
+      "examples": [
+        {
+          "title": "a hinge on a labelled bore, the other side anchored by persistent id",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111",
+            "kind": {
+              "Revolute": {
+                "limits": [
+                  -1.57,
+                  1.57
+                ]
+              }
+            },
+            "a": {
+              "instance_id": "22222222-2222-4222-8222-222222222222",
+              "label": "hinge_bore"
+            },
+            "b": {
+              "instance_id": "33333333-3333-4333-8333-333333333333",
+              "pid": "0123456789abcdef0123456789abcdef"
+            }
+          }
+        },
+        {
+          "title": "remove a mate",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111",
+            "action": "remove",
+            "mate_id": "44444444-4444-4444-8444-444444444444"
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_solve",
+      "bench": "assembly",
+      "stability": "experimental",
+      "effects": "mutates",
+      "idempotent": true,
+      "summary": "Solve the mate system: parts are placed by their mates; returns solved poses, per-mate facts, and a compact verdict.",
+      "description": "SOLVE the mate system: parts are PLACED by their mates. Returns each instance's solved pose, per-mate facts (enforced/violation/anchor) and a verdict (constrainedness + conflict witnesses). `converged:false` = the mates cannot all hold; the witnesses name which fight.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "assembly_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "assembly id"
+          },
+          "ground": {
+            "type": "string",
+            "format": "uuid",
+            "description": "grounded instance (default: first)"
+          }
+        },
+        "required": [
+          "assembly_id"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "POST",
+        "path": "/api/assembly/{assembly_id}/solve",
+        "body": {
+          "ground": {
+            "$arg": "ground",
+            "default": null
+          }
+        }
+      },
+      "examples": [
+        {
+          "title": "solve with the first instance grounded",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111"
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_certify",
+      "bench": "assembly",
+      "stability": "experimental",
+      "effects": "read_only",
+      "idempotent": true,
+      "summary": "The full assembly certificate — does this go together AND move without collision? is_sound = AND of mates/grounding/clearance dims.",
+      "description": "THE FULL CERTIFICATE. `is_sound` = AND of: mates_consistent · fully_grounded (no floating part) · no_static_interference · swept_clearance_ok · mates_anchored (no invented coordinate) · mates_in_contact · mates_enforced. Mobility is REPORTED, not failed. `sweeps` = one fact per motion (continuous TOI, no tunneling) with ε and any contact; an uncertifiable sweep REFUSES with a reason. Certified clearance = distance − ε.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "assembly_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "assembly id"
+          },
+          "ground": {
+            "type": "string",
+            "format": "uuid",
+            "description": "grounded instance"
+          },
+          "epsilon": {
+            "type": "number",
+            "description": "clearance margin (mm); honoured only ABOVE the kernel floor"
+          }
+        },
+        "required": [
+          "assembly_id"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "POST",
+        "path": "/api/assembly/{assembly_id}/certify",
+        "body": {
+          "ground": {
+            "$arg": "ground",
+            "default": null
+          },
+          "epsilon": {
+            "$arg": "epsilon",
+            "default": null
+          }
+        }
+      },
+      "examples": [
+        {
+          "title": "certify with a 0.05 mm clearance margin",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111",
+            "epsilon": 0.05
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_dof",
+      "bench": "assembly",
+      "stability": "experimental",
+      "effects": "read_only",
+      "idempotent": true,
+      "summary": "DOF + per-instance constrainment: which instances are fully located, which still move (and how), which are over-constrained.",
+      "description": "DOF + per-instance constrainment: which instances are fully located, which MOVE (and how — 'rotation about axis A through P'), which are over-constrained and via which mates. Reports STRUCTURAL vs NUMERIC DOF; when they disagree (`special_geometry:true`) the geometry is the truth. Cheap.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "assembly_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "assembly id"
+          }
+        },
+        "required": [
+          "assembly_id"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "GET",
+        "path": "/api/assembly/{assembly_id}/dof"
+      },
+      "examples": [
+        {
+          "title": "what can still move",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111"
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_drag",
+      "bench": "assembly",
+      "stability": "experimental",
+      "effects": "mutates",
+      "idempotent": true,
+      "summary": "Drive a joint — your kinematic hand. Set a joint parameter and the affected chain re-solves; poses are written back.",
+      "description": "DRIVE A JOINT: set a joint parameter, the affected chain re-solves, poses written back. Driveable: Revolute (rotation), Slider (translation), Cylindrical (both); Planar/Ball/PinSlot REFUSE. Drive a coupling's base joint, not the coupling. Limits CLAMP (not error). `converged:false` = UNREACHABLE, all poses restored (never a half-stroke). `rank_transitions` warns of a singular pose.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "assembly_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "assembly id"
+          },
+          "mate_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "the joint to drive"
+          },
+          "param": {
+            "type": "string",
+            "enum": [
+              "rotation",
+              "translation"
+            ],
+            "description": "rotation about the connector z, or translation along it"
+          },
+          "value": {
+            "type": "number",
+            "description": "target value (radians for rotation, mm for translation)"
+          },
+          "ground": {
+            "type": "string",
+            "format": "uuid",
+            "description": "grounded instance"
+          }
+        },
+        "required": [
+          "assembly_id",
+          "mate_id",
+          "param",
+          "value"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "POST",
+        "path": "/api/assembly/{assembly_id}/drag",
+        "body": {
+          "mate_id": {
+            "$arg": "mate_id"
+          },
+          "param": {
+            "$arg": "param"
+          },
+          "value": {
+            "$arg": "value"
+          },
+          "ground": {
+            "$arg": "ground",
+            "default": null
+          }
+        }
+      },
+      "examples": [
+        {
+          "title": "turn the crank to 0.5 rad",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111",
+            "mate_id": "44444444-4444-4444-8444-444444444444",
+            "param": "rotation",
+            "value": 0.5
+          }
+        }
+      ]
+    },
+    {
+      "name": "assembly_interference",
+      "bench": "assembly",
+      "stability": "experimental",
+      "effects": "read_only",
+      "idempotent": true,
+      "summary": "What touches, and at what angle: static overlaps + continuous-TOI joint sweeps, first_contact, min certified clearance.",
+      "description": "WHAT TOUCHES, AND WHEN — fix a mechanism without rendering. `static_pairs` = overlaps at the solved pose. `sweeps` walk every mate-derived joint through its range with continuous TOI, returning motion-stamped facts. `first_contact` = where motion first closes; `min_certified_clearance` = distance − ε. A `refusal` = not certified (says why).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "assembly_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "assembly id"
+          },
+          "ground": {
+            "type": "string",
+            "format": "uuid",
+            "description": "grounded instance"
+          },
+          "epsilon": {
+            "type": "number",
+            "description": "clearance margin (mm) above the kernel floor"
+          }
+        },
+        "required": [
+          "assembly_id"
+        ],
+        "additionalProperties": false
+      },
+      "call": {
+        "method": "GET",
+        "path": "/api/assembly/{assembly_id}/interference",
+        "query": [
+          "ground",
+          "epsilon"
+        ]
+      },
+      "examples": [
+        {
+          "title": "sweep every joint",
+          "args": {
+            "assembly_id": "11111111-1111-4111-8111-111111111111"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -2,16 +2,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import {
-  api,
-  ok,
-  fail,
-  ApiError,
-  imageFreshness,
-  recordImageSent,
-  lastPartMutationTurn,
-  lastGlobalMutationTurnValue,
-} from "../core.js";
+import { api, ok, fail, ApiError, imageFreshness, recordImageSent, lastPartMutationTurn, lastGlobalMutationTurnValue, PART_ID_DOC } from "../core.js";
 
 export function registerPerceptionTools(server: ToolHost) {
   server.tool(
@@ -80,7 +71,7 @@ export function registerPerceptionTools(server: ToolHost) {
       "`\"stale\"` and `sound` is `false` (never the old passing verdict, never " +
       "a fabricated fresh one); call verify_part to clear it. `designed:false` " +
       "or `sound:false` (incl. `status:\"stale\"`) = stop and fix.",
-    { part_id: z.number().int().describe("part id (list_parts)") },
+    { part_id: z.number().int().describe(PART_ID_DOC) },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/truth`));
@@ -96,7 +87,7 @@ export function registerPerceptionTools(server: ToolHost) {
       "from the EXACT solid — reveals internal cavities, wall thickness and " +
       "through-holes a render hides. Each layer is a z-slice (rows y, cols x).",
     {
-      part_id: z.number().int().describe("part id (list_parts)"),
+      part_id: z.number().int().describe(PART_ID_DOC),
       n: z
         .number()
         .int()
@@ -334,7 +325,7 @@ export function registerPerceptionTools(server: ToolHost) {
       "callouts AND a structured table (id, kind, value, face ids, 3D anchor), " +
       "including POSITION rows (each bore/boss axis's X/Y offsets from a NAMED " +
       "datum). Values off analytic surfaces, never pixels. Labels follow document_units.",
-    { part_id: z.number().int().describe("part id (list_parts)") },
+    { part_id: z.number().int().describe(PART_ID_DOC) },
     async ({ part_id }) => {
       try {
         const r = await api("GET", `/api/agent/parts/${part_id}/dimensions`);
@@ -437,7 +428,7 @@ export function registerPerceptionTools(server: ToolHost) {
     "part_coverage",
     "COVERAGE honesty: which faces the 4 standard views SHOW vs leave unseen — " +
       "so you know when to request another camera angle.",
-    { part_id: z.number().int().describe("part id (list_parts)") },
+    { part_id: z.number().int().describe(PART_ID_DOC) },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/coverage`));

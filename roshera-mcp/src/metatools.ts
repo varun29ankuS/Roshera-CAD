@@ -548,6 +548,14 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
         purpose: entry.description,
         token_estimate: estimateTokens(entry),
         input_schema: toolJsonSchema(entry),
+        // A backend-defined tool also says what it does to the model and
+        // shows worked calls, straight from its one definition (served.ts).
+        ...((entry.served as any)?.examples
+          ? {
+              effects: (entry.served as any).effects,
+              examples: (entry.served as any).examples,
+            }
+          : {}),
         usage: `invoke({ name: '${entry.name}', args: { … } }) runs this tool; args are validated by this exact schema.`,
       });
     },

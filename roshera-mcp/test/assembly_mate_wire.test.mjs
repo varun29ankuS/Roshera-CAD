@@ -1,28 +1,34 @@
 /**
- * Mate wire proof — `assembly_mate` creates a mate, end to end, against the
- * backend's OWN wire shapes.
+ * Mate wire proof — `assembly_mate`, defined by the BACKEND
+ * (`roshera-backend/api-server/src/agent_tools/assembly.json`) and registered
+ * generically (src/served.ts), against the server's OWN wire shapes.
  *
- * The defect (2026-11-17): the connector route answers
- * `{ connector_id, instance_id, provenance, frame, radius }`
- * (`api-server/src/assembly_mates.rs::ConnectorResponse`), and the tool read
- * `conn.id`. Both connector ids were therefore `undefined`, JSON dropped them
- * from the mate body, and the mate route refused the body for a missing
- * field. No agent could create a mate, and every attempt left two connectors
- * in the assembly that no mate referenced.
+ * History: on 2026-11-17 the hand-written TypeScript composition read
+ * `conn.id` where the connector route answers `connector_id`, so no agent
+ * could create a mate; it was fixed by deleting the connectors afterwards,
+ * which still left them behind whenever a delete failed. Since 2026-11-18 a
+ * mate is ONE call to `POST /api/assembly/{id}/joint`, which adds both
+ * connectors and the mate under one lock or nothing at all
+ * (`assembly_mates.rs::create_joint_core`). And a pid is a 32-hex string end
+ * to end: the form `select_face` and the Kernel Lens report is the form the
+ * route reads (`assembly_mates.rs::pid_wire`).
  *
- * This drives the REAL dispatch stack (ToolTable wrapper + gates + the real
- * `assembly_mate` handler + `core.ts` `api()`/`fail()`, compiled from src to
- * test/.build) against a stub that answers as the server does:
+ * This drives the REAL dispatch stack (ToolTable wrapper + gates + the served
+ * handler + core.ts `api()`/`fail()`, compiled to test/.build) against a stub
+ * that answers as the server does:
  *
- *   (w1) the mate body carries the two ids the connector route returned;
- *   (w2) the result names the mate AND each connector's anchor provenance
- *        (the durability rung the certificate later judges);
- *   (w3) a mate the server refuses leaves NO connector behind: both are
- *        deleted, and the refusal reaches the agent as an error;
- *   (w4) a second connector the server refuses takes the first one with it;
- *   (w5) a connector answer that names no id is refused, never posted on;
- *   (w6) the stub's connector shape is pinned to the Rust source, so a
- *        server-side rename breaks here instead of in an agent's session.
+ *   (w1) create is ONE request to the joint route, carrying kind, both ends
+ *        (the hex pid verbatim) and couples;
+ *   (w2) the result is the server's answer: the mate and each connector's
+ *        anchor provenance;
+ *   (w3) a refused joint reaches the agent as a typed error, and nothing else
+ *        is called (no clean-up requests: the server made nothing);
+ *   (w4) edit and remove go to the mate routes; a missing mate_id is refused
+ *        before any request;
+ *   (w5) the schema the agent validates against accepts only the canonical
+ *        pid form and refuses an unknown field (the SDK path, validateOp);
+ *   (w6) the stub's shapes are pinned to the Rust source, so a server-side
+ *        rename breaks here instead of in an agent's session.
  *
  *     npm run test:gates:build && node test/assembly_mate_wire.test.mjs
  */
@@ -38,20 +44,12 @@ const ASM = "aaaaaaaa-0000-4000-8000-000000000001";
 const INST_A = "aaaaaaaa-0000-4000-8000-0000000000a1";
 const INST_B = "aaaaaaaa-0000-4000-8000-0000000000b1";
 const MATE = "aaaaaaaa-0000-4000-8000-00000000000e";
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CONN_A = "cccccccc-0000-4000-8000-000000000001";
+const CONN_B = "cccccccc-0000-4000-8000-000000000002";
+const PID = "0123456789abcdef0123456789abcdef";
 
 /** Every request the stub saw, in order. */
 let seen = [];
-/** How many connectors the stub has minted (ids are distinct per mint). */
-let minted = 0;
-/** The connector ids currently alive in the stub's assembly. */
-let alive = new Set();
-/** When set, the Nth connector POST (1-based) is refused. */
-let refuseConnectorNumber = 0;
-/** When true, the connector answer carries no id field at all. */
-let namelessConnector = false;
-
-const connectorId = (n) => `cccccccc-0000-4000-8000-${String(n).padStart(12, "0")}`;
 
 const stub = http.createServer((req, res) => {
   const url = req.url ?? "";
@@ -60,64 +58,44 @@ const stub = http.createServer((req, res) => {
   req.on("end", () => {
     const body = raw.length ? JSON.parse(raw) : undefined;
     seen.push({ method: req.method, url, body });
-    const send = (status, payload, json = true) => {
-      res.writeHead(status, { "Content-Type": json ? "application/json" : "text/plain" });
-      res.end(json ? JSON.stringify(payload) : payload);
+    const send = (status, payload) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(payload));
     };
 
-    if (req.method === "POST" && url === `/api/assembly/${ASM}/connector`) {
-      minted += 1;
-      if (minted === refuseConnectorNumber) {
-        return send(400, {
-          success: false,
-          error_code: "invalid_parameter",
-          error: "label 'no-such-face' does not name a face on this instance",
-          retryable: false,
-        });
-      }
-      const id = connectorId(minted);
-      alive.add(id);
-      // assembly_mates.rs::ConnectorResponse, field for field.
-      const answer = {
-        connector_id: id,
-        instance_id: body.instance_id,
-        provenance: body.frame ? "Raw" : "Label",
-        frame: { origin: [0, 0, 0], z_axis: [0, 0, 1], x_axis: [1, 0, 0] },
-        radius: null,
-      };
-      if (namelessConnector) delete answer.connector_id;
-      return send(200, answer);
-    }
-
-    const del = url.match(new RegExp(`^/api/assembly/${ASM}/connector/([0-9a-f-]+)$`));
-    if (req.method === "DELETE" && del) {
-      if (!alive.delete(del[1])) return send(400, { success: false, error: "connector not found" });
-      return send(200, { success: true, connector_id: del[1] });
-    }
-
-    if (req.method === "POST" && url === `/api/assembly/${ASM}/mate`) {
-      // axum's Json extractor: `a: Uuid` / `b: Uuid` are required fields.
-      for (const side of ["a", "b"]) {
-        if (typeof body?.[side] !== "string" || !UUID_RE.test(body[side])) {
-          return send(
-            422,
-            `Failed to deserialize the JSON body into the target type: missing field \`${side}\``,
-            false,
-          );
-        }
-      }
+    if (req.method === "POST" && url === `/api/assembly/${ASM}/joint`) {
       if (body.kind === "Cam") {
         return send(400, {
           success: false,
           error_code: "invalid_parameter",
           error: "mate kind Cam is refused: not implemented in the solver",
           retryable: false,
+          hint: "the mate was refused; its two connectors were not kept",
         });
       }
-      // assembly_mates.rs::create_mate answer.
-      return send(200, { mate_id: MATE, kind: body.kind, a: body.a, b: body.b, at: null });
+      const end = (side, id) => ({
+        connector_id: id,
+        instance_id: side.instance_id,
+        provenance: side.frame ? "Raw" : side.pid ? "Pid" : "Label",
+        frame: { origin: [0, 0, 0], z_axis: [0, 0, 1], x_axis: [1, 0, 0] },
+        radius: null,
+      });
+      // assembly_mates.rs::JointResponse, field for field.
+      return send(200, {
+        mate_id: MATE,
+        kind: body.kind,
+        a: CONN_A,
+        b: CONN_B,
+        at: [],
+        connectors: { a: end(body.a, CONN_A), b: end(body.b, CONN_B) },
+      });
     }
-
+    if (req.method === "PATCH" && url === `/api/assembly/${ASM}/mate/${MATE}`) {
+      return send(200, { success: true, mate_id: MATE, kind: body.kind });
+    }
+    if (req.method === "DELETE" && url === `/api/assembly/${ASM}/mate/${MATE}`) {
+      return send(200, { success: true, mate_id: MATE });
+    }
     send(404, {});
   });
 });
@@ -126,109 +104,110 @@ await once(stub, "listening");
 process.env.ROSHERA_URL = `http://127.0.0.1:${stub.address().port}`;
 
 const { buildTable } = await import(pathToFileURL(join(HERE, ".build", "surface.js")).href);
+const { validateOp } = await import(pathToFileURL(join(HERE, ".build", "metatools.js")).href);
 const table = buildTable();
-const call = (name, args) => table.get(name).handler(args, {});
-const reset = () => {
-  seen = [];
-  minted = 0;
-  alive = new Set();
-  refuseConnectorNumber = 0;
-  namelessConnector = false;
+/** Validate as the SDK does (defaults applied), then dispatch the real handler. */
+const call = async (args) => {
+  const { parsed } = await validateOp(table, "assembly_mate", args);
+  return table.get("assembly_mate").handler(parsed, {});
 };
 const jsonOf = (result) => JSON.parse(result.content[0].text);
-const mateArgs = (kind) => ({
+const createArgs = (kind) => ({
   assembly_id: ASM,
-  action: "create",
   kind,
-  a: { instance_id: INST_A, label: "bore" },
-  b: {
-    instance_id: INST_B,
-    frame: { origin: [0, 0, 0], z_axis: [0, 0, 1], x_axis: [1, 0, 0] },
-  },
+  a: { instance_id: INST_A, pid: PID },
+  b: { instance_id: INST_B, frame: { origin: [0, 0, 0], z_axis: [0, 0, 1], x_axis: [1, 0, 0] } },
 });
 
 let passed = 0;
 const check = async (label, fn) => {
+  seen = [];
   await fn();
   passed += 1;
   console.log(`  ok - ${label}`);
 };
 
-await check("(w1) the mate body carries the ids the connector route returned", async () => {
-  reset();
-  const result = await call("assembly_mate", mateArgs({ Revolute: { limits: [-0.1, 0.1] } }));
+await check("(w1) create is one request to the joint route", async () => {
+  const result = await call(createArgs({ Revolute: { limits: [-0.1, 0.1] } }));
   assert.notEqual(result.isError, true, result.content[0].text);
-  const mate = seen.find((s) => s.method === "POST" && s.url.endsWith("/mate"));
-  assert.ok(mate, "the mate route was never reached");
-  assert.equal(mate.body.a, connectorId(1), "side A is the first connector the server minted");
-  assert.equal(mate.body.b, connectorId(2), "side B is the second connector the server minted");
-  assert.deepEqual(mate.body.kind, { Revolute: { limits: [-0.1, 0.1] } });
+  assert.equal(seen.length, 1, `exactly one request, got ${seen.map((s) => `${s.method} ${s.url}`)}`);
+  const [joint] = seen;
+  assert.equal(joint.method, "POST");
+  assert.equal(joint.url, `/api/assembly/${ASM}/joint`);
+  assert.deepEqual(joint.body.kind, { Revolute: { limits: [-0.1, 0.1] } });
+  assert.deepEqual(joint.body.a, { instance_id: INST_A, pid: PID }, "the hex pid goes through verbatim");
+  assert.equal(joint.body.couples, null, "absent couples are sent as null, as the route defaults");
 });
 
-await check("(w2) the result names the mate and each connector's anchor provenance", async () => {
-  reset();
-  const out = jsonOf(await call("assembly_mate", mateArgs("Fastened")));
+await check("(w2) the result is the server's answer, connectors included", async () => {
+  const result = await call(createArgs("Fastened"));
+  const out = jsonOf(result);
   assert.equal(out.mate_id, MATE);
-  assert.equal(out.a, connectorId(1));
-  assert.equal(out.b, connectorId(2));
-  assert.deepEqual(
-    [out.connectors.a.connector_id, out.connectors.a.provenance],
-    [connectorId(1), "Label"],
-  );
-  assert.deepEqual(
-    [out.connectors.b.connector_id, out.connectors.b.provenance],
-    [connectorId(2), "Raw"],
-    "a raw frame is reported as raw: the rung certify judges",
-  );
-  assert.equal(alive.size, 2, "a created mate keeps both its connectors");
+  assert.deepEqual([out.connectors.a.connector_id, out.connectors.a.provenance], [CONN_A, "Pid"]);
+  assert.deepEqual([out.connectors.b.connector_id, out.connectors.b.provenance], [CONN_B, "Raw"]);
+  assert.deepEqual(result.structuredContent, out, "the same facts as structured content");
 });
 
-await check("(w3) a refused mate leaves no connector behind", async () => {
-  reset();
-  const result = await call("assembly_mate", mateArgs("Cam"));
+await check("(w3) a refused joint is a typed error and nothing else is called", async () => {
+  const result = await call(createArgs("Cam"));
   assert.equal(result.isError, true, "the server's refusal must reach the agent as an error");
-  assert.match(result.content[0].text, /Cam is refused/);
   assert.equal(result.structuredContent?.error_code, "invalid_parameter");
-  const deletes = seen.filter((s) => s.method === "DELETE").map((s) => s.url.split("/").pop());
-  assert.deepEqual(deletes.sort(), [connectorId(1), connectorId(2)]);
-  assert.equal(alive.size, 0, "both connectors made for the refused mate are gone");
+  assert.match(result.structuredContent?.hint ?? "", /connectors were not kept/);
+  assert.equal(seen.length, 1, "no clean-up requests: the server made nothing");
 });
 
-await check("(w4) a refused second connector takes the first one with it", async () => {
-  reset();
-  refuseConnectorNumber = 2;
-  const result = await call("assembly_mate", mateArgs("Fastened"));
-  assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /no-such-face/);
-  assert.equal(alive.size, 0, "the first connector is not left orphaned");
-  assert.equal(
-    seen.filter((s) => s.url.endsWith("/mate")).length, 0,
-    "no mate is attempted on half a pair",
-  );
+await check("(w4) edit and remove reach the mate routes; a missing mate_id is refused first", async () => {
+  const edited = await call({ assembly_id: ASM, action: "edit", mate_id: MATE, kind: "Fastened" });
+  assert.notEqual(edited.isError, true, edited.content[0].text);
+  assert.deepEqual([seen[0].method, seen[0].body], ["PATCH", { kind: "Fastened" }]);
+
+  seen = [];
+  const removed = await call({ assembly_id: ASM, action: "remove", mate_id: MATE });
+  assert.notEqual(removed.isError, true, removed.content[0].text);
+  assert.deepEqual([seen[0].method, seen[0].url], ["DELETE", `/api/assembly/${ASM}/mate/${MATE}`]);
+
+  seen = [];
+  const refused = await call({ assembly_id: ASM, action: "remove" });
+  assert.equal(refused.isError, true);
+  assert.deepEqual(refused.structuredContent?.details?.missing, ["mate_id"]);
+  assert.equal(seen.length, 0, "nothing is sent for a call that cannot be made");
+
+  const noKind = await call({ assembly_id: ASM, a: createArgs("x").a, b: createArgs("x").b });
+  assert.equal(noKind.isError, true);
+  assert.deepEqual(noKind.structuredContent?.details?.missing, ["kind"]);
 });
 
-await check("(w5) a connector answer that names no id is refused, never posted on", async () => {
-  reset();
-  namelessConnector = true;
-  const result = await call("assembly_mate", mateArgs("Fastened"));
-  assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /connector_id/);
-  assert.equal(
-    seen.filter((s) => s.url.endsWith("/mate")).length, 0,
-    "a mate must never be posted with an id the server did not give",
-  );
+await check("(w5) the schema takes only the canonical pid and refuses unknown fields", async () => {
+  const bad = { ...createArgs("Fastened"), a: { instance_id: INST_A, pid: "1512366075204170929049582354406559" } };
+  await assert.rejects(validateOp(table, "assembly_mate", bad), /pid|Invalid/);
+  const upper = { ...createArgs("Fastened"), a: { instance_id: INST_A, pid: PID.toUpperCase() } };
+  await assert.rejects(validateOp(table, "assembly_mate", upper));
+  const typo = { ...createArgs("Fastened"), a: { instance_id: INST_A, lable: "bore" } };
+  await assert.rejects(validateOp(table, "assembly_mate", typo), /lable|Unrecognized/);
+  const top = { ...createArgs("Fastened"), mate: MATE };
+  await assert.rejects(validateOp(table, "assembly_mate", top), /mate|Unrecognized/);
 });
 
-await check("(w6) the stub's connector shape is the server's own", async () => {
+await check("(w6) the stub's shapes are the server's own", async () => {
   const src = readFileSync(
     join(HERE, "..", "..", "roshera-backend", "api-server", "src", "assembly_mates.rs"),
     "utf8",
   );
-  const m = src.match(/pub struct ConnectorResponse \{([^}]*)\}/);
-  assert.ok(m, "ConnectorResponse is no longer declared in assembly_mates.rs");
-  const fields = [...m[1].matchAll(/pub (\w+):/g)].map((f) => f[1]);
-  assert.deepEqual(fields, ["connector_id", "instance_id", "provenance", "frame", "radius"]);
-  assert.match(src, /"mate_id": mate\.id\.0/, "the mate route no longer answers `mate_id`");
+  const fields = (name) => {
+    const m = src.match(new RegExp(`pub struct ${name} \\{([^}]*)\\}`));
+    assert.ok(m, `${name} is no longer declared in assembly_mates.rs`);
+    return [...m[1].matchAll(/pub (\w+):/g)].map((f) => f[1]);
+  };
+  assert.deepEqual(fields("JointResponse"), ["mate_id", "kind", "a", "b", "at", "connectors"]);
+  assert.deepEqual(fields("JointConnectors"), ["a", "b"]);
+  assert.deepEqual(fields("ConnectorResponse"), ["connector_id", "instance_id", "provenance", "frame", "radius"]);
+  assert.deepEqual(fields("CreateJointRequest"), ["kind", "a", "b", "couples"]);
+  assert.deepEqual(fields("JointEnd"), ["instance_id", "label", "pid", "face_id", "frame"]);
+  // The schema's connector fields are exactly the JointEnd fields the route reads.
+  const schema = table.get("assembly_mate").served.input_schema;
+  assert.deepEqual(Object.keys(schema.properties.a.properties), fields("JointEnd"));
+  const main = readFileSync(join(HERE, "..", "..", "roshera-backend", "api-server", "src", "main.rs"), "utf8");
+  assert.ok(main.includes('"/api/assembly/{id}/joint"'), "main.rs routes the joint path");
 });
 
 stub.close();

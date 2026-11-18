@@ -18,7 +18,6 @@
 //! restart shows its certificate's blocking faces but not the import story.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::Json;
 use dashmap::DashMap;
 use geometry_engine::lens::{EntityRef, EventKind, FaceStatus, LensEvent, LensJournal, Stage};
@@ -27,6 +26,7 @@ use geometry_engine::primitives::topology_builder::BRepModel;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+use crate::error_catalog::{ApiError, ErrorCode};
 use crate::part_mgr::ActiveModel;
 use crate::AppState;
 
@@ -190,9 +190,9 @@ pub async fn get_part_lens(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(part): Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, ApiError> {
     let mut model = model_handle.write().await;
-    let solid_id = resolve_solid(&state, &model, &part).ok_or(StatusCode::NOT_FOUND)?;
+    let solid_id = resolve_solid(&state, &model, &part).ok_or_else(|| part_not_resolved(&part))?;
     let lens = part_lens(&state, &mut model, solid_id);
     drop(model);
     let mut overview = lens.journal.overview();
@@ -233,14 +233,26 @@ pub async fn get_part_lens(
     })))
 }
 
+/// The typed 404 for a part reference that names no live solid. Before
+/// 2026-11-18 both lens routes answered a bare 404 with an empty body, so
+/// `lens_explain` / `lens_why_not_sound` could not say what was wrong.
+fn part_not_resolved(part: &str) -> ApiError {
+    ApiError::new(
+        ErrorCode::SolidNotFound,
+        format!("part {part} does not name a live solid"),
+    )
+    .with_hint("pass an integer part_id from list_parts or an object_uuid")
+    .with_details(json!({ "part": part }))
+}
+
 /// `GET /api/lens/{part}/face/{face_id}`: one face's story.
 pub async fn get_face_lens(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path((part, face_id)): Path<(String, u32)>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, ApiError> {
     let mut model = model_handle.write().await;
-    let solid_id = resolve_solid(&state, &model, &part).ok_or(StatusCode::NOT_FOUND)?;
+    let solid_id = resolve_solid(&state, &model, &part).ok_or_else(|| part_not_resolved(&part))?;
     let lens = part_lens(&state, &mut model, solid_id);
     drop(model);
     let (_, pid) = lens
@@ -248,7 +260,14 @@ pub async fn get_face_lens(
         .iter()
         .find(|(f, _)| *f == face_id)
         .copied()
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::SolidNotFound,
+                format!("face {face_id} is not a face of part {part}"),
+            )
+            .with_hint("list the part's faces with GET /api/lens/{part}")
+            .with_details(json!({ "part": part, "face_id": face_id }))
+        })?;
     let events: Vec<Value> = match pid {
         Some(p) => lens.journal.for_face(p).map(event_json).collect(),
         None => lens

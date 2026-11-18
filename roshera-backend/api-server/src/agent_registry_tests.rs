@@ -244,6 +244,270 @@ async fn tool_registry_schemas_are_object_typed() {
     }
 }
 
+/// (e) The backend-owned definitions are SERVED: `GET /api/agent/tools` is the
+/// route roshera-mcp lists them from, and `/api/agent/tool-registry` names the
+/// same tools, so the two listings cannot disagree.
+#[tokio::test]
+async fn agent_tools_route_serves_the_owned_definitions() {
+    let state = make_test_state().await;
+    let (status, body) = get(&state, "/api/agent/tools").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /api/agent/tools; body = {body}"
+    );
+    assert_eq!(body["registry_version"].as_str(), Some("2.0.0"), "{body}");
+    let tools = body["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`tools` must be an array; body = {body}"));
+    assert_eq!(tools.len(), 12, "the assembly bench; body = {body}");
+    for t in tools {
+        let name = t["name"].as_str().unwrap_or("");
+        assert!(name.starts_with("assembly_"), "{t}");
+        assert!(t["call"].is_object(), "{name} must say how it is called");
+        assert!(
+            t["examples"].as_array().is_some_and(|a| !a.is_empty()),
+            "{name} must carry an example"
+        );
+        assert_eq!(t["input_schema"]["additionalProperties"], false, "{name}");
+    }
+
+    let (_, registry) = get(&state, "/api/agent/tool-registry").await;
+    let listed: std::collections::HashSet<&str> = registry["tools"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|t| t["name"].as_str()).collect())
+        .unwrap_or_default();
+    for t in tools {
+        let name = t["name"].as_str().unwrap_or("");
+        assert!(
+            listed.contains(name),
+            "{name} served but not in the tool registry"
+        );
+    }
+}
+
+/// POST a JSON body through the live router and return `(status, json_body)`.
+async fn post(state: &AppState, uri: &str, body: Value) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static request must build");
+    let response = build_router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router must produce a response (oneshot infallibility)");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body must serialize to finite bytes");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// (f) `assembly_mate`'s route is live and refuses typed: an unknown assembly
+/// is a catalogue error, and a pid that is not the canonical 32-hex form is a
+/// typed `invalid_parameter` naming the form — not axum's bare-text 422.
+#[tokio::test]
+async fn joint_route_is_routed_and_refuses_typed() {
+    let state = make_test_state().await;
+    let end = |pid: &str| {
+        serde_json::json!({
+            "instance_id": "22222222-2222-4222-8222-222222222222",
+            "pid": pid,
+        })
+    };
+    let uri = "/api/assembly/11111111-1111-4111-8111-111111111111/joint";
+
+    let (status, body) = post(
+        &state,
+        uri,
+        serde_json::json!({
+            "kind": "Fastened",
+            "a": end("0123456789abcdef0123456789abcdef"),
+            "b": end("fedcba9876543210fedcba9876543210"),
+        }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "route must exist; {body}"
+    );
+    assert!(
+        body["error_code"].is_string(),
+        "typed refusal for an unknown assembly: {body}"
+    );
+
+    let (status, body) = post(
+        &state,
+        uri,
+        serde_json::json!({ "kind": "Fastened", "a": end("12345"), "b": end("12345") }),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status} {body}");
+    assert_eq!(
+        body["error_code"].as_str(),
+        Some("invalid_parameter"),
+        "{body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("32 lowercase hex"),
+        "the refusal names the canonical pid form: {body}"
+    );
+}
+
+/// (g) `set_part_color` refuses a part that does not exist (typed
+/// `solid_not_found`) and still colours one that does. RED before
+/// 2026-11-18: the route answered 200 `success: true` for any integer and
+/// recorded the colour in history.
+#[tokio::test]
+async fn set_part_color_refuses_a_part_that_does_not_exist() {
+    let state = make_test_state().await;
+    let (status, body) = post(
+        &state,
+        "/api/agent/parts/987654/color",
+        serde_json::json!({ "r": 10, "g": 20, "b": 30 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["error_code"].as_str(),
+        Some("solid_not_found"),
+        "{body}"
+    );
+    assert!(
+        state.solid_colors.get(&987_654).is_none(),
+        "no colour is stored for a part that does not exist"
+    );
+
+    let (status, body) = post(
+        &state,
+        "/api/geometry/box",
+        serde_json::json!({ "width": 5.0, "depth": 5.0, "height": 5.0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "box create; body = {body}");
+    let sid: u32 = {
+        let m = state.model.read().await;
+        let ids: Vec<u32> = m.solids.iter().map(|(id, _)| id as u32).collect();
+        ids.into_iter().next().unwrap_or(u32::MAX)
+    };
+    let (status, body) = post(
+        &state,
+        &format!("/api/agent/parts/{sid}/color"),
+        serde_json::json!({ "r": 10, "g": 20, "b": 30 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["color"], serde_json::json!([10, 20, 30]), "{body}");
+}
+
+/// (h) The routes agent tools reach answer refusals with a TYPED body (the
+/// error catalogue), never a bare status code with an empty body. RED before
+/// 2026-11-18: every case below answered its status with no body at all, so
+/// MCP's `fail()` had no `error_code` to surface (MCP_AUDIT.md §2).
+#[tokio::test]
+async fn tool_reached_routes_refuse_with_typed_bodies() {
+    let state = make_test_state().await;
+    let cases: Vec<(&str, StatusCode, Value)> = vec![
+        (
+            "GET /api/timeline/history/not-a-branch",
+            StatusCode::BAD_REQUEST,
+            get(&state, "/api/timeline/history/not-a-branch").await.1,
+        ),
+        (
+            "GET /api/timeline/rebuild-certificate/not-a-branch",
+            StatusCode::BAD_REQUEST,
+            get(&state, "/api/timeline/rebuild-certificate/not-a-branch")
+                .await
+                .1,
+        ),
+        (
+            "GET /api/timeline/scrub/not-a-branch/1",
+            StatusCode::BAD_REQUEST,
+            get(&state, "/api/timeline/scrub/not-a-branch/1").await.1,
+        ),
+        (
+            "POST /api/timeline/undo {}",
+            StatusCode::BAD_REQUEST,
+            post(&state, "/api/timeline/undo", serde_json::json!({}))
+                .await
+                .1,
+        ),
+        (
+            "POST /api/timeline/redo bad session",
+            StatusCode::BAD_REQUEST,
+            post(
+                &state,
+                "/api/timeline/redo",
+                serde_json::json!({ "session_id": "nope" }),
+            )
+            .await
+            .1,
+        ),
+        (
+            "POST /api/timeline/clear bad session",
+            StatusCode::BAD_REQUEST,
+            post(
+                &state,
+                "/api/timeline/clear",
+                serde_json::json!({ "session_id": "nope" }),
+            )
+            .await
+            .1,
+        ),
+        (
+            "GET /api/lens/987654",
+            StatusCode::NOT_FOUND,
+            get(&state, "/api/lens/987654").await.1,
+        ),
+        (
+            "GET /api/agent/parts/987654/gdt",
+            StatusCode::NOT_FOUND,
+            get(&state, "/api/agent/parts/987654/gdt").await.1,
+        ),
+        (
+            "GET /api/agent/parts/987654/profile",
+            StatusCode::NOT_FOUND,
+            get(&state, "/api/agent/parts/987654/profile").await.1,
+        ),
+        (
+            "GET /api/agent/faces/987654",
+            StatusCode::NOT_FOUND,
+            get(&state, "/api/agent/faces/987654").await.1,
+        ),
+    ];
+    for (what, _expected, body) in &cases {
+        assert!(
+            body["error_code"].is_string(),
+            "{what}: no typed body; got {body}"
+        );
+        assert!(
+            body["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{what}: {body}"
+        );
+    }
+    // The status codes are the ones these routes always answered.
+    for (uri, expected) in [
+        (
+            "/api/timeline/history/not-a-branch",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/api/lens/987654", StatusCode::NOT_FOUND),
+        ("/api/agent/faces/987654", StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = get(&state, uri).await;
+        assert_eq!(status, expected, "{uri}: {body}");
+    }
+}
+
 /// (d) DISCONNECTION GATE — the agent can actually reach the rename route.
 ///
 /// `rename_part_by_uuid` was built, correct, routed, auth-guarded and covered

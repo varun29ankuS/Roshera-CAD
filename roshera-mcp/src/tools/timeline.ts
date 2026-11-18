@@ -5,7 +5,7 @@
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { api, ok, fail, ApiError } from "../core.js";
+import { api, ok, fail, ApiError, CONFIRM, confirmationRequired } from "../core.js";
 import { typedErrorResult, type GateDecision } from "../gates.js";
 
 /**
@@ -29,12 +29,47 @@ const AGENT_SESSION_ID = randomUUID();
 function refusalOrFail(e: unknown) {
   if (e instanceof ApiError && [404, 409, 422].includes(e.status)) {
     try {
-      return typedErrorResult({ refused: JSON.parse(e.body) });
+      const body = JSON.parse(e.body);
+      // A catalogue body's code, message and hint are lifted to the top level
+      // (where fail() puts them for every other tool) instead of staying
+      // buried in `refused` (MCP_AUDIT.md §2: "loses the hint tier").
+      const catalogue =
+        body && typeof body === "object" && typeof body.error_code === "string"
+          ? {
+              error_code: body.error_code,
+              reason: typeof body.error === "string" ? body.error : e.message,
+              retryable: body.retryable === true,
+              ...(typeof body.hint === "string" ? { hint: body.hint } : {}),
+            }
+          : {};
+      return typedErrorResult({ refused: body, ...catalogue });
     } catch {
       /* body not JSON — fall through */
     }
   }
   return fail(e);
+}
+
+/**
+ * A route that answers HTTP 200 with `success: false` did NOT do what was
+ * asked: undo / redo with nothing to step over, an unknown session, a refused
+ * replay (`handlers/timeline.rs::undo_operation`), or a merge stopped by
+ * conflicts (`branches.rs::MergeView`). Such an answer is an ERROR result
+ * carrying the typed refusal — the server's body verbatim as `refused`, its
+ * `error_code` when it gave one (else `fallbackCode`), its message as
+ * `reason` — so every client sees a failure, `cad_program` stops at it, and
+ * the refusal cache records it. Before 2026-11-18 these were wrapped as
+ * ordinary results (MCP_AUDIT.md 1.4 / 1.5). Returns null for a real success.
+ */
+export function successFalseRefusal(r: any, fallbackCode: string) {
+  if (!r || typeof r !== "object" || r.success !== false) return null;
+  return typedErrorResult({
+    refused: r,
+    error_code: typeof r.error_code === "string" ? r.error_code : fallbackCode,
+    reason: typeof r.message === "string" ? r.message : `${fallbackCode.replace(/_/g, " ")}`,
+    retryable: false,
+    ...(typeof r.hint === "string" ? { hint: r.hint } : {}),
+  });
 }
 
 export function registerTimelineTools(server: ToolHost) {
@@ -410,6 +445,10 @@ export function registerTimelineTools(server: ToolHost) {
           `/api/branches/${encodeURIComponent(source)}/merge`,
           { target, strategy, message },
         );
+        // A merge stopped by conflicts merged nothing: a typed failure with
+        // its witnesses, and no certificate for a state that did not change.
+        const conflicted = successFalseRefusal(r, "branch_merge_conflict");
+        if (conflicted) return conflicted;
         if (r?.success && certify) {
           // The certificate is the proof the merged state still derives
           // (#64 rebuild certificate) — fetched, never fabricated; on
@@ -576,14 +615,14 @@ export function registerTimelineTools(server: ToolHost) {
     "Step this agent's timeline cursor back one operation and re-derive the " +
       "live model to match. The cursor is per-MCP-session, seeded at the " +
       "current head on first use; at the beginning it answers " +
-      "{success:false, can_undo:false} — an honest bottom, not an error.",
+      "a typed refusal (nothing_to_undo) — an honest bottom, never a silent success.",
     {},
     async () => {
       try {
         const r = await api("POST", "/api/timeline/undo", {
           session_id: AGENT_SESSION_ID,
         });
-        return ok(r);
+        return successFalseRefusal(r, "nothing_to_undo") ?? ok(r);
       } catch (e) {
         return fail(e);
       }
@@ -594,14 +633,14 @@ export function registerTimelineTools(server: ToolHost) {
     "timeline_redo",
     "Step this agent's timeline cursor forward one operation (after " +
       "timeline_undo) and re-derive the live model to match. At the head it " +
-      "answers {success:false} honestly.",
+      "refuses typed (nothing_to_redo), never a silent success.",
     {},
     async () => {
       try {
         const r = await api("POST", "/api/timeline/redo", {
           session_id: AGENT_SESSION_ID,
         });
-        return ok(r);
+        return successFalseRefusal(r, "nothing_to_redo") ?? ok(r);
       } catch (e) {
         return fail(e);
       }
@@ -612,14 +651,18 @@ export function registerTimelineTools(server: ToolHost) {
     "clear_timeline",
     "Reset a branch to ZERO events and wipe the live model — DESTRUCTIVE and " +
       "irreversible (the ledger is rewritten). Use clear_parts instead for an " +
-      "empty scene with preserved history.",
+      "empty scene with preserved history. Needs confirm: true.",
     {
       branch_id: z
         .string()
         .default("main")
         .describe("branch to clear; 'main' is the trunk"),
+      confirm: CONFIRM,
     },
-    async ({ branch_id }) => {
+    async ({ branch_id, confirm }) => {
+      if (confirm !== true) {
+        return confirmationRequired("clear_timeline", `erases every event on branch '${branch_id}' and the live model, irreversibly`);
+      }
       try {
         // The endpoint seeds its own replay position, so a fresh per-call
         // session id is sufficient; the truncate is branch-scoped, not

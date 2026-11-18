@@ -27,9 +27,10 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { BASE, AUTH_HEADERS, bindSessionDocument } from "./core.js";
+import { BASE, AUTH_HEADERS, bindSessionDocument, ID_SPACES_INSTRUCTIONS } from "./core.js";
 import { RegisteredTool, canonicalJson, fnv1a64hex } from "./registry.js";
 import { setRegistryWarning } from "./metatools.js";
+import { fetchLiveDefs, loadCheckedInDefs, type ServedRegistry } from "./served.js";
 import {
   buildTableWithControls,
   resolveSurfaceMode,
@@ -52,12 +53,44 @@ const server = new McpServer({
   name: "🅡 ROSHERA",
   version: "0.1.0",
   icons: [{ src: ROSHERA_ICON, mimeType: "image/svg+xml", sizes: ["48x48"] }],
+}, {
+  // Said once per session, not per tool: the two id spaces and the units.
+  instructions: ID_SPACES_INSTRUCTIONS,
 });
 
 // ── 1. Register EVERY tool + composition + meta-tools into the single table ──
 // (Assembly + surface policy live in surface.ts, shared with the test suite.)
 // The Workbench controller (S3) rides along, owning the bench-switch state.
-const { table, workbench } = buildTableWithControls();
+//
+// The backend-defined tools (served.ts) come from the live server's
+// `GET /api/agent/tools` when it answers — what THIS backend serves — and
+// otherwise from the backend's checked-in definition files. A listing in a
+// registry format this adapter does not speak refuses startup of that bench
+// loudly rather than registering part of it.
+async function loadServed(): Promise<ServedRegistry | null> {
+  try {
+    const live = await fetchLiveDefs();
+    if (live) return live;
+  } catch (e) {
+    console.error(`roshera-mcp: live tool definitions refused — ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+  try {
+    return loadCheckedInDefs();
+  } catch (e) {
+    console.error(`roshera-mcp: no backend tool definitions — ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+const served = await loadServed();
+if (served === null) {
+  setRegistryWarning(
+    "the backend-defined tools (the assembly bench) are not registered: their definitions could not be loaded (see stderr).",
+  );
+} else {
+  console.error(`roshera-mcp: ${served.tools.length} backend-defined tools from ${served.source}.`);
+}
+const { table, workbench } = buildTableWithControls(served);
 
 // ── 2. Mount the active surface onto the live server ─────────────────────────
 // Default = minimal-complete (core verbs + workbench/cad_program + 3 meta-tools);
@@ -72,7 +105,11 @@ const { table, workbench } = buildTableWithControls();
 function mount(entry: RegisteredTool, enabled = true) {
   const handle = server.registerTool(
     entry.name,
-    { description: entry.description, inputSchema: entry.schema as any },
+    {
+      description: entry.description,
+      inputSchema: entry.schema as any,
+      ...(entry.annotations ? { annotations: entry.annotations as any } : {}),
+    },
     entry.handler,
   );
   if (!enabled) handle.disable();

@@ -40,6 +40,7 @@
 //! /api/agent/parts/{id}/select-face`). Selector resolution reuses the
 //! `resolve_selector` machinery from the label handler (same function).
 
+use crate::error_catalog::ApiError;
 use crate::part_mgr::ActiveModel;
 use crate::AppState;
 use axum::{
@@ -1359,12 +1360,14 @@ pub async fn get_gdt_handler(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
-) -> Result<Json<GdtResponse>, StatusCode> {
+) -> Result<Json<GdtResponse>, ApiError> {
     let solid = id as SolidId;
     let model = model_handle.read().await;
 
+    // Typed (2026-11-18): a bare 404 with no body reached `gdt_report` as
+    // "→ 404: " and nothing else.
     if model.solids.get(solid).is_none() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::solid_not_found(id));
     }
 
     let drf = drf_for_solid(&model, solid);

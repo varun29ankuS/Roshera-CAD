@@ -19,6 +19,7 @@ mod agent_registry;
 #[cfg(test)]
 mod agent_registry_tests;
 mod agent_show;
+mod agent_tools;
 mod ai_provider_config;
 mod assembly_instances;
 mod assembly_mates;
@@ -11301,6 +11302,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
             delete(assembly_mates::delete_connector),
         )
         .route("/api/assembly/{id}/mate", post(assembly_mates::create_mate))
+        // Connectors + mate as ONE change (the agent's `assembly_mate`).
+        .route(
+            "/api/assembly/{id}/joint",
+            post(assembly_mates::create_joint),
+        )
         .route(
             "/api/assembly/{id}/mate/{mid}",
             axum::routing::patch(assembly_mates::patch_mate).delete(assembly_mates::delete_mate),
@@ -11704,6 +11710,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/agent/tool-registry",
             get(crate::agent_registry::tool_registry),
         )
+        // Backend-owned agent tool definitions (single-registry stage 1):
+        // the assembly bench, served verbatim; roshera-mcp registers them.
+        .route("/api/agent/tools", get(crate::agent_tools::list_tools))
         .route(
             "/api/agent/parts/{id}/truth",
             get(handlers::agent::part_truth),
