@@ -49,7 +49,7 @@ import {
   listDocumentParts,
   deleteDrawing,
   downloadDrawing,
-  fetchDrawingSvg,
+  previewDrawingSvg,
   getDrawing,
   getDrawingQuality,
   listDrawings,
@@ -319,7 +319,9 @@ export function DrawingsWorkspace() {
     setLoading(true)
     setError(null)
     try {
-      const [d, s] = await Promise.all([getDrawing(id), fetchDrawingSvg(id)])
+      // The on-screen sheet is a draft for review: shown even when its layout
+      // check fails (SheetPanel lists the findings); downloads stay refused.
+      const [d, s] = await Promise.all([getDrawing(id), previewDrawingSvg(id)])
       setActiveDrawing(d)
       setSvg(s)
     } catch (e) {

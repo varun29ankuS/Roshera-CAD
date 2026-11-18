@@ -10,6 +10,8 @@
  * `GET /api/drawings/{id}/svg` and inline the response into a Blob URL.
  */
 
+import { drawingSvgUrl } from './drawing-svg-url'
+
 const API_HOST = import.meta.env.VITE_API_URL || ''
 
 // ── Wire types — mirror geometry-engine/src/drawing/types.rs ────────
@@ -555,9 +557,21 @@ export async function getDrawingQuality(drawingId: string): Promise<DrawingQuali
   return jsonOrThrow<DrawingQualityReport>(r, 'getDrawingQuality')
 }
 
-/** Fetch the rendered SVG (raw XML string). Empty drawing → envelope only. */
+/** Fetch the rendered SVG (raw XML string) for a DOWNLOAD: refused while the
+ *  sheet's layout check fails. Empty drawing → envelope only. */
 export async function fetchDrawingSvg(id: string): Promise<string> {
-  const r = await fetch(`${API_HOST}/api/drawings/${id}/svg`)
+  const r = await fetch(drawingSvgUrl(API_HOST, id, { review: false }))
+  if (!r.ok) {
+    throw await refusalOf(r)
+  }
+  return r.text()
+}
+
+/** Fetch the sheet to SHOW on screen: a draft for human review even when
+ *  its layout check fails (the sheet panel lists the findings). An unsound
+ *  sheet is still refused. */
+export async function previewDrawingSvg(id: string): Promise<string> {
+  const r = await fetch(drawingSvgUrl(API_HOST, id, { review: true }))
   if (!r.ok) {
     throw await refusalOf(r)
   }
