@@ -57,6 +57,30 @@ export function shouldShowGuide(storage: KeyValueStore): boolean {
   }
 }
 
+/** Whether the guide may open now: only for a signed-in person, never over
+ *  the sign-in screen (a 401 trips `authRequired` only AFTER the app has
+ *  mounted, so checking that alone opened the guide behind the sign-in). */
+export function guideMayOpen(s: { authenticated: boolean; authRequired: boolean; seen: boolean }): boolean {
+  return s.authenticated && !s.authRequired && !s.seen
+}
+
+/** Whether a failure is the person not being signed in (or their session
+ *  ending) rather than anything about their work. The sign-in screen says
+ *  so; posting it to the Blackboard too only buried the board under
+ *  "Scene sync failed (HTTP 401)" and an auth-handshake refusal, and the
+ *  kernel-evidence row then read that refusal as the KERNEL refusing. */
+export function isSignInProblem(e: { status?: number; text?: string }): boolean {
+  if (e.status === 401) return true
+  const t = (e.text ?? '').toLowerCase()
+  return (
+    t.includes('auth_handshake_timeout') ||
+    t.includes('(unauthorized)') ||
+    t.includes('authentication handshake') ||
+    t.includes('invalid or expired token') ||
+    t.includes('authentication required')
+  )
+}
+
 /** Remember that the guide was dismissed. Never throws. */
 export function markGuideSeen(storage: KeyValueStore): void {
   try {
@@ -115,7 +139,7 @@ export function parseShowcase(raw: unknown): ShowcaseItem[] {
     const { kind, title, caption, src } = it as Record<string, unknown>
     if (typeof kind !== 'string' || !kinds.has(kind)) continue
     if (typeof title !== 'string' || title.trim() === '') continue
-    if (typeof src !== 'string' || !src.startsWith('/showcase/') || !/\.(png|jpe?g|webp|svg)$/i.test(src)) continue
+    if (typeof src !== 'string' || !src.startsWith('/showcase/') || !/\.(png|jpe?g|webp|svg|stl)$/i.test(src)) continue
     out.push({
       kind: kind as ShowcaseKind,
       title: title.trim(),
@@ -124,6 +148,13 @@ export function parseShowcase(raw: unknown): ShowcaseItem[] {
     })
   }
   return out
+}
+
+/** The sign-in hero: the first item that is a mesh the kernel made (an STL
+ *  tessellated from a certified STEP part), shown live in 3D; `null` when
+ *  the manifest lists images only. */
+export function heroOf(items: readonly ShowcaseItem[]): ShowcaseItem | null {
+  return items.find((i) => /\.stl$/i.test(i.src)) ?? null
 }
 
 // --- reopening the guide -------------------------------------------------

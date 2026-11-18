@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
-import { isAuthRequired } from '@/lib/auth'
-import { GUIDE_STEPS, markGuideSeen, onOpenGuide, shouldShowGuide } from '@/lib/first-run'
+import { isAuthenticated, isAuthRequired, onAuthChange } from '@/lib/auth'
+import { GUIDE_STEPS, guideMayOpen, markGuideSeen, onOpenGuide, shouldShowGuide } from '@/lib/first-run'
 
 function storage(): Pick<Storage, 'getItem' | 'setItem'> {
   try {
@@ -20,7 +20,13 @@ function storage(): Pick<Storage, 'getItem' | 'setItem'> {
  * per the layout rules; it never opens over the sign-in screen.
  */
 export function FirstRunGuide() {
-  const [open, setOpen] = useState(() => !isAuthRequired() && shouldShowGuide(storage()))
+  const decide = () =>
+    guideMayOpen({
+      authenticated: isAuthenticated(),
+      authRequired: isAuthRequired(),
+      seen: !shouldShowGuide(storage()),
+    })
+  const [open, setOpen] = useState(decide)
   const [step, setStep] = useState(0)
 
   useEffect(
@@ -29,6 +35,18 @@ export function FirstRunGuide() {
         setStep(0)
         setOpen(true)
       }),
+    [],
+  )
+
+  // Sign-in state changes after mount: a 401 trips "auth required" (close,
+  // the sign-in screen shows) and a sign-in sets the token (open if unseen).
+  useEffect(
+    () =>
+      onAuthChange(() => {
+        if (isAuthRequired()) setOpen(false)
+        else if (decide()) setOpen(true)
+      }),
+    // `decide` reads module state only; it has no React dependencies.
     [],
   )
 

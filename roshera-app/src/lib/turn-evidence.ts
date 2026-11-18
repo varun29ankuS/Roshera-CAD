@@ -3,6 +3,7 @@ import type { BlackboardCard, CardKind } from './blackboard-cards.ts'
 import { isDfmReport } from './blackboard-cards.ts'
 import { isBuildStepLine } from './blackboard-groups.ts'
 import { cardsInText, cardVerdict, type LineVerdict } from './blackboard-line-state.ts'
+import { isSignInProblem } from './first-run.ts'
 
 /**
  * TURN EVIDENCE — every agent turn ends in the kernel's answer
@@ -96,7 +97,9 @@ function evidenceForRun(run: BlackboardLine[], inFlight: boolean): TurnEvidence 
   let lastBuildLineId: string | null = null
   for (const line of run) {
     if (isBuildStepLine(line)) lastBuildLineId = line.id
-    if (SERVER_REFUSED.test(line.text)) {
+    // A refusal because the person is not signed in is not the kernel
+    // refusing their work (lib/first-run.ts isSignInProblem).
+    if (SERVER_REFUSED.test(line.text) && !isSignInProblem({ text: line.text })) {
       marks.push({ lineId: line.id, source: 'server-refusal', verdict: 'inconclusive', word: 'refused' })
       continue
     }

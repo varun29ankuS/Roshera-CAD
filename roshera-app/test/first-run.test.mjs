@@ -20,7 +20,11 @@ import {
   friendlyLoginError,
   parseShowcase,
   SHOWCASE_LABEL,
+  guideMayOpen,
+  isSignInProblem,
+  heroOf,
 } from '../src/lib/first-run.ts'
+import { turnEvidence } from '../src/lib/turn-evidence.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const src = (p) => readFileSync(join(here, '..', 'src', p), 'utf8')
@@ -91,6 +95,45 @@ test('the sign-in screen explains Roshera and uses the plain-language errors', (
   assert.ok(/<label/.test(login), 'fields are labelled, not placeholder-only')
   assert.ok(login.includes('/logo.png'), 'it carries the Roshera logo')
   assert.ok(login.includes('parseShowcase('), 'it shows the showcase from its manifest')
+  assert.ok(login.includes('<HeroModel'), 'the hero is a live 3D model')
+})
+
+test('the guide opens only for a signed-in person, never over the sign-in screen', () => {
+  assert.equal(guideMayOpen({ authenticated: true, authRequired: false, seen: false }), true)
+  assert.equal(guideMayOpen({ authenticated: false, authRequired: false, seen: false }), false, 'not signed in yet')
+  assert.equal(guideMayOpen({ authenticated: true, authRequired: true, seen: false }), false, 'session expired: sign-in shows')
+  assert.equal(guideMayOpen({ authenticated: true, authRequired: false, seen: true }), false, 'already seen')
+  const guide = src('components/FirstRunGuide.tsx')
+  assert.ok(guide.includes('guideMayOpen('), 'the guide decides with guideMayOpen')
+  assert.ok(guide.includes('onAuthChange('), 'and re-decides when sign-in state changes')
+})
+
+test('a sign-in problem is not posted to the board and is not kernel evidence', () => {
+  assert.equal(isSignInProblem({ status: 401 }), true)
+  assert.equal(isSignInProblem({ status: 500 }), false)
+  assert.equal(
+    isSignInProblem({
+      text: 'authentication handshake deadline (30s) exceeded: send an Authenticate frame with a valid token promptly after connecting (auth_handshake_timeout)',
+    }),
+    true,
+  )
+  assert.equal(isSignInProblem({ text: 'invalid or expired token (unauthorized)' }), true)
+  assert.equal(isSignInProblem({ text: 'fillet radius 12 exceeds the edge length (fillet_too_large)' }), false)
+  const bridge = src('lib/ws-bridge.ts')
+  assert.ok((bridge.match(/isSignInProblem\(/g) ?? []).length >= 2, 'ws-bridge filters both the 401 resync and the WS refusal')
+  const lines = [
+    { id: 'u1', author: 'user', text: 'make a plate' },
+    {
+      id: 's1',
+      author: 'system',
+      text: 'Server refused: authentication handshake deadline (30s) exceeded: send an Authenticate frame with a valid token promptly after connecting (auth_handshake_timeout)',
+    },
+  ]
+  const turns = turnEvidence(lines)
+  assert.ok(
+    turns.every((t) => t.marks.length === 0),
+    'a sign-in refusal is not a kernel refusal: ' + JSON.stringify(turns),
+  )
 })
 
 test('the showcase manifest keeps only real, well-formed items', () => {
@@ -110,6 +153,12 @@ test('the showcase manifest keeps only real, well-formed items', () => {
     ['Bracket', 'Flange', 'Vice'],
     'unknown kinds, other hosts and untitled items are dropped',
   )
+  const hero = parseShowcase({
+    items: [{ kind: 'part', title: 'Bracket', caption: 'sound', src: '/showcase/hero-124.stl' }],
+  })
+  assert.equal(hero.length, 1, 'a kernel-made mesh (STL) is a showcase item too')
+  assert.equal(heroOf(hero)?.src, '/showcase/hero-124.stl', 'the first mesh is the 3D hero')
+  assert.equal(heroOf(items), null, 'images alone give no 3D hero')
   assert.deepEqual(parseShowcase(null), [])
   assert.deepEqual(parseShowcase({ items: 'nope' }), [])
   assert.equal(SHOWCASE_LABEL.assembly, 'Assembly')

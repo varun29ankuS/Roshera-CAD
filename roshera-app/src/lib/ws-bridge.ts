@@ -21,6 +21,7 @@ import type {
 } from './protocol'
 import { serverErrorText, type ServerMessage } from './ws-schemas'
 import { mergeObjectCreated } from './object-upsert'
+import { isSignInProblem } from './first-run'
 import { Quaternion, Euler } from 'three'
 
 // ─── Type conversion: backend → frontend ────────────────────────────
@@ -488,7 +489,10 @@ function handleServerMessage(msg: ServerMessage) {
       // A refusal the user cannot see reads as "the click did nothing".
       const text = serverErrorText(msg)
       console.error('[WS] Server error:', text)
-      useBlackboardStore.getState().addLine(`Server refused: ${text}`, 'system')
+      // Not signed in: the sign-in screen says so; the board is for the work.
+      if (!isSignInProblem({ text })) {
+        useBlackboardStore.getState().addLine(`Server refused: ${text}`, 'system')
+      }
       break
     }
 
@@ -597,12 +601,15 @@ async function resyncSceneFromServer(): Promise<void> {
       // is worse than any single panel's. Report it the same way the catch
       // below reports a thrown exception.
       console.error(`[ws-bridge] scene resync failed: HTTP ${res.status} (scene preserved)`)
-      useBlackboardStore
-        .getState()
-        .addLine(
-          `Scene sync failed (HTTP ${res.status}) — the model shown may be stale.`,
-          'system',
-        )
+      // A 401 is "not signed in", which the sign-in screen already says.
+      if (!isSignInProblem({ status: res.status })) {
+        useBlackboardStore
+          .getState()
+          .addLine(
+            `Scene sync failed (HTTP ${res.status}) — the model shown may be stale.`,
+            'system',
+          )
+      }
       return
     }
     const snap = (await res.json()) as {
