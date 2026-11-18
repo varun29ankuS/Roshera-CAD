@@ -18,11 +18,8 @@ import {
   shouldShowGuide,
   markGuideSeen,
   friendlyLoginError,
-  parseShowcase,
-  SHOWCASE_LABEL,
   guideMayOpen,
   isSignInProblem,
-  heroOf,
 } from '../src/lib/first-run.ts'
 import { turnEvidence } from '../src/lib/turn-evidence.ts'
 
@@ -94,8 +91,7 @@ test('the sign-in screen explains Roshera and uses the plain-language errors', (
   assert.ok(!login.includes('This instance requires authentication'), 'no system-speak')
   assert.ok(/<label/.test(login), 'fields are labelled, not placeholder-only')
   assert.ok(login.includes('/logo.png'), 'it carries the Roshera logo')
-  assert.ok(login.includes('parseShowcase('), 'it shows the showcase from its manifest')
-  assert.ok(login.includes('<HeroModel'), 'the hero is a live 3D model')
+  assert.ok(login.includes('<SignInHero'), 'the hero is a live 3D scene')
 })
 
 test('the guide opens only for a signed-in person, never over the sign-in screen', () => {
@@ -136,30 +132,3 @@ test('a sign-in problem is not posted to the board and is not kernel evidence', 
   )
 })
 
-test('the showcase manifest keeps only real, well-formed items', () => {
-  const items = parseShowcase({
-    items: [
-      { kind: 'drawing', title: 'Bracket', caption: 'Certified sheet', src: '/showcase/a.png' },
-      { kind: 'part', title: 'Flange', caption: 'Sound', src: '/showcase/b.png' },
-      { kind: 'assembly', title: 'Vice', caption: '12 parts', src: '/showcase/c.png' },
-      { kind: 'video', title: 'x', caption: 'y', src: '/showcase/d.mp4' },
-      { kind: 'part', title: 'Remote', caption: 'z', src: 'https://elsewhere.example/e.png' },
-      { kind: 'part', title: '', caption: 'no title', src: '/showcase/f.png' },
-      'not an object',
-    ],
-  })
-  assert.deepEqual(
-    items.map((i) => i.title),
-    ['Bracket', 'Flange', 'Vice'],
-    'unknown kinds, other hosts and untitled items are dropped',
-  )
-  const hero = parseShowcase({
-    items: [{ kind: 'part', title: 'Bracket', caption: 'sound', src: '/showcase/hero-124.stl' }],
-  })
-  assert.equal(hero.length, 1, 'a kernel-made mesh (STL) is a showcase item too')
-  assert.equal(heroOf(hero)?.src, '/showcase/hero-124.stl', 'the first mesh is the 3D hero')
-  assert.equal(heroOf(items), null, 'images alone give no 3D hero')
-  assert.deepEqual(parseShowcase(null), [])
-  assert.deepEqual(parseShowcase({ items: 'nope' }), [])
-  assert.equal(SHOWCASE_LABEL.assembly, 'Assembly')
-})

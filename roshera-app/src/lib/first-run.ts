@@ -105,57 +105,6 @@ export function friendlyLoginError(raw: string): string {
   return 'The server could not sign you in. Try again; if it keeps failing, restart the server.'
 }
 
-// --- the sign-in showcase ------------------------------------------------
-
-/** What a showcase image shows. */
-export type ShowcaseKind = 'part' | 'assembly' | 'drawing'
-
-/** One image on the sign-in screen: real Roshera output (a part render, an
- *  assembly render, a drawing sheet), listed in /showcase/manifest.json. */
-export interface ShowcaseItem {
-  kind: ShowcaseKind
-  title: string
-  caption: string
-  src: string
-}
-
-export const SHOWCASE_LABEL: Record<ShowcaseKind, string> = {
-  part: 'Part',
-  assembly: 'Assembly',
-  drawing: 'Drawing',
-}
-
-/** The well-formed items of a showcase manifest. Only same-origin images
- *  under /showcase/ of a known kind with a title are kept: the screen shows
- *  what we made, never a picture from elsewhere. */
-export function parseShowcase(raw: unknown): ShowcaseItem[] {
-  if (!raw || typeof raw !== 'object') return []
-  const items = (raw as { items?: unknown }).items
-  if (!Array.isArray(items)) return []
-  const kinds = new Set<string>(['part', 'assembly', 'drawing'])
-  const out: ShowcaseItem[] = []
-  for (const it of items) {
-    if (!it || typeof it !== 'object') continue
-    const { kind, title, caption, src } = it as Record<string, unknown>
-    if (typeof kind !== 'string' || !kinds.has(kind)) continue
-    if (typeof title !== 'string' || title.trim() === '') continue
-    if (typeof src !== 'string' || !src.startsWith('/showcase/') || !/\.(png|jpe?g|webp|svg|stl)$/i.test(src)) continue
-    out.push({
-      kind: kind as ShowcaseKind,
-      title: title.trim(),
-      caption: typeof caption === 'string' ? caption.trim() : '',
-      src,
-    })
-  }
-  return out
-}
-
-/** The sign-in hero: the first item that is a mesh the kernel made (an STL
- *  tessellated from a certified STEP part), shown live in 3D; `null` when
- *  the manifest lists images only. */
-export function heroOf(items: readonly ShowcaseItem[]): ShowcaseItem | null {
-  return items.find((i) => /\.stl$/i.test(i.src)) ?? null
-}
 
 // --- reopening the guide -------------------------------------------------
 
