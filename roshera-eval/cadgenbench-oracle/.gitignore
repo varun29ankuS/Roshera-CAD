@@ -1,0 +1,5 @@
+# CADGenBench sample parts and prebuilt probe binaries: data / build output,
+# kept locally only.
+cgb16/
+probes/
+__pycache__/
