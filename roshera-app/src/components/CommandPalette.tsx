@@ -34,6 +34,7 @@ import { useBlackboardStore } from '@/stores/blackboard-store'
 import { exportSceneAs } from '@/lib/export-api'
 import { newDocument } from '@/lib/documents-api'
 import { runNewProject } from '@/lib/new-project'
+import { openGuide } from '@/lib/first-run'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
@@ -181,6 +182,13 @@ export function CommandPalette() {
       group: 'File',
       keywords: ['delete all', 'reset'],
       run: () => clearScene(),
+    })
+    cmds.push({
+      id: 'help.getting-started',
+      label: 'Getting started',
+      group: 'Help',
+      keywords: ['help', 'guide', 'tour', 'how', 'first', 'start'],
+      run: () => openGuide(),
     })
     cmds.push({
       id: 'file.demos',

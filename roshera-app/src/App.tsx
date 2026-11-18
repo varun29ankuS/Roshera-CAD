@@ -22,6 +22,7 @@ import { BlackboardFixtures } from '@/components/dev/BlackboardFixtures'
 import { SemanticsPanel } from '@/components/dev/SemanticsPanel'
 import { CommandPalette } from '@/components/CommandPalette'
 import { LoginDialog } from '@/components/LoginDialog'
+import { FirstRunGuide } from '@/components/FirstRunGuide'
 import { cn } from '@/lib/utils'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
 import { useUserContextPublisher } from '@/hooks/use-user-context-publisher'
@@ -332,6 +333,9 @@ export function App() {
           backend request returns 401 (auth-required signal). Invisible
           against a local insecure-bypass backend. */}
       <LoginDialog />
+      {/* Getting started: shown once after sign-in, reopenable from the
+          command palette. */}
+      <FirstRunGuide />
     </div>
   )
 }
