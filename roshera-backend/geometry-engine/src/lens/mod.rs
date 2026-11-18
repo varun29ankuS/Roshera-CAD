@@ -61,6 +61,9 @@ pub enum EventKind {
     EdgeRebuiltOnIntersection,
     /// An edge shorter than its tolerance collapsed to a point.
     SmallEdgeCollapsed,
+    /// A vertex of the face that lay off the faces meeting there moved onto
+    /// them (tightened), with the edges ending there re-fitted.
+    VertexTightened,
     /// A certificate check this entity blocks.
     Blocking { conjunct: String },
 }
@@ -78,6 +81,7 @@ impl EventKind {
             EventKind::VerticesMerged => "vertices_merged",
             EventKind::EdgeRebuiltOnIntersection => "edge_rebuilt_on_intersection",
             EventKind::SmallEdgeCollapsed => "small_edge_collapsed",
+            EventKind::VertexTightened => "vertex_tightened",
             EventKind::Blocking { .. } => "blocking",
         }
     }

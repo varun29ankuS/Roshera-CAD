@@ -18,6 +18,7 @@ export type LensKind =
   | 'vertices_merged'
   | 'edge_rebuilt_on_intersection'
   | 'small_edge_collapsed'
+  | 'vertex_tightened'
   | { blocking: { conjunct: string } }
 
 export interface LensEvent {
@@ -85,6 +86,7 @@ const TITLES: Record<string, string> = {
   vertices_merged: 'Duplicate vertices merged to close a loop',
   edge_rebuilt_on_intersection: 'Edge rebuilt where its two faces meet',
   small_edge_collapsed: 'Edge shorter than its tolerance collapsed to a point',
+  vertex_tightened: 'Corner moved onto the faces that meet there',
 }
 
 export interface LensStoryRow {

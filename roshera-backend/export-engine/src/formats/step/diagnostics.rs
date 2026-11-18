@@ -141,6 +141,12 @@ pub enum HealingKind {
     /// `ShapeFix_Wire::FixSmall`). `deviation` is its extent, `tolerance`
     /// the bound.
     SmallEdgeCollapsed,
+    /// A vertex lay off the faces meeting at it (or off the end of an edge's
+    /// curve) and was MOVED onto those faces -- the tightening of tolerant-
+    /// modelling kernels -- with the edges ending there re-fitted.
+    /// `deviation` is its distance off the faces before, `tolerance` after
+    /// (and the vertex's tolerance when that is larger than it was).
+    VertexTightenedOntoFaces,
 }
 
 /// A structured healing event applied during dispatch. Logged on

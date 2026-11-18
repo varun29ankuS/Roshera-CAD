@@ -203,34 +203,60 @@ fn a_face_reversed_against_its_neighbours_is_in_the_journal() {
     assert_eq!(n, 1, "{events:#?}");
 }
 
+/// A cube face written 0.005 mm off its edges (x = 1.005): its four corners
+/// meet three faces each, so the gap is CLOSED, not tolerated -- each corner
+/// is tightened onto the plane where its three faces meet, and the journal
+/// says so on every face at that corner, with the move measured. (Before
+/// tightening the gap was kept and each edge's tolerance raised to it; a
+/// single face written off its edges, with nothing to pin its corners, is
+/// still repaired that way -- tests/step_edge_tolerance_repair.rs.)
 #[test]
-fn an_edge_tolerance_raise_is_in_the_journal_with_its_gap() {
+fn a_face_written_off_its_corners_has_them_tightened_in_the_journal() {
     let (events, pids) = import(&cube(Face5::Lifted));
     on_real_faces(&events, &pids);
-    let raises: Vec<_> = events
+    let tightened: Vec<_> = events
         .iter()
-        .filter(|e| e.kind == EventKind::EdgeToleranceRaised)
+        .filter(|e| e.kind == EventKind::VertexTightened)
+        .collect();
+    let faces: std::collections::HashSet<_> = tightened
+        .iter()
+        .map(|e| format!("{:?}", e.entity))
         .collect();
     assert_eq!(
-        raises.len(),
-        4,
-        "one per edge of the lifted face: {events:#?}"
-    );
-    let faces: std::collections::HashSet<_> =
-        raises.iter().map(|e| format!("{:?}", e.entity)).collect();
-    assert_eq!(
         faces.len(),
-        1,
-        "recorded on the face the edges are off, not its neighbours"
+        5,
+        "recorded on the lifted face and the four faces sharing its corners: {events:#?}"
     );
-    for e in raises {
-        let gap = e
-            .measured
-            .iter()
-            .find(|(k, _)| k == "gap_mm")
-            .map(|(_, v)| *v)
-            .expect("the gap is measured");
-        assert!((gap - 0.005).abs() < 1e-6, "gap {gap}");
-        assert!(e.step_instance.is_some(), "the edge's STEP # is named");
+    assert_eq!(
+        tightened.len(),
+        12,
+        "four corners, each on its three faces: {events:#?}"
+    );
+    for e in &tightened {
+        let get = |k: &str| {
+            e.measured
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| *v)
+                .expect("measured")
+        };
+        assert!(
+            (get("moved_mm") - 0.005).abs() < 1e-6,
+            "moved {}",
+            get("moved_mm")
+        );
+        assert!((get("off_faces_before_mm") - 0.005).abs() < 1e-6);
+        assert!(
+            get("off_faces_after_mm") <= 1e-9,
+            "after {}",
+            get("off_faces_after_mm")
+        );
+        assert!(e.step_instance.is_some(), "the vertex's STEP # is named");
     }
+    assert!(
+        events
+            .iter()
+            .all(|e| e.kind != EventKind::EdgeToleranceRaised),
+        "with the gap closed no tolerance needs raising: {events:#?}"
+    );
 }

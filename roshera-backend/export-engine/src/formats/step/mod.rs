@@ -193,6 +193,9 @@ pub fn import_step_text_uncertified(
     merge_vertices_a_loop_passes_between(&mut model, &mut caches, &mut report);
     lap("merge loop-crossed vertices", t);
     let t = std::time::Instant::now();
+    tighten_vertices_onto_their_faces(&mut model, &mut caches, &mut report);
+    lap("tighten vertices onto their faces", t);
+    let t = std::time::Instant::now();
     collapse_edges_shorter_than_their_tolerance(&mut model, &mut caches, &mut report);
     lap("collapse short edges", t);
     let t = std::time::Instant::now();
@@ -538,6 +541,357 @@ fn merge_vertices_a_loop_passes_between(
                         ("gap_mm", d),
                         ("bound_mm", bound),
                         ("kept_vertex", kept_instance),
+                    ],
+                );
+            }
+        }
+    }
+}
+
+/// How far off its faces -- or off the end of an edge's curve -- a vertex
+/// must be before it is tightened (model units): the importer's on-curve
+/// tolerance; closer than this a vertex is ON them and is left alone.
+const TIGHTEN_ABOVE: f64 = 1e-3;
+
+/// The farthest a vertex is moved when tightened (model units, mm): the same
+/// bound as a vertex's distance off its edge's curve, just above the largest
+/// gap on the valid CADGenBench parts (4.7e-2). A point farther from where
+/// the file put the vertex is not that vertex.
+const TIGHTEN_MOVE_CAP: f64 = 0.05;
+
+/// TIGHTEN every vertex that lies off the faces meeting at it, or off the
+/// end of an edge's curve, by more than [`TIGHTEN_ABOVE`]: move it to the
+/// point that lies on those faces, then re-fit the edges ending there (a
+/// line is rebuilt between its vertices; any other curve is re-trimmed at its
+/// nearest point to the vertex). Writers keep a tolerance on each vertex,
+/// and on CADGenBench parts 211, 212, 240 and 246 none of 137 such vertices
+/// lay on all its faces; accepting the gap as a tolerance (what OCCT does on
+/// import) leaves the model inexact, so the gap is closed instead -- the
+/// "tightening" of tolerant-modelling kernels.
+///
+/// The new point is the best of: the vertex, each curve end there, and their
+/// mean, each refined by averaging its projections onto the faces while that
+/// lowers the worst distance. A vertex is moved only when that strictly
+/// lowers its worst distance to its faces and the move is within
+/// [`TIGHTEN_MOVE_CAP`]; whatever distance is left becomes the vertex's
+/// tolerance. Each move is a [`diagnostics::HealingKind::VertexTightenedOntoFaces`]
+/// (`deviation` the distance off the faces before, `tolerance` after).
+fn tighten_vertices_onto_their_faces(
+    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
+    caches: &mut context::ResolutionCaches,
+    report: &mut ImportReport,
+) {
+    use geometry_engine::math::{Point3, Tolerance};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    // The edges and faces at each vertex.
+    let mut edges_at: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut edge_ids: Vec<u32> = model.edges.iter().map(|(e, _)| e).collect();
+    edge_ids.sort_unstable();
+    for &eid in &edge_ids {
+        if let Some(e) = model.edges.get(eid) {
+            edges_at.entry(e.start_vertex).or_default().push(eid);
+            if e.end_vertex != e.start_vertex {
+                edges_at.entry(e.end_vertex).or_default().push(eid);
+            }
+        }
+    }
+    let mut faces_at: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for (fid, face) in model.faces.iter() {
+        for l in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+            let Some(lp) = model.loops.get(l) else {
+                continue;
+            };
+            for &eid in &lp.edges {
+                if let Some(e) = model.edges.get(eid) {
+                    faces_at.entry(e.start_vertex).or_default().insert(fid);
+                    faces_at.entry(e.end_vertex).or_default().insert(fid);
+                }
+            }
+        }
+    }
+
+    // A point's projection onto each face's surface, with the surface's
+    // unit normal there.
+    let project = |faces: &BTreeSet<u32>, p: &Point3| -> Option<Vec<(Point3, [f64; 3])>> {
+        faces
+            .iter()
+            .map(|&f| {
+                let s = model.surfaces.get(model.faces.get(f)?.surface_id)?;
+                let (u, v) = s.closest_point(p, Tolerance::default()).ok()?;
+                let q = s.point_at(u, v).ok()?;
+                let n = s.normal_at(u, v).ok()?;
+                let len = (n.x * n.x + n.y * n.y + n.z * n.z).sqrt();
+                (len > 0.0).then(|| (q, [n.x / len, n.y / len, n.z / len]))
+            })
+            .collect()
+    };
+    let worst_off = |faces: &BTreeSet<u32>, p: &Point3| -> f64 {
+        match project(faces, p) {
+            Some(q) => q.iter().map(|(q, _)| p.distance(q)).fold(0.0_f64, f64::max),
+            None => f64::INFINITY,
+        }
+    };
+    // One Gauss-Newton step: the point nearest `p` on every face's tangent
+    // plane at `p`'s projection (least squares, a small pull towards `p`
+    // fixing the directions fewer than three faces constrain). Exact in one
+    // step for planes; quadratic for curved faces.
+    let newton = |q: &[(Point3, [f64; 3])], p: &Point3| -> Option<Point3> {
+        const PULL: f64 = 1e-9;
+        let mut a = [[0.0_f64; 3]; 3];
+        let mut b = [PULL * p.x, PULL * p.y, PULL * p.z];
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] = PULL;
+        }
+        for (qp, n) in q {
+            let d = n[0] * qp.x + n[1] * qp.y + n[2] * qp.z;
+            for i in 0..3 {
+                for j in 0..3 {
+                    a[i][j] += n[i] * n[j];
+                }
+                b[i] += n[i] * d;
+            }
+        }
+        let det = |m: &[[f64; 3]; 3]| {
+            m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+        };
+        let d = det(&a);
+        if !(d.abs() > 0.0) {
+            return None;
+        }
+        let mut x = [0.0_f64; 3];
+        for (k, xk) in x.iter_mut().enumerate() {
+            let mut m = a;
+            for i in 0..3 {
+                m[i][k] = b[i];
+            }
+            *xk = det(&m) / d;
+        }
+        x.iter()
+            .all(|c| c.is_finite())
+            .then(|| Point3::new(x[0], x[1], x[2]))
+    };
+    // The end of edge `eid`'s trimmed curve at vertex `vid`: whether it is
+    // the range's start, and the point there.
+    let end_at = |eid: u32, vid: u32| -> Vec<(bool, Point3)> {
+        let Some(e) = model.edges.get(eid) else {
+            return Vec::new();
+        };
+        let Some(c) = model.curves.get(e.curve_id) else {
+            return Vec::new();
+        };
+        let r = e.param_range;
+        let (Ok(a), Ok(b)) = (c.evaluate(r.start), c.evaluate(r.end)) else {
+            return Vec::new();
+        };
+        if e.start_vertex == e.end_vertex {
+            return vec![(true, a.position), (false, b.position)];
+        }
+        let Some(v) = model.vertices.get(vid) else {
+            return Vec::new();
+        };
+        let p = v.point();
+        vec![if p.distance(&a.position) <= p.distance(&b.position) {
+            (true, a.position)
+        } else {
+            (false, b.position)
+        }]
+    };
+
+    struct Move {
+        vertex: u32,
+        from: Point3,
+        to: Point3,
+        before: f64,
+        after: f64,
+        faces: Vec<u32>,
+    }
+    let mut moves: Vec<Move> = Vec::new();
+    for (&vid, edges) in &edges_at {
+        // A point is pinned only where two or more faces meet: a vertex of a
+        // single face (a plate written off its plane) is not tightened --
+        // moving it would rewrite the face, not close a gap -- and is left to
+        // the edge-tolerance repair or its refusal.
+        let Some(faces) = faces_at.get(&vid).filter(|f| f.len() >= 2) else {
+            continue;
+        };
+        let Some(v) = model.vertices.get(vid) else {
+            continue;
+        };
+        let p = v.point();
+        let ends: Vec<Point3> = edges
+            .iter()
+            .flat_map(|&e| end_at(e, vid))
+            .map(|(_, q)| q)
+            .collect();
+        let curve_gap = ends.iter().map(|q| p.distance(q)).fold(0.0_f64, f64::max);
+        let before = worst_off(faces, &p);
+        if !(curve_gap > TIGHTEN_ABOVE || (before > TIGHTEN_ABOVE && before.is_finite())) {
+            continue;
+        }
+        let mut candidates: Vec<Point3> = vec![p];
+        candidates.extend(ends.iter().copied());
+        let n = (ends.len() + 1) as f64;
+        let (sx, sy, sz) = ends
+            .iter()
+            .fold((p.x, p.y, p.z), |(x, y, z), q| (x + q.x, y + q.y, z + q.z));
+        candidates.push(Point3::new(sx / n, sy / n, sz / n));
+        let mut best = (p, before);
+        for start in candidates {
+            let mut at = (start, worst_off(faces, &start));
+            for _ in 0..16 {
+                let Some(q) = project(faces, &at.0) else {
+                    break;
+                };
+                // A Gauss-Newton step, else the mean of the projections; kept
+                // only while it lowers the worst distance.
+                let k = q.len() as f64;
+                let (x, y, z) = q.iter().fold((0.0, 0.0, 0.0), |(x, y, z), (q, _)| {
+                    (x + q.x, y + q.y, z + q.z)
+                });
+                let mean = Point3::new(x / k, y / k, z / k);
+                let step = newton(&q, &at.0)
+                    .map(|s| (s, worst_off(faces, &s)))
+                    .filter(|(_, off)| *off < at.1 * (1.0 - 1e-9))
+                    .or_else(|| {
+                        let off = worst_off(faces, &mean);
+                        (off < at.1 * (1.0 - 1e-9)).then_some((mean, off))
+                    });
+                match step {
+                    Some(next) => at = next,
+                    None => break,
+                }
+                if at.1 <= 1e-12 {
+                    break;
+                }
+            }
+            if at.1 < best.1 && p.distance(&at.0) <= TIGHTEN_MOVE_CAP {
+                best = at;
+            }
+        }
+        let (to, after) = best;
+        if !(after < before) || p.distance(&to) > TIGHTEN_MOVE_CAP {
+            continue;
+        }
+        moves.push(Move {
+            vertex: vid,
+            from: p,
+            to,
+            before,
+            after,
+            faces: faces.iter().copied().collect(),
+        });
+    }
+    if moves.is_empty() {
+        return;
+    }
+
+    for m in &moves {
+        model
+            .vertices
+            .set_position(m.vertex, m.to.x, m.to.y, m.to.z);
+    }
+    // Re-fit every edge ending at a moved vertex: (old, new) position.
+    let moved: HashMap<u32, (Point3, Point3)> =
+        moves.iter().map(|m| (m.vertex, (m.from, m.to))).collect();
+    let mut touched: BTreeSet<u32> = BTreeSet::new();
+    for m in &moves {
+        if let Some(es) = edges_at.get(&m.vertex) {
+            touched.extend(es.iter().copied());
+        }
+    }
+    for eid in touched {
+        let Some(e) = model.edges.get(eid) else {
+            continue;
+        };
+        let (sv, ev, cid, r) = (e.start_vertex, e.end_vertex, e.curve_id, e.param_range);
+        let Some(curve) = model.curves.get(cid) else {
+            continue;
+        };
+        if curve.type_name() == "Line" {
+            let (Some(a), Some(b)) = (model.vertices.get(sv), model.vertices.get(ev)) else {
+                continue;
+            };
+            let (a, b) = (a.point(), b.point());
+            if a.distance(&b) <= TIGHTEN_ABOVE {
+                continue;
+            }
+            if let Some(slot) = model.curves.get_mut(cid) {
+                *slot = Box::new(geometry_engine::primitives::curve::Line::new(a, b));
+            }
+            continue;
+        }
+        if sv == ev {
+            // A closed edge keeps its whole curve.
+            continue;
+        }
+        let span = r.end - r.start;
+        let (Ok(a), Ok(b)) = (curve.evaluate(r.start), curve.evaluate(r.end)) else {
+            continue;
+        };
+        let mut range = r;
+        for vid in [sv, ev] {
+            let Some(&(from, to)) = moved.get(&vid) else {
+                continue;
+            };
+            // The end of the trimmed curve the vertex WAS at.
+            let at_start = from.distance(&a.position) <= from.distance(&b.position);
+            let Ok((t, _)) = curve.closest_point(&to, Tolerance::from_distance(1e-10)) else {
+                continue;
+            };
+            let old = if at_start { r.start } else { r.end };
+            // Only a re-trim NEAR the old end: a far parameter is another
+            // branch of the curve, not this end moved.
+            if !((t - old).abs() <= 0.25 * span.abs()) {
+                continue;
+            }
+            if at_start {
+                range.start = t;
+            } else {
+                range.end = t;
+            }
+        }
+        if range.end > range.start && (range.start != r.start || range.end != r.end) {
+            if let Some(edge) = model.edges.get_mut(eid) {
+                edge.param_range = range;
+            }
+        }
+    }
+
+    let vertex_instance: HashMap<u32, u64> =
+        caches.vertices.iter().map(|(n, &vid)| (vid, *n)).collect();
+    let face_instance: HashMap<u32, u64> = caches.faces.iter().map(|(n, &f)| (f, *n)).collect();
+    for m in moves {
+        if let Some(v) = model.vertices.get(m.vertex) {
+            if m.after > v.tolerance {
+                model
+                    .vertices
+                    .set_tolerance(m.vertex, m.after * (1.0 + 1e-6));
+            }
+        }
+        let instance = vertex_instance.get(&m.vertex).copied();
+        report.healings.push(diagnostics::Healing {
+            kind: diagnostics::HealingKind::VertexTightenedOntoFaces,
+            entity: "VERTEX_POINT".into(),
+            instance: instance.unwrap_or(0),
+            deviation: m.before,
+            tolerance: m.after,
+        });
+        let moved_by = m.from.distance(&m.to);
+        for f in &m.faces {
+            if let Some(&n) = face_instance.get(f) {
+                caches.record_lens(
+                    n,
+                    geometry_engine::lens::Stage::Repair,
+                    geometry_engine::lens::EventKind::VertexTightened,
+                    instance,
+                    "a corner of this face lay off the faces meeting there; it was moved onto them and the edges ending there re-fitted",
+                    &[
+                        ("moved_mm", moved_by),
+                        ("off_faces_before_mm", m.before),
+                        ("off_faces_after_mm", m.after),
                     ],
                 );
             }
