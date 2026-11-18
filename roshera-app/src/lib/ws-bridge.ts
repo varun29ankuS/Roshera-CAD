@@ -22,6 +22,7 @@ import type {
 import { serverErrorText, type ServerMessage } from './ws-schemas'
 import { mergeObjectCreated } from './object-upsert'
 import { isSignInProblem } from './first-run'
+import { latestOnly } from './latest-only'
 import { Quaternion, Euler } from 'three'
 
 // ─── Type conversion: backend → frontend ────────────────────────────
@@ -592,9 +593,16 @@ export async function refreshSceneFromServer(): Promise<void> {
  *  syncs (WS reconnects) leave the camera where the user put it. */
 let framedFirstSync = false
 
+/** Scene requests overlap (the load-time sync and a document switch); only
+ *  the newest may write the scene. A slow answer about the previously open
+ *  document must never land over the document the user is now in. */
+const sceneRequests = latestOnly()
+
 async function resyncSceneFromServer(): Promise<void> {
+  const ticket = sceneRequests.begin()
   try {
     const res = await fetch(`${API_BASE}/scene/snapshot`)
+    if (!sceneRequests.isLatest(ticket)) return
     if (!res.ok) {
       // Silent here used to mean "the whole scene just stays empty with no
       // explanation" — this is the full-model hydration path, so a failure
@@ -621,6 +629,8 @@ async function resyncSceneFromServer(): Promise<void> {
     // blank the viewport. (The old clear-then-build order, paired with an
     // object missing its material, was the "appears then disappears" bug.)
     const converted = (snap.objects ?? []).map(convertCADObject)
+    // A newer request started while this one's body was arriving.
+    if (!sceneRequests.isLatest(ticket)) return
     const scene = useSceneStore.getState()
     // Authoritative snapshot — drop any still-pending churn so a queued
     // delete/upsert from before the reconnect can't race this rebuild.
