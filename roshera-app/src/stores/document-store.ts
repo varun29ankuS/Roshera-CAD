@@ -55,6 +55,13 @@ import { refreshSceneFromServer } from '@/lib/ws-bridge'
 import { syncNotebook } from '@/lib/blackboard-api'
 import { establishAcpSession, getAcpSessionId, resetAcpClient } from '@/lib/acp-blackboard'
 import { enterDocument } from '@/lib/document-scope'
+import {
+  markStartDocumentUsed,
+  planStartDocument,
+  readStartDocument,
+  writeStartDocument,
+} from '@/lib/start-document'
+import { useSceneStore } from '@/stores/scene-store'
 
 export interface DocumentSwitchResult {
   success: boolean
@@ -86,37 +93,19 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : 'backend unreachable'
 }
 
-/** Where this browser remembers the document it was last working in. */
-const LAST_DOCUMENT_KEY = 'roshera.lastDocumentId'
-
-function readLastDocument(): string | null {
+/** This browser's storage, or a store that remembers nothing when it is
+ *  blocked (private window, policy): every load then starts a new blank. */
+function startStorage(): Pick<Storage, 'getItem' | 'setItem'> {
   try {
-    return localStorage.getItem(LAST_DOCUMENT_KEY)
+    return window.localStorage
   } catch {
-    return null
+    return { getItem: () => null, setItem: () => undefined }
   }
 }
 
-function writeLastDocument(id: string): void {
-  try {
-    localStorage.setItem(LAST_DOCUMENT_KEY, id)
-  } catch {
-    // Storage blocked (private window, policy): the next load simply opens
-    // whatever the server has active.
-  }
-}
-
-/** The return-to-last-document switch runs at most once per page load. */
-let restoredLastDocument = false
-/**
- * True from the moment the return-to-last-document switch starts until it
- * succeeds. Meanwhile (and for the rest of the page load if it failed) the
- * server's active document is its BOOT document, not where this browser
- * works -- recording it as the last document would make every later load
- * reopen the wrong one. Found 2026-11-12: after a server restart the app
- * came back in another document twice.
- */
-let restorePending = false
+/** The start-in-a-fresh-document step runs at most once per page load
+ *  (lib/start-document.ts decides which document that is). */
+let startedFresh = false
 
 export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
   documents: [],
@@ -127,30 +116,33 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
     try {
       const docs = await listDocuments()
       set({ documents: docs })
-      // The server boots into its default document; reopen the one this
-      // browser was last working in, if it still exists. Once per load, so
-      // a later refresh never yanks the user out of a document they chose.
-      if (!restoredLastDocument) {
-        restoredLastDocument = true
-        const last = readLastDocument()
-        const target = last ? docs.find((d) => d.id === last) : undefined
-        if (target && !target.active) {
-          restorePending = true
-          void get()
-            .switchTo(target.id)
-            .then((r) => {
-              if (r.success) restorePending = false
+      // A load starts in a fresh document (Varun 2026-11-18): the blank this
+      // browser made last time if nothing was built in it, else a new one.
+      // Never by reopening the last document -- opening one replays and
+      // re-certifies its whole history. Once per load, so a later refresh
+      // never yanks the user out of a document they chose.
+      if (!startedFresh) {
+        startedFresh = true
+        const storage = startStorage()
+        const plan = planStartDocument(docs, readStartDocument(storage))
+        if (plan.kind === 'open') {
+          void get().switchTo(plan.id)
+          return
+        }
+        if (plan.kind === 'create') {
+          void createDocument('Untitled')
+            .then((doc) => {
+              writeStartDocument(storage, { id: doc.id, used: false })
+              return get().switchTo(doc.id)
             })
+            .catch(() => undefined)
           return
         }
       }
-      // Otherwise the active document IS where this browser is working --
-      // unless a return to the last document is still pending (or failed).
       const active = docs.find((d) => d.active)
       // The history caches belong to whatever the server has open -- also
       // when something other than this tab strip (an agent over MCP) moved it.
       if (active && !get().switchingId) enterDocument(active.id)
-      if (active && !restorePending && !get().switchingId) writeLastDocument(active.id)
     } catch {
       // Backend not reachable yet — leave the previous list (possibly
       // empty) in place; the caller decides whether to retry.
@@ -187,7 +179,6 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
         documents: state.documents.map((d) => ({ ...d, active: d.id === id })),
         epoch: state.epoch + 1,
       }))
-      writeLastDocument(id)
       // Re-hydrate the stores that own server-sourced state. A failure in
       // any one of these is reported by that primitive itself (scene sync
       // already posts a Blackboard line on failure); we still complete the
@@ -244,3 +235,11 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
     }
   },
 }))
+
+// Building anything in the blank this browser started in makes it a real
+// document: the next load starts a new blank instead of reopening it.
+useSceneStore.subscribe((scene) => {
+  if (scene.objectOrder.length === 0) return
+  const active = useDocumentStore.getState().documents.find((d) => d.active)
+  markStartDocumentUsed(startStorage(), active?.id ?? null)
+})
