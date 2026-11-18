@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { refreshSceneFromServer } from '@/lib/ws-bridge'
+import { entityIssueLine } from '@/lib/import-report'
+import { importCertificateLine, type ImportPerception } from '@/lib/import-certificate'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 
 const API_HOST = import.meta.env.VITE_API_URL || ''
 
@@ -138,6 +141,22 @@ export function StepImportDropzone() {
       // the server's per-solid ObjectCreated broadcast).
       await refreshSceneFromServer()
       setPhase({ kind: 'done', filename: file.name, res })
+      // Put the kernel's certificate for each imported solid on the board, so
+      // the import's evidence is the kernel's verdict, not "no certificate
+      // shown". Read from the route verify_part uses; a read that fails is
+      // posted as not-run, never as a pass.
+      const solids = res.report.validation
+      for (const s of solids) {
+        const label = solids.length > 1 ? `${name} #${s.solid_id}` : name
+        let perception: ImportPerception | null = null
+        try {
+          const pr = await fetch(`${API_HOST}/api/agent/parts/${s.solid_id}/perception?full=1`)
+          if (pr.ok) perception = (await pr.json()) as ImportPerception
+        } catch {
+          perception = null
+        }
+        useBlackboardStore.getState().addLine(importCertificateLine(label, s.solid_id, perception), 'system')
+      }
     } catch (e) {
       setPhase({
         kind: 'error',
@@ -309,9 +328,8 @@ function ReportBody({ res }: { res: ImportResponse }) {
   const allValid = solids.length > 0 && validCount === solids.length
   const resolvedTypes = distinctTypes(report.counts.resolved)
   const unsupportedTypes = distinctTypes(report.counts.unsupported)
-  const failedTypes = distinctTypes(report.counts.failed)
   const unsupportedTotal = sumCounts(report.counts.unsupported)
-  const failedTotal = sumCounts(report.counts.failed)
+  const issues = entityIssueLine(report.counts.failed, report.ok && allValid)
 
   return (
     <div className="px-2.5 py-2 text-[11px] font-mono">
@@ -377,10 +395,9 @@ function ReportBody({ res }: { res: ImportResponse }) {
         ) : (
           <div className="text-green-600">skipped 0 — full entity coverage</div>
         )}
-        {failedTotal > 0 && (
-          <div className="text-red-500">
-            {failedTotal} entit{failedTotal === 1 ? 'y' : 'ies'} failed ({failedTypes} type
-            {failedTypes === 1 ? '' : 's'})
+        {issues && (
+          <div className={issues.tone === 'caution' ? 'text-caution' : 'text-red-500'} title={issues.title}>
+            {issues.text}
           </div>
         )}
         <div className="mt-0.5">
