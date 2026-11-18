@@ -1,6 +1,6 @@
 import type { BlackboardLine } from '@/stores/blackboard-store'
-import { cardKindFromLanguage, detectEnumeratedChoices, type CardKind } from './blackboard-cards'
-import { isBuildStepLine } from './blackboard-groups'
+import { cardKindFromLanguage, detectEnumeratedChoices, type CardKind } from './blackboard-cards.ts'
+import { isBuildStepLine } from './blackboard-groups.ts'
 
 /**
  * CONTENT CLASS

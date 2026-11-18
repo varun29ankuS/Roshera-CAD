@@ -31,6 +31,8 @@ import {
   CircleSlash,
 } from '@/components/ui/icons'
 import type { AgentTurnStatus } from '@/stores/blackboard-store'
+import { splitSelection } from '@/lib/selection-attachment'
+import { LineSelectionChips } from './SelectionChips'
 
 interface Props {
   line: Line
@@ -284,6 +286,16 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
   )
   const isSystem = line.author === 'system'
 
+  // A user's message carries the selection it was sent with as a trailing
+  // `roshera:selection` block (`lib/selection-attachment.ts`). The board
+  // shows the words and the selection as chips, never the raw block --
+  // derived from the stored text, so a reload shows the same.
+  const sent = useMemo(
+    () => (line.author === 'user' ? splitSelection(line.text) : null),
+    [line.author, line.text],
+  )
+  const shownText = sent?.attachment ? sent.prose : line.text
+
   // Content class decides both editability and shape (see
   // `lib/blackboard-content.ts`'s module doc). `evidence` is machine-
   // authored or verbatim-forwarded — the kernel's own testimony — and gets
@@ -502,14 +514,14 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
             <span className="min-w-0 max-w-[72ch] flex-1">
               {failedTurn ? (
                 <FailedTurnBlock text={line.text} />
-              ) : line.text.trim() ? (
+              ) : shownText.trim() ? (
                 <CardActionsContext.Provider value={cardActions}>
                   <RevealContext.Provider value={reveal}>
                     {/* Only the prose is height-capped; the choice buttons
                         below it are a control and must never sit behind a
  "show more". */}
-                    <ExpandableProse source={line.text}>
-                      <MessageMarkdown content={line.text} />
+                    <ExpandableProse source={shownText}>
+                      <MessageMarkdown content={shownText} />
                     </ExpandableProse>
                     {detectedChoices && <DetectedChoicesCard set={detectedChoices} />}
                   </RevealContext.Provider>
@@ -517,6 +529,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
               ) : (
                 <span className="italic text-muted-foreground/70">Empty line</span>
               )}
+              {sent?.attachment && <LineSelectionChips attachment={sent.attachment} />}
               {isSystem && line.repeatCount !== undefined && line.repeatCount > 1 && (
                 <span
                   className="ml-1 text-[11px] text-muted-foreground/60"

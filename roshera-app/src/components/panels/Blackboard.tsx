@@ -23,6 +23,9 @@ import {
   waitingTurns,
 } from '@/lib/blackboard-composer'
 import { BlackboardSection } from './BlackboardSection'
+import { ComposerSelectionChips } from './SelectionChips'
+import { useSelectionChips } from '@/hooks/use-selection-chips'
+import { attachSelection, messageText } from '@/lib/selection-attachment'
 import { Button } from '@/components/ui/button'
 import {
   NotebookPen,
@@ -286,6 +289,12 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
   // you the queue.
   const waiting = waitingTurns(useTurnQueue())
 
+  // What the person has selected travels with the message
+  // (`lib/selection-attachment.ts`): chips on the composer, each removable
+  // for this ask, and on send one fenced block the agent can act on.
+  const selectionChips = useSelectionChips(isPanelOpen)
+  const { attachment: selectionAttachment, reset: resetSelectionChips } = selectionChips
+
   /**
    * ATTENTION-FOLLOWING SPLIT
    * -------------------------
@@ -411,9 +420,13 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
       // immediately, the reply as an editable line — never a chat bubble.
       // Asking is a return to the conversation's tail: follow it again.
       jumpToLatest()
-      void sendPrompt(text, processBlackboardMessage)
+      // The selection the chips show rides along; history above keeps
+      // only the words, so a recalled prompt never carries a stale block.
+      const withSelection = attachSelection(text, selectionAttachment)
+      resetSelectionChips()
+      void sendPrompt(withSelection, processBlackboardMessage)
     },
-    [draft, jumpToLatest],
+    [draft, jumpToLatest, selectionAttachment, resetSelectionChips],
   )
 
   const handleKeyDown = useCallback(
@@ -454,7 +467,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
 
   // The last thing said, for the collapsed stub. A label that only ever reads
   // "Blackboard" tells the human nothing about whether the agent answered.
-  const lastLine = lines.length > 0 ? lines[lines.length - 1]?.text?.trim() : undefined
+  const lastLine = lines.length > 0 ? messageText(lines[lines.length - 1]?.text ?? '').trim() : undefined
 
   // Collapsed state — a stub row inside the rail, not a tab on the canvas.
   //
@@ -816,10 +829,10 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
             {waiting.map((w) => (
               <span
                 key={w.id}
-                title={w.text}
+                title={messageText(w.text)}
                 className="max-w-[16rem] truncate rounded border border-dashed border-caution-border bg-caution-wash px-1.5 py-0.5 text-caution "
               >
-                {w.text}
+                {messageText(w.text)}
               </span>
             ))}
           </div>
@@ -850,6 +863,8 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
           onSubmit={handleSubmit}
           className="m-2 flex flex-col rounded-lg border border-border bg-card focus-within:border-ring"
         >
+          {/* The selection this message carries (the design's chip row). */}
+          <ComposerSelectionChips chips={selectionChips} />
           <textarea
             ref={inputRef}
             value={draft}
