@@ -1396,7 +1396,7 @@ export function DrawingsWorkspace() {
       )}
       {activeDrawing && titleBlockOpen && (
         <TitleBlockCard
-          key={`${activeDrawing.id}:${JSON.stringify(activeDrawing.title_block ?? null)}`}
+          key={activeDrawing.id}
           drawing={activeDrawing}
           onUpdated={(updated) => {
             setActiveDrawing((prev) => (prev ? { ...prev, title_block: updated } : prev))

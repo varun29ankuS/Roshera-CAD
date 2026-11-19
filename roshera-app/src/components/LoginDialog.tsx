@@ -73,7 +73,7 @@ export function LoginDialog() {
       role="dialog"
       aria-modal="true"
       aria-labelledby="signin-title"
-      className="fixed inset-0 z-[100] overflow-hidden bg-[#f4f1eb] text-[#12161b]"
+      className="fixed inset-0 z-[100] overflow-hidden bg-background text-foreground"
     >
       <SignInHero />
 
@@ -86,7 +86,7 @@ export function LoginDialog() {
       {/* The aircraft's own numbers, the way a parametric model shows them. */}
       <div
         aria-hidden="true"
-        className={`pointer-events-none absolute right-9 top-28 grid gap-2 rounded-[10px] border border-black/10 bg-[#f4f1eb]/90 px-4 py-3.5 text-[#2a3038] ${mono}`}
+        className={`pointer-events-none absolute right-9 top-28 grid gap-2 rounded-[10px] border border-border bg-background/90 px-4 py-3.5 text-foreground/85 ${mono}`}
       >
         {[
           ['Leading-edge sweep', '42', 'deg'],
@@ -94,9 +94,9 @@ export function LoginDialog() {
           ['Tail cant', '27', 'deg'],
         ].map(([label, value, unit]) => (
           <div key={label} className="flex items-center gap-2">
-            <i className="inline-block h-[7px] w-[7px] bg-[#1f55d6]" />
+            <i className="inline-block h-[7px] w-[7px] bg-[#1f55d6] dark:bg-[#7ea4ff]" />
             {label}
-            <b className="min-w-[2.2em] border border-[#2a3038] bg-white/70 px-1.5 py-px text-center font-medium">{value}</b>
+            <b className="min-w-[2.2em] border border-foreground/60 bg-card/70 px-1.5 py-px text-center font-medium">{value}</b>
             {unit}
           </div>
         ))}
@@ -107,30 +107,30 @@ export function LoginDialog() {
         <h2 className="text-[60px] font-semibold leading-[1.02] tracking-[-0.025em]">
           Describe the part.
           <br />
-          <span className="text-[#1f55d6]">Get a verified model.</span>
+          <span className="text-[#1f55d6] dark:text-[#7ea4ff]">Get a verified model.</span>
         </h2>
-        <p className="max-w-[34rem] text-[14px] leading-relaxed text-[#5d636b]">
+        <p className="max-w-[34rem] text-[14px] leading-relaxed text-muted-foreground">
           Tell Roshera what you need in plain words. It builds the 3D part and its drawing, and checks every dimension
           against the geometry before you see it.
         </p>
       </div>
 
       {/* Sign-in card. */}
-      <div className="absolute bottom-9 right-9 w-[380px] max-w-[calc(100vw-4.5rem)] overflow-hidden rounded-2xl border border-black/10 bg-white/90 shadow-[0_30px_60px_-20px_rgba(30,32,28,0.25),0_8px_18px_-10px_rgba(30,32,28,0.15)]">
+      <div className="absolute bottom-9 right-9 w-[380px] max-w-[calc(100vw-4.5rem)] overflow-hidden rounded-2xl border border-border bg-card/95 shadow-[0_30px_60px_-20px_rgba(30,32,28,0.25),0_8px_18px_-10px_rgba(30,32,28,0.15)]">
         <form onSubmit={submit} className="px-6 pb-5 pt-6">
           <h1 id="signin-title" className="flex items-center gap-2.5 text-[20px] font-semibold tracking-tight">
             <img src="/logo.png" alt="" width={22} height={22} className="h-[22px] w-[22px]" />
             Sign in
           </h1>
-          <p className="mb-5 mt-1.5 text-[13px] leading-snug text-[#5d636b]">
+          <p className="mb-5 mt-1.5 text-[13px] leading-snug text-muted-foreground">
             Welcome back. Your parts, drawings and design history are where you left them.
           </p>
 
-          <label htmlFor="signin-username" className={`mb-1.5 block text-[#4a5058] ${mono}`}>
+          <label htmlFor="signin-username" className={`mb-1.5 block text-muted-foreground ${mono}`}>
             Username
           </label>
-          <div className="mb-3.5 flex h-[42px] items-center gap-2.5 rounded-[10px] border border-black/15 bg-white px-3 transition focus-within:border-[#1f55d6] focus-within:shadow-[0_0_0_3px_rgba(31,85,214,0.14)]">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#8a9098" strokeWidth="1.8" aria-hidden="true">
+          <div className="mb-3.5 flex h-[42px] items-center gap-2.5 rounded-[10px] border border-border bg-background px-3 transition focus-within:border-[#1f55d6] dark:focus-within:border-[#7ea4ff] focus-within:shadow-[0_0_0_3px_rgba(31,85,214,0.14)]">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true" className="shrink-0 text-muted-foreground">
               <circle cx="12" cy="8" r="4" />
               <path d="M4 21c1.5-4 5-6 8-6s6.5 2 8 6" />
             </svg>
@@ -145,13 +145,13 @@ export function LoginDialog() {
             />
           </div>
 
-          <label htmlFor="signin-password" className={`mb-1.5 block text-[#4a5058] ${mono}`}>
+          <label htmlFor="signin-password" className={`mb-1.5 block text-muted-foreground ${mono}`}>
             Password
           </label>
           {/* A masked field you cannot unmask makes a typo look like a wrong
               password; the toggle is off by default and never stored. */}
-          <div className="mb-4 flex h-[42px] items-center gap-2.5 rounded-[10px] border border-black/15 bg-white px-3 transition focus-within:border-[#1f55d6] focus-within:shadow-[0_0_0_3px_rgba(31,85,214,0.14)]">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#8a9098" strokeWidth="1.8" aria-hidden="true">
+          <div className="mb-4 flex h-[42px] items-center gap-2.5 rounded-[10px] border border-border bg-background px-3 transition focus-within:border-[#1f55d6] dark:focus-within:border-[#7ea4ff] focus-within:shadow-[0_0_0_3px_rgba(31,85,214,0.14)]">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true" className="shrink-0 text-muted-foreground">
               <rect x="4" y="10" width="16" height="11" rx="2" />
               <path d="M8 10V7a4 4 0 0 1 8 0v3" />
             </svg>
@@ -169,14 +169,14 @@ export function LoginDialog() {
               aria-label={showPassword ? 'Hide password' : 'Show password'}
               aria-pressed={showPassword}
               title={showPassword ? 'Hide password' : 'Show password'}
-              className="grid place-items-center rounded p-1 text-[#8a9098] hover:text-[#12161b] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1f55d6]"
+              className="grid place-items-center rounded p-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1f55d6]"
             >
               {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
             </button>
           </div>
 
           {error && (
-            <p role="alert" className="mb-3 text-[12.5px] leading-snug text-red-600">
+            <p role="alert" className="mb-3 text-[12.5px] leading-snug text-red-600 dark:text-red-400">
               {error}
             </p>
           )}
@@ -184,7 +184,7 @@ export function LoginDialog() {
           <button
             type="submit"
             disabled={busy || !username.trim() || !password}
-            className="flex h-11 w-full items-center justify-center gap-2.5 rounded-[10px] bg-[#12161b] text-[14px] font-semibold text-white transition hover:bg-black active:translate-y-px disabled:opacity-50"
+            className="flex h-11 w-full items-center justify-center gap-2.5 rounded-[10px] bg-primary text-[14px] font-semibold text-primary-foreground transition hover:opacity-90 active:translate-y-px disabled:opacity-50"
           >
             {busy ? 'Signing in…' : 'Sign in'}
             {!busy && (
@@ -193,9 +193,9 @@ export function LoginDialog() {
               </svg>
             )}
           </button>
-          <p className="mt-3 text-center text-[12px] text-[#80868e]">Need an account? Ask your Roshera admin.</p>
+          <p className="mt-3 text-center text-[12px] text-muted-foreground">Need an account? Ask your Roshera admin.</p>
         </form>
-        <div className="flex items-center justify-between border-t border-black/10 bg-[#f4f1eb]/70 px-6 py-3 font-mono text-[11px] text-[#6a7078]">
+        <div className="flex items-center justify-between border-t border-border bg-background/60 px-6 py-3 font-mono text-[11px] text-muted-foreground">
           <span className="flex items-center gap-2">
             <span
               className={`inline-block h-[7px] w-[7px] rounded-full ${

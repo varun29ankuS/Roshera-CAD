@@ -12,6 +12,8 @@ import {
   wingLeadingEdgeX,
   wingTrailingEdgeX,
 } from '@/lib/fighter-model'
+import { signInScenePalette } from '@/lib/sign-in-palette'
+import { useThemeStore } from '@/stores/theme-store'
 
 /**
  * The sign-in hero (Varun 2026-11-18, after nTop's): a stealth fighter
@@ -23,10 +25,13 @@ import {
  */
 export function SignInHero() {
   const host = useRef<HTMLDivElement>(null)
+  // Drawn in the app's theme, so signing in and the app look like one place.
+  const theme = useThemeStore((s) => s.theme)
 
   useEffect(() => {
     const el = host.current
     if (!el) return
+    const pal = signInScenePalette(theme)
     const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
@@ -34,8 +39,8 @@ export function SignInHero() {
     renderer.domElement.style.display = 'block'
 
     const scene = new THREE.Scene()
-    scene.add(new THREE.HemisphereLight(0xffffff, 0xd8d4cc, 0.9))
-    const sun = new THREE.DirectionalLight(0xffffff, 1.6)
+    scene.add(new THREE.HemisphereLight(pal.skyLight, pal.groundLight, 0.9))
+    const sun = new THREE.DirectionalLight(pal.skyLight, theme === 'dark' ? 1.1 : 1.6)
     sun.position.set(-4, 10, 6)
     scene.add(sun)
     const camera = new THREE.PerspectiveCamera(28, 1, 0.5, 400)
@@ -59,23 +64,24 @@ export function SignInHero() {
     ramp.minFilter = ramp.magFilter = THREE.NearestFilter
     ramp.needsUpdate = true
     const offset = { polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }
-    const skin = keep(new THREE.MeshToonMaterial({ color: '#f6f4ee', gradientMap: ramp, side: THREE.DoubleSide, ...offset }))
-    const glass = keep(new THREE.MeshToonMaterial({ color: '#bcd2ee', gradientMap: ramp, transparent: true, opacity: 0.9, ...offset }))
-    const black = keep(new THREE.MeshBasicMaterial({ color: '#0b0d10', side: THREE.DoubleSide }))
-    const dark = keep(new THREE.MeshBasicMaterial({ color: '#20262d', side: THREE.DoubleSide }))
-    const crease = keep(new THREE.LineBasicMaterial({ color: '#1a1f25', transparent: true, opacity: 0.75 }))
-    const panel = keep(new THREE.LineBasicMaterial({ color: '#1a1f25', transparent: true, opacity: 0.35 }))
-    const cs = keep(new THREE.LineBasicMaterial({ color: '#1a1f25', transparent: true, opacity: 0.6 }))
-    const rimInk = keep(new THREE.LineBasicMaterial({ color: '#12161b' }))
-    const edgeBand = keep(new THREE.LineBasicMaterial({ color: '#2b3138' }))
-    const edgeBand2 = keep(new THREE.LineBasicMaterial({ color: '#2b3138', transparent: true, opacity: 0.55 }))
-    // The silhouette: back faces pushed out along their normals, drawn dark.
+    const skin = keep(new THREE.MeshToonMaterial({ color: pal.skin, gradientMap: ramp, side: THREE.DoubleSide, ...offset }))
+    const glass = keep(new THREE.MeshToonMaterial({ color: pal.glass, gradientMap: ramp, transparent: true, opacity: 0.9, ...offset }))
+    const black = keep(new THREE.MeshBasicMaterial({ color: pal.void, side: THREE.DoubleSide }))
+    const dark = keep(new THREE.MeshBasicMaterial({ color: pal.shade, side: THREE.DoubleSide }))
+    const crease = keep(new THREE.LineBasicMaterial({ color: pal.crease, transparent: true, opacity: 0.75 }))
+    const panel = keep(new THREE.LineBasicMaterial({ color: pal.crease, transparent: true, opacity: 0.35 }))
+    const cs = keep(new THREE.LineBasicMaterial({ color: pal.crease, transparent: true, opacity: 0.6 }))
+    const rimInk = keep(new THREE.LineBasicMaterial({ color: pal.rim }))
+    const edgeBand = keep(new THREE.LineBasicMaterial({ color: pal.band }))
+    const edgeBand2 = keep(new THREE.LineBasicMaterial({ color: pal.band, transparent: true, opacity: 0.55 }))
+    // The silhouette: back faces pushed out along their normals, drawn in the
+    // theme's ink (dark on paper, light on graphite).
     const hullMat = keep(
       new THREE.ShaderMaterial({
         side: THREE.BackSide,
-        uniforms: { uWidth: { value: 0.035 } },
+        uniforms: { uWidth: { value: 0.035 }, uInk: { value: new THREE.Color(pal.silhouette) } },
         vertexShader: 'uniform float uWidth; void main() { vec3 p = position + normal * uWidth; gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0); }',
-        fragmentShader: 'void main() { gl_FragColor = vec4(0.07, 0.085, 0.10, 1.0); }',
+        fragmentShader: 'uniform vec3 uInk; void main() { gl_FragColor = vec4(uInk, 1.0); }',
       }),
     )
 
@@ -268,7 +274,13 @@ export function SignInHero() {
       new THREE.ShaderMaterial({
         transparent: true,
         depthWrite: false,
-        uniforms: { uTime: { value: 0 }, uScale: { value: window.innerHeight } },
+        uniforms: {
+          uTime: { value: 0 },
+          uScale: { value: window.innerHeight },
+          uPale: { value: new THREE.Color(pal.wakePale) },
+          uDeep: { value: new THREE.Color(pal.wakeDeep) },
+          uAlpha: { value: pal.wakeAlpha },
+        },
         vertexShader: `
           attribute vec4 seed;
           uniform float uTime; uniform float uScale;
@@ -297,12 +309,12 @@ export function SignInHero() {
             gl_Position = projectionMatrix * mv;
           }`,
         fragmentShader: `
+          uniform vec3 uPale; uniform vec3 uDeep; uniform float uAlpha;
           varying float vAlpha; varying float vCore;
           void main() {
             vec2 q = gl_PointCoord - 0.5; float d = dot(q, q);
             if (d > 0.25) discard;
-            vec3 deep = vec3(0.09, 0.30, 0.85), pale = vec3(0.50, 0.64, 0.95);
-            gl_FragColor = vec4(mix(pale, deep, vCore), vAlpha * (1.0 - d * 3.0));
+            gl_FragColor = vec4(mix(uPale, uDeep, vCore), uAlpha * vAlpha * (1.0 - d * 3.0));
           }`,
       }),
     )
@@ -354,7 +366,7 @@ export function SignInHero() {
       renderer.dispose()
       renderer.domElement.remove()
     }
-  }, [])
+  }, [theme])
 
   return <div ref={host} className="absolute inset-0" aria-hidden="true" />
 }

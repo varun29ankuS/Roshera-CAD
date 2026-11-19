@@ -20,7 +20,9 @@ const here = dirname(fileURLToPath(import.meta.url))
 const src = (p) => readFileSync(join(here, '..', 'src', p), 'utf8')
 
 test('the on-screen preview asks for the draft; a download does not', () => {
-  assert.equal(drawingSvgUrl('', 'abc', { review: true }), '/api/drawings/abc/svg?acknowledge_layout_issues=true')
+  // The screen asks for the PREVIEW (2026-11-18: through the export route
+  // every redraw took 7-8 s and recorded an export in the history).
+  assert.equal(drawingSvgUrl('', 'abc', { review: true }), '/api/drawings/abc/preview.svg')
   assert.equal(drawingSvgUrl('', 'abc', { review: false }), '/api/drawings/abc/svg')
   assert.equal(drawingSvgUrl('http://h:8081', 'a b', { review: false }), 'http://h:8081/api/drawings/a%20b/svg')
   for (const review of [true, false]) {

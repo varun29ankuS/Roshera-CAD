@@ -32,6 +32,7 @@ import {
   defaultTitleBlock,
   updateTitleBlock,
 } from '@/lib/drawings-api'
+import { mergeTitleBlockDraft } from '@/lib/title-block-draft'
 
 /** A drawing in the switcher list. */
 export interface DrawingRow {
@@ -593,9 +594,15 @@ export function TitleBlockCard({
     () => ({ ...defaultTitleBlock(), ...(drawing.title_block ?? {}) }),
     [drawing.title_block],
   )
-  // Seeded once; the parent remounts the card (its `key`) whenever the
-  // server's title block changes, so the draft never shows stale values.
+  // The card stays mounted while the person types. When the server's title
+  // block changes (a field's save landed), fields the person has edited
+  // since keep their text; the rest take the server's values.
   const [draft, setDraft] = useState<TitleBlock>(original)
+  const [seen, setSeen] = useState<TitleBlock>(original)
+  if (seen !== original) {
+    setSeen(original)
+    setDraft(mergeTitleBlockDraft(seen, draft, original))
+  }
 
   const commit = useCallback(async () => {
     const patch: TitleBlockPatch = {}
