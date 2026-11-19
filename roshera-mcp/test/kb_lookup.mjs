@@ -449,6 +449,10 @@ console.log("(2) TIER 2: playbook chunks + tool_sequence resolve against the tab
     aerofoil_section: 961,
     sheet_metal_bracket: 845,
     mounting_plate: 780,
+    // The drafting skill (2026-11-19, authored in kb_data.ts): how to make a
+    // manufacturing drawing -- purpose, standards, sheet, views, dimensions,
+    // tolerances, review loop, family notes.
+    manufacturing_drawing: 888,
   };
   for (const [key, tokens] of Object.entries(PLAYBOOK_TOKENS)) {
     const p = await lookup("playbook", key);

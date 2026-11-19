@@ -175,6 +175,18 @@ const PLAYBOOK_META: Record<string, PlaybookMeta> = {
     certification:
       "gdt_fcf verdicts (flatness, perpendicularity, parallelism, position — RFS only, NO MMC/LMC modifier today) are kernel-certified exact B-Rep measurements via gdt_datum + gdt_fcf. psketch_certify's DOF0 gate certifies dimension COMPLETENESS (no under- or over-constraint), not scheme correctness. The choice of datum/baseline vs chain vs ordinate, ISO 2768 general tolerances, and which faces are functional is drafting judgement captured in the model — real, but NOT a kernel verdict.",
   },
+  // The drafting skill — added 2026-11-19, not vault-doc-sourced (see kb_data.ts).
+  manufacturing_drawing: {
+    tool_sequence: [
+      "ask_choice", "kb_lookup", "verify_part", "gdt_datum", "gdt_fcf", "make_drawing",
+      "drawing_read_semantics", "drawing_dimensions", "iso286_limits",
+      "drawing_set_dimension", "drawing_dimension_properties", "drawing_set_projection",
+      "drawing_set_title", "drawing_query", "drawing_export_sheet",
+    ],
+    section: "drafting skill 2026-11-19",
+    certification:
+      "kernel verdicts: the sheet certificate (every inked value re-measured against the live part; omissions listed), the layout quality report (overlaps, off-sheet, crossings), ISO 286 limits from the tables, gdt_fcf verdicts (RFS). NOT kernel verdicts: the purpose, which features are functional, the datum choice, the view choice, the general tolerance class, the sheet-size rule's aesthetics, and balloon numbering — drafting judgement, stated as intent.",
+  },
   // PART-FAMILY playbooks — added 2026-11-18, not vault-doc-sourced (see
   // kb_data.ts). Each also serves a worked_example (kb_examples.ts).
   aerofoil_section: {
@@ -225,7 +237,9 @@ export function registerKbTools(server: ToolHost): void {
       "snap_fit, dimensioning — datums vs chains, size vs location, one " +
       "dimension per DOF, ASME Y14.5/ISO 129 practice) with tool_sequence of " +
       "real MCP tools in order; part-family playbooks (aerofoil_section, " +
-      "sheet_metal_bracket, mounting_plate) also carry a worked_example. kind " +
+      "sheet_metal_bracket, mounting_plate) also carry a worked_example; " +
+      "manufacturing_drawing = the drafting skill (purpose, ISO sheet/views/" +
+      "dimensions/tolerances, the review loop) — read it BEFORE make_drawing. kind " +
       "'reference' = cited engineering data: clearance_hole (bolt clearance " +
       "diameter, ISO 273), tap_drill (tap drill size for a thread), " +
       "general_tolerance (ISO 2768 band), fit_class (ISO 286 hole/shaft fit " +
