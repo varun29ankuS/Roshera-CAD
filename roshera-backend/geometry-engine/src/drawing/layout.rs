@@ -2395,13 +2395,46 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
             None => Vec::new(),
         };
 
-        // Try Phase 1 candidates first, then Phase 2.
+        // Phase 3: further rows stacked above and below the view and down
+        // its right side -- several frames on one view (the wing rib's two
+        // "⌖ 0.10 A B" frames, 2026-11-19) used up Phases 1 and 2 and the
+        // next fell back onto the raw anchor, on top of the first.
+        let phase3: Vec<[f64; 2]> = match geo_rect {
+            Some(gr) => (1..=12)
+                .flat_map(|k| {
+                    let k = k as f64;
+                    [
+                        [gr.bbox.x0, gr.bbox.y0 - LABEL_GAP - block_h - k * step],
+                        [gr.bbox.x0, gr.bbox.y1 + LABEL_GAP + k * step],
+                        [gr.bbox.x1 + LABEL_GAP, gr.bbox.y0 + k * step],
+                    ]
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // Try Phase 1 candidates first, then Phase 2, then Phase 3.
         let chosen = phase1
             .iter()
             .chain(phase2.iter())
+            .chain(phase3.iter())
             .find(|&&[x0, y0]| !collides(&bbox_at(x0, y0), &result))
             .copied()
-            .unwrap_or([ax, ay]);
+            // Last resort: the nearest row down from the anchor that is at
+            // least clear of every GD&T symbol already placed. It may sit on
+            // other ink (the layout check then reports it), but two frames
+            // printed on one another are unreadable whatever else is there.
+            .unwrap_or_else(|| {
+                let mut y = ay;
+                for _ in 0..200 {
+                    let b = bbox_at(ax, y);
+                    if !result.iter().any(|it| b.intersects(&it.bbox, LABEL_TOL)) {
+                        break;
+                    }
+                    y += step;
+                }
+                [ax, y]
+            });
 
         let [x0, y0] = chosen;
         result.push(SheetItem {
@@ -4138,6 +4171,63 @@ mod tests {
             !segment_crosses_rect(&line, &text),
             "the earlier line runs through the callout: {text:?}"
         );
+    }
+
+    /// GD&T frames never land on one another, however many share an anchor.
+    /// Found recording the wing-rib video (2026-11-19): two "⌖ 0.10 A B"
+    /// frames on the rib's TOP view were printed on top of each other and the
+    /// sheet's export was refused. Each frame tried eight spots and, when all
+    /// were taken, fell back to its raw anchor -- where the previous frame
+    /// already sat.
+    ///
+    /// Mutation: drop the stacked rows and the last-resort GD&T-only search ->
+    /// frames 9 and 10 fall back onto the anchor -> RED.
+    #[test]
+    fn gdt_frames_never_overlap_however_many_share_an_anchor() {
+        let mut drawing = Drawing::new("gdt-stack", SheetSize::A3);
+        let view = simple_view("TOP", ProjectionType::Top, [150.0, 150.0]);
+        drawing.views.push(view);
+        for i in 0..10 {
+            drawing
+                .fcf_blocks
+                .push(crate::drawing::types::PlacedFcfBlock {
+                    characteristic_glyph: "⌖".to_string(),
+                    tolerance_text: "0.10".to_string(),
+                    datum_labels: vec!["A".to_string(), "B".to_string()],
+                    anchor: [160.0, 140.0],
+                    leader_to: None,
+                    owner_view: 0,
+                    feature_pid: None,
+                    annotation_index: Some(i),
+                    annotation_id: None,
+                });
+        }
+        let existing = vec![SheetItem {
+            kind: SheetItemKind::ViewGeometry,
+            bbox: Rect2 {
+                x0: 120.0,
+                y0: 120.0,
+                x1: 260.0,
+                y1: 180.0,
+            },
+            owner_view: Some(0),
+            text: None,
+        }];
+        let placed: Vec<SheetItem> = place_gdt_annotations(&drawing, &existing)
+            .into_iter()
+            .filter(|it| it.kind == SheetItemKind::FcfBlock)
+            .collect();
+        assert_eq!(placed.len(), 10);
+        for (i, a) in placed.iter().enumerate() {
+            for b in placed.iter().skip(i + 1) {
+                assert!(
+                    !a.bbox.intersects(&b.bbox, LABEL_TOL),
+                    "two frames overlap: {:?} vs {:?}",
+                    a.bbox,
+                    b.bbox
+                );
+            }
+        }
     }
 
     /// A two-line leader callout keeps its second line clear of the next
