@@ -30,3 +30,25 @@ export function entityIssueLine(failed: Record<string, number>, allSolidsSound: 
     ? { text: `${entitiesText} raised warnings or errors (${typesText}) — the solid still checks sound`, tone: 'caution', title }
     : { text: `${entitiesText} failed (${typesText})`, tone: 'negative', title }
 }
+
+/** STEP application protocols by the ISO 10303 part number in the schema's
+ *  object id, and by the schema names that carry no id. */
+const PROTOCOLS: { part: string; names: RegExp; label: string }[] = [
+  { part: '203', names: /^CONFIG_CONTROL_DESIGN/, label: 'STEP AP203 · configuration controlled design' },
+  { part: '214', names: /^AUTOMOTIVE_DESIGN/, label: 'STEP AP214 · automotive design' },
+  { part: '442', names: /^AP242_/, label: 'STEP AP242 · model-based 3D engineering' },
+]
+
+/**
+ * The file's STEP schema the way engineers say it ("STEP AP214 · automotive
+ * design"), from the raw header string ("AUTOMOTIVE_DESIGN { 1 0 10303 214 1
+ * 1 1 1 }"). An unknown schema is shown by its name alone; none, as null.
+ */
+export function schemaLabel(schema: string | null | undefined): string | null {
+  const raw = (schema ?? '').trim()
+  if (!raw) return null
+  const name = raw.split('{')[0].trim()
+  const part = raw.match(/\{\s*1\s+0\s+10303\s+(\d+)/)?.[1]
+  const known = PROTOCOLS.find((p) => p.part === part || p.names.test(name))
+  return known ? known.label : name
+}

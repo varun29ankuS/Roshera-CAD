@@ -1318,6 +1318,22 @@ export function ToolBar() {
     return () => document.removeEventListener('pointerdown', onPointerDown, true)
   }, [openId])
 
+  // Escape closes an open flyout, as any menu.
+  useEffect(() => {
+    if (!openId) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setOpenId(null)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [openId])
+
+  // A flyout belongs to the workspace it was opened in: switching workspace
+  // closes it (the Part toolbar is parked under Drawing, its flyout was not).
+  useEffect(() => {
+    setOpenId(null)
+  }, [docMode])
+
   // THE RAIL (Varun 2026-11-13, the approved mockup): the tools themselves
   // under small headings, not six category buttons that each had to be
   // opened. A tool with variants opens a fly-out (▸). Only tools that work
