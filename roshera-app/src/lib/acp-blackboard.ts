@@ -514,6 +514,10 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
     if (stopReason !== 'cancelled') await revealNewDrawing(drawingsBefore)
   } finally {
     stopDrawingWatch()
+    // A sheet opened mid-turn was read before the agent finished editing it
+    // (H7 set after the sheet appeared): the Drawing workspace re-reads the
+    // open sheet on this (2026-11-19).
+    window.dispatchEvent(new Event('roshera:agent-turn-ended'))
     unsubscribe()
     const b = useBlackboardStore.getState()
     b.setStreamingLine(null)

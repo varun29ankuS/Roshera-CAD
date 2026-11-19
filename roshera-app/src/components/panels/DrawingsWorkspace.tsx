@@ -79,6 +79,7 @@ import {
   type SheetQuality,
 } from '@/lib/drawing-drag'
 import { fitSheetScale } from '@/lib/sheet-fit'
+import { withScreenInk } from '@/lib/sheet-screen-ink'
 
 // CSS pixels per millimetre at the standard 96 DPI mapping. At zoom
 // `1.0` the sheet renders at its true physical size.
@@ -374,6 +375,17 @@ export function DrawingsWorkspace() {
     window.addEventListener(HISTORY_CHANGED_EVENT, onHistory)
     return () => window.removeEventListener(HISTORY_CHANGED_EVENT, onHistory)
   }, [activeId, refreshList, refreshActive])
+
+  // An agent turn ended: the sheet on screen may have been opened before the
+  // agent finished editing it (the bracket's H7 was set after the sheet
+  // appeared and never reached the screen, 2026-11-19). Re-read it.
+  useEffect(() => {
+    const onTurnEnded = () => {
+      if (activeId) void refreshActive(activeId)
+    }
+    window.addEventListener('roshera:agent-turn-ended', onTurnEnded)
+    return () => window.removeEventListener('roshera:agent-turn-ended', onTurnEnded)
+  }, [activeId, refreshActive])
 
   const documentEpoch = useDocumentStore((st) => st.epoch)
   const firstEpoch = useRef(documentEpoch)
@@ -693,7 +705,8 @@ export function DrawingsWorkspace() {
   // The SVG is server-rendered & deterministic. The kernel's
   // `escape_xml` helper sanitises every text-node string, and we never
   // splice user-supplied markup back into the payload. Safe to inline.
-  const svgMarkup = useMemo(() => ({ __html: svg }), [svg])
+  // Screen line weights: visible vs hidden readable at any zoom (paper keeps ISO).
+  const svgMarkup = useMemo(() => ({ __html: withScreenInk(svg) }), [svg])
   // A view pointed at in the Sheet panel, marked on the sheet.
   const [hoverViewId, setHoverViewId] = useState<string | null>(null)
   const [hoverRect, setHoverRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
