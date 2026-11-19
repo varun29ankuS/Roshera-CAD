@@ -80,6 +80,7 @@ import {
 } from '@/lib/drawing-drag'
 import { fitSheetScale } from '@/lib/sheet-fit'
 import { withScreenInk } from '@/lib/sheet-screen-ink'
+import { exportRefusalText } from '@/lib/export-refusal'
 
 // CSS pixels per millimetre at the standard 96 DPI mapping. At zoom
 // `1.0` the sheet renders at its true physical size.
@@ -696,7 +697,8 @@ export function DrawingsWorkspace() {
       try {
         await downloadDrawing(activeDrawing.id, activeDrawing.name, format)
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
+        // In plain words: the server's refusals are written for agents.
+        setError(exportRefusalText(e))
       }
     },
     [activeDrawing],
