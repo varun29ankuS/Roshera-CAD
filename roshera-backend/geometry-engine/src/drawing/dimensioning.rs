@@ -239,6 +239,10 @@ pub(crate) fn project_records(
                 anchor - dir * (d.value * 0.5),
                 anchor + dir * (d.value * 0.5),
             ),
+            "angle" => {
+                let p = cone_generator_point(model, &d, anchor, projection).unwrap_or(anchor);
+                (p, p)
+            }
             _ => (anchor, anchor),
         };
         let a = project_point(projection, p0);
@@ -275,6 +279,45 @@ pub(crate) fn project_records(
         });
     }
     out
+}
+
+/// Where a cone's angle is pointed at in a view: the generator the view sees
+/// on its right-hand side, at the station of the record's anchor (on the
+/// axis, half way along a frustum). The angle used to be printed at the axis,
+/// inside the part's outline; it now takes a leader whose arrow touches the
+/// cone's side line. `None` -- the anchor is kept -- for an angle that names
+/// no cone, a view with no principal direction (the isometric), or a view
+/// that sees the cone end-on.
+fn cone_generator_point(
+    model: &BRepModel,
+    d: &crate::readable::DimensionRecord,
+    anchor: Point3,
+    projection: ProjectionType,
+) -> Option<Point3> {
+    let face = model.faces.get(*d.entities.first()?)?;
+    let surface = model.surfaces.get(face.surface_id)?;
+    let cone = surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Cone>()?;
+    let axis = cone.axis.normalize().ok()?;
+    let vd = view_dir(&projection)?;
+    let side = axis
+        .cross(&Vector3::new(vd[0], vd[1], vd[2]))
+        .normalize()
+        .ok()?;
+    let station = (anchor - cone.apex).dot(&axis);
+    let r = station.abs() * cone.half_angle.tan();
+    if !(r.is_finite() && r > 1e-9) {
+        return None;
+    }
+    let (p, q) = (anchor + side * r, anchor - side * r);
+    Some(
+        if project_point(projection, p)[0] >= project_point(projection, q)[0] {
+            p
+        } else {
+            q
+        },
+    )
 }
 
 /// Callouts that actually READ in this view: drop the ones whose measured span
@@ -1375,6 +1418,29 @@ fn hlr_view_geometry(
     Ok(view)
 }
 
+/// The pixel size `(width, height)` of the shaded pictorial of a view of
+/// unit-scale extent `iso_extent` drawn at `scale`.
+fn iso_raster_px(iso_extent: super::types::ViewExtent, scale: f64) -> (usize, usize) {
+    // Sheet-space cell size (mm). Guard against a degenerate/edge-on extent.
+    let w_mm = (iso_extent.width() * scale).max(1.0);
+    let h_mm = (iso_extent.height() * scale).max(1.0);
+
+    // ~8 px/mm gives a crisp cell (≈200 DPI) without a bloated payload; clamp
+    // the long side so a large sheet's iso cell can't emit a multi-MB PNG.
+    const PX_PER_MM: f64 = 8.0;
+    const MAX_SIDE: usize = 640;
+    const MIN_SIDE: usize = 32;
+    let mut px_w = (w_mm * PX_PER_MM).round() as usize;
+    let mut px_h = (h_mm * PX_PER_MM).round() as usize;
+    let longest = px_w.max(px_h);
+    if longest > MAX_SIDE {
+        let s = MAX_SIDE as f64 / longest as f64;
+        px_w = ((px_w as f64) * s).round() as usize;
+        px_h = ((px_h as f64) * s).round() as usize;
+    }
+    (px_w.max(MIN_SIDE), px_h.max(MIN_SIDE))
+}
+
 /// Render the deterministic SHADED-SOLID isometric raster for the pictorial
 /// cell. The image REPLACES the wireframe line work in the SVG/PDF output so a
 /// shop reader sees a recognizable solid, not see-through HLR edges.
@@ -1405,25 +1471,7 @@ fn shaded_iso_raster(
     use crate::tessellation::TessellationParams;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-    // Sheet-space cell size (mm). Guard against a degenerate/edge-on extent.
-    let w_mm = (iso_extent.width() * scale).max(1.0);
-    let h_mm = (iso_extent.height() * scale).max(1.0);
-
-    // ~8 px/mm gives a crisp cell (≈200 DPI) without a bloated payload; clamp
-    // the long side so a large sheet's iso cell can't emit a multi-MB PNG.
-    const PX_PER_MM: f64 = 8.0;
-    const MAX_SIDE: usize = 640;
-    const MIN_SIDE: usize = 32;
-    let mut px_w = (w_mm * PX_PER_MM).round() as usize;
-    let mut px_h = (h_mm * PX_PER_MM).round() as usize;
-    let longest = px_w.max(px_h);
-    if longest > MAX_SIDE {
-        let s = MAX_SIDE as f64 / longest as f64;
-        px_w = ((px_w as f64) * s).round() as usize;
-        px_h = ((px_h as f64) * s).round() as usize;
-    }
-    px_w = px_w.max(MIN_SIDE);
-    px_h = px_h.max(MIN_SIDE);
+    let (px_w, px_h) = iso_raster_px(iso_extent, scale);
 
     let opts = RenderOptions {
         width: px_w,
@@ -1453,10 +1501,7 @@ fn shaded_iso_raster(
 /// 1-2-5 series: 50:1 ... 2:1, 1:1, 1:2 ... 1:200), so a sheet is drawn at a
 /// scale a shop reads with a scale rule -- never 1:1.33 or 2.5:1.
 fn snap_scale(s: f64) -> f64 {
-    const LADDER: [f64; 14] = [
-        50.0, 20.0, 10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002,
-    ];
-    for &v in LADDER.iter() {
+    for &v in ISO_SCALES.iter() {
         if s >= v - 1e-9 {
             return v;
         }
@@ -1940,22 +1985,35 @@ pub fn standard_drawing_auto(
 
 /// [`standard_drawing_auto`] laid out first- or third-angle.
 ///
-/// The sheet is chosen for the views and their dimensions. When that sheet
-/// is short of PAPER -- a dimension it carries found no room clear of the
-/// other ink, or its hole table no free paper (printed across a view, its
-/// title, the notes or the title block) -- it is rebuilt up to two ISO sizes
-/// larger at the SAME scale, so the views keep their size and the ink gets
-/// the paper. The first sheet that is not short of paper is returned; when
-/// none is, the one with the fewest unplaced dimensions, then the fewest
-/// table collisions, then the fewest layout errors (the first of equals): a
-/// dimension is never traded for a cleaner layout. Other layout errors (a
-/// line through a number inside one view's stack) are not a reason to
-/// rebuild: more paper does not move a view's own lanes (CADGenBench 124 kept
-/// them on A1), and every rebuild redraws all four views (a gear-class part
-/// went past its 30 s budget). Found by looking at benchmark sheets: an A3
-/// gear-pump body whose twelve-row table was printed over its FRONT view,
-/// and an A2 crank whose location ladders ran into the frame (both overall
-/// sizes not dimensioned, half the sheet empty).
+/// The sheet and its scale are chosen by SEARCH over (sheet, ISO 5455 scale)
+/// pairs, starting from the size ladder's sheet. The ladder's sheet is built
+/// exactly as before: the smallest ISO sheet for the part's size at the fill
+/// scale, drawn full size on a larger sheet when one holds it at 1:1
+/// ([`SheetChoice::Auto`]); when that sheet is short of PAPER (a dimension
+/// found no room, or the hole table no free paper: [`short_of_paper`]) it is
+/// redrawn up to two sizes larger at no larger scale
+/// ([`SheetChoice::Capped`]). Then every pair the views -- SECTION A-A
+/// included -- fit at EXACTLY that scale ([`SheetShape::fits`]) is
+/// considered, and the most preferred one ([`SheetShape::preference`]: a
+/// sheet that is not mostly empty paper, full size when that is legible,
+/// then the smaller sheet, then the larger scale) is drawn at its exact
+/// scale ([`SheetChoice::Exact`]) when it is preferred over the ladder's
+/// sheet or that sheet is still short of paper. It replaces the ladder's
+/// sheet only when it is no worse in any count of [`SheetScore`] and better
+/// by those counts or, on equal counts, by preference ([`takes_over`]): the
+/// result is never worse than the ladder's.
+///
+/// So the search draws one sheet more than the ladder did, at most. A view's
+/// line work, dimensions and pictorial depend on the part and direction
+/// only, so every sheet after the first places copies of the first one's
+/// views ([`build_sheet`]).
+///
+/// Found by looking at sheets: a DN50 weld-neck flange came out at 1:2 on A2
+/// with its views filling 8% of the paper (the fill scale keeps a 10% margin
+/// and snaps DOWN, so a part that fits at 0.98 is drawn at 0.5, and SECTION
+/// A-A re-fitted every view the same way), and earlier an A3 gear-pump body
+/// whose hole table was printed over its FRONT view and an A2 crank whose
+/// location ladders ran into the frame.
 pub fn standard_drawing_auto_with_projection(
     model: &BRepModel,
     solid_id: SolidId,
@@ -1963,47 +2021,130 @@ pub fn standard_drawing_auto_with_projection(
     angle: super::types::ProjectionAngle,
 ) -> Result<super::types::Drawing, super::projection::ProjectionError> {
     // A view's hidden lines depend on the part and the direction only, so a
-    // sheet rebuilt on larger paper reuses them instead of redrawing all four
-    // views (a gear-class sheet went from 4.5 s to 30 s without this).
+    // sheet rebuilt at another scale or on other paper reuses them instead of
+    // redrawing all four views (a gear-class sheet went from 4.5 s to 30 s
+    // without this); the part's adjacency graph is built once for all.
     let _visibility = super::visibility::VisibilityCacheScope::enter(model);
-    let first = auto_sheet(model, solid_id, part_uuid, angle, None)?;
-    let mut best_short = sheet_shortfall(&first);
-    let report = |d: &super::types::Drawing, short: (usize, usize, usize)| {
-        if draw_profile_enabled() {
+    let _adjacency = crate::readable::adjacency::AdjacencyCacheScope::enter(model);
+    let prof = draw_profile_enabled();
+    let report = |d: &super::types::Drawing, s: &SheetScore, t: std::time::Instant| {
+        if prof {
             eprintln!(
-                "[draw-profile] sheet {} at {}: {} unplaced, {} table collisions, {} layout errors",
+                "[draw-profile] sheet {} at {}: {} unplaced, {} table collisions, {} layout errors, utilization {:.3} ({:.1} ms)",
                 d.sheet_size.label(),
                 d.views.first().map_or(0.0, |v| v.scale),
-                short.0,
-                short.1,
-                short.2
+                s.unplaced,
+                s.table,
+                s.errors,
+                s.utilization,
+                t.elapsed().as_secs_f64() * 1e3
             );
         }
     };
-    report(&first, best_short);
-    if !short_of_paper(best_short) {
-        return Ok(first);
-    }
-    let scale = first.views.first().map_or(1.0, |v| v.scale);
-    let mut sheet = first.sheet_size;
-    let mut best = first;
-    for _ in 0..2 {
-        let Some(next) = larger_sheet(&sheet) else {
-            break;
-        };
-        let roomier = auto_sheet(model, solid_id, part_uuid, angle, Some((next, scale)))?;
-        let short = sheet_shortfall(&roomier);
-        report(&roomier, short);
-        if !short_of_paper(short) {
-            return Ok(roomier);
+    let plan = plan_sheet(model, solid_id, part_uuid)?;
+    let t = std::time::Instant::now();
+    let mut views = Vec::new();
+    let seed = build_sheet(
+        model,
+        solid_id,
+        part_uuid,
+        angle,
+        &plan,
+        SheetChoice::Auto,
+        &mut views,
+    )?;
+    let seed_score = SheetScore::of(&seed);
+    report(&seed, &seed_score, t);
+    let shape = SheetShape::of(&seed, &plan, angle);
+    let seed_scale = seed.views.first().map_or(1.0, |v| v.scale);
+
+    // The size ladder's sheet, exactly as it was chosen before the search:
+    // a seed short of paper is redrawn up to two ISO sizes larger at no
+    // larger scale; the first redraw that is not short of paper is taken,
+    // else the one with the fewest (unplaced, table collisions, errors).
+    // Every (sheet, scale) drawn so far: the search does not draw one twice.
+    let mut built = vec![(seed.sheet_size, seed_scale)];
+    let mut ladder = (seed, seed_score);
+    if short_of_paper(seed_score.shortfall()) {
+        let mut sheet = ladder.0.sheet_size;
+        for _ in 0..2 {
+            let Some(next) = larger_sheet(&sheet) else {
+                break;
+            };
+            sheet = next;
+            let t = std::time::Instant::now();
+            let roomier = build_sheet(
+                model,
+                solid_id,
+                part_uuid,
+                angle,
+                &plan,
+                SheetChoice::Capped(next, seed_scale),
+                &mut views,
+            )?;
+            let s = SheetScore::of(&roomier);
+            report(&roomier, &s, t);
+            built.push((
+                roomier.sheet_size,
+                roomier.views.first().map_or(seed_scale, |v| v.scale),
+            ));
+            let enough = !short_of_paper(s.shortfall());
+            if enough || s.shortfall() < ladder.1.shortfall() {
+                ladder = (roomier, s);
+            }
+            if enough {
+                break;
+            }
         }
-        if short < best_short {
-            best_short = short;
-            best = roomier;
-        }
-        sheet = next;
     }
-    Ok(best)
+
+    // The search: the most preferred (sheet, scale) the views fit, drawn
+    // at exactly that scale, replaces the ladder's sheet when it is no worse
+    // in any count and better by its counts or its preference.
+    let ladder_scale = ladder.0.views.first().map_or(1.0, |v| v.scale);
+    // Preferences of built sheets are read off their measured utilization;
+    // a candidate's estimate only chooses which one to build.
+    let ladder_pref = shape.preference(&ladder.0.sheet_size, ladder_scale, ladder.1.utilization);
+    let Some(c) = shape.candidate(
+        ladder_scale,
+        ladder_pref,
+        short_of_paper(ladder.1.shortfall()),
+        &built,
+    ) else {
+        return Ok(ladder.0);
+    };
+    let t = std::time::Instant::now();
+    let d = build_sheet(
+        model,
+        solid_id,
+        part_uuid,
+        angle,
+        &plan,
+        SheetChoice::Exact(c.sheet, c.scale),
+        &mut views,
+    )?;
+    let s = SheetScore::of(&d);
+    report(&d, &s, t);
+    let pref = shape.preference(&c.sheet, c.scale, s.utilization);
+    if takes_over(&ladder.1, (&ladder.1, ladder_pref), (&s, pref)) {
+        Ok(d)
+    } else {
+        Ok(ladder.0)
+    }
+}
+
+/// Does a built `candidate` replace the `best` sheet so far? Only when it is
+/// no worse than the `seed` in any count (a sheet that trades one shortfall
+/// for another is not taken: the result is never worse than the size
+/// ladder's sheet), and better than `best` by its counts or, on equal
+/// counts, by drafting preference.
+fn takes_over(
+    seed: &SheetScore,
+    best: (&SheetScore, Preference),
+    candidate: (&SheetScore, Preference),
+) -> bool {
+    candidate.0.no_worse_than(seed)
+        && (candidate.0.counts(), candidate.1) < (best.0.counts(), best.1)
 }
 
 /// A sheet is short of paper when a dimension found no room or its hole
@@ -2012,12 +2153,295 @@ fn short_of_paper(short: (usize, usize, usize)) -> bool {
     short.0 > 0 || short.1 > 0
 }
 
+/// How good a built sheet is: what it falls short by ([`sheet_shortfall`])
+/// and how much of the paper its views fill.
+#[derive(Debug, Clone, Copy)]
+struct SheetScore {
+    errors: usize,
+    unplaced: usize,
+    table: usize,
+    utilization: f64,
+}
+
+impl SheetScore {
+    fn of(drawing: &super::types::Drawing) -> Self {
+        let ((unplaced, table, errors), utilization) = sheet_shortfall_and_utilization(drawing);
+        Self {
+            errors,
+            unplaced,
+            table,
+            utilization,
+        }
+    }
+
+    /// `(unplaced, table collisions, errors)`, as [`sheet_shortfall`].
+    fn shortfall(&self) -> (usize, usize, usize) {
+        (self.unplaced, self.table, self.errors)
+    }
+
+    /// Lexicographic badness: layout errors, then unplaced dimensions, then
+    /// hole-table collisions.
+    fn counts(&self) -> (usize, usize, usize) {
+        (self.errors, self.unplaced, self.table)
+    }
+
+    /// No count is higher than `other`'s, and the views do not go from
+    /// filling the sheet to leaving it mostly empty (the quality check's
+    /// `SheetUnderutilized`): a sheet that trades one shortfall for another
+    /// is not taken over the seed.
+    fn no_worse_than(&self, other: &Self) -> bool {
+        let min = super::verify::MIN_UTILIZATION;
+        self.errors <= other.errors
+            && self.unplaced <= other.unplaced
+            && self.table <= other.table
+            && !(self.utilization < min && other.utilization >= min)
+    }
+}
+
+/// Drafting preference of a (sheet, scale), lower is better: `(tier, sheet
+/// rank, -utilization)`. Tier 0: the views fill at least the
+/// under-utilization threshold AND are full size, legibly; tier 1: they fill
+/// it, legibly; tier 2: mostly empty paper, or too small to read. Within a
+/// tier the smaller sheet, then the fuller one (on one sheet: the larger
+/// scale) -- paper is not spent only to fill it: a 30 mm part drawn 2:1 on
+/// A4 is not redrawn 5:1 on A3.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+struct Preference(u8, u8, f64);
+
+/// A (sheet, exact scale) worth building.
+#[derive(Debug, Clone, Copy)]
+struct SheetCandidate {
+    sheet: super::types::SheetSize,
+    scale: f64,
+    preference: Preference,
+}
+
+/// The views of a sheet at unit scale, and the gaps between them, as the
+/// seed sheet laid them out: what decides whether they fit a sheet at a scale
+/// and how much of it they fill, without building it.
+struct SheetShape {
+    angle: super::types::ProjectionAngle,
+    /// FRONT, TOP, RIGHT, ISOMETRIC.
+    core: [super::types::ViewExtent; 4],
+    /// The four-view gaps ([`dimension_band_gaps`] of the probe views).
+    gaps: (f64, f64),
+    /// SECTION A-A's extent and the gaps the section re-layout uses, when
+    /// the part is sectioned.
+    section: Option<(super::types::ViewExtent, (f64, f64))>,
+    /// The part's dimensions need more than the standard gaps.
+    busy: bool,
+    max_dim: f64,
+}
+
+/// Every view placed at `positions` (sheet mm, the renderers' convention: y
+/// up from the sheet's bottom) leaves its title room above it inside the
+/// frame. The fill layouts keep 10% of the paper spare, which always held a
+/// title; a sheet drawn at an exact scale can fill the area to the
+/// millimetre, and a 1:1 box on A4 put "ISOMETRIC (1:1)" over the frame line.
+fn views_leave_title_room(
+    sheet: &super::types::SheetSize,
+    extents: &[super::types::ViewExtent],
+    positions: &[[f64; 2]],
+    scale: f64,
+) -> bool {
+    let (_, _, mt, _) = super::svg::frame_margins(sheet);
+    let title = super::layout::LABEL_GAP + super::layout::VIEW_LABEL_FONT_MM;
+    extents.iter().zip(positions).all(|(e, p)| {
+        // Sheet y (down) of the view's top edge.
+        let top = sheet.height() - p[1] - e.max_y * scale;
+        top - title >= mt
+    })
+}
+
+/// The candidate sheets, smallest first. A0 only when no smaller sheet holds
+/// the views at any scale.
+const SEARCH_SHEETS: [super::types::SheetSize; 4] = [
+    super::types::SheetSize::A4,
+    super::types::SheetSize::A3,
+    super::types::SheetSize::A2,
+    super::types::SheetSize::A1,
+];
+
+/// ISO 5455 recommended scales, largest first (the 1-2-5 series).
+const ISO_SCALES: [f64; 14] = [
+    50.0, 20.0, 10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002,
+];
+
+impl SheetShape {
+    fn of(
+        seed: &super::types::Drawing,
+        plan: &SheetPlan,
+        angle: super::types::ProjectionAngle,
+    ) -> Self {
+        let e = |i: usize| plan.extents.get(i).copied().unwrap_or_default();
+        let section = seed.section.as_ref().and_then(|s| {
+            seed.views
+                .get(s.section_view_idx)
+                .map(|v| (v.extent, section_layout_gaps(seed)))
+        });
+        Self {
+            angle,
+            core: [e(0), e(1), e(2), e(3)],
+            gaps: (plan.vgap, plan.hgap),
+            section,
+            busy: plan.vgap > VGAP || plan.hgap > HGAP,
+            max_dim: plan.max_dim,
+        }
+    }
+
+    /// The views fit `sheet` at exactly `scale`, with their gaps -- the same
+    /// placement the build uses ([`place_four_view`], and for SECTION A-A
+    /// the slot of [`section_slot_rule`]) -- and every view keeps room above
+    /// it for its title inside the frame ([`views_leave_title_room`]).
+    fn fits(&self, sheet: &super::types::SheetSize, scale: f64) -> bool {
+        let [f, t, r, i] = self.core;
+        let (vgap, hgap) = self.gaps;
+        let four = place_four_view(sheet, f, t, r, i, scale, self.angle, vgap, hgap);
+        if !four.fits() || !views_leave_title_room(sheet, &self.core, &four.positions, scale) {
+            return false;
+        }
+        let Some((s, (svgap, shgap))) = self.section else {
+            return true;
+        };
+        match section_slot_rule(sheet) {
+            SectionSlotRule::ReplaceIso => {
+                let p = place_four_view(sheet, f, t, r, s, scale, self.angle, svgap, shgap);
+                p.fits() && views_leave_title_room(sheet, &[f, t, r, s], &p.positions, scale)
+            }
+            SectionSlotRule::FifthSlot => {
+                let (_, p, fits) =
+                    layout_five_view(sheet, f, t, r, i, s, self.angle, svgap, shgap, Some(scale));
+                fits && views_leave_title_room(sheet, &[f, t, r, i, s], &p, scale)
+            }
+        }
+    }
+
+    /// The share of the printable paper the views cover at `scale` -- the
+    /// quantity [`super::verify::verify_drawing`] reports as utilization,
+    /// estimated from the views' extents (an A4 sheet's floating pictorial is
+    /// left out: its scale is chosen afterwards).
+    fn utilization(&self, sheet: &super::types::SheetSize, scale: f64) -> f64 {
+        let area = |e: &super::types::ViewExtent| e.width() * e.height() * scale * scale;
+        let [f, t, r, i] = &self.core;
+        let mut ink = area(f) + area(t) + area(r);
+        match (&self.section, section_slot_rule(sheet)) {
+            (Some((s, _)), SectionSlotRule::ReplaceIso) => ink += area(s),
+            (Some((s, _)), SectionSlotRule::FifthSlot) => ink += area(i) + area(s),
+            (None, _) => ink += area(i),
+        }
+        let frame = super::svg::frame_rect(sheet);
+        let (tb_w, tb_h) = super::svg::title_block_size(sheet);
+        let printable = ((frame.x1 - frame.x0) * (frame.y1 - frame.y0) - tb_w * tb_h).max(1.0);
+        (ink / printable).clamp(0.0, 1.0)
+    }
+
+    /// The preference of `(sheet, scale)` with the views filling `util` of
+    /// the paper: measured on a built sheet, else [`Self::utilization`]'s
+    /// estimate ([`Self::estimated`]).
+    fn preference(&self, sheet: &super::types::SheetSize, scale: f64, util: f64) -> Preference {
+        let filled = util >= super::verify::MIN_UTILIZATION;
+        let full_size = (scale - 1.0).abs() < 1e-9;
+        // A busy part's views must be a legible size on paper, or its
+        // extension lines crowd (see [`MIN_BUSY_VIEW_PAPER_MM`]).
+        let legible = !self.busy || self.max_dim * scale >= MIN_BUSY_VIEW_PAPER_MM;
+        let tier = if filled && full_size && legible {
+            0
+        } else if filled && legible {
+            1
+        } else {
+            2
+        };
+        let rank = SEARCH_SHEETS
+            .iter()
+            .position(|s| s == sheet)
+            .unwrap_or(SEARCH_SHEETS.len()) as u8;
+        Preference(tier, rank, -util)
+    }
+
+    /// [`Self::preference`] of a sheet not built yet.
+    fn estimated(&self, sheet: &super::types::SheetSize, scale: f64) -> Preference {
+        self.preference(sheet, scale, self.utilization(sheet, scale))
+    }
+
+    /// The one sheet worth building after the size ladder's sheet, drawn at
+    /// `seed_scale` with preference `seed_pref`, and none of the `built`
+    /// (sheet, scale) pairs drawn already: the most preferred of
+    /// the pairs considered -- per sheet, its largest ISO scale that fits,
+    /// 1:1 when it fits, and the ladder's scale when it fits. A pair that
+    /// would leave the sheet mostly empty is dropped when some pair fills a
+    /// sheet (unless it is at the ladder's scale), and unless `need_paper`
+    /// only a pair preferred over the ladder's sheet is worth the build.
+    fn candidate(
+        &self,
+        seed_scale: f64,
+        seed_pref: Preference,
+        need_paper: bool,
+        built: &[(super::types::SheetSize, f64)],
+    ) -> Option<SheetCandidate> {
+        let sheet_pairs = |sheets: &[super::types::SheetSize]| -> Vec<SheetCandidate> {
+            let mut out = Vec::new();
+            for sheet in sheets {
+                let fitting: Vec<f64> = ISO_SCALES
+                    .iter()
+                    .copied()
+                    .filter(|&s| self.fits(sheet, s))
+                    .collect();
+                let mut scales: Vec<f64> = fitting.first().copied().into_iter().collect();
+                for want in [1.0, seed_scale] {
+                    if fitting.iter().any(|&s| (s - want).abs() < 1e-9)
+                        && !scales.iter().any(|&s| (s - want).abs() < 1e-9)
+                    {
+                        scales.push(want);
+                    }
+                }
+                for scale in scales {
+                    out.push(SheetCandidate {
+                        sheet: *sheet,
+                        scale,
+                        preference: self.estimated(sheet, scale),
+                    });
+                }
+            }
+            out
+        };
+        let mut all = sheet_pairs(&SEARCH_SHEETS);
+        if all.is_empty() {
+            all = sheet_pairs(&[super::types::SheetSize::A0]);
+        }
+        let some_filled = all.iter().any(|c| c.preference.0 < 2);
+        let out: Vec<SheetCandidate> = all
+            .into_iter()
+            .filter(|c| {
+                !built
+                    .iter()
+                    .any(|(sheet, scale)| c.sheet == *sheet && (c.scale - scale).abs() < 1e-9)
+            })
+            .filter(|c| !some_filled || c.preference.0 < 2 || (c.scale - seed_scale).abs() < 1e-9)
+            .filter(|c| need_paper || c.preference < seed_pref)
+            .collect();
+        out.into_iter().min_by(|a, b| {
+            a.preference
+                .partial_cmp(&b.preference)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+}
+
 /// What a sheet falls short by, `(unplaced, table collisions, errors)`: the
 /// dimensions its views carry that the layout did not place (no room clear
 /// of the other ink), the `HoleTableCollision` findings, and all its layout
-/// errors (`verify_drawing`). A dimension the hole table states instead, or
+/// errors (`verify_drawing`) and ink outside the frame
+/// ([`super::verify::find_ink_outside_frame`]). A dimension the hole table states instead, or
 /// one a person suppressed, is not owed a place.
+#[cfg(test)]
 fn sheet_shortfall(drawing: &super::types::Drawing) -> (usize, usize, usize) {
+    sheet_shortfall_and_utilization(drawing).0
+}
+
+/// [`sheet_shortfall`] and the sheet's utilization, from one quality check.
+fn sheet_shortfall_and_utilization(
+    drawing: &super::types::Drawing,
+) -> ((usize, usize, usize), f64) {
     let report = super::verify::verify_drawing(drawing);
     let errors = report.error_count();
     let table = report
@@ -2026,6 +2450,15 @@ fn sheet_shortfall(drawing: &super::types::Drawing) -> (usize, usize, usize) {
         .filter(|i| i.kind == super::verify::DrawingIssueKind::HoleTableCollision)
         .count();
     let layout = super::layout::compute_layout(drawing);
+    // Ink over the frame line -- a view title pushed off the top of the
+    // paper -- counts with the layout errors: the quality check does not
+    // report it, and a sheet drawn at an exact scale can do it.
+    let errors = errors
+        + super::verify::find_ink_outside_frame(
+            &layout,
+            super::svg::frame_rect(&drawing.sheet_size),
+        )
+        .len();
     let tabled = super::layout::tabled_face_ids(drawing);
     let placed: std::collections::HashSet<(usize, &str)> = layout
         .dimensions
@@ -2054,51 +2487,90 @@ fn sheet_shortfall(drawing: &super::types::Drawing) -> (usize, usize, usize) {
             !by_table && !suppressed && !placed.contains(&(*vi, d.id.as_str()))
         })
         .count();
-    (unplaced, table, errors)
+    ((unplaced, table, errors), report.sheet_utilization)
 }
 
-/// One automatic sheet. `on` forces the sheet and caps the scale (the views
-/// are drawn no larger than that scale, centred on the given sheet); `None`
-/// chooses both from the part and its dimensions.
+/// How an automatic sheet gets its paper and scale.
+#[derive(Debug, Clone, Copy)]
+enum SheetChoice {
+    /// Chosen from the part and its dimensions: the size ladder and the fill
+    /// scale (the search's seed).
+    Auto,
+    /// The sheet given, the scale capped: the views are drawn no larger than
+    /// it, and SECTION A-A re-fits them as on any automatic sheet (the size
+    /// ladder's redraw of a sheet short of paper).
+    Capped(super::types::SheetSize, f64),
+    /// The sheet given and EXACTLY this scale, for every view SECTION A-A
+    /// included: a search candidate.
+    Exact(super::types::SheetSize, f64),
+}
+
+/// Pass 1 of an automatic sheet, which does not depend on the paper: every
+/// view's unit-scale extent, the gaps the views' dimension bands need, and
+/// the depth of their left-hand lanes.
+struct SheetPlan {
+    /// `[front, top, right, iso]` at unit scale.
+    extents: Vec<super::types::ViewExtent>,
+    vgap: f64,
+    hgap: f64,
+    /// Depth of the left lanes of FRONT, TOP and RIGHT, paper mm.
+    left_bands: Vec<f64>,
+    /// The part's largest orthographic size, mm.
+    max_dim: f64,
+}
+
+/// Order matches `layout_four_view`'s returned positions: [Front, Top, Right,
+/// Iso]. Only the orthographic views are dimensioned; the isometric is a
+/// clean pictorial reference.
+const AUTO_VIEWS: [(ProjectionType, &str, bool); 4] = [
+    (ProjectionType::Front, "FRONT", true),
+    (ProjectionType::Top, "TOP", true),
+    (ProjectionType::Right, "RIGHT", true),
+    (ProjectionType::Isometric, "ISOMETRIC", false),
+];
+
+/// The search's seed alone: the sheet the size ladder picks.
+#[cfg(test)]
 fn auto_sheet(
     model: &BRepModel,
     solid_id: SolidId,
     part_uuid: uuid::Uuid,
     angle: super::types::ProjectionAngle,
-    on: Option<(super::types::SheetSize, f64)>,
 ) -> Result<super::types::Drawing, super::projection::ProjectionError> {
-    // Hole recognition and round-part detection ask for this solid's
-    // adjacency graph in every view and pass; build it once for the sheet.
     let _adjacency = crate::readable::adjacency::AdjacencyCacheScope::enter(model);
-    use super::types::{Drawing, ViewSource};
+    let plan = plan_sheet(model, solid_id, part_uuid)?;
+    build_sheet(
+        model,
+        solid_id,
+        part_uuid,
+        angle,
+        &plan,
+        SheetChoice::Auto,
+        &mut Vec::new(),
+    )
+}
 
+/// Pass 1: unit-scale extents to drive sheet + scale + placement. The sheet
+/// size keys off the ORTHOGRAPHIC max dimension (true part size), not the
+/// larger isometric silhouette.
+///
+/// Extent-ONLY: the sheet/scale/placement key off the projected WIREFRAME
+/// extent, which `project_solid_view` computes directly. `build_hlr_view`
+/// never augments the extent past that wireframe, so running the full HLR +
+/// dimension + centerline build here would compute every view TWICE -- and
+/// the visibility raytrace is the pipeline's dominant cost.
+fn plan_sheet(
+    model: &BRepModel,
+    solid_id: SolidId,
+    part_uuid: uuid::Uuid,
+) -> Result<SheetPlan, super::projection::ProjectionError> {
+    use super::types::{Drawing, ViewSource};
     let source = ViewSource::Part {
         part_id: part_uuid,
         solid_id,
     };
     let min_span = 0.5_f64;
-    // Order matches `layout_four_view`'s returned positions:
-    // [Front, Top, Right, Iso]. Only the orthographic views are
-    // dimensioned; the isometric is a clean pictorial reference.
-    let specs = [
-        (ProjectionType::Front, "FRONT", true),
-        (ProjectionType::Top, "TOP", true),
-        (ProjectionType::Right, "RIGHT", true),
-        (ProjectionType::Isometric, "ISOMETRIC", false),
-    ];
-
     let prof = draw_profile_enabled();
-    let t_all = std::time::Instant::now();
-
-    // Pass 1 — unit-scale extents to drive sheet + scale + placement. The
-    // sheet size keys off the ORTHOGRAPHIC max dimension (true part size),
-    // not the larger isometric silhouette.
-    //
-    // Extent-ONLY: the sheet/scale/placement key off the projected WIREFRAME
-    // extent, which `project_solid_view` computes directly. `build_hlr_view`
-    // never augments the extent past that wireframe, so running the full HLR +
-    // dimension + centerline build here would compute every view TWICE — and the
-    // visibility raytrace is the pipeline's dominant cost. Extent-only halves it.
     let t_p1 = std::time::Instant::now();
     let mut extents = Vec::with_capacity(4);
     let mut band_probe = Drawing::new("band probe", super::types::SheetSize::A4);
@@ -2110,7 +2582,7 @@ fn auto_sheet(
             );
         }
     };
-    for (proj, name, dimensioned) in specs {
+    for (proj, name, dimensioned) in AUTO_VIEWS {
         let t = std::time::Instant::now();
         let mut v =
             super::projection::project_solid_view(model, source, proj, name, [0.0, 0.0], 1.0)?;
@@ -2171,12 +2643,67 @@ fn auto_sheet(
         .map(|e| e.width().max(e.height()))
         .fold(0.0_f64, f64::max)
         .max(1.0);
-    let forced = on.is_some();
-    let mut sheet = on.map_or_else(|| pick_sheet(max_dim), |(s, _)| s);
-    let (mut scale, mut positions) = layout_four_view_gap(
-        &sheet, extents[0], extents[1], extents[2], extents[3], angle, vgap, hgap,
-    );
-    if let Some((_, cap)) = on {
+    Ok(SheetPlan {
+        extents,
+        vgap,
+        hgap,
+        left_bands,
+        max_dim,
+    })
+}
+
+/// Pass 2 and the sheet's tail: the views placed and drawn on the paper and
+/// at the scale `choice` gives, then the hole table, SECTION A-A, GD&T and
+/// tolerances. The caller holds an adjacency cache scope over `model`.
+///
+/// `views` carries the four views as drawn for the first sheet of a search
+/// (empty before it): later sheets place copies of them instead of drawing
+/// them again -- the dimensions, centre lines and the shaded pictorial (the
+/// pictorial is rendered again only when its cell now needs more pixels than
+/// it was drawn with; a larger raster in a smaller cell is only scaled down).
+fn build_sheet(
+    model: &BRepModel,
+    solid_id: SolidId,
+    part_uuid: uuid::Uuid,
+    angle: super::types::ProjectionAngle,
+    plan: &SheetPlan,
+    choice: SheetChoice,
+    views: &mut Vec<super::types::ProjectedView>,
+) -> Result<super::types::Drawing, super::projection::ProjectionError> {
+    use super::types::{Drawing, ViewSource};
+
+    let source = ViewSource::Part {
+        part_id: part_uuid,
+        solid_id,
+    };
+    let min_span = 0.5_f64;
+    let specs = AUTO_VIEWS;
+    let prof = draw_profile_enabled();
+    let t_all = std::time::Instant::now();
+    let extents = &plan.extents;
+    let (vgap, hgap, max_dim) = (plan.vgap, plan.hgap, plan.max_dim);
+    let mut exact_scale = None;
+    let (mut sheet, mut scale, mut positions) = match choice {
+        SheetChoice::Exact(sheet, s) => {
+            exact_scale = Some(s);
+            let p = place_four_view(
+                &sheet, extents[0], extents[1], extents[2], extents[3], s, angle, vgap, hgap,
+            )
+            .positions;
+            (sheet, s, p)
+        }
+        SheetChoice::Auto | SheetChoice::Capped(..) => {
+            let sheet = match choice {
+                SheetChoice::Capped(s, _) => s,
+                _ => pick_sheet(max_dim),
+            };
+            let (s, p) = layout_four_view_gap(
+                &sheet, extents[0], extents[1], extents[2], extents[3], angle, vgap, hgap,
+            );
+            (sheet, s, p)
+        }
+    };
+    if let SheetChoice::Capped(_, cap) = choice {
         if scale > cap {
             scale = cap;
             positions = place_four_view(
@@ -2185,13 +2712,14 @@ fn auto_sheet(
             .positions;
         }
     }
+    let free = matches!(choice, SheetChoice::Auto);
     // Drafting practice: a part that would be reduced is drawn full size on a
     // larger sheet when one holds it at 1:1 -- up to two sizes up for the
     // part alone, and as far as A0 when it is the part's DIMENSIONS that need
     // the room (a small part with forty dimensions does not fit the sheet its
     // size alone would pick). When no sheet holds it at 1:1, the sheet that
     // gives the largest scale is used (the smallest such sheet).
-    if scale < 1.0 && !forced {
+    if scale < 1.0 && free {
         let mut candidate = sheet;
         let steps = if vgap > VGAP || hgap > HGAP { 4 } else { 2 };
         for _ in 0..steps {
@@ -2217,7 +2745,7 @@ fn auto_sheet(
     // 30 mm part with forty dimensions has its extension lines a millimetre
     // apart. Up to two sheet sizes up, while the scale grows, until the main
     // views are a legible size on paper.
-    if !forced && (vgap > VGAP || hgap > HGAP) && max_dim * scale < MIN_BUSY_VIEW_PAPER_MM {
+    if free && (vgap > VGAP || hgap > HGAP) && max_dim * scale < MIN_BUSY_VIEW_PAPER_MM {
         let mut candidate = sheet;
         for _ in 0..2 {
             let Some(next) = larger_sheet(&candidate) else {
@@ -2238,7 +2766,7 @@ fn auto_sheet(
         }
     }
 
-    let positions = room_for_left_lanes(&sheet, &extents, scale, positions, &left_bands);
+    let positions = room_for_left_lanes(&sheet, extents, scale, positions, &plan.left_bands);
 
     // Pass 2 — build the placed, scaled views.
     let t_p2 = std::time::Instant::now();
@@ -2246,6 +2774,28 @@ fn auto_sheet(
     drawing.projection = angle;
     drawing.set_unit_notes(model.document_unit());
     for (i, (proj, name, dimensioned)) in specs.iter().enumerate() {
+        // A view drawn for an earlier sheet of this search is the same view:
+        // its line work, dimensions and centre lines are in VIEW space, and
+        // the paper and scale only place it. Its shaded pictorial is kept
+        // unless the cell now needs more pixels than it has.
+        if let Some(built) = views.get(i) {
+            let mut view = built.clone();
+            view.position_mm = positions[i];
+            view.scale = scale;
+            // The raster keeps the cell's aspect, so its long side says how
+            // many pixels it has (the short side differs by rounding alone).
+            let (need_w, need_h) = iso_raster_px(view.extent, scale);
+            if matches!(proj, ProjectionType::Isometric)
+                && built
+                    .shaded_raster
+                    .as_ref()
+                    .is_some_and(|r| need_w.max(need_h) > r.px_width.max(r.px_height))
+            {
+                view.shaded_raster = shaded_iso_raster(model, solid_id, view.extent, scale);
+            }
+            drawing.add_view(view);
+            continue;
+        }
         let t_v = std::time::Instant::now();
         let mut view = build_hlr_view(
             model,
@@ -2275,6 +2825,7 @@ fn auto_sheet(
         if matches!(proj, ProjectionType::Isometric) {
             view.shaded_raster = shaded_iso_raster(model, solid_id, view.extent, scale);
         }
+        views.push(view.clone());
         drawing.add_view(view);
     }
     if prof {
@@ -2302,7 +2853,7 @@ fn auto_sheet(
     // ── Section view (Task 9) ─────────────────────────────────────────────────
     // When the part has internal features (bore sites populated above), add
     // SECTION A-A placed by the deterministic section_slot_rule.
-    attach_section_view(model, solid_id, &mut drawing, &dims);
+    attach_section_view(model, solid_id, &mut drawing, &dims, exact_scale);
 
     // ── GD&T sidecar bridge (Task 6 fix wave) ────────────────────────────────
     // Iterate the model's DRF (datum designations) and GDT sidecar
@@ -3415,7 +3966,12 @@ pub fn section_slot_rule(sheet: &super::types::SheetSize) -> SectionSlotRule {
 /// Comparing both candidates and keeping the winner packs the section where
 /// its own extent actually leaves a gap, instead of a fixed slot.
 ///
-/// Returns `(scale, [front, top, right, iso, section] position_mm)`.
+/// With `fixed`, every view is drawn at exactly that scale (a sheet the
+/// automatic search chose) and the band is used when it fits, else the
+/// column when it fits, else the band.
+///
+/// Returns `(scale, [front, top, right, iso, section] position_mm, fits)`,
+/// `fits` true when the arrangement is inside the usable drawing area.
 fn layout_five_view(
     sheet: &super::types::SheetSize,
     fe: super::types::ViewExtent,
@@ -3426,14 +3982,28 @@ fn layout_five_view(
     angle: super::types::ProjectionAngle,
     vgap: f64,
     hgap: f64,
-) -> (f64, [[f64; 2]; 5]) {
-    let column = five_view_column(sheet, fe, te, re, ie, se, angle, vgap, hgap);
-    let band = five_view_band(sheet, fe, te, re, ie, se, angle, vgap, hgap);
-    if band.0 >= column.0 {
+    fixed: Option<f64>,
+) -> (f64, [[f64; 2]; 5], bool) {
+    let column = five_view_column(sheet, fe, te, re, ie, se, angle, vgap, hgap, fixed);
+    let band = five_view_band(sheet, fe, te, re, ie, se, angle, vgap, hgap, fixed);
+    if fixed.is_some() {
+        if band.2 || !column.2 {
+            band
+        } else {
+            column
+        }
+    } else if band.0 >= column.0 {
         band
     } else {
         column
     }
+}
+
+/// Is a group `g_w` x `g_h` (paper mm) inside the usable area `avail_w` x
+/// `avail_h`, with the bottom dimension band's shortfall kept clear as
+/// [`place_four_view`] keeps it?
+fn group_fits(g_w: f64, g_h: f64, avail_w: f64, avail_h: f64) -> bool {
+    overrun(g_w, avail_w) <= 0.0 && overrun(g_h, avail_h - BOTTOM_DIM_SHORTFALL) <= 0.0
 }
 
 /// Candidate A: SECTION A-A as a dedicated third column beside the TOP/ISO
@@ -3451,7 +4021,8 @@ fn five_view_column(
     angle: super::types::ProjectionAngle,
     vgap: f64,
     hgap: f64,
-) -> (f64, [[f64; 2]; 5]) {
+    fixed: Option<f64>,
+) -> (f64, [[f64; 2]; 5], bool) {
     let w = sheet.width();
     let h = sheet.height();
     let (ml, mr, mt, mb) = super::svg::frame_margins(sheet);
@@ -3494,7 +4065,7 @@ fn five_view_column(
     if !scale.is_finite() || scale <= 0.0 {
         scale = 1.0;
     }
-    scale = snap_scale(scale);
+    scale = fixed.unwrap_or_else(|| snap_scale(scale));
 
     let lw = left_w * scale;
     let mwc = mid_w * scale;
@@ -3525,22 +4096,27 @@ fn five_view_column(
         [xtl - e.min_x * scale, h - ytl - e.max_y * scale]
     };
 
-    (scale, {
-        // The 2×2 core (third angle: FRONT bottom-left, TOP top-left,
-        // RIGHT bottom-centre, ISO top-centre), reflected through its own
-        // centre for first angle; SECTION keeps its right column.
-        let core = (gx, core_y0, gx + lw + hgap + mwc, core_y0 + core_block_h);
-        let c = |x: f64, y: f64| core_cell(angle, (x, y), core);
-        let ((fx, fy), (tx, ty)) = (c(left_cx, bot_cy), c(left_cx, top_cy));
-        let ((rx, ry), (ix, iy)) = (c(mid_cx, bot_cy), c(mid_cx, top_cy));
-        [
-            place(fx, fy, fe),
-            place(tx, ty, te),
-            place(rx, ry, re),
-            place(ix, iy, ie),
-            place(right_cx, sec_cy, se),
-        ]
-    })
+    let fits = group_fits(g_w, g_h, avail_w, avail_h);
+    (
+        scale,
+        {
+            // The 2×2 core (third angle: FRONT bottom-left, TOP top-left,
+            // RIGHT bottom-centre, ISO top-centre), reflected through its own
+            // centre for first angle; SECTION keeps its right column.
+            let core = (gx, core_y0, gx + lw + hgap + mwc, core_y0 + core_block_h);
+            let c = |x: f64, y: f64| core_cell(angle, (x, y), core);
+            let ((fx, fy), (tx, ty)) = (c(left_cx, bot_cy), c(left_cx, top_cy));
+            let ((rx, ry), (ix, iy)) = (c(mid_cx, bot_cy), c(mid_cx, top_cy));
+            [
+                place(fx, fy, fe),
+                place(tx, ty, te),
+                place(rx, ry, re),
+                place(ix, iy, ie),
+                place(right_cx, sec_cy, se),
+            ]
+        },
+        fits,
+    )
 }
 
 /// Candidate B: SECTION A-A as a full-width band ABOVE the TOP/ISO over
@@ -3569,7 +4145,8 @@ fn five_view_band(
     angle: super::types::ProjectionAngle,
     vgap: f64,
     hgap: f64,
-) -> (f64, [[f64; 2]; 5]) {
+    fixed: Option<f64>,
+) -> (f64, [[f64; 2]; 5], bool) {
     let w = sheet.width();
     let h = sheet.height();
     let (ml, mr, mt, mb) = super::svg::frame_margins(sheet);
@@ -3620,7 +4197,7 @@ fn five_view_band(
     if !scale.is_finite() || scale <= 0.0 {
         scale = 1.0;
     }
-    scale = snap_scale(scale);
+    scale = fixed.unwrap_or_else(|| snap_scale(scale));
 
     let lw = left_w * scale;
     let rwc = right_w * scale;
@@ -3651,27 +4228,32 @@ fn five_view_band(
         [xtl - e.min_x * scale, h - ytl - e.max_y * scale]
     };
 
-    (scale, {
-        // The 2×2 core under the band, reflected through its own centre
-        // for first angle; SECTION keeps its band above the core.
-        let core_y0 = gy + shc + SGAP;
-        let core = (
-            core_x0,
-            core_y0,
-            core_x0 + core_block_w,
-            core_y0 + trh + vgap + brh,
-        );
-        let c = |x: f64, y: f64| core_cell(angle, (x, y), core);
-        let ((fx, fy), (tx, ty)) = (c(left_cx, bot_cy), c(left_cx, top_cy));
-        let ((rx, ry), (ix, iy)) = (c(right_cx, bot_cy), c(right_cx, top_cy));
-        [
-            place(fx, fy, fe),
-            place(tx, ty, te),
-            place(rx, ry, re),
-            place(ix, iy, ie),
-            place(band_cx, band_cy, se),
-        ]
-    })
+    let fits = group_fits(g_w, g_h, avail_w, avail_h);
+    (
+        scale,
+        {
+            // The 2×2 core under the band, reflected through its own centre
+            // for first angle; SECTION keeps its band above the core.
+            let core_y0 = gy + shc + SGAP;
+            let core = (
+                core_x0,
+                core_y0,
+                core_x0 + core_block_w,
+                core_y0 + trh + vgap + brh,
+            );
+            let c = |x: f64, y: f64| core_cell(angle, (x, y), core);
+            let ((fx, fy), (tx, ty)) = (c(left_cx, bot_cy), c(left_cx, top_cy));
+            let ((rx, ry), (ix, iy)) = (c(right_cx, bot_cy), c(right_cx, top_cy));
+            [
+                place(fx, fy, fe),
+                place(tx, ty, te),
+                place(rx, ry, re),
+                place(ix, iy, ie),
+                place(band_cx, band_cy, se),
+            ]
+        },
+        fits,
+    )
 }
 
 /// Choose the cutting-plane normal and origin for the section cut.
@@ -3982,11 +4564,38 @@ fn choose_section_plane(
 /// # Name
 ///
 /// The section view name is `"SECTION A-A"`.
+/// The gaps the SECTION A-A re-layout keeps between a sheet's views: the
+/// room their own dimension stacks need ([`dimension_band_gaps`] of FRONT,
+/// TOP and RIGHT, with the bores the hole table states left out).
+fn section_layout_gaps(drawing: &super::types::Drawing) -> (f64, f64) {
+    let mut called_out = drawing
+        .round_part
+        .as_ref()
+        .map(|r| r.callout_faces())
+        .unwrap_or_default();
+    if let Some(h) = &drawing.hole_features {
+        called_out.extend(h.callout_faces());
+    }
+    let tabled: std::collections::HashSet<u32> = drawing
+        .hole_sites
+        .iter()
+        .flat_map(|h| h.face_entities.iter().copied())
+        .filter(|f| !called_out.contains(f))
+        .collect();
+    let n = drawing.views.len().min(3);
+    dimension_band_gaps(&drawing.views[..n], &tabled)
+}
+
+///
+/// `exact`: every view is drawn at exactly this scale (a sheet the automatic
+/// search chose at that scale) instead of at the slot layout's own fill
+/// scale.
 pub(crate) fn attach_section_view(
     model: &BRepModel,
     solid_id: SolidId,
     drawing: &mut super::types::Drawing,
     dims: &[crate::readable::DimensionRecord],
+    exact: Option<f64>,
 ) {
     use super::section_view::section_view;
     use super::types::ViewSource;
@@ -4032,24 +4641,7 @@ pub(crate) fn attach_section_view(
 
     let rule = section_slot_rule(&drawing.sheet_size);
     // The re-placement keeps the room the views' own dimension stacks need.
-    let (vgap, hgap) = {
-        let mut called_out = drawing
-            .round_part
-            .as_ref()
-            .map(|r| r.callout_faces())
-            .unwrap_or_default();
-        if let Some(h) = &drawing.hole_features {
-            called_out.extend(h.callout_faces());
-        }
-        let tabled: std::collections::HashSet<u32> = drawing
-            .hole_sites
-            .iter()
-            .flat_map(|h| h.face_entities.iter().copied())
-            .filter(|f| !called_out.contains(f))
-            .collect();
-        let n = drawing.views.len().min(3);
-        dimension_band_gaps(&drawing.views[..n], &tabled)
-    };
+    let (vgap, hgap) = section_layout_gaps(drawing);
 
     // Compute the section view's position by running the layout solver with the
     // section extent in place of (or appended to) the ISO slot.  This guarantees
@@ -4072,16 +4664,33 @@ pub(crate) fn attach_section_view(
             let front_ext = drawing.views.first().map(|v| v.extent).unwrap_or_default();
             let top_ext = drawing.views.get(1).map(|v| v.extent).unwrap_or_default();
             let right_ext = drawing.views.get(2).map(|v| v.extent).unwrap_or_default();
-            let (s, pos) = layout_four_view_gap(
-                &drawing.sheet_size,
-                front_ext,
-                top_ext,
-                right_ext,
-                section_unit.extent, // ISO slot carries section extent
-                drawing.projection,
-                vgap,
-                hgap,
-            );
+            let (s, pos) = match exact {
+                Some(s) => (
+                    s,
+                    place_four_view(
+                        &drawing.sheet_size,
+                        front_ext,
+                        top_ext,
+                        right_ext,
+                        section_unit.extent,
+                        s,
+                        drawing.projection,
+                        vgap,
+                        hgap,
+                    )
+                    .positions,
+                ),
+                None => layout_four_view_gap(
+                    &drawing.sheet_size,
+                    front_ext,
+                    top_ext,
+                    right_ext,
+                    section_unit.extent, // ISO slot carries section extent
+                    drawing.projection,
+                    vgap,
+                    hgap,
+                ),
+            };
             for (i, v) in drawing.views.iter_mut().take(3).enumerate() {
                 v.scale = s;
                 v.position_mm = pos[i];
@@ -4096,7 +4705,7 @@ pub(crate) fn attach_section_view(
             let top_ext = drawing.views.get(1).map(|v| v.extent).unwrap_or_default();
             let right_ext = drawing.views.get(2).map(|v| v.extent).unwrap_or_default();
             let iso_ext = drawing.views.get(3).map(|v| v.extent).unwrap_or_default();
-            let (s, pos) = layout_five_view(
+            let (s, pos, _) = layout_five_view(
                 &drawing.sheet_size,
                 front_ext,
                 top_ext,
@@ -4106,6 +4715,7 @@ pub(crate) fn attach_section_view(
                 drawing.projection,
                 vgap,
                 hgap,
+                exact,
             );
             for (i, v) in drawing.views.iter_mut().take(4).enumerate() {
                 v.scale = s;
@@ -4306,7 +4916,7 @@ mod tests {
         let mut m = BRepModel::new();
         let cur = scattered_hole_plate(&mut m);
         let angle = super::super::types::ProjectionAngle::Third;
-        let first = auto_sheet(&m, cur, uuid::Uuid::nil(), angle, None).expect("first sheet");
+        let first = auto_sheet(&m, cur, uuid::Uuid::nil(), angle).expect("first sheet");
         assert!(
             first.hole_sites.len() >= 12,
             "fixture: the holes are tabled, got {} rows",
@@ -4350,7 +4960,6 @@ mod tests {
             cur,
             uuid::Uuid::nil(),
             super::super::types::ProjectionAngle::Third,
-            None,
         )
         .expect("first sheet");
         super::super::visibility::reset_visibility_computations();
@@ -4459,6 +5068,122 @@ mod tests {
             (wide[0][0] - at[0][0] - (410.0 - RIGHT_LEADER_ROOM_MM - 250.0)).abs() < 1e-9,
             "{wide:?}"
         );
+    }
+
+    /// A candidate sheet replaces the best so far only when it is no worse
+    /// than the ladder's sheet (the seed) in ANY count, and better by its
+    /// counts or, on equal counts, by preference: a cleaner layout is never
+    /// bought with an unplaced dimension, nor a fuller sheet with an error.
+    ///
+    /// Mutation: make `takes_over` accept every candidate (or drop its
+    /// `no_worse_than` test) -> RED.
+    #[test]
+    fn a_candidate_takes_over_only_when_no_worse_in_any_count() {
+        let score = |errors, unplaced, table| SheetScore {
+            errors,
+            unplaced,
+            table,
+            utilization: 0.2,
+        };
+        let full = Preference(0, 2, -0.3);
+        let reduced = Preference(1, 1, -0.2);
+        let seed = score(2, 1, 0);
+        // Equal counts: preference decides.
+        assert!(takes_over(&seed, (&seed, reduced), (&score(2, 1, 0), full)));
+        assert!(!takes_over(
+            &seed,
+            (&seed, full),
+            (&score(2, 1, 0), reduced)
+        ));
+        // Fewer errors on a less preferred sheet: taken.
+        assert!(takes_over(&seed, (&seed, full), (&score(1, 1, 0), reduced)));
+        // A trade -- no error left, one more dimension unplaced: never.
+        assert!(!takes_over(
+            &seed,
+            (&seed, reduced),
+            (&score(0, 2, 0), full)
+        ));
+        // A new hole-table collision for a fuller sheet: never.
+        assert!(!takes_over(
+            &seed,
+            (&seed, reduced),
+            (&score(2, 1, 1), full)
+        ));
+        // Better than the seed but not than the best so far: not taken.
+        let best = score(0, 0, 0);
+        assert!(!takes_over(
+            &seed,
+            (&best, reduced),
+            (&score(1, 0, 0), full)
+        ));
+        // Fewer unplaced dimensions on a sheet left mostly empty, where the
+        // seed filled its own: a trade, never taken.
+        let empty = SheetScore {
+            utilization: 0.05,
+            ..score(2, 0, 0)
+        };
+        assert!(!takes_over(&seed, (&seed, reduced), (&empty, reduced)));
+    }
+
+    /// The searched sheet is never worse than the size ladder's (the search's
+    /// seed, [`auto_sheet`]): no more layout errors, unplaced dimensions or
+    /// hole-table collisions, and never a less preferred paper and scale --
+    /// on plates and boxes small and large and on a plate whose hole table
+    /// needs more paper.
+    ///
+    /// Mutation: take every built candidate in
+    /// `standard_drawing_auto_with_projection` (drop the `no_worse_than` and
+    /// preference test) -> a less preferred sheet replaces the seed -> RED.
+    #[test]
+    fn the_searched_sheet_is_never_worse_than_the_ladders() {
+        let angle = super::super::types::ProjectionAngle::Third;
+        let mut parts: Vec<(BRepModel, SolidId)> = Vec::new();
+        for (x, y, z) in [
+            (80.0, 60.0, 10.0),
+            (199.0, 74.0, 40.0),
+            (30.0, 20.0, 5.0),
+            (400.0, 40.0, 40.0),
+        ] {
+            let mut m = BRepModel::new();
+            let s = sid(TopologyBuilder::new(&mut m)
+                .create_box_3d(x, y, z)
+                .expect("box"));
+            parts.push((m, s));
+        }
+        let mut m = BRepModel::new();
+        let s = scattered_hole_plate(&mut m);
+        parts.push((m, s));
+        for (m, s) in &parts {
+            let seed = auto_sheet(m, *s, uuid::Uuid::nil(), angle).expect("seed");
+            let d = standard_drawing_auto(m, *s, uuid::Uuid::nil()).expect("sheet");
+            let (a, b) = (SheetScore::of(&seed), SheetScore::of(&d));
+            assert!(
+                b.no_worse_than(&a),
+                "{:?} at {}: {b:?} is worse than the ladder's {:?} at {}: {a:?}",
+                d.sheet_size,
+                d.views[0].scale,
+                seed.sheet_size,
+                seed.views[0].scale
+            );
+            let _scope = crate::readable::adjacency::AdjacencyCacheScope::enter(m);
+            let plan = plan_sheet(m, *s, uuid::Uuid::nil()).expect("plan");
+            let shape = SheetShape::of(&seed, &plan, angle);
+            let pref = |dr: &super::super::types::Drawing| {
+                shape.preference(
+                    &dr.sheet_size,
+                    dr.views[0].scale,
+                    super::super::verify::verify_drawing(dr).sheet_utilization,
+                )
+            };
+            assert!(
+                b.counts() < a.counts() || pref(&d) <= pref(&seed),
+                "{:?} at {} is less preferred than the ladder's {:?} at {}",
+                d.sheet_size,
+                d.views[0].scale,
+                seed.sheet_size,
+                seed.views[0].scale
+            );
+        }
     }
 
     /// Only a shortage of PAPER rebuilds the sheet larger: an unplaced

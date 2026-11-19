@@ -2660,9 +2660,16 @@ pub(crate) fn place_dimensions_routed(
                 [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])],
                 0.5 * (a[0] - b[0]).hypot(a[1] - b[1]),
             ))
-        } else if crate::drawing::dimensioning::is_blend_callout(&d.kind) || d.kind == "radius" {
+        } else if crate::drawing::dimensioning::is_blend_callout(&d.kind)
+            || d.kind == "radius"
+            || (d.kind == "angle" && !d.entities.is_empty())
+        {
             // An arc's radius: the arrow touches the arc at `a` (its span
-            // runs from there to the arc's centre).
+            // runs from there to the arc's centre). A cone's angle: the arrow
+            // touches the cone's side line at `a`
+            // (`dimensioning::cone_generator_point`) and the text stands
+            // clear of the outline -- printed at the axis it sat inside the
+            // part (a weld-neck hub's "∠ 15.2°").
             Some((a, 0.0))
         } else {
             None

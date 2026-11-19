@@ -27,7 +27,7 @@
 //! same way the certificate re-measures a hole-table row.
 
 use crate::primitives::solid::SolidId;
-use crate::primitives::surface::Cylinder;
+use crate::primitives::surface::{Cone, Cylinder};
 use crate::primitives::topology_builder::BRepModel;
 use crate::readable::DimensionRecord;
 use serde::{Deserialize, Serialize};
@@ -87,6 +87,10 @@ pub struct RoundPartCallouts {
     pub coaxial_bore_faces: Vec<u32>,
     /// Faces of every cylinder on the part axis, bore or boss.
     pub coaxial_faces: Vec<u32>,
+    /// Faces of every cone on the part axis (a hub's taper): their end
+    /// diameters are stated with the part's other diameters on the axis.
+    #[serde(default)]
+    pub coaxial_cone_faces: Vec<u32>,
     /// Bolt circles found on the part.
     pub bolt_circles: Vec<BoltCircleCallout>,
 }
@@ -459,8 +463,51 @@ pub fn detect_round_part(
         outer_diameter: 2.0 * outer.radius,
         coaxial_bore_faces,
         coaxial_faces,
+        coaxial_cone_faces: coaxial_cones(model, solid_id, centre, axis, tol),
         bolt_circles,
     })
+}
+
+/// Faces of the solid's cones whose axis is the part axis `(centre, axis)`.
+fn coaxial_cones(
+    model: &BRepModel,
+    solid_id: SolidId,
+    centre: [f64; 3],
+    axis: [f64; 3],
+    tol: f64,
+) -> Vec<u32> {
+    let Some(solid) = model.solids.get(solid_id) else {
+        return Vec::new();
+    };
+    let mut shells = vec![solid.outer_shell];
+    shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
+    let mut out = Vec::new();
+    for sh in shells {
+        let Some(shell) = model.shells.get(sh) else {
+            continue;
+        };
+        for &fid in &shell.faces {
+            let Some(cone) = model
+                .faces
+                .get(fid)
+                .and_then(|f| model.surfaces.get(f.surface_id))
+                .and_then(|s| s.as_any().downcast_ref::<Cone>().map(|c| (c.apex, c.axis)))
+            else {
+                continue;
+            };
+            let (apex, cone_axis) = cone;
+            let Some(a) = unit([cone_axis.x, cone_axis.y, cone_axis.z]) else {
+                continue;
+            };
+            if dot(a, axis).abs() > 1.0 - 1e-9
+                && dist_to_line([apex.x, apex.y, apex.z], centre, axis) <= 1e3 * tol
+            {
+                out.push(fid);
+            }
+        }
+    }
+    out
 }
 
 /// Rewrite the analytic dimension table into what a drawing of a round part
@@ -506,9 +553,12 @@ pub fn apply_round_conventions(
     // circle go in a stack to its LEFT. Four diameters stacked under the face
     // view ran the outermost into the front view below it.
     let side = cross(rp.axis, rp.ref_dir);
+    // A diameter of a cone on the part axis (a hub's taper, at either end)
+    // is one of those diameters too.
+    let coaxial_cones: HashSet<u32> = rp.coaxial_cone_faces.iter().copied().collect();
     for d in out.iter_mut() {
         if d.kind == "diameter"
-            && touches(d, &coaxial)
+            && (touches(d, &coaxial) || touches(d, &coaxial_cones))
             && (d.value - rp.outer_diameter).abs() > 1e-6
         {
             let station = dot(sub(d.anchor, rp.centre), rp.axis);

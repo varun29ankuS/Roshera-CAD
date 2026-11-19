@@ -10,11 +10,17 @@ A part is WORSE when, compared with before:
   * its sheet no longer draws (stage was "done", now is not), or it vanished;
   * the certificate lost soundness, or gained stale / dangling dimensions;
   * it has more layout errors, or more dimensions left off the sheet;
+  * its views went from filling the sheet to under-filling it (sheet
+    utilization from at least UNDERFILLED to below it: the quality check's
+    `SheetUnderutilized` threshold);
   * it got much slower (over 1.5x AND over 5 s more).
 A trade (fewer errors but more dimensions missing) is worse: a regression is
 not paid for by an improvement somewhere else on the same sheet.
-BETTER is strictly fewer errors or missing dimensions (or completeness gained)
-with nothing worse; anything else is SAME.
+BETTER is strictly fewer errors or missing dimensions (or completeness gained,
+or the views fill clearly more of the sheet -- utilization up by at least
+UTIL_GAIN) with nothing worse; a fuller sheet with one new error is WORSE,
+never better. Anything else is SAME. Every row also reports the sheet size,
+the scale and the utilization before and after.
 
 Usage:
   python -I regress.py --before runs/baseline --after runs/final [--md out.md]
@@ -24,6 +30,11 @@ import argparse
 import json
 import os
 import sys
+
+# The quality check's `SheetUnderutilized` threshold (verify.rs MIN_UTILIZATION).
+UNDERFILLED = 0.10
+# A utilization gain this large is an improvement on its own.
+UTIL_GAIN = 0.02
 
 
 def _load(path):
@@ -39,6 +50,8 @@ def _facts(s):
     c = s.get("certificate") or {}
     counts = c.get("counts") or {}
     sheet = s.get("sheet") or {}
+    views = sheet.get("views") or []
+    util = q.get("sheet_utilization")
     return {
         "drawn": s.get("stage") == "done",
         "errors": int(q.get("errors") or 0),
@@ -47,6 +60,9 @@ def _facts(s):
         "complete": bool(c.get("complete")),
         "sound": c.get("sound", True) is not False,
         "ms": int(sheet.get("ms") or 0),
+        "size": sheet.get("size") or "-",
+        "scale": views[0].get("scale") if views else None,
+        "util": float(util) if util is not None else None,
     }
 
 
@@ -72,6 +88,11 @@ def judge(before, after):
         worse.append("no longer complete")
     elif a["complete"] and not b["complete"]:
         better.append("now complete")
+    if b["util"] is not None and a["util"] is not None:
+        if b["util"] >= UNDERFILLED > a["util"]:
+            worse.append(f"utilization {b['util']:.3f} -> {a['util']:.3f} (under-filled)")
+        elif a["util"] - b["util"] >= UTIL_GAIN:
+            better.append(f"utilization {b['util']:.3f} -> {a['util']:.3f}")
     if a["ms"] > 1.5 * b["ms"] and a["ms"] - b["ms"] > 5000:
         worse.append(f"sheet time {b['ms']} -> {a['ms']} ms")
     if not b["drawn"] and a["drawn"]:
@@ -99,19 +120,33 @@ def compare(before_dir, after_dir):
     return rows, worse
 
 
+def _scale(s):
+    """An ISO 5455 scale as a drawing states it: 2:1, 1:1, 1:2."""
+    if not s:
+        return "-"
+    return f"{s:g}:1" if s >= 1 else f"1:{1 / s:g}"
+
+
+def _pct(u):
+    return "-" if u is None else f"{100 * u:.1f}%"
+
+
 def markdown(rows, worse):
     n = {k: sum(1 for r in rows if r["verdict"] == k) for k in ("better", "same", "worse")}
     out = [
         f"# Drawing before/after: {n['better']} better, {n['same']} same, {n['worse']} worse "
         f"({len(rows)} parts)",
         "",
-        "| Part | Verdict | Errors | Not dimensioned | Complete | Sheet ms | Why |",
-        "|---|---|---|---|---|---|---|",
+        "| Part | Verdict | Sheet | Scale | Utilization | Errors | Not dimensioned | Complete | Sheet ms | Why |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         b, a = r["before"], r["after"] or {}
         out.append(
-            f"| {r['id']} | {r['verdict']} | {b['errors']} -> {a.get('errors', '-')} | "
+            f"| {r['id']} | {r['verdict']} | {b['size']} -> {a.get('size', '-')} | "
+            f"{_scale(b['scale'])} -> {_scale(a.get('scale'))} | "
+            f"{_pct(b['util'])} -> {_pct(a.get('util'))} | "
+            f"{b['errors']} -> {a.get('errors', '-')} | "
             f"{b['not_dim']} -> {a.get('not_dim', '-')} | {b['complete']} -> {a.get('complete', '-')} | "
             f"{b['ms']} -> {a.get('ms', '-')} | {'; '.join(r['why'])} |"
         )

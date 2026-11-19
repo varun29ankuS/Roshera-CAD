@@ -195,7 +195,7 @@ pub(crate) const DIM_MARGIN_MM: f64 = 22.0;
 /// Centre-alignment tolerance for the third-angle arrangement.
 const ALIGN_TOL_MM: f64 = 2.0;
 /// Below this fraction of the printable area, the sheet reads as empty.
-const MIN_UTILIZATION: f64 = 0.10;
+pub(crate) const MIN_UTILIZATION: f64 = 0.10;
 
 /// Verify a drawing's layout/annotation quality. Pure function of the
 /// `Drawing` — no kernel access — so it is cheap to run on every
@@ -567,7 +567,10 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
         // The measured DIRECTION joins the key: a feature's X and Y location
         // (a hole pattern's first hole, an untabled bore's two offsets) are two
         // dimensions of one feature, not one dimension inked twice.
-        type Key = (Vec<u32>, String, [i64; 3]);
+        // A diameter is one circle: a frustum's face has two (its large and
+        // its small end, a weld-neck hub's Ø75 and Ø60.3), and those are two
+        // dimensions of one face, so a diameter's key carries its value.
+        type Key = (Vec<u32>, String, [i64; 3], Option<i64>);
         let mut entity_key: HashMap<Key, Vec<String>> = HashMap::new();
         for v in &drawing.views {
             for d in &v.dimensions {
@@ -592,13 +595,14 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
                         (v[2].abs() * 100.0).round() as i64,
                     ]
                 });
+                let circle = (d.kind == "diameter").then(|| (d.value * 1e3).round() as i64);
                 entity_key
-                    .entry((sorted, d.kind.clone(), qdir))
+                    .entry((sorted, d.kind.clone(), qdir, circle))
                     .or_default()
                     .push(v.name.clone());
             }
         }
-        for ((_, kind, _), views) in &entity_key {
+        for ((_, kind, _, _), views) in &entity_key {
             if views.len() < 2 {
                 continue;
             }

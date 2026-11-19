@@ -13,16 +13,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import regress  # noqa: E402
 
 
-def summary(errors=0, not_dim=0, complete=True, sound=True, stage="done", ms=1000, stale=0):
+def summary(errors=0, not_dim=0, complete=True, sound=True, stage="done", ms=1000, stale=0,
+            util=0.3, size="A3", scale=1.0):
     return {
         "stage": stage,
-        "quality": {"errors": errors, "warnings": 0, "passed": errors == 0},
+        "quality": {"errors": errors, "warnings": 0, "passed": errors == 0, "sheet_utilization": util},
         "certificate": {
             "complete": complete,
             "sound": sound,
             "counts": {"not_dimensioned": not_dim, "stale": stale, "dangling": 0},
         },
-        "sheet": {"ms": ms, "ok": stage == "done", "size": "A3", "dimensions_inked": 10},
+        "sheet": {"ms": ms, "ok": stage == "done", "size": size, "dimensions_inked": 10,
+                  "views": [{"name": "FRONT", "scale": scale}]},
     }
 
 
@@ -57,6 +59,25 @@ class Judge(unittest.TestCase):
     def test_a_trade_is_mixed_not_better(self):
         v = regress.judge(summary(errors=3, not_dim=1), summary(errors=1, not_dim=4))
         self.assertEqual(v["verdict"], "worse")
+
+    def test_a_fuller_sheet_is_better(self):
+        v = regress.judge(summary(util=0.08, size="A2", scale=0.5), summary(util=0.32, size="A2"))
+        self.assertEqual(v["verdict"], "better")
+
+    def test_a_fuller_sheet_with_a_new_error_is_worse(self):
+        v = regress.judge(summary(util=0.08), summary(util=0.32, errors=1))
+        self.assertEqual(v["verdict"], "worse")
+
+    def test_a_sheet_that_becomes_underfilled_is_worse(self):
+        v = regress.judge(summary(util=0.25), summary(util=0.06))
+        self.assertEqual(v["verdict"], "worse")
+
+    def test_the_report_states_size_scale_and_utilization(self):
+        rows = [{"id": "124", "verdict": "better", "why": [],
+                 **{k: regress._facts(x) for k, x in (("before", summary(util=0.09, size="A1")),
+                                                     ("after", summary(util=0.3, size="A2", scale=0.5)))}}]
+        text = regress.markdown(rows, [])
+        self.assertIn("| A1 -> A2 | 1:1 -> 1:2 | 9.0% -> 30.0% |", text)
 
     def test_unchanged_is_same(self):
         self.assertEqual(regress.judge(summary(errors=1), summary(errors=1))["verdict"], "same")

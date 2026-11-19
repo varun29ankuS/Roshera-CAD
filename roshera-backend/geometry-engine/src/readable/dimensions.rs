@@ -715,6 +715,8 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
     }
 
     // ── Per analytic surface: bores/bosses, spheres, cones ────────────────────
+    // A frustum's small-end diameter, numbered after every other row.
+    let mut small_ends: Vec<DimensionRecord> = Vec::new();
     let solid = match model.solids.get(solid_id) {
         Some(s) => s,
         None => return dedupe_coincident(out),
@@ -910,10 +912,17 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     None => 0.0,
                 };
                 let base_r = h * cone.half_angle.tan();
+                // The frustum's small end, when the face's trim edges show one.
+                let small = cone_small_end(model, face, cone, axis, base_r);
+                // The angle is a point callout ON THE AXIS, half way along the
+                // frustum when both its ends are known (else at the large
+                // end); a view puts it on the generator it sees
+                // (`drawing::dimensioning::project_records`).
+                let station = small.map_or(h, |(s, _)| 0.5 * (s + h));
                 let anchor = [
-                    cone.apex.x + axis.x * h,
-                    cone.apex.y + axis.y * h,
-                    cone.apex.z + axis.z * h,
+                    cone.apex.x + axis.x * station,
+                    cone.apex.y + axis.y * station,
+                    cone.apex.z + axis.z * station,
                 ];
                 // Angles always in degrees regardless of document_unit.
                 out.push(DimensionRecord {
@@ -929,20 +938,67 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     pid: feature_dim_pid(model, &[fid], "angle"),
                     datum: None,
                 });
-                if base_r > 1e-9 {
+                // A diameter is measured ACROSS the circle, rim to rim: the
+                // record's anchor is a point on the rim and its direction the
+                // radial one, so `anchor -> anchor - direction * value` spans
+                // the circle the way a cylinder's and a sphere's do. (The
+                // anchor used to be ON the axis with a fixed +X direction:
+                // the drawn Ø75 of a weld-neck hub ran from the centre line to
+                // a point 75 mm off it, and an X-axis cone's diameter ran
+                // along its own axis.)
+                let rim = |h: f64| -> Option<([f64; 3], [f64; 3], f64)> {
+                    let r = h * cone.half_angle.tan();
+                    if !(r > 1e-9) {
+                        return None;
+                    }
+                    let (u, _) = radial_frame(axis)?;
+                    let c = cone.apex + axis * h;
+                    Some((
+                        [c.x + u.x * r, c.y + u.y * r, c.z + u.z * r],
+                        [u.x, u.y, u.z],
+                        r,
+                    ))
+                };
+                if let Some((rim_anchor, radial, r)) = rim(h) {
                     out.push(DimensionRecord {
                         id: id(),
                         kind: "diameter".into(),
-                        value: base_r * 2.0,
+                        value: r * 2.0,
                         unit: unit_suffix.into(),
-                        label: format!("Ø{}", unit.format_len_bare(base_r * 2.0)),
+                        label: format!("Ø{}", unit.format_len_bare(r * 2.0)),
                         entities: vec![fid],
-                        anchor,
-                        direction: [1.0, 0.0, 0.0],
+                        anchor: rim_anchor,
+                        direction: radial,
                         axis: Some(cone_axis_arr),
                         pid: feature_dim_pid(model, &[fid], "diameter"),
                         datum: None,
                     });
+                }
+                // A frustum has TWO diameters: the small end too (a weld-neck
+                // hub's Ø60.3 at the weld end was stated nowhere). Read off
+                // the face's own trim edges -- both rims whole circles on this
+                // cone -- never off the surface's height limits alone, which
+                // can be the uncut surface's; recorded after every other row
+                // (see below) so the rows before it keep their ids.
+                if let Some((station, r)) = small {
+                    if let Some((u, _)) = radial_frame(axis) {
+                        let c = cone.apex + axis * station;
+                        let rim_anchor = [c.x + u.x * r, c.y + u.y * r, c.z + u.z * r];
+                        let radial = [u.x, u.y, u.z];
+                        small_ends.push(DimensionRecord {
+                            id: String::new(),
+                            kind: "diameter".into(),
+                            value: r * 2.0,
+                            unit: unit_suffix.into(),
+                            label: format!("Ø{}", unit.format_len_bare(r * 2.0)),
+                            entities: vec![fid],
+                            anchor: rim_anchor,
+                            direction: radial,
+                            axis: Some(cone_axis_arr),
+                            pid: feature_dim_pid(model, &[fid], CONE_SMALL_END_PID_KIND),
+                            datum: None,
+                        });
+                    }
                 }
             }
         }
@@ -972,6 +1028,13 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
             axis: Some(b.axis),
             datum: None,
         });
+    }
+
+    // Last, so every row before them keeps the id it had before frustums
+    // stated their small end.
+    for mut d in small_ends {
+        d.id = id();
+        out.push(d);
     }
 
     merge_coaxial_walls(dedupe_coincident(out))
@@ -1123,6 +1186,38 @@ fn blend_profile(
         }
     }
     Some(Profile { rims, covers })
+}
+
+/// The kind a frustum's SMALL-end diameter is keyed under in its persistent
+/// id: the large end keeps `"diameter"`, so the two rows of one face never
+/// share an identity (the certificate re-measures a dimension by its pid).
+const CONE_SMALL_END_PID_KIND: &str = "diameter_small_end";
+
+/// A cone face's small-end rim `(station along the axis from the apex,
+/// radius)`, read off the face's trim edges, or `None` when the face is no
+/// frustum this can state exactly: a rim that is not one circle, a rim off
+/// the cone, a large rim that is not the `large_r` the large-end row states,
+/// or a small end that is a point (a drill tip's cone runs to its apex).
+fn cone_small_end(
+    model: &BRepModel,
+    face: &Face,
+    cone: &Cone,
+    axis: Vector3,
+    large_r: f64,
+) -> Option<(f64, f64)> {
+    let profile = blend_profile(model, face, cone.apex, axis, radial_frame(axis)?)?;
+    let tan = cone.half_angle.tan();
+    let tol = BLEND_GEOM_TOL * large_r.max(1.0);
+    let [p0, p1] = profile.rims;
+    // Both rims lie on this cone: radius = |station| * tan(half-angle).
+    if [p0, p1].iter().any(|p| (p.1 - p.0.abs() * tan).abs() > tol) {
+        return None;
+    }
+    let (small, large) = if p0.1 <= p1.1 { (p0, p1) } else { (p1, p0) };
+    if (large.1 - large_r).abs() > tol || small.1 <= tol || large.1 - small.1 <= tol {
+        return None;
+    }
+    Some(small)
 }
 
 /// Is azimuth 0 inside `covers`?
