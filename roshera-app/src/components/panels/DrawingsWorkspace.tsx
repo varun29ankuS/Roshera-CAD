@@ -190,6 +190,12 @@ export function DrawingsWorkspace() {
       setParts([])
     }
   }, [])
+  // Workspaces stay mounted when parked: a part imported in the Part
+  // workspace must be offered here when this workspace is opened again.
+  const docMode = useDocModeStore((s) => s.mode)
+  useEffect(() => {
+    if (docMode === 'drawing') void refreshParts()
+  }, [docMode, refreshParts])
 
   // ── Editing the part from the sheet ──────────────────────────────
   // Clicking a dimension opens this editor at the cursor. Applying a new
@@ -677,16 +683,8 @@ export function DrawingsWorkspace() {
   // `escape_xml` helper sanitises every text-node string, and we never
   // splice user-supplied markup back into the payload. Safe to inline.
   const svgMarkup = useMemo(() => ({ __html: svg }), [svg])
-  // A dimension or view pointed at in the Sheet panel, marked on the sheet.
-  const [hoverDimId, setHoverDimId] = useState<string | null>(null)
+  // A view pointed at in the Sheet panel, marked on the sheet.
   const [hoverViewId, setHoverViewId] = useState<string | null>(null)
-  useEffect(() => {
-    const root = canvasRef.current
-    if (!root || !hoverDimId) return
-    const marked = Array.from(root.querySelectorAll(`[data-dim-id="${CSS.escape(hoverDimId)}"]`))
-    marked.forEach((el) => el.setAttribute('data-dim-editing', ''))
-    return () => marked.forEach((el) => el.removeAttribute('data-dim-editing'))
-  }, [hoverDimId, svgMarkup])
   const [hoverRect, setHoverRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
 
   // Mark the dimension being edited on the sheet, so it is clear which one
@@ -1364,14 +1362,11 @@ export function DrawingsWorkspace() {
           drawing={activeDrawing}
           quality={sheetCheck}
           selectedViewId={selectedViewId}
-          editingDimId={dimEdit?.dim.id ?? null}
           onSelectView={setSelectedViewId}
-          onOpenDimension={openDimension}
           busy={viewsBusy}
           onViewMenu={openViewMenu}
           onRemoveView={(id) => void handleRemoveView(id)}
           onAddView={(kind, label) => void handleAddLike(kind, label)}
-          onHoverDimension={setHoverDimId}
           onHoverView={setHoverViewId}
         />
       )}

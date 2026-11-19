@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { ChevronDown, ChevronRight, MoreHorizontal, Plus, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { Drawing, DrawingQualityReport, ProjectedView } from '@/lib/drawings-api'
-import { VIEW_PRESETS, checkSummary, dimensionGroups, dimensionWord, sheetContents, type ViewPreset } from '@/lib/sheet-contents'
+import { VIEW_PRESETS, checkSummary, sheetContents, type ViewPreset } from '@/lib/sheet-contents'
 
 /** A view's kind as a small drawn glyph: an outline for an orthographic
  *  view, a cube for the iso, a hatched square for a section. */
@@ -51,43 +51,27 @@ export function SheetPanel({
   drawing,
   quality,
   selectedViewId,
-  editingDimId,
   busy,
   onSelectView,
-  onOpenDimension,
   onViewMenu,
   onRemoveView,
   onAddView,
-  onHoverDimension,
   onHoverView,
 }: {
   drawing: Drawing
   quality: DrawingQualityReport | null
   selectedViewId: string | null
-  editingDimId: string | null
   busy: boolean
   onSelectView: (viewId: string) => void
-  /** Open the dimension's edit box at a screen point. */
-  onOpenDimension: (dimId: string, x: number, y: number) => void
   onViewMenu: (viewId: string, x: number, y: number) => void
   onRemoveView: (viewId: string) => void
   onAddView: (kind: ViewPreset, label: string) => void
-  /** Mark a dimension / view on the sheet while it is pointed at here. */
-  onHoverDimension: (dimId: string | null) => void
+  /** Mark a view on the sheet while it is pointed at here. */
   onHoverView: (viewId: string | null) => void
 }) {
   const [open, setOpen] = useState(true)
   const [issuesOpen, setIssuesOpen] = useState(false)
   const [adding, setAdding] = useState(false)
-  // Each view is one row; its dimensions are listed only when it is opened.
-  const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
-  const toggleView = (id: string) =>
-    setExpanded((s) => {
-      const next = new Set(s)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
   const { views, dimensionCount } = sheetContents(drawing)
   const check = checkSummary(quality)
   const issues = quality?.issues ?? []
@@ -192,16 +176,6 @@ export function SheetPanel({
                     selectedViewId === v.id ? 'bg-[var(--cad-selected-wash)]' : 'hover:bg-accent/50',
                   )}
                 >
-                  <button
-                    type="button"
-                    disabled={v.dimensions.length === 0}
-                    onClick={() => toggleView(v.id)}
-                    aria-expanded={expanded.has(v.id)}
-                    aria-label={`${expanded.has(v.id) ? 'Fold' : 'List'} the dimensions of ${v.name}`}
-                    className="cad-focus rounded p-0.5 text-muted-foreground hover:text-foreground disabled:invisible"
-                  >
-                    {expanded.has(v.id) ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                  </button>
                   {view && <ViewGlyph view={view} />}
                   <button
                     type="button"
@@ -242,39 +216,6 @@ export function SheetPanel({
                     <X size={12} />
                   </button>
                 </div>
-                {expanded.has(v.id) && v.dimensions.length > 0 && (
-                  <div className="pb-1 pl-7 pr-1">
-                    {dimensionGroups(v.dimensions).map((g) => (
-                      <div key={g.title} className="pt-1">
-                        <div className="flex items-baseline justify-between text-[10.5px] uppercase tracking-wider text-muted-foreground">
-                          <span>{g.title}</span>
-                          <span className="tabular-nums">{g.dimensions.length}</span>
-                        </div>
-                        {g.dimensions.map((d) => (
-                          <button
-                            key={d.id}
-                            type="button"
-                            onClick={(e) => {
-                              const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-                              onOpenDimension(d.id, r.right + 6, r.top)
-                            }}
-                            title={`${dimensionWord(d.kind)} -- click to edit`}
-                            onMouseEnter={() => onHoverDimension(d.id)}
-                            onMouseLeave={() => onHoverDimension(null)}
-                            className={cn(
-                              'cad-focus block w-full truncate rounded px-1.5 py-px text-left font-mono text-[11px] tabular-nums',
-                              editingDimId === d.id
-                                ? 'bg-[var(--cad-selected-wash)] text-foreground'
-                                : 'text-foreground/85 hover:bg-accent/60 hover:text-foreground',
-                            )}
-                          >
-                            {d.label}
-                          </button>
-                        ))}
-                      </div>
-                    ))}
-                  </div>
-                )}
               </div>
             )
           })}

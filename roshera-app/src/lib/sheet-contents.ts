@@ -23,38 +23,6 @@ export function dimensionWord(kind: string): string {
   return KIND_WORDS[kind] ?? kind.replace(/_/g, ' ')
 }
 
-/** Dimension kinds as groups, in the order a drawing is read: overall size,
- *  then features (holes, diameters, radii), then lengths and locations. */
-const GROUPS: [kind: string, title: string][] = [
-  ['extent', 'Overall size'],
-  ['hole_callout', 'Holes'],
-  ['pcd', 'Pitch circles'],
-  ['diameter', 'Diameters'],
-  ['radius', 'Radii'],
-  ['fillet', 'Fillets'],
-  ['chamfer', 'Chamfers'],
-  ['length', 'Lengths'],
-  ['position', 'Locations'],
-  ['angle', 'Angles'],
-]
-
-/** A view's dimensions grouped by kind (the Sheet panel's list); a kind not
- *  in the table gets its own group after the known ones. */
-export function dimensionGroups<D extends { kind: string }>(dims: D[]): { title: string; dimensions: D[] }[] {
-  const order = new Map(GROUPS.map(([k], i) => [k, i]))
-  const byKind = new Map<string, D[]>()
-  for (const d of dims) byKind.set(d.kind, [...(byKind.get(d.kind) ?? []), d])
-  const title = (k: string) => {
-    const known = GROUPS.find(([g]) => g === k)
-    if (known) return known[1]
-    const w = k.replace(/_/g, ' ')
-    return w.charAt(0).toUpperCase() + w.slice(1)
-  }
-  return [...byKind.keys()]
-    .sort((a, b) => (order.get(a) ?? GROUPS.length) - (order.get(b) ?? GROUPS.length) || a.localeCompare(b))
-    .map((k) => ({ title: title(k), dimensions: byKind.get(k) ?? [] }))
-}
-
 /** A view scale as a drawing writes it: 1:1, 1:2, 2:1. */
 function scaleLabel(s: number): string {
   if (s >= 1) return `${Number(s.toFixed(3))}:1`
