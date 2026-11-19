@@ -157,6 +157,11 @@ const PHRASES: Array<[RegExp, string]> = [
   [/\bdegrees[\s-]of[\s-]freedom\b/g, " dof "],
   [/\blead[\s-]?ins?\b/g, " chamfer "],
   [/\bbill[\s-]of[\s-]materials\b/g, " bom "],
+  // A kind of drawing is a request for a NEW sheet: "make a technical drawing
+  // of the part" ranked make_drawing third -- "make" is a stopword and
+  // "drawing" is shared by every drawing_* tool, while "part" hit part_rename's
+  // name. Only make_drawing's purpose says "blueprint" (2026-11-19).
+  [/\b(?:technical|engineering|manufacturing|production|shop|workshop|detail|2d)[\s-]drawings?\b/g, " blueprint drawing "],
   // A standard's number IS its identity: "ISO 2768" / "EN 1092-1" / "DIN 912"
   // must survive the bare-number drop in `tokenize`, so the prefix is glued
   // to its number ("iso2768") — a mixed token that is kept and matches the

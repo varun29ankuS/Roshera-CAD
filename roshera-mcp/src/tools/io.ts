@@ -144,7 +144,8 @@ export function registerIoTools(server: ToolHost) {
 
   server.tool(
     "make_drawing",
-    "Generate a 2D engineering DRAWING: four-view sheet (Front/Top/Right + iso), " +
+    "Generate a 2D engineering DRAWING (the manufacturing blueprint; read kb_lookup " +
+      "playbook manufacturing_drawing first): four-view sheet (Front/Top/Right + iso), " +
       "hidden-line removal, centerlines, ISO-129 deduped dimensions. Returns the " +
       "drawing id + a QUALITY report (label collisions, redundant dims); treat " +
       "passed:false like a watertightness failure. ENFORCED: refused while the " +
