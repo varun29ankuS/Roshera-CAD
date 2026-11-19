@@ -2859,6 +2859,11 @@ pub(crate) fn place_dimensions_routed(
                             .iter()
                             .any(|&(s, ly)| s == side && (ly - y).abs() < row)
                         && !obstacles.iter().any(|o| o.intersects(&b, 0.0))
+                        // Nor on text already placed: a two-line callout is
+                        // taller than the row pitch, and "17× R5" was put on
+                        // the "+0.021/0" under "3× Ø20 H7" (Volvo bracket,
+                        // 2026-11-19).
+                        && !prior_texts.iter().any(|t| t.intersects(&b, 0.0))
                         && leg_is_clear(y)
                         && !crosses_placed(y)
                 };
@@ -4133,6 +4138,61 @@ mod tests {
             !segment_crosses_rect(&line, &text),
             "the earlier line runs through the callout: {text:?}"
         );
+    }
+
+    /// A two-line leader callout keeps its second line clear of the next
+    /// callout on the same side. Found on the Volvo linkage bracket
+    /// (2026-11-19): "3× Ø20 H7" on the shoulder with its limits "+0.021/0"
+    /// on the line under it, and "17× R5" placed one row (two text heights)
+    /// lower -- onto that second line. The row search kept shoulders two text
+    /// heights apart but never compared a new callout's text with the text
+    /// already placed.
+    ///
+    /// Mutation: drop the placed-text test from the leader's `free` row ->
+    /// the R5 lands on "+0.021/0" again -> RED.
+    #[test]
+    fn a_two_line_leader_callout_keeps_its_second_line_clear_of_the_next() {
+        let edits = crate::drawing::dimension_edit::DimensionEdits::new();
+        let none = std::collections::HashSet::new();
+        let unit = crate::units::LengthUnit::default();
+        let frame = [10.0, 10.0, 400.0, 287.0];
+        // The R5 is swept through every nearby position below the H7, in
+        // 0.25 mm steps: wherever its row lands, it must clear both lines.
+        for step in 0..=60 {
+            let dy = -0.25 * step as f64;
+            let mut view = simple_view("TOP", ProjectionType::Top, [100.0, 150.0]);
+            let mut fit = len_dim("3× Ø20 H7 (+0.021/0)", [10.0, 0.0], [0.0, 0.0]);
+            fit.kind = "radius".to_string();
+            fit.id = "d_fit".to_string();
+            let mut next = len_dim("17× R5", [10.0, dy], [5.0, dy]);
+            next.kind = "radius".to_string();
+            next.id = "d_next".to_string();
+            view.dimensions = vec![fit, next];
+            let placed = place_dimensions_routed(
+                &view,
+                297.0,
+                0,
+                &none,
+                Some(frame),
+                &[],
+                &[],
+                &edits,
+                unit,
+            );
+            let next = placed
+                .iter()
+                .find(|p| p.dim_id == "d_next")
+                .expect("R5 placed");
+            let b = placed_text_box(next);
+            for other in placed.iter().filter(|p| p.dim_id.starts_with("d_fit")) {
+                let a = placed_text_box(other);
+                assert!(
+                    !a.intersects(&b, 0.0),
+                    "at dy {dy}: 17× R5 is printed on '{}': {a:?} vs {b:?}",
+                    other.label
+                );
+            }
+        }
     }
 
     /// A stacked dimension's number is not put where an earlier view's
