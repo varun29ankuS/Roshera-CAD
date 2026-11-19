@@ -5770,12 +5770,31 @@ mod tests {
                 code.split("record_csketch_op(")
                     .skip(1)
                     .filter_map(|call| {
-                        let args = call.split(')').next().unwrap_or_default();
-                        literals_of(args).into_iter().next()
+                        // The KIND is the second argument; a call passing it
+                        // through a variable (`kind`) names no literal there
+                        // -- a JSON key later in the call ("corner") is not a
+                        // kind.
+                        let kind_arg = call.split(',').nth(1).unwrap_or_default();
+                        literals_of(kind_arg).into_iter().next()
                     })
                     .filter(|s| is_kind_literal(s))
                     .collect()
             }),
+            // `RecordedOperation::new(DIMENSION_UPDATE_EVENT)`: the value of
+            // that const. A dotted kind is a drawing event (no B-Rep arm),
+            // excluded exactly like a dotted literal above.
+            (
+                "api-server/src/drawing_annotate.rs",
+                "DIMENSION_UPDATE_EVENT",
+                |code| {
+                    code.split("pub const DIMENSION_UPDATE_EVENT: &str = \"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .filter(|kind| !kind.contains('.'))
+                        .map(|kind| vec![kind.to_string()])
+                        .unwrap_or_default()
+                },
+            ),
         ];
 
         let mut recorded: BTreeSet<String> = BTreeSet::new();

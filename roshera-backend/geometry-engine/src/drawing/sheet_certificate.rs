@@ -332,6 +332,13 @@ pub struct SheetReadbackCertificate {
     /// (no cut-through) deserializing.
     #[serde(default)]
     pub section_cuts: Option<SectionCutThrough>,
+    /// Set when the solid the sheet was drawn from is not in the model at
+    /// all, saying so in words. Every fact then reads `dangling` (honestly),
+    /// but the one thing a reader must know is that the PART is gone -- no
+    /// dimension can be fixed on the sheet; the part must be rebuilt or its
+    /// document reopened. `None` when the part is present (2026-11-19).
+    #[serde(default)]
+    pub missing_part: Option<String>,
 }
 
 impl SheetReadbackCertificate {
@@ -1519,8 +1526,20 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
         });
     }
 
+    // The drawn part itself: a sheet of a solid the model does not hold can
+    // verify nothing, whatever its facts tally to.
+    let missing_part = match solid_id {
+        Some(s) if model.solids.get(s).is_none() => Some(format!(
+            "the part this sheet was drawn from (solid {s}) is not in the model: \
+             rebuild the part or reopen its document; no dimension on the sheet \
+             can be checked or fixed until it is back"
+        )),
+        _ => None,
+    };
+
     let counts = VerdictCounts::tally(&facts);
-    let sound = counts.stale == 0 && counts.dangling == 0 && counts.omitted == 0;
+    let sound =
+        missing_part.is_none() && counts.stale == 0 && counts.dangling == 0 && counts.omitted == 0;
     let complete = counts.omitted == 0 && counts.not_dimensioned == 0;
     let omission_summary = super::completeness::omission_summary(&omissions);
     SheetReadbackCertificate {
@@ -1532,6 +1551,7 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
         omission_summary,
         quality,
         section_cuts,
+        missing_part,
     }
 }
 

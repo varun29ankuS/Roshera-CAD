@@ -424,6 +424,7 @@ const BASE_REFS: Record<
 const LIVE_FACT_GATES = new Set<string>([
   "unsound_base",
   "sheet_unsound",
+  "sheet_part_missing",
   "sheet_quality",
   "sheet_uncertified",
   "single_point_run",
@@ -998,6 +999,23 @@ async function sheetExportGate(args: any): Promise<any | null> {
         "backend is reachable, read the certificate with " +
         "drawing_read_semantics, then re-issue this call. This refusal is " +
         "re-evaluated live on every attempt.",
+    });
+  }
+
+  // The part itself is gone (the kernel's `missing_part`): every fact
+  // dangles, and "regenerate from the current model" would be wrong advice --
+  // there is no part to regenerate from (2026-11-19, the wing rib's reopen).
+  if (typeof cert.missing_part === "string" && cert.missing_part.length > 0) {
+    return gateRefusal({
+      gate: "sheet_part_missing",
+      reason:
+        `drawing ${drawingId} cannot be certified: ${cert.missing_part}. ` +
+        "Nothing on the sheet can be checked against a part that is not there.",
+      how_to_proceed:
+        "Rebuild the part (or reopen the document that holds it), confirm it " +
+        "with verify_part, then regenerate the sheet with make_drawing. If the " +
+        "document reopened without its part, say so to the engineer: its saved " +
+        "history could not be replayed, and the timeline panel names the step.",
     });
   }
 

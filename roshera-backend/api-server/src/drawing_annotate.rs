@@ -176,6 +176,7 @@ fn certificate_summary(cert: &SheetReadbackCertificate) -> serde_json::Value {
         "counts": cert.counts,
         "omission_summary": cert.omission_summary,
         "omissions": cert.omissions,
+        "missing_part": cert.missing_part,
     })
 }
 

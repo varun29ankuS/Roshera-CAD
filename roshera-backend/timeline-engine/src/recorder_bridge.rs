@@ -573,7 +573,16 @@ pub struct TimelineRecorder {
     /// default (see `reserve_event_key`'s doc comment). `Arc`-wrapped (not a
     /// bare `OnceLock`) so cloned `TimelineRecorder` handles share ONE
     /// resolution, matching `staging` / `branch_id`.
-    event_counter: Arc<std::sync::OnceLock<Arc<std::sync::atomic::AtomicU64>>>,
+    ///
+    /// The cache is REFRESHED whenever the timeline can be read and its
+    /// counter is a different one: opening a document assigns a fresh
+    /// `Timeline` (and so a fresh counter) inside the same lock, and a
+    /// handle cached once forever kept numbering from the previous
+    /// document's counter -- the wing rib's extrude landed at sequence 15
+    /// after its `set_name` took 0, and the reopened document quarantined
+    /// (2026-11-19). The cached handle is used only while the lock is
+    /// write-held at that instant.
+    event_counter: Arc<PlRwLock<Option<Arc<std::sync::atomic::AtomicU64>>>>,
 }
 
 impl std::fmt::Debug for TimelineRecorder {
@@ -904,7 +913,7 @@ impl TimelineRecorder {
             staging: Arc::new(PlRwLock::new(StagingState::default())),
             sink,
             timeline: recorder_timeline,
-            event_counter: Arc::new(std::sync::OnceLock::new()),
+            event_counter: Arc::new(PlRwLock::new(None)),
         }
     }
 
@@ -1414,21 +1423,23 @@ impl OperationRecorder for TimelineRecorder {
         if let Some(seq) = sticky {
             return Some(format!("evt:{seq}"));
         }
-        let counter = if let Some(c) = self.event_counter.get() {
-            Arc::clone(c)
-        } else {
-            match self.timeline.try_read() {
-                Ok(guard) => {
-                    let resolved = guard.event_counter_handle();
-                    // `set` can lose a race to a concurrent first resolver;
-                    // either winner's handle is the SAME underlying counter
-                    // (both cloned from the same `Timeline`), so losing the
-                    // race is harmless — use whichever ended up cached.
-                    let _ = self.event_counter.set(Arc::clone(&resolved));
-                    self.event_counter.get().map(Arc::clone).unwrap_or(resolved)
+        // The CURRENT timeline's counter whenever the lock is free (a
+        // document switch swaps the timeline inside it); the cached handle
+        // only while a writer holds it at this instant.
+        let counter = match self.timeline.try_read() {
+            Ok(guard) => {
+                let current = guard.event_counter_handle();
+                drop(guard);
+                let mut cached = self.event_counter.write();
+                if !cached.as_ref().is_some_and(|c| Arc::ptr_eq(c, &current)) {
+                    *cached = Some(Arc::clone(&current));
                 }
-                Err(_) => return None,
+                current
             }
+            Err(_) => match self.event_counter.read().as_ref() {
+                Some(c) => Arc::clone(c),
+                None => return None,
+            },
         };
         let seq = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // First reservation inside a discard scope becomes the scope's sticky
@@ -3479,6 +3490,43 @@ mod tests {
             kinds_on(&timeline, &BranchId::main()).await,
             vec!["op-not-on-disk".to_string()],
             "a persist failure leaves the in-memory event in place"
+        );
+    }
+
+    /// Opening a document assigns a FRESH `Timeline` inside the shared lock
+    /// (`api-server/src/documents.rs`), with its own sequence counter. The
+    /// recorder must reserve from THAT counter, not keep numbering from the
+    /// previous document's. Found 2026-11-19: the agent's wing rib recorded
+    /// its `sketch_extrude` at sequence 15 (the previous document's counter)
+    /// while the `set_name` after it took sequence 0, so replay ran
+    /// `set_name` on a solid nothing had built yet and the reopened document
+    /// quarantined its whole history -- the rib vanished, its drawing stayed.
+    #[tokio::test]
+    async fn reservations_follow_a_timeline_swapped_inside_the_lock() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+        for _ in 0..15 {
+            assert!(recorder.reserve_event_key().is_some());
+        }
+
+        // The document switch: a new timeline, same lock.
+        *timeline.write().await = Timeline::new(TimelineConfig::default());
+
+        assert_eq!(
+            recorder.reserve_event_key().as_deref(),
+            Some("evt:0"),
+            "the first reservation in the new document is its sequence 0"
+        );
+        assert_eq!(
+            timeline
+                .read()
+                .await
+                .event_counter_handle()
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "and it advanced the NEW timeline's counter"
         );
     }
 }

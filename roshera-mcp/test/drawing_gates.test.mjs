@@ -225,6 +225,29 @@ check("acknowledge_layout_issues does NOT bypass stale/dangling facts", () => {
   assert.equal(counts.pdf, 0);
 });
 
+// 2026-11-19: the wing rib's document reopened without its part. The sheet's
+// facts all dangled and the refusal told the agent to "regenerate the sheet
+// from the current model" -- there was no part to regenerate from. A sheet
+// whose part is gone is refused as exactly that, with the remedy that works.
+const savedCert = cert;
+cert = {
+  sound: false,
+  counts: { consistent: 1, stale: 4, dangling: 19 },
+  facts: [{ label: "300.03", live: { verdict: "dangling" } }],
+  missing_part: "the part this sheet was drawn from (solid 0) is not in the model",
+  quality: { passed: true, sheet_utilization: 0.09, issues: [] },
+};
+const eGone = await call("drawing_export_sheet", exportArgs);
+check("a sheet whose part is gone is refused as missing_part, not 'regenerate'", () => {
+  assert.ok(isRefusal(eGone, "sheet_part_missing"));
+  assert.equal(counts.pdf, 0);
+  const j = firstJson(eGone);
+  assert.match(j.reason, /not in the model/);
+  assert.match(j.how_to_proceed, /rebuild the part|reopen/i);
+  assert.doesNotMatch(j.how_to_proceed, /Regenerate the sheet from the current model/);
+});
+cert = savedCert;
+
 // ─── 3. sheet-export gate: layout quality + the legitimate flows ────────────
 
 cert = {

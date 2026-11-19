@@ -238,6 +238,8 @@ export interface CertificateSummary {
   }
   omission_summary: string[]
   omissions: SheetOmission[]
+  /** Set when the part the sheet was drawn from is not in the model. */
+  missing_part?: string | null
 }
 
 /** One model dimension no view of the sheet states. */
@@ -258,6 +260,11 @@ export type ChipTone = 'good' | 'warn' | 'bad'
  */
 export function certificateChip(c: CertificateSummary | null): { tone: ChipTone; mark: string; text: string } {
   if (!c) return { tone: 'warn', mark: '?', text: 'Not verified: the part is not loaded' }
+  // The part itself is gone: nothing on the sheet can be fixed, so say what
+  // can (the kernel's `missing_part`), never a count of dimensions to fix.
+  if (c.missing_part) {
+    return { tone: 'bad', mark: '✗', text: 'Part missing: rebuild it or reopen its document' }
+  }
   if (!c.sound) {
     const n = c.counts.stale + c.counts.dangling + c.counts.omitted
     return { tone: 'bad', mark: '✗', text: `Not sound: ${n} to fix` }

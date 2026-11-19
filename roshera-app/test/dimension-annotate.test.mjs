@@ -125,6 +125,14 @@ test('the chip says in one glance whether the sheet is sound and complete', () =
   assert.equal(unsound.text, 'Not sound: 2 to fix')
   // No certificate (the part is not loaded) is never shown as a pass.
   assert.equal(certificateChip(null).tone, 'warn')
+  // The part the sheet was drawn from is gone (2026-11-19: the wing rib's
+  // reopened document showed "Not sound: 23 to fix" -- nothing on the sheet
+  // could be fixed; the part had to come back).
+  const gone = certificateChip(
+    cert({ sound: false, counts: { ...counts, stale: 4, dangling: 19 }, missing_part: 'the part ... is not in the model' }),
+  )
+  assert.equal(gone.tone, 'bad')
+  assert.equal(gone.text, 'Part missing: rebuild it or reopen its document')
 })
 
 test('every omission reason the kernel emits has words', () => {
