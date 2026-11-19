@@ -195,6 +195,17 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
         if view.show_hidden {
             emit_view_hidden(&mut ink, view, layer);
         }
+        // ELLIPSE stays on the sheet, on the view's layer: FreeCAD's legacy
+        // importer reads LINE, LWPOLYLINE, ARC, CIRCLE, SOLID and INSERT
+        // inside a block but not ELLIPSE, and dropped every isometric rim
+        // ("the isometric 3D is missing a lot of lines", 2026-11-19). A
+        // sheet has only a handful, so the object count stays low.
+        let (ellipses, ink): (Vec<Entity>, Vec<Entity>) = ink
+            .into_iter()
+            .partition(|e| matches!(e.specific, EntityType::Ellipse(_)));
+        for e in ellipses {
+            dxf.add_entity(e);
+        }
         let name = format!("VIEW_{layer}");
         let mut record = dxf::tables::BlockRecord::default();
         record.name = name.clone();

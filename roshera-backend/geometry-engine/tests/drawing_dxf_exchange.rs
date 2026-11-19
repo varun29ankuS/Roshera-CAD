@@ -241,6 +241,49 @@ fn no_text_carries_an_alignment_point() {
     assert_eq!(with_11, 0, "TEXT entities with an alignment point");
 }
 
+/// FreeCAD's legacy DXF importer reads LINE, LWPOLYLINE, ARC, CIRCLE, SOLID
+/// and INSERT inside a block -- but not ELLIPSE: every ellipse in a view
+/// block was dropped, and the isometric lost its rims (Varun 2026-11-19,
+/// "the isometric 3D is missing a lot of lines"). Ellipses are written on
+/// the sheet (on their view's layer), where it reads them.
+///
+/// Mutation: leave the ellipses in the view blocks -> RED.
+#[test]
+fn ellipses_are_never_inside_a_block() {
+    use geometry_engine::math::{Point3, Vector3};
+    let mut m = BRepModel::new();
+    let s = match TopologyBuilder::new(&mut m).create_cylinder_3d(
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::new(0.0, 0.0, 1.0),
+        20.0,
+        30.0,
+    ) {
+        Ok(GeometryId::Solid(s)) => s,
+        other => panic!("cylinder: {other:?}"),
+    };
+    let drawing = standard_drawing_auto(&m, s, uuid::Uuid::nil()).unwrap();
+    let dxf = String::from_utf8(render_drawing_dxf(&drawing).unwrap()).unwrap();
+    let p = pairs(&dxf);
+    let section = |name: &str| {
+        let start = p.iter().position(|(c, v)| c == "2" && v == name).unwrap();
+        let end = start
+            + p[start..]
+                .iter()
+                .position(|(c, v)| c == "0" && v == "ENDSEC")
+                .unwrap();
+        &p[start..end]
+    };
+    assert_eq!(
+        entities(section("BLOCKS"), "ELLIPSE").len(),
+        0,
+        "no ellipse inside a block"
+    );
+    assert!(
+        !entities(section("ENTITIES"), "ELLIPSE").is_empty(),
+        "the isometric's rims are written as ellipses on the sheet"
+    );
+}
+
 #[test]
 fn linear_dimensions_are_dimension_entities() {
     let drawing = sheet();
