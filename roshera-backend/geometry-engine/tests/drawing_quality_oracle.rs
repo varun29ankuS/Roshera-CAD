@@ -1522,8 +1522,16 @@ fn hole_table_and_tags_emitted_in_dxf() {
 
     // For each placed hole-tag, verify a DXF TEXT entity exists at the
     // layout-derived coordinate (within 0.5 mm tolerance).
+    // A tag is centred on its anchor; the DXF writes it left-justified at
+    // its start (FreeCAD reads a TEXT alignment point as a direction), half
+    // its width before the anchor (2.6 mm capitals, the layout's advance).
     for ht in &layout.hole_tags {
-        let x_expected = ht.text_anchor[0];
+        let em = 2.6 / geometry_engine::drawing::layout::CAP_HEIGHT_OF_EM;
+        let half = 0.5
+            * ht.tag.chars().count() as f64
+            * geometry_engine::drawing::layout::GLYPH_ADVANCE_EM
+            * em;
+        let x_expected = ht.text_anchor[0] - half;
         let y_expected = sheet_h - ht.text_anchor[1];
         let found = text_entities.iter().any(|t| {
             t.value == ht.tag && (t.x - x_expected).abs() < 0.5 && (t.y - y_expected).abs() < 0.5

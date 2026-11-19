@@ -258,10 +258,14 @@ fn dxf_carries_hidden_edges_dashed_and_honours_show_hidden() {
         .find(|lt| lt.name == "HIDDEN")
         .expect("a HIDDEN line type is defined");
     assert_eq!(hidden_type.dash_dot_space_lengths, vec![4.0, -2.0]);
-    let dashed = file
-        .entities()
-        .filter(|e| e.common.line_type_name == "HIDDEN")
-        .count();
+    // The view line work lives in each view's block (one insert per view).
+    let dashed_in = |f: &dxf::Drawing| {
+        f.entities()
+            .chain(f.blocks().flat_map(|b| b.entities.iter()))
+            .filter(|e| e.common.line_type_name == "HIDDEN")
+            .count()
+    };
+    let dashed = dashed_in(&file);
     assert_eq!(dashed, all, "every hidden edge is written dashed");
 
     let off = d
@@ -272,10 +276,7 @@ fn dxf_carries_hidden_edges_dashed_and_honours_show_hidden() {
     d.views[off].show_hidden = false;
     let fewer = hidden_count(&d);
     assert!(fewer < all);
-    let dashed = read(&d)
-        .entities()
-        .filter(|e| e.common.line_type_name == "HIDDEN")
-        .count();
+    let dashed = dashed_in(&read(&d));
     assert_eq!(dashed, fewer, "a view with hidden lines off writes none");
 }
 

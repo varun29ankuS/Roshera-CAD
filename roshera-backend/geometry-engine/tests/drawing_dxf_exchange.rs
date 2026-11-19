@@ -108,6 +108,128 @@ fn drawing_symbols_are_written_as_themselves() {
     );
 }
 
+/// The colour of each layer (LAYER table, group 62).
+fn layer_colours(p: &[(String, String)]) -> std::collections::HashMap<String, i32> {
+    entities(p, "LAYER")
+        .into_iter()
+        .filter_map(|e| Some((group(e, "2")?.to_string(), group(e, "62")?.parse().ok()?)))
+        .collect()
+}
+
+/// In a CAD tool each kind of line reads at a glance: the layers carry the
+/// usual colours (part edges near-black, dimensions blue, GD&T magenta,
+/// labels and the mark in Roshera orange, the frame grey). Every layer was
+/// ACI 7, and FreeCAD (legacy importer, "use original colours", white
+/// background) paints ACI 7 as WHITE: the sheet opened blank (2026-11-19).
+/// No layer may be ACI 7. The printed sheet stays black on white: a plot
+/// maps colours to black.
+///
+/// Mutation: register every layer as ACI 7 again -> RED.
+#[test]
+fn each_kind_of_line_has_its_layer_colour() {
+    let dxf = String::from_utf8(render_drawing_dxf(&sheet()).unwrap()).unwrap();
+    let colours = layer_colours(&pairs(&dxf));
+    let c = |l: &str| {
+        colours
+            .get(l)
+            .copied()
+            .unwrap_or_else(|| panic!("layer {l} missing: {colours:?}"))
+    };
+    for (layer, aci) in &colours {
+        assert_ne!(
+            *aci, 7,
+            "layer {layer} is ACI 7, which FreeCAD paints white"
+        );
+    }
+    assert_eq!(c("FRONT"), 250, "part edges are near-black");
+    assert_eq!(c("DIMENSIONS"), 5, "dimensions are blue");
+    assert_eq!(c("GDT_FCF"), 6, "GD&T is magenta");
+    assert_eq!(c("VIEW_LABELS"), 30, "view labels are Roshera orange");
+    assert_eq!(c("LOGO"), 30, "the mark is Roshera orange");
+    assert_eq!(c("FRAME"), 8, "the frame is grey");
+}
+
+/// The title block carries the Roshera mark as vectors, as the PDF does: a
+/// rounded square with the R in it and the wordmark under it. The DXF wrote
+/// the word alone (2026-11-19).
+///
+/// Mutation: drop the mark's outline -> RED.
+#[test]
+fn the_title_block_carries_the_roshera_mark() {
+    let dxf = String::from_utf8(render_drawing_dxf(&sheet()).unwrap()).unwrap();
+    let p = pairs(&dxf);
+    let on_logo = |kind: &str| {
+        entities(&p, kind)
+            .into_iter()
+            .filter(|e| group(e, "8") == Some("LOGO"))
+            .count()
+    };
+    assert!(on_logo("LWPOLYLINE") >= 1, "the mark's rounded square");
+    let texts: Vec<&str> = entities(&p, "TEXT")
+        .into_iter()
+        .filter(|e| group(e, "8") == Some("LOGO"))
+        .filter_map(|e| group(e, "1"))
+        .collect();
+    assert!(texts.contains(&"R"), "the R in the mark: {texts:?}");
+    assert!(texts.contains(&"ROSHERA"), "the wordmark: {texts:?}");
+}
+
+/// Every view is ONE insert of a block holding its line work: FreeCAD makes
+/// one document object per model-space entity, and the bracket sheet's
+/// thousands of view polylines (3 617 objects) made it crawl and crash
+/// (2026-11-19). No view line work sits loose in model space.
+///
+/// Mutation: write view polylines to model space again -> RED.
+#[test]
+fn every_view_is_one_block_insert() {
+    let drawing = sheet();
+    let dxf = String::from_utf8(render_drawing_dxf(&drawing).unwrap()).unwrap();
+    let p = pairs(&dxf);
+    // The ENTITIES section only: blocks hold their own entities.
+    let start = p
+        .iter()
+        .position(|(c, v)| c == "2" && v == "ENTITIES")
+        .unwrap();
+    let end = start
+        + p[start..]
+            .iter()
+            .position(|(c, v)| c == "0" && v == "ENDSEC")
+            .unwrap();
+    let model = &p[start..end];
+    let inserts: Vec<&str> = entities(model, "INSERT")
+        .into_iter()
+        .filter_map(|e| group(e, "2"))
+        .collect();
+    assert_eq!(
+        inserts.len(),
+        drawing.views.len(),
+        "one insert per view: {inserts:?}"
+    );
+    let view_layers: Vec<String> = drawing.views.iter().map(|v| v.name.clone()).collect();
+    let loose = entities(model, "LWPOLYLINE")
+        .into_iter()
+        .filter(|e| group(e, "8").is_some_and(|l| view_layers.iter().any(|v| v == l)))
+        .count();
+    assert_eq!(loose, 0, "no view line work loose in model space");
+}
+
+/// FreeCAD's DXF importer reads a TEXT's alignment point (group 11) as a
+/// direction and turned every label toward the sheet origin -- "FRONT (1:1)"
+/// at 48 degrees (2026-11-19). No TEXT carries one: each is written
+/// left-justified at its computed start.
+///
+/// Mutation: write centred text with its alignment point again -> RED.
+#[test]
+fn no_text_carries_an_alignment_point() {
+    let dxf = String::from_utf8(render_drawing_dxf(&sheet()).unwrap()).unwrap();
+    let p = pairs(&dxf);
+    let with_11 = entities(&p, "TEXT")
+        .into_iter()
+        .filter(|e| group(e, "11").is_some())
+        .count();
+    assert_eq!(with_11, 0, "TEXT entities with an alignment point");
+}
+
 #[test]
 fn linear_dimensions_are_dimension_entities() {
     let drawing = sheet();

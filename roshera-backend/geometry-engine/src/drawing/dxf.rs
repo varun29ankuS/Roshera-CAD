@@ -76,13 +76,27 @@ const LAYER_GDT_DATUM: &str = "GDT_DATUM";
 /// Layer for GD&T Feature Control Frame TEXT and LWPOLYLINE entities (Task 6).
 const LAYER_GDT_FCF: &str = "GDT_FCF";
 
-// AutoCAD Color Index (ACI) values used for layer colours. ACI 7 is
-// the "ByLayer" default that renders black on a white background and
-// white on a black background — appropriate for engineering drawings
-// regardless of the viewer's theme. ACI 8 is 50% grey, used for the
-// sheet outline / faint frame elements.
-const ACI_BLACK: u8 = 7;
+/// Layer for the Roshera mark in the title block.
+const LAYER_LOGO: &str = "LOGO";
+
+// AutoCAD Color Index (ACI) values for the layers: each kind of line reads
+// at a glance in a CAD tool, and a plot maps every colour to black, so the
+// printed sheet stays black on white.
+//
+// NOT ACI 7. AutoCAD draws 7 black or white against the background, but
+// FreeCAD (legacy importer with "use original DXF colours") paints it WHITE:
+// on its white background the whole sheet opened blank (2026-11-19). ACI 250
+// is near-black (#333333) in every reader.
+/// Part edges, title block, tables, notes.
+const ACI_INK: u8 = 250;
+/// Sheet frame, hidden lines.
 const ACI_GREY: u8 = 8;
+/// Dimensions, hole tags.
+const ACI_BLUE: u8 = 5;
+/// GD&T: datum symbols and feature control frames.
+const ACI_MAGENTA: u8 = 6;
+/// View labels and the Roshera mark (the brand orange).
+const ACI_ORANGE: u8 = 30;
 
 /// Render a [`Drawing`] to a DXF byte buffer.
 ///
@@ -123,16 +137,19 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     dxf.header.default_drawing_units = dxf::enums::Units::Millimeters;
 
     // -- Layers --------------------------------------------------------
+    // Layer "0" always exists; it too must not be ACI 7.
+    register_layer(&mut dxf, "0", ACI_INK);
     register_layer(&mut dxf, LAYER_FRAME, ACI_GREY);
-    register_layer(&mut dxf, LAYER_TITLEBLOCK, ACI_BLACK);
-    register_layer(&mut dxf, LAYER_TITLEBLOCK_TEXT, ACI_BLACK);
-    register_layer(&mut dxf, LAYER_NOTES, ACI_BLACK);
-    register_layer(&mut dxf, LAYER_VIEW_LABELS, ACI_BLACK);
-    register_layer(&mut dxf, LAYER_DIMENSIONS, ACI_BLACK);
-    register_layer(&mut dxf, LAYER_HOLE_TAGS, ACI_BLACK);
-    register_layer(&mut dxf, LAYER_HOLE_TABLE, ACI_BLACK);
-    register_layer(&mut dxf, LAYER_GDT_DATUM, ACI_BLACK);
-    register_layer(&mut dxf, LAYER_GDT_FCF, ACI_BLACK);
+    register_layer(&mut dxf, LAYER_TITLEBLOCK, ACI_INK);
+    register_layer(&mut dxf, LAYER_TITLEBLOCK_TEXT, ACI_INK);
+    register_layer(&mut dxf, LAYER_NOTES, ACI_INK);
+    register_layer(&mut dxf, LAYER_VIEW_LABELS, ACI_ORANGE);
+    register_layer(&mut dxf, LAYER_DIMENSIONS, ACI_BLUE);
+    register_layer(&mut dxf, LAYER_HOLE_TAGS, ACI_BLUE);
+    register_layer(&mut dxf, LAYER_HOLE_TABLE, ACI_INK);
+    register_layer(&mut dxf, LAYER_GDT_DATUM, ACI_MAGENTA);
+    register_layer(&mut dxf, LAYER_GDT_FCF, ACI_MAGENTA);
+    register_layer(&mut dxf, LAYER_LOGO, ACI_ORANGE);
     // One layer per view, named after the view. Duplicate names are
     // resolved by suffixing with an index — AutoCAD requires layer
     // names to be unique, and two views legitimately can share a
@@ -148,7 +165,7 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     dxf.add_line_type(hidden);
     let view_layers = assign_view_layers(&drawing.views);
     for layer_name in &view_layers {
-        register_layer(&mut dxf, layer_name, ACI_BLACK);
+        register_layer(&mut dxf, layer_name, ACI_INK);
     }
 
     // -- Sheet frame ---------------------------------------------------
@@ -164,12 +181,35 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     // isometric stays clean wireframe line work. `view.shaded_raster` is never
     // consulted in this module.
     let sheet_h = drawing.sheet_size.height();
+    // Each view is ONE block holding its line work, inserted once on the
+    // view's layer. FreeCAD makes a document object per model-space entity:
+    // the bracket sheet's thousands of loose view polylines (3 617 objects)
+    // made it crawl and restart (2026-11-19). A CAD tool also selects,
+    // moves or hides a view as one thing.
     for (view, layer) in drawing.views.iter().zip(view_layers.iter()) {
-        emit_view_polylines(&mut dxf, view, layer, sheet_h);
-        emit_view_circles(&mut dxf, view, layer);
+        let mut ink: Vec<Entity> = Vec::new();
+        emit_view_polylines(&mut ink, view, layer, sheet_h);
+        emit_view_circles(&mut ink, view, layer);
         if view.show_hidden {
-            emit_view_hidden(&mut dxf, view, layer);
+            emit_view_hidden(&mut ink, view, layer);
         }
+        let name = format!("VIEW_{layer}");
+        let mut record = dxf::tables::BlockRecord::default();
+        record.name = name.clone();
+        dxf.add_block_record(record);
+        let mut block = dxf::Block::default();
+        block.name = name.clone();
+        block.layer = layer.clone();
+        block.entities = ink;
+        dxf.add_block(block);
+        let insert = dxf::entities::Insert {
+            name,
+            location: Point::origin(),
+            ..Default::default()
+        };
+        let mut ent = Entity::new(EntityType::Insert(insert));
+        ent.common.layer = layer.clone();
+        dxf.add_entity(ent);
     }
 
     // -- View labels + dimension text from the layout ------------------
@@ -275,7 +315,7 @@ fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
 /// (engineering convention). The SVG renderer flips Y at render time
 /// because SVG is +Y down; the DXF carries the raw +Y-up coordinates.
 fn emit_view_polylines(
-    dxf: &mut DxfDrawing,
+    out: &mut Vec<Entity>,
     view: &ProjectedView,
     layer: &str,
     _sheet_height_mm: f64,
@@ -286,22 +326,36 @@ fn emit_view_polylines(
     // Cut outline + section hatch (campaign #55 Slice 1): the hatch now lives in
     // its own vec but is still emitted to the DXF wireframe, so the DXF output is
     // unchanged by the outline/hatch split.
-    for poly in view.polylines.iter().chain(view.hatch_polylines.iter()) {
-        if poly.points.len() < 2 {
-            continue;
-        }
-        let mut lw = LwPolyline::default();
-        let on_sheet: Vec<[f64; 2]> = poly
-            .points
+    let on_sheet = |poly: &super::types::Polyline2d| -> Vec<[f64; 2]> {
+        poly.points
             .iter()
             .map(|p| [tx + s * p[0], ty + s * p[1]])
-            .collect();
-        lw.vertices = bulged_vertices(&on_sheet);
+            .collect()
+    };
+    // The outline's pieces joined end to end (the hidden-line pass leaves
+    // every edge, and every visible stretch of one, as its own polyline):
+    // fewer, longer polylines, and an arc split across pieces is fitted
+    // whole. The hatch lines are separate strokes and stay so.
+    let outline = chain_polylines(
+        view.polylines
+            .iter()
+            .filter(|p| p.points.len() >= 2)
+            .map(on_sheet)
+            .collect(),
+    );
+    let hatch = view
+        .hatch_polylines
+        .iter()
+        .filter(|p| p.points.len() >= 2)
+        .map(on_sheet);
+    for points in outline.into_iter().chain(hatch) {
+        let mut lw = LwPolyline::default();
+        lw.vertices = bulged_vertices(&points);
         let mut common = EntityCommon::default();
         common.layer = layer.to_string();
         let mut ent = Entity::new(EntityType::LwPolyline(lw));
         ent.common = common;
-        dxf.add_entity(ent);
+        out.push(ent);
     }
 }
 
@@ -314,7 +368,7 @@ fn emit_view_polylines(
 ///
 /// Scope: only `view.circles` / `view.ellipses` (visible); the hidden set is
 /// written dashed by [`emit_view_hidden`].
-fn emit_view_circles(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
+fn emit_view_circles(out: &mut Vec<Entity>, view: &ProjectedView, layer: &str) {
     let s = view.scale;
     let tx = view.position_mm[0];
     let ty = view.position_mm[1];
@@ -330,7 +384,7 @@ fn emit_view_circles(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
         common.layer = layer.to_string();
         let mut ent = Entity::new(EntityType::Circle(circle));
         ent.common = common;
-        dxf.add_entity(ent);
+        out.push(ent);
     }
 
     for e in &view.ellipses {
@@ -351,14 +405,14 @@ fn emit_view_circles(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
         common.layer = layer.to_string();
         let mut ent = Entity::new(EntityType::Ellipse(ellipse));
         ent.common = common;
-        dxf.add_entity(ent);
+        out.push(ent);
     }
 }
 
 /// Emit a view's hidden (occluded) edges, circles and ellipses on the view's
 /// layer with line type HIDDEN, so a CAD reader shows them dashed. Same
 /// sheet-space convention as [`emit_view_polylines`] / [`emit_view_circles`].
-fn emit_view_hidden(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
+fn emit_view_hidden(out: &mut Vec<Entity>, view: &ProjectedView, layer: &str) {
     let s = view.scale;
     let tx = view.position_mm[0];
     let ty = view.position_mm[1];
@@ -366,6 +420,8 @@ fn emit_view_hidden(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
         let mut common = EntityCommon::default();
         common.layer = layer.to_string();
         common.line_type_name = LINE_TYPE_HIDDEN.to_string();
+        // Hidden edges read lighter than visible ones on screen.
+        common.color = Color::from_index(ACI_GREY);
         let mut ent = Entity::new(kind);
         ent.common = common;
         ent
@@ -381,10 +437,10 @@ fn emit_view_hidden(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
             .map(|p| [tx + s * p[0], ty + s * p[1]])
             .collect();
         lw.vertices = bulged_vertices(&on_sheet);
-        dxf.add_entity(dashed(EntityType::LwPolyline(lw)));
+        out.push(dashed(EntityType::LwPolyline(lw)));
     }
     for c in &view.hidden_circles {
-        dxf.add_entity(dashed(EntityType::Circle(Circle {
+        out.push(dashed(EntityType::Circle(Circle {
             center: Point::new(tx + s * c.cx, ty + s * c.cy, 0.0),
             radius: s * c.r,
             normal: Vector::z_axis(),
@@ -397,7 +453,7 @@ fn emit_view_hidden(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
         if rx <= 0.0 {
             continue;
         }
-        dxf.add_entity(dashed(EntityType::Ellipse(Ellipse {
+        out.push(dashed(EntityType::Ellipse(Ellipse {
             center: Point::new(tx + s * e.cx, ty + s * e.cy, 0.0),
             major_axis: Vector::new(rx * e.rotation.cos(), rx * e.rotation.sin(), 0.0),
             normal: Vector::z_axis(),
@@ -801,20 +857,10 @@ fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
     for c in &tb.cells {
         rect(dxf, &c.rect);
     }
-    // The owner's mark: the wordmark centred in the logo cell (DXF has no
-    // fills; the SVG's solid square mark is a raster-free nicety).
-    let l = tb.logo;
-    let word = (l.width() - 2.0).min(3.2) / (7.0 * 0.75);
-    add_text(
-        dxf,
-        LAYER_TITLEBLOCK_TEXT,
-        0.5 * (l.x0 + l.x1),
-        fy(l.y0 + 0.6 * l.height()),
-        (word * 7.0 * 0.75).clamp(1.8, 3.2),
-        0.0,
-        "ROSHERA",
-        HorizontalTextJustification::Center,
-    );
+    // The owner's mark, as the SVG/PDF draws it (`svg::render_roshera_logo`):
+    // a rounded square with the R in it, the wordmark under it, both sized
+    // to the logo cell -- as vectors, on its own layer in the brand orange.
+    emit_roshera_mark(dxf, &tb.logo, sheet_h);
 
     for c in &tb.cells {
         let lb = c.label_box();
@@ -1002,23 +1048,119 @@ fn add_text(
     value: &str,
     justify: HorizontalTextJustification,
 ) {
+    dxf.add_entity(text_entity(
+        layer,
+        x,
+        y,
+        height,
+        rotation_deg,
+        value,
+        justify,
+    ));
+}
+
+/// A TEXT entity whose `justify` anchor is at (x, y), written LEFT-justified
+/// at its computed start with no alignment point (group 11).
+///
+/// A centred or right-justified DXF TEXT is placed by its alignment point;
+/// FreeCAD's DXF importer reads that point as a DIRECTION and turned every
+/// such label toward the sheet origin ("FRONT (1:1)" at 48 degrees,
+/// 2026-11-19). The start is found from the layout's own glyph advance (the
+/// estimate every collision box on the sheet is measured with), along the
+/// text's rotation.
+#[allow(clippy::too_many_arguments)]
+fn text_entity(
+    layer: &str,
+    x: f64,
+    y: f64,
+    height: f64,
+    rotation_deg: f64,
+    value: &str,
+    justify: HorizontalTextJustification,
+) -> Entity {
+    let em = height / CAP_HEIGHT_OF_EM;
+    let width = value.chars().count() as f64 * GLYPH_ADVANCE_EM * em;
+    let back = match justify {
+        HorizontalTextJustification::Center | HorizontalTextJustification::Middle => 0.5 * width,
+        HorizontalTextJustification::Right => width,
+        _ => 0.0,
+    };
+    let (sin, cos) = rotation_deg.to_radians().sin_cos();
     let mut text = Text::default();
     text.value = value.to_string();
     text.text_height = height;
     text.rotation = rotation_deg;
-    text.horizontal_text_justification = justify;
-    // Place the text. The DXF spec uses `location` for left-justified
-    // text and the "alignment point" `second_alignment_point` for
-    // centred/right-justified — we set both so readers that don't
-    // honour the justification flag still see the text near the
-    // intended spot.
-    text.location = Point::new(x, y, 0.0);
-    text.second_alignment_point = Point::new(x, y, 0.0);
-    let mut common = EntityCommon::default();
-    common.layer = layer.to_string();
+    text.location = Point::new(x - back * cos, y - back * sin, 0.0);
     let mut ent = Entity::new(EntityType::Text(text));
-    ent.common = common;
+    ent.common.layer = layer.to_string();
+    ent
+}
+
+/// The Roshera mark in the title block's logo cell (`cell` is y-down sheet
+/// millimetres): the rounded square with the R centred in it and the
+/// wordmark under it, on [`LAYER_LOGO`]. The geometry is the SVG's
+/// (`svg::render_roshera_logo`): same square side, top gap and wordmark size.
+fn emit_roshera_mark(dxf: &mut DxfDrawing, cell: &super::layout::Rect2, sheet_h: f64) {
+    let (x, y, w, h) = (cell.x0, cell.y0, cell.width(), cell.height());
+    let cx = x + w * 0.5;
+    let side = (h * 0.46).min(w * 0.5).max(4.0);
+    let top = y + h * 0.10;
+    // The square, y-up, with corners rounded by quarter arcs (bulge
+    // tan(90deg/4)) of the SVG's 0.8 mm radius.
+    let r = 0.8_f64.min(side * 0.25);
+    let (x0, x1) = (cx - 0.5 * side, cx + 0.5 * side);
+    let (y0, y1) = (sheet_h - (top + side), sheet_h - top);
+    let q = (std::f64::consts::FRAC_PI_2 / 4.0).tan();
+    let corners: [([f64; 2], f64); 8] = [
+        ([x0 + r, y0], 0.0),
+        ([x1 - r, y0], q),
+        ([x1, y0 + r], 0.0),
+        ([x1, y1 - r], q),
+        ([x1 - r, y1], 0.0),
+        ([x0 + r, y1], q),
+        ([x0, y1 - r], 0.0),
+        ([x0, y0 + r], q),
+    ];
+    let mut square = LwPolyline::default();
+    square.vertices = corners
+        .iter()
+        .map(|(p, bulge)| {
+            let mut v = LwPolylineVertex::default();
+            v.x = p[0];
+            v.y = p[1];
+            v.bulge = *bulge;
+            v
+        })
+        .collect();
+    square.set_is_closed(true);
+    let mut ent = Entity::new(EntityType::LwPolyline(square));
+    ent.common.layer = LAYER_LOGO.to_string();
     dxf.add_entity(ent);
+    // The R, centred in the square (capital height 0.72 em of the SVG font).
+    let r_cap = side * 0.72 * CAP_HEIGHT_OF_EM;
+    add_text(
+        dxf,
+        LAYER_LOGO,
+        cx,
+        sheet_h - (top + 0.5 * side) - 0.5 * r_cap,
+        r_cap,
+        0.0,
+        "R",
+        HorizontalTextJustification::Center,
+    );
+    // The wordmark under the square.
+    let word_font = ((w - 5.0) / 7.0).clamp(1.6, 3.6);
+    let word_y = (top + side + word_font * 1.25).min(y + h - 0.8);
+    add_text(
+        dxf,
+        LAYER_LOGO,
+        cx,
+        sheet_h - word_y,
+        word_font * CAP_HEIGHT_OF_EM,
+        0.0,
+        "ROSHERA",
+        HorizontalTextJustification::Center,
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -1098,18 +1240,17 @@ fn dimension_ink(pd: &PlacedDimension, sheet_h: f64) -> Vec<Entity> {
     }
     let [x, y] = up(pd.text_anchor);
     let rotation_deg = -pd.text_rot_deg;
-    let mut text = Text::default();
-    text.value = pd.label.clone();
     // DXF TEXT height is the CAPITAL height; the SVG's font size is the em
     // box. The same ink: capitals 0.70 of DIM_TEXT_FONT_MM.
-    text.text_height = DIM_TEXT_FONT_MM * CAP_HEIGHT_OF_EM;
-    text.rotation = rotation_deg;
-    text.horizontal_text_justification = HorizontalTextJustification::Center;
-    text.location = Point::new(x, y, 0.0);
-    text.second_alignment_point = Point::new(x, y, 0.0);
-    let mut ent = Entity::new(EntityType::Text(text));
-    ent.common.layer = LAYER_DIMENSIONS.to_string();
-    out.push(ent);
+    out.push(text_entity(
+        LAYER_DIMENSIONS,
+        x,
+        y,
+        DIM_TEXT_FONT_MM * CAP_HEIGHT_OF_EM,
+        rotation_deg,
+        &pd.label,
+        HorizontalTextJustification::Center,
+    ));
     // A basic dimension's box: four lines around the text, turned with it
     // (the same box the SVG draws).
     if pd.boxed {
@@ -1256,6 +1397,63 @@ fn arc_sweep(pts: &[[f64; 2]]) -> Option<f64> {
         sweep += step;
     }
     (sweep.abs() < 2.0 * std::f64::consts::PI - 1e-6).then_some(sweep)
+}
+
+/// Polylines joined end to end: a piece whose end (either end) meets another
+/// piece's end (to 1e-5 mm) is appended to it, reversed when needed, until no
+/// unused piece meets the chain at either end. The ink is unchanged -- the
+/// same points, fewer entities.
+fn chain_polylines(polys: Vec<Vec<[f64; 2]>>) -> Vec<Vec<[f64; 2]>> {
+    use std::collections::HashMap;
+    let key = |p: [f64; 2]| ((p[0] * 1e5).round() as i64, (p[1] * 1e5).round() as i64);
+    let mut ends: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (i, p) in polys.iter().enumerate() {
+        if let (Some(a), Some(b)) = (p.first(), p.last()) {
+            ends.entry(key(*a)).or_default().push(i);
+            ends.entry(key(*b)).or_default().push(i);
+        }
+    }
+    let mut used = vec![false; polys.len()];
+    // An unused piece with an end at `at`.
+    let take = |at: [f64; 2], used: &mut Vec<bool>| -> Option<usize> {
+        let j = *ends.get(&key(at))?.iter().find(|&&j| !used[j])?;
+        used[j] = true;
+        Some(j)
+    };
+    let mut out = Vec::new();
+    for i in 0..polys.len() {
+        if used[i] || polys[i].is_empty() {
+            continue;
+        }
+        used[i] = true;
+        let mut chain = polys[i].clone();
+        // Forward from the chain's end, then backward from its start.
+        for forward in [true, false] {
+            loop {
+                let at = if forward {
+                    chain[chain.len() - 1]
+                } else {
+                    chain[0]
+                };
+                let Some(j) = take(at, &mut used) else { break };
+                let mut piece = polys[j].clone();
+                // Orient the piece to continue from `at`.
+                let starts_at = key(piece[0]) == key(at);
+                if forward != starts_at {
+                    piece.reverse();
+                }
+                if forward {
+                    chain.extend(piece.into_iter().skip(1));
+                } else {
+                    piece.pop();
+                    piece.extend(chain);
+                    chain = piece;
+                }
+            }
+        }
+        out.push(chain);
+    }
+    out
 }
 
 /// A polyline's vertices with every run of samples that lies on one circular
@@ -1726,10 +1924,16 @@ mod tests {
 
         // Every placed dimension's DXF TEXT must be at the text_anchor
         // (y-flipped) with rot_dxf = -text_rot_deg.
+        // The TEXT is left-justified with no alignment point (FreeCAD reads
+        // an alignment point as a direction), so its START sits half its
+        // width back from the anchor along its rotation: centred on the
+        // anchor as before.
         for pd in &layout.dimensions {
-            let x_expected = pd.text_anchor[0];
-            let y_expected = sheet_h - pd.text_anchor[1];
-            let rot_expected = -pd.text_rot_deg; // SVG y-down → DXF y-up negates angles
+            let rot = (-pd.text_rot_deg).to_radians();
+            let half = 0.5 * pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
+            let x_expected = pd.text_anchor[0] - half * rot.cos();
+            let y_expected = sheet_h - pd.text_anchor[1] - half * rot.sin();
+            let rot_expected = -pd.text_rot_deg; // SVG y-down→ DXF y-up negates angles
             let found = text_entities.iter().find(|t| {
                 t.value == pd.label
                     && (t.x - x_expected).abs() < 0.05
@@ -1817,6 +2021,20 @@ mod tests {
         let v = bulged_vertices(&pts);
         assert_eq!(v.len(), pts.len());
         assert!(v.iter().all(|x| x.bulge == 0.0));
+    }
+
+    /// Pieces meeting end to end are joined into one polyline, in either
+    /// orientation; pieces that do not meet stay separate.
+    #[test]
+    fn pieces_meeting_end_to_end_are_joined() {
+        let a = vec![[0.0, 0.0], [1.0, 0.0]];
+        let b = vec![[2.0, 0.0], [1.0, 0.0]]; // reversed, meets a's end
+        let c = vec![[0.0, 1.0], [0.0, 0.0]]; // meets a's start
+        let d = vec![[5.0, 5.0], [6.0, 5.0]]; // alone
+        let out = chain_polylines(vec![a, b, c, d]);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0], vec![[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]);
+        assert_eq!(out[1], vec![[5.0, 5.0], [6.0, 5.0]]);
     }
 
     /// A clockwise arc carries a negative bulge (DXF: positive is
