@@ -1,4 +1,5 @@
 import { parseCard, type CardKind } from '@/lib/blackboard-cards'
+import { isStructuredPayload } from '@/lib/card-payload'
 import { ChoicesCard } from './ChoicesCard'
 import { DfmCard } from './DfmCard'
 import { FcfCard } from './FcfCard'
@@ -15,6 +16,15 @@ import { SoundnessCard } from './SoundnessCard'
  */
 export function CardRenderer({ kind, source }: { kind: CardKind; source: string }) {
   const trimmedSource = source.replace(/\n$/, '')
+  // A tool's readable result line in a card fence is shown as that line,
+  // not as a failed card (an engineer reads it; there is nothing to fix).
+  if (!isStructuredPayload(trimmedSource)) {
+    return (
+      <pre className="my-1 overflow-x-auto whitespace-pre-wrap rounded border border-border/70 bg-foreground/5 p-2 font-mono text-[0.85em] text-foreground/85">
+        {trimmedSource}
+      </pre>
+    )
+  }
   const result = parseCard(kind, trimmedSource)
 
   if (!result.ok) {

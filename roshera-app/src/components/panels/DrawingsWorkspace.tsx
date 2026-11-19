@@ -404,6 +404,20 @@ export function DrawingsWorkspace() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // A drawing opened while this workspace is already mounted (parked under
+  // another workspace) -- the agent made one, or "Create Drawing" ran from
+  // the viewport: load the list landing on it. The mount effect above only
+  // covers the first visit; the agent's wing-rib drawing was left unshown
+  // ("No drawings yet") when the workspace had been opened before
+  // (2026-11-19).
+  const pendingDrawingId = useDocModeStore((s) => s.pendingDrawingId)
+  useEffect(() => {
+    if (pendingDrawingId === null) return
+    const pending = useDocModeStore.getState().consumePendingDrawing()
+    if (pending) void refreshList(pending)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingDrawingId])
+
   useEffect(() => {
     if (activeId) {
       void refreshActive(activeId)
