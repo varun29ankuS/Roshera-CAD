@@ -31,6 +31,7 @@ import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { listDrawings } from '@/lib/drawings-api'
+import { pollEvery, watchForNewDrawing } from '@/lib/drawing-watch'
 import { useAcpPermissionStore } from '@/stores/acp-permission-store'
 import { parseCard, type CardKind } from '@/lib/blackboard-cards'
 import {
@@ -438,6 +439,16 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
   // Drawings that exist before the turn: a sheet the agent makes during it is
   // shown to the user, in the Drawing workspace, when the turn ends.
   const drawingsBefore = await drawingIdsOrNull()
+  // ...and the moment it exists, not only when the turn ends: the agent may
+  // spend another minute tolerancing the sheet (Varun 2026-11-19).
+  const stopDrawingWatch =
+    drawingsBefore === null
+      ? () => {}
+      : watchForNewDrawing(drawingsBefore, {
+          list: async () => (await listDrawings()).map((d) => d.id),
+          open: (id) => useDocModeStore.getState().openDrawing(id),
+          every: pollEvery(1500),
+        })
 
   try {
     let stopReason: AcpStopReason
@@ -502,6 +513,7 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
       .setLineTurnStatus(lineId, stopReason === 'cancelled' ? 'cancelled' : 'completed')
     if (stopReason !== 'cancelled') await revealNewDrawing(drawingsBefore)
   } finally {
+    stopDrawingWatch()
     unsubscribe()
     const b = useBlackboardStore.getState()
     b.setStreamingLine(null)
