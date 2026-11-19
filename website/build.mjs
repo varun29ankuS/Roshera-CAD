@@ -9,7 +9,7 @@
 //   - schema.org JSON-LD in every page
 // Run: npm run build   (Vercel runs the same; see vercel.json)
 
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, copyFileSync, rmSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, cpSync, rmSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { marked } from 'marked'
@@ -130,6 +130,71 @@ ${footer()}
 `
 }
 
+// ── Home sections ────────────────────────────────────────────────────────
+
+// The whole loop. "today" ships now; "building" is in development and says so.
+const STAGES = [
+  ['Describe', 'Words, a spec or a STEP file', 'today'],
+  ['Build', 'Native B-Rep, recorded as history', 'today'],
+  ['Certify', 'Sound solid, with the measurements', 'today'],
+  ['Draw', 'Production drawing, re-measured', 'today'],
+  ['Mesh', 'Meshes traced to their faces', 'building'],
+  ['Simulate', 'Stress, heat, flow on the real part', 'building'],
+  ['Improve', 'Results feed the next design step', 'building'],
+]
+const PIPELINE = `<section class="pipe reveal" aria-label="The design loop">
+<div class="mono kicker">The whole loop, one engine</div>
+<ol data-pipeline>${STAGES.map(([t, d, s], i) => `<li data-state="${s}"><span class="mono">${String(i + 1).padStart(2, '0')} · ${s === 'today' ? 'today' : 'building now'}</span><b>${t}</b><em>${d}</em></li>`).join('')}</ol>
+</section>`
+
+const CLIPS = [
+  ['import-step', 'Import a STEP file', 'Pick the file; the kernel checks the solid is sound before anything else.'],
+  ['drawing-appears', 'Ask for the drawing', 'The agent reads the part, asks what it must not guess, and the sheet appears.'],
+  ['zoom-sheet', 'Read it closely', 'Hole table, fits from ISO 286, datums: every value re-measured on the solid.'],
+  ['edit-on-sheet', 'Edit on the sheet', 'Move a dimension, move a view, set a tolerance; each edit is one undoable step.'],
+  ['wing-rib-build', 'A wing rib from its spec', 'NACA 2412, 300 mm chord: the agent generates the section, builds and draws it.'],
+]
+const PLAYER = `<section class="sec watch reveal" data-player>
+<div><div class="mono kicker">See it work</div><h3>Real recordings, not renders.</h3><p>Screen recordings of Roshera at work this week, sped up. Nothing staged: what the agent said and what the kernel checked is what you see.</p>
+<ol class="chapters">${CLIPS.map(([id, t, d], i) => `<li><button type="button" data-src="/video/${id}.mp4" data-poster="/video/${id}.jpg" aria-selected="${i === 0}"><span class="mono">${String(i + 1).padStart(2, '0')}</span><b>${t}</b><em>${d}</em></button></li>`).join('')}</ol></div>
+<figure class="screen"><div class="chrome"><i></i><i></i><i></i><span class="mono">Roshera</span></div><video muted playsinline preload="metadata" aria-label="Recording of Roshera"></video><div class="progress"><i></i></div></figure>
+</section>`
+
+const LOOP = `<section class="sec loop reveal" data-loop>
+<div><div class="mono kicker">Design · mesh · simulate · improve</div><h3>Simulation that feeds back into the design.</h3><p>The next stage closes the loop: mesh the certified part, simulate it, and turn the result into a change the kernel can make and check, with every result traced to the face that caused it.</p>
+<ol class="loop-steps"><li data-step>Part</li><li data-step>Mesh</li><li data-step>Simulate</li><li data-step>Feedback</li><li data-step>Improve</li></ol>
+<p class="note" data-note aria-live="polite"></p>
+<p class="fine">Illustration of the loop we are building. The physics is real: stress around a hole in a plate under tension (the Kirsch solution, peak 3× nominal), and a slot aligned with the load (peak 1 + 2b/a, Inglis).</p></div>
+<figure class="loop-canvas"><canvas aria-label="A plate with a hole is meshed, its stress field computed, the peak found, and the hole reshaped to lower it"></canvas><figcaption class="mono"><span class="scale"></span><span>low</span><span>stress</span><span>high</span></figcaption></figure>
+</section>`
+
+const CERT_ROWS = [
+  ['Ø40 H7', 'main bore', '40.000'],
+  ['3× Ø13 H7', 'mounting holes', '13.000'],
+  ['198.8', 'overall length', '198.800'],
+  ['28.5', 'boss height', '28.500'],
+  ['⌖ Ø0.05 | A | B', 'position, B1–B3', '0.031'],
+  ['R65', 'outer arc', '65.000'],
+]
+const CERT = `<section class="sec cert reveal" data-cert>
+<div><div class="mono kicker">The sheet checks itself</div><h3>Change the part, and the drawing knows.</h3><p>Every value on a Roshera drawing is re-measured on the solid. When the part changes and the sheet does not, the sheet stops being sound, and release is refused until it states what the part really is.</p><p class="note" data-caption aria-live="polite"></p><p><a href="/drawings">How drawings certify themselves →</a></p></div>
+<div class="cert-panel">
+<svg viewBox="0 0 320 150" aria-hidden="true"><rect x="10" y="40" width="300" height="70" rx="35" class="part"/><circle data-bore cx="60" cy="75" r="20" class="part"/><circle cx="170" cy="75" r="6.5" class="part"/><circle cx="215" cy="75" r="6.5" class="part"/><circle cx="260" cy="75" r="6.5" class="part"/><g class="dim"><line x1="40" y1="22" x2="80" y2="22"/><text data-bore-text x="60" y="16">Ø40 H7</text><text x="215" y="132">3× Ø13 H7</text></g><g data-mark></g></svg>
+<ul>${CERT_ROWS.map(([v, w, m]) => `<li data-row data-state="wait"><code>${esc(v)}</code><span>${w}</span><span class="m mono">${m}</span><span class="v mono">…</span></li>`).join('')}</ul>
+<div class="cert-foot"><span class="mono" data-status data-kind="wait">Checking the sheet…</span><span class="mono rel" data-release data-kind="wait">Release: checking</span></div>
+</div>
+</section>`
+
+const SHOTS = `<section class="shots reveal" aria-label="Screenshots">
+<div class="mono kicker">Inside the app</div>
+<div class="shot-grid">
+<figure><img src="/shots/part-imported.jpg" alt="A STEP part imported into Roshera with its soundness certificate" loading="lazy"><figcaption>Imported, and certified sound before anything else.</figcaption></figure>
+<figure><img src="/shots/drawing-sheet.jpg" alt="A production drawing generated by Roshera" loading="lazy"><figcaption>The drawing: views, sections, hole table, title block.</figcaption></figure>
+<figure><img src="/shots/sheet-closeup.jpg" alt="Close-up of datums, hole tags and dimensions on a Roshera drawing" loading="lazy"><figcaption>Datums, hole tags and the agent's account of the sheet.</figcaption></figure>
+<figure><img src="/shots/wing-rib-part.jpg" alt="An aerofoil wing rib built by the agent in Roshera" loading="lazy"><figcaption>A NACA 2412 wing rib, built from its specification.</figcaption></figure>
+</div>
+</section>`
+
 // ── Home ─────────────────────────────────────────────────────────────────
 
 function home() {
@@ -187,12 +252,18 @@ function home() {
   </div>
 </div>
 <main class="wrap">
+${PIPELINE}
+${PLAYER}
 ${extra}
+${LOOP}
+${CERT}
+${SHOTS}
 <section class="sec"><div><div class="mono kicker">From the blog</div><h3>Engineering notes from building the kernel.</h3><p><a href="/blog">All posts →</a></p></div><div class="cards">${latest}</div></section>
 </main>
 ${footer()}
 <script>try{localStorage.setItem("roshera-theme","light")}catch(e){}</script>
 <script src="/hero.js" defer></script>
+<script src="/site.js" defer></script>
 </body>
 </html>
 `
@@ -210,7 +281,7 @@ const write = (rel, text) => {
 const htmlPath = (path) => (path === '/' ? 'index.html' : `${path.slice(1)}/index.html`)
 const mdPath = (path) => (path === '/' ? 'index.md' : `${path.slice(1)}.md`)
 
-for (const f of readdirSync(join(ROOT, 'public'))) copyFileSync(join(ROOT, 'public', f), join(OUT, f))
+cpSync(join(ROOT, 'public'), OUT, { recursive: true })
 
 write('index.html', home())
 for (const p of pages) {
