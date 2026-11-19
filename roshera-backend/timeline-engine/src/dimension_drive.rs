@@ -214,10 +214,15 @@ fn numeric_parameters(events: &[TimelineEvent]) -> Vec<(u64, Uuid, String, Strin
         // GD&T edits (`gdt_*`) carry tolerance zones and basic dimensions,
         // not geometry: no tolerance drives a measured dimension of the part,
         // so none is offered as one to mould.
+        // An import step records the FILE (digest, byte length, name), not a
+        // size: varying its `byte_len` made an imported part's dimension read
+        // "could not tell what drives it" (2026-11-19).
         if is_param_meta(command_type)
             || command_type.starts_with("drawing.")
             || command_type.starts_with("gdt.")
             || command_type.starts_with("gdt_")
+            || command_type == crate::import_replay::IMPORT_STEP_KIND
+            || command_type == crate::import_replay::IMPORT_ROS_KIND
         {
             continue;
         }
