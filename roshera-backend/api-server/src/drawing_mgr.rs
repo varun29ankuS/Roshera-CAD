@@ -338,7 +338,10 @@ impl DrawingManager {
 ///   no longer destroys the drawing (the `state.drawings.clear()`
 ///   removed from `documents::activate` by this same fix), it only
 ///   changes what `state.model` currently holds.
-async fn resolve_owner_model(state: &AppState, owner: &ModelKey) -> Option<Arc<RwLock<BRepModel>>> {
+pub(crate) async fn resolve_owner_model(
+    state: &AppState,
+    owner: &ModelKey,
+) -> Option<Arc<RwLock<BRepModel>>> {
     match owner {
         ModelKey::Part { id } => state.parts.get(id),
         ModelKey::Legacy { document_id } => {
@@ -919,10 +922,42 @@ pub async fn add_view(
     // Project the view *outside* the drawing's lock, through the same
     // hidden-line pipeline as the sheet's own views -- the projection
     // only needs a read lock on the resolved BRepModel.
+    // A sheet drawn in a part frame (placement undone, part squared) gets
+    // its new view projected in that same frame, never from the part as it
+    // sits: one sheet, one frame.
+    let drawn_frame = {
+        let guard = handle.read().await;
+        // The frame is the sheet's part's: a view of another part is not moved.
+        let sheet_source = guard.views.first().map(|v| v.source);
+        guard
+            .drawn_frame
+            .clone()
+            .filter(|_| sheet_source == Some(source))
+    };
     let view = {
         let model_guard = model_handle.read().await;
+        let geometry_engine::drawing::types::ViewSource::Part { solid_id, .. } = source;
+        let framed = match &drawn_frame {
+            Some(frame) => Some(
+                geometry_engine::drawing::model_in_drawn_frame(&model_guard, solid_id, frame)
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ErrorCode::KernelError,
+                            format!(
+                                "drawing {id} is drawn in its part's frame and solid \
+                                 {solid_id} could not be moved into it"
+                            ),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let projected_model: &BRepModel = match &framed {
+            Some(m) => m,
+            None => &model_guard,
+        };
         added_view(
-            &model_guard,
+            projected_model,
             source,
             req.projection,
             req.name.clone(),
@@ -1310,6 +1345,73 @@ pub async fn export_svg(
     Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], svg).into_response())
 }
 
+// ── The on-screen sheet: a preview, not an export ──────────────────
+
+/// The last preview rendered for each drawing, keyed by a hash of the
+/// sheet's content: the same sheet previews again from here.
+static PREVIEW_CACHE: std::sync::LazyLock<dashmap::DashMap<Uuid, (u64, Arc<str>)>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+fn sheet_content_hash(drawing: &Drawing) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = serde_json::to_vec(drawing).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Some(h.finish())
+}
+
+/// `GET /api/drawings/{id}/preview.svg` -- the sheet as it stands, for the
+/// screen.
+///
+/// The download routes (`/svg`, `/pdf`, `/dxf`) bring the sheet up to date
+/// from the history, certify the solid and the sheet, refuse a defective
+/// one, and record the export -- because a FILE leaves the building. The
+/// screen showed the sheet through that same route: every redraw (each view
+/// moved or rescaled) took 7-8 s on a 313k-triangle bracket and wrote a
+/// `drawing.export` event into the history, which in turn invalidated every
+/// cache keyed on the history (found rehearsing the demo video, 2026-11-18).
+///
+/// The preview renders the stored sheet, records nothing and gates nothing;
+/// the sheet's checks are read separately (`/quality`, `/certificate`) and
+/// shown beside it. It carries no measured render facts, so its title block
+/// never claims a verification it did not run. A drawing whose owner does
+/// not resolve is still refused: it would draw a sheet about another part.
+pub async fn preview_svg(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let (_model, handle, _owner) = fetch_owned_drawing_for_export(&state, id).await?;
+    let mut sheet = { handle.read().await.clone() };
+    sheet.render_facts = Default::default();
+    let key = sheet_content_hash(&sheet);
+    if let Some(key) = key {
+        if let Some(hit) = PREVIEW_CACHE.get(&id) {
+            if hit.0 == key {
+                let svg = Arc::clone(&hit.1);
+                return Ok((
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "image/svg+xml")],
+                    svg.to_string(),
+                )
+                    .into_response());
+            }
+        }
+    }
+    let svg: Arc<str> =
+        tokio::task::spawn_blocking(move || Arc::<str>::from(render_drawing_svg(&sheet)))
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::KernelError, "sheet preview render failed"))?;
+    if let Some(key) = key {
+        PREVIEW_CACHE.insert(id, (key, Arc::clone(&svg)));
+    }
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        svg.to_string(),
+    )
+        .into_response())
+}
+
 // ── One-call part drawing (right-click → drawing) ───────────────────
 
 /// Query options for the one-call part drawing.
@@ -1400,11 +1502,15 @@ async fn build_standard_drawing_off_lock(
         // An assembly part is drawn in the frame it was designed in, not at
         // the angle the assembly holds it: its views square and its sizes
         // true. `owned` is this request's copy; the live model is untouched.
-        let frame = geometry_engine::drawing::draw_in_part_frame(&mut owned, solid_id);
+        // A part that sits turned off the world axes is squared to its
+        // natural frame too; the sheet records the move so the certificate
+        // re-measures the live model in the frame the sheet was drawn in.
+        let (frame, drawn_frame) =
+            geometry_engine::drawing::frame_for_drawing(&mut owned, solid_id);
         if let geometry_engine::drawing::PartFrame::AsPlaced { reason } = &frame {
-            tracing::warn!(solid_id, %reason, "sheet drawn at the assembly placement");
+            tracing::warn!(solid_id, %reason, "sheet drawn where the part sits");
         }
-        match scale {
+        let built = match scale {
             Some(scale) => standard_drawing_hlr_with_projection(
                 &owned,
                 solid_id,
@@ -1416,7 +1522,11 @@ async fn build_standard_drawing_off_lock(
             .map_err(SheetBuildError::from_kernel),
             None => standard_drawing_auto_with_projection(&owned, solid_id, part_uuid, projection)
                 .map_err(SheetBuildError::from_kernel),
-        }
+        };
+        built.map(|mut drawing| {
+            drawing.drawn_frame = drawn_frame;
+            drawing
+        })
     })
     .await
     .map_err(|_| SheetBuildError::TaskFailed)?
@@ -2050,7 +2160,7 @@ pub struct SemanticDrawingResponse {
 /// lock, deep-copy into a [`ModelSnapshot`], drop the guard, then run the
 /// (analytic, bounded) certification on a blocking thread so no lock is held
 /// and no async worker is starved.
-async fn certify_off_lock(
+pub(crate) async fn certify_off_lock(
     model_handle: Arc<RwLock<BRepModel>>,
     drawing: Drawing,
 ) -> Result<SheetReadbackCertificate, ApiError> {

@@ -40,3 +40,5 @@
 # geometry-engine/docs/burndown-diag-loft-family.md for the diagnosis and the
 # closing measurement. This file is empty of entries again; any new one requires
 # a diagnosis doc per the ratchet rule above.
+fidelity_requested_vs_measured::loft_cap_faces_are_found_but_the_trimmed_integral_is_not_the_path  # diag: docs/burndown-diag-loft-family.md#2026-11-18-two-loft-reds-found-by-the-drawing-rewrites-full-gate
+loft_orientation::loft_l_section_whose_cap_the_mesh_cannot_orient_is_refused_not_minted  # diag: docs/burndown-diag-loft-family.md#2026-11-18-two-loft-reds-found-by-the-drawing-rewrites-full-gate

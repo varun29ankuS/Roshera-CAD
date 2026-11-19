@@ -1297,6 +1297,59 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "drawing_dimensions",
+            Drawing,
+            Experimental,
+            Curated,
+            "List a sheet's dimensions as inked (value, tolerance, authored text) with the id each is addressed by, and the dimensions the sheet leaves out; complete=false means one is on no view and nobody signed for it.",
+            json!({
+                "type": "object",
+                "properties": {"drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"}},
+                "required": ["drawing_id"]
+            }),
+        ),
+        t(
+            "drawing_dimension_properties",
+            Drawing,
+            Experimental,
+            Curated,
+            "Set the properties of one sheet dimension: tolerance (symmetric, bilateral, limits, ISO 286 class, basic, reference), text before/after the value, a move, or a signed suppression; recorded and undoable. The value stays measured.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "dimension_id": {"type": "string", "description": "dimension id from drawing_dimensions (or the key of an omitted dimension, to waive it)"},
+                    "tolerance": {"type": "string", "enum": ["symmetric", "bilateral", "limits", "fit", "basic", "reference", "none"], "description": "tolerance form; 'none' removes the tolerance"},
+                    "pm": {"type": "number", "description": "symmetric: the +/- value"},
+                    "upper": {"type": "number", "description": "bilateral: signed upper deviation; limits: upper limit of size"},
+                    "lower": {"type": "number", "description": "bilateral: signed lower deviation; limits: lower limit of size"},
+                    "fit": {"type": "string", "description": "fit: one ISO 286 class, e.g. 'H7' (hole) or 'g6' (shaft)"},
+                    "prefix": {"type": "string", "maxLength": 40, "description": "text before the value, e.g. '4X'; '' clears"},
+                    "suffix": {"type": "string", "maxLength": 40, "description": "text after the value, e.g. 'TYP' or 'M12x1.75-6H'; '' clears"},
+                    "move_mm": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "move the text / dimension line [right, down] in sheet mm from its automatic place; [0,0] puts it back"},
+                    "suppress": {"type": "boolean", "description": "true takes it off the sheet (needs by); false puts it back"},
+                    "by": {"type": "string", "description": "who suppresses it (required with suppress=true)"},
+                    "reason": {"type": "string", "description": "why it is suppressed"}
+                },
+                "required": ["drawing_id", "dimension_id"]
+            }),
+        ),
+        t(
+            "iso286_limits",
+            Drawing,
+            Experimental,
+            Curated,
+            "ISO 286 limit deviations and limits of size of a class (H7, g6) at a nominal size, or the clearances of a hole/shaft pair (H7/g6), from the kernel's tables; refused outside them, never interpolated.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "nominal_mm": {"type": "number", "exclusiveMinimum": 0, "description": "nominal size in mm (above 0, up to 500)"},
+                    "fit_class": {"type": "string", "description": "'H7', 'g6', 'JS9', or a pair 'H7/g6'"}
+                },
+                "required": ["nominal_mm", "fit_class"]
+            }),
+        ),
+        t(
             "drawing_read_semantics",
             Drawing,
             Experimental,
@@ -2130,7 +2183,11 @@ mod tests {
         // 116 -> 104 (2026-11-18): the twelve assembly tools moved out of this
         // table into their backend-owned definitions (`agent_tools`); the
         // served registry still lists 116 (pinned below).
-        assert_eq!(tools.len(), 104, "expected 104 tools, got {}", tools.len());
+        // 104 -> 107 (2026-11-18): drawing_dimensions +
+        // drawing_dimension_properties + iso286_limits -- an agent reads and
+        // sets a sheet dimension's properties as a person does in the drawing tab
+        // (GET/PATCH /api/drawings/{id}/dimensions, GET /api/iso286).
+        assert_eq!(tools.len(), 107, "expected 107 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2147,7 +2204,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 116, "104 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 119, "107 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");

@@ -952,6 +952,18 @@ pub async fn boot_replay(state: &AppState) -> DurabilityStatus {
 }
 
 async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
+    // Stage timings of a document open (target `durability.profile`): opening
+    // a document took ~108 s on one with STEP imports (2026-11-18) and the
+    // code alone did not say where; one line per stage says.
+    let open_started = std::time::Instant::now();
+    let open_lap = |stage: &str| {
+        tracing::info!(
+            target: "durability.profile",
+            stage,
+            ms = open_started.elapsed().as_millis() as u64,
+            "document open: stage reached"
+        );
+    };
     if !durability_enabled() {
         tracing::info!(target: "durability", "ROSHERA_DURABILITY=off — persistence disabled, booting blank");
         return DurabilityStatus::Disabled;
@@ -1006,6 +1018,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         }
     }
 
+    open_lap("before step 1b");
     // 1b. Named checkpoints + Blackboard notebooks — restored BEFORE the
     //     event-log early returns below, because both legitimately exist on a
     //     document whose event log is empty (a checkpoint on an empty branch,
@@ -1016,6 +1029,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     restore_checkpoints(state, &document_id).await;
     restore_blackboard(state, &document_id).await;
 
+    open_lap("before step 2");
     // 2. Load the full event log, ordered by sequence_number.
     let rows = match state.database.load_all_timeline_events(&document_id).await {
         Ok(rows) => rows,
@@ -1032,6 +1046,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         return DurabilityStatus::Empty;
     }
 
+    open_lap("before step 3");
     // 3. Deserialize each row's blob back into a full TimelineEvent. A row that
     //    cannot be deserialized is a corrupt/incompatible record: it is kept as
     //    a HOLE at its sequence, attributed to the branch its `branch_id`
@@ -1109,6 +1124,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         }
     }
 
+    open_lap("before step 3b");
     // 3b. Imported files: every import step re-imports its stored bytes when
     //     it replays, and replay is synchronous — so the bytes of every
     //     import step on any branch are read from this document's store now.
@@ -1116,10 +1132,12 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     //     is never skipped.
     crate::import_blobs::preload(state, &document_id, by_seq.values()).await;
 
+    open_lap("before step 4");
     // 4. Every branch's history, by the in-memory rules: the index the fork
     //    left it (persisted, or the fork rule for rows that predate that),
     //    its own events, and the sequences merges inserted into it.
     let mut histories = branch_histories(&plans, &own, &mut faults);
+    open_lap("before step 4b");
     // 4b. A persisted head whose redo tail an operation after it already
     //     discarded — but whose discard never reached the store — must not
     //     hide that operation (see `reconcile_stale_heads`).
@@ -1127,6 +1145,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     let empty = BTreeSet::new();
     let live_history = histories.get(&live_branch).unwrap_or(&empty);
 
+    open_lap("before step 5");
     // 5. Quarantine check over the LIVE branch's history only: certify a
     //    replay of exactly that history (soundness re-measured from the
     //    resulting B-Rep, never asserted) and find its first break — the first
@@ -1262,6 +1281,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     let boundary_seq = boundary.as_ref().map(|b| b.0);
     let refused_by_live = |seq: u64| boundary_seq.is_some_and(|bound| seq >= bound);
 
+    open_lap("before step 6");
     // 6. The served set: the live history's clean prefix, up to the live
     //    branch's persisted applied head — operations the user undid before
     //    the restart stay undone. The boundary above is still checked over
@@ -1274,6 +1294,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         .cloned()
         .collect();
 
+    open_lap("before step 7");
     // 7. Rehydrate the timeline, preserving every event's original
     //    id/sequence/timestamp (so the history endpoint returns byte-identical
     //    events after a restart). Every restorable event is restored EXCEPT
@@ -1436,6 +1457,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         }
     };
 
+    open_lap("before step 8");
     // 8. Install the served events' model as the live model — the certified
     //    model when the whole history is served, else the served prefix from
     //    the frames the certify pass stored — then rebuild the uuid↔solid
@@ -1493,6 +1515,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         id_remap
     };
 
+    open_lap("before step 9");
     // 9. DURABILITY Slice 3 (#39, spec §2.3): re-attach the unrecorded-mutation
     //    side channels that live OUTSIDE the B-Rep model — part colours
     //    (`set_color` events → `AppState.solid_colors`) and the editable revolve
@@ -1504,10 +1527,12 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     //    replay `id_remap`.
     restore_side_channels(state, &served, &id_remap).await;
 
+    open_lap("before step 10");
     // 10. The sheets: rebuilt from their recorded history (creation + edits),
     //     so a restart no longer loses every drawing.
     crate::drawing_mgr::rebuild_sheets_from_history(state, served.clone()).await;
 
+    open_lap("sheets rebuilt (done)");
     status
 }
 

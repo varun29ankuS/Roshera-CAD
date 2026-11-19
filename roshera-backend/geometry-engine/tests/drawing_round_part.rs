@@ -74,10 +74,10 @@ fn a_flange_sheet_states_its_bolt_circle_and_diameters() {
     assert!(bc.through, "the holes go through the 12 mm disc");
 
     for want in [
-        "\u{00D8}85.00",
-        "\u{00D8}22.00",
-        "4\u{00D7} \u{00D8}11.00 THRU EQ SP",
-        "\u{00D8}60.00 PCD",
+        "\u{00D8}85",
+        "\u{00D8}22",
+        "4\u{00D7} \u{00D8}11 THRU EQ SP",
+        "\u{00D8}60 PCD",
     ] {
         assert!(
             ls.iter().any(|l| l == want),
@@ -96,7 +96,7 @@ fn a_flange_sheet_states_its_bolt_circle_and_diameters() {
         "no part-corner offsets on a round part: {positions:?}"
     );
     assert!(
-        !ls.iter().any(|l| l == "85.00"),
+        !ls.iter().any(|l| l == "85"),
         "the outside is a diameter, not a width: {ls:?}"
     );
 
@@ -113,10 +113,10 @@ fn a_flange_sheet_states_its_bolt_circle_and_diameters() {
     // The callouts must be INKED, not just present in the sheet's data: the
     // first build carried all four labels and drew only Ø85.
     for want in [
-        "\u{00D8}85.00",
-        "\u{00D8}22.00",
-        "4\u{00D7} \u{00D8}11.00 THRU EQ SP",
-        "\u{00D8}60.00 PCD",
+        "\u{00D8}85",
+        "\u{00D8}22",
+        "4\u{00D7} \u{00D8}11 THRU EQ SP",
+        "\u{00D8}60 PCD",
     ] {
         assert!(
             svg.contains(&format!(">{want}<")),
@@ -356,12 +356,7 @@ fn a_raised_face_flange_sheet_is_clean() {
     let rp = d.round_part.as_ref().expect("round part");
     assert_eq!(rp.bolt_circles.len(), 1);
     let ls = labels(&d);
-    for want in [
-        "\u{00D8}85.00",
-        "\u{00D8}45.00",
-        "\u{00D8}22.00",
-        "\u{00D8}60.00 PCD",
-    ] {
+    for want in ["\u{00D8}85", "\u{00D8}45", "\u{00D8}22", "\u{00D8}60 PCD"] {
         assert!(
             ls.iter().any(|l| l == want),
             "sheet lacks {want:?}; has {ls:?}"

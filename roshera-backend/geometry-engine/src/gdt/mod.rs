@@ -37,6 +37,7 @@
 pub mod drf;
 pub mod edit;
 pub mod fit;
+pub mod iso286;
 pub mod model;
 pub mod sidecar;
 pub mod verify;

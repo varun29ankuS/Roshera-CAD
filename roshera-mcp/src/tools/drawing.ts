@@ -24,9 +24,14 @@ function certificateLine(cert: any): string {
     c.dangling ? `${c.dangling} DANGLING` : null,
     c.render_only ? `${c.render_only} render_only` : null,
     c.unprovenanced ? `${c.unprovenanced} unprovenanced` : null,
+    c.omitted ? `${c.omitted} OMITTED` : null,
+    c.not_dimensioned ? `${c.not_dimensioned} NOT DIMENSIONED` : null,
+    c.waived ? `${c.waived} waived` : null,
   ].filter(Boolean);
   const quality = cert?.quality?.passed === false ? " | LAYOUT ISSUES" : "";
-  return `${sound ? "SOUND ✓" : "UNSOUND ✗"} ${parts.join(", ")}${quality}`;
+  // Sound = what the sheet shows is true; complete = it shows everything.
+  const complete = cert?.complete === false ? " | INCOMPLETE" : "";
+  return `${sound ? "SOUND ✓" : "UNSOUND ✗"} ${parts.join(", ")}${complete}${quality}`;
 }
 
 /** Render a section cut-through list compactly. */
@@ -133,6 +138,170 @@ export function registerDrawingTools(server: ToolHost): void {
           driver: r?.driver ?? null,
           sound: r?.mould?.is_sound ?? null,
         });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ── drawing_dimensions ─────────────────────────────────────────────────
+  server.tool(
+    "drawing_dimensions",
+    "List a sheet's dimensions AS INKED (value, tolerance, authored text) with " +
+      "the id each is addressed by, and the dimensions the sheet LEAVES OUT " +
+      "(thinned by the automatic selection, not drawn, or suppressed by a named " +
+      "person). complete=false means a model dimension is on no view and nobody " +
+      "signed for it.",
+    {
+      drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
+    },
+    async ({ drawing_id }) => {
+      try {
+        const r = await api("GET", `/api/drawings/${drawing_id}/dimensions`);
+        const dims: any[] = r?.dimensions ?? [];
+        return ok({
+          drawing_id,
+          dimensions: dims.map((d) => ({
+            id: d.id,
+            view: d.view,
+            kind: d.kind,
+            ink: d.ink,
+            value: d.value,
+            editable: d.editable,
+            placed: d.placed,
+            suppressed: d.suppressed,
+            edit: d.edit ?? null,
+          })),
+          complete: r?.certificate?.complete ?? null,
+          sound: r?.certificate?.sound ?? null,
+          omission_summary: r?.certificate?.omission_summary ?? [],
+          omissions: (r?.certificate?.omissions ?? []).map((o: any) => ({
+            key: o.key,
+            view: o.view,
+            kind: o.kind,
+            label: o.label,
+            reason: o.reason,
+            waived_by: o.waiver?.by ?? null,
+          })),
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ── drawing_dimension_properties ───────────────────────────────────────
+  server.tool(
+    "drawing_dimension_properties",
+    "SET THE PROPERTIES OF ONE SHEET DIMENSION (id from drawing_dimensions): its " +
+      "TOLERANCE (symmetric, bilateral, limits, ISO 286 class such as H7 or g6, " +
+      "basic, reference), text before/after the value ('4X', 'TYP', " +
+      "'M12x1.75-6H'), move it, or SUPPRESS it (signed with `by`; the " +
+      "certificate lists it as a waived omission). The value itself is measured " +
+      "and cannot be typed (drawing_set_dimension changes the part). Recorded " +
+      "in the timeline; undoable. Refused typed for a class outside the ISO 286 " +
+      "tables or a dimension without a persistent identity.",
+    {
+      drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
+      dimension_id: z
+        .string()
+        .describe("dimension id from drawing_dimensions (or the key of an omitted dimension, to waive it)"),
+      tolerance: z
+        .enum(["symmetric", "bilateral", "limits", "fit", "basic", "reference", "none"])
+        .optional()
+        .describe("tolerance form; 'none' removes the tolerance"),
+      pm: z.number().optional().describe("symmetric: the +/- value"),
+      upper: z
+        .number()
+        .optional()
+        .describe("bilateral: signed upper deviation; limits: upper limit of size"),
+      lower: z
+        .number()
+        .optional()
+        .describe("bilateral: signed lower deviation; limits: lower limit of size"),
+      fit: z.string().optional().describe("fit: one ISO 286 class, e.g. 'H7' (hole) or 'g6' (shaft)"),
+      prefix: z.string().max(40).optional().describe("text before the value, e.g. '4X'; '' clears"),
+      suffix: z
+        .string()
+        .max(40)
+        .optional()
+        .describe("text after the value, e.g. 'TYP' or 'M12x1.75-6H'; '' clears"),
+      move_mm: z
+        .array(z.number())
+        .length(2)
+        .optional()
+        .describe("move the text / dimension line [right, down] in sheet mm from its automatic place; [0,0] puts it back"),
+      suppress: z.boolean().optional().describe("true takes it off the sheet (needs by); false puts it back"),
+      by: z.string().optional().describe("who suppresses it (required with suppress=true)"),
+      reason: z.string().optional().describe("why it is suppressed"),
+    },
+    async (a) => {
+      try {
+        const body: Record<string, unknown> = {};
+        if (a.tolerance !== undefined) {
+          switch (a.tolerance) {
+            case "none":
+              body.tolerance = null;
+              break;
+            case "symmetric":
+              body.tolerance = { type: "symmetric", pm: a.pm };
+              break;
+            case "bilateral":
+              body.tolerance = { type: "bilateral", upper: a.upper, lower: a.lower };
+              break;
+            case "limits":
+              body.tolerance = { type: "limits", upper: a.upper, lower: a.lower };
+              break;
+            case "fit":
+              body.tolerance = { type: "fit", designation: a.fit };
+              break;
+            default:
+              body.tolerance = { type: a.tolerance };
+          }
+        }
+        if (a.prefix !== undefined) body.prefix = a.prefix;
+        if (a.suffix !== undefined) body.suffix = a.suffix;
+        if (a.move_mm !== undefined) body.text_shift_mm = a.move_mm;
+        if (a.suppress !== undefined) {
+          body.suppressed = a.suppress ? { by: a.by ?? "", reason: a.reason ?? "" } : null;
+        }
+        const r = await api(
+          "PATCH",
+          `/api/drawings/${a.drawing_id}/dimensions/${encodeURIComponent(a.dimension_id)}`,
+          body,
+        );
+        return ok({
+          drawing_id: a.drawing_id,
+          dimension: r?.dimension ?? null,
+          sound: r?.certificate?.sound ?? null,
+          complete: r?.certificate?.complete ?? null,
+          omission_summary: r?.certificate?.omission_summary ?? [],
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ── iso286_limits ──────────────────────────────────────────────────────
+  server.tool(
+    "iso286_limits",
+    "ISO 286 limits and fits from the kernel's tables: the limit deviations " +
+      "and limits of size of one tolerance class ('H7', 'g6') at a nominal " +
+      "size, or for a pair ('H7/g6') both classes, min/max clearance and " +
+      "whether the pair is a clearance, transition or interference one. " +
+      "Refused typed outside the tables; never interpolated.",
+    {
+      nominal_mm: z.number().positive().describe("nominal size in mm (above 0, up to 500)"),
+      fit_class: z.string().describe("'H7', 'g6', 'JS9', or a pair 'H7/g6'"),
+    },
+    async ({ nominal_mm, fit_class }) => {
+      try {
+        const r = await api(
+          "GET",
+          `/api/iso286?nominal=${encodeURIComponent(String(nominal_mm))}&class=${encodeURIComponent(fit_class)}`,
+        );
+        return ok(r);
       } catch (e) {
         return fail(e);
       }

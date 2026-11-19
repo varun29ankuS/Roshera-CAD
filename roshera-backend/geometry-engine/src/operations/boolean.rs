@@ -340,9 +340,11 @@ pub fn boolean_operation(
         operation, solid_a, solid_b,
     );
 
-    // Drop any GWN operand triangles cached by a previous op (SolidIds may
-    // be reused after the model mutates).
-    clear_gwn_triangle_cache();
+    // Drop any GWN operand triangles cached for this model by a previous op
+    // (SolidIds may be reused after the model mutates), and again however
+    // this op returns: a freed model's address can be reused by a new one.
+    clear_gwn_triangle_cache(model);
+    let _gwn_scope = GwnCacheScope(gwn_model_key(model));
 
     // F2-δ pre-flight.
     if options.common.validate_before {
@@ -18214,28 +18216,59 @@ thread_local! {
     /// solids within one boolean op; without this each call re-tessellates
     /// the operand (O(faces) per point), which makes boolean-heavy suites
     /// minutes slow. The operands are read-only for the op's duration, so
-    /// caching their triangles is safe. Cleared at every `boolean_operation`
-    /// entry to avoid staleness from SolidId reuse after the model mutates.
+    /// caching their triangles is safe. This model's entries are cleared at
+    /// every `boolean_operation` entry to avoid staleness from SolidId reuse
+    /// after the model mutates.
+    ///
+    /// Keyed by the MODEL as well as the solid, and never borrowed while a
+    /// mesh is built: tessellation runs on rayon, and a rayon worker waiting
+    /// on its own tasks runs other queued tasks on the same thread -- another
+    /// boolean, on another model (the drawing edit planner tries candidate
+    /// edits in parallel, each on its own copy of the part). That nested op
+    /// found the cell still mutably borrowed ("RefCell already borrowed",
+    /// a 500 from the dimension-edit route under load), and, keyed by
+    /// SolidId alone, it could serve one model's triangles to another or
+    /// clear the outer op's pinned operand snapshot.
     static GWN_TRI_CACHE: std::cell::RefCell<
-        std::collections::HashMap<SolidId, std::rc::Rc<Vec<[Point3; 3]>>>,
+        std::collections::HashMap<(usize, SolidId), std::rc::Rc<Vec<[Point3; 3]>>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Drop all cached operand triangles. Called at each `boolean_operation`
-/// entry so a later op never reads triangles for a since-mutated solid.
-fn clear_gwn_triangle_cache() {
-    GWN_TRI_CACHE.with(|c| c.borrow_mut().clear());
+/// The cache key of `model`: its address, stable while it is borrowed.
+fn gwn_model_key(model: &BRepModel) -> usize {
+    model as *const BRepModel as usize
 }
 
-/// Cached accessor for [`solid_gwn_triangles`]. The fill closure does not
-/// touch the cache, so there is no nested borrow.
+/// Drop `model`'s cached operand triangles. Called at each
+/// `boolean_operation` entry so a later op never reads triangles for a
+/// since-mutated solid; other models' entries (a nested op's) are kept.
+fn clear_gwn_triangle_cache(model: &BRepModel) {
+    let key = gwn_model_key(model);
+    GWN_TRI_CACHE.with(|c| c.borrow_mut().retain(|(m, _), _| *m != key));
+}
+
+/// Removes one model's GWN cache entries when dropped: held by
+/// `boolean_operation` for its whole run, so no entry outlives the op on
+/// any path out of it (the `?` returns included).
+struct GwnCacheScope(usize);
+
+impl Drop for GwnCacheScope {
+    fn drop(&mut self) {
+        let key = self.0;
+        GWN_TRI_CACHE.with(|c| c.borrow_mut().retain(|(m, _), _| *m != key));
+    }
+}
+
+/// Cached accessor for [`solid_gwn_triangles`]. The mesh is built with the
+/// cache released (see [`GWN_TRI_CACHE`]); when a nested op filled the same
+/// entry meanwhile, the first stored mesh wins.
 fn solid_gwn_triangles_cached(model: &BRepModel, solid: SolidId) -> std::rc::Rc<Vec<[Point3; 3]>> {
-    GWN_TRI_CACHE.with(|c| {
-        c.borrow_mut()
-            .entry(solid)
-            .or_insert_with(|| std::rc::Rc::new(solid_gwn_triangles(model, solid)))
-            .clone()
-    })
+    let key = (gwn_model_key(model), solid);
+    if let Some(hit) = GWN_TRI_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let built = std::rc::Rc::new(solid_gwn_triangles(model, solid));
+    GWN_TRI_CACHE.with(|c| c.borrow_mut().entry(key).or_insert(built).clone())
 }
 
 /// Outward-oriented boundary triangles of `solid`, for generalized
@@ -22959,6 +22992,78 @@ mod tests {
     use crate::math::{Point3, Tolerance, Vector3};
     use crate::primitives::surface::{Cylinder, Plane, Sphere};
     use crate::primitives::topology_builder::{BRepModel, TopologyBuilder};
+
+    /// No GWN cache entry outlives the boolean that made it: the model can be
+    /// freed and its address reused by another whose solids share ids.
+    ///
+    /// Mutation: drop the `GwnCacheScope` guard from `boolean_operation` ->
+    /// the operands' meshes stay cached -> RED.
+    #[test]
+    fn a_boolean_leaves_no_gwn_cache_entries_behind() {
+        let mut m = BRepModel::new();
+        let a = match TopologyBuilder::new(&mut m).create_box_3d(10.0, 10.0, 10.0) {
+            Ok(crate::primitives::topology_builder::GeometryId::Solid(s)) => s,
+            other => unreachable!("box: {other:?}"),
+        };
+        let b = match TopologyBuilder::new(&mut m).create_cylinder_3d(
+            Point3::new(0.0, 0.0, -10.0),
+            Vector3::Z,
+            2.0,
+            20.0,
+        ) {
+            Ok(crate::primitives::topology_builder::GeometryId::Solid(s)) => s,
+            other => unreachable!("cylinder: {other:?}"),
+        };
+        let r = boolean_operation(
+            &mut m,
+            a,
+            b,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let key = gwn_model_key(&m);
+        let left = GWN_TRI_CACHE.with(|c| c.borrow().keys().filter(|(k, _)| *k == key).count());
+        assert_eq!(left, 0, "cache entries survived the op");
+    }
+
+    /// The GWN operand cache serves a solid's triangles only to the model
+    /// they were built from: two models whose solids share an id (every
+    /// parallel copy of a part does) each get their own mesh, and opening an
+    /// op on one model leaves the other's entries alone.
+    ///
+    /// Mutation: key the cache by SolidId alone -> the second model is
+    /// served the first model's (smaller) box -> RED.
+    #[test]
+    fn the_gwn_cache_never_serves_one_models_triangles_to_another() {
+        let solid = |m: &mut BRepModel, size: f64| match TopologyBuilder::new(m)
+            .create_box_3d(size, size, size)
+        {
+            Ok(crate::primitives::topology_builder::GeometryId::Solid(s)) => s,
+            other => unreachable!("box: {other:?}"),
+        };
+        let mut small = BRepModel::new();
+        let mut large = BRepModel::new();
+        let a = solid(&mut small, 2.0);
+        let b = solid(&mut large, 20.0);
+        assert_eq!(a, b, "fixture: the two solids share an id");
+        let extent = |t: &[[Point3; 3]]| {
+            t.iter()
+                .flat_map(|tri| tri.iter())
+                .map(|p| p.x.abs())
+                .fold(0.0_f64, f64::max)
+        };
+        let first = solid_gwn_triangles_cached(&small, a);
+        let second = solid_gwn_triangles_cached(&large, b);
+        assert!((extent(&first) - 1.0).abs() < 1e-9, "{}", extent(&first));
+        assert!((extent(&second) - 10.0).abs() < 1e-9, "{}", extent(&second));
+        clear_gwn_triangle_cache(&large);
+        let again = solid_gwn_triangles_cached(&small, a);
+        assert!(
+            std::rc::Rc::ptr_eq(&first, &again),
+            "small's entry survives"
+        );
+    }
 
     /// A plane TANGENT to a cylinder -- its distance from the axis equal to the
     /// radius up to rounding -- meets it in one generator, which the chord

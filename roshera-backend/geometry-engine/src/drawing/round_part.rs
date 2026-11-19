@@ -150,7 +150,7 @@ fn dist_to_line(p: [f64; 3], o: [f64; 3], a: [f64; 3]) -> f64 {
 
 /// Every cylindrical wall of the solid, seam-split faces merged.
 fn cylinder_walls(model: &BRepModel, solid_id: SolidId) -> Vec<Wall> {
-    let bores = crate::readable::bore_face_ids(model, solid_id);
+    let bores = super::arcs::closed_bore_faces(model, solid_id);
     let Some(solid) = model.solids.get(solid_id) else {
         return Vec::new();
     };

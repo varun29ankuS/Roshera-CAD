@@ -331,14 +331,22 @@ pub fn rederive_part_drawing(
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default()
     });
+    // Drawn in the part's frame exactly as the live route draws it (an
+    // assembly placement undone, a turned part squared), on a copy: a sheet
+    // re-derived on replay must be the sheet the live route made, and it
+    // records the move so its certificate re-measures in the same frame.
+    let mut framed = BRepModel::new();
+    geometry_engine::primitives::snapshot::ModelSnapshot::take(model).restore(&mut framed);
+    let (_, drawn_frame) = geometry_engine::drawing::frame_for_drawing(&mut framed, solid_id);
     let mut drawing = match geometry_engine::drawing::standard_drawing_auto_with_projection(
-        model, solid_id, part_uuid, projection,
+        &framed, solid_id, part_uuid, projection,
     ) {
         Ok(d) => d,
         Err(e) => {
             return DrawingRederive::Failed(format!("sheet derivation failed: {e}"));
         }
     };
+    drawing.drawn_frame = drawn_frame;
     // Constraint 2: preserve the drawing's identity (same registry slot).
     drawing.id = geometry_engine::drawing::DrawingId(drawing_id);
 

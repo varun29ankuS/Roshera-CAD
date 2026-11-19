@@ -454,6 +454,11 @@ struct CircleGroup {
     r: f64,
     all_visible: bool,
     all_hidden: bool,
+    /// Angle (radians) the accumulated arc-edges turn through about the
+    /// centre. Only a rim that closes (a full turn) is drawn as a circle: a
+    /// corner round or a half-round end is an ARC, and drawing its whole
+    /// circle put phantom rings around every filleted corner of a plate.
+    sweep: f64,
     fallback: Vec<(bool, Polyline2d)>,
     /// All B-Rep face ids adjacent to any arc-edge of this rim (cap face +
     /// lateral face). Threaded onto [`ProjectedCircle::face_ids`] so downstream
@@ -472,8 +477,29 @@ struct EllipseGroup {
     rotation: f64,
     all_visible: bool,
     all_hidden: bool,
+    /// As [`CircleGroup::sweep`]: an arc viewed obliquely is an elliptical
+    /// arc, never the whole ellipse.
+    sweep: f64,
     fallback: Vec<(bool, Polyline2d)>,
     face_ids: Vec<u32>,
+}
+
+/// A rim closes when its arc-edges turn through a full circle (within a
+/// thousandth of a radian: sampled sweeps of a split rim add up exactly, a
+/// corner round falls short by a quarter turn or more).
+const FULL_TURN_TOL: f64 = 1e-3;
+
+/// Angle the sampled points `pts` of a circular edge turn through about
+/// `centre`: the sum of the angles between consecutive radii (each sample
+/// step is far below a half turn, so every term is exact).
+fn swept_angle(pts: &[Point3], centre: Point3) -> f64 {
+    pts.windows(2)
+        .map(|w| {
+            let a = w[0] - centre;
+            let b = w[1] - centre;
+            a.cross(&b).magnitude().atan2(a.dot(&b))
+        })
+        .sum()
 }
 
 /// A circle projected through an orthographic view matrix, exactly: view-space
@@ -1303,6 +1329,7 @@ fn synth_sphere_silhouette(
         r: radius,
         all_visible: true,
         all_hidden: true,
+        sweep: 0.0,
         fallback: Vec::new(),
         face_ids: Vec::new(),
     });
@@ -1317,6 +1344,7 @@ fn synth_sphere_silhouette(
         let arc_hid = classified.iter().all(|(v, _)| !*v);
         g.all_visible &= arc_vis;
         g.all_hidden &= arc_hid;
+        g.sweep += swept_angle(&p3, center);
         for (vis, seg) in classified {
             let pl = Polyline2d::from_points(seg);
             if pl.points.len() >= 2 {
@@ -1358,14 +1386,117 @@ pub(crate) fn project_solid_edges_visibility_occ(
     occlude: bool,
 ) -> Result<ViewEdges, ProjectionError> {
     let use_accel = !std::env::var_os("ROSHERA_DRAW_NOACCEL").is_some_and(|v| !v.is_empty());
-    project_solid_edges_visibility_mode(
+    let key = VisibilityKey {
+        solid_id,
+        projection: format!("{projection:?}"),
+        samples_per_curve,
+        occlude,
+        use_accel,
+    };
+    let model_key = model as *const BRepModel as usize;
+    let kept = VISIBILITY_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|cache| cache.model == model_key)
+            .and_then(|cache| cache.entries.get(&key).cloned())
+    });
+    if let Some(edges) = kept {
+        return Ok(edges);
+    }
+    VISIBILITY_COMPUTED.with(|c| c.borrow_mut().push(key.clone()));
+    let edges = project_solid_edges_visibility_mode(
         model,
         solid_id,
         projection,
         samples_per_curve,
         use_accel,
         occlude,
-    )
+    )?;
+    VISIBILITY_CACHE.with(|c| {
+        if let Some(cache) = c
+            .borrow_mut()
+            .as_mut()
+            .filter(|cache| cache.model == model_key)
+        {
+            cache.entries.insert(key, edges.clone());
+        }
+    });
+    Ok(edges)
+}
+
+/// The hidden-line results kept while a [`VisibilityCacheScope`] is held.
+struct VisibilityCache {
+    /// The model the results were computed on (its address while borrowed).
+    model: usize,
+    entries: std::collections::HashMap<VisibilityKey, ViewEdges>,
+}
+
+thread_local! {
+    static VISIBILITY_CACHE: std::cell::RefCell<Option<VisibilityCache>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While held, each view's hidden-line work on `model` is computed once and
+/// served again to every later request for the same part, direction and
+/// sampling -- a sheet rebuilt on larger paper at the same scale reuses it.
+/// Hold it only while `model` is borrowed immutably (the guard's lifetime is
+/// tied to that borrow), so the part cannot change under the kept results.
+/// Scopes nest: the outer cache is restored on drop.
+pub(crate) struct VisibilityCacheScope<'m> {
+    previous: Option<VisibilityCache>,
+    _model: std::marker::PhantomData<&'m BRepModel>,
+}
+
+impl<'m> VisibilityCacheScope<'m> {
+    /// Open a cache scope over `model`.
+    pub(crate) fn enter(model: &'m BRepModel) -> Self {
+        let fresh = VisibilityCache {
+            model: model as *const BRepModel as usize,
+            entries: std::collections::HashMap::new(),
+        };
+        let previous = VISIBILITY_CACHE.with(|c| c.borrow_mut().replace(fresh));
+        Self {
+            previous,
+            _model: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for VisibilityCacheScope<'_> {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        VISIBILITY_CACHE.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
+/// What one hidden-line computation depends on: the part, the direction it
+/// is seen from, and how it is sampled and classified -- never the paper or
+/// where the view sits on it. The direction is keyed by its full `Debug` text
+/// (a custom view's rotation is floats, so `ProjectionType` has no `Eq`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct VisibilityKey {
+    solid_id: SolidId,
+    projection: String,
+    samples_per_curve: usize,
+    occlude: bool,
+    use_accel: bool,
+}
+
+thread_local! {
+    /// Every hidden-line computation run on this thread since the last
+    /// [`reset_visibility_computations`], in order.
+    static VISIBILITY_COMPUTED: std::cell::RefCell<Vec<VisibilityKey>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The hidden-line computations run on this thread since the last reset.
+pub(crate) fn visibility_computations() -> Vec<VisibilityKey> {
+    VISIBILITY_COMPUTED.with(|c| c.borrow().clone())
+}
+
+/// Forget the computations [`visibility_computations`] reports.
+pub(crate) fn reset_visibility_computations() {
+    VISIBILITY_COMPUTED.with(|c| c.borrow_mut().clear());
 }
 
 /// Core of [`project_solid_edges_visibility`] with the occlusion strategy chosen
@@ -1596,6 +1727,7 @@ pub(crate) fn project_solid_edges_visibility_mode(
                                 r,
                                 all_visible: true,
                                 all_hidden: true,
+                                sweep: 0.0,
                                 fallback: Vec::new(),
                                 face_ids: Vec::new(),
                             });
@@ -1613,6 +1745,7 @@ pub(crate) fn project_solid_edges_visibility_mode(
                             let arc_hid = runs.iter().all(|(v, _)| !*v);
                             g.all_visible &= arc_vis;
                             g.all_hidden &= arc_hid;
+                            g.sweep += swept_angle(&p3, c3);
                             for (vis, pts) in &runs {
                                 let pl = Polyline2d::from_points(pts.clone());
                                 if pl.points.len() >= 2 {
@@ -1647,6 +1780,7 @@ pub(crate) fn project_solid_edges_visibility_mode(
                                         rotation: ell.rotation,
                                         all_visible: true,
                                         all_hidden: true,
+                                        sweep: 0.0,
                                         fallback: Vec::new(),
                                         face_ids: Vec::new(),
                                     });
@@ -1661,6 +1795,7 @@ pub(crate) fn project_solid_edges_visibility_mode(
                                     let arc_hid = runs.iter().all(|(v, _)| !*v);
                                     g.all_visible &= arc_vis;
                                     g.all_hidden &= arc_hid;
+                                    g.sweep += swept_angle(&p3, c3);
                                     for (vis, pts) in &runs {
                                         let pl = Polyline2d::from_points(pts.clone());
                                         if pl.points.len() >= 2 {
@@ -1832,9 +1967,10 @@ pub(crate) fn project_solid_edges_visibility_mode(
             r: g.r,
             face_ids: g.face_ids.clone(),
         };
-        if g.all_visible {
+        let closed = g.sweep >= std::f64::consts::TAU - FULL_TURN_TOL;
+        if closed && g.all_visible {
             out.circles.push(circ);
-        } else if g.all_hidden {
+        } else if closed && g.all_hidden {
             out.hidden_circles.push(circ);
         } else {
             // A mixed rim falls back to per-arc polylines: the single-edge link
@@ -1868,9 +2004,10 @@ pub(crate) fn project_solid_edges_visibility_mode(
             rotation: g.rotation,
             face_ids: g.face_ids.clone(),
         };
-        if g.all_visible {
+        let closed = g.sweep >= std::f64::consts::TAU - FULL_TURN_TOL;
+        if closed && g.all_visible {
             out.ellipses.push(ell);
-        } else if g.all_hidden {
+        } else if closed && g.all_hidden {
             out.hidden_ellipses.push(ell);
         } else {
             for (vis, pl) in g.fallback {

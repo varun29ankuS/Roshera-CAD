@@ -3675,25 +3675,34 @@ pub async fn get_rebuild_certificate(
 ///   `intent` an agent stated for it, when it stated one.
 ///
 /// A view over the immutable log: nothing is replayed into the live model.
+///
+/// Kept with the history's frames: every field is a function of this exact
+/// history (verdicts, the part each feature ended in, authors, intents), so
+/// the response is stored under the history's hash
+/// ([`chapters_cache_key`]), like the film strip's pictures, and a history
+/// that has not changed is never re-certified. It was, on every request --
+/// 41-52 s per call on a document with STEP imports (2026-11-18), during
+/// which the app showed its old event row instead of the picture strip.
 pub async fn get_chapters(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = state.timeline_recorder.settle().await;
     let branch_id = resolve_branch_ref(&branch_id)?;
-    let events = {
-        let timeline = state.timeline.read().await;
-        let mut all = timeline
-            .get_branch_events(&branch_id, None, None)
-            .map_err(|_| StatusCode::NOT_FOUND)?;
-        all.sort_by_key(|e| e.sequence_number);
-        let applied = timeline
-            .applied_count(&branch_id)
-            .map_err(|_| StatusCode::NOT_FOUND)? as usize;
-        all.truncate(applied);
-        all
-    };
+    let events = applied_events(&state, &branch_id).await?;
 
+    let started = std::time::Instant::now();
+    let chapters_key = chapters_cache_key(&events, &branch_id);
+    if let Some(bytes) = state.frames.presentation(&chapters_key) {
+        if let Ok(served) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            tracing::info!(
+                target: "timeline.profile",
+                total_ms = started.elapsed().as_millis() as u64,
+                "chapters: served from the frame cache"
+            );
+            return Ok(Json(served));
+        }
+    }
     let frames = state.frames.clone();
     let replayed = events.clone();
     let chapter_list = timeline_engine::chapters::chapters(&events);
@@ -3703,14 +3712,24 @@ pub async fn get_chapters(
         .flatten()
         .collect();
     let (cert, live_part) = tokio::task::spawn_blocking(move || {
+        let t = std::time::Instant::now();
         let cert = timeline_engine::rebuild_certificate::certify_rebuild_with_frames(
             &replayed, None, &frames,
         )
         .1;
+        let certified_ms = t.elapsed().as_millis() as u64;
         // Each feature's part as the LIVE model numbers it (the replay's id
         // table maps recorded ids to the ids the rebuilt model uses), and
         // only when that part stands now.
-        let (model, outcome, _) = frames.replay(&replayed);
+        let (model, outcome, stats) = frames.replay(&replayed);
+        tracing::info!(
+            target: "timeline.profile",
+            certified_ms,
+            replayed_ms = t.elapsed().as_millis() as u64 - certified_ms,
+            events_reused = stats.events_reused,
+            events_reexecuted = stats.events_reexecuted,
+            "chapters: certificate and replay"
+        );
         let live: std::collections::HashMap<u64, u64> = recorded_parts
             .into_iter()
             .filter_map(|rec| {
@@ -3789,11 +3808,21 @@ pub async fn get_chapters(
         .iter()
         .map(|c| render(c, &verdict_of, &event_of, &live_part))
         .collect();
-    Ok(Json(serde_json::json!({
+    let served = serde_json::json!({
         "branch": branch_id.to_string(),
         "chapters": chapters,
         "is_sound": cert.is_sound,
-    })))
+    });
+    if let Ok(bytes) = serde_json::to_vec(&served) {
+        state.frames.store_presentation(chapters_key, bytes);
+    }
+    tracing::info!(
+        target: "timeline.profile",
+        total_ms = started.elapsed().as_millis() as u64,
+        chapters = served["chapters"].as_array().map_or(0, Vec::len),
+        "chapters: certified and kept"
+    );
+    Ok(Json(served))
 }
 
 /// Query for [`get_frame_picture`]: the square image size in pixels
@@ -3802,6 +3831,130 @@ pub async fn get_chapters(
 pub struct FramePictureQuery {
     #[serde(default)]
     pub size: Option<usize>,
+}
+
+/// The branch's APPLIED history in sequence order: every event up to the
+/// applied count (an undone tail is not part of the part).
+pub(crate) async fn applied_events(
+    state: &AppState,
+    branch_id: &BranchId,
+) -> Result<Vec<TimelineEvent>, StatusCode> {
+    let timeline = state.timeline.read().await;
+    let mut all = timeline
+        .get_branch_events(branch_id, None, None)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    all.sort_by_key(|e| e.sequence_number);
+    let applied = timeline
+        .applied_count(branch_id)
+        .map_err(|_| StatusCode::NOT_FOUND)? as usize;
+    all.truncate(applied);
+    Ok(all)
+}
+
+/// Where a branch's chapters are kept in the frame cache: the history's own
+/// hash (any edit, undo or new step changes it) and the branch.
+pub(crate) fn chapters_cache_key(events: &[TimelineEvent], branch_id: &BranchId) -> [u8; 32] {
+    timeline_engine::frames::FrameCache::presentation_key(
+        &timeline_engine::frames::FrameCache::key_of(events),
+        &format!("chapters-v1-{branch_id}"),
+    )
+}
+
+/// Where a branch's feature graph (the timeline Map) is kept: the history's
+/// hash and the branch, like its chapters.
+pub(crate) fn feature_graph_cache_key(events: &[TimelineEvent], branch_id: &BranchId) -> [u8; 32] {
+    timeline_engine::frames::FrameCache::presentation_key(
+        &timeline_engine::frames::FrameCache::key_of(events),
+        &format!("feature-graph-v1-{branch_id}"),
+    )
+}
+
+/// `GET /api/timeline/feature-graph/{branch_id}` -- the timeline Map (Varun
+/// 2026-11-18: "one look at map should tell everything ... how it was made ..
+/// what was agent / what was human ... can it be used to rebuild the part").
+///
+/// The branch's chapters (`GET /api/timeline/chapters`, its verdicts,
+/// authors and intents) with, per feature, its name in words and its sizes as
+/// a drawing writes them; `edges` -- which feature each was built on, read off
+/// the recorded solid inputs and outputs ([`timeline_engine::feature_graph`]);
+/// a `summary` (features, by the agent / by people, steps that rebuild sound
+/// out of the total, steps set aside at boot); and the `recipe`, one line per
+/// feature in build order. Kept with the history's frames until the history
+/// changes; no kernel id appears in its words.
+pub async fn get_feature_graph(
+    State(state): State<AppState>,
+    Path(branch_ref): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _ = state.timeline_recorder.settle().await;
+    let branch_id = resolve_branch_ref(&branch_ref)?;
+    let events = applied_events(&state, &branch_id).await?;
+    let key = feature_graph_cache_key(&events, &branch_id);
+    if let Some(bytes) = state.frames.presentation(&key) {
+        if let Ok(served) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            return Ok(Json(served));
+        }
+    }
+
+    let Json(chapters_json) = get_chapters(State(state.clone()), Path(branch_ref)).await?;
+    let chapter_list = timeline_engine::chapters::chapters(&events);
+    let params = timeline_engine::dimension_drive::editable_parameters(&events);
+    let edges = timeline_engine::feature_graph::feature_edges(&events, &chapter_list);
+    let recipe = timeline_engine::feature_graph::recipe(&chapter_list, &edges, &params);
+    let by_anchor: std::collections::HashMap<u64, &timeline_engine::chapters::Chapter> =
+        chapter_list.iter().map(|c| (c.anchor, c)).collect();
+
+    let mut features: Vec<serde_json::Value> = chapters_json["chapters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let (mut by_agent, mut by_user, mut steps_sound) = (0u64, 0u64, 0u64);
+    for f in &mut features {
+        let anchor = f["anchor"].as_u64();
+        if let Some(c) = anchor.and_then(|a| by_anchor.get(&a)) {
+            f["display_name"] = serde_json::json!(timeline_engine::feature_graph::display_name(c));
+            f["sizes"] =
+                serde_json::json!(timeline_engine::feature_graph::feature_sizes(c, &params));
+        }
+        match f["author"].as_str() {
+            Some("agent") => by_agent += 1,
+            Some("user") => by_user += 1,
+            _ => {}
+        }
+        if f["sound"].as_bool() == Some(true) {
+            steps_sound += f["events"].as_array().map_or(0, |e| e.len() as u64);
+        }
+    }
+    let applied = events.len() as u64;
+    let (steps_total, set_aside) = match &*state.durability_status.read().await {
+        crate::durability::DurabilityStatus::Quarantined {
+            events_served,
+            events_total,
+            ..
+        } if branch_id == BranchId::main() => {
+            let total = (*events_total as u64).max(applied);
+            (total, total.saturating_sub(*events_served as u64))
+        }
+        _ => (applied, 0),
+    };
+    let served = serde_json::json!({
+        "branch": branch_id.to_string(),
+        "features": features,
+        "edges": edges,
+        "summary": {
+            "features": features.len(),
+            "by_agent": by_agent,
+            "by_user": by_user,
+            "steps_rebuildable": steps_sound,
+            "steps_total": steps_total,
+            "set_aside": set_aside,
+            "branch": branch_id.to_string(),
+        },
+        "recipe": recipe,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&served) {
+        state.frames.store_presentation(key, bytes);
+    }
+    Ok(Json(served))
 }
 
 /// `GET /api/timeline/frame/{branch_id}/{sequence}/picture` — a picture of

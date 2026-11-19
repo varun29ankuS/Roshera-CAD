@@ -40,6 +40,9 @@ import {
   type SheetDimension,
   type DimensionDriverResolution,
   type DrawingQualityReport,
+  type DimensionListing,
+  annotateDimension,
+  listDimensions,
   getDimensionDriver,
   DrawingRefusal,
   setDrawingDimension,
@@ -59,6 +62,11 @@ import {
   type ViewEdit,
 } from '@/lib/drawings-api'
 import { useDocumentStore } from '@/stores/document-store'
+import { CompletenessChip, DimensionPanel } from '@/components/panels/DimensionPanel'
+import { draggedShift } from '@/lib/dimension-annotate'
+import { latestOnly } from '@/lib/latest-only'
+import { drawingsForDocument } from '@/lib/drawings-for-document'
+import { currentDocument } from '@/lib/document-scope'
 import { HISTORY_CHANGED_EVENT, timelineAction } from '@/lib/history'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import {
@@ -263,7 +271,12 @@ export function DrawingsWorkspace() {
   }, [])
 
   // ── Data fetchers ────────────────────────────────────────────────
+  // Listings overlap (this panel's mount and a document switch); only the
+  // newest may apply, or an older listing made while the previous document
+  // was still open lands last and reopens that document's drawing.
+  const listRequests = useRef(latestOnly())
   const refreshList = useCallback(async (preferId?: string) => {
+    const ticket = listRequests.current.begin()
     setError(null)
     try {
       // `GET /api/drawings` now returns `{id, owner}` per entry rather than
@@ -274,12 +287,13 @@ export function DrawingsWorkspace() {
       // cannot render against this model (the server answers 409), so
       // listing it here only produces an error banner. Part-owned drawings
       // carry no document id and stay listed.
+      // The open document is the app's own record of the confirmed switch
+      // (document-scope), not the "active" flag in a list that may not yet
+      // hold a document just created.
       const docs = useDocumentStore.getState()
-      if (docs.documents.length === 0) await docs.refresh()
-      const activeDoc = useDocumentStore.getState().documents.find((d) => d.active)?.id
-      const entries = (await listDrawings()).filter(
-        (e) => e.owner.kind !== 'legacy' || !activeDoc || e.owner.document_id === activeDoc,
-      )
+      if (docs.documents.length === 0 && currentDocument() === null) await docs.refresh()
+      const openDoc = currentDocument() ?? useDocumentStore.getState().documents.find((d) => d.active)?.id ?? null
+      const entries = drawingsForDocument(await listDrawings(), openDoc)
       const ids = entries.map((e) => e.id)
       // Resolve summaries in parallel — payload is tiny (no polylines
       // would be cheaper, but the kernel's `Drawing` JSON for a fresh
@@ -292,6 +306,7 @@ export function DrawingsWorkspace() {
             .catch(() => ({ id, name: id.slice(0, 8) }) as DrawingSummary),
         ),
       )
+      if (!listRequests.current.isLatest(ticket)) return
       setDrawings(summaries)
       // A caller-preferred drawing (e.g. the viewport "Create Drawing"
       // flow) wins over every other selection rule when it actually
@@ -315,6 +330,10 @@ export function DrawingsWorkspace() {
     }
   }, [activeId])
 
+  // The kernel's reading of the sheet's dimensions (as inked, what is
+  // authored on each) and its completeness: what the property panel and the
+  // completeness chip show. Reloaded with the sheet; `null` while unknown.
+  const [dimListing, setDimListing] = useState<DimensionListing | null>(null)
   const refreshActive = useCallback(async (id: string) => {
     setLoading(true)
     setError(null)
@@ -324,6 +343,11 @@ export function DrawingsWorkspace() {
       const [d, s] = await Promise.all([getDrawing(id), previewDrawingSvg(id)])
       setActiveDrawing(d)
       setSvg(s)
+      // Not fatal to the sheet: without it the panel shows the measured
+      // label and the chip says "not verified".
+      void listDimensions(id)
+        .then(setDimListing)
+        .catch(() => setDimListing(null))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       setActiveDrawing(null)
@@ -899,6 +923,48 @@ export function DrawingsWorkspace() {
     },
     [activeDrawing, refreshActive],
   )
+  // ── Dragging a dimension ─────────────────────────────────────────
+  // A press on a dimension that travels is a move: its text follows the
+  // cursor, and the drop sends ONE annotation (the shift from where the
+  // layout puts it, added to any shift it already had). The kernel redraws
+  // the dimension line and extension lines; an overlap the move causes is
+  // kept and shown by the sheet check, never refused.
+  const dimDragRef = useRef<{
+    id: string
+    startX: number
+    startY: number
+    pxPerMm: number
+    els: SVGElement[]
+    moved: boolean
+  } | null>(null)
+  const dimDraggedRef = useRef(false)
+  const commitDimMove = useCallback(
+    async (id: string, dxPx: number, dyPx: number, pxPerMm: number, els: SVGElement[]) => {
+      if (!activeDrawing) return
+      const known = dimListing?.dimensions.find((d) => d.id === id)
+      const label = known?.ink ?? 'Dimension'
+      try {
+        await annotateDimension(activeDrawing.id, id, {
+          text_shift_mm: draggedShift(known?.edit?.text_shift_mm, dxPx, dyPx, pxPerMm),
+        })
+        setNoteKind('done')
+        setEditNote(`${label} moved. Ctrl+Z undoes it.`)
+        await refreshActive(activeDrawing.id)
+      } catch (e) {
+        els.forEach((el) => {
+          el.style.translate = ''
+        })
+        setNoteKind('info')
+        setEditNote(`Not moved: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    },
+    [activeDrawing, dimListing, refreshActive],
+  )
+  const commitDimMoveRef = useRef(commitDimMove)
+  useEffect(() => {
+    commitDimMoveRef.current = commitDimMove
+  }, [commitDimMove])
+
   // The window-level mouse-up listener is bound once; it reaches the
   // current commit through this ref.
   const commitViewMoveRef = useRef(commitViewMove)
@@ -949,8 +1015,32 @@ export function DrawingsWorkspace() {
   const onCanvasMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     // Ignore clicks on the zoom toolbar so the buttons still work.
     if ((e.target as HTMLElement).closest('button')) return
-    // A dimension is clicked to edit it, not dragged.
-    if ((e.target as Element).closest('[data-dim-id]')) return
+    // A dimension is clicked to open its properties, or dragged to move it.
+    const dimEl = (e.target as Element).closest('[data-dim-id]')
+    if (dimEl) {
+      const sheet = sheetRef.current
+      const id = (dimEl.getAttribute('data-dim-id') ?? '').replace(/-note$/, '')
+      const pxPerMm = sheet ? screenPxPerMm(sheet.getBoundingClientRect().width, sheetWMm) : null
+      if (e.button === 0 && sheet && pxPerMm && id) {
+        dimDragRef.current = {
+          id,
+          startX: e.clientX,
+          startY: e.clientY,
+          pxPerMm,
+          // Every piece of the dimension's text (value, stacked deviations,
+          // a callout's second line).
+          els: Array.from(
+            sheet.querySelectorAll<SVGElement>(
+              `[data-dim-id="${CSS.escape(id)}"], [data-dim-id="${CSS.escape(`${id}-note`)}"]`,
+            ),
+          ),
+          moved: false,
+        }
+        // No text selection while dragging.
+        e.preventDefault()
+      }
+      return
+    }
     if (e.button !== 0) return
     const el = canvasRef.current
     if (!el) return
@@ -968,10 +1058,24 @@ export function DrawingsWorkspace() {
     panStateRef.current.startPan = { ...panStateRef.current.pan }
     el.style.cursor = 'grabbing'
     e.preventDefault()
-  }, [beginViewDrag])
+  }, [beginViewDrag, sheetWMm])
 
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
+      const dd = dimDragRef.current
+      if (dd) {
+        const dx = e.clientX - dd.startX
+        const dy = e.clientY - dd.startY
+        if (!dd.moved && !isDrag(dx, dy)) return
+        dd.moved = true
+        // The SVG's user unit is the sheet millimetre. `translate` (not
+        // `transform`) so a vertical dimension keeps its rotation.
+        const t = `${dx / dd.pxPerMm}px ${dy / dd.pxPerMm}px`
+        dd.els.forEach((el) => {
+          el.style.translate = t
+        })
+        return
+      }
       const d = viewDragRef.current
       if (d) {
         const dx = e.clientX - d.startX
@@ -1004,6 +1108,16 @@ export function DrawingsWorkspace() {
       const el = canvasRef.current
       if (el) el.style.cursor = ''
       panStateRef.current.dragging = false
+      const dd = dimDragRef.current
+      if (dd) {
+        dimDragRef.current = null
+        if (dd.moved) {
+          // The click that ends a drag does not also open the panel.
+          dimDraggedRef.current = true
+          void commitDimMoveRef.current(dd.id, e.clientX - dd.startX, e.clientY - dd.startY, dd.pxPerMm, dd.els)
+        }
+        return
+      }
       const d = viewDragRef.current
       if (!d) return
       viewDragRef.current = null
@@ -1020,6 +1134,13 @@ export function DrawingsWorkspace() {
     }
     // Escape while dragging drops the drag; nothing is sent.
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && dimDragRef.current) {
+        dimDragRef.current.els.forEach((el) => {
+          el.style.translate = ''
+        })
+        dimDragRef.current = null
+        return
+      }
       if (e.key === 'Escape' && viewDragRef.current) {
         viewDragRef.current = null
         setViewGhost(null)
@@ -1046,6 +1167,8 @@ export function DrawingsWorkspace() {
       const dim = view?.dimensions?.find((d) => d.id === id)
       if (!view || !dim) return
       setEditNote(null)
+      // One property card at a time, where the title block card sits.
+      setTitleBlockOpen(false)
       // Keep the box on screen: 300 x 150 is its largest size.
       const x = Math.min(atX, window.innerWidth - 312)
       const y = Math.min(atY, window.innerHeight - 162)
@@ -1080,6 +1203,11 @@ export function DrawingsWorkspace() {
 
   const onSheetClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
+      // The click that ends a dimension drag is the drop, not a selection.
+      if (dimDraggedRef.current) {
+        dimDraggedRef.current = false
+        return
+      }
       const el = (e.target as Element).closest('[data-dim-id]')
       if (!el) {
         // A drag pans the sheet; only a click selects.
@@ -1088,7 +1216,11 @@ export function DrawingsWorkspace() {
         setSelectedViewId(viewAt(e.clientX, e.clientY))
         return
       }
-      openDimension(el.getAttribute('data-dim-id') ?? '', e.clientX + 12, e.clientY + 12)
+      openDimension(
+        (el.getAttribute('data-dim-id') ?? '').replace(/-note$/, ''),
+        e.clientX + 12,
+        e.clientY + 12,
+      )
     },
     [viewAt, openDimension],
   )
@@ -1188,10 +1320,32 @@ export function DrawingsWorkspace() {
             </div>
           )
         ) : (
-          <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground text-center px-6">
-            {drawings.length === 0
-              ? 'No drawings yet. Open the menu at the top left and start one from a part.'
-              : 'Choose a drawing from the menu at the top left.'}
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center text-sm text-muted-foreground">
+            {drawings.length === 0 ? (
+              parts.length === 0 ? (
+                'No parts yet. Build or import a part in the Part workspace, then make its drawing here.'
+              ) : (
+                <>
+                  <span>No drawings yet. Make one from a part:</span>
+                  <div className="flex max-w-xl flex-wrap justify-center gap-2">
+                    {/* The same action the menu's "New drawing from a part" takes,
+                        offered where the engineer is looking. */}
+                    {parts.map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => void handleCreateFromPart(p)}
+                        className="cad-focus rounded-md border border-border bg-card px-3 py-1.5 text-[13px] text-foreground shadow-sm hover:bg-accent/40"
+                      >
+                        Make a drawing of {p.name}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )
+            ) : (
+              'Choose a drawing from the menu at the top left.'
+            )}
           </div>
         )}
       </div>
@@ -1227,8 +1381,17 @@ export function DrawingsWorkspace() {
           projectionBusy={projectionBusy}
           onProjection={(pr) => void changeProjection(pr)}
           titleBlockOpen={titleBlockOpen}
-          onToggleTitleBlock={() => setTitleBlockOpen((o) => !o)}
+          onToggleTitleBlock={() => {
+            // One property card at a time.
+            dimEditAbort.current?.abort()
+            setDimEdit(null)
+            setTitleBlockOpen((o) => !o)
+          }}
           onDownload={(f) => void handleDownload(f)}
+          onPickDimension={() => {
+            setNoteKind('info')
+            setEditNote('Click a dimension on the sheet to open its properties. Drag one to move it.')
+          }}
         />
       )}
       {activeDrawing && titleBlockOpen && (
@@ -1333,85 +1496,41 @@ export function DrawingsWorkspace() {
         </div>
       )}
 
-            {dimEdit && (
-              <div
-                className="fixed z-50 w-[300px] bg-card border border-border rounded-md shadow-lg p-3 text-xs"
-                style={{ left: dimEdit.x, top: dimEdit.y }}
-                onMouseDown={(e) => e.stopPropagation()}
-              >
-                <div className="flex items-start justify-between gap-2 mb-2">
-                  <div className="min-w-0">
-                    <div className="font-medium text-sm">Change {dimEdit.dim.label}</div>
-                    <div className="text-muted-foreground">
-                      {DIM_KIND_WORDS[dimEdit.dim.kind] ?? dimEdit.dim.kind.replace(/_/g, ' ')} · {dimEdit.view} view · edits the part
-                    </div>
-                    <div className="mt-1">{driverLine(dimEdit.driver)}</div>
-                  </div>
-                  <button
-                    type="button"
-                    aria-label="Close"
-                    onClick={() => {
-                      dimEditAbort.current?.abort()
-                      setDimEdit(null)
-                    }}
-                    className="cad-focus shrink-0 text-muted-foreground hover:text-foreground"
-                  >
-                    <X size={14} />
-                  </button>
-                </div>
-                <div className="flex items-center gap-2">
-                  <input
-                    autoFocus
-                    inputMode="decimal"
-                    value={dimEdit.draft}
-                    disabled={dimEdit.busy}
-                    onChange={(e) => setDimEdit({ ...dimEdit, draft: e.target.value, refusal: null })}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault()
-                        void applyDimEdit()
-                      } else if (e.key === 'Escape') {
-                        e.preventDefault()
-                        dimEditAbort.current?.abort()
-                        setDimEdit(null)
-                      }
-                    }}
-                    className="cad-focus w-28 min-w-0 font-mono px-2 py-1 rounded border border-border bg-background"
-                  />
-                  <span className="text-muted-foreground">{dimEdit.dim.unit}</span>
-                  {dimEdit.busy ? (
-                    <button
-                      type="button"
-                      onClick={() => dimEditAbort.current?.abort()}
-                      className="cad-focus ml-auto shrink-0 px-2 py-1 rounded border border-border hover:bg-accent/20"
-                    >
-                      Stop
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => void applyDimEdit()}
-                      className="cad-focus ml-auto shrink-0 px-3 py-1 rounded bg-primary text-primary-foreground hover:opacity-90"
-                    >
-                      Apply
-                    </button>
-                  )}
-                </div>
-                {dimEdit.busy && dimEdit.startedAt !== null && (
-                  <div className="mt-2 text-muted-foreground">
-                    Rebuilding the part and its sheet…{' '}
-                    <span className="font-mono">
-                      {Math.floor((Date.now() - dimEdit.startedAt) / 1000)} s
-                    </span>
-                  </div>
-                )}
-                {dimEdit.refusal && (
-                  <div className="mt-2 flex gap-1 text-red-700">
-                    <span aria-hidden>✗</span>
-                    <span>{dimEdit.refusal}</span>
-                  </div>
-                )}
-              </div>
+            {dimEdit && activeDrawing && (
+              <DimensionPanel
+                drawing={activeDrawing}
+                dim={dimEdit.dim}
+                view={dimEdit.view}
+                kindWords={DIM_KIND_WORDS[dimEdit.dim.kind] ?? dimEdit.dim.kind.replace(/_/g, ' ')}
+                info={dimListing?.dimensions.find((d) => d.id === dimEdit.dim.id) ?? null}
+                certificate={dimListing?.certificate ?? null}
+                driver={dimEdit.driver}
+                driverLine={driverLine(dimEdit.driver)}
+                draft={dimEdit.draft}
+                busy={dimEdit.busy}
+                startedAt={dimEdit.startedAt}
+                valueRefusal={dimEdit.refusal}
+                onDraft={(draft) => setDimEdit((cur) => (cur ? { ...cur, draft, refusal: null } : cur))}
+                onApplyValue={() => void applyDimEdit()}
+                onStop={() => dimEditAbort.current?.abort()}
+                onClose={() => setDimEdit(null)}
+                onChanged={(note) => {
+                  setNoteKind('done')
+                  setEditNote(note)
+                  void refreshActive(activeDrawing.id)
+                }}
+              />
+            )}
+            {activeDrawing && svg && (
+              <CompletenessChip
+                drawing={activeDrawing}
+                certificate={dimListing?.certificate ?? null}
+                onChanged={(note) => {
+                  setNoteKind('done')
+                  setEditNote(note)
+                  void refreshActive(activeDrawing.id)
+                }}
+              />
             )}
 
             {editNote && (

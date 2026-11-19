@@ -11,6 +11,12 @@
  */
 
 import { drawingSvgUrl } from './drawing-svg-url'
+import type {
+  CertificateSummary,
+  DimTolerance,
+  DimensionEdit,
+  Waiver,
+} from './dimension-annotate'
 
 const API_HOST = import.meta.env.VITE_API_URL || ''
 
@@ -83,6 +89,9 @@ export interface SheetDimension {
   value: number
   unit: string
   label: string
+  /** Durable handle its annotations are recorded under; absent when the
+   *  dimension cannot be annotated (its faces carry no persistent id). */
+  key?: string | null
 }
 
 export interface TitleBlock {
@@ -114,6 +123,8 @@ export interface Drawing {
   /** First- or third-angle arrangement. Absent on sheets from a server
    *  that pre-dates the choice — those are third-angle. */
   projection?: ProjectionAngle
+  /** The general-tolerance note inked on the sheet. */
+  tolerance_note?: string
 }
 
 /** First-angle (ISO; India, Europe) or third-angle (ASME) projection. */
@@ -518,6 +529,111 @@ export async function setDrawingDimension(
     },
   )
   return jsonOrRefusal<DimensionEditResult>(r)
+}
+
+// ── Annotating a dimension (tolerance, text, move, suppress) ─────────────
+
+/** One sheet dimension as the property panel reads it. */
+export interface DimensionInfo {
+  id: string
+  key: string | null
+  view: string
+  kind: string
+  value: number
+  unit: string
+  /** The measured label. */
+  label: string
+  /** The label as inked, with the tolerance and text authored on it. */
+  ink: string
+  /** False when the dimension has no persistent identity to record under. */
+  editable: boolean
+  /** False when the view carries it but the layout does not draw it. */
+  placed: boolean
+  suppressed: boolean
+  edit: DimensionEdit | null
+  /** Set when an ISO 286 class is inked without limits, saying why. */
+  unresolved: string | null
+  /** The tolerance the dimension is inked with: authored on it, or (with a
+   *  `feature_pid`) the size tolerance authored on its feature. */
+  tolerance: { kind: string; feature_pid?: string | null } | null
+}
+
+/** A sheet's dimensions and what it leaves out. */
+export interface DimensionListing {
+  dimensions: DimensionInfo[]
+  /** `null` when the sheet's part is not loaded (nothing to verify against). */
+  certificate: CertificateSummary | null
+}
+
+export async function listDimensions(drawingId: string): Promise<DimensionListing> {
+  const r = await fetch(`${API_HOST}/api/drawings/${drawingId}/dimensions`)
+  return jsonOrRefusal<DimensionListing>(r)
+}
+
+/**
+ * What to change on a dimension. A field left out is not touched; `null`
+ * clears it (removes the tolerance, puts the dimension back where the layout
+ * places it, lifts a suppression).
+ */
+export interface DimensionAnnotation {
+  tolerance?: DimTolerance | null
+  prefix?: string
+  suffix?: string
+  text_shift_mm?: [number, number] | null
+  suppressed?: Waiver | null
+}
+
+export interface DimensionAnnotationResult {
+  dimension: Partial<DimensionInfo> & { key: string | null }
+  certificate: CertificateSummary | null
+}
+
+/**
+ * Annotate one dimension (`dimension` is its id on the sheet, or the key of
+ * a dimension the sheet leaves out, to sign for it). One recorded history
+ * step. Throws {@link DrawingRefusal} with the kernel's reason when it is
+ * refused (a fit outside the ISO 286 tables, an unsigned suppression, a
+ * dimension that cannot be annotated).
+ */
+export async function annotateDimension(
+  drawingId: string,
+  dimension: string,
+  change: DimensionAnnotation,
+): Promise<DimensionAnnotationResult> {
+  const r = await fetch(
+    `${API_HOST}/api/drawings/${drawingId}/dimensions/${encodeURIComponent(dimension)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(change),
+    },
+  )
+  if (!r.ok) throw await refusalOf(r)
+  return r.json() as Promise<DimensionAnnotationResult>
+}
+
+/** The limits of one ISO 286 class at a size, from the kernel's tables. */
+export interface Iso286Limits {
+  class: string
+  kind: 'hole' | 'shaft'
+  upper_deviation_mm: number
+  lower_deviation_mm: number
+  upper_limit_mm: number
+  lower_limit_mm: number
+}
+
+/** Throws {@link DrawingRefusal} when the class or size is outside the tables. */
+export async function iso286Limits(
+  nominalMm: number,
+  fitClass: string,
+  signal?: AbortSignal,
+): Promise<Iso286Limits> {
+  const r = await fetch(
+    `${API_HOST}/api/iso286?nominal=${encodeURIComponent(String(nominalMm))}&class=${encodeURIComponent(fitClass)}`,
+    { signal },
+  )
+  if (!r.ok) throw await refusalOf(r)
+  return r.json() as Promise<Iso286Limits>
 }
 
 /** Lay a sheet out first- or third-angle (kept when the part is edited). */

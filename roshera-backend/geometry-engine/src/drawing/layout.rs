@@ -25,18 +25,42 @@ use super::types::{Drawing, ProjectedView};
 /// view's `scale(sx, -sx)` group, so the font is invariant to view scale.
 pub const VIEW_LABEL_FONT_MM: f64 = 3.6;
 
+/// Capital height of a sans-serif face as a fraction of its font size (em):
+/// about 0.70 (DejaVu Sans 0.73, Arial 0.716, Liberation Sans 0.73).
+pub const CAP_HEIGHT_OF_EM: f64 = 0.70;
+
 /// CSS font size of the `.dim-text` class (px == mm). Dimension text is
-/// emitted in sheet space so this is the actual ink height.
-pub const DIM_TEXT_FONT_MM: f64 = 3.1;
+/// emitted in sheet space so this is the actual em size on paper.
+///
+/// ISO 3098: capital height at least 2.5 mm. A font size is the em box, and
+/// a capital is about 0.70 of it, so 2.5 mm capitals need a 3.6 mm font. The
+/// first value, 3.1, printed 2.17 mm capitals: below the minimum on every
+/// sheet, and unreadable when an A2 is printed on A3.
+pub const DIM_TEXT_FONT_MM: f64 = 3.6;
 
 /// CSS font size of the `.notes-strip` class (px == mm).
 /// General notes (unit note, tolerance note, projection note) printed near
-/// the bottom-left of the frame.
-pub const NOTES_FONT_MM: f64 = 2.4;
+/// the bottom-left of the frame. The same ISO 3098 minimum as dimensions
+/// (it was 2.4: 1.7 mm capitals).
+pub const NOTES_FONT_MM: f64 = 3.6;
 
-/// CSS font size for hole-table header/data cells (px == mm).
-/// Also used for hole-tag callouts in the axial view.
-pub const TABLE_TEXT_FONT_MM: f64 = 2.6;
+/// Baseline-to-baseline pitch of the notes strip, mm: 1.4 times the font
+/// size, the ISO 3098 line spacing, rounded up.
+pub const NOTES_LINE_PITCH_MM: f64 = 5.0;
+
+/// Baseline of the lowest notes line above the frame bottom, mm.
+pub const NOTES_BOTTOM_BASELINE_MM: f64 = 3.0;
+
+/// Height of the band the notes strip occupies above the frame bottom, mm:
+/// the lowest baseline, two line pitches, the top line's font and 1.4 mm of
+/// air. Anything placed in the bottom-left corner sits above it.
+pub const NOTES_BAND_MM: f64 =
+    NOTES_BOTTOM_BASELINE_MM + 2.0 * NOTES_LINE_PITCH_MM + NOTES_FONT_MM + 1.4;
+
+/// CSS font size for hole-table header/data cells (px == mm), for the
+/// hole-tag callouts in the axial view and for the datum-origin label:
+/// 2.5 mm capitals, the ISO 3098 minimum (it was 2.6 px, 1.8 mm capitals).
+pub const TABLE_TEXT_FONT_MM: f64 = 3.6;
 
 /// CSS font size of the large drawing title text in the title block (px == mm).
 /// ISO 7200 §8.4 calls for the title to be the largest lettering on the block;
@@ -95,6 +119,102 @@ impl Rect2 {
 }
 
 // ── Text bbox helper ───────────────────────────────────────────────────────────
+
+/// The sheet box of a placed dimension's text as it is drawn: the one box its
+/// `DimensionText` layout item carries, and the one the quality check reads.
+pub(crate) fn placed_text_box(pd: &PlacedDimension) -> Rect2 {
+    let font = DIM_TEXT_FONT_MM;
+    // A stacked tolerance is drawn narrower than its one-line label and
+    // taller: its upper line rises above the value, its lower line hangs
+    // below the baseline. Two stacked limits of size are two full-height
+    // lines.
+    let (text_w, rise, drop) = match &pd.stack {
+        Some(stack) if stack.full_size => (
+            stack.width_mm(),
+            super::dimension_edit::LIMIT_LINE_PITCH_MM,
+            0.0,
+        ),
+        Some(stack) => (
+            stack.width_mm(),
+            super::dimension_edit::TOL_UPPER_RISE_MM,
+            super::dimension_edit::TOL_LOWER_DROP_MM,
+        ),
+        None => (
+            pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * font,
+            0.0,
+            0.0,
+        ),
+    };
+    let [ax, ay] = pd.text_anchor;
+    if pd.text_rot_deg.abs() < 1e-6 {
+        // Horizontal: centred text, baseline at text_anchor[1].
+        Rect2 {
+            x0: ax - text_w * 0.5,
+            y0: ay - font - rise,
+            x1: ax + text_w * 0.5,
+            y1: ay + drop,
+        }
+    } else {
+        // Vertical: rotated -90° about text_anchor. rotate(-90) maps the
+        // centred text span along ±y: x ∈ [ax − font, ax], y ∈ [ay − w/2,
+        // ay + w/2].
+        Rect2 {
+            x0: ax - font - rise,
+            y0: ay - text_w * 0.5,
+            x1: ax + drop,
+            y1: ay + text_w * 0.5,
+        }
+    }
+}
+
+/// The straight ink of a placed dimension: its dimension line (a leader's
+/// shoulder) and its two extension lines (a leader's leg), each segment that
+/// has length. Arrowheads and the text are not lines.
+pub(crate) fn placed_line_segments(pd: &PlacedDimension) -> Vec<[[f64; 2]; 2]> {
+    std::iter::once(pd.line)
+        .chain(extension_line_pieces(pd, 0))
+        .chain(extension_line_pieces(pd, 1))
+        .filter(|s| (s[0][0] - s[1][0]).hypot(s[0][1] - s[1][1]) > 1e-6)
+        .collect()
+}
+
+/// The inked pieces of extension line `i` (0 or 1) of a placed dimension:
+/// the whole line, or what is left of it between its breaks
+/// ([`PlacedDimension::ext_breaks`]). The one reading of a broken line --
+/// the SVG inks these pieces and the quality check tests these pieces.
+pub fn extension_line_pieces(pd: &PlacedDimension, i: usize) -> Vec<[[f64; 2]; 2]> {
+    let Some(seg) = pd.ext.get(i) else {
+        return Vec::new();
+    };
+    // The ends exactly as placed: a line drawn whole is the line itself.
+    let at = |t: f64| -> [f64; 2] {
+        if t <= 0.0 {
+            seg[0]
+        } else if t >= 1.0 {
+            seg[1]
+        } else {
+            [
+                seg[0][0] + (seg[1][0] - seg[0][0]) * t,
+                seg[0][1] + (seg[1][1] - seg[0][1]) * t,
+            ]
+        }
+    };
+    let mut breaks: Vec<[f64; 2]> = pd.ext_breaks.get(i).cloned().unwrap_or_default();
+    breaks.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut pieces = Vec::with_capacity(breaks.len() + 1);
+    let mut from = 0.0_f64;
+    for [t0, t1] in breaks {
+        let (t0, t1) = (t0.clamp(0.0, 1.0), t1.clamp(0.0, 1.0));
+        if t0 > from {
+            pieces.push([at(from), at(t0)]);
+        }
+        from = from.max(t1);
+    }
+    if from < 1.0 {
+        pieces.push([at(from), at(1.0)]);
+    }
+    pieces
+}
 
 /// Bounding box of a text string: `anchor_x` is the text start (SVG default
 /// text-anchor = start), `baseline_y` the baseline. The box spans one
@@ -197,6 +317,21 @@ pub(crate) const TGAP: f64 = 1.4; // label sits TGAP above/beside the dim line
 /// Gap between an extension line and a label placed OUTSIDE a span too short
 /// for it: clears the outside arrowhead (~3 mm) with a little air.
 pub(crate) const AR_OUTSIDE_CLEAR: f64 = 4.0;
+/// Clearance kept around a label placed outside its span when choosing which
+/// side of the span it goes on.
+pub(crate) const OUTSIDE_TEXT_AIR: f64 = 2.0;
+/// Half the width a dimension or extension line is given when it is tested
+/// against a label.
+pub(crate) const LINE_HALF: f64 = 0.15;
+/// The most a point leader's shoulder row rises above its point.
+pub(crate) const POINT_LEADER_MAX_RISE: f64 = 15.0;
+/// Two dimensions share a lane when their spans do not overlap by more than
+/// this: the two links of a chain meet at one extension line.
+pub(crate) const CHAIN_EPS: f64 = 1e-6;
+/// Most lanes one side of a view is searched for room on: far beyond what a
+/// sheet holds (the frame ends the search first); it bounds the search when
+/// no frame is given.
+pub(crate) const MAX_LANES: usize = 64;
 
 /// Arrowhead specification: tip point and direction vector (unit, pointing
 /// AWAY from the tip — i.e. the shaft direction, not the stab direction).
@@ -239,6 +374,24 @@ pub struct PlacedDimension {
     pub dim_id: String,
     /// Index into `drawing.views`.
     pub owner_view: usize,
+    /// `label` with its two tolerance lines stacked (bilateral deviations,
+    /// limits of size, a resolved ISO 286 class), when it has them. The SVG
+    /// and PDF ink this form; `label` stays the one-line text the DXF inks
+    /// and every collision box is measured from.
+    #[serde(default)]
+    pub stack: Option<super::dimension_edit::DimStack>,
+    /// A basic (theoretically exact) dimension: the text is drawn in a box.
+    #[serde(default)]
+    pub boxed: bool,
+    /// Where each extension line (`ext[0]`, `ext[1]`) is broken round
+    /// another dimension's number it would otherwise cross (ISO 129-1: an
+    /// extension line may be interrupted where it meets a dimension value).
+    /// Each break is `[t0, t1]`, `0 < t0 < t1 < 1`, as fractions of the
+    /// line from its start; the ink between is not drawn. Empty for a line
+    /// drawn whole. Read through [`extension_line_pieces`] by the renderer
+    /// and the quality check alike.
+    #[serde(default)]
+    pub ext_breaks: [Vec<[f64; 2]>; 2],
 }
 
 // ── Hole-tag placement ────────────────────────────────────────────────────────
@@ -1029,19 +1182,15 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     //
     // A hole PATTERN callout states its members' size and, with its location
     // and pitch dimensions, their position — the same holds for its rows.
-    let mut callout_faces = drawing
-        .round_part
-        .as_ref()
-        .map(|rp| rp.callout_faces())
-        .unwrap_or_default();
-    if let Some(hf) = &drawing.hole_features {
-        callout_faces.extend(hf.callout_faces());
-    }
-    let tabled_sites: Vec<HoleSite> = drawing
-        .hole_sites
-        .iter()
-        .filter(|s| !s.face_entities.iter().any(|f| callout_faces.contains(f)))
+    let tabled_sites: Vec<HoleSite> = tabled_hole_sites(drawing)
+        .into_iter()
         .cloned()
+        .map(|mut s| {
+            // The row's size cell carries the bore's tolerance and authored
+            // text, exactly as its dimension would.
+            s.dia_label = super::dimension_edit::hole_row_ink(drawing, &s);
+            s
+        })
         .collect();
     // Build the tabled-face-id set once so `place_dimensions` can suppress
     // position dims for tabled bores.
@@ -1050,6 +1199,12 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         .flat_map(|s| s.face_entities.iter().copied())
         .collect();
 
+    // The general notes are laid out after the dimensions but their place is
+    // fixed (bottom-left of the frame): a lane must not run through them.
+    let note_rects: Vec<Rect2> = place_note_items(drawing, mt + frame_h)
+        .into_iter()
+        .map(|it| it.bbox)
+        .collect();
     let mut all_placed: Vec<PlacedDimension> = Vec::new();
     for (idx, view) in drawing.views.iter().enumerate() {
         let (fml, fmr, fmt, fmb) = frame_margins(&drawing.sheet_size);
@@ -1063,16 +1218,18 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         let obstacles: Vec<Rect2> = items
             .iter()
             .filter(|it| {
-                (matches!(
-                    it.kind,
-                    SheetItemKind::ViewGeometry | SheetItemKind::ViewLabel
-                ) && it.owner_view != Some(idx))
+                // The view's own title is ink as well: a short dimension's
+                // outside label was printed across "TOP (1:1)".
+                (it.kind == SheetItemKind::ViewGeometry && it.owner_view != Some(idx))
                     || matches!(
                         it.kind,
-                        SheetItemKind::DimensionText | SheetItemKind::TitleBlock
+                        SheetItemKind::ViewLabel
+                            | SheetItemKind::DimensionText
+                            | SheetItemKind::TitleBlock
                     )
             })
             .map(|it| it.bbox)
+            .chain(note_rects.iter().copied())
             .chain(
                 // Other views' centre lines are ink too, and they overshoot
                 // the outline: a section's hole axes stuck out past its
@@ -1100,31 +1257,25 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
                     }),
             )
             .collect();
-        let pds = place_dimensions_routed(view, h, idx, &tabled_face_ids, Some(frame), &obstacles);
+        // The lines of every callout already placed (earlier views' leaders
+        // and dimension lines): a later callout's text must not sit on one.
+        let ink_lines: Vec<[[f64; 2]; 2]> =
+            all_placed.iter().flat_map(placed_line_segments).collect();
+        let pds = place_dimensions_routed(
+            view,
+            h,
+            idx,
+            &tabled_face_ids,
+            Some(frame),
+            &obstacles,
+            &ink_lines,
+            &drawing.dimension_edits,
+            drawing.document_unit,
+        );
         for pd in &pds {
-            let font = DIM_TEXT_FONT_MM;
-            let text_w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * font;
-            let (bx0, by0, bx1, by1) = if pd.text_rot_deg.abs() < 1e-6 {
-                // Horizontal: centred text, baseline at text_anchor[1].
-                let cx = pd.text_anchor[0];
-                let cy = pd.text_anchor[1];
-                (cx - text_w * 0.5, cy - font, cx + text_w * 0.5, cy)
-            } else {
-                // Vertical: rotated -90° about text_anchor.
-                // rotate(-90) maps the centred text span along ±y:
-                // x ∈ [ax − font, ax], y ∈ [ay − w/2, ay + w/2].
-                let ax = pd.text_anchor[0];
-                let ay = pd.text_anchor[1];
-                (ax - font, ay - text_w * 0.5, ax, ay + text_w * 0.5)
-            };
             items.push(SheetItem {
                 kind: SheetItemKind::DimensionText,
-                bbox: Rect2 {
-                    x0: bx0,
-                    y0: by0,
-                    x1: bx1,
-                    y1: by1,
-                },
+                bbox: placed_text_box(pd),
                 owner_view: Some(idx),
                 text: Some(pd.label.clone()),
             });
@@ -1138,7 +1289,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     //   2. HoleTableBorder + HoleTableText items for the bordered table.
     let mut hole_tags: Vec<PlacedHoleTag> = Vec::new();
     if !tabled_sites.is_empty() {
-        let (tags, table_items) = place_hole_table(drawing, &tabled_sites, h, &items);
+        let (tags, table_items) = place_hole_table(drawing, &tabled_sites, h, &items, &all_placed);
         hole_tags = tags;
         items.extend(table_items);
         // Datum-origin marker: the hole table's X/Y columns measure from the
@@ -1210,11 +1361,38 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     }
 }
 
+/// The hole sites that get a hole-table ROW: every site except the ones a
+/// round-part or hole-pattern callout states instead.
+fn tabled_hole_sites(drawing: &Drawing) -> Vec<&HoleSite> {
+    let mut callout_faces = drawing
+        .round_part
+        .as_ref()
+        .map(|rp| rp.callout_faces())
+        .unwrap_or_default();
+    if let Some(hf) = &drawing.hole_features {
+        callout_faces.extend(hf.callout_faces());
+    }
+    drawing
+        .hole_sites
+        .iter()
+        .filter(|s| !s.face_entities.iter().any(|f| callout_faces.contains(f)))
+        .collect()
+}
+
+/// The bore faces whose size and position the hole table states: their
+/// diameter and corner offsets are not drawn again as dimensions.
+pub(crate) fn tabled_face_ids(drawing: &Drawing) -> std::collections::HashSet<u32> {
+    tabled_hole_sites(drawing)
+        .into_iter()
+        .flat_map(|s| s.face_entities.iter().copied())
+        .collect()
+}
+
 // ── Zone-ref placement ────────────────────────────────────────────────────────
 
 /// Pitch constant used when computing zone cells: keeps layout and renderer in
 /// sync without a separate file-level const in svg.rs.
-const ZONE_FONT_MM: f64 = 3.0;
+const ZONE_FONT_MM: f64 = 3.6;
 
 /// Place zone-grid reference marks in the frame margin.
 ///
@@ -1322,11 +1500,11 @@ pub(crate) fn place_note_items(
     let x = ml + 2.5;
     let font = NOTES_FONT_MM;
 
-    // Three lines, 3 mm apart, reading upward from the frame bottom.
-    // y_proj is the topmost (farthest from bottom), y_bot the closest.
-    let y_proj = frame_bottom - 9.0; // the projection note
-    let y_top = frame_bottom - 6.0; // unit note
-    let y_bot = frame_bottom - 3.0; // tolerance note
+    // Three lines, NOTES_LINE_PITCH_MM apart, reading upward from the frame
+    // bottom. y_proj is the topmost (farthest from bottom), y_bot the closest.
+    let y_bot = frame_bottom - NOTES_BOTTOM_BASELINE_MM; // tolerance note
+    let y_top = y_bot - NOTES_LINE_PITCH_MM; // unit note
+    let y_proj = y_top - NOTES_LINE_PITCH_MM; // the projection note
 
     let notes = [
         (drawing.projection.note(), y_proj),
@@ -1370,7 +1548,7 @@ pub(crate) const HOLE_TAG_FONT_MM: f64 = TABLE_TEXT_FONT_MM;
 /// Cell padding (mm) around text inside table cells.
 const TABLE_CELL_PAD: f64 = 1.0;
 /// Row height (mm) for the table.
-const TABLE_ROW_H: f64 = 5.5;
+const TABLE_ROW_H: f64 = 6.5;
 /// Gap between the table right edge and the frame / title-block left edge.
 const TABLE_MARGIN: f64 = 3.0;
 
@@ -1398,6 +1576,9 @@ const TABLE_MARGIN: f64 = 3.0;
 /// 3. **BELOW-AXIAL slot** — left-aligned under the axial view's geometry
 ///    rect, 6 mm below it.
 ///
+/// 4. **ANYWHERE** — the lowest, then leftmost, free position of a 5 mm grid
+///    over the frame.
+///
 /// If no slot is collision-free the RIGHT slot is used and the verifier's
 /// collision checks report the residual overlap honestly (same fallback
 /// discipline as view labels — placement never silently hides a defect).
@@ -1406,6 +1587,7 @@ fn place_hole_table(
     sites: &[HoleSite],
     sheet_h: f64,
     existing: &[SheetItem],
+    dimensions: &[PlacedDimension],
 ) -> (Vec<PlacedHoleTag>, Vec<SheetItem>) {
     let w = drawing.sheet_size.width();
     let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
@@ -1458,10 +1640,11 @@ fn place_hole_table(
         Rect2 { x0, y0, x1, y1 }
     };
     let bottom_left_slot = {
-        // Clear of the notes strip: three 3 mm-pitch lines above the frame
-        // bottom → reserve 12 mm.
+        // Clear of the notes strip ([`NOTES_BAND_MM`]; it was a fixed 12 mm,
+        // which the ISO 3098 notes outgrew and the table's last row sat on
+        // the projection note).
         let x0 = ml + 2.0;
-        let y1 = (mt + frame_h) - 12.0;
+        let y1 = (mt + frame_h) - NOTES_BAND_MM - 1.5;
         Rect2 {
             x0,
             y0: y1 - total_h,
@@ -1495,6 +1678,24 @@ fn place_hole_table(
         x1: ml + frame_w,
         y1: mt + frame_h,
     };
+    // The general-notes strip (placed after the table, so not yet among
+    // `existing`): the band [`NOTES_BAND_MM`] tall over the widest note line.
+    let notes_rect = {
+        let widest = [
+            drawing.projection.note(),
+            drawing.unit_note.as_str(),
+            drawing.tolerance_note.as_str(),
+        ]
+        .iter()
+        .map(|t| t.chars().count() as f64 * GLYPH_ADVANCE_EM * NOTES_FONT_MM)
+        .fold(0.0_f64, f64::max);
+        Rect2 {
+            x0: ml,
+            y0: mt + frame_h - NOTES_BAND_MM,
+            x1: ml + 2.5 + widest,
+            y1: mt + frame_h,
+        }
+    };
     // NOTE on the tolerance sign: `Rect2::intersects(o, tol)` SHRINKS the
     // test by `tol` (overlap must exceed `tol` to count). Placement wants
     // CLEARANCE, so a NEGATIVE tol expands the test: −1.0 rejects any slot
@@ -1506,10 +1707,10 @@ fn place_hole_table(
             && r.y0 >= frame_rect.y0
             && r.x1 <= frame_rect.x1
             && r.y1 <= frame_rect.y1;
-        if !inside || r.intersects(&title_rect, -1.0) {
+        if !inside || r.intersects(&title_rect, -1.0) || r.intersects(&notes_rect, -1.0) {
             return false;
         }
-        !existing.iter().any(|it| {
+        if existing.iter().any(|it| {
             matches!(
                 it.kind,
                 SheetItemKind::ViewGeometry
@@ -1517,13 +1718,55 @@ fn place_hole_table(
                     | SheetItemKind::ViewLabel
                     | SheetItemKind::HoleTag
             ) && r.intersects(&it.bbox, -1.0)
+        }) {
+            return false;
+        }
+        // Nor across a dimension's lines: its dimension line, extension
+        // lines or a leader's leg (the table was laid over a view's lanes,
+        // clear of every label and through every line).
+        let grown = Rect2 {
+            x0: r.x0 - 1.0,
+            y0: r.y0 - 1.0,
+            x1: r.x1 + 1.0,
+            y1: r.y1 + 1.0,
+        };
+        !dimensions.iter().any(|pd| {
+            std::iter::once(&pd.line)
+                .chain(pd.ext.iter())
+                .any(|seg| segment_crosses_rect(seg, &grown))
         })
     };
 
+    // When none of the three named slots is free, any free place on the
+    // sheet: the lowest, then leftmost, position of a 5 mm grid over the
+    // frame. (The table used to fall straight back to the RIGHT slot, and on
+    // a sheet whose views filled the right it was printed across one.)
+    let anywhere = || -> Option<Rect2> {
+        const STEP: f64 = 5.0;
+        let mut y1 = frame_rect.y1 - 2.0;
+        while y1 - total_h >= frame_rect.y0 + 2.0 {
+            let mut x0 = frame_rect.x0 + 2.0;
+            while x0 + total_w <= frame_rect.x1 - 2.0 {
+                let r = Rect2 {
+                    x0,
+                    y0: y1 - total_h,
+                    x1: x0 + total_w,
+                    y1,
+                };
+                if fits(&r) {
+                    return Some(r);
+                }
+                x0 += STEP;
+            }
+            y1 -= STEP;
+        }
+        None
+    };
     let chosen = [Some(right_slot), Some(bottom_left_slot), below_axial_slot]
         .into_iter()
         .flatten()
         .find(fits)
+        .or_else(anywhere)
         // Fallback: RIGHT slot — the verifier reports the residual overlap.
         .unwrap_or(right_slot);
 
@@ -1637,6 +1880,8 @@ fn place_hole_table(
     // Place tag text at each bore's axial-view centre, with a deterministic
     // offset if that position would collide with existing dimension text.
     let mut placed_tags: Vec<PlacedHoleTag> = Vec::new();
+    let callout_lines: Vec<[[f64; 2]; 2]> =
+        dimensions.iter().flat_map(placed_line_segments).collect();
 
     let axial_idx = match drawing.axial_view_idx {
         Some(i) => i,
@@ -1692,7 +1937,11 @@ fn place_hole_table(
                 x1: cx + half_w,
                 y1: cy + half_h,
             };
-            if !obstacles.iter().any(|o| bbox.intersects(o, 0.2)) {
+            // Nor on a callout's line: a leader leg crossing the bore must
+            // not strike through its tag.
+            if !obstacles.iter().any(|o| bbox.intersects(o, 0.2))
+                && !callout_lines.iter().any(|l| segment_crosses_rect(l, &bbox))
+            {
                 chosen_anchor = [cx, cy];
                 let new_bbox = Rect2 {
                     x0: cx - half_w,
@@ -1733,6 +1982,50 @@ fn place_hole_table(
     }
 
     (placed_tags, new_items)
+}
+
+/// Does the segment pass through the open interior of `r`? Exact
+/// (Liang-Barsky clipping); a zero-length segment is one point. It sampled 65
+/// points along the segment, which steps over a 3.6 mm text box on a leader
+/// leg longer than about 230 mm.
+pub(crate) fn segment_crosses_rect(seg: &[[f64; 2]; 2], r: &Rect2) -> bool {
+    if r.x1 <= r.x0 || r.y1 <= r.y0 {
+        return false;
+    }
+    let [p, q] = *seg;
+    let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    // Each pair: (-d, p - lo) and (d, hi - p) per axis.
+    for (den, num) in [
+        (-dx, p[0] - r.x0),
+        (dx, r.x1 - p[0]),
+        (-dy, p[1] - r.y0),
+        (dy, r.y1 - p[1]),
+    ] {
+        if den == 0.0 {
+            // Parallel to this pair of edges: inside the open slab or never.
+            if num <= 0.0 {
+                return false;
+            }
+            continue;
+        }
+        let t = num / den;
+        if den < 0.0 {
+            // Entering edge.
+            if t > t1 {
+                return false;
+            }
+            t0 = t0.max(t);
+        } else {
+            // Leaving edge.
+            if t < t0 {
+                return false;
+            }
+            t1 = t1.min(t);
+        }
+    }
+    // A segment that only touches the boundary has t0 == t1 on an edge.
+    t1 - t0 > 1e-12 || (dx == 0.0 && dy == 0.0)
 }
 
 // ── Datum-origin marker placement ─────────────────────────────────────────────
@@ -1910,16 +2203,16 @@ pub(crate) fn place_cutting_plane_labels(
 
 /// Font size for GD&T annotation text (datum box label and FCF cells), mm.
 /// Matches `TABLE_TEXT_FONT_MM` (2.6 mm) — the same tier as hole-table text.
-pub(crate) const GDT_FONT_MM: f64 = 2.6;
+pub(crate) const GDT_FONT_MM: f64 = 3.6;
 
 /// Half-size of the datum-symbol box (the boxed letter), mm.
 /// The box is `2 × GDT_BOX_HALF` square. Chosen to comfortably frame a
 /// single capital letter at 2.6 mm font with 1 mm padding on each side.
-pub(crate) const GDT_BOX_HALF: f64 = 2.3;
+pub(crate) const GDT_BOX_HALF: f64 = 2.8;
 
 /// Height of a GD&T FCF block row, mm.  Must accommodate GDT_FONT_MM with
-/// 1 mm padding above and below: `GDT_FONT_MM + 2 × 1.0 = 4.6`.
-pub(crate) const GDT_BLOCK_H: f64 = 4.6;
+/// 1 mm padding above and below: `GDT_FONT_MM + 2 × 1.0 = 5.6`.
+pub(crate) const GDT_BLOCK_H: f64 = 5.6;
 
 /// Internal horizontal padding inside each FCF cell, mm.
 const GDT_CELL_PAD: f64 = 1.0;
@@ -2148,7 +2441,7 @@ fn dim_to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
 /// # Tabled-position AND tabled-diameter suppression (D2 fix)
 ///
 /// When `tabled_face_ids` is non-empty, every dimension with
-/// `kind == "position"` OR `kind == "diameter"` whose entity set intersects
+/// `kind == "position"` OR `kind == "diameter"` whose faces are all within
 /// `tabled_face_ids` is DROPPED from the general dimension stack. Positions
 /// are represented in the hole table's X/Y columns and tag callouts;
 /// diameters are represented in the hole table's Ø column keyed to the same
@@ -2166,20 +2459,22 @@ fn dim_to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
 /// already proven for positions rather than adding new leader-routing /
 /// collision-avoidance machinery.
 ///
-/// Interaction with `qualifies_for_baseline`: the baseline oracle applies
-/// only to the remaining (untabled) position dims. With all bores tabled,
-/// no baseline stack is drawn at all — the hole table IS the baseline.
+/// # Untabled positions
 ///
-/// # Baseline-or-nothing for untabled positions (Deliverable 3 rule)
+/// A position the hole table does not state (a boss, a notch's centre) is
+/// drawn as a dimension from its datum edge like any other; several from one
+/// edge stack as an ISO 129-1 baseline (one shared extension line, smallest
+/// nearest the part). They used to be drawn only when a view had three or
+/// more, which left a lone boss located by nothing.
 ///
-/// The untabled position dims render ONLY as an ISO 129-1 BASELINE stack:
-/// when this view carries ≥3 of them sharing one datum edge
-/// ([`qualifies_for_baseline`](super::hole_table::qualifies_for_baseline)),
-/// they join the `horiz`/`vert` stacks below, where the ascending-span sort
-/// produces exactly the baseline arrangement — one shared datum extension
-/// coordinate, parallel dim lines, smallest span nearest the part. With <3
-/// qualifying positions nothing renders (a lone corner offset is not
-/// chained; honest omission beats a nonstandard callout).
+/// # Lanes, and room
+///
+/// Parallel dimensions share a lane when their spans (and labels) do not
+/// overlap -- a chain -- and take the next lane out when they do, smallest
+/// span nearest the part. A lane is used only where the dimension's line and
+/// label stay inside the frame and off `obstacles`; a dimension with no such
+/// lane is NOT placed, and the sheet certificate reports it by name
+/// ([`super::completeness`]) rather than the sheet printing it over a view.
 pub(crate) fn place_dimensions(
     view: &ProjectedView,
     sheet_h: f64,
@@ -2202,7 +2497,17 @@ pub(crate) fn place_dimensions_in_frame(
     tabled_face_ids: &std::collections::HashSet<u32>,
     frame: Option<[f64; 4]>,
 ) -> Vec<PlacedDimension> {
-    place_dimensions_routed(view, sheet_h, owner, tabled_face_ids, frame, &[])
+    place_dimensions_routed(
+        view,
+        sheet_h,
+        owner,
+        tabled_face_ids,
+        frame,
+        &[],
+        &[],
+        &super::dimension_edit::DimensionEdits::new(),
+        crate::units::LengthUnit::default(),
+    )
 }
 
 /// [`place_dimensions_in_frame`], also keeping each hole-callout leader's
@@ -2210,6 +2515,19 @@ pub(crate) fn place_dimensions_in_frame(
 /// shoulder row is moved up, then down, one text row at a time until it is
 /// clear. Found by looking: three pattern callouts on TOP printed over
 /// SECTION A-A in the next column.
+///
+/// `ink_lines` are the lines (dimension lines, leader legs and shoulders) of
+/// the callouts already placed on the sheet: no text of this view is put on
+/// one, the way `verify_drawing` polices it.
+///
+/// `edits` is what was authored on the sheet's dimensions
+/// ([`super::dimension_edit`]), `unit` the sheet's document unit: a
+/// suppressed dimension is not placed, every other is placed with its
+/// authored tolerance and text in its label, and a dimension that was
+/// dragged is moved by its recorded shift AFTER the automatic placement (the
+/// rest of the stack is laid out as if it had not moved; an overlap the move
+/// causes is kept and reported by `verify_drawing`, never refused).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn place_dimensions_routed(
     view: &ProjectedView,
     sheet_h: f64,
@@ -2217,11 +2535,37 @@ pub(crate) fn place_dimensions_routed(
     tabled_face_ids: &std::collections::HashSet<u32>,
     frame: Option<[f64; 4]>,
     obstacles: &[Rect2],
+    ink_lines: &[[[f64; 2]; 2]],
+    edits: &super::dimension_edit::DimensionEdits,
+    unit: crate::units::LengthUnit,
 ) -> Vec<PlacedDimension> {
     let Some(gr) = view_geometry_rect(view, sheet_h) else {
         return Vec::new();
     };
     let bbox = [gr.x0, gr.y0, gr.x1, gr.y1];
+
+    // The dimensions as inked: suppressed ones gone, authored tolerance and
+    // text composed into the label (one function for layout, renderers and
+    // the certificate: `dimension_ink`).
+    let mut inks: std::collections::HashMap<
+        String,
+        (super::dimension_edit::DimInk, Option<[f64; 2]>),
+    > = std::collections::HashMap::new();
+    let shown: Vec<crate::drawing::dimensioning::Dimension2d> = view
+        .dimensions
+        .iter()
+        .filter_map(|d| {
+            let edit = d.key.as_ref().and_then(|k| edits.get(k));
+            if edit.is_some_and(|e| e.suppressed.is_some()) {
+                return None;
+            }
+            let ink = super::dimension_edit::dimension_ink(d, edit, unit);
+            let mut inked = d.clone();
+            inked.label = ink.label.clone();
+            inks.insert(d.id.clone(), (ink, edit.and_then(|e| e.text_shift_mm)));
+            Some(inked)
+        })
+        .collect();
 
     struct Lin {
         lo: f64,
@@ -2229,43 +2573,48 @@ pub(crate) fn place_dimensions_routed(
         span: f64,
         label: String,
         dim_id: String,
+        /// Width of the text as drawn (a stacked tolerance is narrower than
+        /// its one-line label).
+        text_w: f64,
+        /// Where the text is centred along the line when it fits inside the
+        /// span ([`clear_text_centre`]); the span's middle until the stack
+        /// is known.
+        tc: f64,
     }
     let mut horiz: Vec<Lin> = Vec::new();
     let mut vert: Vec<Lin> = Vec::new();
     let mut result: Vec<PlacedDimension> = Vec::new();
 
     // Tabled predicate: this bore's X/Y and/or Ø live in the hole table
-    // (D2 fix — diameter joins position in the suppression).
+    // (D2 fix — diameter joins position in the suppression). Only a
+    // dimension of the bore's OWN faces is the table's: a location measured
+    // to a boss AND the bore through it (CADGenBench 124: "27.5" to C1's boss)
+    // is not in any row (C1's X and Y read "—"), and suppressing it because
+    // one of its faces was tabled left the boss located nowhere -- the
+    // certificate, which credits a row only with dimensions of its faces,
+    // reported it not dimensioned.
     let is_tabled = |d: &crate::drawing::dimensioning::Dimension2d| -> bool {
         matches!(d.kind.as_str(), "position" | "diameter")
-            && !tabled_face_ids.is_empty()
-            && d.entities.iter().any(|eid| tabled_face_ids.contains(eid))
+            && !d.entities.is_empty()
+            && d.entities.iter().all(|eid| tabled_face_ids.contains(eid))
     };
 
-    // Baseline qualification is decided on the UNTABLED positions only —
-    // a tabled bore's position must neither render nor help its untabled
-    // neighbours reach the ≥3 threshold.
-    let untabled_positions: Vec<crate::drawing::dimensioning::Dimension2d> = view
-        .dimensions
-        .iter()
-        .filter(|d| d.kind == "position" && !is_tabled(d))
-        .cloned()
-        .collect();
-    let baseline = super::hole_table::qualifies_for_baseline(&untabled_positions);
     // Shoulder heights already taken by a leader on each side of this view.
     let mut leader_rows: Vec<(f64, f64)> = Vec::new();
+    // Width of a dimension's text as the sheet draws it.
+    let drawn_width = |d: &crate::drawing::dimensioning::Dimension2d| -> f64 {
+        inks.get(&d.id).map_or_else(
+            || d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM,
+            |(ink, _)| ink.width_mm(),
+        )
+    };
 
-    for d in &view.dimensions {
+    for d in &shown {
         // Tabled-position / tabled-diameter suppression: skip position or
-        // diameter dims whose entity set intersects any tabled bore's face
-        // ids. These X/Y/Ø values are represented in the hole table and
+        // diameter dims whose faces are all tabled bore
+        // faces. These X/Y/Ø values are represented in the hole table and
         // must not appear again in the general dimension stack (D2 fix).
         if is_tabled(d) {
-            continue;
-        }
-        // Baseline-or-nothing: untabled positions render only as a
-        // qualifying baseline stack (see doc comment above).
-        if d.kind == "position" && !baseline {
             continue;
         }
         let a = dim_to_sheet(view, sheet_h, d.a);
@@ -2291,30 +2640,67 @@ pub(crate) fn place_dimensions_routed(
         // A blend callout ("R3.00", "0.50 × 45°") takes the same leader, its
         // arrow on the blend's profile point `a`: the leader routing below
         // treats it as a hole of radius zero centred there.
-        let leader = if d.kind == "hole_callout" && (dx > 1e-6 || dy > 1e-6) {
+        // A diameter seen as a circle that is too small to hold its own
+        // label (a pin, a small boss) is called out on a leader like a hole:
+        // as a dimension its label hung outside a span a few millimetres
+        // long, off the circle it sizes.
+        let small_circle = d.kind == "diameter"
+            && drawn_width(d) > dx.max(dy)
+            && match (
+                d.axis3,
+                crate::drawing::dimensioning::view_dir(&view.projection),
+            ) {
+                (Some(ax), Some(vd)) => {
+                    (ax[0] * vd[0] + ax[1] * vd[1] + ax[2] * vd[2]).abs() > 0.99
+                }
+                _ => false,
+            };
+        let leader = if (d.kind == "hole_callout" || small_circle) && (dx > 1e-6 || dy > 1e-6) {
             Some((
                 [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])],
                 0.5 * (a[0] - b[0]).hypot(a[1] - b[1]),
             ))
-        } else if crate::drawing::dimensioning::is_blend_callout(&d.kind) {
+        } else if crate::drawing::dimensioning::is_blend_callout(&d.kind) || d.kind == "radius" {
+            // An arc's radius: the arrow touches the arc at `a` (its span
+            // runs from there to the arc's centre).
             Some((a, 0.0))
         } else {
             None
         };
         if let Some((centre, r)) = leader {
+            // Callouts already placed -- this view's, and (`ink_lines`) the
+            // lines of earlier views': this callout's text must not sit on
+            // their lines, nor its leg and shoulder run through their text.
+            let prior_lines: Vec<[[f64; 2]; 2]> = result
+                .iter()
+                .flat_map(placed_line_segments)
+                .chain(ink_lines.iter().copied())
+                .collect();
+            let prior_texts: Vec<Rect2> = result.iter().map(placed_text_box).collect();
             // A qualifier in parentheses ("(1ST AT 45.0°)") goes on a second
             // line UNDER the shoulder, the way a drafter writes a two-line
             // callout -- one 70 mm line ran off the sheet.
-            let (main, note) = match d.label.split_once(" (") {
-                Some((m, n)) => (m.to_string(), Some(n.trim_end_matches(')').to_string())),
-                None => (d.label.clone(), None),
+            // Only a TRAILING parenthesis is a qualifier: an ISO 286 class
+            // inks its limits in parentheses mid-label
+            // ("4x O6.60 H7 (+0.015/0) THRU"), and those stay on the line.
+            let (main, note) = match d.label.rsplit_once(" (") {
+                Some((m, n)) if d.label.ends_with(')') => {
+                    (m.to_string(), Some(n.trim_end_matches(')').to_string()))
+                }
+                _ => (d.label.clone(), None),
             };
             let width_of = |t: &str| t.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
             let text_w = note
                 .as_deref()
                 .map(width_of)
                 .unwrap_or(0.0)
-                .max(width_of(&main));
+                // The whole label on the shoulder is drawn with its
+                // tolerance stacked; a label split over two lines is not.
+                .max(if note.is_none() {
+                    drawn_width(d)
+                } else {
+                    width_of(&main)
+                });
             // Ink below the shoulder: the second line, when there is one.
             let below = if note.is_some() {
                 TGAP + DIM_TEXT_FONT_MM
@@ -2332,7 +2718,24 @@ pub(crate) fn place_dimensions_routed(
                 }
                 None => true,
             };
+            // A leader goes to the view's right (the vertical lanes own the
+            // left) unless it would leave the frame there.
+            let point_leader = r == 0.0;
             let preferred = if fits(1.0) || !fits(-1.0) { 1.0 } else { -1.0 };
+            // How far the shoulder row rises above the feature: 45 degrees
+            // for a hole callout, and no more than a short rise for a POINT
+            // leader -- an arc's radius, a fillet, a chamfer. At 45 degrees
+            // the leg from a point on the far side of a view climbed to the
+            // top of the sheet, and on a busy part a dozen of them crossed
+            // it.
+            let rise = |elbow_x: f64| -> f64 {
+                let run = (elbow_x - centre[0]).abs();
+                if point_leader {
+                    run.min(POINT_LEADER_MAX_RISE)
+                } else {
+                    run
+                }
+            };
             // Where the shoulder may go, in order: the preferred side one
             // standoff out, then further out on that side, then the other
             // side. A callout whose first side had no clear row used to be
@@ -2359,7 +2762,7 @@ pub(crate) fn place_dimensions_routed(
             let bottom = frame.map(|f| f[3] - 1.0).unwrap_or(f64::INFINITY);
             let mut placed: Option<(f64, f64, f64)> = None;
             for &(side, elbow_x) in &shoulders {
-                let nominal = (centre[1] - (elbow_x - centre[0]).abs()).max(top);
+                let nominal = (centre[1] - rise(elbow_x)).max(top);
                 // The shoulder + text box for a row at `y`.
                 let text_box = |y: f64| {
                     let (x0, x1) = if side > 0.0 {
@@ -2404,17 +2807,42 @@ pub(crate) fn place_dimensions_routed(
                     });
                     // Nor may it run through another view, a view title or text
                     // already placed: the mounting plate's counterbore leader was
-                    // drawn straight through "SECTION A-A (1:1)". Sampled along
-                    // the leg (exact enough at drafting scale, and deterministic).
-                    let clear_of_ink = obstacles.iter().all(|o| {
-                        !(1..64).any(|k| {
-                            let t = k as f64 / 64.0;
-                            let x = tip[0] + ux * t;
-                            let yy = tip[1] + uy * t;
-                            x > o.x0 && x < o.x1 && yy > o.y0 && yy < o.y1
-                        })
-                    });
+                    // drawn straight through "SECTION A-A (1:1)". Tested
+                    // exactly: sampled at 63 points, a long leg stepped over a
+                    // line of text.
+                    let leg = [tip, [elbow_x, y]];
+                    let clear_of_ink = obstacles.iter().all(|o| !segment_crosses_rect(&leg, o));
                     clear_of_holes && clear_of_ink
+                };
+                // This callout's own lines and text at a row `y`: the text as
+                // the layout boxes it (`placed_text_box`: one font height
+                // above the shoulder's TGAP), the leg and the shoulder.
+                let own_ink = |y: f64| -> (Rect2, [[[f64; 2]; 2]; 2]) {
+                    let (x0, x1) = if side > 0.0 {
+                        (elbow_x, elbow_x + text_w + 2.0)
+                    } else {
+                        (elbow_x - text_w - 2.0, elbow_x)
+                    };
+                    let cx = 0.5 * (x0 + x1);
+                    let text = Rect2 {
+                        x0: cx - 0.5 * text_w,
+                        y0: y - TGAP - DIM_TEXT_FONT_MM,
+                        x1: cx + 0.5 * text_w,
+                        y1: y - TGAP,
+                    };
+                    let (vx, vy) = (elbow_x - centre[0], y - centre[1]);
+                    let len = vx.hypot(vy).max(1e-9);
+                    let tip = [centre[0] + vx / len * r, centre[1] + vy / len * r];
+                    let elbow = [elbow_x, y];
+                    let end = [elbow_x + side * (text_w + 2.0), y];
+                    (text, [[tip, elbow], [elbow, end]])
+                };
+                let crosses_placed = |y: f64| {
+                    let (text, lines) = own_ink(y);
+                    prior_lines.iter().any(|l| segment_crosses_rect(l, &text))
+                        || prior_texts
+                            .iter()
+                            .any(|t| lines.iter().any(|l| segment_crosses_rect(l, t)))
                 };
                 let free = |y: f64| {
                     let b = text_box(y);
@@ -2425,6 +2853,7 @@ pub(crate) fn place_dimensions_routed(
                             .any(|&(s, ly)| s == side && (ly - y).abs() < row)
                         && !obstacles.iter().any(|o| o.intersects(&b, 0.0))
                         && leg_is_clear(y)
+                        && !crosses_placed(y)
                 };
                 // Nearest free row to the nominal one: up first, then down.
                 let mut ey = nominal;
@@ -2459,7 +2888,7 @@ pub(crate) fn place_dimensions_routed(
                         .first()
                         .copied()
                         .unwrap_or((preferred, bbox[2] + STANDOFF));
-                    let mut ey = (centre[1] - (elbow_x - centre[0]).abs()).max(top);
+                    let mut ey = (centre[1] - rise(elbow_x)).max(top);
                     while leader_rows
                         .iter()
                         .any(|&(s, y)| s == side && (y - ey).abs() < row)
@@ -2511,6 +2940,9 @@ pub(crate) fn place_dimensions_routed(
                 label: main,
                 dim_id: d.id.clone(),
                 owner_view: owner,
+                stack: None,
+                boxed: false,
+                ext_breaks: Default::default(),
             });
             if let Some(note) = note {
                 // Second line: text only (degenerate geometry, like a point
@@ -2537,6 +2969,9 @@ pub(crate) fn place_dimensions_routed(
                     label: note,
                     dim_id: format!("{}-note", d.id),
                     owner_view: owner,
+                    stack: None,
+                    boxed: false,
+                    ext_breaks: Default::default(),
                 });
             }
             continue;
@@ -2567,6 +3002,9 @@ pub(crate) fn place_dimensions_routed(
                 label: d.label.clone(),
                 dim_id: d.id.clone(),
                 owner_view: owner,
+                stack: None,
+                boxed: false,
+                ext_breaks: Default::default(),
             });
             continue;
         }
@@ -2578,6 +3016,8 @@ pub(crate) fn place_dimensions_routed(
                 span: dx,
                 label: d.label.clone(),
                 dim_id: d.id.clone(),
+                text_w: drawn_width(d),
+                tc: 0.5 * (a[0] + b[0]),
             });
         } else {
             vert.push(Lin {
@@ -2586,6 +3026,8 @@ pub(crate) fn place_dimensions_routed(
                 span: dy,
                 label: d.label.clone(),
                 dim_id: d.id.clone(),
+                text_w: drawn_width(d),
+                tc: 0.5 * (a[1] + b[1]),
             });
         }
     }
@@ -2599,93 +3041,639 @@ pub(crate) fn place_dimensions_routed(
     };
     horiz.sort_by(by_span);
     vert.sort_by(by_span);
-
-    // Horizontal extents — stacked below the part (increasing sheet-y).
-    let mut level = bbox[3] + STANDOFF;
-    for d in &horiz {
-        // Extension lines from part edge → level + EXT (overshoot).
-        let ext_a = [[d.lo, bbox[3] + GAP], [d.lo, level + EXT]];
-        let ext_b = [[d.hi, bbox[3] + GAP], [d.hi, level + EXT]];
-        // Dim line at `level`.
-        let line = [[d.lo, level], [d.hi, level]];
-        // A label wider than its span goes OUTSIDE, past the right extension
-        // line, with the arrows outside pointing in (ISO 129-1 §6.3) --
-        // centred, it would overrun its own arrows.
-        let text_w = d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
-        let outside = text_w > d.span;
-        // `dir` points from the tip toward the arrow's base: inside arrows
-        // have their bases inside the span, outside arrows outside it.
-        let s_in = if outside { -1.0 } else { 1.0 };
-        let ar_a = ArrowSpec {
-            tip: [d.lo, level],
-            dir: [s_in, 0.0],
-        };
-        let ar_b = ArrowSpec {
-            tip: [d.hi, level],
-            dir: [-s_in, 0.0],
-        };
-        let tx = if outside {
-            d.hi + AR_OUTSIDE_CLEAR + 0.5 * text_w
-        } else {
-            0.5 * (d.lo + d.hi)
-        };
-        let ty = level - TGAP;
-        result.push(PlacedDimension {
-            line,
-            ext: [ext_a, ext_b],
-            arrows: [ar_a, ar_b],
-            text_anchor: [tx, ty],
-            text_rot_deg: 0.0,
-            label: d.label.clone(),
-            dim_id: d.dim_id.clone(),
-            owner_view: owner,
-        });
-        level += STACK;
+    // ...except that a dimension whose extension line would cross another's
+    // number goes nearer the part than it, so the line stops short of it.
+    for stack in [&mut horiz, &mut vert] {
+        // A number that fits its span is slid along it off the other
+        // dimensions' extension lines.
+        let ends: Vec<f64> = stack.iter().flat_map(|d| [d.lo, d.hi]).collect();
+        for d in stack.iter_mut() {
+            d.tc = clear_text_centre(d.lo, d.hi, d.text_w, &ends);
+        }
+        let spans: Vec<(f64, f64, f64, f64)> =
+            stack.iter().map(|d| (d.lo, d.hi, d.text_w, d.tc)).collect();
+        let order = clear_text_order(&spans);
+        let mut taken: Vec<Option<Lin>> = std::mem::take(stack).into_iter().map(Some).collect();
+        for i in order {
+            if let Some(d) = taken.get_mut(i).and_then(Option::take) {
+                stack.push(d);
+            }
+        }
     }
 
-    // Vertical extents — stacked to the left of the part (decreasing sheet-x).
-    let mut level = bbox[0] - STANDOFF;
-    for d in &vert {
-        // Extension lines from part edge → level − EXT (overshoot).
-        let ext_a = [[bbox[0] - GAP, d.lo], [level - EXT, d.lo]];
-        let ext_b = [[bbox[0] - GAP, d.hi], [level - EXT, d.hi]];
-        // Dim line at `level`.
-        let line = [[level, d.lo], [level, d.hi]];
-        // Too short for its label: text OUTSIDE, above the top extension line,
-        // arrows outside pointing in (same rule as the horizontal stack).
-        let text_w = d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
-        let outside = text_w > d.span;
-        let s_in = if outside { -1.0 } else { 1.0 };
-        let ar_a = ArrowSpec {
-            tip: [level, d.lo],
-            dir: [0.0, s_in],
-        };
-        let ar_b = ArrowSpec {
-            tip: [level, d.hi],
-            dir: [0.0, -s_in],
-        };
-        // Text TGAP to the right of the dim line (x decreases leftward, so the
-        // text x-anchor = level − TGAP, rotated -90°).
-        let tx = level - TGAP;
-        let ty = if outside {
-            d.lo - AR_OUTSIDE_CLEAR - 0.5 * text_w
+    // Room: ink is placed only inside the frame and off every obstacle --
+    // other views, their titles and centre lines, text already placed (this
+    // view's leaders and point callouts included), the title block.
+    let own_text: Vec<Rect2> = result
+        .iter()
+        .map(|pd| {
+            let w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
+            Rect2 {
+                x0: pd.text_anchor[0] - 0.5 * w,
+                y0: pd.text_anchor[1] - DIM_TEXT_FONT_MM,
+                x1: pd.text_anchor[0] + 0.5 * w,
+                y1: pd.text_anchor[1],
+            }
+        })
+        .collect();
+    let clear = |b: &Rect2| -> bool {
+        frame.map_or(true, |f| {
+            b.x0 >= f[0] && b.y0 >= f[1] && b.x1 <= f[2] && b.y1 <= f[3]
+        }) && !obstacles
+            .iter()
+            .chain(own_text.iter())
+            .any(|o| o.intersects(b, 0.0))
+    };
+    // A lane's occupied intervals along the dimension direction.
+    let lane_is_free = |lane: Option<&Vec<(f64, f64)>>, occ: (f64, f64)| -> bool {
+        lane.map_or(true, |l| {
+            l.iter()
+                .all(|&(a, b)| occ.1 <= a + CHAIN_EPS || occ.0 >= b - CHAIN_EPS)
+        })
+    };
+
+    // Horizontal dimensions go in lanes BELOW the part, vertical ones in
+    // lanes to its LEFT (ISO 129 practice, and where the view layout leaves
+    // room). When that side has no free lane left -- the frame, another view
+    // -- the dimension goes on the opposite side: above, or to the right.
+    //
+    // `out` is +1 for a side whose lanes run toward increasing sheet
+    // coordinate (below, right) and -1 for the other (above, left); `edge`
+    // is the part's edge on that side.
+    let mut stack_texts: Vec<Rect2> = Vec::new();
+    let mut stack_lines: Vec<Rect2> = Vec::new();
+    for (stack, horizontal) in [(&horiz, true), (&vert, false)] {
+        let sides: [(f64, f64); 2] = if horizontal {
+            [(1.0, bbox[3]), (-1.0, bbox[1])]
         } else {
-            0.5 * (d.lo + d.hi)
+            [(-1.0, bbox[0]), (1.0, bbox[2])]
         };
-        result.push(PlacedDimension {
-            line,
-            ext: [ext_a, ext_b],
-            arrows: [ar_a, ar_b],
-            text_anchor: [tx, ty],
-            text_rot_deg: -90.0,
-            label: d.label.clone(),
-            dim_id: d.dim_id.clone(),
-            owner_view: owner,
-        });
-        level -= STACK;
+        let mut lanes: [Vec<Vec<(f64, f64)>>; 2] = [Vec::new(), Vec::new()];
+        for d in stack.iter() {
+            let text_w = d.text_w;
+            // A label wider than its span goes OUTSIDE, past one extension
+            // line, with the arrows outside pointing in (ISO 129-1 §6.3) --
+            // centred, it would overrun its own arrows. Right of a
+            // horizontal span (left when that place is taken), above a
+            // vertical one (below when that is taken).
+            let outside = text_w > d.span;
+            // Past one end of the span: right of a horizontal one (left when
+            // that place is taken), above a vertical one (below when taken).
+            let outside_centres: Vec<f64> = if horizontal {
+                vec![
+                    d.hi + AR_OUTSIDE_CLEAR + 0.5 * text_w,
+                    d.lo - AR_OUTSIDE_CLEAR - 0.5 * text_w,
+                ]
+            } else {
+                vec![
+                    d.lo - AR_OUTSIDE_CLEAR - 0.5 * text_w,
+                    d.hi + AR_OUTSIDE_CLEAR + 0.5 * text_w,
+                ]
+            };
+            // A rect from `(along, across)` corners in this stack's axes.
+            let rect = |a0: f64, a1: f64, c0: f64, c1: f64| -> Rect2 {
+                let (c0, c1) = (c0.min(c1), c0.max(c1));
+                if horizontal {
+                    Rect2 {
+                        x0: a0,
+                        y0: c0,
+                        x1: a1,
+                        y1: c1,
+                    }
+                } else {
+                    Rect2 {
+                        x0: c0,
+                        y0: a0,
+                        x1: c1,
+                        y1: a1,
+                    }
+                }
+            };
+            // (side index, level of the dimension line, text centre, the
+            // label's box, the three line boxes, text outside the span)
+            let mut spot: Option<(usize, f64, f64, Rect2, [Rect2; 3], bool)> = None;
+            // First a place where no label lies across a line of this view's
+            // other dimensions (a label over an extension line reads as
+            // struck through); then, for a label that fits its span, the same
+            // with the label taken outside the span past one end (ISO 129-1
+            // allows it, and in a dense ladder every lane can have another
+            // dimension's extension line across the span's middle:
+            // CADGenBench 124's TOP); failing both, any free lane.
+            let passes: &[(bool, bool)] = if outside {
+                &[(true, true), (false, true)]
+            } else {
+                &[(true, false), (true, true), (false, false)]
+            };
+            'search: for &(strict, out_of_span) in passes {
+                let centres: Vec<f64> = if out_of_span {
+                    outside_centres.clone()
+                } else {
+                    vec![d.tc]
+                };
+                let air = if out_of_span { OUTSIDE_TEXT_AIR } else { 0.0 };
+                for (si, &(out, edge)) in sides.iter().enumerate() {
+                    for lane in 0..MAX_LANES {
+                        let level = edge + out * (STANDOFF + lane as f64 * STACK);
+                        // The text is always above a horizontal line and to
+                        // the left of a vertical one, whichever side the
+                        // lane is on.
+                        let text_far = level - TGAP - DIM_TEXT_FONT_MM;
+                        let (near, far) = if out > 0.0 {
+                            (text_far - air, level + EXT)
+                        } else {
+                            ((text_far - air).min(level - EXT), level)
+                        };
+                        if let Some(f) = frame {
+                            let (lo_limit, hi_limit) = if horizontal {
+                                (f[1], f[3])
+                            } else {
+                                (f[0], f[2])
+                            };
+                            if near < lo_limit || far > hi_limit {
+                                break;
+                            }
+                        }
+                        for &tc in &centres {
+                            let (a0, a1) = (
+                                d.lo.min(tc - 0.5 * text_w - air),
+                                d.hi.max(tc + 0.5 * text_w + air),
+                            );
+                            // The lane's own ink, and the extension lines
+                            // running to it from the part's edge: neither
+                            // may cross another view or its title.
+                            if !lane_is_free(lanes[si].get(lane), (a0, a1))
+                                || !clear(&rect(a0, a1, near, far))
+                                || !clear(&rect(d.lo, d.hi, edge + out * GAP, level))
+                            {
+                                continue;
+                            }
+                            let text =
+                                rect(tc - 0.5 * text_w, tc + 0.5 * text_w, text_far, level - TGAP);
+                            // An earlier view's leader leg crossing this
+                            // lane would strike through the number.
+                            if ink_lines.iter().any(|l| segment_crosses_rect(l, &text)) {
+                                continue;
+                            }
+                            // The dimension line runs out under a label taken
+                            // outside the span.
+                            let (l0, l1) = (d.lo.min(a0 + air), d.hi.max(a1 - air));
+                            let lines = [
+                                rect(d.lo - LINE_HALF, d.lo + LINE_HALF, edge, level + out * EXT),
+                                rect(d.hi - LINE_HALF, d.hi + LINE_HALF, edge, level + out * EXT),
+                                rect(l0, l1, level - LINE_HALF, level + LINE_HALF),
+                            ];
+                            if strict
+                                && (stack_lines.iter().any(|l| l.intersects(&text, 0.0))
+                                    || stack_texts
+                                        .iter()
+                                        .any(|t| lines.iter().any(|l| l.intersects(t, 0.0))))
+                            {
+                                continue;
+                            }
+                            while lanes[si].len() <= lane {
+                                lanes[si].push(Vec::new());
+                            }
+                            lanes[si][lane].push((a0, a1));
+                            spot = Some((si, level, tc, text, lines, out_of_span));
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            let Some((si, level, tc, text, lines, taken_out)) = spot else {
+                // No room on either side: not placed, and reported as such
+                // by the certificate.
+                continue;
+            };
+            stack_texts.push(text);
+            stack_lines.extend(lines);
+            let (out, edge) = sides[si];
+            // `dir` points from the tip toward the arrow's base: inside
+            // arrows have their bases inside the span, outside arrows
+            // outside it.
+            let s_in = if outside { -1.0 } else { 1.0 };
+            // A label that fits its span but was taken outside it sits on the
+            // dimension line run out past that end; its arrows stay inside.
+            let (line_lo, line_hi) = if taken_out && !outside {
+                (d.lo.min(tc - 0.5 * text_w), d.hi.max(tc + 0.5 * text_w))
+            } else {
+                (d.lo, d.hi)
+            };
+            // A point at `along` the dimension direction and `across` it.
+            let at = |along: f64, across: f64| -> [f64; 2] {
+                if horizontal {
+                    [along, across]
+                } else {
+                    [across, along]
+                }
+            };
+            let unit_along = |sign: f64| -> [f64; 2] {
+                if horizontal {
+                    [sign, 0.0]
+                } else {
+                    [0.0, sign]
+                }
+            };
+            result.push(PlacedDimension {
+                line: [at(line_lo, level), at(line_hi, level)],
+                // Extension lines from the part's edge to just past the line.
+                ext: [
+                    [at(d.lo, edge + out * GAP), at(d.lo, level + out * EXT)],
+                    [at(d.hi, edge + out * GAP), at(d.hi, level + out * EXT)],
+                ],
+                arrows: [
+                    ArrowSpec {
+                        tip: at(d.lo, level),
+                        dir: unit_along(s_in),
+                    },
+                    ArrowSpec {
+                        tip: at(d.hi, level),
+                        dir: unit_along(-s_in),
+                    },
+                ],
+                // TGAP off the line: above it, or (turned -90°) left of it.
+                text_anchor: at(tc, level - TGAP),
+                text_rot_deg: if horizontal { 0.0 } else { -90.0 },
+                label: d.label.clone(),
+                dim_id: d.dim_id.clone(),
+                owner_view: owner,
+                stack: None,
+                boxed: false,
+                ext_breaks: Default::default(),
+            });
+        }
     }
+
+    // Authored presentation: the stacked tolerance / basic box of the label
+    // as placed, then the recorded drag.
+    for pd in &mut result {
+        let id = pd.dim_id.strip_suffix("-note").unwrap_or(&pd.dim_id);
+        let Some((ink, shift)) = inks.get(id) else {
+            continue;
+        };
+        if pd.label == ink.label {
+            pd.stack = ink.stack.clone();
+            pd.boxed = ink.boxed;
+        }
+        if let Some(by) = shift {
+            shift_placed_dimension(pd, *by);
+        }
+    }
+
+    // What no lane order keeps clear -- an extension line run out across
+    // another dimension's number -- is broken round the number.
+    break_extension_lines_round_numbers(&mut result);
 
     result
+}
+
+/// Air left between a broken extension line and the number it is broken
+/// round (paper mm).
+const EXT_BREAK_CLEAR: f64 = 0.5;
+/// Shortest piece a broken extension line may leave (paper mm): a stub
+/// shorter than this no longer reads as part of the line.
+const EXT_BREAK_MIN_PIECE: f64 = 1.0;
+
+/// Break each extension line of a view's stacked dimensions where it would
+/// run through the number of another of them (ISO 129-1: a dimension value
+/// is not crossed by any line; an extension line may be interrupted there).
+///
+/// In a dense ladder every lane can have another dimension's extension line
+/// across it, and a number may have no place along its own span that none
+/// crosses: CADGenBench 124's FRONT, "12.5" between the ends of "29" and
+/// "30" half a millimetre apart, and its TOP, "3x O20" taken outside its span
+/// where "64.4" and "74.4" run out. The lane order keeps what it can clear
+/// ([`clear_text_order`]); this takes out the rest.
+///
+/// Only an extension line is broken -- never a dimension line or a leader's
+/// leg (`ext[0]` of a callout whose `ext[1]` is a point) -- and only where
+/// both pieces stay legible: the piece at the part at least
+/// [`EXT_BREAK_MIN_PIECE`] long, and the piece at the dimension line running
+/// that much short of the line besides its overshoot. A crossing that cannot
+/// be broken so is left whole, and the quality check reports it.
+///
+/// The break is recorded on the dimension ([`PlacedDimension::ext_breaks`])
+/// and read through [`extension_line_pieces`] by the renderer and the check
+/// alike, so the sheet certified is the sheet drawn.
+fn break_extension_lines_round_numbers(placed: &mut [PlacedDimension]) {
+    let has_length = |s: &[[f64; 2]; 2]| (s[1][0] - s[0][0]).hypot(s[1][1] - s[0][1]) > 1e-6;
+    // The number each dimension prints, shrunk by the tolerance the check
+    // allows a line grazing a box (`verify`'s 0.2 mm).
+    let numbers: Vec<Option<Rect2>> = placed
+        .iter()
+        .map(|pd| {
+            if pd.label.is_empty() {
+                return None;
+            }
+            let t = placed_text_box(pd);
+            let inner = Rect2 {
+                x0: t.x0 + 0.2,
+                y0: t.y0 + 0.2,
+                x1: t.x1 - 0.2,
+                y1: t.y1 - 0.2,
+            };
+            (inner.x1 > inner.x0 && inner.y1 > inner.y0).then_some(inner)
+        })
+        .collect();
+    for (k, pd) in placed.iter_mut().enumerate() {
+        // A stacked linear dimension: a dimension line and two extension
+        // lines. A leader (point second line) and a point callout are not.
+        if !has_length(&pd.line) || !has_length(&pd.ext[1]) {
+            continue;
+        }
+        for i in 0..2 {
+            let seg = pd.ext[i];
+            let len = (seg[1][0] - seg[0][0]).hypot(seg[1][1] - seg[0][1]);
+            if len < 1e-6 {
+                continue;
+            }
+            // Fractions along the line where the pieces must survive: the
+            // part's end, and the dimension line's (its overshoot `EXT` and
+            // a stub inside it).
+            let t_min = EXT_BREAK_MIN_PIECE / len;
+            let t_max = 1.0 - (EXT + EXT_BREAK_MIN_PIECE) / len;
+            let mut breaks: Vec<[f64; 2]> = Vec::new();
+            for (j, number) in numbers.iter().enumerate() {
+                let Some(number) = number else {
+                    continue;
+                };
+                if j == k || !segment_crosses_rect(&seg, number) {
+                    continue;
+                }
+                let around = Rect2 {
+                    x0: number.x0 - 0.2 - EXT_BREAK_CLEAR,
+                    y0: number.y0 - 0.2 - EXT_BREAK_CLEAR,
+                    x1: number.x1 + 0.2 + EXT_BREAK_CLEAR,
+                    y1: number.y1 + 0.2 + EXT_BREAK_CLEAR,
+                };
+                let Some((t0, t1)) = segment_span_in_rect(&seg, &around) else {
+                    continue;
+                };
+                if t0 >= t_min && t1 <= t_max {
+                    breaks.push([t0, t1]);
+                }
+            }
+            if breaks.is_empty() {
+                continue;
+            }
+            // Overlapping breaks are one break.
+            breaks.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut merged: Vec<[f64; 2]> = Vec::with_capacity(breaks.len());
+            for b in breaks {
+                match merged.last_mut() {
+                    Some(last) if b[0] <= last[1] => last[1] = last[1].max(b[1]),
+                    _ => merged.push(b),
+                }
+            }
+            pd.ext_breaks[i] = merged;
+        }
+    }
+}
+
+/// The part of a segment inside the closed rect `r`, as fractions `(t0, t1)`
+/// of the segment from its start (Liang-Barsky), or `None` when it misses.
+fn segment_span_in_rect(seg: &[[f64; 2]; 2], r: &Rect2) -> Option<(f64, f64)> {
+    let [p, q] = *seg;
+    let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    for (den, num) in [
+        (-dx, p[0] - r.x0),
+        (dx, r.x1 - p[0]),
+        (-dy, p[1] - r.y0),
+        (dy, r.y1 - p[1]),
+    ] {
+        if den == 0.0 {
+            if num < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let t = num / den;
+        if den < 0.0 {
+            t0 = t0.max(t);
+        } else {
+            t1 = t1.min(t);
+        }
+    }
+    (t0 < t1).then_some((t0, t1))
+}
+
+/// Where a stacked dimension's number sits along its dimension line when
+/// nothing is in the way: centred on a span that holds it, else outside past
+/// its upper end (the first place the lane search tries). `(lo, hi, text_w)`
+/// in paper mm along the stack's direction; returns the number's extent.
+fn nominal_text_window(lo: f64, hi: f64, text_w: f64, tc: f64) -> (f64, f64) {
+    let tc = if text_w > hi - lo {
+        hi + AR_OUTSIDE_CLEAR + 0.5 * text_w
+    } else {
+        tc
+    };
+    (tc - 0.5 * text_w, tc + 0.5 * text_w)
+}
+
+/// Clearance between a stacked dimension's number and an extension line
+/// (paper mm): the line's width and the quality check's 0.2 mm tolerance.
+const TEXT_LINE_CLEAR: f64 = 0.3;
+
+/// Where along its span a number that fits it is centred: the middle, unless
+/// an end of another dimension of the stack (whose extension line runs across
+/// this lane when that dimension is laid further out) falls under the number
+/// there; then the place nearest the middle, still inside the span, that no
+/// such end falls under. When there is none, the middle (the lane order then
+/// keeps those lines short of it where it can: [`clear_text_order`]). A
+/// number wider than its span goes outside it and is not moved here.
+///
+/// `ends` are the ends of every dimension of the stack, this one's included
+/// (its own lines bound the number and never cross it).
+fn clear_text_centre(lo: f64, hi: f64, text_w: f64, ends: &[f64]) -> f64 {
+    let mid = 0.5 * (lo + hi);
+    let half = 0.5 * text_w;
+    // The number stays between its own extension lines.
+    let (min_c, max_c) = (lo + half + TEXT_LINE_CLEAR, hi - half - TEXT_LINE_CLEAR);
+    if min_c > max_c {
+        return mid;
+    }
+    let others: Vec<f64> = ends
+        .iter()
+        .copied()
+        .filter(|&e| e > lo + 1e-6 && e < hi - 1e-6)
+        .collect();
+    let blocked = |c: f64| {
+        others
+            .iter()
+            .any(|&e| (e - c).abs() < half + TEXT_LINE_CLEAR)
+    };
+    if !blocked(mid) {
+        return mid;
+    }
+    let mut candidates: Vec<f64> = others
+        .iter()
+        .flat_map(|&e| [e - half - TEXT_LINE_CLEAR, e + half + TEXT_LINE_CLEAR])
+        .filter(|&c| c >= min_c - 1e-9 && c <= max_c + 1e-9)
+        .collect();
+    candidates.extend([min_c, max_c]);
+    candidates.sort_by(|a, b| {
+        (a - mid)
+            .abs()
+            .partial_cmp(&(b - mid).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.into_iter().find(|&c| !blocked(c)).unwrap_or(mid)
+}
+
+/// The order a stack of parallel dimensions is laid outward from the part.
+///
+/// Extension lines run from the part out to their own dimension line, across
+/// every lane nearer the part; a dimension laid further out than another
+/// whose number covers one of its ends draws its extension line through that
+/// number (CADGenBench 124: the heights of a stepped boss, lengths from 3.25
+/// and 4 above the datum, struck through the "12.5" and "17.5" of the
+/// locations laid inside them). So a dimension with an end inside another's
+/// number goes nearer the part than that one; otherwise the shorter span goes
+/// nearer, so the overall size sits outermost (ISO 129 practice).
+///
+/// `stack` is `(lo, hi, text_w, tc)` per dimension (`tc` from
+/// [`clear_text_centre`]), sorted by span ascending; the
+/// result is a permutation of its indices. Repeatedly the first dimension (in
+/// span order) none of whose blockers is still waiting is taken; when every
+/// waiting one is blocked (each covers another's end, a cycle), the first in
+/// span order is taken, and the lane search keeps whichever crossing remains
+/// off its strict pass or the quality check reports it.
+fn clear_text_order(stack: &[(f64, f64, f64, f64)]) -> Vec<usize> {
+    const CLEAR: f64 = TEXT_LINE_CLEAR;
+    let n = stack.len();
+    // An end of x lies under y's number.
+    let covers = |x: usize, y: usize| -> bool {
+        let (lo, hi, w, tc) = stack[y];
+        let (t0, t1) = nominal_text_window(lo, hi, w, tc);
+        let (xlo, xhi, _, _) = stack[x];
+        [xlo, xhi].iter().any(|&e| e > t0 - CLEAR && e < t1 + CLEAR)
+    };
+    let mut waiting: Vec<usize> = (0..n).collect();
+    let mut order = Vec::with_capacity(n);
+    while !waiting.is_empty() {
+        let pick = waiting
+            .iter()
+            .position(|&y| {
+                !waiting
+                    .iter()
+                    .any(|&x| x != y && covers(x, y) && !covers(y, x))
+            })
+            .unwrap_or(0);
+        order.push(waiting.remove(pick));
+    }
+    order
+}
+
+/// How deep the dimension lanes BELOW a view and to its LEFT run, in sheet
+/// mm from the view's edge to the outermost ink, when the view has all the
+/// room it wants (no frame, no neighbours): what the sheet layout must leave
+/// beside the view for its dimensions. `(below, left)`; `0.0` for a side
+/// with no stacked dimension.
+pub(crate) fn dimension_band_depths(
+    view: &ProjectedView,
+    tabled_face_ids: &std::collections::HashSet<u32>,
+) -> (f64, f64) {
+    let Some(gr) = view_geometry_rect(view, 0.0) else {
+        return (0.0, 0.0);
+    };
+    let (mut below, mut left) = (0.0_f64, 0.0_f64);
+    for pd in place_dimensions(view, 0.0, 0, tabled_face_ids) {
+        let stacked = (pd.ext[1][0][0] - pd.ext[1][1][0]).abs() > 1e-9
+            || (pd.ext[1][0][1] - pd.ext[1][1][1]).abs() > 1e-9;
+        if !stacked {
+            // A leader or a point callout.
+            continue;
+        }
+        if pd.text_rot_deg.abs() < 1e-6 {
+            below = below.max(pd.line[0][1] + EXT - gr.y1);
+        } else {
+            left = left.max(gr.x0 - (pd.line[0][0] - TGAP - DIM_TEXT_FONT_MM));
+        }
+    }
+    (below, left)
+}
+
+/// Move a placed dimension by a recorded drag `[right, down]` (sheet mm), as
+/// an engineer drags one in established CAD:
+///
+/// * a linear dimension: the drag ACROSS its dimension line moves the line
+///   (its extension lines follow), the drag ALONG it slides the text;
+/// * a leader callout: the shoulder and its text move, the arrow stays on
+///   the feature and the leg is redrawn to the moved elbow;
+/// * a point callout (an angle): the text moves.
+pub(crate) fn shift_placed_dimension(pd: &mut PlacedDimension, by: [f64; 2]) {
+    let degenerate = |seg: &[[f64; 2]; 2]| {
+        (seg[0][0] - seg[1][0]).abs() < 1e-9 && (seg[0][1] - seg[1][1]).abs() < 1e-9
+    };
+    let [dx, dy] = by;
+    if degenerate(&pd.line) {
+        // Point callout / a leader's second text line.
+        for p in pd
+            .line
+            .iter_mut()
+            .chain(pd.ext.iter_mut().flat_map(|e| e.iter_mut()))
+        {
+            p[0] += dx;
+            p[1] += dy;
+        }
+        for a in &mut pd.arrows {
+            a.tip[0] += dx;
+            a.tip[1] += dy;
+        }
+        pd.text_anchor[0] += dx;
+        pd.text_anchor[1] += dy;
+        return;
+    }
+    if degenerate(&pd.ext[1]) {
+        // Leader: `ext[0]` is the leg (feature edge -> elbow), `line` the
+        // shoulder.
+        for p in pd.line.iter_mut().chain(pd.ext[1].iter_mut()) {
+            p[0] += dx;
+            p[1] += dy;
+        }
+        pd.ext[0][1][0] += dx;
+        pd.ext[0][1][1] += dy;
+        pd.arrows[1].tip[0] += dx;
+        pd.arrows[1].tip[1] += dy;
+        pd.text_anchor[0] += dx;
+        pd.text_anchor[1] += dy;
+        let (vx, vy) = (
+            pd.ext[0][1][0] - pd.ext[0][0][0],
+            pd.ext[0][1][1] - pd.ext[0][0][1],
+        );
+        let len = vx.hypot(vy);
+        if len > 1e-9 {
+            pd.arrows[0].dir = [vx / len, vy / len];
+        }
+        return;
+    }
+    let horizontal = (pd.line[0][1] - pd.line[1][1]).abs() < 1e-9;
+    if horizontal {
+        for p in &mut pd.line {
+            p[1] += dy;
+        }
+        for e in &mut pd.ext {
+            e[1][1] += dy;
+        }
+        for a in &mut pd.arrows {
+            a.tip[1] += dy;
+        }
+        pd.text_anchor[0] += dx;
+        pd.text_anchor[1] += dy;
+    } else {
+        for p in &mut pd.line {
+            p[0] += dx;
+        }
+        for e in &mut pd.ext {
+            e[1][0] += dx;
+        }
+        for a in &mut pd.arrows {
+            a.tip[0] += dx;
+        }
+        pd.text_anchor[0] += dx;
+        pd.text_anchor[1] += dy;
+    }
 }
 
 // ── Unit tests ─────────────────────────────────────────────────────────────────
@@ -2926,47 +3914,64 @@ mod tests {
             pid: None,
             datum: None,
             tolerance: None,
+            key: None,
+            members: Vec::new(),
         }
     }
 
-    /// Deliverable 3 RULE: untabled position dims render ONLY as a baseline
-    /// stack — a view carrying fewer than three of them draws none at all
-    /// (tabled bores carry their positions in the hole table; a lone corner
-    /// offset is not chained).
-    ///
-    /// Mutation proof: remove the `qualifies_for_baseline` gate in
-    /// `place_dimensions` → both positions render → RED.
-    #[test]
-    fn positions_below_baseline_threshold_are_suppressed() {
-        let mut view = simple_view("TOP", ProjectionType::Top, [100.0, 150.0]);
-        view.dimensions = vec![
-            pos_dim("8.00", [-10.0, -8.0], [-2.0, -8.0]),
-            pos_dim("14.00", [-10.0, -4.0], [4.0, -4.0]),
-        ];
-        let placed = place_dimensions(&view, 297.0, 0, &std::collections::HashSet::new());
-        assert!(
-            placed.is_empty(),
-            "2 position dims must not render as a chained stack; got {:?}",
-            placed.iter().map(|p| &p.label).collect::<Vec<_>>()
-        );
+    fn len_dim(label: &str, a: [f64; 2], b: [f64; 2]) -> crate::drawing::dimensioning::Dimension2d {
+        let mut d = pos_dim(label, a, b);
+        d.kind = "length".to_string();
+        d
     }
 
-    /// ≥3 untabled positions sharing a datum edge render as an ISO 129-1
-    /// BASELINE stack: every dim line starts at the shared datum coordinate,
-    /// the lines are parallel, and the stack ascends smallest-first (nearest
-    /// the part), so extension lines never cross.
+    /// The level (sheet y) of each placed horizontal dimension, by label.
+    fn level_of(placed: &[PlacedDimension], label: &str) -> f64 {
+        placed
+            .iter()
+            .find(|p| p.label == label)
+            .unwrap_or_else(|| panic!("{label} was not placed"))
+            .line[0][1]
+    }
+
+    /// A position the hole table does not state is drawn as a dimension from
+    /// its datum edge, however few there are: a lone boss used to be located
+    /// by nothing (positions were drawn only in threes).
+    ///
+    /// Mutation: restore the three-or-nothing gate in
+    /// `place_dimensions_routed` and nothing is placed.
+    #[test]
+    fn two_untabled_positions_are_both_drawn() {
+        let mut view = simple_view("TOP", ProjectionType::Top, [100.0, 150.0]);
+        view.dimensions = vec![
+            pos_dim("8", [-10.0, -8.0], [-2.0, -8.0]),
+            pos_dim("14", [-10.0, -4.0], [4.0, -4.0]),
+        ];
+        let placed = place_dimensions(&view, 297.0, 0, &std::collections::HashSet::new());
+        let labels: Vec<&str> = placed.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["8", "14"], "both offsets are drawn");
+    }
+
+    /// Positions from one datum edge stack as an ISO 129-1 BASELINE: every
+    /// dimension line starts at the shared datum coordinate, the lines are
+    /// parallel, and the smallest is nearest the part, so extension lines
+    /// never cross.
     #[test]
     fn three_positions_from_one_datum_render_as_baseline_stack() {
         let mut view = simple_view("TOP", ProjectionType::Top, [100.0, 150.0]);
         // Three horizontal positions from the view's left datum edge
         // (view-space x = −10 → sheet x = 100 + (−10) = 90).
+        // Labels as the sheet prints them (ISO 129-1, no trailing zeros). With
+        // "8.00" the label outgrew its 8 mm span and went outside it, where
+        // the 12 mm dimension's extension line would strike it through, so
+        // that dimension (rightly) moved to the far side of the part.
         view.dimensions = vec![
-            pos_dim("16.00", [-10.0, 0.0], [6.0, 0.0]),
-            pos_dim("8.00", [-10.0, -8.0], [-2.0, -8.0]),
-            pos_dim("12.00", [-10.0, -4.0], [2.0, -4.0]),
+            pos_dim("16", [-10.0, 0.0], [6.0, 0.0]),
+            pos_dim("8", [-10.0, -8.0], [-2.0, -8.0]),
+            pos_dim("12", [-10.0, -4.0], [2.0, -4.0]),
         ];
         let placed = place_dimensions(&view, 297.0, 0, &std::collections::HashSet::new());
-        assert_eq!(placed.len(), 3, "baseline mode renders all three positions");
+        assert_eq!(placed.len(), 3, "all three positions are drawn");
         for p in &placed {
             assert!(
                 (p.line[0][0] - 90.0).abs() < 1e-9,
@@ -2976,12 +3981,399 @@ mod tests {
         }
         // Ascending: smallest span nearest the part, stack levels increasing.
         let labels: Vec<&str> = placed.iter().map(|p| p.label.as_str()).collect();
-        assert_eq!(labels, ["8.00", "12.00", "16.00"], "ascending span order");
+        assert_eq!(labels, ["8", "12", "16"], "ascending span order");
         assert!(
             placed[0].line[0][1] < placed[1].line[0][1]
                 && placed[1].line[0][1] < placed[2].line[0][1],
-            "parallel dim lines stacked ascending below the part"
+            "parallel dim lines stacked ascending below the part: {:?}",
+            placed
+                .iter()
+                .map(|p| (&p.label, p.line))
+                .collect::<Vec<_>>()
         );
+    }
+
+    /// Dimensions whose spans do not overlap are a CHAIN: they share one
+    /// lane. One that overlaps them takes the next lane out. (Each used to
+    /// take a lane of its own, eight millimetres apart, so a view with
+    /// twenty dimensions needed 160 mm of paper under it.)
+    ///
+    /// Mutation: make `lane_is_free` always false past the first occupant
+    /// (one dimension per lane) and the chain spreads over three lanes.
+    #[test]
+    fn a_chain_shares_one_lane_and_an_overlapping_dimension_takes_the_next() {
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        view.dimensions = vec![
+            len_dim("AAAA", [-10.0, 0.0], [0.0, 0.0]),
+            len_dim("BBBB", [0.0, 0.0], [10.0, 0.0]),
+            len_dim("CCCCC", [-10.0, 0.0], [10.0, 0.0]),
+        ];
+        let placed = place_dimensions(&view, 297.0, 0, &std::collections::HashSet::new());
+        assert_eq!(placed.len(), 3);
+        let (a, b, c) = (
+            level_of(&placed, "AAAA"),
+            level_of(&placed, "BBBB"),
+            level_of(&placed, "CCCCC"),
+        );
+        assert!(
+            (a - b).abs() < 1e-9,
+            "the two links share a lane: {a} vs {b}"
+        );
+        assert!(
+            (c - a - STACK).abs() < 1e-9,
+            "the overall dimension is one lane further out: {c} vs {a}"
+        );
+    }
+
+    /// A dimension is placed only where there is room. With the frame's
+    /// bottom edge just under the view, the lanes below it are off the
+    /// sheet, so the dimension goes ABOVE the view; with another view's
+    /// geometry there as well, it is not placed at all (and the certificate
+    /// then reports it) rather than printed over that view.
+    ///
+    /// Mutation: drop the `clear(..)` tests from the lane search and the
+    /// dimension is drawn below the frame.
+    #[test]
+    fn a_dimension_with_no_room_below_goes_above_and_with_no_room_at_all_is_not_placed() {
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        view.dimensions = vec![len_dim("20", [-10.0, 0.0], [10.0, 0.0])];
+        // The view's geometry spans sheet y 137..157 (sheet height 297).
+        let gr = view_geometry_rect(&view, 297.0).expect("rect");
+        let none = std::collections::HashSet::new();
+        let edits = crate::drawing::dimension_edit::DimensionEdits::new();
+        let unit = crate::units::LengthUnit::default();
+
+        // Roomy frame: below, as always.
+        let roomy = [10.0, 10.0, 400.0, 287.0];
+        let placed =
+            place_dimensions_routed(&view, 297.0, 0, &none, Some(roomy), &[], &[], &edits, unit);
+        assert_eq!(placed.len(), 1);
+        assert!(placed[0].line[0][1] > gr.y1, "below the view");
+
+        // Frame ends 5 mm under the view: no lane fits below, so above.
+        let tight = [10.0, 10.0, 400.0, gr.y1 + 5.0];
+        let placed =
+            place_dimensions_routed(&view, 297.0, 0, &none, Some(tight), &[], &[], &edits, unit);
+        assert_eq!(placed.len(), 1, "placed on the other side");
+        assert!(placed[0].line[0][1] < gr.y0, "above the view");
+
+        // And another view's geometry right above it: nowhere.
+        let neighbour = Rect2 {
+            x0: gr.x0 - 50.0,
+            y0: 10.0,
+            x1: gr.x1 + 50.0,
+            y1: gr.y0 - 3.0,
+        };
+        let placed = place_dimensions_routed(
+            &view,
+            297.0,
+            0,
+            &none,
+            Some(tight),
+            &[neighbour],
+            &[],
+            &edits,
+            unit,
+        );
+        assert!(
+            placed.is_empty(),
+            "no room on either side: not placed, never printed over the neighbour"
+        );
+    }
+
+    /// A line through the middle of a placed callout's text: horizontal, 60 mm
+    /// either side of it.
+    fn strike_through(t: &Rect2) -> [[f64; 2]; 2] {
+        let y = 0.5 * (t.y0 + t.y1);
+        [[t.x0 - 60.0, y], [t.x1 + 60.0, y]]
+    }
+
+    /// A leader callout's text is not put on a line an earlier view already
+    /// drew there (CADGenBench 119: the shoulder of FRONT's "2× 0.6 × 45°"
+    /// ran through TOP's "2× R2.1" printed under it). The callout is still
+    /// placed, on a free row.
+    ///
+    /// Mutation: drop `crosses_placed` from the leader's `free` row test ->
+    /// the text lands on the line again -> RED.
+    #[test]
+    fn a_leader_text_is_not_put_on_an_earlier_views_line() {
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        let mut r = len_dim("R5", [10.0, 0.0], [5.0, 0.0]);
+        r.kind = "radius".to_string();
+        view.dimensions = vec![r];
+        let none = std::collections::HashSet::new();
+        let edits = crate::drawing::dimension_edit::DimensionEdits::new();
+        let unit = crate::units::LengthUnit::default();
+        let frame = [10.0, 10.0, 400.0, 287.0];
+        let alone =
+            place_dimensions_routed(&view, 297.0, 0, &none, Some(frame), &[], &[], &edits, unit);
+        assert_eq!(alone.len(), 1);
+        let line = strike_through(&placed_text_box(&alone[0]));
+        let placed = place_dimensions_routed(
+            &view,
+            297.0,
+            0,
+            &none,
+            Some(frame),
+            &[],
+            &[line],
+            &edits,
+            unit,
+        );
+        assert_eq!(placed.len(), 1, "still placed");
+        let text = placed_text_box(&placed[0]);
+        assert!(
+            !segment_crosses_rect(&line, &text),
+            "the earlier line runs through the callout: {text:?}"
+        );
+    }
+
+    /// A stacked dimension's number is not put where an earlier view's
+    /// leader leg runs: it takes the next lane. Still placed.
+    ///
+    /// Mutation: drop the `ink_lines` test from the lane search -> the number
+    /// sits on the leg -> RED.
+    #[test]
+    fn a_stacked_dimension_number_is_not_put_on_an_earlier_views_line() {
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        view.dimensions = vec![len_dim("20", [-10.0, 0.0], [10.0, 0.0])];
+        let none = std::collections::HashSet::new();
+        let edits = crate::drawing::dimension_edit::DimensionEdits::new();
+        let unit = crate::units::LengthUnit::default();
+        let frame = [10.0, 10.0, 400.0, 287.0];
+        let alone =
+            place_dimensions_routed(&view, 297.0, 0, &none, Some(frame), &[], &[], &edits, unit);
+        assert_eq!(alone.len(), 1);
+        let line = strike_through(&placed_text_box(&alone[0]));
+        let placed = place_dimensions_routed(
+            &view,
+            297.0,
+            0,
+            &none,
+            Some(frame),
+            &[],
+            &[line],
+            &edits,
+            unit,
+        );
+        assert_eq!(placed.len(), 1, "still placed");
+        let text = placed_text_box(&placed[0]);
+        assert!(
+            !segment_crosses_rect(&line, &text),
+            "the earlier line runs through the number: {text:?}"
+        );
+    }
+
+    /// No extension line of a stack runs through another dimension's number
+    /// (CADGenBench 124, FRONT: a height from 3.25 above the datum was laid
+    /// outside the location "12.5", and its extension line struck through
+    /// the "12.5"). The dimension whose end falls under the other's number is
+    /// laid nearer the part.
+    ///
+    /// Mutation: make `clear_text_order` return the span order -> the longer
+    /// dimension is laid outside and its line crosses "12.5" -> RED.
+    #[test]
+    fn no_extension_line_runs_through_another_dimensions_number() {
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        view.dimensions = vec![
+            pos_dim("12.5", [-10.0, -10.0], [-10.0, 2.5]),
+            len_dim("36.75", [-10.0, -6.75], [-10.0, 30.0]),
+        ];
+        // The frame ends just right of the view: both go on its left.
+        let placed = place_dimensions_routed(
+            &view,
+            297.0,
+            0,
+            &std::collections::HashSet::new(),
+            Some([10.0, 10.0, 112.0, 287.0]),
+            &[],
+            &[],
+            &crate::drawing::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+        );
+        assert_eq!(placed.len(), 2, "both placed");
+        for a in &placed {
+            for b in &placed {
+                if a.label == b.label {
+                    continue;
+                }
+                let t = placed_text_box(b);
+                assert!(
+                    !placed_line_segments(a)
+                        .iter()
+                        .any(|l| segment_crosses_rect(l, &t)),
+                    "a line of '{}' runs through '{}'",
+                    a.label,
+                    b.label
+                );
+            }
+        }
+    }
+
+    /// Two dimensions each with an end under the other's centred number (no
+    /// lane order keeps both clear: CADGenBench 105, "43.5" and "Ø39"): a
+    /// number that fits its span slides along it off the other's extension
+    /// line, and neither is struck through.
+    ///
+    /// Mutation: make `clear_text_centre` return the span's middle -> the
+    /// outer one's line crosses the inner one's number -> RED.
+    #[test]
+    fn a_number_slides_along_its_span_off_another_dimensions_line() {
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        view.dimensions = vec![
+            len_dim("AAAA", [-10.0, -10.0], [-10.0, 10.0]),
+            len_dim("BBBB", [-10.0, 0.0], [-10.0, 22.0]),
+        ];
+        let placed = place_dimensions_routed(
+            &view,
+            297.0,
+            0,
+            &std::collections::HashSet::new(),
+            Some([10.0, 10.0, 112.0, 287.0]),
+            &[],
+            &[],
+            &crate::drawing::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+        );
+        assert_eq!(placed.len(), 2, "both placed");
+        for a in &placed {
+            for b in &placed {
+                if a.label != b.label {
+                    let t = placed_text_box(b);
+                    assert!(
+                        !placed_line_segments(a)
+                            .iter()
+                            .any(|l| segment_crosses_rect(l, &t)),
+                        "a line of '{}' runs through '{}'",
+                        a.label,
+                        b.label
+                    );
+                }
+            }
+        }
+    }
+
+    /// A location the hole table states (the bore's own faces) is not
+    /// stacked again; a location measured to a boss AND the bore through it
+    /// is in no row and is drawn (CADGenBench 124: C1's boss located by
+    /// nothing, its row reading "—").
+    ///
+    /// Mutation: suppress a dimension when ANY of its faces is tabled ->
+    /// the boss's location is dropped -> RED.
+    #[test]
+    fn only_a_bores_own_location_is_left_to_the_hole_table() {
+        let mut view = simple_view("TOP", ProjectionType::Top, [100.0, 150.0]);
+        let mut bore = pos_dim("BORE", [-10.0, -8.0], [-2.0, -8.0]);
+        bore.entities = vec![124];
+        let mut boss = pos_dim("BOSS", [-10.0, -6.0], [0.0, -6.0]);
+        boss.entities = vec![31, 124];
+        view.dimensions = vec![bore, boss];
+        let tabled: std::collections::HashSet<u32> = [124].into_iter().collect();
+        let placed = place_dimensions(&view, 297.0, 0, &tabled);
+        let labels: Vec<&str> = placed.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, vec!["BOSS"], "{labels:?}");
+    }
+
+    /// With the lanes boxed in by the frame, a number no lane keeps clear of
+    /// another dimension's extension line is taken outside its span, past one
+    /// end, on the dimension line run out under it -- not printed on the line.
+    ///
+    /// Mutation: drop the out-of-span pass from the lane search -> "AAAA" is
+    /// printed across "CC"'s extension line -> RED.
+    #[test]
+    fn a_number_with_no_clear_lane_goes_outside_its_span() {
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        // The view spans sheet y 137..157; three lanes fit below it.
+        let below = |x0: f64, x1: f64| ([x0, -10.0], [x1, -10.0]);
+        let (p0, p1) = below(-10.0, 0.0);
+        let (q0, q1) = below(-10.0, 1.0);
+        let (c0, c1) = below(-10.0, 14.0);
+        let (a0, a1) = below(5.0, 23.0);
+        view.dimensions = vec![
+            len_dim("P", p0, p1),
+            len_dim("Q", q0, q1),
+            len_dim("CC", c0, c1),
+            len_dim("AAAA", a0, a1),
+        ];
+        let bottom = 157.0 + STANDOFF + 2.0 * STACK + EXT + 0.5;
+        let placed = place_dimensions_routed(
+            &view,
+            297.0,
+            0,
+            &std::collections::HashSet::new(),
+            Some([10.0, 136.0, 400.0, bottom]),
+            &[],
+            &[],
+            &crate::drawing::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+        );
+        assert_eq!(placed.len(), 4, "all placed");
+        for a in &placed {
+            for b in &placed {
+                if a.label != b.label {
+                    let t = placed_text_box(b);
+                    assert!(
+                        !placed_line_segments(a)
+                            .iter()
+                            .any(|l| segment_crosses_rect(l, &t)),
+                        "a line of '{}' runs through '{}'",
+                        a.label,
+                        b.label
+                    );
+                }
+            }
+        }
+        // "AAAA" sits on its own dimension line.
+        let a = placed.iter().find(|p| p.label == "AAAA").expect("AAAA");
+        let (lo, hi) = (
+            a.line[0][0].min(a.line[1][0]),
+            a.line[0][0].max(a.line[1][0]),
+        );
+        assert!(
+            a.text_anchor[0] > lo && a.text_anchor[0] < hi,
+            "the line runs out under the number: {a:?}"
+        );
+    }
+
+    /// `clear_text_centre`: the middle when nothing ends under it; else the
+    /// nearest place inside the span that no other end falls under.
+    #[test]
+    fn clear_text_centre_avoids_other_ends() {
+        let w = 8.9;
+        assert!((clear_text_centre(0.0, 20.0, w, &[0.0, 20.0]) - 10.0).abs() < 1e-9);
+        let c = clear_text_centre(0.0, 20.0, w, &[0.0, 20.0, 10.0]);
+        assert!((c - 10.0).abs() >= 0.5 * w + TEXT_LINE_CLEAR - 1e-9, "{c}");
+        assert!(
+            c - 0.5 * w >= 0.0 && c + 0.5 * w <= 20.0,
+            "inside its span: {c}"
+        );
+    }
+
+    /// `segment_crosses_rect` is exact on the open interior: a segment
+    /// through it, one ending inside it and a point inside it cross; one
+    /// along an edge, one touching a corner and one passing beside it do not.
+    #[test]
+    fn segment_crosses_rect_is_exact() {
+        let r = Rect2 {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 10.0,
+            y1: 4.0,
+        };
+        assert!(segment_crosses_rect(&[[-5.0, 2.0], [15.0, 2.0]], &r));
+        assert!(segment_crosses_rect(&[[-5.0, -5.0], [5.0, 2.0]], &r));
+        assert!(segment_crosses_rect(&[[5.0, 2.0], [5.0, 2.0]], &r));
+        assert!(!segment_crosses_rect(&[[-5.0, 0.0], [15.0, 0.0]], &r));
+        assert!(!segment_crosses_rect(&[[-5.0, -5.0], [0.0, 0.0]], &r));
+        assert!(!segment_crosses_rect(&[[-5.0, 5.0], [15.0, 5.0]], &r));
+        // A 400 mm diagonal crossing between two of 65 sample points.
+        let small = Rect2 {
+            x0: 202.0,
+            y0: 150.0,
+            x1: 204.5,
+            y1: 153.6,
+        };
+        assert!(segment_crosses_rect(&[[0.0, 0.0], [400.0, 300.0]], &small));
     }
 
     /// `compute_layout` must be a pure function of the drawing — calling it

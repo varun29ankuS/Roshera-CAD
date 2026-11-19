@@ -28,14 +28,32 @@ use super::types::{
     Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, ViewExtent, ViewSource,
 };
 
-/// Hatch line spacing in model units (pre-scale). Lands at a sensible on-sheet
-/// pitch (~2–3 mm) for the small/medium parts the drawing module targets.
+/// Hatch pitch ON PAPER, millimetres, measured square to the hatch lines.
+///
+/// ISO 128-50 hatching is a paper convention: the same 45° lines at the same
+/// spacing whatever the view's scale. The first version fixed the spacing in
+/// MODEL units (a step of 4.0, 2.83 square to the lines), so it printed at
+/// 0.57 mm on a 1:5 sheet (a grey smear) and 5.7 mm at 2:1. 3 mm sits in the
+/// 2-4 mm band drafters use for sections of ordinary size.
+pub const HATCH_PITCH_PAPER_MM: f64 = 3.0;
+
+/// Hatch line spacing in VIEW (model) units for a view drawn at `scale`, as
+/// the step of `c` in the lines `y = x + c`: the square pitch times sqrt(2),
+/// divided by the scale, so the printed pitch is [`HATCH_PITCH_PAPER_MM`] at
+/// every scale. A non-finite or non-positive scale is treated as 1:1.
 ///
 /// `pub(crate)`: the D1 harness invariant in `drawing/verify.rs`
-/// (`section_shows_only_hatch`) reuses this exact constant as its tolerance
-/// margin so the check stays honest about what "beyond the hatched footprint"
-/// means in THIS renderer, rather than duplicating the literal.
-pub(crate) const HATCH_SPACING: f64 = 4.0;
+/// (`section_shows_only_hatch`) uses the same spacing as its tolerance margin
+/// so the check stays honest about what "beyond the hatched footprint" means
+/// in THIS renderer, rather than duplicating the number.
+pub(crate) fn hatch_spacing(scale: f64) -> f64 {
+    let s = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    HATCH_PITCH_PAPER_MM * std::f64::consts::SQRT_2 / s
+}
 
 /// Build a SECTION view: cut `solid_id` on the plane `(origin, normal)` and
 /// return a [`ProjectedView`] whose polylines are the cut outline plus 45°
@@ -188,7 +206,8 @@ pub fn section_view(
     // triangles (not even-odd) so holes/bores stay correctly UN-hatched.
     let c_lo = min_y - max_x;
     let c_hi = max_y - min_x;
-    let mut c = (c_lo / HATCH_SPACING).ceil() * HATCH_SPACING;
+    let spacing = hatch_spacing(scale);
+    let mut c = (c_lo / spacing).ceil() * spacing;
     while c < c_hi {
         let mut spans: Vec<(f64, f64)> = Vec::new();
         for t in &tris2d {
@@ -214,7 +233,7 @@ pub fn section_view(
         if let Some((b0, b1)) = cur {
             hatch.push(Polyline2d::from_points(vec![[b0, b0 + c], [b1, b1 + c]]));
         }
-        c += HATCH_SPACING;
+        c += spacing;
     }
 
     Some(ProjectedView {

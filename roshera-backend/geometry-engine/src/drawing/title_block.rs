@@ -208,10 +208,17 @@ pub fn status(drawing: &Drawing) -> &'static str {
     }
 }
 
-/// `"SOUND 1a2b3c4d"`, `"NOT SOUND"`, or `"UNVERIFIED"` (no certificate was
-/// computed for this render).
+/// `"SOUND 1a2b3c4d"`, `"INCOMPLETE (3)"` (sound, but three model dimensions
+/// are on no view and nobody waived them), `"NOT SOUND"`, or `"UNVERIFIED"`
+/// (no certificate was computed for this render).
 pub fn verification_label(drawing: &Drawing) -> String {
     match &drawing.render_facts.verification {
+        // Sound but leaving model dimensions unstated: the stamp says so. A
+        // sheet that omits dimensions must not print the same word as one
+        // that states them all.
+        Some(s) if s.sound && s.not_dimensioned > 0 => {
+            format!("INCOMPLETE ({})", s.not_dimensioned)
+        }
         Some(s) if s.sound => format!("SOUND {}", s.digest),
         Some(_) => "NOT SOUND".to_string(),
         None => "UNVERIFIED".to_string(),
@@ -627,6 +634,7 @@ pub fn compute_render_facts(model: &mut BRepModel, drawing: &Drawing) -> RenderF
         verification: Some(SheetStamp {
             sound: cert.sound,
             digest,
+            not_dimensioned: cert.counts.not_dimensioned,
         }),
     }
 }

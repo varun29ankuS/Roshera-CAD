@@ -1,0 +1,34 @@
+{
+  "id": "107",
+  "source": "Read off reference/107/input.png (CADGenBench, rendered 2400 px wide) by the drawing agent (Opus) on 2026-11-18. One pass, not double-checked by a person. DEV. Sheet-metal part. Only the FORMED-part dimensions (the end view at right) and the hole and radius callouts are listed; the about 50 flat-pattern ordinates of the lower-left view are unfolded lengths a sheet of the formed solid cannot state and are left out on purpose.",
+  "views": ["front", "top", "iso"],
+  "dims": [
+    {"kind": "linear", "value": 72.0, "feature": "hole row ordinate 72"},
+    {"kind": "linear", "value": 64.5, "feature": "ordinate 64.5"},
+    {"kind": "linear", "value": 57.5, "feature": "ordinate 57.5"},
+    {"kind": "linear", "value": 50.5, "feature": "ordinate 50.5"},
+    {"kind": "linear", "value": 42.5, "feature": "ordinate 42.5"},
+    {"kind": "linear", "value": 29.5, "feature": "ordinate 29.5"},
+    {"kind": "linear", "value": 21.5, "feature": "ordinate 21.5"},
+    {"kind": "linear", "value": 14.5, "feature": "ordinate 14.5"},
+    {"kind": "linear", "value": 7.5, "feature": "ordinate 7.5"},
+    {"kind": "linear", "value": 22.7, "feature": "flange height 22.7"},
+    {"kind": "linear", "value": 18.7, "feature": "hole height 18.7"},
+    {"kind": "linear", "value": 11.7, "feature": "hole height 11.7"},
+    {"kind": "linear", "value": 4.7, "feature": "hole height 4.7"},
+    {"kind": "linear", "value": 6.7, "feature": "6.7 left"},
+    {"kind": "linear", "value": 6.2, "feature": "6.2 left"},
+    {"kind": "linear", "value": 2.0, "feature": "sheet thickness 2"},
+    {"kind": "radius", "value": 1.0, "count": 2, "feature": "R1 TYP"},
+    {"kind": "radius", "value": 3.0, "count": 4, "feature": "R3 corners"},
+    {"kind": "radius", "value": 2.5, "count": 3, "feature": "R2.5"},
+    {"kind": "radius", "value": 3.6, "count": 2, "feature": "R3.6"},
+    {"kind": "radius", "value": 0.5, "feature": "R0.5"}
+  ],
+  "holes": [
+    {"dia": 2.4, "count": 8, "thru": true},
+    {"dia": 10.0, "count": 2, "thru": true},
+    {"dia": 5.5, "count": 2, "thru": true}
+  ],
+  "notes": ["SHEET THICKNESS 2", "BENDS (ALL RADII 1)"]
+}

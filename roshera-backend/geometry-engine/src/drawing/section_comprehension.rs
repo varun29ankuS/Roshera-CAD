@@ -33,7 +33,6 @@ use crate::math::{Point3, Vector3};
 use crate::primitives::solid::SolidId;
 use crate::primitives::surface::Plane;
 use crate::primitives::topology_builder::BRepModel;
-use crate::readable::bore_face_ids;
 
 use super::hole_table::HoleSite;
 use super::types::SectionSemantics;
@@ -241,7 +240,7 @@ pub fn section_cut_through(
         }
     };
 
-    let bores = bore_face_ids(model, solid_id);
+    let bores = super::arcs::closed_bore_faces(model, solid_id);
     let bounds = part_bounds(model, solid_id);
 
     let Some(solid) = model.solids.get(solid_id) else {

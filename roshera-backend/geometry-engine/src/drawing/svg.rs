@@ -209,14 +209,26 @@ fn write_stylesheet(out: &mut String) {
     );
     // View labels — 3.6 mm, slightly muted so they don't compete with the part.
     out.push_str("    .label { font: 3.6px sans-serif; fill: #444; }\n");
-    // ISO 129 dimensions — thin tier 0.18 mm + filled arrowheads + 3.1 mm text.
+    // ISO 129 dimensions — thin tier 0.18 mm + filled arrowheads + text at
+    // DIM_TEXT_FONT_MM (ISO 3098: 2.5 mm capitals).
     out.push_str("    .dim-line { stroke: #111; stroke-width: 0.18; fill: none; }\n");
     out.push_str("    .dim-arrow { fill: #111; stroke: none; }\n");
-    out.push_str("    .dim-text { font: 3.1px sans-serif; fill: #111; }\n");
+    out.push_str(&format!(
+        "    .dim-text {{ font: {:.2}px sans-serif; fill: #111; }}\n",
+        super::layout::DIM_TEXT_FONT_MM
+    ));
     out.push_str("    .dim-text-c { text-anchor: middle; dominant-baseline: alphabetic; }\n");
+    // A stacked tolerance (upper over lower deviation) at TOL_FONT_MM, the
+    // size its stack geometry is laid out for, and the box of a basic
+    // dimension.
+    out.push_str(&format!(
+        "    .dim-tol {{ font-size: {:.2}px; }}\n",
+        super::dimension_edit::TOL_FONT_MM
+    ));
+    out.push_str("    .dim-box { stroke: #111; stroke-width: 0.18; fill: none; }\n");
     // Zone markers — 3 mm bold, centred in the margin cells.
     out.push_str(
-        "    .zone { font: 700 3px sans-serif; fill: #111; text-anchor: middle; \
+        "    .zone { font: 700 3.6px sans-serif; fill: #111; text-anchor: middle; \
          dominant-baseline: middle; }\n",
     );
     // Zone tick marks — 0.18 mm thin (same as dimension tier).
@@ -260,23 +272,24 @@ fn write_stylesheet(out: &mut String) {
          dominant-baseline: middle; }\n",
     );
     out.push_str("    .logo-mark-fill { fill: #111; stroke: #111; stroke-width: 0.2; }\n");
-    // Notes strip — 2.4 mm, NOTES_FONT_MM tier.
-    out.push_str(
-        "    .notes-strip { font: 500 2.4px sans-serif; fill: #333; \
-         letter-spacing: 0.06px; }\n",
-    );
+    // Notes strip — NOTES_FONT_MM tier (ISO 3098: 2.5 mm capitals).
+    out.push_str(&format!(
+        "    .notes-strip {{ font: 500 {:.2}px sans-serif; fill: #333; \
+         letter-spacing: 0.06px; }}\n",
+        super::layout::NOTES_FONT_MM
+    ));
     // Projection symbol — pure thin lines (0.18 mm) + filled circles.
     out.push_str("    .proj-sym { fill: none; stroke: #111; stroke-width: 0.18; }\n");
     out.push_str("    .proj-sym-fill { fill: #111; stroke: none; }\n");
     // Hole-table / hole-tag styles (Task 7) — TABLE_TEXT_FONT_MM = 2.6 mm.
     out.push_str(
-        "    .hole-tag { font: 700 2.6px sans-serif; fill: #111; \
+        "    .hole-tag { font: 700 3.6px sans-serif; fill: #111; \
          text-anchor: middle; dominant-baseline: alphabetic; }\n",
     );
     // Hole-table outer border — 0.25 mm; inner separators handled as thin lines.
     out.push_str("    .hole-table-border { fill: none; stroke: #111; stroke-width: 0.25; }\n");
     out.push_str("    .hole-table-inner { fill: none; stroke: #111; stroke-width: 0.18; }\n");
-    out.push_str("    .hole-table-text { font: 500 2.6px sans-serif; fill: #111; }\n");
+    out.push_str("    .hole-table-text { font: 500 3.6px sans-serif; fill: #111; }\n");
     // Drafting symbols (counterbore, countersink, depth): a font stack that
     // carries them and a size that reads, so the rest of the label stays in
     // the sheet's sans-serif.
@@ -304,7 +317,7 @@ fn write_stylesheet(out: &mut String) {
     // Datum-origin marker (hole-table X/Y reference corner): thin crosshair
     // + open circle + small "0,0" label.
     out.push_str("    .datum-marker { fill: none; stroke: #111; stroke-width: 0.18; }\n");
-    out.push_str("    .datum-marker-label { font: 500 2.6px sans-serif; fill: #111; }\n");
+    out.push_str("    .datum-marker-label { font: 500 3.6px sans-serif; fill: #111; }\n");
     // GD&T datum feature symbol (Task 6): boxed letter + filled triangle on
     // the feature edge.  ISO 1101 / ASME Y14.5 style.
     // Box border: 0.25 mm (same tier as hole-table outer border).
@@ -313,7 +326,7 @@ fn write_stylesheet(out: &mut String) {
     out.push_str("    .gdt-datum-box { fill: white; stroke: #111; stroke-width: 0.25; }\n");
     out.push_str("    .gdt-datum-triangle { fill: #111; stroke: none; }\n");
     out.push_str(
-        "    .gdt-datum-label { font: 700 2.6px sans-serif; fill: #111; \
+        "    .gdt-datum-label { font: 700 3.6px sans-serif; fill: #111; \
          text-anchor: middle; dominant-baseline: middle; }\n",
     );
     // GD&T Feature Control Frame (Task 6): bordered multi-cell rectangle.
@@ -323,7 +336,7 @@ fn write_stylesheet(out: &mut String) {
     out.push_str("    .gdt-fcf-border { fill: none; stroke: #111; stroke-width: 0.25; }\n");
     out.push_str("    .gdt-fcf-inner { fill: none; stroke: #111; stroke-width: 0.18; }\n");
     out.push_str(
-        "    .gdt-fcf-text { font: 500 2.6px sans-serif; fill: #111; \
+        "    .gdt-fcf-text { font: 500 3.6px sans-serif; fill: #111; \
          dominant-baseline: middle; }\n",
     );
     out.push_str("    .gdt-leader { stroke: #111; stroke-width: 0.18; fill: none; }\n");
@@ -591,8 +604,13 @@ fn render_dimensions(out: &mut String, layout: &SheetLayout) {
             (p0[0] - p1[0]).abs() < 1e-9 && (p0[1] - p1[1]).abs() < 1e-9
         };
         if !is_degenerate {
-            for seg in &pd.ext {
-                dim_line(out, seg[0][0], seg[0][1], seg[1][0], seg[1][1]);
+            // Each extension line as its pieces: a line broken round another
+            // dimension's number is inked in two (the same pieces the
+            // quality check tests).
+            for i in 0..pd.ext.len() {
+                for seg in crate::drawing::layout::extension_line_pieces(pd, i) {
+                    dim_line(out, seg[0][0], seg[0][1], seg[1][0], seg[1][1]);
+                }
             }
             dim_line(
                 out,
@@ -605,15 +623,110 @@ fn render_dimensions(out: &mut String, layout: &SheetLayout) {
                 ink_arrow(out, ar, AR_L, AR_W);
             }
         }
-        dim_text(
+        match &pd.stack {
+            Some(stack) => dim_text_stacked(out, pd, stack),
+            None => dim_text(
+                out,
+                pd.text_anchor[0],
+                pd.text_anchor[1],
+                &pd.label,
+                pd.text_rot_deg,
+                &pd.dim_id,
+            ),
+        }
+        if pd.boxed {
+            dim_box(out, pd);
+        }
+    }
+}
+
+/// Ink a dimension whose tolerance is two stacked lines: the value, then the
+/// upper deviation over the lower one at 0.7 of the value's height, then any
+/// trailing text -- the whole group centred on the dimension's text anchor
+/// (and turned with it for a vertical dimension). Every piece carries the
+/// dimension's `data-dim-id`, so a click on any of them selects it.
+fn dim_text_stacked(
+    out: &mut String,
+    pd: &super::layout::PlacedDimension,
+    stack: &super::dimension_edit::DimStack,
+) {
+    use super::dimension_edit::STACK_GAP_MM as GAP;
+    let (w_lead, w_tol, _) = stack.run_widths();
+    let trail = stack.trail.trim();
+    let total = stack.width_mm();
+    let [x, y] = pd.text_anchor;
+    let x_lead_end = x - 0.5 * total + w_lead;
+    let x_tol = x_lead_end + GAP;
+    let id = escape_xml(&pd.dim_id);
+    if pd.text_rot_deg.abs() < 1e-6 {
+        out.push_str("  <g class=\"dim-toleranced\">\n");
+    } else {
+        let _ = writeln!(
             out,
-            pd.text_anchor[0],
-            pd.text_anchor[1],
-            &pd.label,
-            pd.text_rot_deg,
-            &pd.dim_id,
+            "  <g class=\"dim-toleranced\" transform=\"rotate({:.1} {x:.3} {y:.3})\">",
+            pd.text_rot_deg
         );
     }
+    let _ = writeln!(
+        out,
+        "    <text class=\"dim-text\" data-dim-id=\"{id}\" text-anchor=\"end\" \
+         x=\"{x_lead_end:.3}\" y=\"{y:.3}\">{}</text>",
+        ink_text(&stack.lead)
+    );
+    // Deviations: two lines straddling the value's mid-height. Limits
+    // of size: two full-height lines, the lower on the value's baseline.
+    let (class, y_upper, y_lower) = if stack.full_size {
+        (
+            "dim-text",
+            y - super::dimension_edit::LIMIT_LINE_PITCH_MM,
+            y,
+        )
+    } else {
+        (
+            "dim-text dim-tol",
+            y - super::dimension_edit::TOL_UPPER_RISE_MM,
+            y + super::dimension_edit::TOL_LOWER_DROP_MM,
+        )
+    };
+    for (line_y, text) in [(y_upper, &stack.upper), (y_lower, &stack.lower)] {
+        let _ = writeln!(
+            out,
+            "    <text class=\"{class}\" data-dim-id=\"{id}\" x=\"{x_tol:.3}\" \
+             y=\"{line_y:.3}\">{}</text>",
+            ink_text(text)
+        );
+    }
+    if !trail.is_empty() {
+        let _ = writeln!(
+            out,
+            "    <text class=\"dim-text\" data-dim-id=\"{id}\" x=\"{:.3}\" y=\"{y:.3}\">{}</text>",
+            x_tol + w_tol + GAP,
+            ink_text(trail)
+        );
+    }
+    out.push_str("  </g>\n");
+}
+
+/// The box of a basic (theoretically exact) dimension, around its text.
+fn dim_box(out: &mut String, pd: &super::layout::PlacedDimension) {
+    use super::layout::{DIM_TEXT_FONT_MM, GLYPH_ADVANCE_EM};
+    let w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM + 1.6;
+    let h = DIM_TEXT_FONT_MM + 0.9;
+    let [x, y] = pd.text_anchor;
+    let transform = if pd.text_rot_deg.abs() < 1e-6 {
+        String::new()
+    } else {
+        format!(
+            " transform=\"rotate({:.1} {x:.3} {y:.3})\"",
+            pd.text_rot_deg
+        )
+    };
+    let _ = writeln!(
+        out,
+        "  <rect class=\"dim-box\" x=\"{:.3}\" y=\"{:.3}\" width=\"{w:.3}\" height=\"{h:.3}\"{transform} />",
+        x - 0.5 * w,
+        y - DIM_TEXT_FONT_MM - 0.35,
+    );
 }
 
 /// Ink one arrowhead from an [`ArrowSpec`].

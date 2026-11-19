@@ -80,6 +80,8 @@ fn dim(label: &str, a: [f64; 2], b: [f64; 2]) -> Dimension2d {
         pid: None,
         datum: None,
         tolerance: None,
+        key: None,
+        members: Vec::new(),
     }
 }
 
@@ -107,6 +109,8 @@ fn dim_with_entities(
         pid: None,
         datum: None,
         tolerance: None,
+        key: None,
+        members: Vec::new(),
     }
 }
 
@@ -588,6 +592,8 @@ fn dimension_label_collision_flagged() {
                 pid: None,
                 datum: None,
                 tolerance: None,
+                key: None,
+                members: Vec::new(),
             },
             Dimension2d {
                 id: "angle_b".to_string(),
@@ -603,6 +609,8 @@ fn dimension_label_collision_flagged() {
                 pid: None,
                 datum: None,
                 tolerance: None,
+                key: None,
+                members: Vec::new(),
             },
         ],
     ));
@@ -663,6 +671,8 @@ fn dimension_on_geometry_flagged() {
             pid: None,
             datum: None,
             tolerance: None,
+            key: None,
+            members: Vec::new(),
         }],
     ));
     let report = verify_drawing(&d);
@@ -1231,6 +1241,8 @@ fn hole_tag_forced_onto_dimension_text_fires_collision() {
         pid: None,
         datum: None,
         tolerance: None,
+        key: None,
+        members: Vec::new(),
     };
 
     let mut d = Drawing::new("TagCollision", SheetSize::A3);
@@ -1700,10 +1712,25 @@ fn off_origin_bore_tags_land_on_their_own_circles() {
 /// quality report on 2026-07-05: 60×40×12 plate, four Ø6 THRU bores on a
 /// ring of radius 18 (Z axis). Rectangular (not square) plate + a wide ring
 /// exposes placement/scale defects the square six-hole fixture missed.
+///
+/// The plate is centred, so it spans y = ±20 and the two bores at (0, ±18)
+/// (reaching y = ±21) BREAK OUT through the long edges: they are arcs of
+/// more than half a turn, stated by their diameter and location but never
+/// tabled as drilled holes (`drawing::arcs`). Only the bores at (±18, 0)
+/// close. The tabled-sheet tests use [`closed_ring_plate`].
 fn ring_plate() -> (BRepModel, u32) {
+    ring_plate_of_height(40.0)
+}
+
+/// [`ring_plate`] on a 60×48 plate, so all four bores close and are tabled.
+fn closed_ring_plate() -> (BRepModel, u32) {
+    ring_plate_of_height(48.0)
+}
+
+fn ring_plate_of_height(height: f64) -> (BRepModel, u32) {
     let mut m = BRepModel::new();
     let plate = match TopologyBuilder::new(&mut m)
-        .create_box_3d(60.0, 40.0, 12.0)
+        .create_box_3d(60.0, height, 12.0)
         .expect("plate")
     {
         GeometryId::Solid(s) => s,
@@ -1754,7 +1781,7 @@ fn ring_plate() -> (BRepModel, u32) {
 ///   - the hole-table region intersects NO DimensionText / ViewGeometry ink.
 #[test]
 fn ring_plate_sheet_passes_quality_with_utilization() {
-    let (m, part) = ring_plate();
+    let (m, part) = closed_ring_plate();
     let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
     let report = verify_drawing(&dwg);
     assert!(
@@ -1908,7 +1935,7 @@ fn ring_plate_section_shows_bore_voids() {
 /// `compute_layout` → no DatumMarker item → RED.
 #[test]
 fn ring_plate_datum_marker_at_table_origin() {
-    let (m, part) = ring_plate();
+    let (m, part) = closed_ring_plate();
     let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
     let layout = compute_layout(&dwg);
 
@@ -2013,25 +2040,31 @@ fn hole_table_on_dimension_text_fires_collision() {
         pid: None,
         datum: None,
         tolerance: None,
+        key: None,
+        members: Vec::new(),
     };
 
     let mut d = Drawing::new("TableCollision", SheetSize::A4);
-    // A 200×140 TOP view at pos [30, 25] (sheet h = 210, pos_y measured
-    // from the sheet BOTTOM): geometry spans sheet x ∈ [30, 230],
-    // y ∈ [45, 185] — covering the BOTTOM-LEFT slot; the BELOW-AXIAL slot
-    // (y ≥ 191) runs off the frame. Placement therefore falls back to the
-    // RIGHT slot (~x 66..114, y 144..155 above the title block).
+    // A 277×190 TOP view at pos [10, 10] (sheet h = 210, pos_y measured
+    // from the sheet BOTTOM): geometry spans sheet x ∈ [10, 287],
+    // y ∈ [10, 200] — the WHOLE frame, so none of the three named slots
+    // fits and neither does any free place on the sheet. (Placement now
+    // searches the frame before giving up; the old 200×140 view left room
+    // to its right, the table went there, and the planted text was never
+    // covered.) Placement therefore falls back to the RIGHT slot (~x
+    // 66..114, y 144..155 above the title block), where the verifier must
+    // report what the table covers.
     d.add_view(rect_view(
         "TOP",
         ProjectionType::Top,
-        [30.0, 25.0],
-        200.0,
-        140.0,
+        [10.0, 10.0],
+        277.0,
+        190.0,
         vec![
-            // Leader-free angle callout: view-space anchor a = (55, 37) →
-            // sheet (30+55, 185−37) = (85, 148) — inside the RIGHT slot's
+            // Leader-free angle callout: view-space anchor a = (75, 52) →
+            // sheet (10+75, 200−52) = (85, 148) — inside the RIGHT slot's
             // table rect.
-            angle("60.000\u{00B0}", [55.0, 37.0]),
+            angle("60.000\u{00B0}", [75.0, 52.0]),
         ],
     ));
     d.axial_view_idx = Some(0);
@@ -3709,4 +3742,161 @@ fn explicit_scale_hlr_sheet_tables_its_bores_and_certifies_sound() {
             );
         }
     }
+}
+
+/// One hole-table row for a fixture: a Ø5 THRU hole tagged `tag`.
+fn table_row(tag: &str) -> geometry_engine::drawing::HoleSite {
+    geometry_engine::drawing::HoleSite {
+        tag: tag.to_string(),
+        group: "A".to_string(),
+        diameter_mm: 5.0,
+        x_label: "5".to_string(),
+        y_label: "5".to_string(),
+        x_mm: 5.0,
+        y_mm: 5.0,
+        dia_label: "\u{00D8}5".to_string(),
+        depth_label: "THRU".to_string(),
+        is_through: true,
+        depth_mm: Some(10.0),
+        axial_centre: None,
+        world_centre: None,
+        face_entities: vec![99],
+        datum: None,
+        tolerance: None,
+    }
+}
+
+/// A hole table printed across a view is a defect the sheet check must
+/// report. Found by looking at benchmark sheets (the table over the TOP view
+/// on one, over the general notes on two others) that `verify_drawing`
+/// passed: the table was only ever tested against dimension text.
+///
+/// The fixture's one view fills the frame, so no place on the sheet is free
+/// and the table falls back to its nominal slot, on the view.
+///
+/// Mutation: remove the `check_hole_table_clear` call from `verify_drawing`
+/// and the overlap is certified clean again.
+#[test]
+fn hole_table_over_a_view_is_flagged() {
+    let mut d = Drawing::new("TableOnView", SheetSize::A3);
+    d.add_view(rect_view(
+        "A",
+        ProjectionType::Top,
+        [25.0, 20.0],
+        380.0,
+        262.0,
+        Vec::new(),
+    ));
+    d.hole_sites = vec![table_row("A1"), table_row("A2")];
+    let report = verify_drawing(&d);
+    let hits: Vec<&DrawingIssue> = report
+        .issues
+        .iter()
+        .filter(|i| i.kind == DrawingIssueKind::HoleTableCollision)
+        .collect();
+    assert!(
+        hits.iter().any(|i| i.message.contains("a view")),
+        "the table lies on the view and the check must say so; issues: {:?}",
+        report
+            .issues
+            .iter()
+            .map(|i| (i.kind, &i.message))
+            .collect::<Vec<_>>()
+    );
+    assert!(!report.passed, "a table over a view fails the sheet check");
+}
+
+/// The table is PLACED clear whenever the sheet has a free place for it,
+/// even when its three named slots are taken: here views occupy the
+/// right-hand slot and the bottom-left corner, and the table goes to free
+/// paper instead of onto either.
+///
+/// Mutation: drop the `.or_else(anywhere)` fallback in `place_hole_table`
+/// and the table lands on the right-hand view (`HoleTableCollision`).
+#[test]
+fn hole_table_finds_free_paper_when_its_slots_are_taken() {
+    let mut d = Drawing::new("TableFree", SheetSize::A3);
+    // Over the RIGHT slot (just left of the title block, above it).
+    d.add_view(rect_view(
+        "A",
+        ProjectionType::Front,
+        [150.0, 60.0],
+        110.0,
+        60.0,
+        Vec::new(),
+    ));
+    // Over the BOTTOM-LEFT slot.
+    d.add_view(rect_view(
+        "B",
+        ProjectionType::Right,
+        [22.0, 30.0],
+        60.0,
+        60.0,
+        Vec::new(),
+    ));
+    d.hole_sites = vec![table_row("A1"), table_row("A2")];
+    let report = verify_drawing(&d);
+    assert!(
+        !report.has(DrawingIssueKind::HoleTableCollision),
+        "free paper exists, so the table must not sit on a view: {:?}",
+        report
+            .issues
+            .iter()
+            .map(|i| (i.kind, &i.message))
+            .collect::<Vec<_>>()
+    );
+    let layout = compute_layout(&d);
+    assert!(
+        layout
+            .items
+            .iter()
+            .any(|it| it.kind == SheetItemKind::HoleTableBorder),
+        "the table is on the sheet"
+    );
+}
+
+/// The 60×40 ring plate's bores at (0, ±18) break out through its long
+/// edges: arcs of more than half a turn. They are not drilled holes and get
+/// no hole-table row (a row would state a closed Ø6 bore the part does not
+/// have), but they are not dropped either: each is stated by its diameter on
+/// the sheet or named as an omission, and the sheet stays SOUND -- nothing
+/// it states is false.
+///
+/// Mutation: make `arcs::closed_bore_faces` return `bore_face_ids`
+/// unfiltered -> the break-out arcs are tabled at (0, ±18) -> RED.
+#[test]
+fn ring_plate_breakout_bores_are_stated_not_tabled() {
+    use geometry_engine::drawing::sheet_certificate::certify_drawing;
+    let (m, part) = ring_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    for h in &dwg.hole_sites {
+        let c = h.world_centre.expect("a tabled bore has a world centre");
+        assert!(
+            c[1].abs() < 1.0,
+            "a break-out arc was tabled as a drilled hole: {} at {c:?}",
+            h.tag
+        );
+    }
+    let cert = certify_drawing(&m, &dwg);
+    assert!(cert.sound, "facts: {:#?}", cert.facts);
+    let diameters_inked = dwg
+        .views
+        .iter()
+        .flat_map(|v| v.dimensions.iter())
+        .filter(|x| x.label.contains("\u{00D8}6"))
+        .count();
+    let diameters_omitted = cert
+        .omissions
+        .iter()
+        .filter(|o| o.kind == "diameter" && (o.value - 6.0).abs() < 1e-6)
+        .count();
+    assert!(
+        diameters_inked + diameters_omitted >= 1,
+        "the break-out bores are neither stated nor named: labels {:?}, omissions {:?}",
+        dwg.views
+            .iter()
+            .flat_map(|v| v.dimensions.iter().map(|x| x.label.clone()))
+            .collect::<Vec<_>>(),
+        cert.omissions
+    );
 }

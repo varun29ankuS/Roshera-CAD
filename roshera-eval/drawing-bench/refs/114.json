@@ -1,0 +1,41 @@
+{
+  "id": "114",
+  "source": "Read off reference/114/input.png (CADGenBench, rendered 2400 px wide) by the drawing agent (Opus) on 2026-11-18. One pass, not double-checked by a person. HELD OUT. The reference is a sheet-metal part drawn as its FLAT PATTERN with ordinate dimensions; the linear values are unfolded lengths a sheet of the formed solid cannot state without a flat-pattern view. Holes and radii are matchable.",
+  "views": ["front", "iso"],
+  "dims": [
+    {"kind": "linear", "value": 61.0, "feature": "flat ordinate 61"},
+    {"kind": "linear", "value": 52.2, "feature": "flat ordinate 52.2"},
+    {"kind": "linear", "value": 45.5, "feature": "flat ordinate 45.5"},
+    {"kind": "linear", "value": 20.4, "feature": "flat ordinate 20.4"},
+    {"kind": "linear", "value": 98.0, "feature": "flat ordinate 98"},
+    {"kind": "linear", "value": 91.5, "feature": "flat ordinate 91.5"},
+    {"kind": "linear", "value": 85.0, "feature": "flat ordinate 85"},
+    {"kind": "linear", "value": 66.0, "feature": "flat ordinate 66"},
+    {"kind": "linear", "value": 47.8, "feature": "flat ordinate 47.8"},
+    {"kind": "linear", "value": 43.8, "feature": "flat ordinate 43.8"},
+    {"kind": "linear", "value": 28.8, "feature": "flat ordinate 28.8"},
+    {"kind": "linear", "value": 25.8, "feature": "flat ordinate 25.8"},
+    {"kind": "linear", "value": 16.6, "feature": "flat ordinate 16.6"},
+    {"kind": "linear", "value": 5.3, "feature": "flat ordinate 5.3"},
+    {"kind": "linear", "value": 18.0, "feature": "flat ordinate 18"},
+    {"kind": "linear", "value": 23.9, "feature": "flat ordinate 23.9"},
+    {"kind": "linear", "value": 47.0, "feature": "flat ordinate 47"},
+    {"kind": "linear", "value": 51.4, "feature": "flat ordinate 51.4"},
+    {"kind": "linear", "value": 52.0, "feature": "flat ordinate 52"},
+    {"kind": "linear", "value": 65.0, "feature": "flat ordinate 65"},
+    {"kind": "linear", "value": 70.0, "feature": "flat ordinate 70"},
+    {"kind": "linear", "value": 3.0, "feature": "sheet thickness (note)"},
+    {"kind": "radius", "value": 2.0, "count": 2, "feature": "R2 corners, tab"},
+    {"kind": "radius", "value": 3.5, "count": 3, "feature": "R3.5 corners"},
+    {"kind": "radius", "value": 10.0, "feature": "R10"},
+    {"kind": "radius", "value": 25.0, "count": 2, "feature": "R25 outline"},
+    {"kind": "radius", "value": 15.0, "feature": "R15 outline"},
+    {"kind": "radius", "value": 22.0, "feature": "R22 outline"}
+  ],
+  "holes": [
+    {"dia": 4.5, "count": 1, "thru": true},
+    {"dia": 7.0, "count": 2, "thru": true},
+    {"dia": 6.8, "count": 1, "thru": true}
+  ],
+  "notes": ["SHEET THICKNESS 3", "BEND RADIUS 3 UNLESS OTHERWISE SPECIFIED", "ALL BEND ANGLES 90"]
+}

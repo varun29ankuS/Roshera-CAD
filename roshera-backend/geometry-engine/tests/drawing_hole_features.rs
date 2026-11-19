@@ -102,7 +102,7 @@ fn a_counterbored_flange_has_one_bolt_circle() {
         rp.bolt_circles
     );
     let ls = labels(&d);
-    let want = "4\u{00D7} \u{00D8}6.60 THRU \u{2334} \u{00D8}11.00 \u{21A7} 6.80 EQ SP";
+    let want = "4\u{00D7} \u{00D8}6.6 THRU \u{2334} \u{00D8}11 \u{21A7} 6.8 EQ SP";
     assert!(ls.iter().any(|l| l == want), "sheet lacks {want:?}: {ls:?}");
 }
 
@@ -236,7 +236,7 @@ fn a_counterbore_is_recognised_and_its_row_is_inked() {
     );
     assert!(hf.patterns.is_empty(), "one hole is not a pattern");
     assert!(
-        inks(&svg, "\u{00D8}6.60 \u{2334} \u{00D8}11.00 \u{21A7} 6.80"),
+        inks(&svg, "\u{00D8}6.6 \u{2334} \u{00D8}11 \u{21A7} 6.8"),
         "row size cell"
     );
     assert!(inks(&svg, "THRU"), "row depth cell");
@@ -291,9 +291,9 @@ fn a_countersink_and_a_drill_point_are_recognised() {
     assert_eq!(pt.label(), "\u{00D8}8.00 \u{21A7} 12.00");
     assert!(inks(
         &svg,
-        "\u{00D8}9.00 \u{2335} \u{00D8}18.00 \u{00D7} 90\u{00B0}"
+        "\u{00D8}9 \u{2335} \u{00D8}18 \u{00D7} 90\u{00B0}"
     ));
-    assert!(inks(&svg, "\u{21A7} 12.00"));
+    assert!(inks(&svg, "\u{21A7} 12"));
     // The cone's own records (an angle, and a "diameter" read off the uncut
     // surface bound) are stated by the callout, not inked beside it.
     let ls = labels(&d);
@@ -337,8 +337,13 @@ fn a_grid_of_counterbores_is_one_callout_located_by_pitch() {
     let p = &hf.patterns[0];
     assert_eq!(p.counts, [2, 2]);
     assert!((p.pitch[0] - 40.0).abs() < 1e-9 && (p.pitch[1] - 20.0).abs() < 1e-9);
-    let want = "4\u{00D7} \u{00D8}6.60 THRU \u{2334} \u{00D8}11.00 \u{21A7} 6.80";
-    assert_eq!(p.label, want);
+    // The model states the pattern to two places; the sheet prints it without
+    // trailing zeros (ISO 129-1).
+    assert_eq!(
+        p.label,
+        "4\u{00D7} \u{00D8}6.60 THRU \u{2334} \u{00D8}11.00 \u{21A7} 6.80"
+    );
+    let want = "4\u{00D7} \u{00D8}6.6 THRU \u{2334} \u{00D8}11 \u{21A7} 6.8";
     let ls = labels(&d);
     assert!(ls.iter().any(|l| l == want), "{ls:?}");
     // Located: the first hole from the part corner (20, 20), the pitch 40 / 20.
@@ -350,11 +355,11 @@ fn a_grid_of_counterbores_is_one_callout_located_by_pitch() {
             .map(|x| x.label.clone())
             .collect()
     };
-    assert_eq!(kinds("location"), vec!["20.00", "20.00"], "{ls:?}");
+    assert_eq!(kinds("location"), vec!["20", "20"], "{ls:?}");
     let mut pitches = kinds("pitch");
     pitches.sort();
-    assert_eq!(pitches, vec!["20.00", "40.00"], "{ls:?}");
-    for t in [want, "20.00", "40.00"] {
+    assert_eq!(pitches, vec!["20", "40"], "{ls:?}");
+    for t in [want, "20", "40"] {
         assert!(inks(&svg, t), "sheet does not ink {t:?}");
     }
     assert!(!inks(&svg, "TAG"), "a located pattern has no hole table");
@@ -389,9 +394,13 @@ fn a_row_of_countersinks_states_its_equal_spacing() {
     let (d, svg) = sheet(&m, s, "countersink_row");
     let hf = d.hole_features.as_ref().expect("stacks");
     assert_eq!(hf.patterns.len(), 1, "{:#?}", hf.patterns);
-    let want = "3\u{00D7} \u{00D8}9.00 THRU \u{2335} \u{00D8}18.00 \u{00D7} 90\u{00B0}";
-    assert_eq!(hf.patterns[0].label, want);
-    for t in [want, "2\u{00D7} 25.00 (=50.00)"] {
+    assert_eq!(
+        hf.patterns[0].label,
+        "3\u{00D7} \u{00D8}9.00 THRU \u{2335} \u{00D8}18.00 \u{00D7} 90\u{00B0}"
+    );
+    // Printed without trailing zeros (ISO 129-1).
+    let want = "3\u{00D7} \u{00D8}9 THRU \u{2335} \u{00D8}18 \u{00D7} 90\u{00B0}";
+    for t in [want, "2\u{00D7} 25 (=50)"] {
         assert!(inks(&svg, t), "sheet does not ink {t:?}");
     }
 }
@@ -406,10 +415,19 @@ fn two_blind_holes_are_a_linear_pattern() {
     let (d, svg) = sheet(&m, s, "blind_pair");
     let hf = d.hole_features.as_ref().expect("stacks");
     assert_eq!(hf.patterns.len(), 1);
-    let want = "2\u{00D7} \u{00D8}8.00 \u{21A7} 12.00";
-    assert_eq!(hf.patterns[0].label, want);
+    assert_eq!(
+        hf.patterns[0].label,
+        "2\u{00D7} \u{00D8}8.00 \u{21A7} 12.00"
+    );
+    // Printed without trailing zeros (ISO 129-1).
+    let want = "2\u{00D7} \u{00D8}8 \u{21A7} 12";
     assert!(inks(&svg, want));
-    assert!(inks(&svg, "40.00"), "the pitch");
+    let pitch = d
+        .views
+        .iter()
+        .flat_map(|v| v.dimensions.iter())
+        .any(|x| x.kind == "pitch" && x.label == "40");
+    assert!(pitch, "the pitch is a 40 dimension");
 }
 
 /// Unequal spacing is NOT a pattern: the holes keep their table rows.
@@ -448,9 +466,9 @@ fn a_plate_with_three_patterns_inks_all_of_them() {
     assert_eq!(hf.stacks.len(), 8, "{:#?}", hf.stacks);
     assert_eq!(hf.patterns.len(), 3, "{:#?}", hf.patterns);
     for want in [
-        "4\u{00D7} \u{00D8}6.60 THRU \u{2334} \u{00D8}11.00 \u{21A7} 6.80",
-        "2\u{00D7} \u{00D8}9.00 THRU \u{2335} \u{00D8}18.00 \u{00D7} 90\u{00B0}",
-        "2\u{00D7} \u{00D8}8.00 \u{21A7} 12.00",
+        "4\u{00D7} \u{00D8}6.6 THRU \u{2334} \u{00D8}11 \u{21A7} 6.8",
+        "2\u{00D7} \u{00D8}9 THRU \u{2335} \u{00D8}18 \u{00D7} 90\u{00B0}",
+        "2\u{00D7} \u{00D8}8 \u{21A7} 12",
     ] {
         assert!(inks(&svg, want), "sheet does not ink {want:?}");
     }
@@ -648,9 +666,9 @@ fn a_wider_countersink_makes_the_sheet_stale() {
 fn a_counterbored_flange_certifies_and_goes_stale_when_deepened() {
     let (m, s) = counterbored_flange(6.8);
     let (d, svg) = sheet(&m, s, "counterbored_flange");
-    let want = "4\u{00D7} \u{00D8}6.60 THRU \u{2334} \u{00D8}11.00 \u{21A7} 6.80 EQ SP";
+    let want = "4\u{00D7} \u{00D8}6.6 THRU \u{2334} \u{00D8}11 \u{21A7} 6.8 EQ SP";
     assert!(inks(&svg, want), "sheet does not ink {want:?}");
-    assert!(inks(&svg, "\u{00D8}60.00 PCD"));
+    assert!(inks(&svg, "\u{00D8}60 PCD"));
     assert!(!inks(&svg, "TAG"), "every hole is called out");
     let (f, sound) = facts(&m, &d, SheetFactKind::BoltCircle);
     assert_eq!(f.len(), 1);
@@ -1030,7 +1048,7 @@ fn a_bore_through_plate_and_boss_is_one_through_hole() {
         "the Ø30 bore must be ONE hole, got rows {rows:?}"
     );
     let stated_thru = rows.iter().any(|(_, depth)| depth == "THRU")
-        || inks(&svg, "\u{00D8}30.00 THRU")
+        || inks(&svg, "\u{00D8}30 THRU")
         || d.hole_features.as_ref().map_or(false, |hf| {
             hf.stacks
                 .iter()
@@ -1085,7 +1103,7 @@ fn the_live_mounting_plate_sheet_is_right_and_clean() {
     assert!(
         inks(
             &svg,
-            "4\u{00D7} \u{00D8}6.60 THRU \u{2334} \u{00D8}11.00 \u{21A7} 6.50"
+            "4\u{00D7} \u{00D8}6.6 THRU \u{2334} \u{00D8}11 \u{21A7} 6.5"
         ),
         "the four counterbored holes are one callout"
     );
@@ -1158,4 +1176,35 @@ fn the_live_mounting_plate_sheet_is_right_and_clean() {
         through_text.is_empty(),
         "leader lines through text/views: {through_text:?}"
     );
+}
+
+/// A feature coaxial with a tabled hole -- the boss a hole is drilled
+/// through, a counterbore -- sits at the hole's X and Y: the hole table's row
+/// states its location. The sheet keeps one of two dimensions with the same
+/// number over the same interval, and when the one kept was the hole's (which
+/// the table states, so it is not inked) the coaxial feature's location was
+/// reported "not on the sheet": an INCOMPLETE certificate for a location the
+/// sheet prints (CADGenBench 119 and 102).
+///
+/// Mutation: credit only inked dimensions in `completeness::same_statement`
+/// again -> the boss's locations are omissions -> RED.
+#[test]
+fn a_feature_coaxial_with_a_tabled_hole_is_located_by_its_row() {
+    use geometry_engine::drawing::completeness::dimension_omissions;
+    let mut m = BRepModel::new();
+    let mut s = plate(&mut m);
+    // A Ø20 x 6 boss on the top face (z = 10) off the centre, drilled Ø8
+    // through boss and plate.
+    let boss = cyl(&mut m, 20.0, 10.0, 10.0, 10.0, 6.0);
+    s = boolean_operation(&mut m, s, boss, BooleanOp::Union, BooleanOptions::default()).unwrap();
+    let hole = cyl(&mut m, 20.0, 10.0, -15.0, 4.0, 40.0);
+    s = cut(&mut m, s, hole);
+    let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).unwrap();
+    assert!(!d.hole_sites.is_empty(), "the Ø8 hole is tabled");
+    let located_nowhere: Vec<String> = dimension_omissions(&m, &d)
+        .into_iter()
+        .filter(|o| o.kind == "position")
+        .map(|o| format!("{} {} ({:?})", o.view, o.label, o.reason))
+        .collect();
+    assert!(located_nowhere.is_empty(), "{located_nowhere:?}");
 }

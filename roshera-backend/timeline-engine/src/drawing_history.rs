@@ -2,8 +2,9 @@
 //!
 //! A drawing is created from a part and then edited: renamed, its title block
 //! filled in (material, approval), views added and removed, deleted. Every
-//! edit is a recorded event. [`rebuild_drawings`] replays them all, in order,
-//! on top of the sheet re-derived from the part as it stands at the drawing's
+//! edit is a recorded event, the annotations of its dimensions (tolerance,
+//! text, move, suppression: `drawing.dimension.update`) included.
+//! [`rebuild_drawings`] replays them all, in order, on top of the sheet re-derived from the part as it stands at the drawing's
 //! position in the history (moulds folded in, so the sheet follows the part).
 //!
 //! Before this, only the creation and a projection switch were replayed: a
@@ -262,7 +263,26 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                         serde_json::from_value::<ViewSource>(p.get("source")?.clone()).ok()
                     })
                     .unwrap_or(source);
-                let key = FrameCache::derived_key(&FrameCache::key_of(&geometry), &followed, &[]);
+                // A view added to a sheet drawn in a part frame is projected
+                // in that frame (the move is part of the cache key).
+                // The frame is the sheet's part's: a view of another part is
+                // not moved.
+                let drawn_frame = out.drawings.get(&id).and_then(|d| {
+                    let ViewSource::Part { part_id, .. } = source;
+                    let same_part = d.views.first().is_some_and(|v| {
+                        let ViewSource::Part {
+                            part_id: sheet_part,
+                            ..
+                        } = v.source;
+                        sheet_part == part_id
+                    });
+                    d.drawn_frame.clone().filter(|_| same_part)
+                });
+                let key = FrameCache::derived_key(
+                    &FrameCache::key_of(&geometry),
+                    &followed,
+                    format!("{drawn_frame:?}").as_bytes(),
+                );
                 let projected = match frames.view(&key) {
                     Some(hit) => {
                         out.stats.views_reused += 1;
@@ -276,17 +296,34 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                             .get(&(solid_id as u64))
                             .copied()
                             .unwrap_or(solid_id as u64) as u32;
-                        let r = added_view(
-                            &model,
-                            ViewSource::Part {
-                                part_id,
-                                solid_id: live,
-                            },
-                            projection,
-                            name,
-                            position,
-                            scale,
-                        );
+                        let source_live = ViewSource::Part {
+                            part_id,
+                            solid_id: live,
+                        };
+                        let r = match &drawn_frame {
+                            Some(f) => {
+                                match geometry_engine::drawing::model_in_drawn_frame(
+                                    &model, live, f,
+                                ) {
+                                    Some(framed) => added_view(
+                                        &framed,
+                                        source_live,
+                                        projection,
+                                        name,
+                                        position,
+                                        scale,
+                                    ),
+                                    None => Err(
+                                        geometry_engine::drawing::ProjectionError::SolidNotFound(
+                                            live,
+                                        ),
+                                    ),
+                                }
+                            }
+                            None => {
+                                added_view(&model, source_live, projection, name, position, scale)
+                            }
+                        };
                         if let Ok(v) = &r {
                             out.stats.views_projected += 1;
                             frames.store_view(key, v.clone());
@@ -368,6 +405,31 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                     }
                     _ => out.issues.push(format!(
                         "sequence {}: a view edit could not be read",
+                        e.sequence_number
+                    )),
+                }
+            }
+            // What was authored on one dimension -- tolerance, text, a move,
+            // a suppression -- as the whole record, keyed by the dimension's
+            // durable key. It is put back as recorded even when the rebuilt
+            // sheet no longer carries that dimension: the sheet certificate
+            // then reports the edit as dangling. It is never moved to another
+            // dimension, and never dropped here without a trace.
+            "drawing.dimension.update" => {
+                let p = params(e);
+                let key = p.and_then(|p| p.get("key")).and_then(Value::as_str);
+                let edit = p.and_then(|p| p.get("edit")).and_then(|v| {
+                    serde_json::from_value::<geometry_engine::drawing::DimensionEdit>(v.clone())
+                        .ok()
+                });
+                match (target, key, edit) {
+                    (Some(id), Some(key), Some(edit)) => {
+                        if let Some(d) = out.drawings.get_mut(&id) {
+                            d.apply_dimension_edit(key, edit);
+                        }
+                    }
+                    _ => out.issues.push(format!(
+                        "sequence {}: a dimension annotation could not be read",
                         e.sequence_number
                     )),
                 }

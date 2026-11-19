@@ -699,6 +699,9 @@ pub struct SheetStamp {
     /// First 8 hex digits of the SHA-256 over the certificate's facts in
     /// canonical order.
     pub digest: String,
+    /// Model dimensions no view states and nobody waived (the certificate's
+    /// `counts.not_dimensioned`). Above zero the stamp reads `INCOMPLETE`.
+    pub not_dimensioned: usize,
 }
 
 // ── GD&T sheet annotations ────────────────────────────────────────────────────
@@ -947,7 +950,10 @@ pub struct ToleranceRef {
     pub feature_pid: Option<String>,
     /// Index of this tolerance within the feature's sidecar annotation list.
     pub annotation_index: usize,
-    /// The authored bound kind: `"plus_minus"`, `"limits"`, or `"fit"`.
+    /// The authored bound kind. From a feature's size annotation:
+    /// `"plus_minus"`, `"limits"` or `"fit"`. From a tolerance authored on
+    /// the sheet dimension itself: `"symmetric"`, `"bilateral"`, `"limits"`,
+    /// `"fit"`, `"basic"` or `"reference"`.
     pub kind: String,
     /// The nominal (basic) size in millimetres.
     pub nominal: f64,
@@ -1090,6 +1096,24 @@ pub struct Drawing {
     /// and pattern. `serde(default)` keeps older sheets parsing.
     #[serde(default)]
     pub hole_features: Option<super::hole_features::HoleFeatures>,
+    /// What was authored on this sheet's dimensions -- tolerance, text before
+    /// and after the value, a move, a suppression -- by dimension key
+    /// ([`super::dimensioning::Dimension2d::key`]). The dimensions themselves
+    /// stay derived from the model; these are applied to them whenever the
+    /// sheet is laid out, so they survive every rebuild. Each entry is a
+    /// recorded `drawing.dimension.update` event. `serde(default)` keeps
+    /// older sheets parsing.
+    #[serde(default)]
+    pub dimension_edits: super::dimension_edit::DimensionEdits,
+    /// The rigid move the part was drawn under, when it was not drawn where
+    /// the model holds it: an assembly placement undone and/or the part
+    /// squared to its natural frame ([`super::part_frame`]). Every view,
+    /// dimension, hole position and cutting plane on the sheet is in this
+    /// frame, so the certificate re-measures the live model moved by it.
+    /// `None` when the part was drawn as modelled. `serde(default)` keeps
+    /// older sheets parsing.
+    #[serde(default)]
+    pub drawn_frame: Option<super::part_frame::DrawnFrame>,
     /// Render-time facts (mass, certificate stamp) -- set on a transient copy
     /// right before rendering, never persisted.
     #[serde(skip)]
@@ -1134,6 +1158,8 @@ impl Drawing {
             general_tolerance: GeneralTolerance::default(),
             round_part: None,
             hole_features: None,
+            dimension_edits: super::dimension_edit::DimensionEdits::new(),
+            drawn_frame: None,
             render_facts: RenderFacts::default(),
         }
     }

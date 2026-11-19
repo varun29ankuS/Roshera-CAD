@@ -133,6 +133,10 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
           void createDocument('Untitled')
             .then((doc) => {
               writeStartDocument(storage, { id: doc.id, used: false })
+              // In the list before the switch marks it active: otherwise the
+              // list holds no active document until it is re-fetched, and
+              // anything that asks it which document is open hears "none".
+              set((s) => ({ documents: s.documents.some((d) => d.id === doc.id) ? s.documents : [...s.documents, doc] }))
               return get().switchTo(doc.id)
             })
             .catch(() => undefined)
@@ -217,6 +221,7 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
     if (get().switchingId) return { success: false, error: 'a switch is already in progress' }
     try {
       const doc = await createDocument(name)
+      set((s) => ({ documents: s.documents.some((d) => d.id === doc.id) ? s.documents : [...s.documents, doc] }))
       return await get().switchTo(doc.id)
     } catch (err) {
       return { success: false, error: errorMessage(err) }

@@ -361,14 +361,15 @@ pub fn verify_dimensional(
     face: FaceId,
     tol: &DimensionalTolerance,
 ) -> ConformanceResult {
-    // A fit class has no resolved numeric envelope — honest non-verdict.
+    // A fit class outside the ISO 286 tables has no numeric envelope —
+    // honest non-verdict.
     let (lower, upper) = match tol.limit_range() {
         Some(r) => r,
         None => {
             return ConformanceResult::not_verified(
                 "DIAMETER",
                 0.0,
-                "fit-class tolerance: ISO 286 grade table not yet resolved",
+                "fit-class tolerance: class or size outside the tabulated ISO 286 range",
             );
         }
     };
@@ -1884,8 +1885,8 @@ mod tests {
 
     #[test]
     fn fit_class_dimensional_is_not_verified() {
-        // No geometry needed: a fit-class tolerance has no resolved envelope.
-        let dim = DimensionalTolerance::fit(10.0, "H7");
+        // No geometry needed: an untabulated fit class has no resolved envelope.
+        let dim = DimensionalTolerance::fit(10.0, "za6");
         assert!(matches!(dim.bound, ToleranceBound::Fit(_)));
         assert_eq!(dim.limit_range(), None);
     }

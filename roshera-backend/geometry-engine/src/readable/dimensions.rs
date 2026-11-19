@@ -63,7 +63,7 @@ const ROSHERA_DIM_NS: Uuid = Uuid::from_u128(0x6e5a_1f00_0000_4000_8000_526f_736
 ///
 /// Derivation: UUIDv5 over `ROSHERA_DIM_NS` + sorted entity pids (as
 /// big-endian u128 bytes) + kind bytes, length-prefixed to prevent aliasing.
-fn feature_dim_pid(model: &BRepModel, entities: &[u32], kind: &str) -> Option<String> {
+pub(crate) fn feature_dim_pid(model: &BRepModel, entities: &[u32], kind: &str) -> Option<String> {
     if entities.is_empty() {
         return None;
     }

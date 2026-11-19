@@ -172,7 +172,9 @@ console.log("(o3) ratchet floor (encodes observed reality, never aspiration)");
 // Raised 111 → 112 (2026-09-24, audit Task 93): part_rename (a3ab6b9e, "core").
 // Raised 112 → 114 (2026-11-11): drawing_set_dimension + drawing_set_projection
 // ("drawing", experimental) — editing the part from its drawing.
-const FLOOR_TOTAL = 114;
+// Raised 114 → 121 (2026-11-17): the measured size after drawing_dimensions,
+// drawing_dimension_properties and iso286_limits ("drawing", experimental).
+const FLOOR_TOTAL = 121;
 if (names.length >= FLOOR_TOTAL)
   pass(`registry size ${names.length} ≥ floor ${FLOOR_TOTAL}`);
 else

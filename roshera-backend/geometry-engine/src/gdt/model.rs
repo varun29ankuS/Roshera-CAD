@@ -191,10 +191,9 @@ impl MaterialModifier {
 }
 
 /// A standard ISO 286 fit class, e.g. `H7` (hole) or `g6` (shaft). Carried as
-/// the authored text plus the nominal; this phase models the type and resolves
-/// the *symmetric envelope is unknown* honestly rather than fabricating limits
-/// from an incomplete table. A later phase will expand the ISO 286 grade tables
-/// into explicit upper/lower deviations.
+/// the authored text; its limits are resolved from the nominal by the tables
+/// in [`super::iso286`]. A class or size outside those tables stays
+/// unresolved (no limits) rather than being approximated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FitClass {
     /// The fit designation as authored, e.g. `"H7"`, `"g6"`, `"H7/g6"`.
@@ -210,8 +209,9 @@ pub enum ToleranceBound {
     PlusMinus { plus: f64, minus: f64 },
     /// Explicit upper and lower limits (already absolute sizes, not deltas).
     Limits { upper: f64, lower: f64 },
-    /// An ISO 286 fit class. The numeric envelope is not yet resolved from the
-    /// grade tables, so verification against a fit class reports
+    /// An ISO 286 fit class, resolved by [`super::iso286::resolve_class`]. A
+    /// class outside the tabulated set has no numeric envelope, and
+    /// verification against it reports
     /// [`super::verify::Conformance::NotYetVerified`] rather than guessing.
     Fit(FitClass),
 }
@@ -255,7 +255,7 @@ impl DimensionalTolerance {
         }
     }
 
-    /// Fit-class tolerance (numeric envelope not yet resolved).
+    /// Fit-class tolerance (limits resolved from the ISO 286 tables).
     pub fn fit(nominal: f64, designation: impl Into<String>) -> Self {
         Self {
             nominal,
@@ -265,8 +265,9 @@ impl DimensionalTolerance {
         }
     }
 
-    /// The resolved `[lower, upper]` absolute size limits, when the bound is a
-    /// numeric one. `None` for an unresolved fit class — the caller must report
+    /// The resolved `[lower, upper]` absolute size limits. A fit class is
+    /// resolved from the ISO 286 tables ([`super::iso286`]); `None` for a
+    /// class or size those tables do not cover — the caller must report
     /// `NotYetVerified` rather than treat an absent envelope as in-spec.
     pub fn limit_range(&self) -> Option<(f64, f64)> {
         match &self.bound {
@@ -274,7 +275,9 @@ impl DimensionalTolerance {
                 Some((self.nominal - minus, self.nominal + plus))
             }
             ToleranceBound::Limits { upper, lower } => Some((*lower, *upper)),
-            ToleranceBound::Fit(_) => None,
+            ToleranceBound::Fit(fc) => super::iso286::resolve_class(self.nominal, &fc.designation)
+                .ok()
+                .map(|c| c.limits(self.nominal)),
         }
     }
 }
@@ -471,13 +474,22 @@ mod tests {
     }
 
     #[test]
-    fn fit_class_has_no_resolved_range() {
+    fn fit_class_resolves_from_the_iso_286_tables() {
         let f = DimensionalTolerance::fit(10.0, "H7");
-        assert_eq!(
-            f.limit_range(),
-            None,
-            "unresolved fit must not fabricate limits"
-        );
+        let (lo, hi) = f.limit_range().expect("H7 at 10 mm is tabulated");
+        assert!((lo - 10.0).abs() < 1e-9 && (hi - 10.015).abs() < 1e-9);
+    }
+
+    #[test]
+    fn untabulated_fit_class_has_no_resolved_range() {
+        for (nominal, class) in [(10.0, "za6"), (600.0, "H7"), (10.0, "H7/g6")] {
+            let f = DimensionalTolerance::fit(nominal, class);
+            assert_eq!(
+                f.limit_range(),
+                None,
+                "{class} at {nominal} mm must not fabricate limits"
+            );
+        }
     }
 
     #[test]

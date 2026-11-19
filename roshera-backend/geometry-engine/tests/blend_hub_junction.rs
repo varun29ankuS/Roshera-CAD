@@ -464,7 +464,7 @@ fn a_blended_hub_sheet_calls_out_its_fillet_and_its_chamfer() {
         let fillet = front
             .dimensions
             .iter()
-            .find(|x| x.label == "R3.00")
+            .find(|x| x.label == "R3")
             .unwrap_or_else(|| panic!("{route}: no R3 callout in FRONT; the sheet shows {all:?}"));
         assert_eq!(
             fillet.entities, tori,
@@ -482,9 +482,9 @@ fn a_blended_hub_sheet_calls_out_its_fillet_and_its_chamfer() {
         let chamfer = front
             .dimensions
             .iter()
-            .find(|x| x.label == "0.50 × 45°")
+            .find(|x| x.label == "0.5 × 45°")
             .unwrap_or_else(|| {
-                panic!("{route}: no 0.50 × 45° callout in FRONT; the sheet shows {all:?}")
+                panic!("{route}: no 0.5 × 45° callout in FRONT; the sheet shows {all:?}")
             });
         assert_eq!(
             chamfer.entities, cones,
@@ -510,7 +510,7 @@ fn a_blended_hub_sheet_calls_out_its_fillet_and_its_chamfer() {
         );
         // Each callout is inked once, on a leader whose arrow touches it.
         let layout = compute_layout(d);
-        for (callout, label) in [(fillet, "R3.00"), (chamfer, "0.50 × 45°")] {
+        for (callout, label) in [(fillet, "R3"), (chamfer, "0.5 × 45°")] {
             let inked: Vec<_> = layout
                 .dimensions
                 .iter()
@@ -540,7 +540,7 @@ fn a_blended_hub_sheet_calls_out_its_fillet_and_its_chamfer() {
         }
         // Certified like any other dimension.
         let cert = certify_drawing(&m, d);
-        for label in ["R3.00", "0.50 × 45°"] {
+        for label in ["R3", "0.5 × 45°"] {
             let fact = cert
                 .facts
                 .iter()
@@ -588,7 +588,7 @@ fn a_blend_callout_goes_stale_when_the_blend_changes_size() {
     let sheet =
         standard_drawing_hlr(&m3, part3, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("R3 sheet");
     let cert = certify_drawing(&m4, &sheet);
-    for (label, live) in [("R3.00", 4.0), ("0.50 × 45°", 0.8)] {
+    for (label, live) in [("R3", 4.0), ("0.5 × 45°", 0.8)] {
         let fact = cert
             .facts
             .iter()
@@ -604,72 +604,90 @@ fn a_blend_callout_goes_stale_when_the_blend_changes_size() {
     assert!(!cert.sound);
 }
 
-/// Rim rounds are called out one per rim: R1 on the flange's top and bottom
-/// outer rims are two blends of one size, each with its own "R1.00" on the
-/// arc it names -- not merged into one, and not dropped as a repeat of the
-/// other's value.
-#[test]
-fn each_rim_round_gets_its_own_radius_callout() {
-    use geometry_engine::drawing::types::{ProjectionType, SheetSize};
-    use geometry_engine::drawing::{certify_drawing, standard_drawing_hlr, SheetVerdict};
+/// The hub with rounds on the flange's top (z = 12) and bottom (z = 0)
+/// outer rims, of the given radii.
+fn rim_rounded_hub(top: f64, bottom: f64) -> (BRepModel, SolidId) {
     let (mut m, part) = blended_hub(0.5, 3.0);
-    for z in [12.0, 0.0] {
+    for (z, r) in [(12.0, top), (0.0, bottom)] {
         let outer = rim(&m, 40.0, z);
         fillet_edges(
             &mut m,
             part,
             outer,
             FilletOptions {
-                fillet_type: FilletType::Constant(1.0),
-                radius: 1.0,
+                fillet_type: FilletType::Constant(r),
+                radius: r,
                 ..Default::default()
             },
         )
-        .unwrap_or_else(|e| panic!("R1 on the flange rim at z = {z}: {e:?}"));
+        .unwrap_or_else(|e| panic!("R{r} on the flange rim at z = {z}: {e:?}"));
     }
+    (m, part)
+}
+
+/// Rim rounds of one size are stated once with their count (ISO 129-1):
+/// R1 on the flange's top and bottom outer rims is ONE "2× R1" callout on
+/// one rim's arc, speaking for both rims by name -- not two "R1"s, and not
+/// one R1 that drops the other rim as a repeat. The count is a statement
+/// about each rim: certified while both are R1, and STALE once one of them
+/// is not (the sheet would otherwise claim two R1 rims on a part with one).
+#[test]
+fn equal_rim_rounds_are_one_counted_callout_that_speaks_for_each_rim() {
+    use geometry_engine::drawing::types::{ProjectionType, SheetSize};
+    use geometry_engine::drawing::{certify_drawing, standard_drawing_hlr, SheetVerdict};
+    let counted = "2\u{00D7} R1";
+    let (m, part) = rim_rounded_hub(1.0, 1.0);
     let d = standard_drawing_hlr(&m, part, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("hlr");
     let front = d
         .views
         .iter()
         .find(|v| matches!(v.projection, ProjectionType::Front))
         .expect("front view");
+    let labels: Vec<String> = front.dimensions.iter().map(|x| x.label.clone()).collect();
     let r1: Vec<_> = front
         .dimensions
         .iter()
-        .filter(|x| x.label == "R1.00")
+        .filter(|x| x.label == counted)
         .collect();
-    assert_eq!(
-        r1.len(),
-        2,
-        "two R1 callouts in FRONT: {:?}",
-        front
-            .dimensions
-            .iter()
-            .map(|x| x.label.clone())
-            .collect::<Vec<_>>()
-    );
-    // Each on its own rim's arc: tube centres (39, 11) and (39, 1).
-    for (cz, x) in [(11.0, 0usize), (1.0, 1)] {
-        let hit = r1
-            .iter()
-            .any(|c| ((c.a[0] - 39.0).hypot(c.a[1] - cz) - 1.0).abs() < 1e-6);
-        assert!(
-            hit,
-            "callout {x}: no R1 on the arc about (39, {cz}): {r1:?}"
-        );
-    }
-    assert_ne!(r1[0].entities, r1[1].entities, "each names its own rim");
-    let cert = certify_drawing(&m, &d);
+    assert_eq!(r1.len(), 1, "one counted R1 callout in FRONT: {labels:?}");
     assert!(
+        !labels.iter().any(|l| l == "R1"),
+        "no uncounted R1 beside it: {labels:?}"
+    );
+    let r1 = r1[0];
+    assert_eq!(r1.members.len(), 2, "it names both rims: {:?}", r1.members);
+    assert_ne!(r1.members[0], r1.members[1], "two different rims");
+    // Its arrow is on one rim's arc: tube centres (39, 11) and (39, 1).
+    let on_arc = |cz: f64| ((r1.a[0] - 39.0).hypot(r1.a[1] - cz) - 1.0).abs() < 1e-6;
+    assert!(
+        on_arc(11.0) || on_arc(1.0),
+        "the callout's point {:?} is on neither rim's arc",
+        r1.a
+    );
+    let head_is_top = on_arc(11.0);
+    let verdict_of = |model: &BRepModel| {
+        let cert = certify_drawing(model, &d);
         cert.facts
             .iter()
-            .filter(|f| f.label == "R1.00")
-            .all(|f| f.live.verdict == SheetVerdict::Consistent),
-        "{:?}",
-        cert.facts
-            .iter()
-            .filter(|f| f.label == "R1.00")
-            .collect::<Vec<_>>()
+            .find(|f| f.label == counted)
+            .map(|f| (f.live.verdict, format!("{f:?}")))
+            .unwrap_or_else(|| panic!("no certificate fact for {counted}"))
+    };
+    let (held, why) = verdict_of(&m);
+    assert_eq!(held, SheetVerdict::Consistent, "{why}");
+    // The same sheet against the hub whose OTHER rim -- not the one the
+    // callout's arrow is on, so only the count can catch it -- is now R1.5.
+    let (changed, part2) = if head_is_top {
+        rim_rounded_hub(1.0, 1.5)
+    } else {
+        rim_rounded_hub(1.5, 1.0)
+    };
+    assert_eq!(part, part2, "fixture: same solid id");
+    let (stale, why) = verdict_of(&changed);
+    assert_eq!(
+        stale,
+        SheetVerdict::Stale,
+        "the other rim is no longer R1, so the count is false: {why}"
     );
 }
 
@@ -722,21 +740,7 @@ fn a_blended_hub_sheet_passes_the_layout_gate_with_its_callouts() {
     use geometry_engine::drawing::{
         render_drawing_svg, standard_drawing_auto, standard_drawing_hlr, verify_drawing, Severity,
     };
-    let (mut m, part) = blended_hub(0.5, 3.0);
-    for z in [12.0, 0.0] {
-        let outer = rim(&m, 40.0, z);
-        fillet_edges(
-            &mut m,
-            part,
-            outer,
-            FilletOptions {
-                fillet_type: FilletType::Constant(1.0),
-                radius: 1.0,
-                ..Default::default()
-            },
-        )
-        .expect("R1 flange rim");
-    }
+    let (m, part) = rim_rounded_hub(1.0, 1.0);
     let auto = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("auto");
     let hlr = standard_drawing_hlr(&m, part, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("hlr");
     for (route, d) in [("auto", &auto), ("hlr", &hlr)] {
@@ -748,8 +752,13 @@ fn a_blended_hub_sheet_passes_the_layout_gate_with_its_callouts() {
             .collect();
         assert!(errors.is_empty(), "{route}: {errors:#?}");
         let svg = render_drawing_svg(d);
-        for label in ["R3.00", "R1.00", "0.50 × 45°"] {
-            assert!(svg.contains(label), "{route}: the SVG has no {label}");
+        // Each callout as its own text element (metric drafting numbers, and
+        // the two equal rim rounds as one counted callout).
+        for label in ["R3", "2\u{00D7} R1", "0.5 \u{00D7} 45\u{00B0}"] {
+            assert!(
+                svg.contains(&format!(">{label}</text>")),
+                "{route}: the SVG has no {label}"
+            );
         }
     }
 }

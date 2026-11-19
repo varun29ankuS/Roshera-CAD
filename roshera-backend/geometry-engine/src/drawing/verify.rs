@@ -83,6 +83,12 @@ pub enum DrawingIssueKind {
     /// shaded overlay). Both must derive from the one shared iso camera
     /// (`render::camera_basis(CanonicalView::Isometric)`).
     IsoOrientationMismatch,
+    /// The hole table sits on other ink: a view's geometry, a view title, the
+    /// general notes or the title block. Found by looking at benchmark
+    /// sheets (a table printed across the TOP view, another across the
+    /// notes) that this check certified clean, because the table was only
+    /// ever tested against dimension text.
+    HoleTableCollision,
 }
 
 /// A single quality finding.
@@ -441,6 +447,9 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     // ── DimensionLabelCollision detection ─────────────────────────────────
     check_dimension_label_collisions(&layout, &mut issues);
 
+    // ── HoleTableCollision detection ────────────────────────────────────
+    check_hole_table_clear(&layout, &mut issues);
+
     // ── DimensionOnGeometry detection ─────────────────────────────────────
     check_dimension_on_geometry(&layout, drawing, &mut issues);
 
@@ -531,7 +540,7 @@ fn check_alignment(
 ///    multiple views to give context.
 ///
 ///    **Tabled-position exception**: `kind == "position"` dimensions whose
-///    entity set intersects a tabled bore's `face_entities` are excluded from
+///    faces are all a tabled bore's `face_entities` are excluded from
 ///    this check. Position dims for tabled bores are represented in the hole
 ///    table (X/Y columns) rather than the general dim stack, so their
 ///    appearance in multiple views is by design — both views carry the dim for
@@ -570,7 +579,7 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
                 // rendered only in the hole table, not as redundant dim callouts.
                 if d.kind == "position"
                     && !tabled_face_ids.is_empty()
-                    && d.entities.iter().any(|eid| tabled_face_ids.contains(eid))
+                    && d.entities.iter().all(|eid| tabled_face_ids.contains(eid))
                 {
                     continue;
                 }
@@ -714,6 +723,8 @@ fn check_dimension_label_collisions(
         }
     }
 
+    check_callout_lines_clear_of_text(layout, issues);
+
     // ── Hole-table region × dimension text ────────────────────────────────
     // The table (borders + cells) must not sit on any dimension callout.
     // Coverage gap found on the live ring-plate sheet (2026-07-05): the
@@ -748,6 +759,113 @@ fn check_dimension_label_collisions(
                     None,
                 ));
             }
+        }
+    }
+}
+
+/// A dimension's lines -- its dimension line, a leader's shoulder, its
+/// extension lines, a leader's leg -- must not run through another callout's
+/// text, a hole tag, a cutting-plane letter or a view title: a line struck
+/// through a number makes it unreadable as surely as two numbers printed on
+/// top of each other. Found by looking at a benchmark sheet whose quality
+/// report was clean: the shoulder of "2× 0.6 × 45°" ran through "2× R2.1"
+/// printed directly beneath it, the two text boxes only touching.
+/// `DimensionLabelCollision`, one finding per (line owner, text) pair.
+fn check_callout_lines_clear_of_text(
+    layout: &super::layout::SheetLayout,
+    issues: &mut Vec<DrawingIssue>,
+) {
+    let texts: Vec<&super::layout::SheetItem> = layout
+        .items
+        .iter()
+        .filter(|it| {
+            matches!(
+                it.kind,
+                SheetItemKind::DimensionText
+                    | SheetItemKind::HoleTag
+                    | SheetItemKind::CuttingPlaneLabel
+                    | SheetItemKind::ViewLabel
+            )
+        })
+        .collect();
+    for pd in &layout.dimensions {
+        let own = super::layout::placed_text_box(pd);
+        let lines = super::layout::placed_line_segments(pd);
+        if lines.is_empty() {
+            continue;
+        }
+        for t in &texts {
+            if t.kind == SheetItemKind::DimensionText
+                && t.owner_view == Some(pd.owner_view)
+                && t.bbox == own
+            {
+                continue;
+            }
+            // The tolerance every text check allows: a line grazing a box
+            // edge by less than this is registration noise, not a strike.
+            let inner = Rect2 {
+                x0: t.bbox.x0 + DIM_TEXT_COLLISION_TOL_MM,
+                y0: t.bbox.y0 + DIM_TEXT_COLLISION_TOL_MM,
+                x1: t.bbox.x1 - DIM_TEXT_COLLISION_TOL_MM,
+                y1: t.bbox.y1 - DIM_TEXT_COLLISION_TOL_MM,
+            };
+            if inner.x1 <= inner.x0 || inner.y1 <= inner.y0 {
+                continue;
+            }
+            if lines
+                .iter()
+                .any(|s| super::layout::segment_crosses_rect(s, &inner))
+            {
+                issues.push(error(
+                    DrawingIssueKind::DimensionLabelCollision,
+                    format!(
+                        "a line of callout '{}' runs through '{}'",
+                        pd.label,
+                        t.text.as_deref().unwrap_or("?"),
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+}
+
+/// The hole table (the union of its borders) must not sit on a view's
+/// geometry, a view title, a line of the general notes or the title block:
+/// one `HoleTableCollision` error per item it covers. (Dimension text under
+/// the table is `DimensionLabelCollision`, above.)
+fn check_hole_table_clear(layout: &super::layout::SheetLayout, issues: &mut Vec<DrawingIssue>) {
+    let Some(table) = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::HoleTableBorder)
+        .map(|it| it.bbox)
+        .reduce(|a, b| Rect2 {
+            x0: a.x0.min(b.x0),
+            y0: a.y0.min(b.y0),
+            x1: a.x1.max(b.x1),
+            y1: a.y1.max(b.y1),
+        })
+    else {
+        return;
+    };
+    for it in &layout.items {
+        let what = match it.kind {
+            SheetItemKind::ViewGeometry => "a view",
+            SheetItemKind::ViewLabel => "a view title",
+            SheetItemKind::NoteText => "the general notes",
+            SheetItemKind::TitleBlock => "the title block",
+            _ => continue,
+        };
+        if table.intersects(&it.bbox, DIM_TEXT_COLLISION_TOL_MM) {
+            issues.push(error(
+                DrawingIssueKind::HoleTableCollision,
+                match &it.text {
+                    Some(t) => format!("hole table overlaps {what} ('{t}')"),
+                    None => format!("hole table overlaps {what}"),
+                },
+                None,
+            ));
         }
     }
 }
@@ -1262,7 +1380,8 @@ pub fn section_shows_only_hatch(view: &super::types::ProjectedView) -> bool {
         gaps.push((cursor, hatch_b.x1));
     }
 
-    let margin = super::section_view::HATCH_SPACING * 0.25;
+    let spacing = super::section_view::hatch_spacing(view.scale);
+    let margin = spacing * 0.25;
     if gaps.iter().all(|&(s, e)| e - s <= 2.0 * margin) {
         // No usable internal gap (a one-band cut, or every gap is too
         // narrow to distinguish "bridges it" from sampling noise) — fall
@@ -1270,10 +1389,10 @@ pub fn section_shows_only_hatch(view: &super::types::ProjectedView) -> bool {
         let Some(outline_b) = bbox_of(&view.polylines) else {
             return true; // hatch present, no outline at all — definitely missing
         };
-        let grew = outline_b.x0 < hatch_b.x0 - super::section_view::HATCH_SPACING
-            || outline_b.x1 > hatch_b.x1 + super::section_view::HATCH_SPACING
-            || outline_b.y0 < hatch_b.y0 - super::section_view::HATCH_SPACING
-            || outline_b.y1 > hatch_b.y1 + super::section_view::HATCH_SPACING;
+        let grew = outline_b.x0 < hatch_b.x0 - spacing
+            || outline_b.x1 > hatch_b.x1 + spacing
+            || outline_b.y0 < hatch_b.y0 - spacing
+            || outline_b.y1 > hatch_b.y1 + spacing;
         return !grew;
     }
 
@@ -1322,7 +1441,7 @@ pub fn section_shows_only_hatch(view: &super::types::ProjectedView) -> bool {
             }
         }
     }
-    bridged <= super::section_view::HATCH_SPACING
+    bridged <= spacing
 }
 
 fn error(kind: DrawingIssueKind, message: String, view: Option<String>) -> DrawingIssue {
@@ -1679,6 +1798,9 @@ mod harness_invariant_tests {
             label: label.to_string(),
             dim_id: String::new(),
             owner_view: 0,
+            stack: None,
+            boxed: false,
+            ext_breaks: Default::default(),
         }
     }
 
@@ -1691,6 +1813,150 @@ mod harness_invariant_tests {
         let overflows = find_span_overflows(&layout);
         assert_eq!(overflows.len(), 1, "narrow-span wide label must be flagged");
         assert!(overflows[0].text_width_mm > overflows[0].span_mm);
+    }
+
+    // ── check_callout_lines_clear_of_text ─────────────────────────────────
+
+    /// A leader callout: leg from `tip` to the elbow, shoulder from the elbow
+    /// `w` mm to the right, its text TGAP above the shoulder.
+    fn leader(label: &str, tip: [f64; 2], elbow: [f64; 2], w: f64) -> PlacedDimension {
+        let end = [elbow[0] + w, elbow[1]];
+        PlacedDimension {
+            line: [elbow, end],
+            ext: [[tip, elbow], [elbow, elbow]],
+            arrows: [
+                ArrowSpec {
+                    tip,
+                    dir: [1.0, 0.0],
+                },
+                ArrowSpec {
+                    tip: end,
+                    dir: [0.0, 0.0],
+                },
+            ],
+            text_anchor: [elbow[0] + 0.5 * w, elbow[1] - super::super::layout::TGAP],
+            text_rot_deg: 0.0,
+            label: label.to_string(),
+            dim_id: label.to_string(),
+            owner_view: 0,
+            stack: None,
+            boxed: false,
+            ext_breaks: Default::default(),
+        }
+    }
+
+    /// Lay out placed dimensions as `compute_layout` does: each with its
+    /// `DimensionText` item.
+    fn with_texts(dims: Vec<PlacedDimension>) -> SheetLayout {
+        let mut layout = empty_layout();
+        for pd in &dims {
+            layout.items.push(SheetItem {
+                kind: SheetItemKind::DimensionText,
+                bbox: super::super::layout::placed_text_box(pd),
+                owner_view: Some(pd.owner_view),
+                text: Some(pd.label.clone()),
+            });
+        }
+        layout.dimensions = dims;
+        layout
+    }
+
+    /// The benchmark sheet (CADGenBench 119, FRONT's right side): the shoulder
+    /// of "2× 0.6 × 45°" ran through "2× R2.1" printed one font height below
+    /// it. The two text boxes only touch, so the text-on-text check passed
+    /// the sheet; the line through the text is a collision.
+    ///
+    /// Mutation: skip `check_callout_lines_clear_of_text` in
+    /// `check_dimension_label_collisions` -> no finding -> RED.
+    #[test]
+    fn a_leader_shoulder_through_another_callout_is_a_collision() {
+        // Baselines 149.577 and 153.190, as on the sheet.
+        let tgap = super::super::layout::TGAP;
+        let upper = leader(
+            "2\u{00D7} 0.6 \u{00D7} 45\u{00B0}",
+            [130.0, 160.0],
+            [150.0, 149.577 + tgap],
+            26.0,
+        );
+        let lower = leader(
+            "2\u{00D7} R2.1",
+            [60.0, 60.0],
+            [140.0, 153.190 + tgap],
+            17.0,
+        );
+        // The text boxes do not overlap: the old check is silent.
+        assert!(!super::super::layout::placed_text_box(&upper).intersects(
+            &super::super::layout::placed_text_box(&lower),
+            DIM_TEXT_COLLISION_TOL_MM
+        ));
+        let layout = with_texts(vec![upper, lower]);
+        let mut issues = Vec::new();
+        check_dimension_label_collisions(&layout, &mut issues);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.kind == DrawingIssueKind::DimensionLabelCollision
+                    && i.message.contains("runs through '2\u{00D7} R2.1'")),
+            "{issues:?}"
+        );
+    }
+
+    /// Clean pair: the same two callouts a full row apart -- nothing runs
+    /// through anything, and a callout's own lines never count against its
+    /// own text.
+    #[test]
+    fn leaders_a_row_apart_are_clear() {
+        let tgap = super::super::layout::TGAP;
+        let upper = leader(
+            "2\u{00D7} 0.6 \u{00D7} 45\u{00B0}",
+            [170.0, 160.0],
+            [150.0, 140.0 + tgap],
+            26.0,
+        );
+        let lower = leader(
+            "2\u{00D7} R2.1",
+            [100.0, 170.0],
+            [140.0, 153.19 + tgap],
+            17.0,
+        );
+        let layout = with_texts(vec![upper, lower]);
+        let mut issues = Vec::new();
+        check_dimension_label_collisions(&layout, &mut issues);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    /// A long leader leg (a 400 mm diagonal) through a 3.6 mm text box is
+    /// found wherever it crosses: the segment test is exact. Sampled at 65
+    /// points it stepped about 6 mm at a time and passed straight over the
+    /// box.
+    ///
+    /// Mutation: restore the 65-point sampling in `segment_crosses_rect` ->
+    /// the crossing between two samples is missed -> RED.
+    #[test]
+    fn a_long_leg_through_a_small_label_is_found() {
+        let long = leader("R160", [0.0, 0.0], [400.0, 300.0], 10.0);
+        // A label straddling the leg between two of the old sample points
+        // (t = 32/64 -> (200, 150), t = 33/64 -> (206.25, 154.69)).
+        let t = text_item(
+            SheetItemKind::DimensionText,
+            "7",
+            Rect2 {
+                x0: 202.0,
+                y0: 150.0,
+                x1: 204.5,
+                y1: 153.6,
+            },
+        );
+        let mut layout = with_texts(vec![long]);
+        layout.items.push(t);
+        let mut issues = Vec::new();
+        check_dimension_label_collisions(&layout, &mut issues);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("runs through '7'")),
+            "{issues:?}"
+        );
     }
 
     /// A comfortably wide span (90 mm) for a short label ("120.00") never

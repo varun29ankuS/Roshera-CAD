@@ -129,3 +129,36 @@ which lofts two congruent squares whose edge lists start one corner apart (the
 correct answer is a box of volume `side^2 * height` exactly; before the fix the
 kernel built a sound, closed, ORIENTED body of 2/3 that volume — the wrong shape
 reported honestly) and a triangle to a square (the smallest dissimilar pair).
+
+## 2026-11-18: two loft reds found by the drawing rewrite's full gate
+
+Both were measured RED on the code BEFORE the drawing rewrite (main at
+94917545, geometry-engine untouched), so neither is caused by the drawing work.
+
+### `fidelity_requested_vs_measured::loft_cap_faces_are_found_but_the_trimmed_integral_is_not_the_path`
+
+**No breaking commit: an improvement tripped a tripwire.** The test is a
+deliberate tripwire: it asserts `Face::area` still CANNOT measure a nurbs_loft
+cap (a loop of one self-closing periodic-NURBS edge), so that the day it can,
+someone switches `queries::fidelity::mesh_cross_section_area` back to the exact
+trimmed integral. It now measures the r = 6 cap as 113.0968916743036 mm^2
+(pi * 36 = 113.0973..., 4e-6 relative), so the tripwire fired as designed. The
+most recent commit touching face area is `a9d13a70` ("every minted face
+measures its own parametric domain"); not bisected.
+
+**Fix (queued, kernel):** `mesh_cross_section_area` takes `&BRepModel`, while
+`Face::area` needs `&mut LoopStore`; switch the reading to the exact integral
+(signature to `&mut BRepModel`, or clone the face and its loops), keep the
+tessellated reading only as the stated fallback, then delete this test case.
+
+### `loft_orientation::loft_l_section_whose_cap_the_mesh_cannot_orient_is_refused_not_minted`
+
+The test expects the L-section loft to be REFUSED (its cap could not be
+oriented by the mesh); the kernel now MINTS a solid (`must not mint: 0`).
+Suspected cause: `439ccbc2` ("a loft orients each band from its slab's signed
+volume, or refuses") made this case orientable -- UNVERIFIED (not bisected).
+Whether the minted solid is right is NOT yet known: it may be an improvement
+(test stale) or a wrong solid slipping through (a real defect). Removal
+requires measuring it: closed, oriented, volume equal to the analytic L-prism
+volume; if so, the test is re-pinned to "builds the right solid"; if not, the
+refusal is restored.

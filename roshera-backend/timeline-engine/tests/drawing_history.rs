@@ -853,3 +853,177 @@ fn a_front_drag_survives_a_later_dimension_edit() {
         assert_eq!(v.position_mm, m.position_mm, "{} keeps its drag", v.name);
     }
 }
+
+fn dimension_update(seq: u64, did: Uuid, key: &str, edit: serde_json::Value) -> TimelineEvent {
+    generic(
+        "drawing.dimension.update",
+        seq,
+        json!({
+            "params": { "key": key, "dimension_id": "d0", "edit": edit },
+            "inputs": [format!("drawing:{did}")],
+            "outputs": []
+        }),
+    )
+}
+
+/// What is authored on a dimension -- a tolerance, text, a move, a signed
+/// suppression -- is history: a rebuild (restart, undo, a dimension edit that
+/// re-derives the sheet) re-applies it to THE SAME dimension, found by its
+/// durable key, and the sheet inks it. Undo is the same replay without the
+/// event. An edit whose dimension the rebuilt sheet no longer carries is kept
+/// (the certificate reports it dangling); it is never moved to another.
+///
+/// Mutation: remove the `drawing.dimension.update` arm from
+/// `rebuild_drawings` and every assertion on `dimension_edits` goes red.
+#[test]
+fn a_dimension_annotation_survives_a_rebuild_and_is_undone_by_dropping_its_event() {
+    use geometry_engine::drawing::dimension_edit::{DimTolerance, DimensionEdit, Waiver};
+    use geometry_engine::drawing::svg::render_drawing_svg;
+
+    let did = Uuid::new_v4();
+    let mut events = plate();
+    events.push(from_part(3, 3, did));
+    // The sheet as first derived: take two overall sizes by what the sheet
+    // says, with their durable keys.
+    let first = rebuild_drawings(&events, &FrameCache::new(64));
+    let sheet = first.drawings.get(&did).expect("derived");
+    let mut keyed: Vec<(String, String)> = sheet
+        .views
+        .iter()
+        .flat_map(|v| v.dimensions.iter())
+        .filter(|d| d.kind == "extent")
+        .filter_map(|d| Some((d.key.clone()?, d.label.clone())))
+        .collect();
+    keyed.dedup();
+    assert!(
+        keyed.len() >= 2,
+        "a recorded part's overall sizes carry durable keys: {keyed:?}"
+    );
+    let (tol_key, tol_label) = keyed[0].clone();
+    let (gone_key, gone_label) = keyed[1].clone();
+    assert_ne!(tol_key, gone_key);
+
+    let tolerance = DimensionEdit {
+        tolerance: Some(DimTolerance::Bilateral {
+            upper: 0.1,
+            lower: -0.05,
+        }),
+        suffix: "TYP".to_string(),
+        text_shift_mm: Some([3.0, 2.0]),
+        ..DimensionEdit::default()
+    };
+    let suppression = DimensionEdit {
+        suppressed: Some(Waiver {
+            by: "varun".to_string(),
+            reason: "see note 2".to_string(),
+        }),
+        ..DimensionEdit::default()
+    };
+    events.extend([
+        dimension_update(4, did, &tol_key, json!(tolerance)),
+        dimension_update(5, did, &gone_key, json!(suppression)),
+        dimension_update(6, did, "a-key-of-no-dimension", json!({ "prefix": "4X" })),
+        // The part is edited AFTER the annotations: the sheet is re-derived.
+        mould(1, "radius", 4.0, 7),
+    ]);
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    assert!(built.issues.is_empty(), "{:?}", built.issues);
+    let d = built.drawings.get(&did).expect("rebuilt");
+    assert_eq!(d.dimension_edits.get(&tol_key), Some(&tolerance));
+    assert_eq!(d.dimension_edits.get(&gone_key), Some(&suppression));
+    assert!(
+        d.dimension_edits.contains_key("a-key-of-no-dimension"),
+        "an edit whose dimension is gone is kept for the certificate to report"
+    );
+    let svg = render_drawing_svg(d);
+    assert!(
+        svg.contains(">+0.10<") && svg.contains(">-0.05<") && svg.contains("TYP"),
+        "the rebuilt sheet inks the tolerance on {tol_label}"
+    );
+    assert_eq!(
+        d.find_dimension(&gone_key).map(|x| x.label.clone()),
+        Some(gone_label),
+        "the suppression is on the dimension it was made on"
+    );
+
+    // Undo of the tolerance = the same history without that event.
+    let undone: Vec<TimelineEvent> = events
+        .iter()
+        .filter(|e| e.sequence_number != 4)
+        .cloned()
+        .collect();
+    let after = rebuild_drawings(&undone, &FrameCache::new(64));
+    let d = after.drawings.get(&did).expect("rebuilt");
+    assert!(!d.dimension_edits.contains_key(&tol_key));
+    assert!(!render_drawing_svg(d).contains(">+0.10<"));
+
+    // A later event on the same key replaces the record; an empty one
+    // clears it.
+    events.push(dimension_update(8, did, &tol_key, json!({})));
+    let cleared = rebuild_drawings(&events, &FrameCache::new(64));
+    assert!(!cleared.drawings[&did]
+        .dimension_edits
+        .contains_key(&tol_key));
+}
+
+/// A Ø20 × 40 cylinder modelled with its axis turned 20 degrees off Z.
+fn turned_cylinder(seq: u64, out: u64) -> TimelineEvent {
+    let t = 20f64.to_radians();
+    generic(
+        "create_cylinder_3d",
+        seq,
+        json!({
+            "params": { "Create3D": {
+                "primitive_type": "cylinder",
+                "parameters": {
+                    "base_x": 0.0, "base_y": 0.0, "base_z": 0.0,
+                    "axis_x": t.sin(), "axis_y": 0.0, "axis_z": t.cos(),
+                    "radius": 10.0, "height": 40.0
+                },
+                "timestamp": 0
+            }},
+            "inputs": [], "outputs": [format!("solid:{out}")]
+        }),
+    )
+}
+
+/// A sheet re-derived on replay is drawn in the part's frame exactly as the
+/// live route draws it, records that frame, and a view added to it is
+/// projected in the same frame. Before, replay drew the part as it sat (a
+/// restart turned a squared sheet back into a skewed one) and an added view
+/// came from the unsquared part: one sheet, two frames.
+///
+/// Mutation: drop `frame_for_drawing` from `rederive_part_drawing` -> no
+/// frame recorded; drop the frame from the replayed `drawing.add_view` -> the
+/// LEFT view reads the turned cylinder's 44.4 mm projected height.
+#[test]
+fn a_replayed_sheet_and_its_added_view_share_the_part_frame() {
+    let did = Uuid::new_v4();
+    let left = Uuid::new_v4();
+    let events = vec![
+        turned_cylinder(0, 1),
+        from_part(1, 1, did),
+        add_view(2, did, left, 1, "LEFT", "left"),
+    ];
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    let d = built.drawings.get(&did).expect("rebuilt");
+    let frame = d
+        .drawn_frame
+        .as_ref()
+        .expect("the replayed sheet records its frame");
+    assert!(
+        (frame.tilt_deg - 20.0).abs() < 1e-6,
+        "tilt {}",
+        frame.tilt_deg
+    );
+    let v = d
+        .views
+        .iter()
+        .find(|v| v.id.0 == left)
+        .expect("the added view is on the sheet");
+    let h = v.extent.height();
+    assert!(
+        (h - 40.0).abs() < 0.05,
+        "the added LEFT view is projected squared (height 40), read {h:.2}"
+    );
+}

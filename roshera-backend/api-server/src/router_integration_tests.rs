@@ -10534,7 +10534,7 @@ async fn boolean_route_carries_declared_facets_across_the_spawn_blocking_boundar
         .find(|(e, _)| {
             matches!(
                 &e.operation,
-                timeline_engine::Operation::Generic { command_type, .. }
+                timeline_engine::types::Operation::Generic { command_type, .. }
                     if command_type.to_lowercase().contains("boolean")
             )
         })
@@ -10670,7 +10670,7 @@ async fn boolean_route_with_no_headers_records_no_facets_across_the_spawn_blocki
         .find(|(e, _)| {
             matches!(
                 &e.operation,
-                timeline_engine::Operation::Generic { command_type, .. }
+                timeline_engine::types::Operation::Generic { command_type, .. }
                     if command_type.to_lowercase().contains("boolean")
             )
         })
@@ -11960,6 +11960,71 @@ async fn a_first_angle_switch_survives_editing_the_part_through_the_drawing() {
     );
 }
 
+/// The on-screen sheet is a PREVIEW, not an export (found rehearsing the demo
+/// video, 2026-11-18: every redraw took 7-8 s and wrote a `drawing.export`
+/// event into the history). The preview renders the sheet as it stands: no
+/// export gates (those keep defective FILES from leaving), no history event,
+/// and the same bytes again until the sheet changes.
+///
+/// Mutation: record an export event in `preview_svg` -> the history grows
+/// -> RED.
+#[tokio::test]
+async fn the_sheet_preview_renders_without_recording_or_gating() {
+    let state = make_test_state().await;
+    let drawing_id = bored_part_with_drawing(&state, "").await;
+    let main = timeline_engine::BranchId::main();
+    // The recorder is asynchronous: let the drawing's own creation land
+    // before counting, so the count compares only what the preview adds.
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("recorder flush");
+    let before = crate::handlers::timeline::applied_events(&state, &main)
+        .await
+        .expect("history")
+        .len();
+
+    let route = format!("/api/drawings/{drawing_id}/preview.svg");
+    let (s1, first) = dispatch_raw(&state, json_get(&route)).await;
+    assert_eq!(s1, StatusCode::OK, "the preview renders");
+    let text = String::from_utf8(first.clone()).expect("utf-8 svg");
+    assert!(text.contains("<svg"), "an SVG");
+    let (s2, second) = dispatch_raw(&state, json_get(&route)).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(first, second, "the same sheet previews the same bytes");
+
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("recorder flush");
+    let after = crate::handlers::timeline::applied_events(&state, &main)
+        .await
+        .expect("history")
+        .len();
+    assert_eq!(
+        after, before,
+        "previewing a sheet records nothing in the history"
+    );
+}
+
+/// A preview of a drawing bound to another model is still refused: it would
+/// draw a sheet about a different part.
+#[tokio::test]
+async fn the_sheet_preview_of_an_unknown_drawing_is_not_found() {
+    let state = make_test_state().await;
+    let (s, _) = dispatch_raw(
+        &state,
+        json_get(&format!(
+            "/api/drawings/{}/preview.svg",
+            uuid::Uuid::new_v4()
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
 /// A drawing can be created first-angle directly.
 #[tokio::test]
 async fn a_drawing_can_be_created_first_angle() {
@@ -11967,6 +12032,141 @@ async fn a_drawing_can_be_created_first_angle() {
     let drawing_id = bored_part_with_drawing(&state, "?projection=first").await;
     let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
     assert_eq!(sheet["projection"], "first");
+}
+
+/// The timeline's chapters are KEPT with the history's frames: the first
+/// request certifies the history and stores the response under the
+/// history's hash; the next request for the same history is that stored
+/// response, byte for byte, never a second certification (it re-certified
+/// on every request -- 41-52 s per call on a document with STEP imports,
+/// 2026-11-18). A history that changes (undo) has a different key, so it is
+/// never served the old rows.
+///
+/// Mutation: drop the store in `get_chapters` -> nothing is kept -> RED.
+#[tokio::test]
+async fn the_timeline_chapters_are_kept_until_the_history_changes() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+    let main = timeline_engine::BranchId::main();
+
+    let (s, first) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    assert_eq!(s, StatusCode::OK, "body = {first}");
+    let events = crate::handlers::timeline::applied_events(&state, &main)
+        .await
+        .expect("applied history");
+    let key = crate::handlers::timeline::chapters_cache_key(&events, &main);
+    let kept = state
+        .frames
+        .presentation(&key)
+        .expect("the first request keeps its chapters with the history's frames");
+    let kept: serde_json::Value = serde_json::from_slice(&kept).expect("kept as JSON");
+    assert_eq!(kept, first, "what is kept is exactly what was served");
+    let (_, second) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    assert_eq!(
+        second, first,
+        "the same history is served the same chapters"
+    );
+
+    let (us, ubody) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/undo",
+            json!({ "session_id": uuid::Uuid::new_v4().to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(us, StatusCode::OK, "undo; body = {ubody}");
+    let after_events = crate::handlers::timeline::applied_events(&state, &main)
+        .await
+        .expect("applied history after undo");
+    assert_ne!(
+        crate::handlers::timeline::chapters_cache_key(&after_events, &main),
+        key,
+        "a changed history has its own key"
+    );
+    let (_, after) = dispatch(&state, json_get("/api/timeline/chapters/main")).await;
+    assert_ne!(
+        after, first,
+        "an undone step is not served the old chapters"
+    );
+}
+
+/// The timeline Map is one feature graph (Varun 2026-11-18: "one look at map
+/// should tell everything"): the features, what each was built on, who made
+/// it, its sizes, and the recipe. A drilled box: the hole is built on the box.
+///
+/// Mutation: drop the edges from the response -> RED.
+#[tokio::test]
+async fn the_feature_graph_wires_a_drilled_box_and_counts_who_made_it() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+    let (s, body) = dispatch(&state, json_get("/api/timeline/feature-graph/main")).await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    let features = body["features"].as_array().expect("features");
+    assert_eq!(features.len(), 2, "box and hole; body = {body}");
+    let edges = body["edges"].as_array().expect("edges");
+    assert_eq!(
+        edges.len(),
+        1,
+        "the hole is built on the box; body = {body}"
+    );
+    assert_eq!(edges[0]["from"], features[0]["anchor"]);
+    assert_eq!(edges[0]["to"], features[1]["anchor"]);
+    assert_eq!(body["summary"]["features"], 2);
+    let by = body["summary"]["by_agent"].as_u64().unwrap_or(0)
+        + body["summary"]["by_user"].as_u64().unwrap_or(0);
+    assert!(
+        by <= 2,
+        "authors are counted, never invented; body = {body}"
+    );
+    let recipe = body["recipe"].as_array().expect("recipe");
+    assert_eq!(
+        recipe.len(),
+        2,
+        "one recipe line per feature; body = {body}"
+    );
+    for f in features {
+        assert!(
+            f["display_name"].is_string() && f["sizes"].is_array(),
+            "{f}"
+        );
+    }
+    assert!(
+        !body.to_string().contains("solid:"),
+        "no kernel ids in the map's words"
+    );
+}
+
+/// An empty history is an empty map, not an error.
+#[tokio::test]
+async fn the_feature_graph_of_an_empty_history_is_empty() {
+    let state = make_test_state().await;
+    let (s, body) = dispatch(&state, json_get("/api/timeline/feature-graph/main")).await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    assert_eq!(body["features"].as_array().map_or(99, Vec::len), 0);
+    assert_eq!(body["edges"].as_array().map_or(99, Vec::len), 0);
+}
+
+/// The map is kept with the history's frames until the history changes, like
+/// the chapters it is made from.
+///
+/// Mutation: drop the store in `get_feature_graph` -> nothing kept -> RED.
+#[tokio::test]
+async fn the_feature_graph_is_kept_until_the_history_changes() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+    let main = timeline_engine::BranchId::main();
+    let (_, first) = dispatch(&state, json_get("/api/timeline/feature-graph/main")).await;
+    let events = crate::handlers::timeline::applied_events(&state, &main)
+        .await
+        .expect("history");
+    let key = crate::handlers::timeline::feature_graph_cache_key(&events, &main);
+    let kept = state
+        .frames
+        .presentation(&key)
+        .expect("kept with the history's frames");
+    let kept: serde_json::Value = serde_json::from_slice(&kept).expect("json");
+    assert_eq!(kept, first);
 }
 
 /// The timeline's rows are chapters -- engineering features, like a CAD
@@ -12620,7 +12820,7 @@ async fn a_sketch_extrude_step_carries_the_sketch_it_was_made_from() {
         .expect("main events");
     let step = events
         .iter()
-        .find(|e| matches!(&e.operation, timeline_engine::Operation::Generic { command_type, .. } if command_type == "sketch_extrude"))
+        .find(|e| matches!(&e.operation, timeline_engine::types::Operation::Generic { command_type, .. } if command_type == "sketch_extrude"))
         .expect("the extrude is recorded");
     let params = serde_json::to_value(&step.operation).expect("operation json");
     let source = find_key(&params, "source").expect("the step carries the sketch source");
@@ -13253,4 +13453,266 @@ async fn the_first_operation_after_opening_a_document_has_a_baseline() {
         Some(1),
         "the roll face; changes = {changes}"
     );
+}
+
+/// The drawing tab's property panel and an agent's `drawing_dimension_properties`
+/// reach the same route. Through the REAL router: a tolerance set on a sheet
+/// dimension is inked on the exported SVG and stated by the certificate; text
+/// before / after the value is inked; a typed value, a class outside the ISO
+/// 286 tables and an unsigned suppression are refused and change nothing; a
+/// signed suppression takes the dimension off the sheet and the certificate
+/// lists it as waived by that person; and every one of those is history --
+/// undo takes the last one back and the earlier ones replay onto the rebuilt
+/// sheet.
+///
+/// Wiring (disconnection gate): `GET /api/drawings/{id}/dimensions`,
+/// `PATCH /api/drawings/{id}/dimensions/{dim}`, the `drawing.dimension.update`
+/// event and its replay arm in `timeline_engine::drawing_history`.
+#[tokio::test]
+async fn a_dimension_is_toleranced_annotated_suppressed_and_undone_through_the_router() {
+    let state = make_test_state().await;
+    let _ = seed_bored_box_live(&state).await;
+    let part_uuid = state
+        .uuid_to_local
+        .iter()
+        .max_by_key(|e| *e.value())
+        .map(|e| *e.key())
+        .expect("the bored part is registered");
+    let (cs, created) = dispatch(
+        &state,
+        json_post(&format!("/api/parts/uuid/{part_uuid}/drawing"), json!({})),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "{created}");
+    let drawing_id = created["id"].as_str().expect("drawing id").to_string();
+    let dims_route = format!("/api/drawings/{drawing_id}/dimensions");
+    let svg_of = |state: &AppState| {
+        let state = state.clone();
+        let route = format!("/api/drawings/{drawing_id}/svg");
+        async move {
+            let (s, bytes) = dispatch_raw(&state, json_get(&route)).await;
+            assert_eq!(s, StatusCode::OK, "svg export");
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    };
+
+    // The listing: every dimension as inked, addressable, and the sheet's
+    // completeness.
+    let (ls, listing) = dispatch(&state, json_get(&dims_route)).await;
+    assert_eq!(ls, StatusCode::OK, "{listing}");
+    let dims = listing["dimensions"].as_array().expect("dimensions");
+    let placed_linear = |d: &&Value| {
+        d["placed"] == true
+            && d["editable"] == true
+            && matches!(d["kind"].as_str(), Some("extent") | Some("length"))
+    };
+    let mut linear = dims.iter().filter(placed_linear);
+    let first = linear.next().expect("a placed, editable linear dimension");
+    let second = linear.next().expect("a second one");
+    let (dim_id, label) = (
+        first["id"].as_str().expect("id").to_string(),
+        first["label"].as_str().expect("label").to_string(),
+    );
+    let (other_id, other_label) = (
+        second["id"].as_str().expect("id").to_string(),
+        second["label"].as_str().expect("label").to_string(),
+    );
+    assert!(
+        listing["certificate"]["complete"].is_boolean(),
+        "the listing carries the sheet's completeness: {listing}"
+    );
+    let patch = |dim: &str, body: Value| {
+        json_patch(
+            &format!("/api/drawings/{drawing_id}/dimensions/{dim}"),
+            body,
+        )
+    };
+
+    // A LINEAR dimension takes a tolerance and text.
+    let (ts, toleranced) = dispatch(
+        &state,
+        patch(
+            &dim_id,
+            json!({ "tolerance": { "type": "bilateral", "upper": 0.1, "lower": -0.05 }, "suffix": "TYP" }),
+        ),
+    )
+    .await;
+    assert_eq!(ts, StatusCode::OK, "{toleranced}");
+    let inked = format!("{label} +0.10/-0.05 TYP");
+    assert_eq!(
+        toleranced["dimension"]["ink"],
+        inked.as_str(),
+        "{toleranced}"
+    );
+    assert_eq!(toleranced["certificate"]["sound"], true, "{toleranced}");
+    let svg = svg_of(&state).await;
+    assert!(
+        svg.contains(">+0.10<") && svg.contains(">-0.05<") && svg.contains("TYP"),
+        "the exported sheet inks the tolerance"
+    );
+    let (_, cert) = dispatch(
+        &state,
+        json_get(&format!("/api/drawings/{drawing_id}/certificate")),
+    )
+    .await;
+    // `/certificate` flattens the certificate beside its owner.
+    let stated = cert["facts"]
+        .as_array()
+        .expect("facts")
+        .iter()
+        .find(|f| f["label"] == inked.as_str())
+        .unwrap_or_else(|| panic!("the certificate states the dimension as inked: {cert}"));
+    assert_eq!(stated["tolerance"]["kind"], "bilateral", "{stated}");
+    assert!(
+        stated["live"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("authored text, not verified")),
+        "{stated}"
+    );
+
+    // Refused, and nothing changes: a typed value, a class outside the ISO
+    // 286 tables, an unsigned suppression, an unknown dimension.
+    for (body, why) in [
+        (json!({ "value": 12.0 }), "the value is measured"),
+        (
+            json!({ "tolerance": { "type": "fit", "designation": "za6" } }),
+            "za6 is not tabulated",
+        ),
+        (
+            json!({ "suppressed": { "by": "", "reason": "" } }),
+            "a suppression is signed",
+        ),
+        (json!({}), "nothing to change"),
+    ] {
+        // Raw: a body the route cannot even read (an unknown field) is
+        // refused by the extractor, in plain text.
+        let (s, refused) = dispatch_raw(&state, patch(&dim_id, body)).await;
+        assert!(
+            s.is_client_error(),
+            "{why}: {s} {}",
+            String::from_utf8_lossy(&refused)
+        );
+    }
+    let (ns, _) = dispatch(
+        &state,
+        patch("no-such-dimension", json!({ "prefix": "4X" })),
+    )
+    .await;
+    assert_eq!(ns, StatusCode::NOT_FOUND);
+    let (_, after_refusals) = dispatch(&state, json_get(&dims_route)).await;
+    let same = after_refusals["dimensions"]
+        .as_array()
+        .and_then(|a| a.iter().find(|d| d["id"] == dim_id.as_str()))
+        .expect("still listed");
+    assert_eq!(
+        same["ink"],
+        inked.as_str(),
+        "a refused edit changes nothing"
+    );
+
+    // A signed suppression: off the sheet, waived on that name.
+    let (ss, suppressed) = dispatch(
+        &state,
+        patch(
+            &other_id,
+            json!({ "suppressed": { "by": "varun", "reason": "see note 2" } }),
+        ),
+    )
+    .await;
+    assert_eq!(ss, StatusCode::OK, "{suppressed}");
+    assert_eq!(
+        suppressed["certificate"]["counts"]["waived"], 1,
+        "{suppressed}"
+    );
+    let waived = suppressed["certificate"]["omissions"]
+        .as_array()
+        .expect("omissions")
+        .iter()
+        .find(|o| o["waiver"]["by"] == "varun")
+        .unwrap_or_else(|| panic!("the omission names who suppressed it: {suppressed}"));
+    assert_eq!(waived["label"], other_label.as_str());
+    assert_eq!(waived["reason"], "suppressed");
+
+    // History: both annotations were recorded as `drawing.dimension.update`.
+    let _ = state.timeline_recorder.settle().await;
+    let recorded = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("events")
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.operation,
+                    timeline_engine::types::Operation::Generic { command_type, .. }
+                        if command_type == crate::drawing_annotate::DIMENSION_UPDATE_EVENT
+                )
+            })
+            .count()
+    };
+    assert_eq!(
+        recorded, 2,
+        "one event per applied annotation, none per refusal"
+    );
+
+    // Undo takes back the suppression; the sheet is rebuilt from history, so
+    // the tolerance survives only because it replays.
+    let session = crate::handlers::timeline::live_session_id(&timeline_engine::BranchId::main());
+    let (us, undone) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/undo",
+            json!({ "session_id": session.to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(us, StatusCode::OK, "{undone}");
+    assert_ne!(undone["success"], false, "{undone}");
+    let (_, after) = dispatch(&state, json_get(&dims_route)).await;
+    assert_eq!(
+        after["certificate"]["counts"]["waived"], 0,
+        "undo brings the suppressed dimension back: {after}"
+    );
+    let replayed = after["dimensions"]
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|d| d["label"] == label.as_str() && d["placed"] == true)
+        })
+        .expect("the toleranced dimension, on the rebuilt sheet");
+    assert_eq!(
+        replayed["ink"],
+        inked.as_str(),
+        "the earlier annotation is replayed onto the rebuilt sheet"
+    );
+}
+
+/// `GET /api/iso286`: the kernel's ISO 286 tables behind a route (the fit
+/// picker's preview and the `iso286_limits` MCP tool). Known vectors, a pair,
+/// and a typed refusal outside the tables.
+#[tokio::test]
+async fn iso_286_limits_are_served_from_the_kernel_tables() {
+    let state = make_test_state().await;
+    let (s, h7) = dispatch(&state, json_get("/api/iso286?nominal=25&class=H7")).await;
+    assert_eq!(s, StatusCode::OK, "{h7}");
+    assert_eq!(h7["kind"], "hole");
+    assert!((h7["upper_deviation_mm"].as_f64().unwrap_or(f64::NAN) - 0.021).abs() < 1e-9);
+    assert!(h7["lower_deviation_mm"].as_f64().unwrap_or(f64::NAN).abs() < 1e-9);
+    assert!((h7["upper_limit_mm"].as_f64().unwrap_or(f64::NAN) - 25.021).abs() < 1e-9);
+
+    let (s, pair) = dispatch(&state, json_get("/api/iso286?nominal=25&class=H7/g6")).await;
+    assert_eq!(s, StatusCode::OK, "{pair}");
+    assert_eq!(pair["fit"]["kind"], "clearance");
+    assert!((pair["fit"]["min_clearance_mm"].as_f64().unwrap_or(f64::NAN) - 0.007).abs() < 1e-9);
+    assert!((pair["fit"]["max_clearance_mm"].as_f64().unwrap_or(f64::NAN) - 0.041).abs() < 1e-9);
+
+    for (query, reason) in [
+        ("nominal=600&class=H7", "nominal_out_of_range"),
+        ("nominal=25&class=za6", "class_not_tabulated"),
+        ("nominal=25&class=M12x1.75", "bad_designation"),
+    ] {
+        let (s, refused) = dispatch(&state, json_get(&format!("/api/iso286?{query}"))).await;
+        assert!(s.is_client_error(), "{query}: {s} {refused}");
+        assert_eq!(refused["details"]["reason"], reason, "{refused}");
+    }
 }

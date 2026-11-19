@@ -14,7 +14,7 @@ use super::types::ProjectionType;
 use crate::math::{Point3, Vector3};
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
-use crate::readable::{extract_dimensions, DatumDescriptor};
+use crate::readable::DatumDescriptor;
 use serde::{Deserialize, Serialize};
 
 /// Per-phase drawing-build profiling, opt-in via the `ROSHERA_DRAW_PROFILE`
@@ -31,8 +31,9 @@ fn draw_profile_enabled() -> bool {
 pub struct Dimension2d {
     /// Stable id carried from the analytic record (the mould handle).
     pub id: String,
-    /// "diameter" | "radius" | "length" | "angle" | "extent", the feature
-    /// callouts (see `is_feature_callout`), or a blend callout ("fillet" |
+    /// "diameter" | "radius" | "length" | "angle" | "extent" | "position",
+    /// the feature callouts ("hole_callout" | "pcd" | "location" | "pitch"),
+    /// or a blend callout ("fillet" |
     /// "chamfer", see `is_blend_callout`).
     pub kind: String,
     pub value: f64,
@@ -76,6 +77,25 @@ pub struct Dimension2d {
     /// serialized drawings parsing.
     #[serde(default)]
     pub tolerance: Option<super::types::ToleranceRef>,
+    /// The durable handle a sheet edit of THIS dimension is recorded under
+    /// (its tolerance, text, placement, suppression: see
+    /// [`super::dimension_edit`]). The `pid` when the dimension has one; for
+    /// a callout that has none (a hole callout, a pitch circle, a pattern's
+    /// pitch) an id derived from the persistent ids of the faces it names.
+    /// `None` when those faces carry no persistent id: such a dimension
+    /// cannot be edited, and the edit is refused rather than bound to a face
+    /// number that the next rebuild may hand to another face.
+    /// `#[serde(default)]` keeps older serialized drawings parsing.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// A counted callout ("4× R5"): the identity
+    /// ([`dimension_identity`]) of every equal feature this one dimension
+    /// states, itself included. Empty for an ordinary dimension. The count in
+    /// the label is `members.len()`; the certificate re-measures every member
+    /// on the live model, and a member is a dimension the sheet states.
+    /// `#[serde(default)]` keeps older serialized drawings parsing.
+    #[serde(default)]
+    pub members: Vec<String>,
 }
 
 impl Dimension2d {
@@ -109,10 +129,20 @@ pub fn auto_dimensions(
     solid_id: SolidId,
     projection: ProjectionType,
 ) -> Vec<Dimension2d> {
-    let mut out = Vec::new();
+    project_records(model, convention_records(model, solid_id), projection)
+}
+
+/// The analytic dimension table of `solid_id` as a drawing states it: round
+/// parts, hole stacks / patterns and chamfers rewritten into their drafting
+/// conventions. The same table for every view; [`project_records`] puts it
+/// into one.
+pub(crate) fn convention_records(
+    model: &BRepModel,
+    solid_id: SolidId,
+) -> Vec<crate::readable::DimensionRecord> {
     // A round part is dimensioned the way a drawing states it (Ø outside,
     // bolt circle as one callout), not by the plate convention.
-    let mut records = extract_dimensions(model, solid_id);
+    let mut records = super::arcs::drafting_dimensions(model, solid_id);
     let round = super::round_part::detect_round_part(model, solid_id, &records);
     if let Some(rp) = &round {
         records = super::round_part::apply_round_conventions(records, rp);
@@ -135,6 +165,71 @@ pub fn auto_dimensions(
             && !d.entities.is_empty()
             && d.entities.iter().all(|e| chamfered.contains(e)))
     });
+    records
+}
+
+/// A dimension label as a metric drawing prints it (ISO 129-1): no trailing
+/// zeros and no bare decimal point -- `45`, not `45.00`; `R2.5`, not
+/// `R2.50`; `0.5 × 45°`. Every number in the label is rewritten; everything
+/// else is kept. A label in inches or feet is returned unchanged: there the
+/// number of decimal places is part of the statement (ASME Y14.5).
+///
+/// The label only: the value a dimension carries, and the certificate's
+/// re-measurement of it, are untouched. A tolerance is composed onto the
+/// label afterwards ([`super::dimension_edit::dimension_ink`]) and keeps the
+/// places it was stated to.
+pub(crate) fn drafting_number_text(label: &str, unit: crate::units::LengthUnit) -> String {
+    use crate::units::LengthUnit;
+    if !matches!(
+        unit,
+        LengthUnit::Millimetre | LengthUnit::Centimetre | LengthUnit::Metre
+    ) {
+        return label.to_string();
+    }
+    let chars: Vec<char> = label.chars().collect();
+    let mut out = String::with_capacity(label.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // Integer part.
+        let start = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        out.extend(&chars[start..i]);
+        // Fraction: a point followed by at least one digit.
+        if i + 1 < chars.len() && chars[i] == '.' && chars[i + 1].is_ascii_digit() {
+            let frac_start = i + 1;
+            let mut j = frac_start;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            let mut end = j;
+            while end > frac_start && chars[end - 1] == '0' {
+                end -= 1;
+            }
+            if end > frac_start {
+                out.push('.');
+                out.extend(&chars[frac_start..end]);
+            }
+            i = j;
+        }
+    }
+    out
+}
+
+/// Project a dimension table ([`convention_records`]) into one view.
+pub(crate) fn project_records(
+    model: &BRepModel,
+    records: Vec<crate::readable::DimensionRecord>,
+    projection: ProjectionType,
+) -> Vec<Dimension2d> {
+    let mut out = Vec::new();
+    let unit = model.document_unit();
     for d in records {
         let anchor = Point3::new(d.anchor[0], d.anchor[1], d.anchor[2]);
         let dir = Vector3::new(d.direction[0], d.direction[1], d.direction[2]);
@@ -148,12 +243,19 @@ pub fn auto_dimensions(
         };
         let a = project_point(projection, p0);
         let b = project_point(projection, p1);
+        let key = super::dimension_edit::dimension_key(
+            model,
+            &d.kind,
+            &d.entities,
+            d.direction,
+            d.pid.as_deref(),
+        );
         out.push(Dimension2d {
             id: d.id,
             kind: d.kind,
             value: d.value,
             unit: d.unit,
-            label: d.label,
+            label: drafting_number_text(&d.label, unit),
             a,
             b,
             entities: d.entities,
@@ -168,6 +270,8 @@ pub fn auto_dimensions(
             datum: d.datum,
             // Tolerance is joined later by `attach_tolerances` (Slice 4).
             tolerance: None,
+            key,
+            members: Vec::new(),
         });
     }
     out
@@ -177,19 +281,61 @@ pub fn auto_dimensions(
 /// projects edge-on (e.g. a Z height in Top view), since their line collapses
 /// to a point and would clutter without informing. Angles are kept (point
 /// callouts). `min_span` is in view-space mm.
+///
+/// Nothing is thinned for legibility here. The view used to keep at most
+/// eight dimensions, five diameters and no angles past two, which made a
+/// busy part's sheet state under half of what the model has; every callout
+/// that reads is now carried, equal features are counted once
+/// ([`count_equal_features`]), and room is the layout's business: a
+/// dimension it cannot place is reported by the certificate, by name.
 pub fn visible_dimensions(
     model: &BRepModel,
     solid_id: SolidId,
     projection: ProjectionType,
     min_span: f64,
 ) -> Vec<Dimension2d> {
-    let mut dims: Vec<Dimension2d> = auto_dimensions(model, solid_id, projection)
+    candidate_dimensions(model, solid_id, projection, min_span)
+}
+
+/// Every callout that READS in this view: what the view owes. The sheet
+/// certificate compares this against what the sheet inks, so a dimension
+/// that is on no view is reported, never silently absent
+/// ([`super::completeness`]).
+pub fn candidate_dimensions(
+    model: &BRepModel,
+    solid_id: SolidId,
+    projection: ProjectionType,
+    min_span: f64,
+) -> Vec<Dimension2d> {
+    candidates_from_records(
+        model,
+        convention_records(model, solid_id),
+        projection,
+        min_span,
+    )
+}
+
+/// [`candidate_dimensions`] from a dimension table already extracted
+/// ([`convention_records`]), so several views share one extraction.
+pub(crate) fn candidates_from_records(
+    model: &BRepModel,
+    records: Vec<crate::readable::DimensionRecord>,
+    projection: ProjectionType,
+    min_span: f64,
+) -> Vec<Dimension2d> {
+    let mut dims: Vec<Dimension2d> = project_records(model, records, projection)
         .into_iter()
         .filter(|d| {
             if is_blend_callout(&d.kind) {
                 return shows_blend_profile(d, &projection);
             }
-            d.kind == "angle" || d.projected_span() >= min_span
+            if d.kind == "radius" {
+                return shows_arc_best(d, &projection);
+            }
+            if d.kind == "angle" {
+                return shows_cone_angle(d, &projection);
+            }
+            d.projected_span() >= min_span
         })
         .collect();
     // Drawing convention: a linear dimension shows just its value — strip the
@@ -205,84 +351,123 @@ pub fn visible_dimensions(
             }
         }
     }
-    select_dimensions(dims)
+    dims
 }
 
-/// Keep a COMPLEX part's drawing readable. A revolved bell nozzle has ~9 cone
-/// bands, so the raw auto-dimensions stack dozens of overlapping ∠/Ø callouts
-/// (KNOWN_BUGS DRW-DIM-EXPLOSION). Select the few that DEFINE the part:
-///   1. drop per-band cone half-angles when there are several (clutter, not
-///      something a drawing dimensions per band);
-///   2. collapse near-equal values (a stack of Ø72.0/Ø72.0/… → one);
-///   3. cap diameters to the most significant — the largest (envelope) plus
-///      the smallest (throat/bore) — dropping the intermediate contour rings;
-///   4. cap the per-view total so callouts never overlap.
-fn select_dimensions(mut dims: Vec<Dimension2d>) -> Vec<Dimension2d> {
-    use std::collections::HashSet;
-
-    // 1. Per-band angle clutter.
-    let angle_count = dims.iter().filter(|d| d.kind == "angle").count();
-    if angle_count > 2 {
-        dims.retain(|d| d.kind != "angle");
-    }
-
-    // 2. Collapse near-equal (kind, value) to a single representative (0.5 mm).
-    //    A hole callout, a pitch circle, a pattern's location and its pitch
-    //    are each a distinct statement about named holes, never a contour
-    //    ring: two of them with one value (X 10 and Y 10 to the first hole of
-    //    a grid) are both needed, so they are exempt.
-    let mut seen: HashSet<(String, i64)> = HashSet::new();
-    dims.retain(|d| {
-        is_feature_callout(&d.kind) || seen.insert((d.kind.clone(), (d.value * 2.0).round() as i64))
-    });
-
-    // 3. Cap diameters/radii: keep the largest 3 + smallest 2 distinct (envelope
-    //    + throat), drop the rest of a contour's rings.
-    const MAX_DIA: usize = 5;
-    let mut dia: Vec<Dimension2d> = dims
-        .iter()
-        .filter(|d| d.kind == "diameter" || d.kind == "radius")
-        .cloned()
-        .collect();
-    if dia.len() > MAX_DIA {
-        dia.sort_by(|a, b| {
-            b.value
-                .partial_cmp(&a.value)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut keep: Vec<Dimension2d> = dia.iter().take(3).cloned().collect();
-        keep.extend(dia.iter().rev().take(2).cloned());
-        let kept: HashSet<String> = keep.iter().map(|d| d.id.clone()).collect();
-        dims.retain(|d| (d.kind != "diameter" && d.kind != "radius") || kept.contains(&d.id));
-    }
-
-    // 4. Hard per-view cap, prioritising extents (overall envelope) > diameters
-    //    > the rest, so the most informative callouts survive. A recognised
-    //    feature's callouts are NOT subject to the cap: a hole pattern's
-    //    callout, locations and pitch are what locate its holes (they replace
-    //    the hole-table rows), so dropping one leaves a hole sized but
-    //    unplaced — or, worse, stated only in a side view.
-    const MAX_PER_VIEW: usize = 8;
-    let (features, mut rest): (Vec<Dimension2d>, Vec<Dimension2d>) =
-        dims.into_iter().partition(|d| is_feature_callout(&d.kind));
-    if rest.len() > MAX_PER_VIEW {
-        let rank = |k: &str| match k {
-            "extent" | "length" => 0,
-            "diameter" | "radius" => 1,
-            _ => 2,
-        };
-        rest.sort_by_key(|d| rank(&d.kind));
-        rest.truncate(MAX_PER_VIEW);
-    }
-    rest.extend(features);
-    rest
+/// What makes two dimension records the same statement: the durable `pid`,
+/// or (a callout, or faces without persistent ids) kind + faces + value +
+/// direction. Not the edit key: sheets stored before dimensions carried one
+/// must compare equal to the live table too.
+pub(crate) fn dimension_identity(d: &Dimension2d) -> String {
+    identity_of(
+        &d.kind,
+        d.pid.as_deref(),
+        &d.entities,
+        d.value,
+        d.dir3.unwrap_or([0.0; 3]),
+    )
 }
 
-/// A callout that states a recognised feature (a round part's bolt circle, a
-/// hole pattern's callout, location and pitch) -- never contour clutter, so
-/// [`select_dimensions`] neither merges nor drops it as one.
-fn is_feature_callout(kind: &str) -> bool {
-    matches!(kind, "hole_callout" | "pcd" | "location" | "pitch") || is_blend_callout(kind)
+/// [`dimension_identity`] of a dimension record of the model's table.
+pub(crate) fn record_identity(d: &crate::readable::DimensionRecord) -> String {
+    identity_of(
+        &d.kind,
+        d.pid.as_deref(),
+        &d.entities,
+        d.value,
+        unit3_or_zero(d.direction),
+    )
+}
+
+fn identity_of(
+    kind: &str,
+    pid: Option<&str>,
+    entities: &[u32],
+    value: f64,
+    dir: [f64; 3],
+) -> String {
+    if let Some(p) = pid {
+        return p.to_string();
+    }
+    let mut faces = entities.to_vec();
+    faces.sort_unstable();
+    let mut q = [
+        (dir[0] * 100.0).round() as i64,
+        (dir[1] * 100.0).round() as i64,
+        (dir[2] * 100.0).round() as i64,
+    ];
+    if q.iter().find(|v| **v != 0).is_some_and(|v| *v < 0) {
+        q = [-q[0], -q[1], -q[2]];
+    }
+    format!("{kind}|{faces:?}|{}|{q:?}", (value * 100.0).round() as i64)
+}
+
+/// A feature size that is stated once for every equal feature, with their
+/// count: an arc's radius, a diameter, a cone angle, a fillet, a chamfer.
+/// Lengths, locations and overall sizes are never counted: two equal lengths
+/// are two different places on the part.
+fn is_counted_kind(kind: &str) -> bool {
+    matches!(kind, "radius" | "diameter" | "angle") || is_blend_callout(kind)
+}
+
+/// The count prefix of a counted callout: `"4× "`.
+pub(crate) fn count_prefix(n: usize) -> String {
+    format!("{n}\u{00D7} ")
+}
+
+/// State equal features ONCE, with their count (ISO 129-1: "4× R5").
+///
+/// In each view, the dimensions of one counted kind ([`is_counted_kind`])
+/// whose values print the same (equal to 0.005) become one callout on the
+/// first of them: its label takes the count and its
+/// [`Dimension2d::members`] names every feature it speaks for. The others
+/// leave the view; they are not omitted -- the certificate reads the members
+/// and re-measures each one ([`super::completeness`],
+/// [`super::sheet_certificate`]).
+///
+/// Left alone: a dimension the hole table states instead (it is not inked,
+/// so it can head no count), one with a bound tolerance (its limits are a
+/// statement about that feature only), and one already counted. Runs after
+/// the cross-view dedup, the hole table and the tolerance binding, so each
+/// feature is in the one view that states it.
+pub(crate) fn count_equal_features(drawing: &mut super::types::Drawing) {
+    use std::collections::HashMap;
+    let tabled = super::layout::tabled_face_ids(drawing);
+    for view in &mut drawing.views {
+        // (kind, value in hundredths) -> index of the callout that counts it.
+        let mut head: HashMap<(String, i64), usize> = HashMap::new();
+        let mut kept: Vec<Dimension2d> = Vec::with_capacity(view.dimensions.len());
+        for d in std::mem::take(&mut view.dimensions) {
+            let countable = is_counted_kind(&d.kind)
+                && d.tolerance.is_none()
+                && d.members.is_empty()
+                && !(d.kind == "diameter" && d.entities.iter().any(|e| tabled.contains(e)));
+            if !countable {
+                kept.push(d);
+                continue;
+            }
+            let key = (d.kind.clone(), (d.value * 100.0).round() as i64);
+            match head.get(&key) {
+                Some(&i) => {
+                    if kept[i].members.is_empty() {
+                        let own = dimension_identity(&kept[i]);
+                        kept[i].members.push(own);
+                    }
+                    kept[i].members.push(dimension_identity(&d));
+                }
+                None => {
+                    head.insert(key, kept.len());
+                    kept.push(d);
+                }
+            }
+        }
+        for d in &mut kept {
+            if d.members.len() > 1 {
+                d.label = format!("{}{}", count_prefix(d.members.len()), d.label);
+            }
+        }
+        view.dimensions = kept;
+    }
 }
 
 /// A blend callout -- a fillet's "R3.00" or a chamfer's "0.50 × 45°" -- is a
@@ -306,6 +491,35 @@ fn shows_blend_profile(d: &Dimension2d, projection: &ProjectionType) -> bool {
     };
     dot3(axis, vd).abs() < 1e-6 && dot3(dir, vd).abs() < 1e-6
 }
+
+/// Is this the view an arc's radius is stated in: the standard view looking
+/// most nearly along the arc's axis, where the arc is drawn as an arc? An
+/// axis on a world axis has exactly one such view direction; an oblique axis
+/// takes the nearest (never none, so the radius is always owed somewhere).
+fn shows_arc_best(d: &Dimension2d, projection: &ProjectionType) -> bool {
+    let (Some(vd), Some(axis)) = (view_dir(projection), d.axis3) else {
+        return false;
+    };
+    let best = axis[0].abs().max(axis[1].abs()).max(axis[2].abs());
+    dot3(axis, vd).abs() >= best - 1e-9
+}
+
+/// A cone's angle reads in a view that sees the cone from the side. Seen
+/// along its axis a cone is two concentric circles and its angle is nowhere
+/// on the paper: the callout was printed at the axis, the middle of the view,
+/// on top of the bore tags there, owed to nothing a reader could see. A view
+/// with no principal direction (the isometric) keeps it, as before.
+fn shows_cone_angle(d: &Dimension2d, projection: &ProjectionType) -> bool {
+    let (Some(vd), Some(axis)) = (view_dir(projection), d.dir3) else {
+        return true;
+    };
+    let len = dot3(axis, axis).sqrt();
+    len < 1e-12 || (dot3(axis, vd) / len).abs() < END_ON_COS
+}
+
+/// `|cos|` between a cone's axis and the view direction above which the cone
+/// is seen end-on (within about 8 degrees of its axis).
+const END_ON_COS: f64 = 0.99;
 
 /// World-space view direction (unit vector, pointing INTO the scene) that a
 /// standard projection camera looks along. Used by `dedup_dimensions_global`
@@ -354,7 +568,10 @@ fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
 /// direction) — identical direction+value = duplicate; different direction at
 /// same value = not a duplicate and must survive.
 ///
-/// Angle dimensions are exempt from both passes.
+/// Angle dimensions are exempt from Pass A; in Pass B an angle that names its
+/// faces (a cone's) is kept in one view like any feature dimension (all
+/// spans are zero, so the lowest view index keeps it), and one with no faces
+/// is exempt.
 pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
     // ── Pass A: same-view same-interval dedup ────────────────────────────────
     for view in &mut drawing.views {
@@ -368,11 +585,16 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
             orient: char,
             lo: f64,
             hi: f64,
+            /// Where the span sits across its direction (view mm).
+            across: f64,
             rank: u8,
         }
         let mut lins: Vec<Lin> = Vec::new();
         for (idx, d) in view.dimensions.iter().enumerate() {
-            if d.kind == "angle" {
+            // An arc's radius is a leader on that arc: its span runs from the
+            // arc to its centre, and two equal arcs in line with each other
+            // are two features, not one dimension stated twice.
+            if d.kind == "angle" || d.kind == "radius" {
                 continue;
             }
             let dx = (d.a[0] - d.b[0]).abs();
@@ -381,10 +603,18 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
                 continue;
             }
             let orient = if dx >= dy { 'H' } else { 'V' };
-            let (lo, hi) = if orient == 'H' {
-                (d.a[0].min(d.b[0]), d.a[0].max(d.b[0]))
+            let (lo, hi, across) = if orient == 'H' {
+                (
+                    d.a[0].min(d.b[0]),
+                    d.a[0].max(d.b[0]),
+                    0.5 * (d.a[1] + d.b[1]),
+                )
             } else {
-                (d.a[1].min(d.b[1]), d.a[1].max(d.b[1]))
+                (
+                    d.a[1].min(d.b[1]),
+                    d.a[1].max(d.b[1]),
+                    0.5 * (d.a[0] + d.b[0]),
+                )
             };
             let rank: u8 = match d.kind.as_str() {
                 "extent" => 0,
@@ -396,6 +626,7 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
                 orient,
                 lo,
                 hi,
+                across,
                 rank,
             });
         }
@@ -419,6 +650,28 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
                     continue;
                 }
                 if (vi.value - vj.value).abs() > tol_val {
+                    continue;
+                }
+                // Two equal balls side by side -- spans that project onto one
+                // interval but sit at different places across it -- are two
+                // features, not one dimension stated twice: both stay, and
+                // the count states them on one callout
+                // (`count_equal_features`). Dropping one as a duplicate left
+                // its twin, when it was laid 0.6 mm along, stated by nothing
+                // (CADGenBench 124's fourth SØ5). Only a feature with no
+                // axis (a sphere) is kept so: a bore or boss is stated where
+                // it reads as a circle, by its hole-table row or the cross-view
+                // pass below, and two of its diameters kept here would be
+                // inked over one interval.
+                let distinct_features = vi.kind == vj.kind
+                    && is_counted_kind(&vi.kind)
+                    && vi.axis3.is_none()
+                    && vj.axis3.is_none()
+                    && !vi.entities.is_empty()
+                    && !vj.entities.is_empty()
+                    && vi.entities.iter().all(|e| !vj.entities.contains(e))
+                    && (lins[i].across - lins[j].across).abs() >= tol_int;
+                if distinct_features {
                     continue;
                 }
                 let lo_match = (lins[i].lo - lins[j].lo).abs() < tol_int;
@@ -478,7 +731,11 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
         let vdir = view_dir(&projs[vi]);
         for di in 0..drawing.views[vi].dimensions.len() {
             let d = &drawing.views[vi].dimensions[di];
-            if d.kind == "angle" {
+            // An angle with no faces names no feature to match on, so it stays
+            // where it is. A cone's angle names its cone: a cone standing on
+            // a plate is seen from the side by FRONT and RIGHT alike, and its
+            // angle was stated in both (found on a benchmark sheet).
+            if d.kind == "angle" && d.entities.is_empty() {
                 continue;
             }
             let qval = (d.value * 100.0).round() as i64;
@@ -536,10 +793,22 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
     // Build a removal set: (view_idx, dim_idx).
     let mut remove: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
 
+    // Groups whose keeper may be moved to another view that reads it (Pass C):
+    // a linear dimension kept by span alone, with its entries.
+    let mut movable: Vec<(Vec<u32>, String, i64, Vec<(usize, usize, f64)>)> = Vec::new();
+
     // Entity groups: keep one per group.
-    for (_, mut entries) in entity_groups {
+    for ((ents, kind, qval), mut entries) in entity_groups {
         if entries.len() < 2 {
             continue;
+        }
+        if entries.iter().all(|e| !e.3) && matches!(kind.as_str(), "position" | "length") {
+            movable.push((
+                ents,
+                kind,
+                qval,
+                entries.iter().map(|e| (e.0, e.1, e.2)).collect(),
+            ));
         }
         // Prefer the axial view for diameters/radii; among those, or if none
         // are axial, keep the view with the largest projected span. Tie → lowest
@@ -582,6 +851,38 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
         }
     }
 
+    // ── Pass C: a dimension that would print on another's lines ──────────────
+    // Two different dimensions of one view whose intervals end within half a
+    // millimetre of each other on paper (a boss located 48.9 from the datum and
+    // a slot 49.18) are drawn with their extension lines on top of each other:
+    // nobody can tell which number belongs to which line, and the sheet's
+    // quality check reports them as bracketing the same interval. When another
+    // view also reads one of them and has no such neighbour for it, it is
+    // stated there instead -- moved, never dropped. Groups in a fixed order,
+    // so the sheet is the same on every build.
+    movable.sort_by(|a, b| (&a.0, &a.1, a.2).cmp(&(&b.0, &b.1, b.2)));
+    for (_, _, _, entries) in &movable {
+        let Some(&(kv, kd, _)) = entries.iter().find(|e| !remove.contains(&(e.0, e.1))) else {
+            continue;
+        };
+        if !crowds_a_kept_interval(drawing, &remove, kv, kd) {
+            continue;
+        }
+        let alternative = entries
+            .iter()
+            .filter(|e| e.0 != kv && !crowds_a_kept_interval(drawing, &remove, e.0, e.1))
+            .max_by(|a, b| {
+                a.2.partial_cmp(&b.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.0.cmp(&a.0))
+            })
+            .copied();
+        if let Some((av, ad, _)) = alternative {
+            remove.insert((kv, kd));
+            remove.remove(&(av, ad));
+        }
+    }
+
     // Apply removals.
     for vi in 0..n_views {
         let mut di = 0_usize;
@@ -591,6 +892,61 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
             r
         });
     }
+}
+
+/// How close (paper mm) the ends of two same-direction intervals of one view
+/// may come before their extension lines read as one: the tolerance
+/// `verify::check_redundant_dimensions` reports at.
+const CROWDED_INTERVAL_MM: f64 = 0.5;
+
+/// The paper interval of a linear dimension in its view: orientation
+/// (`true` = horizontal) and its two ends. `None` for an angle, a radius and
+/// a point callout.
+fn paper_interval(view: &super::types::ProjectedView, d: &Dimension2d) -> Option<(bool, f64, f64)> {
+    if d.kind == "angle" || d.kind == "radius" {
+        return None;
+    }
+    let dx = (d.a[0] - d.b[0]).abs();
+    let dy = (d.a[1] - d.b[1]).abs();
+    if dx < 1e-6 && dy < 1e-6 {
+        return None;
+    }
+    let s = view.scale.abs();
+    Some(if dx >= dy {
+        (true, d.a[0].min(d.b[0]) * s, d.a[0].max(d.b[0]) * s)
+    } else {
+        (false, d.a[1].min(d.b[1]) * s, d.a[1].max(d.b[1]) * s)
+    })
+}
+
+/// Does dimension `di` of view `vi` end, at both ends, within
+/// [`CROWDED_INTERVAL_MM`] of another dimension the view keeps (one not in
+/// `removed`)?
+fn crowds_a_kept_interval(
+    drawing: &super::types::Drawing,
+    removed: &std::collections::HashSet<(usize, usize)>,
+    vi: usize,
+    di: usize,
+) -> bool {
+    let Some(view) = drawing.views.get(vi) else {
+        return false;
+    };
+    let Some((h, lo, hi)) = view
+        .dimensions
+        .get(di)
+        .and_then(|d| paper_interval(view, d))
+    else {
+        return false;
+    };
+    view.dimensions.iter().enumerate().any(|(j, o)| {
+        j != di
+            && !removed.contains(&(vi, j))
+            && paper_interval(view, o).is_some_and(|(oh, olo, ohi)| {
+                oh == h
+                    && (olo - lo).abs() < CROWDED_INTERVAL_MM
+                    && (ohi - hi).abs() < CROWDED_INTERVAL_MM
+            })
+    })
 }
 
 /// Assemble a standard third-angle engineering drawing — Front, Top, Right —
@@ -644,10 +1000,11 @@ pub fn standard_drawing(
     dedup_dimensions_global(&mut drawing);
     // `visible_dimensions` rewrote the records into the round-part and hole
     // conventions; record the callouts so the certificate re-measures them.
-    let dims = extract_dimensions(model, solid_id);
+    let dims = super::arcs::drafting_dimensions(model, solid_id);
     drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
     drawing.hole_features =
         super::hole_features::detect_hole_features(model, solid_id, drawing.round_part.as_ref());
+    count_equal_features(&mut drawing);
     Ok(drawing)
 }
 
@@ -754,34 +1111,33 @@ pub fn standard_drawing_hlr_with_projection(
     // leaves the right column and top row sized by the real views and the
     // top-right quadrant empty.
     let no_iso = super::types::ViewExtent::default();
-    // The gap between the view rows must hold the upper view's stack of
-    // horizontal dimensions, as on the automatic route
-    // (`dimension_band_gaps`). With the fixed gap, a plate's five hole
-    // locations under TOP ran down into FRONT -- "40.00" and "60.00" printed
-    // inside its geometry. The views are not built yet, so count from the
-    // same analytic dimension table each view is about to draw; bore
-    // diameters are left out (a table row or a callout states them, never a
-    // stacked dimension).
-    let bores = crate::readable::bore_face_ids(model, solid_id);
-    let stacked = specs
-        .iter()
-        .map(|(proj, _)| {
-            visible_dimensions(model, solid_id, *proj, min_span)
-                .iter()
-                .filter(|d| {
-                    let dx = (d.a[0] - d.b[0]).abs();
-                    let dy = (d.a[1] - d.b[1]).abs();
-                    !matches!(d.kind.as_str(), "angle" | "hole_callout")
-                        && !(d.kind == "diameter" && d.entities.iter().any(|e| bores.contains(e)))
-                        && dx >= dy
-                        && dx > 1e-6
-                })
-                .count()
-        })
-        .max()
-        .unwrap_or(0);
-    let vgap = VGAP + stacked.saturating_sub(3) as f64 * super::layout::STACK;
-    let placement = place_four_view(&sheet, fe, te, re, no_iso, scale, angle, vgap, HGAP);
+    // The gaps between the views must hold their dimension lanes, as on the
+    // automatic route (`dimension_band_gaps`). With the fixed gap, a plate's
+    // five hole locations under TOP ran down into FRONT -- "40.00" and
+    // "60.00" printed inside its geometry. The views are not built yet, so
+    // the lanes are measured on probes carrying the same analytic dimension
+    // table each view is about to draw; bore diameters are left out (a table
+    // row or a callout states them, never a stacked dimension).
+    let bores = super::arcs::closed_bore_faces(model, solid_id);
+    let (vgap, hgap) = {
+        let mut probe = Drawing::new("band probe", sheet);
+        for (proj, name) in specs {
+            let mut v = super::projection::project_solid_view(
+                model,
+                source,
+                proj,
+                name,
+                [0.0, 0.0],
+                scale,
+            )?;
+            v.dimensions = visible_dimensions(model, solid_id, proj, min_span);
+            probe.add_view(v);
+        }
+        dedup_dimensions_global(&mut probe);
+        count_equal_features(&mut probe);
+        dimension_band_gaps(&probe.views, &bores)
+    };
+    let placement = place_four_view(&sheet, fe, te, re, no_iso, scale, angle, vgap, hgap);
     // A finite, positive scale can still be too large to MEASURE against: at
     // `1e308` the guard above passes and `1e308 * 80` is `inf`, so the overrun
     // is not a number. Reporting that as a fit failure would print "by inf mm"
@@ -828,13 +1184,14 @@ pub fn standard_drawing_hlr_with_projection(
     // walk) those bores read `omitted` and the sheet refuses at export, which is
     // the certificate telling the truth about a sheet that was always
     // incomplete. The fix is to table the bores, not to lower the bar.
-    let dims = extract_dimensions(model, solid_id);
-    let bore_faces = crate::readable::bore_face_ids(model, solid_id);
+    let dims = super::arcs::drafting_dimensions(model, solid_id);
+    let bore_faces = super::arcs::closed_bore_faces(model, solid_id);
     drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
     drawing.hole_features =
         super::hole_features::detect_hole_features(model, solid_id, drawing.round_part.as_ref());
     attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
     super::round_part::add_pitch_circles(&mut drawing);
+    count_equal_features(&mut drawing);
 
     Ok(drawing)
 }
@@ -944,8 +1301,8 @@ fn build_hlr_view(
 /// are -- hidden-line removed with occluded edges dashed, true circles and
 /// ellipses, per-edge lineage, centre lines -- not as the bare wireframe
 /// [`super::projection::project_solid_view`] gives. An isometric is the
-/// sheet's pictorial: every edge solid, with the shaded raster the sheet's own
-/// isometric carries.
+/// sheet's pictorial: its visible edges, with the shaded raster the sheet's
+/// own isometric carries.
 ///
 /// It carries NO dimensions. A sheet's dimensions are deduplicated across its
 /// views when it is made ([`dedup_dimensions_global`]), so each feature is
@@ -986,39 +1343,24 @@ fn hlr_view_geometry(
     use super::visibility::project_solid_edges_visibility_occ;
 
     let mut view = project_solid_view(model, source, proj, name, pos, scale)?;
-    // The isometric merges visible + hidden into one all-solid set below, so its
-    // occlusion pass is discarded work — skip it (`occlude = false`). Orthographic
-    // views keep true HLR.
-    let occlude = !matches!(proj, ProjectionType::Isometric);
     let edges =
-        project_solid_edges_visibility_occ(model, solid_id, proj, DEFAULT_CURVE_SAMPLES, occlude)?;
+        project_solid_edges_visibility_occ(model, solid_id, proj, DEFAULT_CURVE_SAMPLES, true)?;
     if matches!(proj, ProjectionType::Isometric) {
-        // The isometric is a PICTORIAL reference, drawn as a clean solid
-        // wireframe. Per-segment occlusion mis-classifies a curved rim in the
-        // oblique iso view: the rim is mostly near-silhouette (its tangent is
-        // ~perpendicular to the view), where the occlusion raycast grazes the
-        // surface and reports "hidden", so the whole rim renders dashed — an
-        // all-dashed "ghost". Showing every edge solid (the standard isometric
-        // convention, which omits hidden lines) removes the ghost without
-        // relying on the fragile oblique-view occlusion test.
-        let mut all = edges.visible;
-        all.extend(edges.hidden);
-        view.polylines = all;
-        // Keep the provenance parallel to `polylines` (visible then hidden), so
-        // `entity_at` can name an edge by its lineage. (The iso cell is drawn as
-        // a shaded raster and `entity_at` refuses render_only there before
-        // reaching these — but the lockstep invariant is maintained regardless.)
-        let mut all_sources = edges.visible_sources;
-        all_sources.extend(edges.hidden_sources);
-        view.polyline_sources = all_sources;
+        // The isometric is a PICTORIAL reference: the shaded solid with its
+        // VISIBLE edges inked on it, and no hidden lines (the isometric
+        // convention). It used to ink every edge, hidden ones as solid lines
+        // too -- to dodge an all-dashed rim that chord-midpoint occlusion
+        // probes once gave curved edges -- so the far side of every bore and
+        // pocket was drawn through the shading: an X-ray, not a solid (found
+        // looking at a benchmark sheet). Curved edges are probed on the curve
+        // now ([`super::visibility`]), so the iso takes the true HLR split
+        // and drops the hidden set.
+        view.polylines = edges.visible;
+        view.polyline_sources = edges.visible_sources;
         view.hidden_polylines = Vec::new();
-        let mut all_circles = edges.circles;
-        all_circles.extend(edges.hidden_circles);
-        view.circles = select_circles(all_circles);
+        view.circles = select_circles(edges.circles);
         view.hidden_circles = Vec::new();
-        let mut all_ellipses = edges.ellipses;
-        all_ellipses.extend(edges.hidden_ellipses);
-        view.ellipses = select_ellipses(all_ellipses);
+        view.ellipses = select_ellipses(edges.ellipses);
         view.hidden_ellipses = Vec::new();
     } else {
         view.polylines = edges.visible;
@@ -1216,33 +1558,112 @@ fn dimension_band_gaps(
     views: &[super::types::ProjectedView],
     tabled: &std::collections::HashSet<u32>,
 ) -> (f64, f64) {
-    use super::layout::STACK;
-    // The column gap is not widened for a hole callout's leader: widening it
-    // shrank a flange sheet's scale to 0.75. The leader's shoulder row is
-    // routed around the neighbouring views instead
-    // (`layout::place_dimensions_in_frame`).
-    let hgap = HGAP;
-    let stacked = |v: &super::types::ProjectedView| -> usize {
-        v.dimensions
+    // How deep each view's lanes run when it has the room it wants, measured
+    // by the layout's own placement (so a chain that shares one lane counts
+    // once). The views are probes at 1:1; lane depth is paper millimetres and
+    // changes with the final scale only where labels start or stop fitting
+    // their spans.
+    let depth = |proj: ProjectionType| -> (f64, f64) {
+        views
             .iter()
-            .filter(|d| {
-                let dx = (d.a[0] - d.b[0]).abs();
-                let dy = (d.a[1] - d.b[1]).abs();
-                !matches!(d.kind.as_str(), "angle" | "hole_callout" | "position")
-                    && !(d.kind == "diameter" && d.entities.iter().any(|e| tabled.contains(e)))
-                    && dx >= dy
-                    && dx > 1e-6
+            .find(|v| v.projection == proj)
+            .map_or((0.0, 0.0), |v| {
+                super::layout::dimension_band_depths(v, tabled)
             })
-            .count()
     };
-    let n = views.iter().map(stacked).max().unwrap_or(0);
-    // [`VGAP`] holds THREE stacked dimensions: the third line sits at
-    // STANDOFF + 2·STACK = 27 mm below the upper view, clear of the lower
-    // view's title glyphs (a flange's OD, bore and PCD — measured on the
-    // inked sheet). Each dimension past three needs one more STACK.
-    let vgap = VGAP + n.saturating_sub(3) as f64 * STACK;
+    let (front, top, right) = (
+        depth(ProjectionType::Front),
+        depth(ProjectionType::Top),
+        depth(ProjectionType::Right),
+    );
+    // Between the rows: the upper view's lanes, the lower view's title, and
+    // whatever of the lower row's own lanes will not fit under it (those go
+    // above their view: `layout::place_dimensions_routed`). [`VGAP`] holds
+    // three lanes: the third line sits STANDOFF + 2 STACK = 27 mm below the
+    // upper view, clear of the lower view's title glyphs.
+    let spill_below = (front.0.max(right.0) - LANES_UNDER_BOTTOM_ROW_MM).max(0.0);
+    let vgap = (top.0 + BAND_TO_TITLE_MM + spill_below).clamp(VGAP, MAX_GAP);
+    // Between the columns: the right-hand view's lanes on its left, and
+    // whatever of the left column's lanes will not fit beside it (those go to
+    // the right of their view). The gap is not widened for a hole callout's
+    // leader: widening it shrank a flange sheet's scale to 0.75; the leader's
+    // shoulder row is routed around the neighbouring views instead.
+    let spill_left = (front.1.max(top.1) - PAD_LEFT).max(0.0);
+    let hgap = (right.1 + BAND_TO_VIEW_MM + spill_left).clamp(HGAP, MAX_GAP);
     (vgap, hgap)
 }
+
+/// Paper kept free right of the right-hand column when the views are moved
+/// right ([`room_for_left_lanes`]): a leader's shoulder and its callout.
+const RIGHT_LEADER_ROOM_MM: f64 = 40.0;
+
+/// Move the four views right, all together (so every projection line is
+/// kept), when the lanes left of the leftmost views need more paper than the
+/// centred arrangement leaves them and the sheet has paper to spare on the
+/// right. The arrangement is centred for its views, not for their
+/// dimensions: on a part with a tall location ladder the outer lanes hit the
+/// frame, and the dimensions there went unplaced (CADGenBench 124: the
+/// locations 27.5, 28.5 and 10 "not dimensioned") while 150 mm of the sheet
+/// stood empty right of the isometric.
+///
+/// `extents` are the views' unit-scale extents `[front, top, right, iso]`,
+/// `positions` their placed origins, `left_bands` the depth of the left lanes
+/// of FRONT, TOP and RIGHT.
+fn room_for_left_lanes(
+    sheet: &super::types::SheetSize,
+    extents: &[super::types::ViewExtent],
+    scale: f64,
+    mut positions: [[f64; 2]; 4],
+    left_bands: &[f64],
+) -> [[f64; 2]; 4] {
+    let (ml, mr, _, _) = super::svg::frame_margins(sheet);
+    let (frame_x0, frame_x1) = (ml, sheet.width() - mr);
+    // Sheet x-extent of view `i`.
+    let span = |i: usize| -> Option<(f64, f64)> {
+        let e = extents.get(i)?;
+        let p = positions.get(i)?;
+        Some((p[0] + e.min_x * scale, p[0] + e.max_x * scale))
+    };
+    let spans: Vec<(f64, f64)> = (0..positions.len()).filter_map(span).collect();
+    let Some(left_edge) = spans.iter().map(|s| s.0).reduce(f64::min) else {
+        return positions;
+    };
+    let Some(right_edge) = spans.iter().map(|s| s.1).reduce(f64::max) else {
+        return positions;
+    };
+    // The lanes that matter are those of the views in the leftmost column.
+    let need = (0..3)
+        .filter(|&i| span(i).is_some_and(|s| s.0 - left_edge < 1.0))
+        .filter_map(|i| left_bands.get(i).copied())
+        .fold(0.0_f64, f64::max);
+    // A little air between the outermost lane's text and the frame.
+    let short = need + 1.0 - (left_edge - frame_x0);
+    let spare = frame_x1 - RIGHT_LEADER_ROOM_MM - right_edge;
+    let shift = short.min(spare);
+    if shift > 0.0 && shift.is_finite() {
+        for p in &mut positions {
+            p[0] += shift;
+        }
+    }
+    positions
+}
+
+/// From the outermost ink of the upper view's lanes to the lower view: its
+/// title and a little air. With [`super::layout::STANDOFF`] and
+/// [`super::layout::STACK`] this makes [`VGAP`] hold exactly three lanes.
+const BAND_TO_TITLE_MM: f64 = 3.5;
+/// From the outermost ink of a view's left-hand lanes to the view beside it.
+const BAND_TO_VIEW_MM: f64 = 4.0;
+/// Lane depth that fits under the bottom row: the bottom pad plus the slack
+/// the fill margin leaves above the title block.
+const LANES_UNDER_BOTTOM_ROW_MM: f64 = 22.0;
+/// A part whose dimensions need more than the standard gaps is drawn so its
+/// largest view is at least this long on paper, when a sheet up to two sizes
+/// larger allows it.
+const MIN_BUSY_VIEW_PAPER_MM: f64 = 60.0;
+/// The widest gap the view layout opens for dimensions. Past this a view's
+/// dimensions are placed where there is room and the rest are reported.
+const MAX_GAP: f64 = 120.0;
 
 // Reserve dimension room on the left + bottom + between columns, and
 // the title-block band along the bottom, then center the group.
@@ -1339,10 +1760,13 @@ fn fill_scale_four_view(
     let s_w = (avail_w - hgap) / unit_w;
     let s_h = (avail_h - vgap) / unit_h;
     let mut scale = 0.9 * s_w.min(s_h);
-    if !scale.is_finite() || scale <= 0.0 {
+    if !scale.is_finite() {
         scale = 1.0;
     }
-    snap_scale(scale)
+    // Gaps wider than the sheet leave no room for the views at all: that is
+    // the smallest scale, never 1:1 (which laid a busy small part's views
+    // out over the title block and off the top of an A4).
+    snap_scale(scale.max(0.0))
 }
 
 /// Where the four views sit at a GIVEN scale, and by how much the group
@@ -1515,11 +1939,133 @@ pub fn standard_drawing_auto(
 }
 
 /// [`standard_drawing_auto`] laid out first- or third-angle.
+///
+/// The sheet is chosen for the views and their dimensions. When that sheet
+/// is short of PAPER -- a dimension it carries found no room clear of the
+/// other ink, or its hole table no free paper (printed across a view, its
+/// title, the notes or the title block) -- it is rebuilt up to two ISO sizes
+/// larger at the SAME scale, so the views keep their size and the ink gets
+/// the paper. The first sheet that is not short of paper is returned; when
+/// none is, the one with the fewest unplaced dimensions, then the fewest
+/// table collisions, then the fewest layout errors (the first of equals): a
+/// dimension is never traded for a cleaner layout. Other layout errors (a
+/// line through a number inside one view's stack) are not a reason to
+/// rebuild: more paper does not move a view's own lanes (CADGenBench 124 kept
+/// them on A1), and every rebuild redraws all four views (a gear-class part
+/// went past its 30 s budget). Found by looking at benchmark sheets: an A3
+/// gear-pump body whose twelve-row table was printed over its FRONT view,
+/// and an A2 crank whose location ladders ran into the frame (both overall
+/// sizes not dimensioned, half the sheet empty).
 pub fn standard_drawing_auto_with_projection(
     model: &BRepModel,
     solid_id: SolidId,
     part_uuid: uuid::Uuid,
     angle: super::types::ProjectionAngle,
+) -> Result<super::types::Drawing, super::projection::ProjectionError> {
+    // A view's hidden lines depend on the part and the direction only, so a
+    // sheet rebuilt on larger paper reuses them instead of redrawing all four
+    // views (a gear-class sheet went from 4.5 s to 30 s without this).
+    let _visibility = super::visibility::VisibilityCacheScope::enter(model);
+    let first = auto_sheet(model, solid_id, part_uuid, angle, None)?;
+    let mut best_short = sheet_shortfall(&first);
+    let report = |d: &super::types::Drawing, short: (usize, usize, usize)| {
+        if draw_profile_enabled() {
+            eprintln!(
+                "[draw-profile] sheet {} at {}: {} unplaced, {} table collisions, {} layout errors",
+                d.sheet_size.label(),
+                d.views.first().map_or(0.0, |v| v.scale),
+                short.0,
+                short.1,
+                short.2
+            );
+        }
+    };
+    report(&first, best_short);
+    if !short_of_paper(best_short) {
+        return Ok(first);
+    }
+    let scale = first.views.first().map_or(1.0, |v| v.scale);
+    let mut sheet = first.sheet_size;
+    let mut best = first;
+    for _ in 0..2 {
+        let Some(next) = larger_sheet(&sheet) else {
+            break;
+        };
+        let roomier = auto_sheet(model, solid_id, part_uuid, angle, Some((next, scale)))?;
+        let short = sheet_shortfall(&roomier);
+        report(&roomier, short);
+        if !short_of_paper(short) {
+            return Ok(roomier);
+        }
+        if short < best_short {
+            best_short = short;
+            best = roomier;
+        }
+        sheet = next;
+    }
+    Ok(best)
+}
+
+/// A sheet is short of paper when a dimension found no room or its hole
+/// table has no free paper ([`sheet_shortfall`]'s first two counts).
+fn short_of_paper(short: (usize, usize, usize)) -> bool {
+    short.0 > 0 || short.1 > 0
+}
+
+/// What a sheet falls short by, `(unplaced, table collisions, errors)`: the
+/// dimensions its views carry that the layout did not place (no room clear
+/// of the other ink), the `HoleTableCollision` findings, and all its layout
+/// errors (`verify_drawing`). A dimension the hole table states instead, or
+/// one a person suppressed, is not owed a place.
+fn sheet_shortfall(drawing: &super::types::Drawing) -> (usize, usize, usize) {
+    let report = super::verify::verify_drawing(drawing);
+    let errors = report.error_count();
+    let table = report
+        .issues
+        .iter()
+        .filter(|i| i.kind == super::verify::DrawingIssueKind::HoleTableCollision)
+        .count();
+    let layout = super::layout::compute_layout(drawing);
+    let tabled = super::layout::tabled_face_ids(drawing);
+    let placed: std::collections::HashSet<(usize, &str)> = layout
+        .dimensions
+        .iter()
+        .map(|pd| {
+            (
+                pd.owner_view,
+                pd.dim_id.strip_suffix("-note").unwrap_or(&pd.dim_id),
+            )
+        })
+        .collect();
+    let unplaced = drawing
+        .views
+        .iter()
+        .enumerate()
+        .flat_map(|(vi, v)| v.dimensions.iter().map(move |d| (vi, d)))
+        .filter(|(vi, d)| {
+            let by_table = matches!(d.kind.as_str(), "position" | "diameter")
+                && !d.entities.is_empty()
+                && d.entities.iter().all(|e| tabled.contains(e));
+            let suppressed = d
+                .key
+                .as_ref()
+                .and_then(|k| drawing.dimension_edits.get(k))
+                .is_some_and(|e| e.suppressed.is_some());
+            !by_table && !suppressed && !placed.contains(&(*vi, d.id.as_str()))
+        })
+        .count();
+    (unplaced, table, errors)
+}
+
+/// One automatic sheet. `on` forces the sheet and caps the scale (the views
+/// are drawn no larger than that scale, centred on the given sheet); `None`
+/// chooses both from the part and its dimensions.
+fn auto_sheet(
+    model: &BRepModel,
+    solid_id: SolidId,
+    part_uuid: uuid::Uuid,
+    angle: super::types::ProjectionAngle,
+    on: Option<(super::types::SheetSize, f64)>,
 ) -> Result<super::types::Drawing, super::projection::ProjectionError> {
     // Hole recognition and round-part detection ask for this solid's
     // adjacency graph in every view and pass; build it once for the sheet.
@@ -1580,9 +2126,11 @@ pub fn standard_drawing_auto_with_projection(
         }
     }
     dedup_dimensions_global(&mut band_probe);
-    let (vgap, hgap) = {
+    // Equal features take one callout on the sheet, so they take one here.
+    count_equal_features(&mut band_probe);
+    let (vgap, hgap, left_bands) = {
         let t = std::time::Instant::now();
-        let dims = extract_dimensions(model, solid_id);
+        let dims = super::arcs::drafting_dimensions(model, solid_id);
         lap("extract_dimensions", t);
         let t = std::time::Instant::now();
         let round = super::round_part::detect_round_part(model, solid_id, &dims);
@@ -1596,12 +2144,20 @@ pub fn standard_drawing_auto_with_projection(
         }
         let t = std::time::Instant::now();
         let tabled: std::collections::HashSet<u32> =
-            crate::readable::bore_face_ids(model, solid_id)
+            super::arcs::closed_bore_faces(model, solid_id)
                 .into_iter()
                 .filter(|f| !called_out.contains(f))
                 .collect();
         lap("bore_face_ids", t);
-        dimension_band_gaps(&band_probe.views, &tabled)
+        let (vgap, hgap) = dimension_band_gaps(&band_probe.views, &tabled);
+        // How deep each orthographic view's left-hand lanes run (FRONT,
+        // TOP, RIGHT), paper mm.
+        let left_bands: Vec<f64> = band_probe
+            .views
+            .iter()
+            .map(|v| super::layout::dimension_band_depths(v, &tabled).1)
+            .collect();
+        (vgap, hgap, left_bands)
     };
     if prof {
         eprintln!(
@@ -1615,13 +2171,53 @@ pub fn standard_drawing_auto_with_projection(
         .map(|e| e.width().max(e.height()))
         .fold(0.0_f64, f64::max)
         .max(1.0);
-    let mut sheet = pick_sheet(max_dim);
+    let forced = on.is_some();
+    let mut sheet = on.map_or_else(|| pick_sheet(max_dim), |(s, _)| s);
     let (mut scale, mut positions) = layout_four_view_gap(
         &sheet, extents[0], extents[1], extents[2], extents[3], angle, vgap, hgap,
     );
+    if let Some((_, cap)) = on {
+        if scale > cap {
+            scale = cap;
+            positions = place_four_view(
+                &sheet, extents[0], extents[1], extents[2], extents[3], scale, angle, vgap, hgap,
+            )
+            .positions;
+        }
+    }
     // Drafting practice: a part that would be reduced is drawn full size on a
-    // larger sheet when one up to two sizes up holds it at 1:1.
-    if scale < 1.0 {
+    // larger sheet when one holds it at 1:1 -- up to two sizes up for the
+    // part alone, and as far as A0 when it is the part's DIMENSIONS that need
+    // the room (a small part with forty dimensions does not fit the sheet its
+    // size alone would pick). When no sheet holds it at 1:1, the sheet that
+    // gives the largest scale is used (the smallest such sheet).
+    if scale < 1.0 && !forced {
+        let mut candidate = sheet;
+        let steps = if vgap > VGAP || hgap > HGAP { 4 } else { 2 };
+        for _ in 0..steps {
+            let Some(next) = larger_sheet(&candidate) else {
+                break;
+            };
+            let (s, p) = layout_four_view_gap(
+                &next, extents[0], extents[1], extents[2], extents[3], angle, vgap, hgap,
+            );
+            candidate = next;
+            if s > scale {
+                sheet = candidate;
+                scale = s;
+                positions = p;
+            }
+            if s >= 1.0 {
+                break;
+            }
+        }
+    }
+
+    // A small part whose dimensions need room is drawn ENLARGED: at 1:1 a
+    // 30 mm part with forty dimensions has its extension lines a millimetre
+    // apart. Up to two sheet sizes up, while the scale grows, until the main
+    // views are a legible size on paper.
+    if !forced && (vgap > VGAP || hgap > HGAP) && max_dim * scale < MIN_BUSY_VIEW_PAPER_MM {
         let mut candidate = sheet;
         for _ in 0..2 {
             let Some(next) = larger_sheet(&candidate) else {
@@ -1631,14 +2227,18 @@ pub fn standard_drawing_auto_with_projection(
                 &next, extents[0], extents[1], extents[2], extents[3], angle, vgap, hgap,
             );
             candidate = next;
-            if s >= 1.0 {
+            if s > scale {
                 sheet = candidate;
                 scale = s;
                 positions = p;
+            }
+            if max_dim * scale >= MIN_BUSY_VIEW_PAPER_MM {
                 break;
             }
         }
     }
+
+    let positions = room_for_left_lanes(&sheet, &extents, scale, positions, &left_bands);
 
     // Pass 2 — build the placed, scaled views.
     let t_p2 = std::time::Instant::now();
@@ -1691,8 +2291,8 @@ pub fn standard_drawing_auto_with_projection(
     // material-side qualifier (bore = concave cylindrical face) keeps the
     // part's own OD / boss faces out of the table.
     let t_tail = std::time::Instant::now();
-    let dims = extract_dimensions(model, solid_id);
-    let bore_faces = crate::readable::bore_face_ids(model, solid_id);
+    let dims = super::arcs::drafting_dimensions(model, solid_id);
+    let bore_faces = super::arcs::closed_bore_faces(model, solid_id);
     drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
     drawing.hole_features =
         super::hole_features::detect_hole_features(model, solid_id, drawing.round_part.as_ref());
@@ -1717,6 +2317,10 @@ pub fn standard_drawing_auto_with_projection(
     // bore pattern" with limits + provenance (and honestly refuse fabricated
     // limits for an unresolved ISO 286 fit class).
     attach_tolerances(model, solid_id, &mut drawing);
+
+    // Equal features are stated once with their count ("4× R5"): after the
+    // table and the tolerances, so a tabled or toleranced size heads no count.
+    count_equal_features(&mut drawing);
 
     // ── Pictorial isometric coexistence (A4 ReplaceIso) ───────────────────────
     // On A4, SECTION A-A replaced the ISO cell entirely — but the sheet must
@@ -2637,6 +3241,18 @@ fn attach_hole_table_from_dims(
         }
     }
 
+    // The table prints its numbers the way the dimensions do.
+    let unit = drawing.document_unit;
+    for site in &mut sites {
+        for label in [
+            &mut site.x_label,
+            &mut site.y_label,
+            &mut site.dia_label,
+            &mut site.depth_label,
+        ] {
+            *label = drafting_number_text(label, unit);
+        }
+    }
     drawing.hole_sites = sites;
 }
 
@@ -3668,6 +4284,426 @@ mod tests {
         }
     }
 
+    /// The hole table sits on other ink.
+    fn hole_table_collides(drawing: &super::super::types::Drawing) -> bool {
+        !drawing.hole_sites.is_empty()
+            && super::super::verify::verify_drawing(drawing)
+                .issues
+                .iter()
+                .any(|i| i.kind == super::super::verify::DrawingIssueKind::HoleTableCollision)
+    }
+
+    /// A hole table with no free paper on the sheet chosen for the views is
+    /// not printed across a view: the sheet goes up an ISO size at the SAME
+    /// scale and the table is placed clear. (A twelve-row table was printed
+    /// over a gear-pump body's FRONT view on its A3 sheet.)
+    ///
+    /// Mutation: return the first sheet from
+    /// `standard_drawing_auto_with_projection` without the retry -> the
+    /// table collides -> RED.
+    #[test]
+    fn a_hole_table_with_no_room_moves_the_sheet_up_not_onto_a_view() {
+        let mut m = BRepModel::new();
+        let cur = scattered_hole_plate(&mut m);
+        let angle = super::super::types::ProjectionAngle::Third;
+        let first = auto_sheet(&m, cur, uuid::Uuid::nil(), angle, None).expect("first sheet");
+        assert!(
+            first.hole_sites.len() >= 12,
+            "fixture: the holes are tabled, got {} rows",
+            first.hole_sites.len()
+        );
+        assert!(
+            hole_table_collides(&first),
+            "fixture: on {:?} the table has no free paper",
+            first.sheet_size
+        );
+        let d = standard_drawing_auto(&m, cur, uuid::Uuid::nil()).expect("sheet");
+        assert!(
+            !hole_table_collides(&d),
+            "the table is printed on other ink on {:?}",
+            d.sheet_size
+        );
+        assert_ne!(d.sheet_size, first.sheet_size, "a larger sheet");
+        assert!(
+            (d.views[0].scale - first.views[0].scale).abs() < 1e-12,
+            "the views keep their scale: {} vs {}",
+            d.views[0].scale,
+            first.views[0].scale
+        );
+    }
+
+    /// A sheet rebuilt on larger paper at the same scale does not redo the
+    /// hidden-line work: the edges a view sees depend on the part and the
+    /// direction only, not on the paper or where the view sits on it. Each
+    /// (view, occlusion) pair is computed once per drawing. (A gear-class part
+    /// went from 4.5 s to 30 s when every rebuild redrew all four views.)
+    ///
+    /// Mutation: drop the cache lookup in
+    /// `visibility::project_solid_edges_visibility_occ` -> a view computed twice
+    /// -> RED.
+    #[test]
+    fn a_sheet_rebuilt_larger_reuses_each_views_hidden_line_work() {
+        let mut m = BRepModel::new();
+        let cur = scattered_hole_plate(&mut m);
+        let first = auto_sheet(
+            &m,
+            cur,
+            uuid::Uuid::nil(),
+            super::super::types::ProjectionAngle::Third,
+            None,
+        )
+        .expect("first sheet");
+        super::super::visibility::reset_visibility_computations();
+        let d = standard_drawing_auto(&m, cur, uuid::Uuid::nil()).expect("sheet");
+        assert_ne!(
+            d.sheet_size, first.sheet_size,
+            "fixture: the sheet is rebuilt larger"
+        );
+        let computed = super::super::visibility::visibility_computations();
+        assert!(!computed.is_empty(), "the views were computed");
+        let mut seen = std::collections::HashSet::new();
+        for key in &computed {
+            assert!(
+                seen.insert(key.clone()),
+                "view {key:?} computed twice in one drawing: {computed:?}"
+            );
+        }
+    }
+
+    /// An 80 x 60 x 8 plate with 18 holes at irregular positions and sizes: no
+    /// two make a pattern, so every hole is its own hole-table row and the
+    /// table needs more paper than the views alone pick.
+    fn scattered_hole_plate(m: &mut BRepModel) -> SolidId {
+        let mut cur = sid(TopologyBuilder::new(m)
+            .create_box_3d(80.0, 60.0, 8.0)
+            .expect("plate"));
+        // Irregular positions and sizes: no two holes make a pattern, so every
+        // hole is a row of its own.
+        let holes: [(f64, f64, f64); 18] = [
+            (-34.0, -24.0, 1.5),
+            (-27.0, -9.0, 1.6),
+            (-31.0, 7.0, 1.7),
+            (-25.0, 22.0, 1.8),
+            (-16.0, -21.0, 1.9),
+            (-11.0, -3.0, 2.0),
+            (-14.0, 13.0, 2.1),
+            (-4.0, 24.0, 2.2),
+            (2.0, -17.0, 2.3),
+            (5.0, 4.0, 2.4),
+            (9.0, 15.0, 2.5),
+            (15.0, -25.0, 2.6),
+            (19.0, -8.0, 1.55),
+            (23.0, 9.0, 1.65),
+            (27.0, 23.0, 1.75),
+            (33.0, -15.0, 1.85),
+            (35.0, 1.0, 1.95),
+            (-21.0, 0.5, 2.05),
+        ];
+        for (x, y, r) in holes {
+            let hole = sid(TopologyBuilder::new(m)
+                .create_cylinder_3d(Point3::new(x, y, -10.0), Vector3::Z, r, 20.0)
+                .expect("hole"));
+            cur = crate::operations::boolean::boolean_operation(
+                m,
+                cur,
+                hole,
+                crate::operations::boolean::BooleanOp::Difference,
+                crate::operations::boolean::BooleanOptions::default(),
+            )
+            .expect("drill");
+        }
+        cur
+    }
+
+    /// The views move right together when the left column's lanes need
+    /// more paper than the centred arrangement leaves them, never further
+    /// than the paper the right side can spare, and not at all when they fit.
+    ///
+    /// Mutation: return `positions` unchanged from `room_for_left_lanes` ->
+    /// the lanes stay short of paper -> RED.
+    #[test]
+    fn the_views_move_right_to_make_room_for_the_left_lanes() {
+        use super::super::types::{SheetSize, ViewExtent};
+        let e = ViewExtent {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 50.0,
+            max_y: 40.0,
+        };
+        let extents = [e, e, e, e];
+        // A3 (420 wide, frame from x = 20 to 410). Left column at x 40..90,
+        // right column at 200..250: 20 mm left of the views, 120 spare on
+        // the right after the leader room.
+        let at = [[40.0, 100.0], [40.0, 200.0], [200.0, 100.0], [200.0, 200.0]];
+        let moved = room_for_left_lanes(&SheetSize::A3, &extents, 1.0, at, &[60.0, 30.0, 0.0]);
+        let shift = moved[0][0] - at[0][0];
+        assert!(
+            (shift - 41.0).abs() < 1e-9,
+            "60 mm of lanes + 1 of air: {shift}"
+        );
+        assert!(
+            moved
+                .iter()
+                .zip(at.iter())
+                .all(|(m, a)| (m[0] - a[0] - shift).abs() < 1e-12 && (m[1] - a[1]).abs() < 1e-12),
+            "all four move together, sideways only"
+        );
+        // Lanes that fit: nothing moves.
+        assert_eq!(
+            room_for_left_lanes(&SheetSize::A3, &extents, 1.0, at, &[10.0, 10.0, 0.0]),
+            at
+        );
+        // More than the right side can spare: only what it spares.
+        let wide = room_for_left_lanes(&SheetSize::A3, &extents, 1.0, at, &[400.0, 0.0, 0.0]);
+        assert!(
+            (wide[0][0] - at[0][0] - (410.0 - RIGHT_LEADER_ROOM_MM - 250.0)).abs() < 1e-9,
+            "{wide:?}"
+        );
+    }
+
+    /// Only a shortage of PAPER rebuilds the sheet larger: an unplaced
+    /// dimension or a hole table on other ink. Layout errors alone do not
+    /// (more paper does not move a view's own lanes, and every rebuild redraws
+    /// all four views: a gear-class part went past its 30 s budget).
+    ///
+    /// Mutation: count layout errors as a shortage of paper -> RED.
+    #[test]
+    fn only_a_shortage_of_paper_rebuilds_the_sheet_larger() {
+        assert!(short_of_paper((1, 0, 0)), "an unplaced dimension");
+        assert!(short_of_paper((0, 1, 1)), "a hole table on other ink");
+        assert!(!short_of_paper((0, 0, 4)), "line crossings alone");
+        assert!(!short_of_paper((0, 0, 0)), "a clean sheet");
+    }
+
+    /// `sheet_shortfall` counts a dimension the layout found no room for: the
+    /// automatic sheet steps up a size when a view's dimensions go unplaced
+    /// (CADGenBench 124: three locations not dimensioned at 1:1 on A2).
+    ///
+    /// Mutation: count no unplaced dimensions -> RED.
+    #[test]
+    fn a_dimension_with_no_room_is_a_shortfall_of_the_sheet() {
+        let mut m = BRepModel::new();
+        let part = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(40.0, 30.0, 20.0)
+            .expect("box"));
+        let mut d = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+        assert_eq!(sheet_shortfall(&d).0, 0, "a box's sheet places everything");
+        // FRONT blown up to fill the whole frame: no lane is left for it.
+        let front = d
+            .views
+            .iter_mut()
+            .find(|v| v.projection == ProjectionType::Front)
+            .expect("front");
+        assert!(
+            !front.dimensions.is_empty(),
+            "fixture: FRONT is dimensioned"
+        );
+        front.scale *= 40.0;
+        assert!(sheet_shortfall(&d).0 > 0, "FRONT's dimensions have no room");
+    }
+
+    /// A cone's angle is owed and drawn only where the cone is seen from the
+    /// side. Seen along its axis (TOP, for a Z-axis cone) the angle is
+    /// nowhere on the paper; it used to be printed at the view's centre.
+    ///
+    /// Mutation: make `shows_cone_angle` return true -> TOP carries the
+    /// angle -> RED.
+    #[test]
+    fn a_cone_angle_reads_only_where_the_cone_is_seen_from_the_side() {
+        let mut m = BRepModel::new();
+        let cone = sid(TopologyBuilder::new(&mut m)
+            .create_cone_3d(Point3::ORIGIN, Vector3::Z, 10.0, 5.0, 5.0)
+            .expect("cone"));
+        let angles = |p: ProjectionType| {
+            candidate_dimensions(&m, cone, p, 1.0)
+                .into_iter()
+                .filter(|d| d.kind == "angle")
+                .count()
+        };
+        assert_eq!(angles(ProjectionType::Top), 0, "end-on: no angle");
+        assert!(
+            angles(ProjectionType::Front) >= 1,
+            "side-on: the angle reads"
+        );
+        assert!(
+            angles(ProjectionType::Right) >= 1,
+            "side-on: the angle reads"
+        );
+    }
+
+    /// Two different locations of one view whose extension lines would land
+    /// within half a millimetre of each other on paper (CADGenBench 124: a
+    /// boss at Y 48.9 and a slot at Y 49.18, both in TOP at 1:1) are not
+    /// drawn on top of each other: one is stated in the other view that
+    /// reads it (RIGHT shows Y too). Neither is dropped.
+    ///
+    /// Mutation: make `crowds_a_kept_interval` return false -> both stay in
+    /// TOP -> RED.
+    #[test]
+    fn two_locations_whose_lines_coincide_are_stated_in_two_views() {
+        use super::super::types::{Drawing, SheetSize, ViewSource};
+        let mut m = BRepModel::new();
+        let part = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(60.0, 60.0, 20.0)
+            .expect("box"));
+        let src = ViewSource::Part {
+            part_id: uuid::Uuid::nil(),
+            solid_id: part,
+        };
+        let loc = |id: &str, face: u32, value: f64, a: [f64; 2], b: [f64; 2]| Dimension2d {
+            id: id.to_string(),
+            kind: "position".to_string(),
+            value,
+            unit: "mm".to_string(),
+            label: format!("{value}"),
+            a,
+            b,
+            entities: vec![face],
+            axis3: None,
+            dir3: Some([0.0, 1.0, 0.0]),
+            pid: None,
+            datum: None,
+            tolerance: None,
+            key: None,
+            members: Vec::new(),
+        };
+        let mut d = Drawing::new("t", SheetSize::A3);
+        let mut top = super::super::projection::project_solid_view(
+            &m,
+            src,
+            ProjectionType::Top,
+            "TOP",
+            [100.0, 200.0],
+            1.0,
+        )
+        .expect("top");
+        top.dimensions = vec![
+            loc("boss", 2, 48.9, [-30.0, -30.0], [-30.0, 18.9]),
+            loc("slot", 81, 49.18, [-30.0, -30.0], [-30.0, 19.18]),
+        ];
+        let mut right = super::super::projection::project_solid_view(
+            &m,
+            src,
+            ProjectionType::Right,
+            "RIGHT",
+            [300.0, 100.0],
+            1.0,
+        )
+        .expect("right");
+        right.dimensions = vec![
+            loc("boss", 2, 48.9, [-30.0, -10.0], [18.9, -10.0]),
+            loc("slot", 81, 49.18, [-30.0, -10.0], [19.18, -10.0]),
+        ];
+        d.add_view(top);
+        d.add_view(right);
+        dedup_dimensions_global(&mut d);
+        let ids = |i: usize| -> Vec<&str> {
+            d.views[i]
+                .dimensions
+                .iter()
+                .map(|x| x.id.as_str())
+                .collect()
+        };
+        assert_eq!(ids(0).len(), 1, "TOP keeps one: {:?}", ids(0));
+        assert_eq!(ids(1).len(), 1, "RIGHT states the other: {:?}", ids(1));
+        assert_ne!(ids(0), ids(1), "each stated once");
+    }
+
+    /// The isometric inks only the edges the viewer can see: on a box, nine
+    /// of its twelve -- the three meeting at the far corner are behind the
+    /// solid. It inked all twelve, hidden ones as solid lines through the
+    /// shading (an X-ray; found on the CADGenBench 124 sheet).
+    ///
+    /// Mutation: ink the hidden set in the isometric again -> 12 -> RED.
+    #[test]
+    fn the_isometric_inks_only_the_edges_that_can_be_seen() {
+        use super::super::types::ViewSource;
+        let mut m = BRepModel::new();
+        let part = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(40.0, 30.0, 20.0)
+            .expect("box"));
+        let src = ViewSource::Part {
+            part_id: uuid::Uuid::nil(),
+            solid_id: part,
+        };
+        let iso = hlr_view_geometry(
+            &m,
+            part,
+            src,
+            ProjectionType::Isometric,
+            "ISO",
+            [0.0, 0.0],
+            1.0,
+        )
+        .expect("iso");
+        assert_eq!(iso.polylines.len(), 9, "visible edges of a box in iso");
+        assert!(
+            iso.hidden_polylines.is_empty(),
+            "no hidden lines in the iso"
+        );
+    }
+
+    /// A cone standing on its axis is seen from the side by FRONT and RIGHT
+    /// alike; its angle is stated in ONE of them, and the sheet's quality
+    /// check finds no angle stated twice. Found on a benchmark sheet (a plate
+    /// whose two countersink cones read "2× ∠45°" above FRONT and again above
+    /// RIGHT: a RedundantDimension error, and the sheet refused for export).
+    ///
+    /// Mutation: exempt every angle from the cross-view pass again ->
+    /// FRONT and RIGHT both carry it -> RED.
+    #[test]
+    fn a_cone_angle_is_stated_in_one_view_not_every_view_that_sees_it() {
+        let mut m = BRepModel::new();
+        let cone = sid(TopologyBuilder::new(&mut m)
+            .create_cone_3d(Point3::ORIGIN, Vector3::Z, 10.0, 5.0, 5.0)
+            .expect("cone"));
+        let d = standard_drawing_auto(&m, cone, uuid::Uuid::new_v4()).expect("sheet");
+        let carrying: Vec<&str> = d
+            .views
+            .iter()
+            .filter(|v| v.dimensions.iter().any(|x| x.kind == "angle"))
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(carrying.len(), 1, "angle stated in {carrying:?}");
+        let q = super::super::verify::verify_drawing(&d);
+        assert!(
+            !q.has(super::super::verify::DrawingIssueKind::RedundantDimension),
+            "{:?}",
+            q.issues
+        );
+    }
+
+    /// [`drafting_number_text`] strips only FRACTIONAL trailing zeros (ISO
+    /// 129-1): an integer's zeros are its value (`100` stays `100`, `R20`
+    /// stays `R20`), a significant last place stays (`10.05`), a bare point
+    /// goes (`10.0` -> `10`), and an inch label keeps every place it states
+    /// (ASME Y14.5: the places are the tolerance).
+    ///
+    /// Mutation: trim trailing zeros from the whole number run instead of
+    /// from its fraction only -> `100` prints `1` -> RED.
+    #[test]
+    fn drafting_numbers_lose_only_fractional_trailing_zeros() {
+        use crate::units::LengthUnit;
+        let mm = LengthUnit::Millimetre;
+        for (given, want) in [
+            ("100", "100"),
+            ("100.00", "100"),
+            ("10.0", "10"),
+            ("0.50", "0.5"),
+            ("10.05", "10.05"),
+            ("0.00", "0"),
+            ("R20", "R20"),
+            ("R2.50", "R2.5"),
+            ("4\u{00D7} \u{00D8}6.60 THRU", "4\u{00D7} \u{00D8}6.6 THRU"),
+            ("0.50 \u{00D7} 45.00\u{00B0}", "0.5 \u{00D7} 45\u{00B0}"),
+            ("M10\u{00D7}1.25", "M10\u{00D7}1.25"),
+            ("THRU", "THRU"),
+        ] {
+            assert_eq!(drafting_number_text(given, mm), want, "{given:?}");
+        }
+        assert_eq!(drafting_number_text("2.500", LengthUnit::Inch), "2.500");
+    }
+
     /// [`overrun`] must NOT be `(need - have).max(0.0)`.
     ///
     /// `f64::max` returns the OTHER operand when one is NaN, so `.max(0.0)`
@@ -4010,12 +5046,13 @@ mod tests {
 
         let svg = crate::drawing::render_drawing_svg(&dwg);
         // The drawing carries ISO dimension lines (offset, with arrowheads)
-        // and the EXACT values — 40 / 30 / 20 each appear in the SVG ink.
+        // and the EXACT values — 40 / 30 / 20 each appear in the SVG ink,
+        // printed without trailing zeros (ISO 129-1).
         assert!(svg.contains("dim-line"), "dimension lines rendered");
         assert!(svg.contains("dim-arrow"), "dimension arrowheads rendered");
-        assert!(svg.contains("40.00"), "40mm extent value drawn");
-        assert!(svg.contains("30.00"), "30mm extent value drawn");
-        assert!(svg.contains("20.00"), "20mm extent value drawn");
+        assert!(svg.contains(">40<"), "40mm extent value drawn");
+        assert!(svg.contains(">30<"), "30mm extent value drawn");
+        assert!(svg.contains(">20<"), "20mm extent value drawn");
     }
 
     #[test]

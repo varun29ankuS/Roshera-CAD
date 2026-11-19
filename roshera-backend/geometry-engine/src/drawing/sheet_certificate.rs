@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use crate::primitives::persistent_id::PersistentId;
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
-use crate::readable::{extract_dimensions, DatumDescriptor, DimensionRecord};
+use crate::readable::{DatumDescriptor, DimensionRecord};
 
 use super::hole_table::{HoleSite, UNKNOWN_DEPTH_LABEL};
 use super::section_comprehension::{section_cut_through, SectionCutKind, SectionCutThrough};
@@ -100,6 +100,16 @@ pub enum SheetVerdict {
     /// model against the ink. A drawing that silently drops a bore is not a
     /// faithful snapshot, so an omission makes the sheet unsound.
     Omitted,
+    /// The model has this DIMENSION and no view of the sheet states it: the
+    /// automatic selection thinned it, the layout did not draw it, or it is
+    /// simply not there ([`super::completeness`]). Everything the sheet does
+    /// show can still be true, so this does not make the sheet unsound; it
+    /// makes it NOT COMPLETE ([`SheetReadbackCertificate::complete`]).
+    NotDimensioned,
+    /// A dimension the model has, taken off the sheet by a named person
+    /// ([`super::dimension_edit::Waiver`]). Listed, with the name; the sheet
+    /// stays complete because the gap is signed for.
+    Waived,
 }
 
 impl SheetVerdict {
@@ -112,6 +122,8 @@ impl SheetVerdict {
             SheetVerdict::RenderOnly => "render_only",
             SheetVerdict::Unprovenanced => "unprovenanced",
             SheetVerdict::Omitted => "omitted",
+            SheetVerdict::NotDimensioned => "not_dimensioned",
+            SheetVerdict::Waived => "waived",
         }
     }
 }
@@ -228,6 +240,12 @@ pub struct VerdictCounts {
     /// `serde(default)` keeps pre-Task-17 certificates deserializing.
     #[serde(default)]
     pub omitted: usize,
+    /// Model dimensions no view states (not waived).
+    #[serde(default)]
+    pub not_dimensioned: usize,
+    /// Model dimensions a named person took off the sheet.
+    #[serde(default)]
+    pub waived: usize,
 }
 
 impl VerdictCounts {
@@ -241,6 +259,8 @@ impl VerdictCounts {
                 SheetVerdict::RenderOnly => c.render_only += 1,
                 SheetVerdict::Unprovenanced => c.unprovenanced += 1,
                 SheetVerdict::Omitted => c.omitted += 1,
+                SheetVerdict::NotDimensioned => c.not_dimensioned += 1,
+                SheetVerdict::Waived => c.waived += 1,
             }
         }
         c
@@ -282,6 +302,26 @@ pub struct SheetReadbackCertificate {
     /// `render_only` / `unprovenanced` facts still do not make a sheet unsound:
     /// they are honest absences, not lies.
     pub sound: bool,
+    /// True when the sheet leaves nothing out unsigned: no bore without a
+    /// row or callout (`omitted`) and no model dimension that no view states
+    /// (`not_dimensioned`). A dimension a named person suppressed (`waived`)
+    /// does not break it -- it is listed in [`Self::omissions`] with the name.
+    ///
+    /// `sound` says what the sheet shows is true; `complete` says it shows
+    /// everything. A sheet can be sound and not complete: the automatic
+    /// sheet may find no room for a dimension, or a person may take one off
+    /// the stored sheet, and every dimension so left out is counted here.
+    /// `serde(default)` reads an older certificate as not complete.
+    #[serde(default)]
+    pub complete: bool,
+    /// Every model dimension no view of the sheet states, waived or not,
+    /// with the view it would read in, the reason and the waiver.
+    #[serde(default)]
+    pub omissions: Vec<super::completeness::DimensionOmission>,
+    /// The un-waived omissions in words, one line per view and kind:
+    /// `"3 angles not dimensioned on FRONT"`.
+    #[serde(default)]
+    pub omission_summary: Vec<String>,
     /// The layout-quality report (the existing 2D perception oracle), embedded
     /// so one certificate covers readability + truth.
     pub quality: DrawingQualityReport,
@@ -852,15 +892,94 @@ fn omitted_bore_facts(
     drawing: &Drawing,
     live_dims: &[DimensionRecord],
 ) -> Vec<SheetFact> {
-    use std::collections::HashSet;
-
     let Some(solid) = solid_id else {
         return Vec::new();
     };
-    let live_bores = crate::readable::bore_face_ids(model, solid);
+    let live_bores = super::arcs::closed_bore_faces(model, solid);
     if live_bores.is_empty() {
         return Vec::new();
     }
+    let tabled = stated_bore_faces(drawing);
+
+    let mut out = Vec::new();
+    for d in live_dims {
+        if d.kind != "diameter" || d.entities.is_empty() {
+            continue;
+        }
+        // Bores only — a boss or the part silhouette is not a missing hole.
+        if !d.entities.iter().any(|e| live_bores.contains(e)) {
+            continue;
+        }
+        // The sheet already carries a row naming one of these faces.
+        if d.entities.iter().any(|e| tabled.contains(e)) {
+            continue;
+        }
+        out.push(SheetFact {
+            kind: SheetFactKind::Omitted,
+            owner_view: drawing.axial_view_idx,
+            label: format!("bore {} on the model has no hole-table row", d.label),
+            value: Some(d.value),
+            unit: d.unit.clone(),
+            pid: d.pid.clone(),
+            face_ids: d.entities.clone(),
+            datum: None,
+            tolerance: None,
+            live: LiveCheck {
+                measured: Some(d.value),
+                deviation: None,
+                verdict: SheetVerdict::Omitted,
+                detail: None,
+            },
+        });
+    }
+    out
+}
+
+/// Re-measure a counted callout ("4× R5"): every feature it speaks for must
+/// still be on the live model, of the callout's kind and at its value. One
+/// that is gone, or no longer equal, makes the count a false statement, and
+/// the fact reads `stale` naming how many the model really has. (A feature
+/// the model has BEYOND the count is found from the other side: it is a
+/// dimension no view states, an omission.)
+fn counted_members_check(
+    dim: &super::dimensioning::Dimension2d,
+    live: &HashMap<String, (String, f64)>,
+    check: &mut LiveCheck,
+) {
+    let stated = dim.members.len();
+    if stated < 2 {
+        return;
+    }
+    let still_equal = dim
+        .members
+        .iter()
+        .filter(|m| {
+            live.get(*m).is_some_and(|(kind, value)| {
+                *kind == dim.kind && (value - dim.value).abs() <= CERT_DIM_ORACLE_MM
+            })
+        })
+        .count();
+    if still_equal == stated {
+        return;
+    }
+    if matches!(
+        check.verdict,
+        SheetVerdict::Consistent | SheetVerdict::Unprovenanced
+    ) {
+        check.verdict = SheetVerdict::Stale;
+    }
+    let finding =
+        format!("count: the sheet states {stated}\u{00D7}, the model has {still_equal} equal");
+    check.detail = Some(match check.detail.take() {
+        Some(d) => format!("{d}; {finding}"),
+        None => finding,
+    });
+}
+
+/// The bore faces the sheet STATES: by a hole-table row, or by a hole callout
+/// that is on a view.
+pub(crate) fn stated_bore_faces(drawing: &Drawing) -> std::collections::HashSet<u32> {
+    use std::collections::HashSet;
     // "Stated" means INKED. Bores a callout covers (bolt circle, coaxial bore,
     // hole pattern) get no drawn table row -- their `hole_sites` entries stay
     // as data underneath -- so for those faces only a callout DIMENSION that
@@ -906,39 +1025,7 @@ fn omitted_bore_facts(
             .collect();
         tabled.extend(stated.into_iter().flatten());
     }
-
-    let mut out = Vec::new();
-    for d in live_dims {
-        if d.kind != "diameter" || d.entities.is_empty() {
-            continue;
-        }
-        // Bores only — a boss or the part silhouette is not a missing hole.
-        if !d.entities.iter().any(|e| live_bores.contains(e)) {
-            continue;
-        }
-        // The sheet already carries a row naming one of these faces.
-        if d.entities.iter().any(|e| tabled.contains(e)) {
-            continue;
-        }
-        out.push(SheetFact {
-            kind: SheetFactKind::Omitted,
-            owner_view: drawing.axial_view_idx,
-            label: format!("bore {} on the model has no hole-table row", d.label),
-            value: Some(d.value),
-            unit: d.unit.clone(),
-            pid: d.pid.clone(),
-            face_ids: d.entities.clone(),
-            datum: None,
-            tolerance: None,
-            live: LiveCheck {
-                measured: Some(d.value),
-                deviation: None,
-                verdict: SheetVerdict::Omitted,
-                detail: None,
-            },
-        });
-    }
-    out
+    tabled
 }
 
 /// Certify a drawing sheet against the LIVE model: build one [`SheetFact`] per
@@ -949,6 +1036,29 @@ fn omitted_bore_facts(
 /// surface reads, never tessellation), PID resolution is O(1) hashmap lookups,
 /// and the section re-cut is a single analytic plane∩solid pass.
 pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCertificate {
+    // A sheet drawn in a part frame (assembly placement undone, or the part
+    // squared) states every size, position and cutting plane in THAT frame.
+    // Re-measure the live model moved by the same rigid move, never the live
+    // model as it sits: an overall extent of a turned part is a different
+    // number along the world axes, and reading it there would report a true
+    // sheet stale.
+    if let Some(frame) = &drawing.drawn_frame {
+        let solid_id = drawing.views.first().map(|v| match v.source {
+            ViewSource::Part { solid_id, .. } => solid_id,
+        });
+        if let Some(framed) =
+            solid_id.and_then(|s| super::part_frame::model_in_drawn_frame(model, s, frame))
+        {
+            return certify_drawing_in_frame(&framed, drawing);
+        }
+        // The solid is gone or could not be moved: certify where it is. Every
+        // frame-dependent fact then reads stale -- reported, never hidden.
+    }
+    certify_drawing_in_frame(model, drawing)
+}
+
+/// [`certify_drawing`] against a model already in the sheet's frame.
+fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCertificate {
     let quality = verify_drawing(drawing);
 
     // Resolve the drawn solid from the first Part view.
@@ -958,7 +1068,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
 
     // Re-measure the analytic dimension table ONCE.
     let live_dims: Vec<DimensionRecord> = solid_id
-        .map(|s| extract_dimensions(model, s))
+        .map(|s| super::arcs::drafting_dimensions(model, s))
         .unwrap_or_default();
     let mut live_by_pid: HashMap<String, f64> = HashMap::new();
     for d in &live_dims {
@@ -967,22 +1077,58 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
         }
     }
 
+    // What a counted callout's members are re-measured against: the table
+    // the sheet's views are built from, by the identity each member is
+    // recorded under. Built only when the sheet counts something.
+    let counts_something = drawing
+        .views
+        .iter()
+        .flat_map(|v| v.dimensions.iter())
+        .any(|d| d.members.len() > 1);
+    let live_members: HashMap<String, (String, f64)> = match solid_id {
+        Some(s) if counts_something => super::dimensioning::convention_records(model, s)
+            .iter()
+            .map(|r| {
+                (
+                    super::dimensioning::record_identity(r),
+                    (r.kind.clone(), r.value),
+                )
+            })
+            .collect(),
+        _ => HashMap::new(),
+    };
+
     let mut facts: Vec<SheetFact> = Vec::new();
 
     // ── Per-view facts ────────────────────────────────────────────────────────
     for (vi, view) in drawing.views.iter().enumerate() {
         for dim in &view.dimensions {
-            let live = dimension_live_check(&dim.pid, dim.value, &live_by_pid);
+            let edit = dim
+                .key
+                .as_ref()
+                .and_then(|k| drawing.dimension_edits.get(k));
+            // A suppressed dimension is not ink: the live-side walk below
+            // reports it as a waived omission.
+            if edit.is_some_and(|e| e.suppressed.is_some()) {
+                continue;
+            }
+            // The fact states the dimension AS INKED -- measured value plus
+            // the tolerance and text authored on it -- from the same function
+            // the layout and every renderer ink it with.
+            let ink = super::dimension_edit::dimension_ink(dim, edit, drawing.document_unit);
+            let mut live = dimension_live_check(&dim.pid, dim.value, &live_by_pid);
+            dimension_ink_check(model, dim, edit, &ink, &mut live);
+            counted_members_check(dim, &live_members, &mut live);
             facts.push(SheetFact {
                 kind: SheetFactKind::Dimension,
                 owner_view: Some(vi),
-                label: dim.label.clone(),
+                label: ink.label.clone(),
                 value: Some(dim.value),
                 unit: dim.unit.clone(),
                 pid: dim.pid.clone(),
                 face_ids: dim.entities.clone(),
                 datum: dim.datum.clone(),
-                tolerance: dim.tolerance.clone(),
+                tolerance: ink.tolerance.clone().or_else(|| dim.tolerance.clone()),
                 live,
             });
         }
@@ -1034,7 +1180,12 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
         facts.push(SheetFact {
             kind: SheetFactKind::Hole,
             owner_view: drawing.axial_view_idx,
-            label: format!("{} {}", hole.tag, hole.dia_label),
+            // As inked: the row's size cell with the bore's tolerance.
+            label: format!(
+                "{} {}",
+                hole.tag,
+                super::dimension_edit::hole_row_ink(drawing, hole)
+            ),
             value: Some(hole.diameter_mm),
             unit: "mm".to_string(),
             pid: None,
@@ -1208,9 +1359,119 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
         section_cuts = ct;
     }
 
+    // ── Edits whose dimension is gone ─────────────────────────────────────────
+    // A tolerance, text or move authored on a dimension the sheet no longer
+    // carries (its feature was consumed, the part was re-imported) is
+    // reported, never moved to another dimension. A bare suppression is the
+    // exception: it waives a dimension that is, by definition, not on the
+    // sheet, and the omission walk below accounts for it.
+    {
+        let on_sheet: std::collections::HashSet<&str> = drawing
+            .views
+            .iter()
+            .flat_map(|v| v.dimensions.iter())
+            .filter_map(|d| d.key.as_deref())
+            .collect();
+        for (key, edit) in &drawing.dimension_edits {
+            if on_sheet.contains(key.as_str()) {
+                continue;
+            }
+            let only_waiver = edit.suppressed.is_some()
+                && edit.tolerance.is_none()
+                && edit.prefix.is_empty()
+                && edit.suffix.is_empty();
+            if only_waiver {
+                continue;
+            }
+            let mut what: Vec<String> = Vec::new();
+            if let Some(t) = &edit.tolerance {
+                what.push(format!("a {} tolerance", t.kind()));
+            }
+            if !edit.prefix.is_empty() || !edit.suffix.is_empty() {
+                what.push(format!(
+                    "the text '{}'",
+                    [edit.prefix.as_str(), edit.suffix.as_str()]
+                        .iter()
+                        .filter(|t| !t.is_empty())
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(" ... ")
+                ));
+            }
+            if edit.text_shift_mm.is_some() {
+                what.push("a move".to_string());
+            }
+            facts.push(SheetFact {
+                kind: SheetFactKind::Dimension,
+                owner_view: None,
+                label: format!(
+                    "{} authored on a dimension that is no longer on the sheet",
+                    what.join(" and ")
+                ),
+                value: None,
+                unit: String::new(),
+                pid: Some(key.clone()),
+                face_ids: Vec::new(),
+                datum: None,
+                tolerance: None,
+                live: LiveCheck {
+                    measured: None,
+                    deviation: None,
+                    verdict: SheetVerdict::Dangling,
+                    detail: Some(
+                        "the dimension this was authored on is gone; it is not moved to \
+                         another one. Clear the edit, or author it again on the new dimension"
+                            .to_string(),
+                    ),
+                },
+            });
+        }
+    }
+
     // ── LIVE-SIDE WALK: what the model has and the sheet does not ─────────────
     facts.extend(omitted_bore_facts(solid_id, model, drawing, &live_dims));
     facts.extend(gdt_live_side_facts(solid_id, model, drawing));
+    // Every model dimension no view states: thinned by the automatic
+    // selection, not drawn by the layout, or suppressed by a named person.
+    let omissions = super::completeness::dimension_omissions(model, drawing);
+    for o in &omissions {
+        let (verdict, label, detail) = match &o.waiver {
+            Some(w) => (
+                SheetVerdict::Waived,
+                format!(
+                    "{} not dimensioned on {}: suppressed by {}",
+                    o.label, o.view, w.by
+                ),
+                Some(if w.reason.trim().is_empty() {
+                    format!("suppressed by {}", w.by)
+                } else {
+                    format!("suppressed by {}: {}", w.by, w.reason.trim())
+                }),
+            ),
+            None => (
+                SheetVerdict::NotDimensioned,
+                format!("{} not dimensioned on {}", o.label, o.view),
+                Some(o.reason.text().to_string()),
+            ),
+        };
+        facts.push(SheetFact {
+            kind: SheetFactKind::Omitted,
+            owner_view: o.owner_view,
+            label,
+            value: Some(o.value),
+            unit: o.unit.clone(),
+            pid: o.pid.clone(),
+            face_ids: o.entities.clone(),
+            datum: None,
+            tolerance: None,
+            live: LiveCheck {
+                measured: Some(o.value),
+                deviation: None,
+                verdict,
+                detail,
+            },
+        });
+    }
 
     // ── Structured note: document unit + general tolerance ────────────────────
     {
@@ -1260,12 +1521,121 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
 
     let counts = VerdictCounts::tally(&facts);
     let sound = counts.stale == 0 && counts.dangling == 0 && counts.omitted == 0;
+    let complete = counts.omitted == 0 && counts.not_dimensioned == 0;
+    let omission_summary = super::completeness::omission_summary(&omissions);
     SheetReadbackCertificate {
         facts,
         counts,
         sound,
+        complete,
+        omissions,
+        omission_summary,
         quality,
         section_cuts,
+    }
+}
+
+/// The INK check of a dimension's authored content, written into `live`.
+///
+/// The measured value is checked by [`dimension_live_check`]; this checks
+/// what stands beside it:
+///
+/// * a tolerance joined from the feature's size annotation (the GD&T
+///   sidecar) is a SNAPSHOT on the sheet. It is compared with the annotation
+///   the model carries now; a tolerance edited or removed on the model after
+///   the sheet was built makes the fact `stale`, naming both;
+/// * an ISO 286 class that does not resolve at the measured size is inked
+///   without limits, and the fact is `stale` saying why (no limits are
+///   invented);
+/// * authored text is listed as not verified.
+///
+/// A verdict that is already worse than `consistent` is kept; only the
+/// detail is added to.
+fn dimension_ink_check(
+    model: &BRepModel,
+    dim: &super::dimensioning::Dimension2d,
+    edit: Option<&super::dimension_edit::DimensionEdit>,
+    ink: &super::dimension_edit::DimInk,
+    live: &mut LiveCheck,
+) {
+    use crate::gdt::model::{Annotation, ToleranceBound};
+    let mut notes: Vec<String> = Vec::new();
+    let mut stale = false;
+
+    // The feature tolerance is what is inked only when no tolerance is
+    // authored on the dimension itself.
+    let inks_feature_tolerance = edit.and_then(|e| e.tolerance.as_ref()).is_none();
+    if let (true, Some(sheet)) = (inks_feature_tolerance, &dim.tolerance) {
+        let live_annotation = sheet
+            .feature_pid
+            .as_deref()
+            .and_then(parse_pid)
+            .and_then(|pid| model.gdt.annotations(pid).get(sheet.annotation_index))
+            .and_then(|a| match a {
+                Annotation::Dimensional(dt) => Some(dt),
+                _ => None,
+            });
+        match live_annotation {
+            None => {
+                stale = true;
+                notes.push(format!(
+                    "tolerance: the sheet inks '{}', the model no longer carries it",
+                    ink.label
+                ));
+            }
+            Some(dt) => {
+                let (kind, designation) = match &dt.bound {
+                    ToleranceBound::PlusMinus { .. } => ("plus_minus", None),
+                    ToleranceBound::Limits { .. } => ("limits", None),
+                    ToleranceBound::Fit(fc) => ("fit", Some(fc.designation.clone())),
+                };
+                let now = dt.limit_range().map(|(lo, hi)| [lo, hi]);
+                let same_limits = match (sheet.limits, now) {
+                    (Some(a), Some(b)) => (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if kind != sheet.kind
+                    || designation != sheet.designation
+                    || !same_limits
+                    || (dt.nominal - sheet.nominal).abs() > 1e-9
+                {
+                    stale = true;
+                    let show = |l: Option<[f64; 2]>| match l {
+                        Some([lo, hi]) => format!("{lo:.4}..{hi:.4}"),
+                        None => "no limits".to_string(),
+                    };
+                    notes.push(format!(
+                        "tolerance: the sheet inks '{}' (limits {}), the model now has {}",
+                        ink.label,
+                        show(sheet.limits),
+                        show(now)
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(why) = &ink.unresolved {
+        stale = true;
+        notes.push(format!("tolerance: {why}"));
+    }
+    if !ink.authored.is_empty() {
+        notes.push(format!(
+            "authored text, not verified: {}",
+            ink.authored
+                .iter()
+                .map(|t| format!("'{t}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if stale && live.verdict == SheetVerdict::Consistent {
+        live.verdict = SheetVerdict::Stale;
+    }
+    if !notes.is_empty() {
+        let mut all: Vec<String> = live.detail.take().into_iter().collect();
+        all.extend(notes);
+        live.detail = Some(all.join("; "));
     }
 }
 
@@ -1626,9 +1996,9 @@ mod tests {
         assert!(hole_fact.tolerance.as_ref().unwrap().limits.is_some());
     }
 
-    /// An ISO 286 `H7` FIT class must answer *designation without limits* — the
-    /// numeric envelope is NOT fabricated (the honesty pass-through of
-    /// `DimensionalTolerance::limit_range`).
+    /// An ISO 286 FIT class outside the tabulated set must answer *designation
+    /// without limits* — the numeric envelope is NOT fabricated (the honesty
+    /// pass-through of `DimensionalTolerance::limit_range`).
     #[test]
     fn fit_class_tolerance_refuses_fabricated_limits() {
         use crate::drawing::dimensioning::standard_drawing_auto;
@@ -1637,7 +2007,7 @@ mod tests {
         let (mut m, part, _bore_fid, pid) = bored_plate_with_bore_pid();
         m.gdt.attach(
             pid,
-            Annotation::Dimensional(DimensionalTolerance::fit(10.0, "H7")),
+            Annotation::Dimensional(DimensionalTolerance::fit(10.0, "za6")),
         );
         let drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
 
@@ -1650,7 +2020,7 @@ mod tests {
         assert_eq!(tref.kind, "fit");
         assert_eq!(
             tref.designation.as_deref(),
-            Some("H7"),
+            Some("za6"),
             "fit designation is disclosed: {tref:?}"
         );
         assert!(
@@ -1983,10 +2353,14 @@ mod tests {
             "the dropped bore must appear in the section cut with no tag: {ct:?}"
         );
 
+        // The BORE omissions (verdict `omitted`). The same kind also carries
+        // the dimensions no view states (`not_dimensioned`): with its row
+        // gone, the bore's location and depth are among those, and they are
+        // counted separately.
         let omitted: Vec<&SheetFact> = cert
             .facts
             .iter()
-            .filter(|f| f.kind == SheetFactKind::Omitted)
+            .filter(|f| f.kind == SheetFactKind::Omitted && f.live.verdict == SheetVerdict::Omitted)
             .collect();
         assert!(
             omitted.iter().any(|f| {

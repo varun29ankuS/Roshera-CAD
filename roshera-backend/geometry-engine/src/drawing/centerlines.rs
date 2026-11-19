@@ -118,6 +118,15 @@ pub fn centerlines(
     };
     let vm = view_matrix_for_projection(projection);
     let mut cands: Vec<Centerline> = Vec::new();
+    // A corner round or a pocket corner (an arc of half a turn or less) is
+    // not a hole or a shaft: it gets no centre mark and no axis line. Drawn
+    // for every cylindrical face, the marks of a part's large blend radii
+    // ran far outside its outline.
+    let arcs: std::collections::HashSet<u32> = super::arcs::cylinder_walls(model, solid_id)
+        .into_iter()
+        .filter(|w| w.is_radius())
+        .flat_map(|w| w.faces)
+        .collect();
 
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
@@ -128,6 +137,9 @@ pub fn centerlines(
             None => continue,
         };
         for &fid in &shell.faces {
+            if arcs.contains(&fid) {
+                continue;
+            }
             let face = match model.faces.get(fid) {
                 Some(f) => f,
                 None => continue,

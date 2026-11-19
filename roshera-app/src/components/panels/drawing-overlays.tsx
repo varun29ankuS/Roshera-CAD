@@ -221,10 +221,13 @@ export function SheetActions({
   titleBlockOpen,
   onToggleTitleBlock,
   onDownload,
+  onPickDimension,
 }: {
   projection: ProjectionAngle
   projectionBusy: boolean
   onProjection: (p: ProjectionAngle) => void
+  /** Annotate > tolerance / text / suppress: the engineer picks a dimension next. */
+  onPickDimension: () => void
   titleBlockOpen: boolean
   onToggleTitleBlock: () => void
   onDownload: (f: DrawingFormat) => void
@@ -260,7 +263,7 @@ export function SheetActions({
           </button>
         ))}
       </div>
-      <AnnotateMenu />
+      <AnnotateMenu onPickDimension={onPickDimension} />
       <button
         type="button"
         onClick={onToggleTitleBlock}
@@ -314,12 +317,36 @@ export function SheetActions({
  * it from the sheet today. An item is enabled only when a drawing route
  * places that annotation on this sheet AND records it in the history (so
  * Ctrl+Z and a restart keep it). `why` says, in a drafter's words, what is
- * there instead. Surveyed against `api-server/src/main.rs` (the
- * `/api/drawings/...` routes) and `drawing/types.rs`: there is no route that
- * adds a note, dimension, centre mark, datum flag, feature control frame or
- * surface-finish symbol to a sheet, so none is enabled; none is faked.
+ * there instead.
+ *
+ * Enabled: what `PATCH /api/drawings/{id}/dimensions/{dim}` records on a
+ * dimension that is already on the sheet -- a tolerance or fit, text before
+ * and after the value, a move, a signed suppression. Each of those starts by
+ * picking the dimension, so the item arms that pick.
+ *
+ * Not enabled (no route adds them to a sheet; none is faked): a new
+ * dimension, a note, a centre mark, a datum flag, a feature control frame, a
+ * surface-finish symbol.
  */
-const ANNOTATIONS: { key: string; label: string; why: string }[] = [
+const ANNOTATIONS: { key: string; label: string; why: string; enabled?: boolean }[] = [
+  {
+    key: 'tolerance',
+    label: 'Tolerance / fit',
+    why: 'Click a dimension, then set ±, two deviations, limits, an ISO 286 fit (H7, g6), basic or reference.',
+    enabled: true,
+  },
+  {
+    key: 'dimension-text',
+    label: 'Dimension text',
+    why: 'Click a dimension, then write before or after its value: 4X, TYP, THRU, a thread such as M12x1.75-6H.',
+    enabled: true,
+  },
+  {
+    key: 'suppress',
+    label: 'Move or suppress a dimension',
+    why: 'Drag a dimension to move it. Click it to take it off the sheet on your name; the certificate lists it as waived.',
+    enabled: true,
+  },
   {
     key: 'note',
     label: 'Note',
@@ -327,8 +354,8 @@ const ANNOTATIONS: { key: string; label: string; why: string }[] = [
   },
   {
     key: 'dimension',
-    label: 'Dimension',
-    why: 'Dimensions are placed by the kernel from the part. Click one to change the part; adding one is not available yet.',
+    label: 'New dimension',
+    why: 'Dimensions are placed by the kernel from the part; adding one by picking edges is not available yet.',
   },
   {
     key: 'centre',
@@ -352,7 +379,7 @@ const ANNOTATIONS: { key: string; label: string; why: string }[] = [
   },
 ]
 
-export function AnnotateMenu() {
+export function AnnotateMenu({ onPickDimension }: { onPickDimension: () => void }) {
   const [open, setOpen] = useState(false)
   const close = useCallback(() => setOpen(false), [])
   const ref = useDismiss(open, close)
@@ -370,7 +397,22 @@ export function AnnotateMenu() {
       </button>
       {open && (
         <div role="menu" aria-label="Annotate" className={`${card} absolute right-0 mt-1 w-72 py-1 text-xs`}>
-          {ANNOTATIONS.map((a) => (
+          {ANNOTATIONS.map((a) =>
+            a.enabled ? (
+              <button
+                key={a.key}
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setOpen(false)
+                  onPickDimension()
+                }}
+                className="cad-focus block w-full px-3 py-1.5 text-left hover:bg-accent/20"
+              >
+                <div>{a.label}</div>
+                <div className="text-[11px] leading-snug text-muted-foreground">{a.why}</div>
+              </button>
+            ) : (
             // Not a disabled <button>: browsers drop the tooltip on one, and
             // the reason is what the engineer needs, so it is shown in the row.
             <div
@@ -383,7 +425,8 @@ export function AnnotateMenu() {
               <div className="text-muted-foreground">{a.label}</div>
               <div className="text-[11px] leading-snug text-muted-foreground/80">{a.why}</div>
             </div>
-          ))}
+            ),
+          )}
         </div>
       )}
     </div>
@@ -644,7 +687,10 @@ export function SheetHint() {
   })
   if (!show) return null
   return (
-    <div className={`${card} absolute top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 px-3 py-1.5 text-xs`}>
+    // Bottom centre: the top edge belongs to the sheet's own actions
+    // (projection, Annotate, Title block, Download), which this hint ran
+    // under on a normal-width screen (found rehearsing the demo, 2026-11-18).
+    <div className={`${card} absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex max-w-[min(42rem,calc(100%-24rem))] items-center gap-2 px-3 py-1.5 text-xs`}>
       <span>
         Click a dimension to change the part · click a view, then drag it to move it · drag the
         sheet to pan

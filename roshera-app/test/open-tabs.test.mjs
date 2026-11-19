@@ -1,4 +1,4 @@
-﻿// Run: node --experimental-strip-types --test test/open-tabs.test.mjs
+// Run: node --experimental-strip-types --test test/open-tabs.test.mjs
 //
 // Varun (2026-11-18): "there are few 10's of tabs open". The tab strip showed
 // EVERY document ever made (33 on this server) except the ones closed in that

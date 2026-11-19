@@ -289,15 +289,15 @@ fn datum_referenced_characteristic_is_not_falsely_passed() {
 
 #[test]
 fn fit_class_dimension_is_not_verified() {
-    // A fit class (H7) has no resolved numeric envelope this phase → honest
-    // NotYetVerified, not a pass.
+    // A fit class outside the ISO 286 tables (za6) has no resolved numeric
+    // envelope → honest NotYetVerified, not a pass.
     let mut model = BRepModel::new();
     let solid = build_cylinder(&mut model, 5.0, 30.0);
     let face = first_face_of_kind(&model, solid, "Cylinder");
 
     model.attach_face_annotation(
         face,
-        Annotation::Dimensional(DimensionalTolerance::fit(10.0, "H7")),
+        Annotation::Dimensional(DimensionalTolerance::fit(10.0, "za6")),
     );
     let r = &model.verify_face_conformance(face)[0];
     assert_eq!(

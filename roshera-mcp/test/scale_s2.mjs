@@ -128,8 +128,11 @@ const table = buildTable();
   // "core") -- the agent reads the Kernel Lens journal.
   // 118 -> 119 (2026-11-17): user_context (kernel, "core") -- the agent reads
   // what the person hovers and has selected (GET /api/agent/user-context).
-  if (table.size === 119) pass("table holds 119 tools (114 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 119`);
+  // 119 -> 122 (2026-11-18): drawing_dimensions + drawing_dimension_properties
+  // + iso286_limits (kernel, "drawing") -- an agent reads and annotates a
+  // sheet's dimensions exactly as a person does in the drawing tab.
+  if (table.size === 122) pass("table holds 122 tools (117 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 122`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -159,8 +162,10 @@ const table = buildTable();
   // 109 -> 111 (2026-11-11): drawing_set_dimension + drawing_set_projection.
   // 113 -> 115 (2026-11-15): lens_explain + lens_why_not_sound.
   // 115 -> 116 (2026-11-17): user_context.
-  if (full.length === 116) pass("full surface exposes exactly 116 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 116`);
+  // 116 -> 119 (2026-11-18): drawing_dimensions + drawing_dimension_properties
+  // + iso286_limits.
+  if (full.length === 119) pass("full surface exposes exactly 119 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 119`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");

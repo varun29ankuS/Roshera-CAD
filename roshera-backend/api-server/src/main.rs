@@ -40,6 +40,7 @@ mod change_ledger;
 mod csketch;
 mod documents;
 mod documents_tests;
+mod drawing_annotate;
 mod drawing_edit;
 mod drawing_mgr;
 #[cfg(test)]
@@ -11394,9 +11395,16 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route("/api/drawings/{id}/views", post(drawing_mgr::add_view))
         .route(
-            "/api/drawings/{id}/dimensions/{dim_id}",
-            post(drawing_edit::edit_dimension),
+            "/api/drawings/{id}/dimensions",
+            get(drawing_annotate::list_dimensions),
         )
+        .route(
+            "/api/drawings/{id}/dimensions/{dim_id}",
+            // POST changes the PART (the value); PATCH annotates the SHEET
+            // (tolerance, text, move, suppress).
+            post(drawing_edit::edit_dimension).patch(drawing_annotate::annotate_dimension),
+        )
+        .route("/api/iso286", get(drawing_annotate::iso286_limits))
         .route(
             "/api/drawings/{id}/dimensions/{dim_id}/driver",
             get(drawing_edit::dimension_driver),
@@ -11410,6 +11418,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             delete(drawing_mgr::remove_view).patch(drawing_mgr::update_view),
         )
         .route("/api/drawings/{id}/svg", get(drawing_mgr::export_svg))
+        .route(
+            "/api/drawings/{id}/preview.svg",
+            get(drawing_mgr::preview_svg),
+        )
         .route("/api/drawings/{id}/pdf", get(drawing_mgr::export_pdf))
         .route("/api/drawings/{id}/dxf", get(drawing_mgr::export_dxf))
         // One-call "right-click → drawing": third-angle Front/Top/Right with
@@ -12004,6 +12016,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         // The timeline's rows: the applied history grouped into engineering
         // features (chapters), each with its verdict, author and intent.
+        .route(
+            "/api/timeline/feature-graph/{branch_id}",
+            get(handlers::timeline::get_feature_graph),
+        )
         .route(
             "/api/timeline/chapters/{branch_id}",
             get(crate::handlers::timeline::get_chapters),

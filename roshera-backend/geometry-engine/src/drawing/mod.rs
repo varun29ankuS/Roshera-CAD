@@ -23,12 +23,16 @@
 //! SVG rendering lives in [`svg`]; REST and frontend integration lives
 //! in `api-server` and `roshera-app` respectively.
 
+pub mod arcs;
 pub mod centerlines;
+pub mod completeness;
+pub mod dimension_edit;
 pub mod dimensioning;
 pub mod dxf;
 pub mod hole_features;
 pub mod hole_table;
 pub mod layout;
+pub mod natural_frame;
 pub mod part_frame;
 pub mod pdf;
 pub mod projection;
@@ -44,15 +48,23 @@ pub mod verify;
 pub mod visibility;
 
 pub use centerlines::{centerlines, Centerline};
+pub use completeness::{dimension_omissions, DimensionOmission, OmissionReason};
+pub use dimension_edit::{
+    dimension_ink, DimInk, DimStack, DimTolerance, DimensionEdit, DimensionEditError,
+    DimensionEdits, Waiver,
+};
 pub use dimensioning::{
-    added_view, auto_dimensions, section_slot_rule, set_projection, standard_drawing,
-    standard_drawing_auto, standard_drawing_auto_with_projection, standard_drawing_hlr,
-    standard_drawing_hlr_with_projection, visible_dimensions, CuttingPlaneLine, Dimension2d,
-    SectionSlotRule,
+    added_view, auto_dimensions, candidate_dimensions, section_slot_rule, set_projection,
+    standard_drawing, standard_drawing_auto, standard_drawing_auto_with_projection,
+    standard_drawing_hlr, standard_drawing_hlr_with_projection, visible_dimensions,
+    CuttingPlaneLine, Dimension2d, SectionSlotRule,
 };
 pub use dxf::{render_drawing_dxf, DxfRenderError};
-pub use hole_table::{build_hole_table, qualifies_for_baseline, tag_letter, HoleSite};
-pub use part_frame::{draw_in_part_frame, PartFrame};
+pub use hole_table::{build_hole_table, tag_letter, HoleSite};
+pub use natural_frame::{analyse_natural_frame, FrameAnalysis, NoNaturalFrame};
+pub use part_frame::{
+    draw_in_part_frame, frame_for_drawing, model_in_drawn_frame, DrawnFrame, PartFrame,
+};
 pub use pdf::{render_drawing_pdf, PdfRenderError};
 pub use projection::{
     project_solid_edges, project_solid_view, view_matrix_for_projection, ProjectionError,

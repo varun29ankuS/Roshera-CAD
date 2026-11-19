@@ -1,6 +1,5 @@
-import { Suspense, lazy, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
+import { Suspense, lazy, useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
 import { useWSStore } from '@/stores/ws-store'
-import { useSceneStore } from '@/stores/scene-store'
 import { useActionErrorStore } from '@/stores/action-error-store'
 import { useDocumentStore } from '@/stores/document-store'
 import { isCurrentScope, scopeToken } from '@/lib/document-scope'
@@ -25,7 +24,7 @@ import { useChapters } from '@/hooks/use-chapters'
 // (see vault Research/2026-07-31-ui-pass-spec.md §3). Lazy-loaded: it
 // pulls in `@xyflow/react`, which has no reason to sit in the initial
 // bundle for the ~everyday case of never opening the map.
-const TimelineGraph = lazy(() => import('./TimelineGraph'))
+const FeatureMap = lazy(() => import('./FeatureMap'))
 
 // NOTE: these helpers + types are NOT re-exported from here. Consumers must
 // import them directly from `@/lib/timeline-events` (the source of truth).
@@ -741,26 +740,9 @@ export function Timeline() {
   // visually and adds little when you're focused on a single branch,
   // so it stays out of the way until you ask for it.
   const [overviewExpanded, setOverviewExpanded] = useState(false)
-  // Map view: a full-panel React Flow graph, independent of the branch
-  // minimap above and the strip below. Closed by default — it is heavier
-  // (lazy chunk + per-branch history fetches) and answers a different
-  // question ("how was this structured") than the strip's "scrub to a
-  // point in time".
+  // The Map: how this part was made, as one feature graph (FeatureMap).
+  // Closed by default; a lazy chunk, opened from the bar's Map button.
   const [graphOpen, setGraphOpen] = useState(false)
-  // Live solid-id → display-name map, from the same scene store the browser
-  // tree renders (`obj.name` via `analyticalGeometry.solidId`). Keeps lane
-  // labels byte-identical to the tree for live parts — including custom
-  // names from create/rename. Memoized on the objects Map reference (the
-  // store replaces it on every scene mutation).
-  const sceneObjects = useSceneStore((s) => s.objects)
-  const liveNames = useMemo(() => {
-    const m = new Map<string, string>()
-    for (const [, obj] of sceneObjects) {
-      const sid = obj.analyticalGeometry?.solidId
-      if (sid !== undefined && obj.name) m.set(`solid:${sid}`, obj.name)
-    }
-    return m
-  }, [sceneObjects])
   // Collapse the event body to just the controls row, reclaiming the dock's
   // vertical space for the viewport. Remembered across sessions.
   const [bodyCollapsed, setBodyCollapsed] = useState<boolean>(() => {
@@ -1701,18 +1683,11 @@ export function Timeline() {
         <Suspense
           fallback={
             <div className="fixed inset-6 z-50 flex items-center justify-center rounded-lg border border-border bg-card shadow-2xl text-[12px] text-muted-foreground/70 font-mono">
-              ⋯ loading map view
+              ⋯ loading the map
             </div>
           }
         >
-          <TimelineGraph
-            branches={branches}
-            activeBranchId={activeBranchId}
-            liveNames={liveNames}
-            checkpoints={checkpoints}
-            durability={durability}
-            onClose={() => setGraphOpen(false)}
-          />
+          <FeatureMap branch={activeBranchId} onClose={() => setGraphOpen(false)} />
         </Suspense>
       )}
     </div>

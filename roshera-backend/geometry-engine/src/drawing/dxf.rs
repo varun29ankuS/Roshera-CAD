@@ -37,7 +37,10 @@ use dxf::tables::{Layer, LineType};
 use dxf::{Color, Drawing as DxfDrawing, LwPolylineVertex, Point, Vector};
 use thiserror::Error;
 
-use super::layout::{compute_layout, SheetItemKind};
+use super::layout::{
+    compute_layout, SheetItemKind, CAP_HEIGHT_OF_EM, DIM_TEXT_FONT_MM, GLYPH_ADVANCE_EM,
+    NOTES_BOTTOM_BASELINE_MM, NOTES_FONT_MM, NOTES_LINE_PITCH_MM,
+};
 use super::types::{Drawing, ProjectedView, SheetSize};
 
 /// Errors produced during DXF rendering.
@@ -473,11 +476,31 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
             LAYER_DIMENSIONS,
             x,
             y,
-            3.1, // DIM_TEXT_FONT_MM — matches the SVG stylesheet
+            // DXF TEXT height is the CAPITAL height; the SVG's font size is
+            // the em box. The same ink: capitals 0.70 of DIM_TEXT_FONT_MM.
+            DIM_TEXT_FONT_MM * CAP_HEIGHT_OF_EM,
             rotation_deg,
             &pd.label,
             HorizontalTextJustification::Center,
         );
+        // A basic dimension's box: four lines around the text, turned with
+        // it (the same box the SVG draws).
+        if pd.boxed {
+            let w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM + 1.6;
+            let (lo, hi) = (-0.75, DIM_TEXT_FONT_MM + 0.15);
+            let (sin, cos) = rotation_deg.to_radians().sin_cos();
+            let at = |u: f64, v: f64| (x + u * cos - v * sin, y + u * sin + v * cos);
+            let corners = [
+                at(-0.5 * w, lo),
+                at(0.5 * w, lo),
+                at(0.5 * w, hi),
+                at(-0.5 * w, hi),
+            ];
+            for k in 0..4 {
+                let (p, q) = (corners[k], corners[(k + 1) % 4]);
+                add_line(dxf, LAYER_DIMENSIONS, p.0, p.1, q.0, q.1);
+            }
+        }
     }
 
     // ── Hole-tag callouts ───────────────────────────────────────────────
@@ -884,16 +907,18 @@ fn emit_notes_strip(dxf: &mut DxfDrawing, drawing: &Drawing) {
     let sheet = &drawing.sheet_size;
     let (ml, _mr, _mt, mb) = frame_margins(sheet);
     // Engineering notes drift up from the bottom-left of the frame.
+    // The same baselines and capital height as the SVG notes strip.
     let x = ml + 2.5;
-    let y0 = mb + 3.0;
-    let y1 = mb + 6.0;
-    let y2 = mb + 9.0;
+    let y0 = mb + NOTES_BOTTOM_BASELINE_MM;
+    let y1 = y0 + NOTES_LINE_PITCH_MM;
+    let y2 = y1 + NOTES_LINE_PITCH_MM;
+    let cap = NOTES_FONT_MM * CAP_HEIGHT_OF_EM;
     add_text(
         dxf,
         LAYER_NOTES,
         x,
         y0,
-        2.4,
+        cap,
         0.0,
         // Unit-aware notes stored on the Drawing at build time (same source
         // the SVG renders) - DXF and SVG can never disagree.
@@ -905,7 +930,7 @@ fn emit_notes_strip(dxf: &mut DxfDrawing, drawing: &Drawing) {
         LAYER_NOTES,
         x,
         y1,
-        2.4,
+        cap,
         0.0,
         &drawing.unit_note,
         HorizontalTextJustification::Left,
@@ -915,7 +940,7 @@ fn emit_notes_strip(dxf: &mut DxfDrawing, drawing: &Drawing) {
         LAYER_NOTES,
         x,
         y2,
-        2.4,
+        cap,
         0.0,
         drawing.projection.note(),
         HorizontalTextJustification::Left,
@@ -1352,6 +1377,8 @@ mod tests {
                     pid: None,
                     datum: None,
                     tolerance: None,
+                    key: None,
+                    members: Vec::new(),
                 },
                 Dimension2d {
                     id: "h".to_string(),
@@ -1367,6 +1394,8 @@ mod tests {
                     pid: None,
                     datum: None,
                     tolerance: None,
+                    key: None,
+                    members: Vec::new(),
                 },
             ],
             centerlines: Vec::new(),
