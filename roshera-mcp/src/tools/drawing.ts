@@ -14,6 +14,61 @@ import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail } from "../core.js";
 
+/** One layout finding as a stable line: severity, view and message. */
+function issueLine(i: any): string {
+  const view = i?.view ? ` [${i.view}]` : "";
+  return `${i?.severity ?? "?"}${view}: ${i?.message ?? i?.kind ?? "issue"}`;
+}
+
+/** The sheet's layout findings as lines, or null when the check cannot be read. */
+async function layoutLines(drawingId: string): Promise<{ lines: string[]; passed: boolean | null } | null> {
+  try {
+    const q = await api("GET", `/api/drawings/${drawingId}/quality`);
+    const issues: any[] = Array.isArray(q?.issues) ? q.issues : [];
+    return { lines: issues.map(issueLine), passed: typeof q?.passed === "boolean" ? q.passed : null };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run a sheet edit and report what it did to the layout (2026-11-19): the
+ * agent set the bracket's bores to H7, the longer label collided with R25,
+ * and the edit's answer said only "sound" -- the export gate caught what the
+ * agent never saw. Every sheet-editing tool now answers with the issues its
+ * edit CREATED and RESOLVED and whether the sheet still passes, read from the
+ * same layout check the export gate uses. `null` when that check cannot be
+ * read -- never a guessed "clean".
+ */
+async function withSheetEffect<T>(
+  drawingId: string,
+  edit: () => Promise<T>,
+): Promise<{ result: T; sheet_effect: any }> {
+  const before = await layoutLines(drawingId);
+  const result = await edit();
+  const after = await layoutLines(drawingId);
+  if (before === null || after === null) {
+    return { result, sheet_effect: null };
+  }
+  const was = new Set(before.lines);
+  const now = new Set(after.lines);
+  const created = after.lines.filter((l) => !was.has(l));
+  const resolved = before.lines.filter((l) => !now.has(l));
+  return {
+    result,
+    sheet_effect: {
+      layout_passes: after.passed,
+      new_issues: created,
+      resolved_issues: resolved,
+      open_issues: after.lines.length,
+      note:
+        created.length > 0
+          ? "this edit created layout issues: fix them (move_mm, or tell the engineer) before going on"
+          : "no new layout issues",
+    },
+  };
+}
+
 /** Compact one-line verdict tally for a sheet certificate. */
 function certificateLine(cert: any): string {
   const c = cert?.counts ?? {};
@@ -126,17 +181,20 @@ export function registerDrawingTools(server: ToolHost): void {
     },
     async ({ drawing_id, dimension_id, value }) => {
       try {
-        const r = await api(
-          "POST",
-          `/api/drawings/${drawing_id}/dimensions/${encodeURIComponent(dimension_id)}`,
-          { value },
-          180_000,
+        const { result: r, sheet_effect } = await withSheetEffect(drawing_id, () =>
+          api(
+            "POST",
+            `/api/drawings/${drawing_id}/dimensions/${encodeURIComponent(dimension_id)}`,
+            { value },
+            180_000,
+          ),
         );
         return ok({
           drawing_id,
           dimension: r?.dimension ?? null,
           driver: r?.driver ?? null,
           sound: r?.mould?.is_sound ?? null,
+          sheet_effect,
         });
       } catch (e) {
         return fail(e);
@@ -265,10 +323,12 @@ export function registerDrawingTools(server: ToolHost): void {
         if (a.suppress !== undefined) {
           body.suppressed = a.suppress ? { by: a.by ?? "", reason: a.reason ?? "" } : null;
         }
-        const r = await api(
-          "PATCH",
-          `/api/drawings/${a.drawing_id}/dimensions/${encodeURIComponent(a.dimension_id)}`,
-          body,
+        const { result: r, sheet_effect } = await withSheetEffect(a.drawing_id, () =>
+          api(
+            "PATCH",
+            `/api/drawings/${a.drawing_id}/dimensions/${encodeURIComponent(a.dimension_id)}`,
+            body,
+          ),
         );
         return ok({
           drawing_id: a.drawing_id,
@@ -276,6 +336,7 @@ export function registerDrawingTools(server: ToolHost): void {
           sound: r?.certificate?.sound ?? null,
           complete: r?.certificate?.complete ?? null,
           omission_summary: r?.certificate?.omission_summary ?? [],
+          sheet_effect,
         });
       } catch (e) {
         return fail(e);
@@ -320,8 +381,15 @@ export function registerDrawingTools(server: ToolHost): void {
     },
     async ({ drawing_id, projection }) => {
       try {
-        const r = await api("PATCH", `/api/drawings/${drawing_id}/projection`, { projection });
-        return ok({ drawing_id, projection: r?.projection ?? projection, quality: r?.quality ?? null });
+        const { result: r, sheet_effect } = await withSheetEffect(drawing_id, () =>
+          api("PATCH", `/api/drawings/${drawing_id}/projection`, { projection }),
+        );
+        return ok({
+          drawing_id,
+          projection: r?.projection ?? projection,
+          quality: r?.quality ?? null,
+          sheet_effect,
+        });
       } catch (e) {
         return fail(e);
       }
