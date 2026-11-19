@@ -791,6 +791,115 @@ fn is_parameterization_seam(
             .is_some()
 }
 
+/// Largest turn between two flat facets that still reads as one faceted
+/// surface rather than a bend a drafter would draw.
+const FACET_SEAM_MAX_TURN_DEG: f64 = 20.0;
+
+/// Fewest facets a run of shallow seams must join before it counts as a
+/// faceted surface. A shallow crown of two or three flats is real geometry.
+const FACET_RUN_MIN_FACES: usize = 4;
+
+/// The seams between neighbouring flat facets of a faceted surface, each with
+/// its two faces' OUTWARD normals.
+///
+/// A profile sampled into a polygon (an aerofoil from its NACA ordinates)
+/// and extruded is a run of flat faces a few degrees apart. Each seam
+/// between two of them is a topological edge, but not an edge of the part a
+/// drafter draws: inked edge by edge, the rib's FRONT and SECTION views came
+/// out striped across their whole length (2026-11-19). A seam qualifies when
+/// both faces are planes turning by less than [`FACET_SEAM_MAX_TURN_DEG`]
+/// AND the faces it joins belong to a run of at least
+/// [`FACET_RUN_MIN_FACES`] such facets -- an isolated shallow bend is a real
+/// edge and is never returned here. The caller still draws a seam that is
+/// the silhouette in its view (the surface turning away from the viewer).
+fn facet_seams(
+    model: &BRepModel,
+    edge_faces: &std::collections::HashMap<EdgeId, Vec<u32>>,
+) -> std::collections::HashMap<EdgeId, (Vector3, Vector3)> {
+    let outward = |fid: u32| -> Option<Vector3> {
+        let face = model.faces.get(fid)?;
+        let surface = model.surfaces.get(face.surface_id)?;
+        let plane = surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Plane>()?;
+        let n = plane.normal.normalize().ok()?;
+        Some(match face.orientation {
+            crate::primitives::face::FaceOrientation::Forward => n,
+            crate::primitives::face::FaceOrientation::Backward => -n,
+        })
+    };
+    let min_cos = FACET_SEAM_MAX_TURN_DEG.to_radians().cos();
+
+    // Shallow planar seams, and the faces they join (union-find on face ids).
+    let mut shallow: Vec<(EdgeId, u32, u32, Vector3, Vector3)> = Vec::new();
+    for (edge_id, faces) in edge_faces {
+        if faces.len() != 2 || faces[0] == faces[1] {
+            continue;
+        }
+        let (Some(a), Some(b)) = (outward(faces[0]), outward(faces[1])) else {
+            continue;
+        };
+        // Same outward direction within the turn limit, but not coplanar
+        // (a coplanar split is drawn as it always was).
+        let c = a.dot(&b);
+        if c >= min_cos && c < 1.0 - 1e-12 {
+            shallow.push((*edge_id, faces[0], faces[1], a, b));
+        }
+    }
+    if shallow.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let mut parent: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    fn find(parent: &mut std::collections::HashMap<u32, u32>, x: u32) -> u32 {
+        let mut r = x;
+        while let Some(&p) = parent.get(&r) {
+            if p == r {
+                break;
+            }
+            r = p;
+        }
+        // Path compression.
+        let mut y = x;
+        while let Some(&p) = parent.get(&y) {
+            if p == r {
+                break;
+            }
+            parent.insert(y, r);
+            y = p;
+        }
+        r
+    }
+    for &(_, f1, f2, _, _) in &shallow {
+        parent.entry(f1).or_insert(f1);
+        parent.entry(f2).or_insert(f2);
+        let (r1, r2) = (find(&mut parent, f1), find(&mut parent, f2));
+        if r1 != r2 {
+            parent.insert(r1, r2);
+        }
+    }
+    let faces: Vec<u32> = parent.keys().copied().collect();
+    let mut run_size: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for f in faces {
+        let r = find(&mut parent, f);
+        *run_size.entry(r).or_default() += 1;
+    }
+    shallow
+        .into_iter()
+        .filter(|&(_, f1, _, _, _)| {
+            let r = find(&mut parent, f1);
+            run_size.get(&r).copied().unwrap_or(0) >= FACET_RUN_MIN_FACES
+        })
+        .map(|(e, _, _, a, b)| (e, (a, b)))
+        .collect()
+}
+
+/// Whether a facet seam is the silhouette in a view looking along `w`: one of
+/// its faces faces the viewer and the other faces away (or lies edge-on).
+fn facet_seam_is_silhouette(normals: &(Vector3, Vector3), w: Vector3) -> bool {
+    let (a, b) = (normals.0.dot(&w), normals.1.dot(&w));
+    a * b <= 1e-12
+}
+
 /// The outline of a torus face (a round-edge fillet) in this view: where its
 /// normal turns perpendicular to the view direction `w`.
 ///
@@ -1608,6 +1717,9 @@ pub(crate) fn project_solid_edges_visibility_mode(
         }
     }
 
+    // Seams inside a faceted surface: drawn only where they are the outline.
+    let seams = facet_seams(model, &edge_faces);
+
     for sh in shell_ids {
         let shell = match model.shells.get(sh) {
             Some(s) => s,
@@ -1643,6 +1755,12 @@ pub(crate) fn project_solid_edges_visibility_mode(
                     // the true silhouette is synthesized separately below,
                     // regardless of whether it coincides with this seam.
                     if is_parameterization_seam(model, *edge_id, &edge_faces) {
+                        continue;
+                    }
+                    if seams
+                        .get(edge_id)
+                        .is_some_and(|n| !facet_seam_is_silhouette(n, w))
+                    {
                         continue;
                     }
                     let n = if is_linear {
