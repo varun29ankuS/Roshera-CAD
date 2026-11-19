@@ -78,14 +78,11 @@ import {
   screenPxPerMm,
   type SheetQuality,
 } from '@/lib/drawing-drag'
+import { fitSheetScale } from '@/lib/sheet-fit'
 
 // CSS pixels per millimetre at the standard 96 DPI mapping. At zoom
 // `1.0` the sheet renders at its true physical size.
 const PX_PER_MM = 96 / 25.4
-
-// Padding (CSS px) preserved around the sheet when computing the
-// fit-to-window scale so the corners + drop shadow stay visible.
-const FIT_PADDING_PX = 24
 
 function sheetDimensionsMm(sheet: Drawing['sheet_size']): [number, number] {
   if (typeof sheet === 'string') {
@@ -721,13 +718,11 @@ export function DrawingsWorkspace() {
   const sheetWPx = sheetWMm * PX_PER_MM
   const sheetHPx = sheetHMm * PX_PER_MM
 
-  const fitScale = useMemo(() => {
-    if (containerSize.w <= 0 || containerSize.h <= 0) return 1
-    const pad = FIT_PADDING_PX * 2
-    const sx = Math.max(0.01, (containerSize.w - pad) / sheetWPx)
-    const sy = Math.max(0.01, (containerSize.h - pad) / sheetHPx)
-    return Math.min(sx, sy)
-  }, [containerSize, sheetWPx, sheetHPx])
+  // Clear of the toolbar band (top) and the zoom/verdict band (bottom).
+  const fitScale = useMemo(
+    () => fitSheetScale(containerSize.w, containerSize.h, sheetWPx, sheetHPx),
+    [containerSize, sheetWPx, sheetHPx],
+  )
 
   const effectiveScale = zoomMode === 'fit' ? fitScale : zoom
   const displayW = Math.max(1, sheetWPx * effectiveScale)
