@@ -1,0 +1,17 @@
+{
+  "name": "roshera-website",
+  "private": true,
+  "version": "1.0.0",
+  "description": "roshera.tech: the public website, built from Markdown into static HTML for people and AI agents.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "hero": "node scripts/build-hero.mjs"
+  },
+  "dependencies": {
+    "marked": "14.1.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
