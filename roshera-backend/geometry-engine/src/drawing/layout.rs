@@ -1300,6 +1300,14 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         }
     }
 
+    // ── Profile ordinate table (a freeform outline's definition) ─────
+    // Laid out as the same table items the hole table uses, so every
+    // renderer inks it and the checker keeps it clear of other ink.
+    if let Some(table) = &drawing.profile_table {
+        let table_items = place_profile_table(drawing, table, h, &items, &all_placed);
+        items.extend(table_items);
+    }
+
     // ── Zone-grid reference marks ─────────────────────────────────────
     // Zone letters (vertical axis) and numbers (horizontal axis) placed
     // in the frame margin at the standard ~50 mm pitch. Zone marks enter
@@ -1582,6 +1590,236 @@ const TABLE_MARGIN: f64 = 3.0;
 /// If no slot is collision-free the RIGHT slot is used and the verifier's
 /// collision checks report the residual overlap honestly (same fallback
 /// discipline as view labels — placement never silently hides a defect).
+/// A number as the ordinate table prints it: two decimals, no "-0.00".
+fn ordinate_label(v: f64) -> String {
+    let s = format!("{v:.2}");
+    if s == "-0.00" {
+        "0.00".to_string()
+    } else {
+        s
+    }
+}
+
+/// Lay out a freeform outline's ordinate table (Varun 2026-11-19: "the
+/// drawing for the aerofoil has no overall dimensions neither spline
+/// measurement"): a title line, a summary line (chord, maximum thickness and
+/// where, trailing-edge thickness), then `% CHORD | X | UPPER | LOWER`, one
+/// row per station. Placed like the hole table -- above the title block, at
+/// the bottom left, under the view that shows the outline, or the first free
+/// spot -- clear of every view, label, dimension line and table already on
+/// the sheet. Emitted as `HoleTableBorder` / `HoleTableText` items, so every
+/// renderer inks it and the layout check covers it.
+fn place_profile_table(
+    drawing: &Drawing,
+    table: &super::profile_table::ProfileTable,
+    sheet_h: f64,
+    existing: &[SheetItem],
+    dimensions: &[PlacedDimension],
+) -> Vec<SheetItem> {
+    let w = drawing.sheet_size.width();
+    let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
+    let (tb_w, tb_h) = title_block_size(&drawing.sheet_size);
+    let frame_w = w - ml - mr;
+    let frame_h = sheet_h - mt - mb;
+    let tb_x0 = ml + frame_w - tb_w;
+    let tb_y0 = mt + frame_h - tb_h;
+
+    let headers = ["% CHORD", "X", "UPPER", "LOWER"];
+    let rows: Vec<[String; 4]> = table
+        .stations
+        .iter()
+        .map(|s| {
+            [
+                format!("{}", s.percent),
+                ordinate_label(s.x_mm),
+                ordinate_label(s.upper_mm),
+                ordinate_label(s.lower_mm),
+            ]
+        })
+        .collect();
+    let title = "PROFILE ORDINATES (mm FROM CHORD LINE)".to_string();
+    let summary = format!(
+        "CHORD {}  MAX THICKNESS {} AT {}%  TE {}",
+        ordinate_label(table.chord_mm),
+        ordinate_label(table.max_thickness_mm),
+        table.max_thickness_at_percent,
+        ordinate_label(table.te_thickness_mm)
+    );
+    let width_of = |t: &str| t.chars().count() as f64 * GLYPH_ADVANCE_EM * TABLE_TEXT_FONT_MM;
+    let mut col_widths: Vec<f64> = (0..4)
+        .map(|c| {
+            rows.iter()
+                .map(|r| width_of(&r[c]))
+                .fold(width_of(headers[c]), f64::max)
+                + 2.0 * TABLE_CELL_PAD
+        })
+        .map(|cw: f64| cw.max(10.0))
+        .collect();
+    // The title and summary lines span the table: widen the last column when
+    // they are wider than the columns.
+    let lines_w = width_of(&title).max(width_of(&summary)) + 2.0 * TABLE_CELL_PAD;
+    let cols_w: f64 = col_widths.iter().sum();
+    if lines_w > cols_w {
+        if let Some(last) = col_widths.last_mut() {
+            *last += lines_w - cols_w;
+        }
+    }
+    let total_w: f64 = col_widths.iter().sum();
+    // Title + summary + header + one row per station.
+    let total_h = (3 + rows.len()) as f64 * TABLE_ROW_H;
+
+    let frame_rect = Rect2 {
+        x0: ml,
+        y0: mt,
+        x1: ml + frame_w,
+        y1: mt + frame_h,
+    };
+    let title_rect = Rect2 {
+        x0: tb_x0,
+        y0: tb_y0,
+        x1: ml + frame_w,
+        y1: mt + frame_h,
+    };
+    let notes_rect = Rect2 {
+        x0: ml,
+        y0: mt + frame_h - NOTES_BAND_MM,
+        x1: ml + frame_w * 0.5,
+        y1: mt + frame_h,
+    };
+    let fits = |r: &Rect2| -> bool {
+        let inside = r.x0 >= frame_rect.x0
+            && r.y0 >= frame_rect.y0
+            && r.x1 <= frame_rect.x1
+            && r.y1 <= frame_rect.y1;
+        if !inside || r.intersects(&title_rect, -1.0) || r.intersects(&notes_rect, -1.0) {
+            return false;
+        }
+        if existing.iter().any(|it| {
+            matches!(
+                it.kind,
+                SheetItemKind::ViewGeometry
+                    | SheetItemKind::DimensionText
+                    | SheetItemKind::ViewLabel
+                    | SheetItemKind::HoleTag
+                    | SheetItemKind::HoleTableBorder
+                    | SheetItemKind::HoleTableText
+            ) && r.intersects(&it.bbox, -2.0)
+        }) {
+            return false;
+        }
+        let grown = Rect2 {
+            x0: r.x0 - 1.0,
+            y0: r.y0 - 1.0,
+            x1: r.x1 + 1.0,
+            y1: r.y1 + 1.0,
+        };
+        !dimensions.iter().any(|pd| {
+            std::iter::once(&pd.line)
+                .chain(pd.ext.iter())
+                .any(|seg| segment_crosses_rect(seg, &grown))
+        })
+    };
+    let at = |x0: f64, y0: f64| Rect2 {
+        x0,
+        y0,
+        x1: x0 + total_w,
+        y1: y0 + total_h,
+    };
+    let right_slot = at(
+        (tb_x0 + tb_w - total_w).max(ml + 1.0),
+        tb_y0 - TABLE_MARGIN - total_h,
+    );
+    let bottom_left = at(ml + 2.0, mt + frame_h - NOTES_BAND_MM - 1.5 - total_h);
+    let below_view = table.owner_view.and_then(|vi| {
+        existing
+            .iter()
+            .find(|it| it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(vi))
+            .map(|g| at(g.bbox.x0, g.bbox.y1 + 8.0))
+    });
+    let anywhere = || -> Option<Rect2> {
+        const STEP: f64 = 5.0;
+        let mut y1 = frame_rect.y1 - 2.0;
+        while y1 - total_h >= frame_rect.y0 + 2.0 {
+            let mut x0 = frame_rect.x1 - 2.0 - total_w;
+            while x0 >= frame_rect.x0 + 2.0 {
+                let r = at(x0, y1 - total_h);
+                if fits(&r) {
+                    return Some(r);
+                }
+                x0 -= STEP;
+            }
+            y1 -= STEP;
+        }
+        None
+    };
+    let chosen = [Some(right_slot), below_view, Some(bottom_left)]
+        .into_iter()
+        .flatten()
+        .find(fits)
+        .or_else(anywhere)
+        // Nowhere free: above the title block; the layout check reports it.
+        .unwrap_or(right_slot);
+
+    let mut out: Vec<SheetItem> = Vec::new();
+    let border = |x0: f64, y0: f64, x1: f64, y1: f64| SheetItem {
+        kind: SheetItemKind::HoleTableBorder,
+        bbox: Rect2 { x0, y0, x1, y1 },
+        owner_view: None,
+        text: None,
+    };
+    let text = |s: &str, x: f64, y: f64| SheetItem {
+        kind: SheetItemKind::HoleTableText,
+        bbox: text_bbox(s, TABLE_TEXT_FONT_MM, x, y),
+        owner_view: None,
+        text: Some(s.to_string()),
+    };
+    // Outer border, then the rule under the summary and under the header.
+    out.push(border(chosen.x0, chosen.y0, chosen.x1, chosen.y1));
+    let header_top = chosen.y0 + 2.0 * TABLE_ROW_H;
+    let header_bottom = header_top + TABLE_ROW_H;
+    out.push(border(
+        chosen.x0,
+        header_top - 0.1,
+        chosen.x1,
+        header_top + 0.1,
+    ));
+    out.push(border(
+        chosen.x0,
+        header_bottom - 0.1,
+        chosen.x1,
+        header_bottom + 0.1,
+    ));
+    // Column separators from the header down.
+    let mut cx = chosen.x0;
+    for cw in col_widths.iter().take(col_widths.len() - 1) {
+        cx += cw;
+        out.push(border(cx - 0.1, header_top, cx + 0.1, chosen.y1));
+    }
+    // Title and summary lines.
+    let pad = TABLE_CELL_PAD;
+    out.push(text(&title, chosen.x0 + pad, chosen.y0 + TABLE_ROW_H - pad));
+    out.push(text(
+        &summary,
+        chosen.x0 + pad,
+        chosen.y0 + 2.0 * TABLE_ROW_H - pad,
+    ));
+    // Header and rows.
+    let mut x = chosen.x0;
+    for (c, h) in headers.iter().enumerate() {
+        out.push(text(h, x + pad, header_bottom - pad));
+        x += col_widths[c];
+    }
+    for (r, row) in rows.iter().enumerate() {
+        let y = header_bottom + (r + 1) as f64 * TABLE_ROW_H - pad;
+        let mut x = chosen.x0;
+        for (c, cell) in row.iter().enumerate() {
+            out.push(text(cell, x + pad, y));
+            x += col_widths[c];
+        }
+    }
+    out
+}
+
 fn place_hole_table(
     drawing: &Drawing,
     sites: &[HoleSite],

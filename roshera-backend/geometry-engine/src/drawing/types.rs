@@ -1114,6 +1114,14 @@ pub struct Drawing {
     /// older sheets parsing.
     #[serde(default)]
     pub drawn_frame: Option<super::part_frame::DrawnFrame>,
+    /// The ordinates of a freeform outline (an aerofoil section, a cam): the
+    /// upper and lower surface measured from the solid at standard stations
+    /// along the chord, with the chord, the maximum thickness and the
+    /// trailing-edge thickness. `None` for parts without such an outline. The
+    /// certificate re-measures every ordinate. `serde(default)` keeps older
+    /// sheets parsing.
+    #[serde(default)]
+    pub profile_table: Option<super::profile_table::ProfileTable>,
     /// Render-time facts (mass, certificate stamp) -- set on a transient copy
     /// right before rendering, never persisted.
     #[serde(skip)]
@@ -1160,6 +1168,7 @@ impl Drawing {
             hole_features: None,
             dimension_edits: super::dimension_edit::DimensionEdits::new(),
             drawn_frame: None,
+            profile_table: None,
             render_facts: RenderFacts::default(),
         }
     }

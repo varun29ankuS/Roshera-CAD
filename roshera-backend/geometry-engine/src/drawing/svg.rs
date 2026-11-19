@@ -813,8 +813,11 @@ fn render_hole_table(out: &mut String, layout: &SheetLayout) {
         .filter(|i| i.kind == SheetItemKind::HoleTableBorder)
         .collect();
 
-    // The first HoleTableBorder item is the outer border (added first in place_hole_table).
-    if let Some(outer) = borders.first() {
+    // Outer borders are the boxes (both sides wider than a separator's
+    // 0.2 mm); a sheet may carry two tables (holes and a profile's
+    // ordinates), each with its own outer border.
+    let is_box = |b: &crate::drawing::layout::Rect2| b.width() > 0.5 && b.height() > 0.5;
+    for outer in borders.iter().filter(|i| is_box(&i.bbox)) {
         let b = &outer.bbox;
         let _ = write!(
             out,
@@ -826,10 +829,10 @@ fn render_hole_table(out: &mut String, layout: &SheetLayout) {
             b.height()
         );
     }
-    // Remaining borders are separator lines (thin bboxes). Inner separators
+    // The rest are separator lines (thin bboxes). Inner separators
     // use `.hole-table-inner` (0.18 mm) while the outer border uses
     // `.hole-table-border` (0.25 mm) — ISO 128 heavy/thin distinction.
-    for sep in borders.iter().skip(1) {
+    for sep in borders.iter().filter(|i| !is_box(&i.bbox)) {
         let b = &sep.bbox;
         // Determine orientation: a horizontal separator has height ≈ 0.2,
         // a vertical separator has width ≈ 0.2.

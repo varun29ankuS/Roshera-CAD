@@ -1233,6 +1233,8 @@ pub fn standard_drawing_hlr_with_projection(
     drawing.hole_features =
         super::hole_features::detect_hole_features(model, solid_id, drawing.round_part.as_ref());
     attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
+    // A freeform outline (an aerofoil) is stated by its ordinate table.
+    super::profile_table::attach_profile_table(model, solid_id, &mut drawing);
     super::round_part::add_pitch_circles(&mut drawing);
     count_equal_features(&mut drawing);
 
@@ -2848,6 +2850,8 @@ fn build_sheet(
     drawing.hole_features =
         super::hole_features::detect_hole_features(model, solid_id, drawing.round_part.as_ref());
     attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
+    // A freeform outline (an aerofoil) is stated by its ordinate table.
+    super::profile_table::attach_profile_table(model, solid_id, &mut drawing);
     super::round_part::add_pitch_circles(&mut drawing);
 
     // ── Section view (Task 9) ─────────────────────────────────────────────────

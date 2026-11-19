@@ -35,6 +35,7 @@ pub mod layout;
 pub mod natural_frame;
 pub mod part_frame;
 pub mod pdf;
+pub mod profile_table;
 pub mod projection;
 pub mod query;
 pub mod round_part;

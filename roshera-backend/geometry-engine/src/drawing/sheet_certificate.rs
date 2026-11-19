@@ -154,6 +154,10 @@ pub enum SheetFactKind {
     Section,
     /// A structured sheet note (unit + general tolerance).
     Note,
+    /// One ordinate of a freeform outline's table (an aerofoil's upper or
+    /// lower surface at a station, or its chord), re-measured on the live
+    /// solid ([`super::profile_table`]).
+    ProfileOrdinate,
     /// Ink with no model referent (raster pictorial, hatch texture).
     RenderOnly,
     /// NOT a sheet element: a live model feature the sheet has no counterpart
@@ -1524,6 +1528,67 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
                 },
             },
         });
+    }
+
+    // The profile ordinate table: every ordinate re-measured on the live
+    // solid's own outline. A table the live part no longer has (the outline
+    // gone, or no longer freeform) dangles; a value off by more than the
+    // oracle is stale.
+    if let Some(table) = &drawing.profile_table {
+        let live = solid_id.and_then(|s| super::profile_table::measure_profile(model, s));
+        let mut push = |label: String, sheet: f64, measured: Option<f64>| {
+            let (verdict, deviation) = match measured {
+                None => (SheetVerdict::Dangling, None),
+                Some(m) => {
+                    let dev = (m - sheet).abs();
+                    (
+                        if dev <= CERT_DIM_ORACLE_MM {
+                            SheetVerdict::Consistent
+                        } else {
+                            SheetVerdict::Stale
+                        },
+                        Some(dev),
+                    )
+                }
+            };
+            facts.push(SheetFact {
+                kind: SheetFactKind::ProfileOrdinate,
+                owner_view: table.owner_view,
+                label,
+                value: Some(sheet),
+                unit: "mm".to_string(),
+                pid: None,
+                face_ids: vec![table.face],
+                datum: None,
+                tolerance: None,
+                live: LiveCheck {
+                    measured,
+                    deviation,
+                    verdict,
+                    detail: None,
+                },
+            });
+        };
+        push(
+            "profile chord".to_string(),
+            table.chord_mm,
+            live.as_ref().map(|l| l.chord_mm),
+        );
+        for st in &table.stations {
+            let at = live
+                .as_ref()
+                .and_then(|l| l.stations.iter().find(|s| s.percent == st.percent));
+            push(
+                format!("profile upper at {}% chord", st.percent),
+                st.upper_mm,
+                at.map(|s| s.upper_mm),
+            );
+            push(
+                format!("profile lower at {}% chord", st.percent),
+                st.lower_mm,
+                at.map(|s| s.lower_mm),
+            );
+        }
     }
 
     // The drawn part itself: a sheet of a solid the model does not hold can
