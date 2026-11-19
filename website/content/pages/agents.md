@@ -1,27 +1,29 @@
 ---
 title: Agents
-description: AI agents drive Roshera through REST and the Model Context Protocol, read manufacturing playbooks before they act, and get a certificate with every result.
+description: AI agents drive Roshera through REST and the Model Context Protocol, read manufacturing playbooks before they act, ask for what they must not invent, and get a certificate with every result.
 ---
 
-## The same tools for people and agents
+<div class="facts"><div><b>MCP + REST</b><span>the same commands the app uses</span></div><div><b>Playbooks</b><span>part-family know-how read before acting</span></div><div><b>Certificates</b><span>on every build, drawing and tolerance</span></div></div>
 
-Everything the app does goes through the kernel's commands, and the same commands are available to software:
+## The problem
 
-- a **REST API** for scripts and integrations,
-- a **Model Context Protocol (MCP) server** that gives an AI agent over a hundred geometry, drawing and verification tools.
+An agent that writes CAD commands into a conventional modeller gets no feedback about whether the result is right. It guesses, the modeller complies, and the error surfaces downstream.
 
-## Playbooks before actions
+## How agents work with Roshera
 
-Agents read **playbooks** before they build: how to design a flange to its standard, how to lay out an aerofoil from its NACA designation, how to make a manufacturing drawing (purpose first, ISO sheet and view rules, fits from tables, the review loop). The playbooks say which values must come from the engineer and never be invented.
+**Tools.** The kernel exposes over a hundred geometry, drawing and verification tools through the Model Context Protocol, plus REST for scripts. A tool finder lets an agent locate the right tool from a plain description.
 
-## A certificate with every result
+**Playbooks.** Before building, the agent reads a playbook for the part family: a flange to its standard, an aerofoil from its NACA designation, a manufacturing drawing (purpose first, sheet and view rules, fits from tables, the review loop). Playbooks say which values come from the engineer and must never be invented.
 
-Agents are wrong sometimes. Roshera is built so that it shows: every build returns a soundness certificate, every drawing a sheet certificate, every tolerance a measured verdict. When an agent entered hole positions with the wrong sign in a recent session, the kernel reported all three holes out of spec by tens of millimetres, and the agent corrected them.
+**Feedback.** Every action returns a certificate. Edits on a drawing return what changed on the sheet: new issues, resolved issues, layout passes. Refusals say why. The agent reacts to facts, not to its own guess about the result.
 
-## Agents ask instead of guessing
+**Asking.** Given "H7 on the Ø20 bores" on a part whose Ø20 features are boss outsides, the agent reports what it measured and asks which features take the fit.
 
-Given an ambiguous request ("H7 on the Ø20 bores" on a part whose Ø20 features are boss outsides, not bores), the agent says what it measured and asks which features take the fit. It does not ink a tolerance on a guess.
+## Proof
 
-## Connect
+- An agent entered three hole positions with the wrong sign; the kernel measured all three out of spec by 74 to 144 mm; the agent fixed them before release.
+- [Real recordings](/#watch) of an agent importing a part, drafting it and answering for each choice.
 
-Write to [info@roshera.tech](mailto:info@roshera.tech) for API access. This site publishes a machine-readable index at [/llms.txt](/llms.txt) and a Markdown copy of every page.
+## Next step
+
+Connect your agent, or talk to us about evals and environments: [For AI labs](/ai-labs) · [info@roshera.tech](mailto:info@roshera.tech).

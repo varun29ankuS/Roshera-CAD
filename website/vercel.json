@@ -6,6 +6,7 @@
   "outputDirectory": "dist",
   "cleanUrls": true,
   "trailingSlash": false,
+  "redirects": [{ "source": "/use-cases", "destination": "/engineering", "permanent": true }],
   "headers": [
     {
       "source": "/(.*)\\.md",

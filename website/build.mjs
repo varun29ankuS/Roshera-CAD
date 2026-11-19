@@ -58,11 +58,11 @@ const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 
 const NAV = [
   ['/why', 'Why Roshera'],
+  ['/engineering', 'Engineering'],
+  ['/ai-labs', 'AI labs'],
   ['/drawings', 'Drawings'],
   ['/kernel', 'Kernel'],
-  ['/fields', 'Fields'],
-  ['/agents', 'Agents'],
-  ['/use-cases', 'Use cases'],
+  ['/fields', 'Simulation'],
   ['/blog', 'Blog'],
   ['/contact', 'Contact'],
 ]
@@ -114,6 +114,7 @@ function header(current) {
 const footer = () => `<footer class="foot"><div class="wrap foot-in">
   <div><a class="brand" href="/"><img src="/logo.png" alt="" width="22" height="22">${NAME}</a><p>${esc(TAGLINE)}</p></div>
   <div class="mono"><span>Contact</span><a href="mailto:${EMAIL}">${EMAIL}</a></div>
+  <div class="mono"><span>Product</span><a href="/drawings">Drawings</a> · <a href="/kernel">Kernel</a> · <a href="/fields">Fields &amp; simulation</a> · <a href="/agents">Agents</a></div>
   <div class="mono"><span>For machines</span><a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">sitemap</a> · <a href="/rss.xml">rss</a></div>
 </div></footer>`
 
@@ -147,6 +148,11 @@ const PIPELINE = `<section class="pipe reveal" aria-label="The design loop">
 <ol data-pipeline>${STAGES.map(([t, d, s], i) => `<li data-state="${s}"><span class="mono">${String(i + 1).padStart(2, '0')} · ${s === 'today' ? 'today' : 'building now'}</span><b>${t}</b><em>${d}</em></li>`).join('')}</ol>
 </section>`
 
+const DOORS = `<section class="doors reveal" aria-label="Who Roshera is for">
+<a class="door-card" href="/engineering"><span class="mono kicker">For engineering teams</span><b>Production drawings you can release without re-checking every number.</b><em>STEP in, certified drawing out. Fits, hole tables, GD&amp;T, profile tables; a sheet that refuses release when it disagrees with the part.</em><span class="go-link">Start a pilot →</span></a>
+<a class="door-card" href="/ai-labs"><span class="mono kicker">For AI labs</span><b>A geometry environment with verifiable rewards.</b><em>Every action returns a machine-checkable certificate. Evals graded by the kernel, not by a judge model; refusals you can score for honesty.</em><span class="go-link">Evals and environments →</span></a>
+</section>`
+
 const CLIPS = [
   ['import-step', 'Import a STEP file', 'Pick the file; the kernel checks the solid is sound before anything else.'],
   ['drawing-appears', 'Ask for the drawing', 'The agent reads the part, asks what it must not guess, and the sheet appears.'],
@@ -154,13 +160,13 @@ const CLIPS = [
   ['edit-on-sheet', 'Edit on the sheet', 'Move a dimension, move a view, set a tolerance; each edit is one undoable step.'],
   ['wing-rib-build', 'A wing rib from its spec', 'NACA 2412, 300 mm chord: the agent generates the section, builds and draws it.'],
 ]
-const PLAYER = `<section class="sec watch reveal" data-player>
+const PLAYER = `<section class="sec watch reveal" id="watch" data-player>
 <div><div class="mono kicker">See it work</div><h3>Real recordings, not renders.</h3><p>Screen recordings of Roshera at work this week, sped up. Nothing staged: what the agent said and what the kernel checked is what you see.</p>
 <ol class="chapters">${CLIPS.map(([id, t, d], i) => `<li><button type="button" data-src="/video/${id}.mp4" data-poster="/video/${id}.jpg" aria-selected="${i === 0}"><span class="mono">${String(i + 1).padStart(2, '0')}</span><b>${t}</b><em>${d}</em></button></li>`).join('')}</ol></div>
 <figure class="screen"><div class="chrome"><i></i><i></i><i></i><span class="mono">Roshera</span></div><video muted playsinline preload="metadata" aria-label="Recording of Roshera"></video><div class="progress"><i></i></div></figure>
 </section>`
 
-const LOOP = `<section class="sec loop reveal" data-loop>
+const LOOP = `<section class="sec loop reveal" id="loop" data-loop>
 <div><div class="mono kicker">Design · mesh · simulate · improve</div><h3>Simulation that feeds back into the design.</h3><p>The next stage closes the loop: mesh the certified part, simulate it, and turn the result into a change the kernel can make and check, with every result traced to the face that caused it.</p>
 <ol class="loop-steps"><li data-step>Part</li><li data-step>Mesh</li><li data-step>Simulate</li><li data-step>Feedback</li><li data-step>Improve</li></ol>
 <p class="note" data-note aria-live="polite"></p>
@@ -242,17 +248,18 @@ function home() {
   </div>
   <div class="contact-card">
     <div class="in">
-      <h2><img src="/logo.png" alt="" width="22" height="22">Start a pilot</h2>
-      <p>Send us a part you make today, your process and what your drawings must show.</p>
+      <h2><img src="/logo.png" alt="" width="22" height="22">Work with us</h2>
+      <p>Engineering team: send a part you make today. AI lab: tell us what your models must build or be graded on.</p>
       <label class="mono" for="mail">Write to</label>
       <div class="addr"><span id="mail">${EMAIL}</span></div>
-      <a class="go" href="mailto:${EMAIL}?subject=Roshera%20pilot">Email us</a>
+      <a class="go" href="mailto:${EMAIL}?subject=Roshera">Email us</a>
     </div>
     <div class="status mono"><span><i></i>Kernel online</span><span>pilots open</span></div>
   </div>
 </div>
 <main class="wrap">
 ${PIPELINE}
+${DOORS}
 ${PLAYER}
 ${extra}
 ${LOOP}
@@ -345,6 +352,8 @@ write(
   `# ${NAME}
 
 > ${TAGLINE} Roshera is a native B-Rep geometry kernel with a drawing bench, an event-sourced design timeline and exact signed-distance fields. People use it in a CAD workspace; AI agents use the same commands over REST and the Model Context Protocol. Every result carries a certificate: sheet values are re-measured against the solid, and operations outside what the kernel can verify are refused with a reason.
+
+Roshera works with two kinds of customer: engineering teams (production drawings from STEP, certified parts) and AI labs and agent builders (certificate-graded evals, a geometry environment with verifiable rewards, MCP tool access). Meshing and simulation that feed back into the design are in development.
 
 Contact: ${EMAIL}
 
