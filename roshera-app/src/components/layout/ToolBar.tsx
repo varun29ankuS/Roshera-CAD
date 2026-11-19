@@ -1471,7 +1471,7 @@ export function ToolBar() {
   const exportGroup: ToolGroup = {
     id: 'export',
     icon: FileDown,
-    tooltip: 'Export or import',
+    tooltip: 'Export the part',
     sections: [
       {
         label: 'Export',
@@ -1480,14 +1480,6 @@ export function ToolBar() {
           { icon: FileDown, label: 'STL', action: () => sendDirectExport('STL') },
           { icon: FileDown, label: 'OBJ', action: () => sendDirectExport('OBJ') },
           { icon: FileDown, label: 'ROS (Roshera)', action: () => sendDirectExport('ROS') },
-        ],
-      },
-      {
-        label: 'Import',
-        items: [
-          // Opens the StepImportDropzone's native file picker (which also
-          // accepts drag-and-drop onto the viewport).
-          { icon: FileUp, label: 'STEP', action: () => window.dispatchEvent(new CustomEvent('roshera:open-step-import')) },
         ],
       },
     ],
@@ -1522,6 +1514,14 @@ export function ToolBar() {
     { kind: 'cap', label: 'MAKE' },
     tool({ icon: DfmIcon, label: 'DFM', active: docMode === 'dfm', action: () => setDocMode('dfm') }),
     tool({ icon: DrawingIcon, label: 'Drawing', action: () => setDocMode('drawing') }),
+    // Import is its own button (Varun 2026-11-19: "I only see export in make
+    // toolbar" -- it was the second section of the Export flyout). Opens the
+    // StepImportDropzone's file picker, which also takes drag-and-drop.
+    tool({
+      icon: FileUp,
+      label: 'Import',
+      action: () => window.dispatchEvent(new CustomEvent('roshera:open-step-import')),
+    }),
     flyout(exportGroup, 'Export'),
   ]
 
