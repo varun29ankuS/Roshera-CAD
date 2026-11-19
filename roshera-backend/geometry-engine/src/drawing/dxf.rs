@@ -38,8 +38,8 @@ use dxf::{Color, Drawing as DxfDrawing, LwPolylineVertex, Point, Vector};
 use thiserror::Error;
 
 use super::layout::{
-    compute_layout, SheetItemKind, CAP_HEIGHT_OF_EM, DIM_TEXT_FONT_MM, GLYPH_ADVANCE_EM,
-    NOTES_BOTTOM_BASELINE_MM, NOTES_FONT_MM, NOTES_LINE_PITCH_MM,
+    compute_layout, PlacedDimension, SheetItemKind, CAP_HEIGHT_OF_EM, DIM_TEXT_FONT_MM,
+    GLYPH_ADVANCE_EM, NOTES_BOTTOM_BASELINE_MM, NOTES_FONT_MM, NOTES_LINE_PITCH_MM,
 };
 use super::types::{Drawing, ProjectedView, SheetSize};
 
@@ -108,9 +108,19 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     // LWPOLYLINE is MinVersion=R14 — under the default every view-geometry
     // and hole-table-border polyline vanished from the written file while
     // TEXT/LINE survived, so the sheet exported as floating annotations
-    // with no part edges. R2000 (AC1015) is the universally-readable
-    // baseline that supports LWPOLYLINE.
-    dxf.header.version = dxf::enums::AcadVersion::R2000;
+    // with no part edges. R2000 (AC1015) was the baseline that supports
+    // LWPOLYLINE; R2007 (AC1021) is used because its text is UTF-8. In an
+    // R2000 file the writer escapes every non-ASCII character (`×` ->
+    // `\U+00D7`) and FreeCAD 1.0 showed the escapes literally ("6\U+00D7
+    // R2.5", 2026-11-19); every current CAD tool reads R2007.
+    dxf.header.version = dxf::enums::AcadVersion::R2007;
+    // -- Units ---------------------------------------------------------
+    // Every coordinate on the sheet is a millimetre. Without these the crate
+    // writes `$MEASUREMENT` English and `$INSUNITS` unitless, and FreeCAD
+    // read the sheet as inches: everything 25.4 times too large (found
+    // opening the Volvo demo sheet, 2026-11-19).
+    dxf.header.drawing_units = dxf::enums::DrawingUnits::Metric;
+    dxf.header.default_drawing_units = dxf::enums::Units::Millimeters;
 
     // -- Layers --------------------------------------------------------
     register_layer(&mut dxf, LAYER_FRAME, ACI_GREY);
@@ -281,16 +291,12 @@ fn emit_view_polylines(
             continue;
         }
         let mut lw = LwPolyline::default();
-        lw.vertices = poly
+        let on_sheet: Vec<[f64; 2]> = poly
             .points
             .iter()
-            .map(|p| {
-                let mut v = LwPolylineVertex::default();
-                v.x = tx + s * p[0];
-                v.y = ty + s * p[1];
-                v
-            })
+            .map(|p| [tx + s * p[0], ty + s * p[1]])
             .collect();
+        lw.vertices = bulged_vertices(&on_sheet);
         let mut common = EntityCommon::default();
         common.layer = layer.to_string();
         let mut ent = Entity::new(EntityType::LwPolyline(lw));
@@ -369,16 +375,12 @@ fn emit_view_hidden(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
             continue;
         }
         let mut lw = LwPolyline::default();
-        lw.vertices = poly
+        let on_sheet: Vec<[f64; 2]> = poly
             .points
             .iter()
-            .map(|p| {
-                let mut v = LwPolylineVertex::default();
-                v.x = tx + s * p[0];
-                v.y = ty + s * p[1];
-                v
-            })
+            .map(|p| [tx + s * p[0], ty + s * p[1]])
             .collect();
+        lw.vertices = bulged_vertices(&on_sheet);
         dxf.add_entity(dashed(EntityType::LwPolyline(lw)));
     }
     for c in &view.hidden_circles {
@@ -464,41 +466,56 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
     // its anchor, and the bbox carries no orientation. The SVG's dim_text
     // inks `x=anchor, y=anchor, rotate(text_rot_deg about anchor)` — the
     // DXF mirrors that exactly with the y-flip / angle negation above.
+    // Each dimension carries its ink -- extension lines (as broken round
+    // other numbers), dimension line, filled arrowheads, value -- the same
+    // geometry the SVG draws. A linear dimension is written as a DIMENSION
+    // entity (its measured points, its line, its value) whose block holds
+    // that ink, so a CAD tool reads it as a dimension; a callout (leader to a
+    // feature) or a leader-free label is written as its ink. Before
+    // 2026-11-19 only the value TEXT was written: in FreeCAD every
+    // dimension was a bare number.
+    let mut dim_blocks = 0usize;
     for pd in &layout.dimensions {
         if pd.label.is_empty() {
             continue;
         }
-        let x = pd.text_anchor[0];
-        let y = sheet_h - pd.text_anchor[1];
-        let rotation_deg = -pd.text_rot_deg;
-        add_text(
-            dxf,
-            LAYER_DIMENSIONS,
-            x,
-            y,
-            // DXF TEXT height is the CAPITAL height; the SVG's font size is
-            // the em box. The same ink: capitals 0.70 of DIM_TEXT_FONT_MM.
-            DIM_TEXT_FONT_MM * CAP_HEIGHT_OF_EM,
-            rotation_deg,
-            &pd.label,
-            HorizontalTextJustification::Center,
-        );
-        // A basic dimension's box: four lines around the text, turned with
-        // it (the same box the SVG draws).
-        if pd.boxed {
-            let w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM + 1.6;
-            let (lo, hi) = (-0.75, DIM_TEXT_FONT_MM + 0.15);
-            let (sin, cos) = rotation_deg.to_radians().sin_cos();
-            let at = |u: f64, v: f64| (x + u * cos - v * sin, y + u * sin + v * cos);
-            let corners = [
-                at(-0.5 * w, lo),
-                at(0.5 * w, lo),
-                at(0.5 * w, hi),
-                at(-0.5 * w, hi),
-            ];
-            for k in 0..4 {
-                let (p, q) = (corners[k], corners[(k + 1) % 4]);
-                add_line(dxf, LAYER_DIMENSIONS, p.0, p.1, q.0, q.1);
+        let ink = dimension_ink(pd, sheet_h);
+        match linear_definition(pd, sheet_h) {
+            Some(def) => {
+                dim_blocks += 1;
+                let name = format!("*D{dim_blocks}");
+                let mut record = dxf::tables::BlockRecord::default();
+                record.name = name.clone();
+                dxf.add_block_record(record);
+                let mut block = dxf::Block::default();
+                block.name = name.clone();
+                block.layer = LAYER_DIMENSIONS.to_string();
+                block.set_is_anonymous(true);
+                block.entities = ink;
+                dxf.add_block(block);
+
+                let mut base = dxf::entities::DimensionBase::default();
+                base.block_name = name;
+                base.definition_point_1 = Point::new(def.line_point[0], def.line_point[1], 0.0);
+                base.text_mid_point = Point::new(def.text_mid[0], def.text_mid[1], 0.0);
+                base.text = pd.label.clone();
+                base.dimension_style_name = "STANDARD".to_string();
+                base.is_block_reference_referenced_by_this_block_only = true;
+                let dim = dxf::entities::RotatedDimension {
+                    dimension_base: base,
+                    definition_point_2: Point::new(def.feature[0][0], def.feature[0][1], 0.0),
+                    definition_point_3: Point::new(def.feature[1][0], def.feature[1][1], 0.0),
+                    rotation_angle: def.rotation_deg,
+                    ..Default::default()
+                };
+                let mut ent = Entity::new(EntityType::RotatedDimension(dim));
+                ent.common.layer = LAYER_DIMENSIONS.to_string();
+                dxf.add_entity(ent);
+            }
+            None => {
+                for ent in ink {
+                    dxf.add_entity(ent);
+                }
             }
         }
     }
@@ -1005,6 +1022,286 @@ fn add_text(
 }
 
 // ---------------------------------------------------------------------
+// Dimensions: ink and definition
+// ---------------------------------------------------------------------
+
+/// A LINE entity on a layer, in DXF (+Y-up) sheet coordinates.
+fn line_entity(layer: &str, a: [f64; 2], b: [f64; 2]) -> Entity {
+    let mut line = Line::default();
+    line.p1 = Point::new(a[0], a[1], 0.0);
+    line.p2 = Point::new(b[0], b[1], 0.0);
+    let mut ent = Entity::new(EntityType::Line(line));
+    ent.common.layer = layer.to_string();
+    ent
+}
+
+/// The ink of one placed dimension in DXF (+Y-up) sheet coordinates: its
+/// extension lines as drawn (broken round other numbers), its dimension or
+/// leader line, its arrowheads as filled SOLID triangles, its value TEXT and
+/// a basic dimension's box. The same geometry `svg::render_dimensions` inks;
+/// a leader-free label (angle / point callout) is its text alone.
+fn dimension_ink(pd: &PlacedDimension, sheet_h: f64) -> Vec<Entity> {
+    use super::layout::{extension_line_pieces, AR_L, AR_W};
+    let up = |p: [f64; 2]| [p[0], sheet_h - p[1]];
+    let mut out = Vec::new();
+    let [l0, l1] = pd.line;
+    let has_line = (l0[0] - l1[0]).abs() > 1e-9 || (l0[1] - l1[1]).abs() > 1e-9;
+    if has_line {
+        for i in 0..pd.ext.len() {
+            for seg in extension_line_pieces(pd, i) {
+                let (a, b) = (up(seg[0]), up(seg[1]));
+                if (a[0] - b[0]).hypot(a[1] - b[1]) > 1e-9 {
+                    out.push(line_entity(LAYER_DIMENSIONS, a, b));
+                }
+            }
+        }
+        out.push(line_entity(LAYER_DIMENSIONS, up(l0), up(l1)));
+        for ar in &pd.arrows {
+            // `dir` points from the tip toward the base (SVG frame); the
+            // y-flip turns it with the sheet.
+            let tip = up(ar.tip);
+            let dir = [ar.dir[0], -ar.dir[1]];
+            let base = [tip[0] + dir[0] * AR_L, tip[1] + dir[1] * AR_L];
+            let perp = [-dir[1] * AR_W, dir[0] * AR_W];
+            let b1 = [base[0] - perp[0], base[1] - perp[1]];
+            let b2 = [base[0] + perp[0], base[1] + perp[1]];
+            let solid = dxf::entities::Solid {
+                first_corner: Point::new(tip[0], tip[1], 0.0),
+                second_corner: Point::new(b1[0], b1[1], 0.0),
+                third_corner: Point::new(b2[0], b2[1], 0.0),
+                // A triangle: the fourth corner repeats the third.
+                fourth_corner: Point::new(b2[0], b2[1], 0.0),
+                ..Default::default()
+            };
+            let mut ent = Entity::new(EntityType::Solid(solid));
+            ent.common.layer = LAYER_DIMENSIONS.to_string();
+            out.push(ent);
+            // The same triangle as a closed outline: FreeCAD 1.0's DXF
+            // importer skips SOLID ("Unsupported DXF features: Entity type
+            // 'SOLID'"), so without it every arrowhead vanished there.
+            // AutoCAD and other readers fill the SOLID underneath.
+            let mut outline = LwPolyline::default();
+            outline.vertices = [tip, b1, b2]
+                .into_iter()
+                .map(|p| {
+                    let mut v = LwPolylineVertex::default();
+                    v.x = p[0];
+                    v.y = p[1];
+                    v
+                })
+                .collect();
+            outline.set_is_closed(true);
+            let mut ent = Entity::new(EntityType::LwPolyline(outline));
+            ent.common.layer = LAYER_DIMENSIONS.to_string();
+            out.push(ent);
+        }
+    }
+    let [x, y] = up(pd.text_anchor);
+    let rotation_deg = -pd.text_rot_deg;
+    let mut text = Text::default();
+    text.value = pd.label.clone();
+    // DXF TEXT height is the CAPITAL height; the SVG's font size is the em
+    // box. The same ink: capitals 0.70 of DIM_TEXT_FONT_MM.
+    text.text_height = DIM_TEXT_FONT_MM * CAP_HEIGHT_OF_EM;
+    text.rotation = rotation_deg;
+    text.horizontal_text_justification = HorizontalTextJustification::Center;
+    text.location = Point::new(x, y, 0.0);
+    text.second_alignment_point = Point::new(x, y, 0.0);
+    let mut ent = Entity::new(EntityType::Text(text));
+    ent.common.layer = LAYER_DIMENSIONS.to_string();
+    out.push(ent);
+    // A basic dimension's box: four lines around the text, turned with it
+    // (the same box the SVG draws).
+    if pd.boxed {
+        let w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM + 1.6;
+        let (lo, hi) = (-0.75, DIM_TEXT_FONT_MM + 0.15);
+        let (sin, cos) = rotation_deg.to_radians().sin_cos();
+        let at = |u: f64, v: f64| [x + u * cos - v * sin, y + u * sin + v * cos];
+        let corners = [
+            at(-0.5 * w, lo),
+            at(0.5 * w, lo),
+            at(0.5 * w, hi),
+            at(-0.5 * w, hi),
+        ];
+        for k in 0..4 {
+            out.push(line_entity(
+                LAYER_DIMENSIONS,
+                corners[k],
+                corners[(k + 1) % 4],
+            ));
+        }
+    }
+    out
+}
+
+/// What a CAD tool needs to read a linear dimension, in DXF (+Y-up) sheet
+/// coordinates: the two measured feature points, a point on the dimension
+/// line, the text position and the line's direction.
+struct LinearDefinition {
+    feature: [[f64; 2]; 2],
+    line_point: [f64; 2],
+    text_mid: [f64; 2],
+    rotation_deg: f64,
+}
+
+/// The definition of a placed dimension when it is a linear one: two
+/// extension lines, parallel to each other and square to a dimension line
+/// whose ends sit on them. A callout (leader to a feature) or a leader-free
+/// label is not, and returns `None`.
+fn linear_definition(pd: &PlacedDimension, sheet_h: f64) -> Option<LinearDefinition> {
+    let up = |p: [f64; 2]| [p[0], sheet_h - p[1]];
+    let unit = |a: [f64; 2], b: [f64; 2]| -> Option<[f64; 2]> {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = dx.hypot(dy);
+        (len > 1e-6).then(|| [dx / len, dy / len])
+    };
+    let (l0, l1) = (up(pd.line[0]), up(pd.line[1]));
+    let along = unit(l0, l1)?;
+    let mut feature = [[0.0; 2]; 2];
+    for (i, end) in [l0, l1].into_iter().enumerate() {
+        let (e0, e1) = (up(pd.ext[i][0]), up(pd.ext[i][1]));
+        let e = unit(e0, e1)?;
+        // Square to the dimension line.
+        if (e[0] * along[0] + e[1] * along[1]).abs() > 1e-3 {
+            return None;
+        }
+        // The dimension line's end sits on this extension line.
+        let off = [end[0] - e0[0], end[1] - e0[1]];
+        if (off[0] * e[1] - off[1] * e[0]).abs() > 1e-3 {
+            return None;
+        }
+        // The measured point is the extension line's end away from the
+        // dimension line (its other end overshoots the line).
+        let d0 = (e0[0] - end[0]).hypot(e0[1] - end[1]);
+        let d1 = (e1[0] - end[0]).hypot(e1[1] - end[1]);
+        feature[i] = if d0 >= d1 { e0 } else { e1 };
+    }
+    Some(LinearDefinition {
+        feature,
+        line_point: l1,
+        text_mid: up(pd.text_anchor),
+        rotation_deg: along[1].atan2(along[0]).to_degrees(),
+    })
+}
+
+// ---------------------------------------------------------------------
+// Arcs: tessellated circular arcs written as true arcs
+// ---------------------------------------------------------------------
+
+/// The furthest a sample may sit from the fitted circle (sheet mm) for a run
+/// of samples to be written as one arc. The samples of a projected circular
+/// arc lie on it to rounding; a spline's do not.
+const ARC_FIT_TOL_MM: f64 = 0.002;
+/// The largest angle one segment may turn through on a fitted arc. Kernel
+/// tessellation steps are a few degrees; a square's corners (90 deg) or a
+/// hexagon's (60 deg) lie on a circle too and must stay straight.
+const ARC_MAX_STEP_RAD: f64 = 25.0 * std::f64::consts::PI / 180.0;
+/// Fewest samples that make an arc (three segments).
+const ARC_MIN_POINTS: usize = 4;
+/// Larger radii are written straight: a near-flat run is a line.
+const ARC_MAX_RADIUS_MM: f64 = 5000.0;
+
+/// Centre and radius of the circle through three points, `None` when they
+/// are (nearly) collinear.
+fn circle_through(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> Option<([f64; 2], f64)> {
+    let d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    let (a2, b2, c2) = (
+        a[0] * a[0] + a[1] * a[1],
+        b[0] * b[0] + b[1] * b[1],
+        c[0] * c[0] + c[1] * c[1],
+    );
+    let ux = (a2 * (b[1] - c[1]) + b2 * (c[1] - a[1]) + c2 * (a[1] - b[1])) / d;
+    let uy = (a2 * (c[0] - b[0]) + b2 * (a[0] - c[0]) + c2 * (b[0] - a[0])) / d;
+    let r = (a[0] - ux).hypot(a[1] - uy);
+    Some(([ux, uy], r))
+}
+
+/// The signed sweep (radians, counter-clockwise positive in the +Y-up DXF
+/// frame) of `pts` as one arc, or `None` when they are not one arc: off the
+/// circle through their ends and middle, turning back, turning too far in
+/// one step, or a full turn or more.
+fn arc_sweep(pts: &[[f64; 2]]) -> Option<f64> {
+    if pts.len() < ARC_MIN_POINTS {
+        return None;
+    }
+    let (c, r) = circle_through(pts[0], pts[pts.len() / 2], pts[pts.len() - 1])?;
+    if r > ARC_MAX_RADIUS_MM {
+        return None;
+    }
+    if pts
+        .iter()
+        .any(|p| ((p[0] - c[0]).hypot(p[1] - c[1]) - r).abs() > ARC_FIT_TOL_MM)
+    {
+        return None;
+    }
+    let mut sweep = 0.0;
+    let mut sign = 0.0_f64;
+    for w in pts.windows(2) {
+        let (u, v) = (
+            [w[0][0] - c[0], w[0][1] - c[1]],
+            [w[1][0] - c[0], w[1][1] - c[1]],
+        );
+        let step = (u[0] * v[1] - u[1] * v[0]).atan2(u[0] * v[0] + u[1] * v[1]);
+        if step.abs() < 1e-12 || step.abs() > ARC_MAX_STEP_RAD {
+            return None;
+        }
+        if sign == 0.0 {
+            sign = step.signum();
+        } else if step.signum() != sign {
+            return None;
+        }
+        sweep += step;
+    }
+    (sweep.abs() < 2.0 * std::f64::consts::PI - 1e-6).then_some(sweep)
+}
+
+/// A polyline's vertices with every run of samples that lies on one circular
+/// arc written as a single bulged segment (DXF LWPOLYLINE bulge = tan of a
+/// quarter of the arc's sweep). FreeCAD, AutoCAD and CAM tools read a bulged
+/// segment as a true arc: snaps find its centre, its radius reads back.
+fn bulged_vertices(pts: &[[f64; 2]]) -> Vec<LwPolylineVertex> {
+    let vertex = |p: [f64; 2], bulge: f64| {
+        let mut v = LwPolylineVertex::default();
+        v.x = p[0];
+        v.y = p[1];
+        v.bulge = bulge;
+        v
+    };
+    let mut out = Vec::with_capacity(pts.len());
+    let mut i = 0;
+    while i < pts.len() {
+        // The longest run from `i` that is one arc.
+        let mut best: Option<(usize, f64)> = None;
+        let mut j = i + ARC_MIN_POINTS - 1;
+        while j < pts.len() {
+            match arc_sweep(&pts[i..=j]) {
+                Some(sweep) => best = Some((j, sweep)),
+                None => break,
+            }
+            j += 1;
+        }
+        match best {
+            Some((end, sweep)) => {
+                out.push(vertex(pts[i], (sweep / 4.0).tan()));
+                i = end;
+                if i == pts.len() - 1 {
+                    out.push(vertex(pts[i], 0.0));
+                    break;
+                }
+            }
+            None => {
+                out.push(vertex(pts[i], 0.0));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
 // Misc helpers (kept in sync with svg.rs)
 // ---------------------------------------------------------------------
 
@@ -1456,5 +1753,87 @@ mod tests {
         // Empty / whitespace falls back to a default.
         assert_eq!(sanitise_layer_name(""), "VIEW");
         assert_eq!(sanitise_layer_name("   "), "VIEW");
+    }
+
+    /// A tessellated circular arc is written as one bulged segment: FreeCAD
+    /// imported the Volvo demo sheet as 72 837 straight edges and 20 circles,
+    /// every fillet and boss outline a run of facets (2026-11-19).
+    ///
+    /// Mutation: make `bulged_vertices` write every sample straight -> RED.
+    #[test]
+    fn a_sampled_arc_is_written_as_one_bulged_segment() {
+        // A quarter of a 10 mm circle (16 steps, counter-clockwise), then a
+        // straight run on to (-6, 10).
+        let mut pts: Vec<[f64; 2]> = (0..=16)
+            .map(|k| {
+                let a = std::f64::consts::FRAC_PI_2 * k as f64 / 16.0;
+                [10.0 * a.cos(), 10.0 * a.sin()]
+            })
+            .collect();
+        pts.push([-3.0, 10.0]);
+        pts.push([-6.0, 10.0]);
+        let v = bulged_vertices(&pts);
+        // The arc start, the arc end, then the straight run.
+        assert_eq!(
+            v.len(),
+            4,
+            "arc start, arc end and two straight points: {v:?}"
+        );
+        let quarter = (std::f64::consts::FRAC_PI_2 / 4.0).tan();
+        assert!(
+            (v[0].bulge - quarter).abs() < 1e-9,
+            "bulge {} ≠ tan(90°/4)",
+            v[0].bulge
+        );
+        assert!(
+            (v[1].x).abs() < 1e-9 && (v[1].y - 10.0).abs() < 1e-9,
+            "arc ends at (0, 10)"
+        );
+        assert!(
+            v[1..].iter().all(|x| x.bulge == 0.0),
+            "the rest is straight"
+        );
+    }
+
+    /// A square's corners lie on a circle too; it stays four straight sides.
+    #[test]
+    fn a_square_is_not_mistaken_for_an_arc() {
+        let pts = [
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 10.0],
+            [0.0, 10.0],
+            [0.0, 0.0],
+        ];
+        let v = bulged_vertices(&pts);
+        assert_eq!(v.len(), pts.len());
+        assert!(v.iter().all(|x| x.bulge == 0.0), "{v:?}");
+    }
+
+    /// A straight run of samples stays straight.
+    #[test]
+    fn a_straight_run_stays_straight() {
+        let pts: Vec<[f64; 2]> = (0..10).map(|k| [k as f64, 2.0 * k as f64]).collect();
+        let v = bulged_vertices(&pts);
+        assert_eq!(v.len(), pts.len());
+        assert!(v.iter().all(|x| x.bulge == 0.0));
+    }
+
+    /// A clockwise arc carries a negative bulge (DXF: positive is
+    /// counter-clockwise).
+    #[test]
+    fn a_clockwise_arc_has_a_negative_bulge() {
+        let pts: Vec<[f64; 2]> = (0..=8)
+            .map(|k| {
+                let a = -std::f64::consts::FRAC_PI_2 * k as f64 / 8.0;
+                [5.0 * a.cos(), 5.0 * a.sin()]
+            })
+            .collect();
+        let v = bulged_vertices(&pts);
+        assert_eq!(v.len(), 2);
+        assert!(
+            v[0].bulge < 0.0
+                && (v[0].bulge + (std::f64::consts::FRAC_PI_2 / 4.0).tan()).abs() < 1e-9
+        );
     }
 }
