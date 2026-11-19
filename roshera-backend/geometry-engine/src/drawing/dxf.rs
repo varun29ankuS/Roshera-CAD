@@ -87,16 +87,18 @@ const LAYER_LOGO: &str = "LOGO";
 // FreeCAD (legacy importer with "use original DXF colours") paints it WHITE:
 // on its white background the whole sheet opened blank (2026-11-19). ACI 250
 // is near-black (#333333) in every reader.
-/// Part edges, title block, tables, notes.
+//
+// Two-tone (Varun 2026-11-19, after per-kind colours: "the blue
+// dimensioning is really bad look"): the part in near-black, everything said
+// ABOUT it -- dimensions, tags, GD&T, labels, frame, title block, the mark --
+// in one accent, the way a well-made production drawing separates the two.
+/// Part edges, tables, notes.
 const ACI_INK: u8 = 250;
-/// Sheet frame, hidden lines.
-const ACI_GREY: u8 = 8;
-/// Dimensions, hole tags.
-const ACI_BLUE: u8 = 5;
-/// GD&T: datum symbols and feature control frames.
-const ACI_MAGENTA: u8 = 6;
-/// View labels and the Roshera mark (the brand orange).
-const ACI_ORANGE: u8 = 30;
+/// Hidden edges: dashed, and a grey that still reads on a white background
+/// (ACI 8 all but vanished there: partly hidden circles looked broken).
+const ACI_HIDDEN: u8 = 252;
+/// The accent: every annotation (Roshera orange).
+const ACI_ACCENT: u8 = 30;
 
 /// Render a [`Drawing`] to a DXF byte buffer.
 ///
@@ -139,17 +141,17 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     // -- Layers --------------------------------------------------------
     // Layer "0" always exists; it too must not be ACI 7.
     register_layer(&mut dxf, "0", ACI_INK);
-    register_layer(&mut dxf, LAYER_FRAME, ACI_GREY);
-    register_layer(&mut dxf, LAYER_TITLEBLOCK, ACI_INK);
-    register_layer(&mut dxf, LAYER_TITLEBLOCK_TEXT, ACI_INK);
-    register_layer(&mut dxf, LAYER_NOTES, ACI_INK);
-    register_layer(&mut dxf, LAYER_VIEW_LABELS, ACI_ORANGE);
-    register_layer(&mut dxf, LAYER_DIMENSIONS, ACI_BLUE);
-    register_layer(&mut dxf, LAYER_HOLE_TAGS, ACI_BLUE);
-    register_layer(&mut dxf, LAYER_HOLE_TABLE, ACI_INK);
-    register_layer(&mut dxf, LAYER_GDT_DATUM, ACI_MAGENTA);
-    register_layer(&mut dxf, LAYER_GDT_FCF, ACI_MAGENTA);
-    register_layer(&mut dxf, LAYER_LOGO, ACI_ORANGE);
+    register_layer(&mut dxf, LAYER_FRAME, ACI_ACCENT);
+    register_layer(&mut dxf, LAYER_TITLEBLOCK, ACI_ACCENT);
+    register_layer(&mut dxf, LAYER_TITLEBLOCK_TEXT, ACI_ACCENT);
+    register_layer(&mut dxf, LAYER_NOTES, ACI_ACCENT);
+    register_layer(&mut dxf, LAYER_VIEW_LABELS, ACI_ACCENT);
+    register_layer(&mut dxf, LAYER_DIMENSIONS, ACI_ACCENT);
+    register_layer(&mut dxf, LAYER_HOLE_TAGS, ACI_ACCENT);
+    register_layer(&mut dxf, LAYER_HOLE_TABLE, ACI_ACCENT);
+    register_layer(&mut dxf, LAYER_GDT_DATUM, ACI_ACCENT);
+    register_layer(&mut dxf, LAYER_GDT_FCF, ACI_ACCENT);
+    register_layer(&mut dxf, LAYER_LOGO, ACI_ACCENT);
     // One layer per view, named after the view. Duplicate names are
     // resolved by suffixing with an index — AutoCAD requires layer
     // names to be unique, and two views legitimately can share a
@@ -421,7 +423,7 @@ fn emit_view_hidden(out: &mut Vec<Entity>, view: &ProjectedView, layer: &str) {
         common.layer = layer.to_string();
         common.line_type_name = LINE_TYPE_HIDDEN.to_string();
         // Hidden edges read lighter than visible ones on screen.
-        common.color = Color::from_index(ACI_GREY);
+        common.color = Color::from_index(ACI_HIDDEN);
         let mut ent = Entity::new(kind);
         ent.common = common;
         ent
@@ -1496,6 +1498,56 @@ fn bulged_vertices(pts: &[[f64; 2]]) -> Vec<LwPolylineVertex> {
             }
         }
     }
+    drop_collinear(out)
+}
+
+/// The furthest (sheet mm) a dropped sample may sit from the straight
+/// segment that replaces it.
+const COLLINEAR_TOL_MM: f64 = 0.001;
+
+/// Vertices with every sample on a straight run removed: a vertex between
+/// two straight segments goes when it, and every vertex already dropped
+/// since the last kept one, lies within [`COLLINEAR_TOL_MM`] of the segment
+/// from the last kept vertex to the next one. An arc's ends are kept.
+fn drop_collinear(v: Vec<LwPolylineVertex>) -> Vec<LwPolylineVertex> {
+    if v.len() < 3 {
+        return v;
+    }
+    // Distance to the SEGMENT, not its infinite line: a run that doubles
+    // back along itself (out to B, back toward A) has its turning point on
+    // the line but beyond the segment, and dropping it would erase ink (the
+    // first version did: the FRONT view lost 620 mm of edges).
+    let off_line = |a: &LwPolylineVertex, b: &LwPolylineVertex, p: &LwPolylineVertex| {
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 < 1e-24 {
+            0.0
+        } else {
+            (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0)
+        };
+        (p.x - (a.x + t * dx)).hypot(p.y - (a.y + t * dy))
+    };
+    let n = v.len();
+    let mut out: Vec<LwPolylineVertex> = Vec::with_capacity(n);
+    let mut dropped: Vec<usize> = Vec::new();
+    out.push(v[0].clone());
+    for k in 1..n - 1 {
+        let Some(last) = out.last() else { break };
+        let straight_both_sides = last.bulge == 0.0 && v[k].bulge == 0.0;
+        let next = &v[k + 1];
+        if straight_both_sides
+            && off_line(last, next, &v[k]) <= COLLINEAR_TOL_MM
+            && dropped
+                .iter()
+                .all(|&d| off_line(last, next, &v[d]) <= COLLINEAR_TOL_MM)
+        {
+            dropped.push(k);
+        } else {
+            out.push(v[k].clone());
+            dropped.clear();
+        }
+    }
+    out.push(v[n - 1].clone());
     out
 }
 
@@ -1978,11 +2030,13 @@ mod tests {
         pts.push([-6.0, 10.0]);
         let v = bulged_vertices(&pts);
         // The arc start, the arc end, then the straight run.
+        // The arc start, the arc end, then the straight run as one segment.
         assert_eq!(
             v.len(),
-            4,
-            "arc start, arc end and two straight points: {v:?}"
+            3,
+            "arc start, arc end, end of the straight run: {v:?}"
         );
+        assert!((v[2].x + 6.0).abs() < 1e-9 && (v[2].y - 10.0).abs() < 1e-9);
         let quarter = (std::f64::consts::FRAC_PI_2 / 4.0).tan();
         assert!(
             (v[0].bulge - quarter).abs() < 1e-9,
@@ -2014,13 +2068,42 @@ mod tests {
         assert!(v.iter().all(|x| x.bulge == 0.0), "{v:?}");
     }
 
-    /// A straight run of samples stays straight.
+    /// A straight run of samples is written as ONE straight segment: the
+    /// FRONT view of the Volvo bracket carried 18 332 vertices, mostly
+    /// collinear samples, and FreeCAD crashed after a while (2026-11-19).
+    ///
+    /// Mutation: keep every collinear sample -> RED.
     #[test]
-    fn a_straight_run_stays_straight() {
+    fn a_straight_run_is_one_segment() {
         let pts: Vec<[f64; 2]> = (0..10).map(|k| [k as f64, 2.0 * k as f64]).collect();
         let v = bulged_vertices(&pts);
-        assert_eq!(v.len(), pts.len());
+        assert_eq!(v.len(), 2, "{v:?}");
         assert!(v.iter().all(|x| x.bulge == 0.0));
+        assert!((v[1].x - 9.0).abs() < 1e-12 && (v[1].y - 18.0).abs() < 1e-12);
+    }
+
+    /// A run that doubles back along its own line keeps its turning point:
+    /// out to (10, 0) and back to (4, 0) is 16 mm of ink, not 4.
+    ///
+    /// Mutation: measure distance to the infinite line -> RED.
+    #[test]
+    fn a_run_that_doubles_back_keeps_its_turn() {
+        let pts = [[0.0, 0.0], [5.0, 0.0], [10.0, 0.0], [7.0, 0.0], [4.0, 0.0]];
+        let v = bulged_vertices(&pts);
+        let len: f64 = v
+            .windows(2)
+            .map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y))
+            .sum();
+        assert!((len - 16.0).abs() < 1e-9, "ink length {len}: {v:?}");
+    }
+
+    /// A gentle bend is NOT straightened: a point further than the tolerance
+    /// from the joined segment is kept.
+    #[test]
+    fn a_bend_is_kept() {
+        let pts = [[0.0, 0.0], [5.0, 0.0], [10.0, 0.01], [15.0, 0.02]];
+        let v = bulged_vertices(&pts);
+        assert!(v.len() >= 3, "the bend at (5, 0) stays: {v:?}");
     }
 
     /// Pieces meeting end to end are joined into one polyline, in either

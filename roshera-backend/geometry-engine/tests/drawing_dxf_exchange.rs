@@ -141,12 +141,23 @@ fn each_kind_of_line_has_its_layer_colour() {
             "layer {layer} is ACI 7, which FreeCAD paints white"
         );
     }
+    // Two-tone (Varun 2026-11-19, "the blue dimensioning is really bad
+    // look"): the part in near-black, everything said about it -- dimensions,
+    // tags, GD&T, labels, frame, title block, the mark -- in one accent.
     assert_eq!(c("FRONT"), 250, "part edges are near-black");
-    assert_eq!(c("DIMENSIONS"), 5, "dimensions are blue");
-    assert_eq!(c("GDT_FCF"), 6, "GD&T is magenta");
-    assert_eq!(c("VIEW_LABELS"), 30, "view labels are Roshera orange");
-    assert_eq!(c("LOGO"), 30, "the mark is Roshera orange");
-    assert_eq!(c("FRAME"), 8, "the frame is grey");
+    for layer in [
+        "DIMENSIONS",
+        "HOLE_TAGS",
+        "GDT_FCF",
+        "GDT_DATUM",
+        "VIEW_LABELS",
+        "FRAME",
+        "TITLEBLOCK",
+        "TITLEBLOCK_TEXT",
+        "LOGO",
+    ] {
+        assert_eq!(c(layer), 30, "{layer} is in the accent (Roshera orange)");
+    }
 }
 
 /// The title block carries the Roshera mark as vectors, as the PDF does: a
