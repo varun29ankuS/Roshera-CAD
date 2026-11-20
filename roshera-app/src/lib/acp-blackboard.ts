@@ -41,6 +41,7 @@ import {
   AcpProtocolError,
   AcpRateLimitError,
   acpCooldownRemainingMs,
+  installPageHideRelease,
   type AcpSessionUpdate,
   type AcpStopReason,
 } from '@/lib/acp-client'
@@ -649,6 +650,15 @@ export function resetAcpClient(): void {
   // `close()` does not fire `onDisconnect` (it's an intentional close,
   // not a drop) — end the session in the header explicitly here.
   useAcpSessionStore.getState().endSession()
+}
+
+// A reload, navigation or closed tab releases this page's agent connection
+// (and with it the agent's MCP server process) instead of leaving it for
+// the backend's orphan reaper.
+if (typeof window !== 'undefined') {
+  installPageHideRelease(window, () => {
+    if (sharedClient) resetAcpClient()
+  })
 }
 
 /** Send a `session/cancel` on the shared client, if one exists and is

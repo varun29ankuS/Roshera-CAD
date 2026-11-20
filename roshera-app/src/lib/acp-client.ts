@@ -857,7 +857,9 @@ export class AcpClient {
       this.sessStream?.close()
       this.connStream = null
       this.sessStream = null
-      this.connectionId = null
+      // The backend may already have forgotten this id (restart, provider
+      // repin); when it has not, this is the only thing that frees it.
+      this.releaseConnection()
       this.sessionId = null
       this._currentModel = null
       // Re-ask the backend (never a cached copy) which provider now backs
@@ -940,10 +942,44 @@ export class AcpClient {
     this.notify('session/cancel', { sessionId: this.sessionId }, true)
   }
 
-  /** Tear down both SSE streams. Terminal — this client cannot be reused. */
+  /** Tear down both SSE streams and release the connection on the backend.
+   *  Terminal — this client cannot be reused. */
   close(): void {
     this.connStream?.close()
     this.sessStream?.close()
+    this.releaseConnection()
     this.dead = true
   }
+
+  /** `DELETE /acp` for the current connection, fire-and-forget. The backend
+   *  transport ends a connection ONLY on DELETE — a dropped event stream
+   *  does not, and there is no idle timeout — so a client that just walks
+   *  away leaves the connection, its agent and the agent's MCP server
+   *  process alive until the server dies. `keepalive` lets the request
+   *  outlive a page being unloaded. A failure is ignored: the backend's
+   *  orphan reaper closes whatever this misses. */
+  private releaseConnection(): void {
+    const id = this.connectionId
+    if (!id) return
+    this.connectionId = null
+    try {
+      void fetch(this.acpPath, {
+        method: 'DELETE',
+        headers: { 'Acp-Connection-Id': id },
+        keepalive: true,
+      }).catch(() => undefined)
+    } catch {
+      // A fetch that throws synchronously (no network stack) changes nothing.
+    }
+  }
+}
+
+/** Release the app's agent connection when the page is hidden for good
+ *  (`pagehide`: reload, navigation, closed tab). A page restored from the
+ *  back/forward cache finds its client dead and builds a fresh one. */
+export function installPageHideRelease(
+  target: Pick<Window, 'addEventListener'> | { addEventListener: (type: string, fn: () => void) => void },
+  release: () => void,
+): void {
+  target.addEventListener('pagehide', () => release())
 }
