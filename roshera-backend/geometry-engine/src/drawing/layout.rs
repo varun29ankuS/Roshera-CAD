@@ -1222,16 +1222,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     //
     // A hole PATTERN callout states its members' size and, with its location
     // and pitch dimensions, their position — the same holds for its rows.
-    let tabled_sites: Vec<HoleSite> = tabled_hole_sites(drawing)
-        .into_iter()
-        .cloned()
-        .map(|mut s| {
-            // The row's size cell carries the bore's tolerance and authored
-            // text, exactly as its dimension would.
-            s.dia_label = super::dimension_edit::hole_row_ink(drawing, &s);
-            s
-        })
-        .collect();
+    let tabled_sites = hole_table_rows(drawing);
     // Build the tabled-face-id set once so `place_dimensions` can suppress
     // position dims for tabled bores.
     let tabled_face_ids: std::collections::HashSet<u32> = tabled_sites
@@ -1344,7 +1335,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     // Laid out as the same table items the hole table uses, so every
     // renderer inks it and the checker keeps it clear of other ink.
     if let Some(table) = &drawing.profile_table {
-        let table_items = place_profile_table(drawing, table, h, &items, &all_placed);
+        let table_items = place_profile_table(drawing, table, &items, &all_placed);
         items.extend(table_items);
     }
 
@@ -1424,6 +1415,19 @@ fn tabled_hole_sites(drawing: &Drawing) -> Vec<&HoleSite> {
         .hole_sites
         .iter()
         .filter(|s| !s.face_entities.iter().any(|f| callout_faces.contains(f)))
+        .collect()
+}
+
+/// The hole table's rows: every tabled site, its size cell carrying the
+/// bore's tolerance and authored text exactly as its dimension would.
+fn hole_table_rows(drawing: &Drawing) -> Vec<HoleSite> {
+    tabled_hole_sites(drawing)
+        .into_iter()
+        .cloned()
+        .map(|mut s| {
+            s.dia_label = super::dimension_edit::hole_row_ink(drawing, &s);
+            s
+        })
         .collect()
 }
 
@@ -1600,6 +1604,323 @@ const TABLE_ROW_H: f64 = 6.5;
 /// Gap between the table right edge and the frame / title-block left edge.
 const TABLE_MARGIN: f64 = 3.0;
 
+// ── Table paper: one rule for the placers and the sheet search ───────────────
+
+/// Which of the sheet's tables: each has its own slot rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableKind {
+    /// The hole table ([`place_hole_table`]).
+    Hole,
+    /// A freeform outline's ordinate table ([`place_profile_table`]).
+    Profile,
+}
+
+impl TableKind {
+    /// How far (mm) the table keeps clear of other ink.
+    fn clearance(self) -> f64 {
+        match self {
+            TableKind::Hole => 1.0,
+            TableKind::Profile => 2.0,
+        }
+    }
+}
+
+/// The paper a table takes, mm. A table is lettering, so its size is the
+/// same on every sheet and at every scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TablePaper {
+    pub(crate) kind: TableKind,
+    pub(crate) w: f64,
+    pub(crate) h: f64,
+}
+
+/// The hole table's column widths: the widest of each column's header and
+/// cells, never under 6 mm. Columns: TAG · X · Y · Ø · DEPTH.
+fn hole_table_columns(sites: &[HoleSite]) -> Vec<f64> {
+    const HEADERS: [&str; 5] = ["TAG", "X", "Y", "\u{00D8}", "DEPTH"];
+    let width = |t: &str| t.chars().count() as f64 * GLYPH_ADVANCE_EM * TABLE_TEXT_FONT_MM;
+    (0..5)
+        .map(|col| {
+            let data = sites
+                .iter()
+                .map(|s| {
+                    width(match col {
+                        0 => s.tag.as_str(),
+                        1 => s.x_label.as_str(),
+                        2 => s.y_label.as_str(),
+                        3 => s.dia_label.as_str(),
+                        _ => s.depth_label.as_str(),
+                    }) + 2.0 * TABLE_CELL_PAD
+                })
+                .fold(0.0_f64, f64::max);
+            (width(HEADERS[col]) + 2.0 * TABLE_CELL_PAD)
+                .max(data)
+                .max(6.0)
+        })
+        .collect()
+}
+
+/// The text of an ordinate table and its column widths.
+struct ProfileTableText {
+    headers: [&'static str; 4],
+    rows: Vec<[String; 4]>,
+    title: String,
+    summary: String,
+    col_widths: Vec<f64>,
+}
+
+impl ProfileTableText {
+    /// Title + summary + header + one row per station.
+    fn height(&self) -> f64 {
+        (3 + self.rows.len()) as f64 * TABLE_ROW_H
+    }
+
+    fn width(&self) -> f64 {
+        self.col_widths.iter().sum()
+    }
+}
+
+/// A title line, a summary line (chord, maximum thickness and where,
+/// trailing-edge thickness), then `% CHORD | X | UPPER | LOWER`, one row per
+/// station; the last column widened when the title or summary line is wider
+/// than the columns.
+fn profile_table_text(table: &super::profile_table::ProfileTable) -> ProfileTableText {
+    let headers = ["% CHORD", "X", "UPPER", "LOWER"];
+    let rows: Vec<[String; 4]> = table
+        .stations
+        .iter()
+        .map(|s| {
+            [
+                format!("{}", s.percent),
+                ordinate_label(s.x_mm),
+                ordinate_label(s.upper_mm),
+                ordinate_label(s.lower_mm),
+            ]
+        })
+        .collect();
+    let title = "PROFILE ORDINATES (mm FROM CHORD LINE)".to_string();
+    let summary = format!(
+        "CHORD {}  MAX THICKNESS {} AT {}%  TE {}",
+        ordinate_label(table.chord_mm),
+        ordinate_label(table.max_thickness_mm),
+        table.max_thickness_at_percent,
+        ordinate_label(table.te_thickness_mm)
+    );
+    let width_of = |t: &str| t.chars().count() as f64 * GLYPH_ADVANCE_EM * TABLE_TEXT_FONT_MM;
+    let mut col_widths: Vec<f64> = (0..4)
+        .map(|c| {
+            rows.iter()
+                .map(|r| width_of(&r[c]))
+                .fold(width_of(headers[c]), f64::max)
+                + 2.0 * TABLE_CELL_PAD
+        })
+        .map(|cw: f64| cw.max(10.0))
+        .collect();
+    let lines_w = width_of(&title).max(width_of(&summary)) + 2.0 * TABLE_CELL_PAD;
+    let cols_w: f64 = col_widths.iter().sum();
+    if lines_w > cols_w {
+        if let Some(last) = col_widths.last_mut() {
+            *last += lines_w - cols_w;
+        }
+    }
+    ProfileTableText {
+        headers,
+        rows,
+        title,
+        summary,
+        col_widths,
+    }
+}
+
+/// The tables `drawing` prints, in the order [`compute_layout`] places them
+/// (the hole table, then the ordinate table), with the index of the view each
+/// one's "under the view" slot hangs from.
+pub(crate) fn table_papers(drawing: &Drawing) -> Vec<(TablePaper, Option<usize>)> {
+    let mut out = Vec::new();
+    let rows = hole_table_rows(drawing);
+    if !rows.is_empty() {
+        out.push((
+            TablePaper {
+                kind: TableKind::Hole,
+                w: hole_table_columns(&rows).iter().sum(),
+                h: (1 + rows.len()) as f64 * TABLE_ROW_H,
+            },
+            drawing.axial_view_idx,
+        ));
+    }
+    if let Some(table) = &drawing.profile_table {
+        let text = profile_table_text(table);
+        out.push((
+            TablePaper {
+                kind: TableKind::Profile,
+                w: text.width(),
+                h: text.height(),
+            },
+            table.owner_view,
+        ));
+    }
+    out
+}
+
+/// The width of the widest general-note line, mm: the notes strip the hole
+/// table keeps clear of.
+pub(crate) fn notes_width(drawing: &Drawing) -> f64 {
+    [
+        drawing.projection.note(),
+        drawing.unit_note.as_str(),
+        drawing.tolerance_note.as_str(),
+    ]
+    .iter()
+    .map(|t| t.chars().count() as f64 * GLYPH_ADVANCE_EM * NOTES_FONT_MM)
+    .fold(0.0_f64, f64::max)
+}
+
+/// Where a table goes on `sheet`: the first of its kind's named slots, then
+/// the first free place of a 5 mm scan of the frame, that is inside the
+/// frame, clear of the title block and the notes strip (`notes_w` wide, the
+/// hole table's measure of it), and `clear` of the rest of the sheet's ink.
+/// `anchor` is the geometry rect of the view the table may hang under.
+/// `Err` carries the slot above the title block, where a table with no free
+/// paper is printed (and the layout check reports it).
+///
+/// The hole table tries the slot left of the title block, the bottom-left
+/// corner, under the axial view, then scans left to right; the ordinate
+/// table tries the slot above the title block, under the view that shows the
+/// outline, the bottom-left corner, then scans right to left. Both scan from
+/// the bottom of the frame up.
+pub(crate) fn table_spot(
+    sheet: &super::types::SheetSize,
+    notes_w: f64,
+    paper: TablePaper,
+    anchor: Option<Rect2>,
+    clear: impl Fn(&Rect2) -> bool,
+) -> Result<Rect2, Rect2> {
+    let (ml, mr, mt, mb) = frame_margins(sheet);
+    let (tb_w, tb_h) = title_block_size(sheet);
+    let frame_w = sheet.width() - ml - mr;
+    let frame_h = sheet.height() - mt - mb;
+    let tb_x0 = ml + frame_w - tb_w;
+    let tb_y0 = mt + frame_h - tb_h;
+    let frame = Rect2 {
+        x0: ml,
+        y0: mt,
+        x1: ml + frame_w,
+        y1: mt + frame_h,
+    };
+    let title = Rect2 {
+        x0: tb_x0,
+        y0: tb_y0,
+        x1: frame.x1,
+        y1: frame.y1,
+    };
+    let notes = Rect2 {
+        x0: ml,
+        y0: frame.y1 - NOTES_BAND_MM,
+        x1: match paper.kind {
+            TableKind::Hole => ml + 2.5 + notes_w,
+            TableKind::Profile => ml + frame_w * 0.5,
+        },
+        y1: frame.y1,
+    };
+    let (tw, th) = (paper.w, paper.h);
+    let at = |x0: f64, y0: f64| Rect2 {
+        x0,
+        y0,
+        x1: x0 + tw,
+        y1: y0 + th,
+    };
+    let bottom_left = at(ml + 2.0, frame.y1 - NOTES_BAND_MM - 1.5 - th);
+    let (fallback, named) = match paper.kind {
+        TableKind::Hole => {
+            let x1 = tb_x0 - TABLE_MARGIN;
+            let y1 = tb_y0 - TABLE_MARGIN;
+            let right = Rect2 {
+                x0: (x1 - tw).max(ml + 1.0),
+                y0: (y1 - th).max(mt + 1.0),
+                x1,
+                y1,
+            };
+            let below = anchor.map(|g| at(g.x0, g.y1 + 6.0));
+            (right, [Some(right), Some(bottom_left), below])
+        }
+        TableKind::Profile => {
+            let right = at((tb_x0 + tb_w - tw).max(ml + 1.0), tb_y0 - TABLE_MARGIN - th);
+            let below = anchor.map(|g| at(g.x0, g.y1 + 8.0));
+            (right, [Some(right), below, Some(bottom_left)])
+        }
+    };
+    // NOTE on the tolerance sign: `Rect2::intersects(o, tol)` SHRINKS the
+    // test by `tol`; a negative tol expands it, so -1.0 keeps 1 mm of air.
+    let fits = |r: &Rect2| -> bool {
+        r.x0 >= frame.x0
+            && r.y0 >= frame.y0
+            && r.x1 <= frame.x1
+            && r.y1 <= frame.y1
+            && !r.intersects(&title, -1.0)
+            && !r.intersects(&notes, -1.0)
+            && clear(r)
+    };
+    if let Some(r) = named.into_iter().flatten().find(|r| fits(r)) {
+        return Ok(r);
+    }
+    const STEP: f64 = 5.0;
+    let mut y1 = frame.y1 - 2.0;
+    while y1 - th >= frame.y0 + 2.0 {
+        match paper.kind {
+            TableKind::Hole => {
+                let mut x0 = frame.x0 + 2.0;
+                while x0 + tw <= frame.x1 - 2.0 {
+                    let r = at(x0, y1 - th);
+                    if fits(&r) {
+                        return Ok(r);
+                    }
+                    x0 += STEP;
+                }
+            }
+            TableKind::Profile => {
+                let mut x0 = frame.x1 - 2.0 - tw;
+                while x0 >= frame.x0 + 2.0 {
+                    let r = at(x0, y1 - th);
+                    if fits(&r) {
+                        return Ok(r);
+                    }
+                    x0 -= STEP;
+                }
+            }
+        }
+        y1 -= STEP;
+    }
+    Err(fallback)
+}
+
+/// Do the `tables` (in placing order, each with the geometry rect of the view
+/// it may hang under) all find free paper on `sheet`, clear of the
+/// `obstacles` (views and their titles) and of each other, by the slot rule
+/// the layout places them by ([`table_spot`])? What the sheet search asks of
+/// a (sheet, scale) before building it.
+pub(crate) fn tables_find_paper(
+    sheet: &super::types::SheetSize,
+    notes_w: f64,
+    tables: &[(TablePaper, Option<Rect2>)],
+    obstacles: &[Rect2],
+) -> bool {
+    let mut taken: Vec<Rect2> = Vec::new();
+    for (paper, anchor) in tables {
+        let gap = -paper.kind.clearance();
+        let spot = table_spot(sheet, notes_w, *paper, *anchor, |r| {
+            !obstacles
+                .iter()
+                .chain(taken.iter())
+                .any(|o| r.intersects(o, gap))
+        });
+        match spot {
+            Ok(r) => taken.push(r),
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// Place hole-tag callouts and the bordered hole table on the sheet.
 ///
 /// Returns `(hole_tags, new_sheet_items)` where:
@@ -1652,88 +1973,24 @@ fn ordinate_label(v: f64) -> String {
 fn place_profile_table(
     drawing: &Drawing,
     table: &super::profile_table::ProfileTable,
-    sheet_h: f64,
     existing: &[SheetItem],
     dimensions: &[PlacedDimension],
 ) -> Vec<SheetItem> {
-    let w = drawing.sheet_size.width();
-    let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
-    let (tb_w, tb_h) = title_block_size(&drawing.sheet_size);
-    let frame_w = w - ml - mr;
-    let frame_h = sheet_h - mt - mb;
-    let tb_x0 = ml + frame_w - tb_w;
-    let tb_y0 = mt + frame_h - tb_h;
-
-    let headers = ["% CHORD", "X", "UPPER", "LOWER"];
-    let rows: Vec<[String; 4]> = table
-        .stations
-        .iter()
-        .map(|s| {
-            [
-                format!("{}", s.percent),
-                ordinate_label(s.x_mm),
-                ordinate_label(s.upper_mm),
-                ordinate_label(s.lower_mm),
-            ]
-        })
-        .collect();
-    let title = "PROFILE ORDINATES (mm FROM CHORD LINE)".to_string();
-    let summary = format!(
-        "CHORD {}  MAX THICKNESS {} AT {}%  TE {}",
-        ordinate_label(table.chord_mm),
-        ordinate_label(table.max_thickness_mm),
-        table.max_thickness_at_percent,
-        ordinate_label(table.te_thickness_mm)
-    );
-    let width_of = |t: &str| t.chars().count() as f64 * GLYPH_ADVANCE_EM * TABLE_TEXT_FONT_MM;
-    let mut col_widths: Vec<f64> = (0..4)
-        .map(|c| {
-            rows.iter()
-                .map(|r| width_of(&r[c]))
-                .fold(width_of(headers[c]), f64::max)
-                + 2.0 * TABLE_CELL_PAD
-        })
-        .map(|cw: f64| cw.max(10.0))
-        .collect();
-    // The title and summary lines span the table: widen the last column when
-    // they are wider than the columns.
-    let lines_w = width_of(&title).max(width_of(&summary)) + 2.0 * TABLE_CELL_PAD;
-    let cols_w: f64 = col_widths.iter().sum();
-    if lines_w > cols_w {
-        if let Some(last) = col_widths.last_mut() {
-            *last += lines_w - cols_w;
-        }
-    }
-    let total_w: f64 = col_widths.iter().sum();
-    // Title + summary + header + one row per station.
-    let total_h = (3 + rows.len()) as f64 * TABLE_ROW_H;
-
-    let frame_rect = Rect2 {
-        x0: ml,
-        y0: mt,
-        x1: ml + frame_w,
-        y1: mt + frame_h,
+    let ProfileTableText {
+        headers,
+        rows,
+        title,
+        summary,
+        col_widths,
+    } = profile_table_text(table);
+    let paper = TablePaper {
+        kind: TableKind::Profile,
+        w: col_widths.iter().sum(),
+        h: (3 + rows.len()) as f64 * TABLE_ROW_H,
     };
-    let title_rect = Rect2 {
-        x0: tb_x0,
-        y0: tb_y0,
-        x1: ml + frame_w,
-        y1: mt + frame_h,
-    };
-    let notes_rect = Rect2 {
-        x0: ml,
-        y0: mt + frame_h - NOTES_BAND_MM,
-        x1: ml + frame_w * 0.5,
-        y1: mt + frame_h,
-    };
-    let fits = |r: &Rect2| -> bool {
-        let inside = r.x0 >= frame_rect.x0
-            && r.y0 >= frame_rect.y0
-            && r.x1 <= frame_rect.x1
-            && r.y1 <= frame_rect.y1;
-        if !inside || r.intersects(&title_rect, -1.0) || r.intersects(&notes_rect, -1.0) {
-            return false;
-        }
+    // Clear of every view, label, dimension and table already on the sheet,
+    // and of every dimension's lines.
+    let clear = |r: &Rect2| -> bool {
         if existing.iter().any(|it| {
             matches!(
                 it.kind,
@@ -1743,7 +2000,7 @@ fn place_profile_table(
                     | SheetItemKind::HoleTag
                     | SheetItemKind::HoleTableBorder
                     | SheetItemKind::HoleTableText
-            ) && r.intersects(&it.bbox, -2.0)
+            ) && r.intersects(&it.bbox, -TableKind::Profile.clearance())
         }) {
             return false;
         }
@@ -1760,46 +2017,22 @@ fn place_profile_table(
                 .any(|seg| segment_crosses_rect(&seg, &grown))
         })
     };
-    let at = |x0: f64, y0: f64| Rect2 {
-        x0,
-        y0,
-        x1: x0 + total_w,
-        y1: y0 + total_h,
-    };
-    let right_slot = at(
-        (tb_x0 + tb_w - total_w).max(ml + 1.0),
-        tb_y0 - TABLE_MARGIN - total_h,
-    );
-    let bottom_left = at(ml + 2.0, mt + frame_h - NOTES_BAND_MM - 1.5 - total_h);
-    let below_view = table.owner_view.and_then(|vi| {
+    let anchor = table.owner_view.and_then(|vi| {
         existing
             .iter()
             .find(|it| it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(vi))
-            .map(|g| at(g.bbox.x0, g.bbox.y1 + 8.0))
+            .map(|g| g.bbox)
     });
-    let anywhere = || -> Option<Rect2> {
-        const STEP: f64 = 5.0;
-        let mut y1 = frame_rect.y1 - 2.0;
-        while y1 - total_h >= frame_rect.y0 + 2.0 {
-            let mut x0 = frame_rect.x1 - 2.0 - total_w;
-            while x0 >= frame_rect.x0 + 2.0 {
-                let r = at(x0, y1 - total_h);
-                if fits(&r) {
-                    return Some(r);
-                }
-                x0 -= STEP;
-            }
-            y1 -= STEP;
-        }
-        None
+    // Nowhere free: above the title block; the layout check reports it.
+    let chosen = match table_spot(
+        &drawing.sheet_size,
+        notes_width(drawing),
+        paper,
+        anchor,
+        clear,
+    ) {
+        Ok(r) | Err(r) => r,
     };
-    let chosen = [Some(right_slot), below_view, Some(bottom_left)]
-        .into_iter()
-        .flatten()
-        .find(fits)
-        .or_else(anywhere)
-        // Nowhere free: above the title block; the layout check reports it.
-        .unwrap_or(right_slot);
 
     let mut out: Vec<SheetItem> = Vec::new();
     let border = |x0: f64, y0: f64, x1: f64, y1: f64| SheetItem {
@@ -1868,127 +2101,21 @@ fn place_hole_table(
     existing: &[SheetItem],
     dimensions: &[PlacedDimension],
 ) -> (Vec<PlacedHoleTag>, Vec<SheetItem>) {
-    let w = drawing.sheet_size.width();
-    let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
-    let (tb_w, tb_h) = title_block_size(&drawing.sheet_size);
-    let frame_w = w - ml - mr;
-    let frame_h = sheet_h - mt - mb;
-
-    // Title block occupies the bottom-right corner of the frame.
-    let tb_x0 = ml + frame_w - tb_w;
-    let tb_y0 = mt + frame_h - tb_h;
-
-    // Build table column headers and compute column widths.
-    // Columns: TAG · X · Y · Ø · DEPTH
     let headers = ["TAG", "X", "Y", "\u{00D8}", "DEPTH"];
-
-    // Determine column widths from the widest content (header or data cell).
-    let col_w = |col: usize| -> f64 {
-        let header_w = headers[col].chars().count() as f64 * GLYPH_ADVANCE_EM * TABLE_TEXT_FONT_MM
-            + 2.0 * TABLE_CELL_PAD;
-        let max_data_w = sites
-            .iter()
-            .map(|s| {
-                let text = match col {
-                    0 => s.tag.as_str(),
-                    1 => s.x_label.as_str(),
-                    2 => s.y_label.as_str(),
-                    3 => s.dia_label.as_str(),
-                    _ => s.depth_label.as_str(),
-                };
-                text.chars().count() as f64 * GLYPH_ADVANCE_EM * TABLE_TEXT_FONT_MM
-                    + 2.0 * TABLE_CELL_PAD
-            })
-            .fold(0.0_f64, f64::max);
-        header_w.max(max_data_w).max(6.0) // minimum column width = 6 mm
+    let col_widths = hole_table_columns(sites);
+    let paper = TablePaper {
+        kind: TableKind::Hole,
+        w: col_widths.iter().sum(),
+        // One header row + one row per site.
+        h: (1 + sites.len()) as f64 * TABLE_ROW_H,
     };
-
-    let col_widths: Vec<f64> = (0..5).map(col_w).collect();
-    let total_w: f64 = col_widths.iter().sum();
-    // One header row + one row per site.
-    let total_rows = 1 + sites.len();
-    let total_h = total_rows as f64 * TABLE_ROW_H;
-
-    // ── Candidate anchor slots (see the doc comment for the rule) ────────────
-    // Each candidate is the table rect (x0, y0, x1, y1).
-    let right_slot = {
-        let x1 = tb_x0 - TABLE_MARGIN;
-        let x0 = (x1 - total_w).max(ml + 1.0);
-        let y1 = tb_y0 - TABLE_MARGIN;
-        let y0 = (y1 - total_h).max(mt + 1.0);
-        Rect2 { x0, y0, x1, y1 }
-    };
-    let bottom_left_slot = {
-        // Clear of the notes strip ([`NOTES_BAND_MM`]; it was a fixed 12 mm,
-        // which the ISO 3098 notes outgrew and the table's last row sat on
-        // the projection note).
-        let x0 = ml + 2.0;
-        let y1 = (mt + frame_h) - NOTES_BAND_MM - 1.5;
-        Rect2 {
-            x0,
-            y0: y1 - total_h,
-            x1: x0 + total_w,
-            y1,
-        }
-    };
-    let below_axial_slot = drawing.axial_view_idx.and_then(|ax_idx| {
-        existing
-            .iter()
-            .find(|it| it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(ax_idx))
-            .map(|geo| Rect2 {
-                x0: geo.bbox.x0,
-                y0: geo.bbox.y1 + 6.0,
-                x1: geo.bbox.x0 + total_w,
-                y1: geo.bbox.y1 + 6.0 + total_h,
-            })
-    });
-
-    // A slot FITS when it stays inside the frame, clear of the title block,
-    // and intersects no existing ink item.
-    let frame_rect = Rect2 {
-        x0: ml,
-        y0: mt,
-        x1: ml + frame_w,
-        y1: mt + frame_h,
-    };
-    let title_rect = Rect2 {
-        x0: tb_x0,
-        y0: tb_y0,
-        x1: ml + frame_w,
-        y1: mt + frame_h,
-    };
-    // The general-notes strip (placed after the table, so not yet among
-    // `existing`): the band [`NOTES_BAND_MM`] tall over the widest note line.
-    let notes_rect = {
-        let widest = [
-            drawing.projection.note(),
-            drawing.unit_note.as_str(),
-            drawing.tolerance_note.as_str(),
-        ]
-        .iter()
-        .map(|t| t.chars().count() as f64 * GLYPH_ADVANCE_EM * NOTES_FONT_MM)
-        .fold(0.0_f64, f64::max);
-        Rect2 {
-            x0: ml,
-            y0: mt + frame_h - NOTES_BAND_MM,
-            x1: ml + 2.5 + widest,
-            y1: mt + frame_h,
-        }
-    };
-    // NOTE on the tolerance sign: `Rect2::intersects(o, tol)` SHRINKS the
-    // test by `tol` (overlap must exceed `tol` to count). Placement wants
-    // CLEARANCE, so a NEGATIVE tol expands the test: −1.0 rejects any slot
-    // closer than 1 mm to existing ink — strictly tighter than the
-    // verifier's 0.2 mm collision threshold, so a slot that "fits" here can
-    // never fire the verifier's table-collision check.
-    let fits = |r: &Rect2| -> bool {
-        let inside = r.x0 >= frame_rect.x0
-            && r.y0 >= frame_rect.y0
-            && r.x1 <= frame_rect.x1
-            && r.y1 <= frame_rect.y1;
-        if !inside || r.intersects(&title_rect, -1.0) || r.intersects(&notes_rect, -1.0) {
-            return false;
-        }
+    // Clear of every view, label, dimension text and hole tag (1 mm of air:
+    // strictly tighter than the verifier's 0.2 mm collision threshold, so a
+    // slot that is clear here never fires the table-collision check), and
+    // not across a dimension's lines: its dimension line, extension lines or
+    // a leader's leg (the table was laid over a view's lanes, clear of every
+    // label and through every line).
+    let clear = |r: &Rect2| -> bool {
         if existing.iter().any(|it| {
             matches!(
                 it.kind,
@@ -1996,13 +2123,10 @@ fn place_hole_table(
                     | SheetItemKind::DimensionText
                     | SheetItemKind::ViewLabel
                     | SheetItemKind::HoleTag
-            ) && r.intersects(&it.bbox, -1.0)
+            ) && r.intersects(&it.bbox, -TableKind::Hole.clearance())
         }) {
             return false;
         }
-        // Nor across a dimension's lines: its dimension line, extension
-        // lines or a leader's leg (the table was laid over a view's lanes,
-        // clear of every label and through every line).
         let grown = Rect2 {
             x0: r.x0 - 1.0,
             y0: r.y0 - 1.0,
@@ -2016,39 +2140,25 @@ fn place_hole_table(
                 .any(|seg| segment_crosses_rect(&seg, &grown))
         })
     };
-
-    // When none of the three named slots is free, any free place on the
-    // sheet: the lowest, then leftmost, position of a 5 mm grid over the
-    // frame. (The table used to fall straight back to the RIGHT slot, and on
-    // a sheet whose views filled the right it was printed across one.)
-    let anywhere = || -> Option<Rect2> {
-        const STEP: f64 = 5.0;
-        let mut y1 = frame_rect.y1 - 2.0;
-        while y1 - total_h >= frame_rect.y0 + 2.0 {
-            let mut x0 = frame_rect.x0 + 2.0;
-            while x0 + total_w <= frame_rect.x1 - 2.0 {
-                let r = Rect2 {
-                    x0,
-                    y0: y1 - total_h,
-                    x1: x0 + total_w,
-                    y1,
-                };
-                if fits(&r) {
-                    return Some(r);
-                }
-                x0 += STEP;
-            }
-            y1 -= STEP;
-        }
-        None
+    let anchor = drawing.axial_view_idx.and_then(|ax_idx| {
+        existing
+            .iter()
+            .find(|it| it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(ax_idx))
+            .map(|geo| geo.bbox)
+    });
+    // When no slot is free: the RIGHT slot, and the verifier reports the
+    // residual overlap. (The table used to fall straight back to it before
+    // the scan, and on a sheet whose views filled the right it was printed
+    // across one.)
+    let chosen = match table_spot(
+        &drawing.sheet_size,
+        notes_width(drawing),
+        paper,
+        anchor,
+        clear,
+    ) {
+        Ok(r) | Err(r) => r,
     };
-    let chosen = [Some(right_slot), Some(bottom_left_slot), below_axial_slot]
-        .into_iter()
-        .flatten()
-        .find(fits)
-        .or_else(anywhere)
-        // Fallback: RIGHT slot — the verifier reports the residual overlap.
-        .unwrap_or(right_slot);
 
     let (table_x0, table_y0, table_x1, table_y1) = (chosen.x0, chosen.y0, chosen.x1, chosen.y1);
 

@@ -136,14 +136,18 @@ fn drill(m: &mut BRepModel, s: SolidId, x: f64, y: f64, z0: f64, r: f64, h: f64)
 
 /// EN 1092-1 DN50 PN16 type 11: the raised face Ø102 x 2 (z -2..0), the
 /// Ø165 x 18 plate, the hub from Ø74 at the plate tapering to the Ø60.3 x 2.9
-/// pipe, the weld end 48 from the raised face with a 37.5 deg bevel down to a
-/// 1.6 mm root face, the Ø54.5 bore through; 4 x Ø18 on Ø125. Datum A the
-/// raised face, datum B the bore, a Ø0.5 position frame on every bolt hole.
+/// pipe, the weld end 48 from the raised face prepared as ASME B16.25 / ISO
+/// 9692-1 specify: a 37.5 deg bevel measured from the END FACE (the plane
+/// square to the pipe axis) down to a 1.6 mm root face -- the bevel falls
+/// `dr * tan 37.5` along the axis over its `dr` of wall, so its cone's
+/// half-angle to the axis is 52.5 deg -- the Ø54.5 bore through; 4 x Ø18 on
+/// Ø125. Datum A the raised face, datum B a bolt hole, a Ø0.5 position frame
+/// on every bolt hole.
 fn en1092_weld_neck_with_gdt() -> (BRepModel, SolidId) {
     let mut m = BRepModel::new();
     m.set_event_key(Some("flange".to_string()));
     let bevel_dr = 30.15 - (27.25 + 1.6);
-    let bevel_dz = bevel_dr / 37.5f64.to_radians().tan();
+    let bevel_dz = bevel_dr * 37.5f64.to_radians().tan();
     let meridian = [
         (27.25, -2.0),
         (51.0, -2.0),
@@ -361,18 +365,40 @@ fn a_first_angle_toleranced_weld_neck_flange_is_full_size_and_complete() {
             v.name
         );
     }
+    // Its weld end is a 37.5 deg preparation, and the sheet states it as one:
+    // 37.5° from the end face, not an included angle on a leader.
+    let angles: Vec<&Dimension2d> = d
+        .views
+        .iter()
+        .flat_map(|v| v.dimensions.iter())
+        .filter(|x| x.kind == "angle")
+        .collect();
+    let labels: Vec<&str> = angles.iter().map(|x| x.label.as_str()).collect();
+    assert!(
+        angles
+            .iter()
+            .any(|x| x.label == "37.5\u{00B0}"
+                && x.datum.as_ref().is_some_and(|r| r.kind == "end_face")),
+        "the weld bevel reads 37.5° from the end face: {labels:?}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|l| l.contains("75") && !l.contains("37.5")),
+        "no included angle on the weld end: {labels:?}"
+    );
 }
 
 /// A 300 mm NACA 2412 rib with its datums, position frames and ordinate
-/// table belongs on A3 at 1:2 or A2 at 1:1. It still comes out on A1 at 1:1
-/// filling 9 % of the paper: A2 at 1:1 is 2.4 mm too narrow for the
-/// full-scale isometric cell beside the 300 mm views, and on A3 at 1:2 the
-/// 145 mm ordinate table has no free paper beside the centred views (it is
-/// printed over TOP, and two hole locations 0.18 mm apart read as one
-/// interval at 1:2). Making either clean needs the sheet search to reserve
-/// room for the tables, or a reduced-scale pictorial.
+/// table belongs on A2 or smaller; it came out on A1 at 1:1 filling 9 % of
+/// the paper. On A3 at 1:2 its 116 x 136 mm ordinate table has no free paper
+/// beside the views (it was printed over TOP), and the search did not know:
+/// it built that sheet, found it dirty and kept A1. On A2 at 1:1 the
+/// full-scale isometric cell is 2.4 mm too wide beside the 300 mm views. The
+/// search now counts the tables' paper, skips A3 at 1:2, and draws the rib
+/// full size on A2 with its pictorial at 1:2 (stated in its title, as ISO
+/// 128 allows).
 #[test]
-#[ignore = "open: the sheet search does not reserve paper for the ordinate and hole tables"]
 fn a_toleranced_aerofoil_rib_goes_on_a2_or_smaller() {
     let (mut m, s) = naca2412_rib_with_gdt();
     let _ = frame_for_drawing(&mut m, s);
@@ -391,14 +417,98 @@ fn a_toleranced_aerofoil_rib_goes_on_a2_or_smaller() {
     assert_clean_and_filled(&m, &d, &what);
 }
 
+/// The rib's Ø16 and Ø12 bores are 0.18 mm apart in Y: two rows of its hole
+/// table, Y 17.9 and Y 18.08. Their location dimensions are not inked (the
+/// table states them), so the sheet's check does not report them as one
+/// interval stated twice -- it did on the A3 1:2 sheet, where they were
+/// 0.09 mm apart on paper. The check still reports the same two dimensions
+/// when they ARE inked (no table), where their extension lines would
+/// print on each other.
+///
+/// Mutation: let `verify::check_redundant_dimensions`' same-interval pass
+/// count the dimensions the table states again -> RED.
+#[test]
+fn two_tabled_holes_close_in_y_are_two_rows_not_one_interval() {
+    use geometry_engine::drawing::verify::DrawingIssueKind;
+    let (mut m, s) = naca2412_rib_with_gdt();
+    let _ = frame_for_drawing(&mut m, s);
+    let d = standard_drawing_auto_with_projection(&m, s, uuid::Uuid::nil(), ProjectionAngle::First)
+        .expect("sheet");
+    let row = |y: &str| {
+        d.hole_sites
+            .iter()
+            .find(|h| h.y_label == y)
+            .unwrap_or_else(|| panic!("a row at Y {y}"))
+            .clone()
+    };
+    let (b1, a1) = (row("17.9"), row("18.08"));
+    // Both locations stated in TOP, as the A3 1:2 sheet had them.
+    let mut doctored = d.clone();
+    let mine = |x: &Dimension2d| {
+        x.kind == "position"
+            && x.entities
+                .iter()
+                .any(|e| b1.face_entities.contains(e) || a1.face_entities.contains(e))
+    };
+    let ti = doctored
+        .views
+        .iter()
+        .position(|v| v.name == "TOP")
+        .expect("TOP");
+    let template = doctored.views[ti]
+        .dimensions
+        .iter()
+        .find(|x| x.kind == "position" && (x.a[0] - x.b[0]).abs() < 1e-9)
+        .expect("a Y location in TOP")
+        .clone();
+    for v in &mut doctored.views {
+        v.dimensions.retain(|x| !mine(x));
+    }
+    let min_x = doctored.views[ti].extent.min_x;
+    for (k, site) in [&b1, &a1].into_iter().enumerate() {
+        let mut x = template.clone();
+        x.id = format!("probe-y-{k}");
+        x.key = None;
+        x.entities = site.face_entities.clone();
+        x.value = site.y_mm;
+        x.label = site.y_label.clone();
+        x.a = [min_x + site.x_mm, template.a[1]];
+        x.b = [min_x + site.x_mm, template.a[1] + site.y_mm];
+        doctored.views[ti].dimensions.push(x);
+    }
+    let redundant = |d: &Drawing| {
+        verify_drawing(d)
+            .issues
+            .into_iter()
+            .filter(|i| i.kind == DrawingIssueKind::RedundantDimension)
+            .map(|i| i.message)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        redundant(&doctored).is_empty(),
+        "two table rows read as one interval: {:?}",
+        redundant(&doctored)
+    );
+    // Inked, they would print on each other's lines: still reported.
+    let mut inked = doctored.clone();
+    inked.hole_sites.clear();
+    assert!(
+        redundant(&inked)
+            .iter()
+            .any(|msg| msg.contains("17.9") && msg.contains("18.08")),
+        "{:?}",
+        redundant(&inked)
+    );
+}
+
 // ── Cone angles: each stated by the convention for its kind ─────────────────
 
 /// The EN 1092-1 DN50 weld neck of [`en1092_weld_neck_with_gdt`] with its
 /// weld end prepared the way ASME B16.25 and ISO 9692-1 specify it: the
 /// bevel `bevel_deg` from the END FACE (the plane square to the pipe axis),
 /// down to the 1.6 mm root face, so the bevel cone's half-angle to the axis
-/// is `90 - bevel_deg`. (That fixture runs `dr / tan`, which puts its bevel
-/// 37.5 deg to the AXIS: a 52.5 deg preparation.) Returns the bevel face,
+/// is `90 - bevel_deg` (at 37.5 deg it is that fixture's weld end, without
+/// its GD&T). Returns the bevel face,
 /// which carries a persistent id as a face the app's history minted does.
 fn weld_neck_with_weld_prep(bevel_deg: f64) -> (BRepModel, SolidId, u32) {
     use geometry_engine::primitives::surface::Cone;

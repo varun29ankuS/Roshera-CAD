@@ -625,6 +625,20 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
     // ── Same-view same-interval check ────────────────────────────────────
     // Within each view, look for pairs of dimensions with the same orientation
     // whose projected intervals (lo..hi in sheet space) coincide within 0.5 mm.
+    //
+    // Only dimensions that are INKED take part: a bore's size and location
+    // the hole table states are rows of the table, not lines on the view
+    // (`layout` never draws them), so two of them cannot print on each
+    // other's lines. Two tabled holes 0.18 mm apart in Y (an aerofoil rib's
+    // lightening hole and spar bore) are two rows, 17.9 and 18.08 -- at 1:2
+    // their un-inked location dimensions came 0.09 mm apart on paper and were
+    // reported as one interval stated twice.
+    let table_faces = super::layout::tabled_face_ids(drawing);
+    let stated_by_table = |d: &super::dimensioning::Dimension2d| {
+        matches!(d.kind.as_str(), "position" | "diameter")
+            && !d.entities.is_empty()
+            && d.entities.iter().all(|e| table_faces.contains(e))
+    };
     for v in &drawing.views {
         struct Lin {
             lo: f64,
@@ -633,7 +647,7 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
             label: String,
         }
         let mut lins: Vec<Lin> = Vec::new();
-        for d in &v.dimensions {
+        for d in v.dimensions.iter().filter(|d| !stated_by_table(d)) {
             let a = [
                 v.position_mm[0] + d.a[0] * v.scale,
                 (sheet_h - v.position_mm[1]) - d.a[1] * v.scale,
