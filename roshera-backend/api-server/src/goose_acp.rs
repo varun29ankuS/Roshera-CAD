@@ -809,6 +809,27 @@ pub(crate) fn acp_router(
     acp_provider_epoch: Arc<crate::acp_provider_epoch::AcpProviderEpoch>,
 ) -> Option<axum::Router> {
     let root = GOOSE_ROOT.get()?;
+    Some(acp_router_at(
+        root,
+        auth_manager,
+        ai_provider_manager,
+        acp_provider_epoch,
+    ))
+}
+
+/// The body of [`acp_router`] for an explicit goose root: everything the
+/// production `/acp` surface is, minus the [`GOOSE_ROOT`] lookup that ties
+/// it to a completed [`initialize`]. Split out so a test can drive the real
+/// layer stack (goose's transport, MCP injection, turn bookkeeping, the
+/// orphan reaper, the epoch layer, keepalive) without becoming a second
+/// `initialize()` caller or setting the process-global [`GOOSE_ROOT`] —
+/// which would mount `/acp` on every test-built app in the binary.
+fn acp_router_at(
+    root: &std::path::Path,
+    auth_manager: Arc<session_manager::AuthManager>,
+    ai_provider_manager: Arc<crate::ai_provider_config::AiProviderManager>,
+    acp_provider_epoch: Arc<crate::acp_provider_epoch::AcpProviderEpoch>,
+) -> axum::Router {
     let server = std::sync::Arc::new(goose::acp::server_factory::AcpServer::new(
         goose::acp::server_factory::AcpServerFactoryConfig {
             // No forced builtins — and BUILTIN_REGISTRY is empty anyway
@@ -867,32 +888,30 @@ pub(crate) fn acp_router(
         orphan_grace_secs = reaper.grace().as_secs(),
         "ACP session cap and orphaned-connection reaper configured"
     );
-    Some(
-        inner
-            .layer(axum::middleware::from_fn_with_state(
-                reaper,
-                crate::acp_orphan_reaper::track_acp_connections,
-            ))
-            // Outermost of the inner layers (still under `acp_gate` + auth
-            // at the merge site): a connection minted under a previous
-            // provider epoch is refused with the bare-404 reestablish
-            // signature BEFORE turn bookkeeping or MCP injection ever see
-            // the request — goose stores the provider on the session and
-            // restores it, so without this a repin left the open browser
-            // tab prompting the OLD provider indefinitely. See
-            // `acp_provider_epoch.rs` for the full contract, including the
-            // deliberate in-flight-turn choice.
-            .layer(axum::middleware::from_fn_with_state(
-                acp_provider_epoch,
-                crate::acp_provider_epoch::enforce_provider_epoch,
-            ))
-            // Outermost: inject `: keepalive` SSE comments into idle /acp
-            // streams. Applied after (outside) `observe_acp_transport` so
-            // its scanner reads the raw upstream bytes and never sees the
-            // injected comments. See [`acp_sse_keepalive`] for why silence
-            // must be distinguishable from death.
-            .layer(axum::middleware::from_fn(acp_sse_keepalive)),
-    )
+    inner
+        .layer(axum::middleware::from_fn_with_state(
+            reaper,
+            crate::acp_orphan_reaper::track_acp_connections,
+        ))
+        // Outermost of the inner layers (still under `acp_gate` + auth
+        // at the merge site): a connection minted under a previous
+        // provider epoch is refused with the bare-404 reestablish
+        // signature BEFORE turn bookkeeping or MCP injection ever see
+        // the request — goose stores the provider on the session and
+        // restores it, so without this a repin left the open browser
+        // tab prompting the OLD provider indefinitely. See
+        // `acp_provider_epoch.rs` for the full contract, including the
+        // deliberate in-flight-turn choice.
+        .layer(axum::middleware::from_fn_with_state(
+            acp_provider_epoch,
+            crate::acp_provider_epoch::enforce_provider_epoch,
+        ))
+        // Outermost: inject `: keepalive` SSE comments into idle /acp
+        // streams. Applied after (outside) `observe_acp_transport` so
+        // its scanner reads the raw upstream bytes and never sees the
+        // injected comments. See [`acp_sse_keepalive`] for why silence
+        // must be distinguishable from death.
+        .layer(axum::middleware::from_fn(acp_sse_keepalive))
 }
 
 /// Default upper bound on agent sessions kept loaded per ACP connection.
@@ -2617,5 +2636,156 @@ mod tests {
             body["active"].get("api_key").is_none() && body["active"]["api_key"].is_null(),
             "the config endpoint must never serve a credential"
         );
+    }
+
+    /// One `/acp` request on the router under test.
+    async fn acp_request(
+        router: &axum::Router,
+        method: Method,
+        connection_id: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> Response {
+        let mut builder = Request::builder().method(method).uri("/acp");
+        if let Some(id) = connection_id {
+            builder = builder.header(crate::acp_provider_epoch::ACP_CONNECTION_ID_HEADER, id);
+        }
+        let body = match body {
+            Some(json) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(json.to_string())
+            }
+            None => {
+                builder = builder.header(header::ACCEPT, "text/event-stream");
+                Body::empty()
+            }
+        };
+        let mut request = builder.body(body).expect("request build");
+        // What the global `auth_middleware` attaches before `/acp` runs.
+        request.extensions_mut().insert(AuthInfo {
+            user_id: "reaper-wiring-test".to_string(),
+            session_id: None,
+            permissions: vec![],
+            roles: vec![],
+            is_api_key: false,
+            principal: session_manager::PrincipalKind::Human,
+        });
+        router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the /acp router is infallible")
+    }
+
+    /// `initialize` on a fresh connection; returns its connection id.
+    async fn acp_initialize(router: &axum::Router) -> String {
+        let response = acp_request(
+            router,
+            Method::POST,
+            None,
+            Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": { "protocolVersion": 1, "clientCapabilities": {} }
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "initialize must succeed");
+        response
+            .headers()
+            .get(crate::acp_provider_epoch::ACP_CONNECTION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .expect("initialize must mint an Acp-Connection-Id")
+    }
+
+    /// A JSON-RPC notification on `connection_id`: goose's transport answers
+    /// 202 while the connection exists and a bare 404 once it is gone, and a
+    /// POST never touches the reaper's stream accounting.
+    async fn acp_probe(router: &axum::Router, connection_id: &str) -> StatusCode {
+        acp_request(
+            router,
+            Method::POST,
+            Some(connection_id),
+            Some(serde_json::json!({ "jsonrpc": "2.0", "method": "roshera/probe" })),
+        )
+        .await
+        .status()
+    }
+
+    /// The production call site of the orphan reaper: the router
+    /// [`acp_router`] serves (its body, [`acp_router_at`], over goose's real
+    /// transport) closes a connection that never opens an SSE stream once
+    /// the grace from `ROSHERA_ACP_ORPHAN_GRACE_SECS` passes, and leaves a
+    /// connection holding a stream alone. Remove the reaper layer from
+    /// `acp_router_at`, or stop it reading the grace override, and the
+    /// orphan is still answering 202 at the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acp_router_reaps_a_connection_that_never_opens_a_stream() {
+        // goose reads its Config cell while serving; claim it first.
+        claim_goose_config_cell();
+        let server_root = std::env::temp_dir().join(format!(
+            "roshera-acp-reaper-wiring-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&server_root).expect("temp goose server root");
+
+        // The grace is read once, when the router is built.
+        let router = {
+            let _env_guard = crate::ai_provider_config::process_env_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os(crate::acp_orphan_reaper::ACP_ORPHAN_GRACE_ENV);
+            std::env::set_var(crate::acp_orphan_reaper::ACP_ORPHAN_GRACE_ENV, "1");
+            let router = acp_router_at(
+                &server_root,
+                test_auth_manager(),
+                test_ai_provider_manager(),
+                Arc::new(crate::acp_provider_epoch::AcpProviderEpoch::new()),
+            );
+            match previous {
+                Some(value) => {
+                    std::env::set_var(crate::acp_orphan_reaper::ACP_ORPHAN_GRACE_ENV, value)
+                }
+                None => std::env::remove_var(crate::acp_orphan_reaper::ACP_ORPHAN_GRACE_ENV),
+            }
+            router
+        };
+
+        let live = acp_initialize(&router).await;
+        let live_stream = acp_request(&router, Method::GET, Some(&live), None).await;
+        assert_eq!(live_stream.status(), StatusCode::OK, "SSE GET must open");
+
+        // Minted last and probed at once, so the positive control runs well
+        // inside its 1 s grace even on a loaded machine.
+        let orphan = acp_initialize(&router).await;
+        assert_eq!(
+            acp_probe(&router, &orphan).await,
+            StatusCode::ACCEPTED,
+            "positive control: the orphan exists before its grace has passed"
+        );
+        assert_eq!(acp_probe(&router, &live).await, StatusCode::ACCEPTED);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut orphan_status = acp_probe(&router, &orphan).await;
+        while orphan_status != StatusCode::NOT_FOUND && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            orphan_status = acp_probe(&router, &orphan).await;
+        }
+        assert_eq!(
+            orphan_status,
+            StatusCode::NOT_FOUND,
+            "a connection that never opened an SSE stream must be closed by \
+             the orphan reaper in the production /acp router (1 s grace)"
+        );
+        assert_eq!(
+            acp_probe(&router, &live).await,
+            StatusCode::ACCEPTED,
+            "a connection holding an SSE stream must not be reaped"
+        );
+
+        drop(live_stream);
+        let _ = acp_request(&router, Method::DELETE, Some(&live), None).await;
+        let _ = std::fs::remove_dir_all(&server_root);
     }
 }

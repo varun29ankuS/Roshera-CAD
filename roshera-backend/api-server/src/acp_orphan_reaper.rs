@@ -417,12 +417,16 @@ mod tests {
     }
 
     fn harness(max_turn_deferral: Duration) -> Harness {
+        harness_with_grace(GRACE, max_turn_deferral)
+    }
+
+    fn harness_with_grace(grace: Duration, max_turn_deferral: Duration) -> Harness {
         let deletes = Arc::new(Mutex::new(Vec::new()));
         let inner = stub_inner(Arc::clone(&deletes));
         let turn_active = Arc::new(AtomicBool::new(false));
         let turn_flag = Arc::clone(&turn_active);
         let reaper = Arc::new(AcpOrphanReaper::new(
-            GRACE,
+            grace,
             max_turn_deferral,
             inner.clone(),
             Arc::new(move |_| turn_flag.load(Ordering::SeqCst)),
@@ -465,6 +469,28 @@ mod tests {
         drop(stream);
 
         tokio::time::sleep(SETTLE).await;
+        assert_eq!(deletes(&h), vec!["conn-1".to_string()]);
+    }
+
+    /// The grace is a real wait, not a formality: an orphan is left alone
+    /// until it has elapsed, and reaped once it has. Every other test here
+    /// re-opens its stream (or holds it) before the reap task first runs,
+    /// so a reaper that DELETEs the moment a connection is orphaned passes
+    /// all of them; this is the test that fails on it.
+    #[tokio::test]
+    async fn orphan_is_not_reaped_before_the_grace_elapses() {
+        let grace = Duration::from_millis(1000);
+        let h = harness_with_grace(grace, MAX_TURN_DEFERRAL);
+        send(&h.router, Method::POST, None).await;
+        drop(send(&h.router, Method::GET, Some("conn-1")).await);
+
+        tokio::time::sleep(grace / 5).await;
+        assert!(
+            deletes(&h).is_empty(),
+            "reaped before the grace period elapsed"
+        );
+
+        tokio::time::sleep(grace + SETTLE).await;
         assert_eq!(deletes(&h), vec!["conn-1".to_string()]);
     }
 

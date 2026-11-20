@@ -38,6 +38,7 @@ mod bounded_exec;
 mod branch_switch_tests;
 mod branches;
 mod change_ledger;
+mod child_process_lifetime;
 mod csketch;
 mod documents;
 mod documents_tests;
@@ -10256,6 +10257,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_thread_ids(false)
         .with_env_filter(filter)
         .init();
+
+    // Before anything is spawned: every child this process starts from here
+    // on (each agent session's `node roshera-mcp` server) dies with it, even
+    // when the server is killed outright. Logs its own outcome and never
+    // refuses to boot. See `child_process_lifetime.rs`.
+    child_process_lifetime::bind_child_processes_to_server_lifetime();
 
     // Boot-time construction of the provider-config manager. Moved ahead
     // of the goose lockdown below (it used to sit down near the AI

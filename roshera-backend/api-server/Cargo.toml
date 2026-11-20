@@ -109,6 +109,18 @@ png = "0.17"
 # see vendor/goose/VENDORED.md). The harness is ours to change; every rule
 # above still applies to the vendored copy.
 goose = { path = "../vendor/goose/crates/goose", default-features = false }
+
+# Job Object API for `child_process_lifetime.rs` (a killed server takes its
+# `node` MCP children with it). 0.61 is the version tokio already locks, so
+# this adds features to an existing crate, not a new one.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
 hyper = "1.0"
