@@ -182,3 +182,18 @@ Then the editor UI/UX:
 - the certificate re-checked live while editing.
 
 Reference material: incumbent sheets, plus Hanomi drawings ONLY with Varun's permission, kept internal and never committed.
+
+### The layout model: break the sheet into spaces, never average (Varun 2026-11-20)
+
+Varun: "the key is not to average anything ... but break down the drawing in multiple spaces .. then focus on how to utilize those spaces ... using some algorithm". NIST, the standards and the standard textbooks are the starting references. The sheet is laid out as a hierarchy of spaces, each with its own job and its own score:
+
+1. **Fixed zones, placed first by rule and never floating:** the frame, the title block (ISO 7200), the notes strip, and the table column stacked above the title block.
+2. **View cells, placed by constraint layout in the remaining space.** Projected views must align exactly, gutters are equal, margins are balanced. A Cassowary-style solver states this directly instead of correcting it afterwards. The paper/scale search runs on top and scores by how well the zones fit.
+3. **The space inside each view cell:** the geometry stays fixed, surrounded by four annotation bands (top, bottom, left, right).
+   - Dimensions are assigned to a band by their direction and the datum they reference.
+   - A band's depth comes from how many lanes it needs.
+   - Lanes sit at the professional pitch: about 10 mm from the outline, then 7 to 8 mm apart.
+4. **Free-space map.** The largest empty rectangles are kept in each band and in the leftover paper. Leaders, callouts and FCFs are placed into them in priority order: holes and fits first, general sizes last. Anything that does not fit is reported, never jammed in.
+5. **Scoring per space.** Each zone, cell and band is scored on alignment, spacing, crowding and empty paper, and the sheet's grade is its WORST space. One cramped cell cannot hide behind an empty one.
+
+This replaces the greedy lanes and "any free slot" placement. The 3f084e9a table rule (tables take their spot from the free paper by the same rule the search uses) was the first step.
