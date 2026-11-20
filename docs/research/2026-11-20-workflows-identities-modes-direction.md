@@ -182,3 +182,24 @@ in kb_data.ts, and per-card schemas in the app.
 **Order.** Start with the aerospace supplier slice: revision, release, change, first article inspection, signatures and classification. Then follow the identities. Move up-market only once suppliers depend on it.
 
 **Timing.** It comes after kernel trust, the workflow, identity and ontology work, and the environment. Focus now is on what can be done now.
+
+## Agreed: the Blackboard becomes the harness, customisable (Varun 2026-11-20)
+
+Varun: "blackboard essentially becomes the harness ... with customization ability built in".
+
+**What this means.** The Blackboard is not a chat window on top of an agent. It is where the agent's harness lives and is configured, the way Claude Code's settings, hooks, skills and modes shape an agent, but for mechanical engineering:
+- **Mode:** Consult, Plan, Step, Automatic, Explore or Check, shown and switchable on the board.
+- **Workflow and stage strip:** inferred per job, editable.
+- **Identity and gate template:** the industry overlay; gates can be added, never silently removed.
+- **Playbooks and house rules** (customer specs, house fits, preferred standards).
+- **Which tools the agent may use, and where it must ask.**
+- **Checks as cards** that say what was checked, the verdict, what was not checked, and why it matters.
+- **The drawing loop:** eyes, hands and per-space scores (`2026-11-20-agent-eyes-on-drawings-design.md`).
+
+**Customisation is per user, per project and per company.** It is stored and versioned like everything else (ontology plus work graph), and every change is recorded. A customisation can tighten the hard rules but never loosen them:
+- the signer comes from the login;
+- the checker is never the drafter;
+- a person gate never passes by itself;
+- certificate gating cannot be turned off.
+
+The current Blackboard UI rebuild should be designed as this harness surface, not as a better transcript.
