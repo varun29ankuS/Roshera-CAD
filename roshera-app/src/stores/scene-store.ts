@@ -36,10 +36,15 @@ import {
  *  view (iso, Z up): a document opening. */
 export const FRAME_ALL = '*'
 /** `pendingFrameObjectId` value that fits every object in view from the
- *  current direction: a part was just created. Framing the new part alone
- *  zooms onto whatever was made last, which in an agent build is usually a
- *  small cutter about to be consumed by a boolean. */
+ *  current direction: the Fit button. */
 export const FRAME_FIT = '*fit'
+/** `pendingFrameObjectId` value for a part that was just created: every
+ *  object fitted AND turned to the iso view, Z up (`frameView('new', …)`),
+ *  so a fresh part is looked at properly. Every object, not the new one
+ *  alone: framing the new part alone zooms onto whatever was made last,
+ *  which in an agent build is usually a small cutter about to be consumed
+ *  by a boolean. */
+export const FRAME_NEW = '*new'
 
 export type { ServerSketchShape, SketchRegion } from '@/lib/sketch-api'
 

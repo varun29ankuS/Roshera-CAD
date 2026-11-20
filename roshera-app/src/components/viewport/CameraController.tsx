@@ -1,8 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { useSketchBench } from '@/stores/sketch-bench-store'
 import { keepCameraPose, keptCameraPose } from '@/lib/camera-memory'
-import { FIT_MARGIN, fitDistance } from '@/lib/camera-fit'
-import { CAMERA_PRESETS, FRAME_ALL, FRAME_FIT } from '@/stores/scene-store'
+import { FIT_MARGIN, fitDistance, frameView } from '@/lib/camera-fit'
+import { CAMERA_PRESETS, FRAME_ALL, FRAME_FIT, FRAME_NEW } from '@/stores/scene-store'
 import { useThree, useFrame } from '@react-three/fiber'
 import {
   OrbitControls,
@@ -323,11 +323,14 @@ export function CameraController() {
   useEffect(() => {
     if (!pendingFrameObjectId || !controlsRef.current) return
     const controls = controlsRef.current
-    // FRAME_ALL / FRAME_FIT frame the union of every object (a document
-    // opening / a part created); any other id frames that one object.
+    // FRAME_ALL / FRAME_NEW / FRAME_FIT frame the union of every object (a
+    // document opening / a part created / the Fit button); any other id
+    // frames that one object.
     const all = useSceneStore.getState().objects
     const objs =
-      pendingFrameObjectId === FRAME_ALL || pendingFrameObjectId === FRAME_FIT
+      pendingFrameObjectId === FRAME_ALL ||
+      pendingFrameObjectId === FRAME_NEW ||
+      pendingFrameObjectId === FRAME_FIT
         ? [...all.values()]
         : [all.get(pendingFrameObjectId)].filter((o) => o !== undefined)
 
@@ -390,19 +393,22 @@ export function CameraController() {
       }
     }
 
-    // Framing the whole scene happens when a document opens (first load or
-    // a switch): a fresh view, so it looks from the iso direction, Z up. The
-    // camera's current direction means nothing then, and can be garbage: at
-    // boot the server's default document is framed and then the app switches
-    // to the last-used one while that first animation is still in flight.
-    // Framing one part keeps the user's direction (iso if the camera sits on
-    // its target).
-    const iso = new THREE.Vector3(1, -1, 0.75).normalize()
-    const dir =
-      pendingFrameObjectId === FRAME_ALL
-        ? iso
-        : new THREE.Vector3().subVectors(camera.position, controls.target).normalize()
-    if (!Number.isFinite(dir.x) || dir.lengthSq() < 1e-6) dir.copy(iso)
+    // Which way to look (lib/camera-fit `frameView`): a document opening and
+    // a part just built are fresh looks -- iso, Z up -- because the camera's
+    // current direction means nothing then (at boot it can be garbage; after
+    // a top-plane sketch it looks straight down at the new part). The Fit
+    // button and a single object keep the user's direction. A sketch in
+    // progress is never turned off its plane.
+    const current = new THREE.Vector3().subVectors(camera.position, controls.target).normalize()
+    const kind =
+      pendingFrameObjectId === FRAME_ALL ? 'all' : pendingFrameObjectId === FRAME_NEW ? 'new' : 'fit'
+    const view = frameView(
+      kind,
+      [current.x, current.y, current.z],
+      [camera.up.x, camera.up.y, camera.up.z],
+      useSceneStore.getState().sketch.active,
+    )
+    const dir = new THREE.Vector3(...view.direction)
     const endPosition = center.clone().addScaledVector(dir, distance)
 
     animRef.current = {
@@ -410,7 +416,7 @@ export function CameraController() {
       startTarget: controls.target.clone(),
       endPosition,
       endTarget: center,
-      endUp: pendingFrameObjectId === FRAME_ALL ? new THREE.Vector3(0, 0, 1) : camera.up.clone(),
+      endUp: new THREE.Vector3(...view.up),
       progress: 0,
     }
     invalidate()

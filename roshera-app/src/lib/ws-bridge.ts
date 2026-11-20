@@ -9,7 +9,7 @@ import { currentDocument } from '@/lib/document-scope'
 import { DEFAULT_PART_MATERIAL } from '@/lib/part-material'
 import { wsClient, setResyncHook } from './ws-client'
 import { useWSStore } from '@/stores/ws-store'
-import { FRAME_ALL, FRAME_FIT, useSceneStore, type CADObject, type CADMesh, type CADMaterial, type AnalyticalGeometry } from '@/stores/scene-store'
+import { FRAME_ALL, FRAME_NEW, useSceneStore, type CADObject, type CADMesh, type CADMaterial, type AnalyticalGeometry } from '@/stores/scene-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { sketchApi } from './sketch-api'
 import type {
@@ -277,7 +277,7 @@ function flushPendingOps() {
 
     for (const [, op] of toApplyNow) {
       if (!op.announceAsNew) continue
-      scene.setPendingFrameObject(FRAME_FIT)
+      scene.setPendingFrameObject(FRAME_NEW)
       if (op.echoMessage) {
         useBlackboardStore.getState().addLine(op.echoMessage, 'system')
       }
