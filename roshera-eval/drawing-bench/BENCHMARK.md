@@ -150,3 +150,35 @@ What the deltas say:
 * Item 5: trailing zeros (ISO 129-1; `{:.2}` in `hole_table.rs`, round-part and hole-feature labels, about 70 test assertions), tolerance text (`TOL_FONT_MM` 2.17 mm font, 1.5 mm capitals, below ISO 3098), hole-table/tag/title-block text under 2.5 mm, notes and leaders, GD&T placement.
 * Verifier gaps found: a hole table over the notes strip and a hole table over a view's geometry (105) are not reported by `verify_drawing`.
 * Drawing defects seen on contact sheets: fillet and pocket-corner arcs drawn as full circles (110, 124), hidden edges drawn over the shaded isometric.
+
+## Next: drafting craft, measured (Varun 2026-11-20)
+
+Varun, comparing against professionally drafted sheets: "it has a lot of professional feel to it ... the lines are organized, properly spaced, each line is aligned ... choice of places for tables, choice of font, how the annotations happen". Also: "we are missing a few algorithms and whole lot of ui/ux improvement".
+
+The plan is to add a CRAFT score beside completeness and truth. Each check is computed from the rendered SVG, has a rule ID and a tolerance, and is held by the regress ratchet:
+
+- alignment of dimension rows and chains, and equal stacking lanes;
+- spacing: the first dimension line is about 10 mm from the outline, then 7 to 8 mm between lines (ISO 129 practice); text clear of lines; crowding;
+- line weights: two widths in a 2:1 ratio, assigned by line type (ISO 128);
+- one drafting font to ISO 3098 type B, 3.5 mm on A3 and larger, used the same way in dimensions, tables and the title block;
+- annotation style: arrows 3 mm, filled, about 15 degrees and identical; leaders at 30 to 60 degrees, never crossing anything; text reading from the bottom or the right;
+- table zones: hole and revision tables anchored to the frame and title-block grid, never floating;
+- view layout: equal gutters, exact projection alignment, balanced margins;
+- the title block grid (ISO 7200).
+
+Missing algorithms, scored on this bench:
+- the dimension scheme: a minimal complete set as a spanning tree over the features, using the kernel's DOF accounting, with baseline, chain and ordinate styles, symmetric dimensions and counted callouts;
+- view selection: the best front view, dropping redundant views, sections, detail, auxiliary and broken views;
+- annotation placement: candidate positions, a collision graph, then optimisation;
+- line work: fillet silhouettes, tangent edges, thread conventions, selective hidden lines.
+
+Then the editor UI/UX:
+- direct manipulation;
+- a smart-dimension tool, checked against the solid;
+- templates;
+- the checker redline workflow;
+- the revision diff;
+- agent commands;
+- the certificate re-checked live while editing.
+
+Reference material: incumbent sheets, plus Hanomi drawings ONLY with Varun's permission, kept internal and never committed.
