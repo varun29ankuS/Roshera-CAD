@@ -7,6 +7,7 @@ import {
 } from '@/components/ui/icons'
 import type { RefusalCard as RefusalCardData } from '@/lib/blackboard-cards'
 import { CardShell, Chip } from './card-chrome'
+import { CardText } from './CardText'
 
 /**
  * TYPED REFUSAL CARD
@@ -79,7 +80,7 @@ export function RefusalCard({ card }: { card: RefusalCardData }) {
             <span className="mr-1.5 font-mono text-[11px] uppercase tracking-wide text-muted-foreground">
               hint
             </span>
-            {card.hint}
+            <CardText text={card.hint} />
           </span>
         </div>
       )}
@@ -91,7 +92,9 @@ export function RefusalCard({ card }: { card: RefusalCardData }) {
           {card.options.map((opt, i) => (
             <div key={i} className="flex items-start gap-1.5 text-[11px] text-foreground/80">
               <ArrowRight size={10} className="mt-0.5 shrink-0 text-sky-400/70" />
-              <span>{opt}</span>
+              <span>
+                <CardText text={opt} />
+              </span>
             </div>
           ))}
         </div>

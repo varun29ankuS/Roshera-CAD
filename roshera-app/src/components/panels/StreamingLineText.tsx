@@ -1,4 +1,5 @@
 import { useMemo } from 'react'
+import { normalizeMathDelimiters } from '@/lib/math-delimiters'
 import { splitStreamingText } from '@/lib/streaming-math'
 import { MessageMarkdown } from './MessageMarkdown'
 
@@ -16,9 +17,13 @@ import { MessageMarkdown } from './MessageMarkdown'
  * the plain-prose tail. While an expression or card fence is mid-write its
  * source is withheld behind a chalk cursor; it appears whole the moment the
  * closing delimiter arrives.
+ *
+ * LaTeX's own `\(…\)` / `\[…\]` are rewritten to the dollar forms first
+ * (`normalizeMathDelimiters`), the same rewrite `MessageMarkdown` applies to
+ * the committed line, so streaming and final render cut expressions alike.
  */
 export function StreamingLineText({ text }: { text: string }) {
-  const view = useMemo(() => splitStreamingText(text), [text])
+  const view = useMemo(() => splitStreamingText(normalizeMathDelimiters(text)), [text])
   return (
     <div>
       {view.settled.map((chunk, i) => (

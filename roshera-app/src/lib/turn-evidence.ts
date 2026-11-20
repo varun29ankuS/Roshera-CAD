@@ -84,6 +84,12 @@ function markWord(card: BlackboardCard, verdict: LineVerdict): string {
       return 'refused'
     case 'choices':
       return 'choice'
+    case 'part':
+      return verdict === 'pass' ? 'part sound' : verdict === 'fail' ? 'part unsound' : 'part not certified'
+    case 'sheet':
+      return verdict === 'pass' ? 'sheet certified' : verdict === 'fail' ? 'sheet not ready' : 'sheet not checked'
+    case 'measures':
+      return verdict === 'pass' ? 'within limits' : verdict === 'fail' ? 'out of limits' : 'limits undecided'
   }
 }
 

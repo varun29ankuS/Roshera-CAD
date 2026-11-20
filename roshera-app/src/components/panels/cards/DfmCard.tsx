@@ -15,6 +15,7 @@ import {
   type DfmUnverifiableReason,
 } from '@/lib/blackboard-cards'
 import { CardShell, Chip, KV, type CardAccent } from './card-chrome'
+import { CardText } from './CardText'
 import { fmtNum } from './format'
 
 /**
@@ -251,7 +252,11 @@ function DfmReportView({ card }: { card: DfmReportCard }) {
           </div>
         ))}
       </div>
-      {card.note && <div className="mt-1 text-[11px] text-foreground/70">{card.note}</div>}
+      {card.note && (
+        <div className="mt-1 text-[11px] text-foreground/70">
+          <CardText text={card.note} />
+        </div>
+      )}
     </CardShell>
   )
 }
@@ -268,7 +273,11 @@ export function DfmCard({ card }: { card: DfmCardData }) {
     >
       <VerdictBody verdict={card.verdict} unit={unit} />
       <ProvenanceFooter provenance={card.provenance} />
-      {card.note && <div className="mt-1 text-[11px] text-foreground/70">{card.note}</div>}
+      {card.note && (
+        <div className="mt-1 text-[11px] text-foreground/70">
+          <CardText text={card.note} />
+        </div>
+      )}
     </CardShell>
   )
 }

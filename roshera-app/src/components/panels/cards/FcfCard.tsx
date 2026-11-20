@@ -14,6 +14,7 @@ import {
   modifierSymbol,
 } from '@/lib/gdt-symbols'
 import { CardShell, Chip, type CardAccent } from './card-chrome'
+import { CardText } from './CardText'
 import { fmtNum } from './format'
 
 /**
@@ -238,7 +239,11 @@ export function FcfCard({ card }: { card: FcfCardData }) {
       {dialectNote !== null && (
         <div className="mt-0.5 text-[11px] text-caution">{dialectNote}</div>
       )}
-      {card.note && <div className="mt-1 text-[11px] text-foreground/70">{card.note}</div>}
+      {card.note && (
+        <div className="mt-1 text-[11px] text-foreground/70">
+          <CardText text={card.note} />
+        </div>
+      )}
     </CardShell>
   )
 }

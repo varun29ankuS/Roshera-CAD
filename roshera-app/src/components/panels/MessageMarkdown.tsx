@@ -1,16 +1,18 @@
-import { Children, isValidElement, memo, type ReactNode } from 'react'
+import { Children, isValidElement, memo, useMemo, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type { Components } from 'react-markdown'
-import remarkMath from 'remark-math'
-import rehypeKatex from 'rehype-katex'
 import { cn } from '@/lib/utils'
 import { cardKindFromLanguage } from '@/lib/blackboard-cards'
+import { REHYPE_PLUGINS, REMARK_PLUGINS } from '@/lib/markdown-pipeline'
+import { normalizeMathDelimiters } from '@/lib/math-delimiters'
 import { CardRenderer } from './cards/CardRenderer'
 
 /**
- * Renders agent prose with embedded LaTeX math. Inline `$...$` and block
- * `$$...$$` are typeset with KaTeX; everything else is rendered as light
- * markdown so the agent can emit derivations (prose + equations) naturally.
+ * Renders agent prose with embedded LaTeX math. Inline `$...$` / `\(...\)`
+ * and block `$$...$$` / `\[...\]` are typeset with KaTeX (the backslash
+ * forms are rewritten to dollars by `normalizeMathDelimiters`); everything
+ * else is rendered as markdown with GFM tables (lib/markdown-pipeline.ts),
+ * so the agent can emit derivations and value tables naturally.
  *
  * Malformed LaTeX never crashes the panel: rehype-katex is configured with
  * `throwOnError: false`, so a broken expression falls back to its raw source
@@ -65,9 +67,30 @@ const markdownComponents: Components = {
     <blockquote className="my-1 border-l-2 border-border/70 pl-2 text-foreground/75">{children}</blockquote>
   ),
   hr: () => <hr className="my-2 border-border/50" />,
-  // No `table` handler: GFM tables need remark-gfm, which isn't a dependency
-  // here — adding one mid-task is out of scope. Bare CommonMark tables
-  // render as literal pipe text, same as before this change.
+  // GFM tables (remark-gfm, see lib/markdown-pipeline.ts) in the card
+  // grammar: hairline borders, a mono uppercase header like a card's section
+  // labels, tabular numerals so a column of values lines up, and horizontal
+  // scroll instead of overflowing the panel.
+  table: ({ children }) => (
+    <div className="my-1.5 overflow-x-auto rounded-md border border-border/70">
+      <table className="w-full border-collapse text-[11px] tabular-nums">{children}</table>
+    </div>
+  ),
+  thead: ({ children }) => <thead className="bg-foreground/5">{children}</thead>,
+  tr: ({ children }) => <tr className="border-b border-border/50 last:border-b-0">{children}</tr>,
+  th: ({ children, style }) => (
+    <th
+      style={style}
+      className="px-2 py-1 text-left font-mono text-[11px] font-normal uppercase tracking-wide text-muted-foreground"
+    >
+      {children}
+    </th>
+  ),
+  td: ({ children, style }) => (
+    <td style={style} className="px-2 py-1 align-baseline text-foreground/90">
+      {children}
+    </td>
+  ),
   code: ({ children, className: codeClass }) => {
     // A ```roshera:<kind> fence is a TYPED CARD, not a code sample: the
     // payload (validated against the real wire shapes) renders as a
@@ -110,9 +133,8 @@ const markdownComponents: Components = {
   ),
 }
 
-const REHYPE_KATEX_OPTIONS = { throwOnError: false } as const
-
 function MessageMarkdownImpl({ content, className }: Props) {
+  const source = useMemo(() => normalizeMathDelimiters(content), [content])
   return (
     <div
       className={cn(
@@ -122,12 +144,8 @@ function MessageMarkdownImpl({ content, className }: Props) {
         className,
       )}
     >
-      <ReactMarkdown
-        remarkPlugins={[remarkMath]}
-        rehypePlugins={[[rehypeKatex, REHYPE_KATEX_OPTIONS]]}
-        components={markdownComponents}
-      >
-        {content}
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={markdownComponents}>
+        {source}
       </ReactMarkdown>
     </div>
   )

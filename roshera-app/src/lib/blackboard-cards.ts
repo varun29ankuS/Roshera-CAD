@@ -41,8 +41,10 @@
  *   tri-state per invariant: true / false / null-means-not-run; the
  *   consistency conjuncts arrive as consistent / inconsistent / not_applicable.
  * - `roshera:refusal`  → the refusal wire the backend already speaks: a
- *   verbatim `message` from a 409/422 (never paraphrased — gdt.ts surfaces
- *   it as `REFUSED: <msg>`), plus optional next actions. A refusal is a
+ *   verbatim `reason` (never paraphrased — gdt.ts surfaces it as
+ *   `REFUSED: <msg>`), plus optional next actions. The catalog body's
+ *   `error`, the timeline routes' `message` and the MCP `refused: <body>`
+ *   wrapper are accepted as documented aliases (`liftRefusalAliases`). A refusal is a
  *   RESULT, not an error. When the refusal rode the backend's structured
  *   error catalog (`api-server/src/error_catalog.rs` — `{ error_code,
  *   retryable, hint? }`, the same fields the MCP layer's `fail()` already
@@ -57,6 +59,12 @@
  *   agent, once the user has answered — it makes the board a record rather
  *   than a still-open question. There is deliberately NO prose-parsing
  *   fallback: an invalid block renders as raw text, never guessed buttons.
+ * - `roshera:part` / `roshera:sheet` / `roshera:measures` → SUMMARY cards
+ *   for the three most common results (what was built, whether the sheet
+ *   is ready, a set of measured values). Authoring envelopes like `fcf`,
+ *   but every field is named after the wire field it is copied from (see
+ *   each schema). Never probed against raw tool output: they are written
+ *   by the agent on purpose, not sniffed.
  *
  * Envelope fields beyond the wire payloads (`unit`, `note`, `standard`,
  * `options`, `part`) are authoring annotations — presentation the agent adds,
@@ -264,8 +272,65 @@ export type FcfVerdict = z.infer<typeof gdtVerdictSchema>
 
 // ── Refusal ───────────────────────────────────────────────────────────
 
-export const refusalCardSchema = z.object({
-  /** The backend's message VERBATIM — never paraphrased (the gdt.ts rule). */
+/**
+ * The producers a refusal is forwarded from name its verbatim sentence three
+ * ways, all documented wire fields:
+ *   - `reason`  — the MCP layer (`fail()`'s structuredContent, gate refusals,
+ *                 kb_lookup, `successFalseRefusal`) and hand-authored cards;
+ *   - `error`   — the backend error catalog body (`error_catalog.rs`:
+ *                 `{ success: false, error_code, error, retryable, hint? }`);
+ *   - `message` — the timeline routes' HTTP-200 refusal
+ *                 (`handlers/timeline.rs`: `{ success: false, message }`).
+ * The MCP timeline tools also wrap a non-catalog backend body as
+ * `{ refused: <body> }`, so the same fields are read one level down.
+ *
+ * Precedence: `reason` > `error` > `message`, top level before `refused`,
+ * and the typed catalog fields (`error_code`, `retryable`, `hint`) are lifted
+ * from `refused` the same way. A top-level value always wins.
+ *
+ * The aliases apply ONLY to a payload that declares itself a failure —
+ * `success === false`, `refused: true` or a `refused` body, or an
+ * `error_code`. The app probes
+ * tool results against this schema first (acp-blackboard.ts), and an
+ * ordinary result that happens to carry a `message` string must never be
+ * drawn as a refusal.
+ */
+function liftRefusalAliases(input: unknown): unknown {
+  const top = asRecord(input)
+  if (!top) return input
+  // `refused: false` (verify_claim, claim.rs) is a SUCCESS marker — only
+  // `refused: true` or a wrapped refusal body declares a failure.
+  const declaresFailure =
+    top.success === false ||
+    top.refused === true ||
+    asRecord(top.refused) !== null ||
+    typeof top.error_code === 'string'
+  if (!declaresFailure) return input
+  const nested = asRecord(top.refused)
+  const out: Record<string, unknown> = { ...top }
+  const words = (r: Record<string, unknown> | null): string | undefined => {
+    if (!r) return undefined
+    for (const key of ['reason', 'error', 'message'] as const) {
+      const v = r[key]
+      if (typeof v === 'string' && v.length > 0) return v
+    }
+    return undefined
+  }
+  if (typeof out.reason !== 'string') {
+    const reason = words(top) ?? words(nested)
+    if (reason !== undefined) out.reason = reason
+  }
+  if (nested) {
+    if (out.error_code === undefined && typeof nested.error_code === 'string') out.error_code = nested.error_code
+    if (out.retryable === undefined && typeof nested.retryable === 'boolean') out.retryable = nested.retryable
+    if (out.hint === undefined && typeof nested.hint === 'string') out.hint = nested.hint
+  }
+  return out
+}
+
+export const refusalCardSchema = z.preprocess(liftRefusalAliases, z.object({
+  /** The backend's message VERBATIM — never paraphrased (the gdt.ts rule).
+   *  Read from `error` / `message` / `refused.*` per `liftRefusalAliases`. */
   reason: z.string(),
   /** What was refused, named by role ("datum B on the upper bore", …). */
   subject: z.string().optional(),
@@ -285,7 +350,7 @@ export const refusalCardSchema = z.object({
    *  layer's computed one (e.g. blend `r_max` arithmetic). Prose, but prose
    *  the producer authored for this specific code. */
   hint: z.string().optional(),
-})
+}))
 
 export type RefusalCard = z.infer<typeof refusalCardSchema>
 
@@ -496,6 +561,139 @@ export const soundnessCardSchema = z.preprocess(
 
 export type SoundnessCard = z.infer<typeof soundnessCardSchema>
 
+// ── Part summary (mass properties + placement + verdict) ──────────────
+//
+// The answer to "what did you build": one part, its size, its mass, and
+// whether the kernel certified it. Field names are the wire's own —
+// `MassPropertiesReport` (geometry-engine readable/part.rs: `volume` mm³,
+// `surface_area` mm², `mass` kg, `material { name, density }`,
+// `center_of_mass` mm, `provenance` per quantity), get_part's
+// `location.dimensions_world` (world bounding extents, mm), and
+// verify_part's `sound` — so the agent copies numbers, never retypes them.
+
+/** `Exactness` (primitives/solid.rs, `#[serde(tag = "exactness")]`). */
+const exactnessSchema = z.discriminatedUnion('exactness', [
+  z.object({ exactness: z.literal('exact') }).passthrough(),
+  z
+    .object({
+      exactness: z.literal('approximate'),
+      method: z.string(),
+      rel_error_bound: z.number().nonnegative(),
+    })
+    .passthrough(),
+  z.object({ exactness: z.literal('unavailable') }).passthrough(),
+])
+
+export const partCardSchema = z
+  .object({
+    /** The part's name, by its role ("Hub flange"). */
+    part: z.string().min(1).optional(),
+    part_id: z.number().int().nullish(),
+    /** World bounding extents X × Y × Z, mm (`location.dimensions_world`). */
+    dimensions_world: z.tuple([z.number(), z.number(), z.number()]).optional(),
+    volume: z.number().nonnegative().optional(),
+    surface_area: z.number().nonnegative().optional(),
+    mass: z.number().nonnegative().optional(),
+    material: z.object({ name: z.string(), density: z.number().optional() }).passthrough().optional(),
+    center_of_mass: z.tuple([z.number(), z.number(), z.number()]).optional(),
+    /** Per-quantity exactness, verbatim — an approximate volume says so. */
+    provenance: z
+      .object({
+        volume: exactnessSchema.optional(),
+        center_of_mass: exactnessSchema.optional(),
+        inertia: exactnessSchema.optional(),
+      })
+      .passthrough()
+      .optional(),
+    /** verify_part's `sound`, verbatim. null / absent = not certified. */
+    sound: triState,
+    /** Authoring annotation: one short line (math allowed). */
+    note: z.string().optional(),
+  })
+  .refine((c) => c.part !== undefined || c.part_id != null, {
+    message: 'name the part (part or part_id)',
+    path: ['part'],
+  })
+  .refine((c) => c.dimensions_world !== undefined || c.volume !== undefined || c.mass !== undefined, {
+    message: 'a part summary carries at least one measured quantity (dimensions_world, volume or mass)',
+    path: ['volume'],
+  })
+
+export type PartCard = z.infer<typeof partCardSchema>
+export type Exactness = z.infer<typeof exactnessSchema>
+
+// ── Drawing sheet summary ─────────────────────────────────────────────
+//
+// The answer to "is the sheet ready": paper, scale, views, how many
+// dimensions it carries, and the sheet certificate's two separate claims —
+// `sound` (what the sheet shows is true of the model) and `complete` (it
+// shows everything; drawing_dimensions). Field names follow the MCP drawing
+// tools (make_drawing: `drawing_id`, `quality { passed, issues }`;
+// drawing_read_semantics: `name`, `views`, `projection`;
+// drawing_dimensions: `sound`, `complete`, `omission_summary`). `sheet` and
+// `scale` are the title-block facts as printed.
+
+export const sheetCardSchema = z
+  .object({
+    name: z.string().min(1).optional(),
+    drawing_id: z.string().min(1).optional(),
+    /** ISO paper size as printed ("A3"). */
+    sheet: z.string().min(1).optional(),
+    /** Sheet scale as printed ("1:2"). */
+    scale: z.string().min(1).optional(),
+    projection: z.enum(['first', 'third']).optional(),
+    views: z.array(z.string()).optional(),
+    dimensions_placed: z.number().int().nonnegative().optional(),
+    /** Model dimensions on no view (drawing_dimensions omissions). */
+    dimensions_omitted: z.number().int().nonnegative().optional(),
+    sound: triState,
+    complete: triState,
+    /** make_drawing's layout-quality report; `passed: false` is a failure. */
+    quality: z
+      .object({ passed: z.boolean(), issues: z.array(z.unknown()).optional() })
+      .passthrough()
+      .optional(),
+    /** Verbatim omission lines from the certificate. */
+    omission_summary: z.array(z.string()).optional(),
+    note: z.string().optional(),
+  })
+  .refine((c) => c.name !== undefined || c.drawing_id !== undefined, {
+    message: 'name the sheet (name or drawing_id)',
+    path: ['name'],
+  })
+
+export type SheetCard = z.infer<typeof sheetCardSchema>
+
+// ── Measured-values table ─────────────────────────────────────────────
+//
+// Several numbers at once — a bore and its fit band, a wall against its
+// limit, a stress against its allowable. `pass` is per row and tri-state:
+// true / false is a decided check, null is a check that could not be
+// decided, and an absent `pass` is a reported value, not a check.
+
+const measureRowSchema = z.object({
+  /** What was measured, by role (math allowed: "$K_t$ at the fillet"). */
+  quantity: z.string().min(1),
+  /** The number, or exact text where a number is not the answer ("H7/g6"). */
+  value: z.union([z.number(), z.string().min(1)]),
+  unit: z.string().optional(),
+  /** The limit or band it is judged against, as written. */
+  limit: z.union([z.number(), z.string()]).optional(),
+  /** Where the value or limit comes from (a standard, the kernel, a chart). */
+  source: z.string().optional(),
+  pass: z.boolean().nullable().optional(),
+})
+
+export const measuresCardSchema = z.object({
+  title: z.string().optional(),
+  part: z.string().optional(),
+  rows: z.array(measureRowSchema).min(1),
+  note: z.string().optional(),
+})
+
+export type MeasuresCard = z.infer<typeof measuresCardSchema>
+export type MeasureRow = z.infer<typeof measureRowSchema>
+
 // ── Fence parsing ─────────────────────────────────────────────────────
 
 export const CARD_FENCE_PREFIX = 'roshera:'
@@ -507,10 +705,26 @@ export type BlackboardCard =
   | { kind: 'merge'; card: MergeCard }
   | { kind: 'soundness'; card: SoundnessCard }
   | { kind: 'choices'; card: ChoicesCard }
+  | { kind: 'part'; card: PartCard }
+  | { kind: 'sheet'; card: SheetCard }
+  | { kind: 'measures'; card: MeasuresCard }
 
 export type CardKind = BlackboardCard['kind']
 
-const CARD_KINDS: readonly CardKind[] = ['dfm', 'fcf', 'refusal', 'merge', 'soundness', 'choices']
+/** Every fence kind the board renders as a card. The agent policy
+ *  (roshera-agent-policy.md) must teach each one — a card kind the agent is
+ *  never told about is a renderer wired to nothing (test/agent-policy-cards). */
+export const CARD_KINDS: readonly CardKind[] = [
+  'dfm',
+  'fcf',
+  'refusal',
+  'merge',
+  'soundness',
+  'choices',
+  'part',
+  'sheet',
+  'measures',
+]
 
 /** `choices` is hand-authored YAML per `.goosehints`; every other card is a
  *  JSON echo of a wire type. Malformed input in either format yields `null`
@@ -580,6 +794,18 @@ export function parseCard(kind: CardKind, source: string): CardParseResult {
     }
     case 'choices': {
       const r = choicesCardSchema.safeParse(json)
+      return r.success ? { ok: true, card: { kind, card: r.data } } : fail(r)
+    }
+    case 'part': {
+      const r = partCardSchema.safeParse(json)
+      return r.success ? { ok: true, card: { kind, card: r.data } } : fail(r)
+    }
+    case 'sheet': {
+      const r = sheetCardSchema.safeParse(json)
+      return r.success ? { ok: true, card: { kind, card: r.data } } : fail(r)
+    }
+    case 'measures': {
+      const r = measuresCardSchema.safeParse(json)
       return r.success ? { ok: true, card: { kind, card: r.data } } : fail(r)
     }
   }

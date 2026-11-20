@@ -311,6 +311,56 @@ const REFUSAL_TYPED = card('refusal', {
   ],
 })
 
+/** The error-catalog body exactly as the backend sends it (`error`, not
+ *  `reason`) — forwarded verbatim, it reads through the documented alias. */
+const REFUSAL_CATALOG_BODY = card('refusal', {
+  success: false,
+  error_code: 'invalid_parameter',
+  error: 'hole diameter 0 mm is not positive',
+  retryable: false,
+})
+
+const PART_SUMMARY = card('part', {
+  part: 'Hub flange',
+  part_id: 12,
+  dimensions_world: [160, 160, 28],
+  volume: 312400,
+  surface_area: 61230,
+  mass: 2.452,
+  material: { name: 'Steel', density: 7850 },
+  provenance: {
+    volume: { exactness: 'approximate', method: 'mesh_tonon', rel_error_bound: 0.0005 },
+    center_of_mass: { exactness: 'exact' },
+    inertia: { exactness: 'exact' },
+  },
+  center_of_mass: [0, 0, 11.2],
+  sound: true,
+  note: 'Mass at $\\rho = 7850\\ \\mathrm{kg/m^3}$, the house default steel.',
+})
+
+const SHEET_SUMMARY = card('sheet', {
+  name: 'Hub flange',
+  sheet: 'A3',
+  scale: '1:2',
+  projection: 'first',
+  views: ['Front', 'Top', 'Right', 'Iso'],
+  dimensions_placed: 18,
+  dimensions_omitted: 1,
+  sound: true,
+  complete: false,
+  quality: { passed: true, issues: [] },
+  omission_summary: ['bolt-circle diameter D120 is on no view'],
+})
+
+const MEASURES_TABLE = card('measures', {
+  title: 'Bore and wall checks',
+  rows: [
+    { quantity: 'Bore $\\varnothing$', value: 20.012, unit: 'mm', limit: 'H7: 20.000 to 20.021', source: 'ISO 286-2', pass: true },
+    { quantity: 'Wall at the boss', value: 1.8, unit: 'mm', limit: '$\\ge 2.0$', source: 'FDM pack', pass: false },
+    { quantity: '$K_t$ at the fillet', value: '1.8', source: 'Peterson, chart 3.1' },
+  ],
+})
+
 const MERGE_CONFLICT = card('merge', {
   success: false,
   merged_into: 'main',
@@ -577,6 +627,26 @@ const CARD_FIXTURES: Array<{ title: string; note: string; source: string }> = [
     title: 'Typed refusal — with catalog fields',
     note: 'The same refusal carrying the error catalog\'s typed fields: mono error_code chip, retryable as icon + word (absent renders nothing, never a guessed "no"), and the producer-authored hint — all visible text, nothing hover-only.',
     source: REFUSAL_TYPED,
+  },
+  {
+    title: 'Typed refusal — the catalog body verbatim',
+    note: 'The backend error catalog names the sentence `error`; forwarded unchanged it renders as a refusal card (documented alias), not "reason: Required".',
+    source: REFUSAL_CATALOG_BODY,
+  },
+  {
+    title: 'Part summary',
+    note: 'Size, volume, mass, material and the certificate bit. The approximate volume says ± its bound; the note typesets its math.',
+    source: PART_SUMMARY,
+  },
+  {
+    title: 'Sheet summary — sound but incomplete',
+    note: 'Sound and complete are separate badges: this sheet is true of the model but leaves a dimension off, so it is not ready.',
+    source: SHEET_SUMMARY,
+  },
+  {
+    title: 'Measured values',
+    note: 'One row per value: tick / cross where a limit was decided, no glyph for a reported value. Labels and limits typeset inline math.',
+    source: MEASURES_TABLE,
   },
   {
     title: 'Merge — blocked with typed witnesses',

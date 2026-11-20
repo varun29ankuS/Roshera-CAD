@@ -30,19 +30,27 @@ function refusalOrFail(e: unknown) {
   if (e instanceof ApiError && [404, 409, 422].includes(e.status)) {
     try {
       const body = JSON.parse(e.body);
+      const isObject = body !== null && typeof body === "object";
       // A catalogue body's code, message and hint are lifted to the top level
       // (where fail() puts them for every other tool) instead of staying
       // buried in `refused` (MCP_AUDIT.md §2: "loses the hint tier").
       const catalogue =
-        body && typeof body === "object" && typeof body.error_code === "string"
+        isObject && typeof body.error_code === "string"
           ? {
               error_code: body.error_code,
-              reason: typeof body.error === "string" ? body.error : e.message,
               retryable: body.retryable === true,
               ...(typeof body.hint === "string" ? { hint: body.hint } : {}),
             }
           : {};
-      return typedErrorResult({ refused: body, ...catalogue });
+      // EVERY refusal carries a top-level `reason`: the server's own sentence,
+      // verbatim. The mould / bind / delete verdicts are not catalogue bodies
+      // (`{ status: "MouldRejected", reason, kind, ... }`), and without this
+      // the Blackboard's refusal card (which requires `reason`) refused to
+      // render the agent's verbatim forward ("reason: Required").
+      const words = (k: string) =>
+        isObject && typeof body[k] === "string" && body[k].length > 0 ? (body[k] as string) : null;
+      const reason = words("reason") ?? words("error") ?? words("message") ?? e.message;
+      return typedErrorResult({ refused: body, reason, ...catalogue });
     } catch {
       /* body not JSON — fall through */
     }

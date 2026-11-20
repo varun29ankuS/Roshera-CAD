@@ -121,6 +121,19 @@ export function splitStreamingText(text: string): StreamView {
     let i = start
     while (i < end) {
       const ch = text[i]
+      // LaTeX's own `\(` / `\[`. The caller normalizes every CLOSED pair to
+      // dollars first (math-delimiters.ts), so one still here is an
+      // expression the stream has not finished: withhold it exactly like an
+      // unclosed `$`, rather than flash its raw source.
+      if (
+        ch === '\\' &&
+        !isEscaped(text, i) &&
+        (text[i + 1] === '(' || text[i + 1] === '[') &&
+        text.indexOf(text[i + 1] === '(' ? '\\)' : '\\]', i + 2) === -1
+      ) {
+        unclosedMathAt(i)
+        break
+      }
       if (ch !== '$' || isEscaped(text, i)) {
         i++
         continue

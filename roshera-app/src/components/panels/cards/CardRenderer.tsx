@@ -3,8 +3,11 @@ import { isStructuredPayload } from '@/lib/card-payload'
 import { ChoicesCard } from './ChoicesCard'
 import { DfmCard } from './DfmCard'
 import { FcfCard } from './FcfCard'
+import { MeasuresCard } from './MeasuresCard'
 import { MergeCard } from './MergeCard'
+import { PartCard } from './PartCard'
 import { RefusalCard } from './RefusalCard'
+import { SheetCard } from './SheetCard'
 import { SoundnessCard } from './SoundnessCard'
 
 /**
@@ -52,5 +55,11 @@ export function CardRenderer({ kind, source }: { kind: CardKind; source: string 
       return <SoundnessCard card={card.card} />
     case 'choices':
       return <ChoicesCard card={card.card} source={trimmedSource} />
+    case 'part':
+      return <PartCard card={card.card} />
+    case 'sheet':
+      return <SheetCard card={card.card} />
+    case 'measures':
+      return <MeasuresCard card={card.card} />
   }
 }

@@ -96,6 +96,31 @@ export function cardVerdict(card: BlackboardCard): LineVerdict | null {
       // A question, not a verdict — open or answered, it has no pass/fail
       // state of its own.
       return null
+    case 'part': {
+      // The certificate's bit, copied onto the summary. Absent/null: the
+      // summary makes no soundness claim, so the marker makes none either.
+      const sound = card.card.sound
+      if (sound === true) return 'pass'
+      if (sound === false) return 'fail'
+      return null
+    }
+    case 'sheet': {
+      // A sheet is ready only when it is sound (true of the model) AND
+      // complete (shows everything) AND its layout passed. Any proven
+      // failure fails; anything not checked is can't-say, never a pass.
+      const { sound, complete, quality } = card.card
+      if (sound === false || complete === false || quality?.passed === false) return 'fail'
+      if (sound === true && complete === true) return 'pass'
+      return 'inconclusive'
+    }
+    case 'measures': {
+      // Rows without `pass` are reported values, not checks — they do not vote.
+      const votes = card.card.rows.map((r) => r.pass).filter((p) => p !== undefined)
+      if (votes.length === 0) return null
+      if (votes.includes(false)) return 'fail'
+      if (votes.includes(null)) return 'inconclusive'
+      return 'pass'
+    }
   }
 }
 
