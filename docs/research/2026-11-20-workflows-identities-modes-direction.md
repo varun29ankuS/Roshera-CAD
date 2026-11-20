@@ -124,3 +124,39 @@ in kb_data.ts, and per-card schemas in the app.
   - NIST OntoSTEP;
   - BrepPMIOnt;
   - the NIST AP242+QIF reference knowledge graphs, as a test case.
+
+## Agreed: what the plan must also cover (Varun: "agreed on all fronts")
+
+1. **Export control (ITAR, EAR, CUI).**
+   - Every item carries its data classification.
+   - The agent refuses to send controlled data to a model or region that is not
+     cleared, and controlled data is refused by default.
+   - An on-premise deployment may be required, which touches the API-only rule.
+   - A policy is owed before the first aerospace pilot. This is for Varun, and
+     possibly counsel.
+2. **Customer extensions.** OEM house specs and the OEM's own definitions of a key
+   characteristic and of a major or minor change extend the ontology per customer,
+   without forking it.
+3. **PLM interoperability.** Revisions and BOMs are imported from and exported to the
+   customer's system of record: Teamcenter, Windchill or 3DEXPERIENCE.
+4. **Closing the inspection loop.** CMM results come back in (QIF Results or DMIS),
+   measured against the characteristic list, then signed.
+5. **Ontology versioning.** Every schema change has a migration, and data is stamped
+   with the version it was written under, so a 2026 record reads in 2046.
+6. **Ontology-kernel drift gate.** Every term that claims a kernel fact resolves to a
+   real kernel type or check, the same shape as the tool-ontology gate.
+7. **Status on every fact:** proposed, confirmed, certified or reported. A proposed
+   fact can never be read as certified.
+8. **Standards licensing.** Concepts can be modelled freely. Shipping the numbers in
+   ISO, EN or ASME tables may need a licence or customer-supplied data; check before
+   selling.
+9. **Quantities and tolerance semantics** are modelled formally, for example with
+   QUDT, not as strings.
+10. **Invisible to engineers.** The ontology shows only as cards, checks and
+    suggestions.
+11. **The same ontology generates certified tasks** for the AI-lab environment.
+12. **Scope discipline.** Write the questions the ontology must answer first, for
+    example "which key characteristics changed between rev A and rev B?" and "is this
+    releasable, and if not, what blocks it?". Add only the terms a tool, card or one
+    of those questions needs. The first design artefact is that list for the
+    aerospace supplier slice.
