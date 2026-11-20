@@ -110,6 +110,29 @@ The `manufacturing_drawing` playbook gains an "improve the sheet" loop:
 
 In Check mode, the checker is never the agent that drew the sheet.
 
+### 4b. Show: the agent's work is animated, and the animation is the user's guide (Varun 2026-11-20)
+
+Varun: "make sure the animations are there when the agents work too... that should be part of the understanding.. animation will sort of become the guide for users to follow".
+
+**Base.** The agent show channel (`POST /api/agent/show`, `stores/agent-show-store.ts`, `AgentShowBar`, `AgentFacesHighlight`) already lets the agent drive the app's 3D view, with a caption and Pause / Take over. The drawing sheet gets the same:
+
+- **Look.** When the agent calls `drawing_look` or reads a space, the app switches to the Drawing workspace, zooms the sheet to that space and outlines it. The caption names the space and its worst finding, by rule ID with the measured value against the tolerance, e.g. "FRONT top band: lanes 4.1 mm apart, ISO 129 practice 7-8 mm".
+- **Act.** Every layout verb animates its change on the sheet: a dimension glides from its old lane to its new one, a chain snaps into line, a view slides into alignment, a table moves into its zone. The old position stays as a faint ghost for a moment. The caption says what was done and why, with the rule.
+- **Judge.** After each verb, the touched spaces flash their score change: green where it improved, red where it got worse, worst space first, with the certificate verdict.
+- **The animation is emitted by the verbs and look tools themselves, server-side, not left to the agent to remember.** The same events are recorded on the timeline, so a finished session can be replayed step by step as a tutorial: "watch how this sheet was made right".
+- **The user can learn and intervene:**
+  - Pause;
+  - Take over, which stops the agent and leaves the sheet as it is;
+  - step back and forward through the agent's actions;
+  - click a caption's rule ID for a one-line explanation of the rule.
+- Speed follows the user's setting. Reduced-motion users get instant changes with the same captions.
+
+This is part of the slices, not an afterthought:
+- slice 2 (eyes) emits the look frames;
+- slice 3 (hands) emits the act and judge frames;
+- the app work ships with slice 3;
+- slice 4's results run is recorded so the replay can be shown.
+
 ### 5. Results (`roshera-eval/drawing-bench`)
 
 - `bench.py` records the space-map grade for every sheet.
