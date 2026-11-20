@@ -6,6 +6,7 @@
  * carries it out.
  */
 import { chapterTitle, type Chapter } from './chapters-api.ts'
+import type { SheetRect } from './sheet-look.ts'
 
 export type Workspace = 'part' | 'assembly' | 'drawing' | 'dfm'
 export type NamedView = 'iso' | 'front' | 'back' | 'top' | 'bottom' | 'left' | 'right' | 'fit'
@@ -16,6 +17,16 @@ export type ShowAction =
   | { action: 'feature'; name?: string | null; anchor?: number | null; caption?: string | null }
   | { action: 'faces'; solid_id: number; face_ids: number[]; caption?: string | null }
   | { action: 'step'; sequence: number; caption?: string | null }
+  // The agent looked at a space of a drawing sheet (or the whole sheet when
+  // `space` is absent): the Drawing workspace opens that drawing and glides
+  // to the space's box (lib/sheet-look).
+  | {
+      action: 'sheet_space'
+      drawing_id: string
+      space?: string | null
+      rect?: SheetRect | null
+      caption?: string | null
+    }
 
 /** The app's camera preset for an agent view name; null for Fit. */
 export function presetFor(v: NamedView): string | null {
@@ -52,5 +63,7 @@ export function showCaption(a: ShowAction): string {
       return `${a.face_ids.length} face${a.face_ids.length === 1 ? '' : 's'}`
     case 'step':
       return `the part after step ${a.sequence}`
+    case 'sheet_space':
+      return a.space ? `the sheet space ${a.space}` : 'the whole sheet'
   }
 }

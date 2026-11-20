@@ -1021,3 +1021,298 @@ fn the_space_map_holds_every_placed_dimension_once_with_stable_ids() {
         );
     }
 }
+
+// ── Eyes (agent eyes slice 2): the sheet, or one space of it, as a PNG ────
+
+/// The flange's or the rib's first-angle sheet as the agent drew it, laid out
+/// and mapped.
+fn mapped_sheet(
+    build: fn() -> (BRepModel, SolidId),
+) -> (
+    Drawing,
+    geometry_engine::drawing::layout::SheetLayout,
+    geometry_engine::drawing::spaces::SpaceMap,
+) {
+    let (mut m, s) = build();
+    let _ = frame_for_drawing(&mut m, s);
+    let d = standard_drawing_auto_with_projection(&m, s, uuid::Uuid::nil(), ProjectionAngle::First)
+        .expect("sheet");
+    let layout = compute_layout(&d);
+    let map = geometry_engine::drawing::spaces::space_map(&d, &layout);
+    (d, layout, map)
+}
+
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+fn decode_png(png: &[u8]) -> tiny_skia::Pixmap {
+    assert!(png.starts_with(&PNG_MAGIC), "PNG magic bytes");
+    tiny_skia::Pixmap::decode_png(png).expect("a decodable PNG")
+}
+
+/// Dark ink on opaque paper -- black, grey, or black under the translucent
+/// finding mark -- never the outline's colour.
+fn is_ink(p: tiny_skia::PremultipliedColorU8) -> bool {
+    let lum =
+        0.299 * f64::from(p.red()) + 0.587 * f64::from(p.green()) + 0.114 * f64::from(p.blue());
+    p.alpha() == 255 && lum < 110.0 && !is_outline(p)
+}
+
+fn is_white(p: tiny_skia::PremultipliedColorU8) -> bool {
+    p.alpha() == 255 && p.red() > 240 && p.green() > 240 && p.blue() > 240
+}
+
+fn is_outline(p: tiny_skia::PremultipliedColorU8) -> bool {
+    use geometry_engine::drawing::raster::OUTLINE_RGB;
+    let near = |a: u8, b: u8| a.abs_diff(b) < 50;
+    p.alpha() == 255
+        && near(p.red(), OUTLINE_RGB[0])
+        && near(p.green(), OUTLINE_RGB[1])
+        && near(p.blue(), OUTLINE_RGB[2])
+}
+
+/// The share of the pixels of paper box `r` (mm) that pass `test`, in an
+/// image of paper `crop` at `s` px per mm.
+fn share_in(
+    pm: &tiny_skia::Pixmap,
+    crop: &geometry_engine::drawing::layout::Rect2,
+    s: f64,
+    r: &geometry_engine::drawing::layout::Rect2,
+    test: fn(tiny_skia::PremultipliedColorU8) -> bool,
+) -> f64 {
+    let px = |mm: f64, o: f64, n: u32| (((mm - o) * s).round().max(0.0) as u32).min(n);
+    let (x0, x1) = (px(r.x0, crop.x0, pm.width()), px(r.x1, crop.x0, pm.width()));
+    let (y0, y1) = (
+        px(r.y0, crop.y0, pm.height()),
+        px(r.y1, crop.y0, pm.height()),
+    );
+    let (mut hit, mut all) = (0usize, 0usize);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if let Some(p) = pm.pixel(x, y) {
+                all += 1;
+                if test(p) {
+                    hit += 1;
+                }
+            }
+        }
+    }
+    assert!(all > 0, "the box {r:?} lies inside the image");
+    hit as f64 / all as f64
+}
+
+/// The whole sheet renders as a valid PNG whose long edge is the pixels asked
+/// and whose aspect is the paper's, on white paper carrying ink.
+#[test]
+fn the_whole_sheet_renders_as_a_png_at_the_sheet_aspect() {
+    use geometry_engine::drawing::raster::{render_drawing_png, SheetCrop, SHEET_PNG_DEFAULT_PX};
+    assert_eq!(SHEET_PNG_DEFAULT_PX, 1600);
+    let (d, _, _) = mapped_sheet(en1092_weld_neck_with_gdt);
+    let (w, h) = (d.sheet_size.width(), d.sheet_size.height());
+    for px in [1600u32, 700] {
+        let out = render_drawing_png(&d, &SheetCrop::whole(&d), px).expect("png");
+        let pm = decode_png(&out.png);
+        assert_eq!((pm.width(), pm.height()), (out.width, out.height));
+        let (long, short) = if w >= h {
+            (pm.width(), pm.height())
+        } else {
+            (pm.height(), pm.width())
+        };
+        assert_eq!(long, px, "the long edge is the pixels asked");
+        let want = (f64::from(px) * w.min(h) / w.max(h)).round() as u32;
+        assert!(short.abs_diff(want) <= 1, "short edge {short}, want {want}");
+        let ink =
+            pm.pixels().iter().filter(|p| is_ink(**p)).count() as f64 / pm.pixels().len() as f64;
+        let white =
+            pm.pixels().iter().filter(|p| is_white(**p)).count() as f64 / pm.pixels().len() as f64;
+        assert!(ink > 0.002 && ink < 0.4, "ink share {ink}");
+        assert!(white > 0.5, "white paper share {white}");
+    }
+}
+
+/// A space crop shows the space's box plus its margin -- max(8 mm, 15 % of
+/// the longer side), clamped to the paper -- at that box's aspect; the
+/// space's outline is drawn ON the space's box; the dimension texts the space
+/// holds are inked where the layout puts them; and empty paper stays white.
+#[test]
+fn a_space_crop_shows_the_space_its_outline_and_its_dimensions() {
+    use geometry_engine::drawing::layout::{Rect2, SheetItemKind};
+    use geometry_engine::drawing::raster::{render_drawing_png, SheetCrop};
+    use geometry_engine::drawing::spaces::SpaceKind;
+    let (d, layout, map) = mapped_sheet(en1092_weld_neck_with_gdt);
+    let (sw, sh) = (d.sheet_size.width(), d.sheet_size.height());
+    let texts_in = |r: &Rect2| -> Vec<Rect2> {
+        layout
+            .items
+            .iter()
+            .filter(|i| i.kind == SheetItemKind::DimensionText)
+            .map(|i| i.bbox)
+            .filter(|b| {
+                let (cx, cy) = ((b.x0 + b.x1) / 2.0, (b.y0 + b.y1) / 2.0);
+                cx > r.x0 && cx < r.x1 && cy > r.y0 && cy < r.y1
+            })
+            .collect()
+    };
+    let lane = map
+        .spaces
+        .iter()
+        .find(|s| s.kind == SpaceKind::Lane && !texts_in(&s.rect).is_empty())
+        .expect("a lane holding dimension text");
+    let crop = SheetCrop::of_space(&d, &layout, &map, &lane.id).expect("the lane's crop");
+    let out = render_drawing_png(&d, &crop, 1200).expect("png");
+    let pm = decode_png(&out.png);
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("look");
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join(format!("flange-{}.png", lane.id.replace([':', '/'], "_"))),
+        &out.png,
+    )
+    .expect("write");
+
+    // The crop, by this test's own arithmetic.
+    let r = lane.rect;
+    let m = f64::max(8.0, 0.15 * (r.x1 - r.x0).max(r.y1 - r.y0));
+    let want = Rect2 {
+        x0: (r.x0 - m).max(0.0),
+        y0: (r.y0 - m).max(0.0),
+        x1: (r.x1 + m).min(sw),
+        y1: (r.y1 + m).min(sh),
+    };
+    let (cw, ch) = (want.x1 - want.x0, want.y1 - want.y0);
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    assert!(
+        close(out.crop.x0, want.x0)
+            && close(out.crop.y0, want.y0)
+            && close(out.crop.x1, want.x1)
+            && close(out.crop.y1, want.y1),
+        "crop {:?}, want {want:?}",
+        out.crop
+    );
+    assert_eq!(pm.width().max(pm.height()), 1200);
+    let aspect = f64::from(pm.width()) / f64::from(pm.height());
+    let tol = 1.5 / f64::from(pm.width().min(pm.height()));
+    assert!(
+        (aspect / (cw / ch) - 1.0).abs() < tol,
+        "image aspect {aspect}, crop aspect {}",
+        cw / ch
+    );
+
+    // The outline sits on the space's box: its four edges are outline-coloured.
+    let s = out.px_per_mm;
+    let edge = |x0: f64, y0: f64, x1: f64, y1: f64| Rect2 { x0, y0, x1, y1 };
+    let band = 1.5 / s;
+    for (what, e) in [
+        ("top", edge(r.x0, r.y0 - band, r.x1, r.y0 + band)),
+        ("bottom", edge(r.x0, r.y1 - band, r.x1, r.y1 + band)),
+        ("left", edge(r.x0 - band, r.y0, r.x0 + band, r.y1)),
+        ("right", edge(r.x1 - band, r.y0, r.x1 + band, r.y1)),
+    ] {
+        let on = share_in(&pm, &out.crop, s, &e, is_outline);
+        assert!(
+            on > 0.5,
+            "{}: {what} edge {on:.3} outline-coloured",
+            lane.id
+        );
+    }
+
+    // The space's dimension texts are inked where the layout puts them.
+    for b in texts_in(&r) {
+        let (dx, dy) = ((b.x1 - b.x0) * 0.1, (b.y1 - b.y0) * 0.1);
+        let inner = edge(b.x0 + dx, b.y0 + dy, b.x1 - dx, b.y1 - dy);
+        let ink = share_in(&pm, &out.crop, s, &inner, is_ink);
+        assert!(ink > 0.03, "{}: text box {b:?} ink {ink:.3}", lane.id);
+    }
+
+    // Empty paper is white: a free rectangle's interior.
+    let free = map
+        .spaces
+        .iter()
+        .find(|s| s.kind == SpaceKind::Free)
+        .expect("free paper on the flange sheet");
+    let fc = SheetCrop::of_space(&d, &layout, &map, &free.id).expect("free crop");
+    let fo = render_drawing_png(&d, &fc, 800).expect("png");
+    let fp = decode_png(&fo.png);
+    let f = free.rect;
+    let inner = edge(f.x0 + 3.0, f.y0 + 3.0, f.x1 - 3.0, f.y1 - 3.0);
+    let white = share_in(&fp, &fo.crop, fo.px_per_mm, &inner, is_white);
+    assert!(white > 0.98, "{}: interior white {white:.3}", free.id);
+}
+
+/// The long edge is bounded: past the cap or under the floor is refused
+/// typed, never silently clamped; an unknown space has no crop; a crop off
+/// the paper is refused.
+#[test]
+fn the_png_size_cap_holds_and_bad_crops_are_refused() {
+    use geometry_engine::drawing::layout::Rect2;
+    use geometry_engine::drawing::raster::{
+        render_drawing_png, RasterError, SheetCrop, SHEET_PNG_MAX_PX,
+    };
+    assert_eq!(SHEET_PNG_MAX_PX, 4096);
+    let (d, layout, map) = mapped_sheet(en1092_weld_neck_with_gdt);
+    let whole = SheetCrop::whole(&d);
+    for px in [0u32, 63, 4097, u32::MAX] {
+        match render_drawing_png(&d, &whole, px) {
+            Err(RasterError::PxOutOfRange { requested, max, .. }) => {
+                assert_eq!((requested, max), (px, 4096));
+            }
+            Err(e) => panic!("px {px}: refused, but not as out of range: {e}"),
+            Ok(out) => panic!("px {px}: served {} x {}", out.width, out.height),
+        }
+    }
+    let small = render_drawing_png(&d, &whole, 64).expect("the floor is served");
+    assert_eq!(small.width.max(small.height), 64);
+    assert!(SheetCrop::of_space(&d, &layout, &map, "view:NOPE").is_none());
+    let off = SheetCrop {
+        rect: Rect2 {
+            x0: 5000.0,
+            y0: 5000.0,
+            x1: 5100.0,
+            y1: 5100.0,
+        },
+        outline: None,
+        marks: Vec::new(),
+    };
+    assert!(matches!(
+        render_drawing_png(&d, &off, 800),
+        Err(RasterError::EmptyCrop(_))
+    ));
+}
+
+/// The pictures to LOOK at: the flange's and the rib's whole sheet and their
+/// worst space, written under the test target dir.
+#[test]
+fn the_look_pictures_of_the_flange_and_the_rib() {
+    use geometry_engine::drawing::raster::{render_drawing_png, SheetCrop};
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("look");
+    std::fs::create_dir_all(&dir).expect("dir");
+    type Build = fn() -> (BRepModel, SolidId);
+    let parts: [(&str, Build); 2] = [
+        ("flange", en1092_weld_neck_with_gdt),
+        ("rib", naca2412_rib_with_gdt),
+    ];
+    for (what, build) in parts {
+        let (d, layout, map) = mapped_sheet(build);
+        let whole = render_drawing_png(&d, &SheetCrop::whole(&d), 1600).expect("png");
+        std::fs::write(dir.join(format!("{what}-sheet.png")), &whole.png).expect("write");
+        let worst = map.worst.clone().expect("a worst space");
+        let crop = SheetCrop::of_space(&d, &layout, &map, &worst).expect("crop");
+        let look = render_drawing_png(&d, &crop, 1600).expect("png");
+        let name = worst.replace([':', '/'], "_");
+        std::fs::write(dir.join(format!("{what}-{name}.png")), &look.png).expect("write");
+        let space = map.space(&worst).expect("space");
+        eprintln!(
+            "{what}: worst {worst} score {:.3} rect {:?} crop {:?} {}x{} marks {} findings {:?}",
+            space.score,
+            space.rect,
+            look.crop,
+            look.width,
+            look.height,
+            crop.marks.len(),
+            space
+                .findings
+                .iter()
+                .map(|f| format!("{:?} {:.2} {}", f.rule, f.measured, f.message))
+                .collect::<Vec<_>>()
+        );
+    }
+    eprintln!("look pictures in {}", dir.display());
+}

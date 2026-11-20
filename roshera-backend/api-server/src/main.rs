@@ -11472,6 +11472,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/drawings/{id}/spaces",
             get(drawing_mgr::drawing_spaces),
         )
+        // Agent eyes (slice 2): the sheet, or one space of it, as a PNG; an
+        // agent's look is also shown in every open app (AgentShow frame).
+        .route(
+            "/api/drawings/{id}/render.png",
+            get(drawing_mgr::render_png),
+        )
         // Semantic readback (campaign #55 Slice 2): the queryable sheet model +
         // live-checked certificate, and the certificate-only cheap poll.
         .route(

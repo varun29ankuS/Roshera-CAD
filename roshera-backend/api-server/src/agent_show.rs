@@ -57,6 +57,32 @@ pub enum ShowAction {
         #[serde(default)]
         caption: Option<String>,
     },
+    /// Look at a space of a drawing sheet (agent eyes, slice 2): the app
+    /// opens the Drawing workspace on that drawing, glides the sheet to the
+    /// space's box and outlines it. `space` None = the whole sheet. Emitted
+    /// by `GET /api/drawings/{id}/render.png` itself when an agent looks
+    /// (`drawing_mgr::render_png`), so the agent never has to remember to.
+    SheetSpace {
+        drawing_id: uuid::Uuid,
+        #[serde(default)]
+        space: Option<String>,
+        /// The space's box on the paper (mm, origin top-left, y down).
+        #[serde(default)]
+        rect: Option<SheetRect>,
+        #[serde(default)]
+        caption: Option<String>,
+    },
+}
+
+/// A box on the drawing paper, mm, origin top-left, y down -- the space map's
+/// frame (`geometry_engine::drawing::layout::Rect2`).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SheetRect {
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -97,8 +123,31 @@ fn validate(a: &ShowAction) -> Result<(), String> {
             Err("a feature is shown by its name or its anchor step".into())
         }
         ShowAction::Faces { face_ids, .. } if face_ids.is_empty() => Err("no faces to show".into()),
+        ShowAction::SheetSpace { space: Some(s), .. } if s.trim().is_empty() => {
+            Err("a sheet space is named by its id (omit it for the whole sheet)".into())
+        }
+        ShowAction::SheetSpace { rect: Some(r), .. }
+            if ![r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.is_finite())
+                || r.x1 < r.x0
+                || r.y1 < r.y0 =>
+        {
+            Err("a sheet space's box is finite with x1 >= x0 and y1 >= y0".into())
+        }
         _ => Ok(()),
     }
+}
+
+/// Send one checked action to every open app as an `AgentShow` frame on the
+/// live channel: the one seam every show goes through (the agent's own
+/// `POST /api/agent/show`, and the looks the drawing routes emit). Returns
+/// how many apps received it (0 = nobody is looking).
+pub(crate) fn publish(action: &ShowAction) -> Result<usize, ApiError> {
+    validate(action).map_err(|m| ApiError::new(ErrorCode::InvalidParameter, m))?;
+    let frame = serde_json::json!({ "type": "AgentShow", "payload": action });
+    let text = serde_json::to_string(&frame)
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("show frame: {e}")))?;
+    // `send` errs only when no app is listening: delivered to nobody.
+    Ok(crate::geometry_broadcaster().send(text).unwrap_or(0))
 }
 
 pub async fn show(
@@ -111,11 +160,6 @@ pub async fn show(
             format!("cannot show that: {e}"),
         )
     })?;
-    validate(&action).map_err(|m| ApiError::new(ErrorCode::InvalidParameter, m))?;
-    let frame = serde_json::json!({ "type": "AgentShow", "payload": action });
-    let text = serde_json::to_string(&frame)
-        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("show frame: {e}")))?;
-    // `send` errs only when no app is listening: delivered to nobody.
-    let delivered_to = crate::geometry_broadcaster().send(text).unwrap_or(0);
+    let delivered_to = publish(&action)?;
     Ok(Json(ShowResponse { delivered_to }))
 }

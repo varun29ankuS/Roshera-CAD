@@ -1325,6 +1325,25 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "required": ["drawing_id"]
             }),
         ),
+        // Agent eyes (GET /api/drawings/{id}/render.png, drawing_mgr.rs): the
+        // sheet or one space as an image, with that space's findings; the
+        // route shows the look in the user's open app.
+        t(
+            "drawing_look",
+            Drawing,
+            Experimental,
+            Curated,
+            "Look at a sheet as a picture: the whole sheet, or one region (a space id from drawing_spaces) cropped with a margin and outlined, returned as an image together with that region's score and findings worst first. The person's app follows the look.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "space": {"type": "string", "description": "a space id from drawing_spaces (e.g. 'view:FRONT/band:top'); omit for the whole sheet"},
+                    "px": {"type": "integer", "minimum": 64, "maximum": 4096, "description": "the image's long edge in pixels (default 1600)"}
+                },
+                "required": ["drawing_id"]
+            }),
+        ),
         t(
             "drawing_dimension_properties",
             Drawing,
@@ -2300,7 +2319,9 @@ mod tests {
         // existing handlers/gdt.rs routes) instead of undoing the timeline.
         // 112 -> 113 (2026-11-20): drawing_spaces -- the agent sees a sheet
         // as its scored spaces (GET /api/drawings/{id}/spaces).
-        assert_eq!(tools.len(), 113, "expected 113 tools, got {}", tools.len());
+        // 113 -> 114 (2026-11-20): drawing_look -- the agent sees a sheet, or one
+        // space of it, as an image (GET /api/drawings/{id}/render.png).
+        assert_eq!(tools.len(), 114, "expected 114 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2317,7 +2338,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 125, "113 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 126, "114 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");

@@ -452,7 +452,10 @@ console.log("(2) TIER 2: playbook chunks + tool_sequence resolve against the tab
     // The drafting skill (2026-11-19, authored in kb_data.ts): how to make a
     // manufacturing drawing -- purpose, standards, sheet, views, dimensions,
     // tolerances, review loop, family notes.
-    manufacturing_drawing: 888,
+    // 888 -> 959 (2026-11-20): the LOOK step (drawing_spaces, then
+    // drawing_look on the worst space) and the text-height rule corrected to
+    // 2.5 mm capitals, 3.5 mm on A3 and up (ISO 3098 / BS 8888).
+    manufacturing_drawing: 959,
   };
   for (const [key, tokens] of Object.entries(PLAYBOOK_TOKENS)) {
     const p = await lookup("playbook", key);

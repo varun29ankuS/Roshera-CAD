@@ -237,6 +237,18 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
       z.object({ action: z.literal('feature'), name: z.string().nullish(), anchor: z.number().nullish(), caption: z.string().nullish() }),
       z.object({ action: z.literal('faces'), solid_id: z.number(), face_ids: z.array(z.number()), caption: z.string().nullish() }),
       z.object({ action: z.literal('step'), sequence: z.number(), caption: z.string().nullish() }),
+      // The agent looked at a sheet space (GET /api/drawings/{id}/render.png
+      // emits it): the box is paper mm, finite, x1 >= x0, y1 >= y0.
+      z.object({
+        action: z.literal('sheet_space'),
+        drawing_id: z.string().uuid(),
+        space: z.string().min(1).nullish(),
+        rect: z
+          .object({ x0: z.number().finite(), y0: z.number().finite(), x1: z.number().finite(), y1: z.number().finite() })
+          .refine((r) => r.x1 >= r.x0 && r.y1 >= r.y0, 'an inverted sheet box')
+          .nullish(),
+        caption: z.string().nullish(),
+      }),
     ]),
   }),
   // An agent read the person's context (GET /api/agent/user-context,

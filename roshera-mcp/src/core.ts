@@ -243,6 +243,38 @@ export async function readRefusable(res: Response, what: string): Promise<any> {
   return text.length ? JSON.parse(text) : null;
 }
 
+/**
+ * GET a binary body (a PNG) with the session's scope headers -- `api()`
+ * parses JSON and cannot carry bytes. A non-2xx is an `ApiError` carrying the
+ * server's (JSON) refusal text, exactly as `api()` reports one; a timeout is
+ * a 504 the same way. The response headers come back for the caller to read.
+ */
+export async function apiBytes(
+  path: string,
+  timeoutMs: number = TIMEOUT_MS,
+): Promise<{ bytes: Buffer; headers: Headers }> {
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      method: "GET",
+      headers: scopeHeaders(),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    const name = (err as { name?: string })?.name;
+    if (name === "TimeoutError" || name === "AbortError") {
+      throw new ApiError(`GET ${path} → timed out after ${timeoutMs}ms`, 504, "");
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new ApiError(`GET ${path} → network error: ${msg}`, 0, "");
+  }
+  if (!res.ok) {
+    const text = await res.text();
+    throw new ApiError(`GET ${path} → ${res.status}: ${text}`, res.status, text);
+  }
+  return { bytes: Buffer.from(await res.arrayBuffer()), headers: res.headers };
+}
+
 export async function api(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,

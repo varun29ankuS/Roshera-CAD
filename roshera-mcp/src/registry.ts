@@ -235,6 +235,7 @@ const EXPERIMENTAL = new Set<string>([
   "drawing_dimensions",
   "drawing_dimension_properties",
   "drawing_spaces",
+  "drawing_look",
   "iso286_limits",
   "dfm_check",
   "kb_lookup",
@@ -335,6 +336,9 @@ const BENCH_OF: Record<string, Bench> = {
   // The space map: the agent sees a sheet as its scored spaces
   // (GET /api/drawings/{id}/spaces), graded by the worst.
   drawing_spaces: "drawing",
+  // Agent eyes: the sheet or one space as an image (GET .../render.png),
+  // the look shown in the person's app.
+  drawing_look: "drawing",
   drawing_dimension_properties: "drawing",
   iso286_limits: "drawing",
   dimension_part: "drawing",

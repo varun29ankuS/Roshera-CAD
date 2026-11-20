@@ -4,6 +4,7 @@ import { useHistoryView } from '@/stores/history-view-store'
 import { FRAME_FIT, useSceneStore } from '@/stores/scene-store'
 import { fetchChapters, partChapters } from '@/lib/chapters-api'
 import { findFeature, presetFor, showCaption, type ShowAction } from '@/lib/agent-show'
+import { isSheetRect, type SheetRect } from '@/lib/sheet-look'
 
 /**
  * The agent driving the app (Varun 2026-11-14: drive, with Pause / Take
@@ -19,6 +20,10 @@ interface AgentShowState {
   missed: number
   /** Faces the agent lit up, drawn by AgentFacesHighlight. */
   faces: { objectId: string; faceIds: number[] } | null
+  /** The sheet space the agent is looking at, carried out by the Drawing
+   *  workspace (it glides there and outlines it); `seq` makes a repeated
+   *  look at the same space glide again. Null = no look. */
+  sheetLook: SheetLook | null
   receive: (a: ShowAction) => Promise<void>
   pause: () => void
   resume: () => void
@@ -27,11 +32,22 @@ interface AgentShowState {
   dismiss: () => void
 }
 
+export interface SheetLook {
+  drawingId: string
+  space: string | null
+  rect: SheetRect | null
+  caption: string
+  seq: number
+}
+
+let lookSeq = 0
+
 export const useAgentShowStore = create<AgentShowState>((set, get) => ({
   paused: false,
   showing: null,
   missed: 0,
   faces: null,
+  sheetLook: null,
   receive: async (a) => {
     if (get().paused) {
       set((s) => ({ missed: s.missed + 1 }))
@@ -78,10 +94,27 @@ export const useAgentShowStore = create<AgentShowState>((set, get) => ({
         toPart()
         useHistoryView.getState().view(a.sequence)
         return
+      case 'sheet_space': {
+        // The Drawing workspace on that drawing; it glides to the box once
+        // the sheet is on screen (DrawingsWorkspace, lib/sheet-look).
+        useDocModeStore.getState().openDrawing(a.drawing_id)
+        lookSeq += 1
+        set({
+          sheetLook: {
+            drawingId: a.drawing_id,
+            space: a.space ?? null,
+            rect: isSheetRect(a.rect) ? a.rect : null,
+            caption,
+            seq: lookSeq,
+          },
+        })
+        return
+      }
     }
   },
   pause: () => set({ paused: true }),
   resume: () => set({ paused: false, missed: 0 }),
-  takeOver: () => set({ paused: true, showing: null, faces: null }),
-  dismiss: () => set({ showing: null, faces: null }),
+  // Take over leaves the sheet where it is: the outline goes, the view stays.
+  takeOver: () => set({ paused: true, showing: null, faces: null, sheetLook: null }),
+  dismiss: () => set({ showing: null, faces: null, sheetLook: null }),
 }))

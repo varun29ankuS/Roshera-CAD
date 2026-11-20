@@ -60,6 +60,11 @@ rstar = "0.12"
 # exported file carries editable model-space geometry per view layer.
 svg2pdf = "0.13"
 dxf = "0.6"
+# The sheet as a PNG (drawing/raster.rs): the agent's eyes on a drawing. The
+# same SVG as the PDF, rasterised by resvg / tiny-skia -- the exact versions
+# svg2pdf already locks, so the lock gains no package.
+resvg = { version = "=0.45.1", default-features = false, features = ["text", "raster-images"] }
+tiny-skia = "=0.11.4"
 
 # Agent-facing render output (AGENT-RENDER-α). Pure-Rust PNG encoder for
 # the software rasterizer in `render/` — the "screenshot for agents"

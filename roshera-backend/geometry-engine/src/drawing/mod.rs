@@ -39,6 +39,7 @@ pub mod pdf;
 pub mod profile_table;
 pub mod projection;
 pub mod query;
+pub mod raster;
 pub mod round_part;
 pub mod section_comprehension;
 pub mod section_view;
@@ -75,6 +76,9 @@ pub use projection::{
 pub use query::{
     answer_query, DatumStatus, DrawingAnswer, DrawingQuery, EntityAtAnswer, FcfAnswer,
     TolerancedDiameterAnswer,
+};
+pub use raster::{
+    render_drawing_png, RasterError, SheetCrop, SheetPng, SHEET_PNG_DEFAULT_PX, SHEET_PNG_MAX_PX,
 };
 pub use section_comprehension::{
     section_cut_through, SectionCut, SectionCutKind, SectionCutThrough,

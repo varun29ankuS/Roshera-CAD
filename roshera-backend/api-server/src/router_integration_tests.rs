@@ -13805,3 +13805,267 @@ async fn the_spaces_route_serves_the_sheet_space_map() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
+
+/// One GET of the sheet picture, with or without the agent's header: status,
+/// the `x-roshera-crop` / `x-roshera-shown-to` headers, and the body.
+async fn get_render_png(
+    state: &AppState,
+    uri: &str,
+    agent: bool,
+) -> (StatusCode, Option<String>, Option<String>, Vec<u8>) {
+    let mut req = Request::builder().method(Method::GET).uri(uri.to_string());
+    if agent {
+        req = req.header("X-Roshera-Agent", "Claude");
+    }
+    let response = build_router(state.clone())
+        .oneshot(req.body(Body::empty()).expect("request builds"))
+        .await
+        .expect("router must produce a response (oneshot infallibility)");
+    let status = response.status();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (crop, shown) = (header("x-roshera-crop"), header("x-roshera-shown-to"));
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("finite body");
+    (status, crop, shown, bytes.to_vec())
+}
+
+/// (width, height) of a PNG body.
+fn png_size(bytes: &[u8]) -> (u32, u32) {
+    assert!(
+        bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+        "PNG magic bytes"
+    );
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let reader = decoder.read_info().expect("a decodable PNG");
+    let info = reader.info();
+    (info.width, info.height)
+}
+
+/// `GET /api/drawings/{id}/render.png` (agent eyes, slice 2) serves the
+/// stored sheet as a PNG: the whole sheet at the sheet's aspect with the long
+/// edge `px` (default 1600), one space cropped to its box plus margin (the
+/// crop header names the paper shown, which contains the space's box from
+/// `/spaces`); `px` outside 64..=4096 and an unknown space are refused typed,
+/// an unknown drawing is a 404.
+#[tokio::test]
+async fn the_render_png_route_serves_the_sheet_and_one_space() {
+    let state = make_test_state().await;
+    let drawing_id = bored_part_with_drawing(&state, "").await;
+    let (_, sheet) = dispatch(&state, json_get(&format!("/api/drawings/{drawing_id}"))).await;
+    let (_, map) = dispatch(
+        &state,
+        json_get(&format!("/api/drawings/{drawing_id}/spaces")),
+    )
+    .await;
+    let frame = map["spaces"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["id"] == "frame"))
+        .expect("the frame space");
+    let paper_w = frame["rect"]["x1"].as_f64().expect("x1") + 1.0;
+    assert!(paper_w > 200.0, "{sheet}");
+
+    let (s, crop, shown, body) = get_render_png(
+        &state,
+        &format!("/api/drawings/{drawing_id}/render.png"),
+        false,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(shown, None, "a non-agent fetch is not shown");
+    let (w, h) = png_size(&body);
+    assert_eq!(w.max(h), 1600, "the default long edge");
+    let c: Vec<f64> = crop
+        .expect("crop header")
+        .split(',')
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    assert_eq!(c.len(), 4);
+    let aspect = (c[2] - c[0]) / (c[3] - c[1]);
+    assert!(
+        (f64::from(w) / f64::from(h) / aspect - 1.0).abs() < 0.01,
+        "{w}x{h} vs crop {c:?}"
+    );
+
+    let (s, crop, _, body) = get_render_png(
+        &state,
+        &format!("/api/drawings/{drawing_id}/render.png?space=view:FRONT&px=900"),
+        false,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (w, h) = png_size(&body);
+    assert_eq!(w.max(h), 900);
+    let c: Vec<f64> = crop
+        .expect("crop header")
+        .split(',')
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    let front = map["spaces"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["id"] == "view:FRONT"))
+        .expect("view:FRONT");
+    let r = &front["rect"];
+    let (x0, y0, x1, y1) = (
+        r["x0"].as_f64().expect("x0"),
+        r["y0"].as_f64().expect("y0"),
+        r["x1"].as_f64().expect("x1"),
+        r["y1"].as_f64().expect("y1"),
+    );
+    assert!(
+        c[0] < x0 && c[1] < y0 && c[2] > x1 && c[3] > y1,
+        "the crop {c:?} holds the space {r} with a margin"
+    );
+    assert!((c[2] - c[0]) < paper_w - 1.0, "a crop, not the sheet");
+
+    for (q, why) in [
+        ("?px=5000", "over the cap"),
+        ("?px=10", "under the floor"),
+        ("?space=view:NOPE", "unknown space"),
+    ] {
+        let (s, _, _, body) = get_render_png(
+            &state,
+            &format!("/api/drawings/{drawing_id}/render.png{q}"),
+            false,
+        )
+        .await;
+        assert!(s.is_client_error(), "{why}: {s}");
+        let refused: Value = serde_json::from_slice(&body).unwrap_or_default();
+        assert_eq!(
+            refused["error_code"], "invalid_parameter",
+            "{why}: {refused}"
+        );
+    }
+    let (s, _, _, _) = get_render_png(
+        &state,
+        &format!("/api/drawings/{}/render.png", Uuid::new_v4()),
+        false,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+/// An AGENT's look is shown (design 4b, LOOK): the same GET carrying
+/// `X-Roshera-Agent` publishes one `AgentShow` `sheet_space` frame through the
+/// show seam -- the drawing, the space, the space's box exactly as `/spaces`
+/// reports it, and a caption naming the space and its worst finding by rule
+/// id -- and says how many apps it reached. The same GET without the header
+/// publishes nothing for this drawing.
+#[tokio::test]
+async fn an_agent_look_at_a_sheet_space_is_shown_in_the_open_apps() {
+    let state = make_test_state().await;
+    let drawing_id = bored_part_with_drawing(&state, "").await;
+    let (_, map) = dispatch(
+        &state,
+        json_get(&format!("/api/drawings/{drawing_id}/spaces")),
+    )
+    .await;
+    // The worst space: the one an agent looks at first.
+    let worst = map["worst"].as_str().expect("a worst space").to_string();
+    let space = map["spaces"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["id"] == worst.as_str()))
+        .cloned()
+        .expect("the worst space");
+    let uri = format!(
+        "/api/drawings/{drawing_id}/render.png?space={}&px=400",
+        worst.replace('/', "%2F").replace(':', "%3A")
+    );
+    let mut rx = crate::geometry_broadcaster().subscribe();
+    let ours = |rx: &mut tokio::sync::broadcast::Receiver<String>| -> Vec<Value> {
+        let mut found = Vec::new();
+        while let Ok(text) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&text).unwrap_or_default();
+            if frame["type"] == "AgentShow" && frame["payload"]["drawing_id"] == drawing_id.as_str()
+            {
+                found.push(frame);
+            }
+        }
+        found
+    };
+
+    let (s, _, shown, _) = get_render_png(&state, &uri, false).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(shown, None);
+    assert!(ours(&mut rx).is_empty(), "a non-agent fetch moves no app");
+
+    let (s, _, shown, body) = get_render_png(&state, &uri, true).await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let shown: usize = shown.and_then(|n| n.parse().ok()).expect("shown-to header");
+    assert!(shown >= 1, "the subscribed receiver counts: {shown}");
+    let frames = ours(&mut rx);
+    assert_eq!(frames.len(), 1, "one frame per look: {frames:?}");
+    let p = &frames[0]["payload"];
+    assert_eq!(p["action"], "sheet_space", "{p}");
+    assert_eq!(p["space"], worst.as_str(), "{p}");
+    assert_eq!(p["rect"], space["rect"], "the box /spaces reports: {p}");
+    let caption = p["caption"].as_str().expect("caption");
+    // Errors before warnings, as the caption picks.
+    let findings = space["findings"].as_array().cloned().unwrap_or_default();
+    let rule = findings
+        .iter()
+        .find(|f| f["severity"] == "error")
+        .or_else(|| findings.first())
+        .and_then(|f| f["rule"].as_str());
+    if let Some(rule) = rule {
+        assert!(
+            caption.contains(rule),
+            "the caption names the worst finding's rule {rule}: {caption}"
+        );
+        assert!(caption.contains(" vs "), "measured vs tolerance: {caption}");
+    }
+    assert!(caption.contains("score"), "{caption}");
+
+    // The whole sheet, looked at by an agent, is shown too (no space).
+    let (s, _, _, _) = get_render_png(
+        &state,
+        &format!("/api/drawings/{drawing_id}/render.png?px=300"),
+        true,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let frames = ours(&mut rx);
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert!(frames[0]["payload"]["space"].is_null(), "{}", frames[0]);
+    assert!(
+        frames[0]["payload"]["caption"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("the whole sheet")),
+        "{}",
+        frames[0]
+    );
+}
+
+/// The agent's own `POST /api/agent/show` accepts a sheet space too (one
+/// seam, one schema), and refuses an inverted box before anything is sent.
+#[tokio::test]
+async fn an_agent_show_of_a_sheet_space_is_checked() {
+    let state = make_test_state().await;
+    let id = Uuid::new_v4();
+    let (s, body) = dispatch(
+        &state,
+        json_post(
+            "/api/agent/show",
+            json!({ "action": "sheet_space", "drawing_id": id, "space": "title-block",
+                    "rect": {"x0": 10.0, "y0": 20.0, "x1": 50.0, "y1": 40.0} }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let (s, body) = dispatch(
+        &state,
+        json_post(
+            "/api/agent/show",
+            json!({ "action": "sheet_space", "drawing_id": id, "space": "title-block",
+                    "rect": {"x0": 50.0, "y0": 20.0, "x1": 10.0, "y1": 40.0} }),
+        ),
+    )
+    .await;
+    assert!(s.is_client_error(), "{s} {body}");
+}

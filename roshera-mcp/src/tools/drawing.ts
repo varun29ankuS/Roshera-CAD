@@ -12,7 +12,38 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { api, ok, fail } from "../core.js";
+import {
+  api,
+  apiBytes,
+  ok,
+  fail,
+  imageFreshness,
+  lastGlobalMutationTurnValue,
+  recordImageSent,
+} from "../core.js";
+
+/** One space-map finding as a line: severity, rule, message, measured vs tolerance. */
+function findingLine(f: any): string {
+  const t = f?.tolerance ?? {};
+  const range =
+    t.min != null && t.max != null
+      ? `${t.min}..${t.max}`
+      : t.min != null
+        ? `>= ${t.min}`
+        : t.max != null
+          ? `<= ${t.max}`
+          : "";
+  const m = typeof f?.measured === "number" ? +f.measured.toFixed(3) : f?.measured;
+  return `${f?.severity === "error" ? "ERROR" : "warn"} ${f?.rule}: ${f?.message} [${m} ${f?.unit ?? ""} vs ${range}]`;
+}
+
+/** A space's findings as lines, errors before warnings. */
+function findingLines(s: any): string[] {
+  const fs: any[] = Array.isArray(s?.findings) ? s.findings : [];
+  return [...fs]
+    .sort((a, b) => (a?.severity === "error" ? 0 : 1) - (b?.severity === "error" ? 0 : 1))
+    .map(findingLine);
+}
 
 /** One layout finding as a stable line: severity, view and message. */
 function issueLine(i: any): string {
@@ -371,19 +402,7 @@ export function registerDrawingTools(server: ToolHost): void {
         const worst = spaces
           .filter((s) => typeof s?.score === "number" && s.score < 1)
           .sort((a, b) => a.score - b.score || String(a.id).localeCompare(String(b.id)));
-        const finding = (f: any): string => {
-          const t = f?.tolerance ?? {};
-          const range =
-            t.min != null && t.max != null
-              ? `${t.min}..${t.max}`
-              : t.min != null
-                ? `>= ${t.min}`
-                : t.max != null
-                  ? `<= ${t.max}`
-                  : "";
-          const m = typeof f?.measured === "number" ? +f.measured.toFixed(3) : f?.measured;
-          return `${f?.severity === "error" ? "ERROR" : "warn"} ${f?.rule}: ${f?.message} [${m} ${f?.unit ?? ""} vs ${range}]`;
-        };
+        const finding = findingLine;
         // The text the agent reads stays compact: the worst spaces, each with
         // its first findings; the whole map rides in structuredContent only.
         const SHOWN_SPACES = 12;
@@ -422,6 +441,120 @@ export function registerDrawingTools(server: ToolHost): void {
           content: [{ type: "text" as const, text: JSON.stringify(compact, null, 2) }],
           structuredContent: { ...compact, map: r },
         };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ── drawing_look ───────────────────────────────────────────────────────
+  // The agent's EYES on a sheet (agent eyes slice 2): GET
+  // /api/drawings/{id}/render.png as MCP image content, with the region's
+  // findings read from /spaces beside it. The route itself shows the look in
+  // the person's open app (an AgentShow sheet_space frame, sent because this
+  // call carries X-Roshera-Agent), so the agent never has to remember to.
+  server.tool(
+    "drawing_look",
+    "LOOK AT A SHEET: render the drawing as a PNG image and see it -- the " +
+      "whole sheet, or one region (an id from drawing_spaces) cropped with a " +
+      "margin, outlined in magenta, the texts its findings name tinted orange " +
+      "-- with that region's findings beside the image. The person's open app " +
+      "zooms to the same region with a caption. Judge appearance from the " +
+      "image; take every number from the findings.",
+    {
+      drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
+      space: z
+        .string()
+        .optional()
+        .describe("a space id from drawing_spaces (e.g. 'view:FRONT/band:top'); omit for the whole sheet"),
+      px: z
+        .number()
+        .int()
+        .min(64)
+        .max(4096)
+        .optional()
+        .describe("the image's long edge in pixels (default 1600)"),
+    },
+    async ({ drawing_id, space, px }) => {
+      try {
+        // The numbers first: an unknown space is refused here, typed, before
+        // any picture is drawn or shown.
+        const sq = space ? `?space=${encodeURIComponent(space)}` : "";
+        const map = await api("GET", `/api/drawings/${drawing_id}/spaces${sq}`);
+        const q = new URLSearchParams();
+        if (space) q.set("space", space);
+        if (px !== undefined) q.set("px", String(px));
+        const qs = q.toString() ? `?${q.toString()}` : "";
+        const { bytes, headers } = await apiBytes(`/api/drawings/${drawing_id}/render.png${qs}`);
+
+        const spaces: any[] = Array.isArray(map?.spaces) ? map.spaces : [];
+        const SHOWN_UNDER = 8;
+        const SHOWN_FINDINGS = 3;
+        const worstFirst = (xs: any[]) =>
+          xs
+            .filter((s) => typeof s?.score === "number" && s.score < 1)
+            .sort((a, b) => a.score - b.score || String(a.id).localeCompare(String(b.id)));
+        const brief = (s: any) => {
+          const lines = findingLines(s);
+          return {
+            space: s.id,
+            score: +Number(s.score).toFixed(3),
+            findings:
+              lines.length > SHOWN_FINDINGS
+                ? [...lines.slice(0, SHOWN_FINDINGS), `+${lines.length - SHOWN_FINDINGS} more`]
+                : lines,
+          };
+        };
+        const crop = (headers.get("x-roshera-crop") ?? "")
+          .split(",")
+          .map(Number)
+          .filter((n) => Number.isFinite(n));
+        const shownTo = headers.get("x-roshera-shown-to");
+        const bar = typeof map?.bar === "number" ? map.bar : 0.8;
+        let looked: Record<string, unknown>;
+        if (space) {
+          const here = spaces.find((s) => s?.id === space);
+          const under = worstFirst(spaces.filter((s) => s?.id !== space));
+          looked = {
+            space,
+            kind: here?.kind ?? null,
+            score: typeof here?.score === "number" ? +here.score.toFixed(3) : null,
+            below_bar: typeof here?.score === "number" ? here.score < bar : null,
+            findings: here ? findingLines(here) : [],
+            spaces_under_with_findings: under.slice(0, SHOWN_UNDER).map(brief),
+            more_under: Math.max(0, under.length - SHOWN_UNDER),
+          };
+        } else {
+          const worst = worstFirst(spaces);
+          looked = {
+            space: null,
+            worst_spaces: worst.slice(0, SHOWN_UNDER).map(brief),
+            more_spaces_with_findings: Math.max(0, worst.length - SHOWN_UNDER),
+          };
+        }
+        const grade = typeof map?.grade === "number" ? +map.grade.toFixed(3) : null;
+        const text = {
+          drawing_id,
+          ...looked,
+          sheet: { grade, bar, below_bar: map?.below_bar ?? null, worst: map?.worst ?? null },
+          crop_mm: crop.length === 4 ? crop : null,
+          shown_in_app: shownTo === null ? null : Number(shownTo),
+          note:
+            "the image shows appearance only; the findings are the kernel's measurements. " +
+            "Magenta = the region's box, orange = what its findings name.",
+        };
+        const content: any[] = [];
+        const imgKey = `drawing_look:${drawing_id}:${space ?? ""}:${px ?? 1600}`;
+        const watermark = lastGlobalMutationTurnValue();
+        const fresh = imageFreshness(imgKey, watermark);
+        if (fresh.send) {
+          content.push({ type: "image", data: bytes.toString("base64"), mimeType: "image/png" });
+          recordImageSent(imgKey, watermark, `drawing_look ${drawing_id} ${space ?? "whole sheet"}`);
+        } else {
+          content.push({ type: "text", text: `IMAGE UNCHANGED — ${fresh.note}` });
+        }
+        content.push({ type: "text", text: JSON.stringify(text, null, 2) });
+        return { content, structuredContent: text };
       } catch (e) {
         return fail(e);
       }

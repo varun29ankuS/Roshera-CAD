@@ -284,6 +284,7 @@ const READ_ONLY = new Set<string>([
   "drawing_query",
   "drawing_read_semantics",
   "drawing_spaces",
+  "drawing_look",
   "gdt_report",
   "export_part",
   "drawing_export_sheet",

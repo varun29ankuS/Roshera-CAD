@@ -136,8 +136,10 @@ const table = buildTable();
   // corrects GD&T it authored in place instead of undoing the timeline.
   // 127 -> 128 (2026-11-20): drawing_spaces (kernel, "drawing") -- the agent
   // sees a sheet as its scored spaces.
-  if (table.size === 128) pass("table holds 128 tools (123 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 128`);
+  // 128 -> 129 (2026-11-20): drawing_look (kernel, "drawing") -- the agent
+  // sees a sheet, or one space of it, as an image.
+  if (table.size === 129) pass("table holds 129 tools (124 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 129`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -171,8 +173,9 @@ const table = buildTable();
   // + iso286_limits.
   // 119 -> 124 (2026-11-20): the five GD&T edit / delete tools.
   // 124 -> 125 (2026-11-20): drawing_spaces.
-  if (full.length === 125) pass("full surface exposes exactly 125 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 125`);
+  // 125 -> 126 (2026-11-20): drawing_look.
+  if (full.length === 126) pass("full surface exposes exactly 126 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 126`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");

@@ -79,12 +79,14 @@ import {
   type SheetQuality,
 } from '@/lib/drawing-drag'
 import { fitSheetScale } from '@/lib/sheet-fit'
+import { lookGlide, prefersReducedMotion, PX_PER_MM, sheetLookTarget } from '@/lib/sheet-look'
+import { useAgentShowStore } from '@/stores/agent-show-store'
 import { withScreenInk } from '@/lib/sheet-screen-ink'
 import { exportRefusalText } from '@/lib/export-refusal'
 
-// CSS pixels per millimetre at the standard 96 DPI mapping. At zoom
+// CSS pixels per millimetre at the standard 96 DPI mapping (PX_PER_MM, from
+// lib/sheet-look, the one number the agent's look aims with too). At zoom
 // `1.0` the sheet renders at its true physical size.
-const PX_PER_MM = 96 / 25.4
 
 function sheetDimensionsMm(sheet: Drawing['sheet_size']): [number, number] {
   if (typeof sheet === 'string') {
@@ -800,6 +802,64 @@ export function DrawingsWorkspace() {
     setZoomMode('fit')
     setPan({ x: 0, y: 0 })
   }, [])
+
+  // ── The agent's look (agent eyes, slice 2) ────────────────────────
+  // An AgentShow `sheet_space` frame (the server sends one when the agent
+  // looks at a space) lands in the show store; once its drawing is the one
+  // on screen, the sheet glides to the space's box and outlines it, and the
+  // show bar carries the caption. Instant under reduced motion. The user's
+  // own wheel or drag stops the glide; Take over clears the outline and
+  // leaves the sheet where it is.
+  const sheetLook = useAgentShowStore((s) => s.sheetLook)
+  const lookShown = sheetLook !== null && activeDrawing?.id === sheetLook.drawingId ? sheetLook : null
+  const lookFrame = useRef<number | null>(null)
+  const lookDone = useRef<number>(0)
+  const scaleRef = useRef(effectiveScale)
+  useEffect(() => {
+    scaleRef.current = effectiveScale
+  }, [effectiveScale])
+  const cancelLook = useCallback(() => {
+    if (lookFrame.current !== null) cancelAnimationFrame(lookFrame.current)
+    lookFrame.current = null
+  }, [])
+  useEffect(() => cancelLook, [cancelLook])
+  // Take over (or the bar's x) clears the look: a glide in flight stops
+  // where it is, and the sheet stays there.
+  useEffect(() => {
+    if (sheetLook === null) cancelLook()
+  }, [sheetLook, cancelLook])
+  useEffect(() => {
+    if (!lookShown || !svg || containerSize.w <= 0 || containerSize.h <= 0) return
+    if (lookDone.current === lookShown.seq) return
+    lookDone.current = lookShown.seq
+    cancelLook()
+    const to = sheetLookTarget(containerSize, { w: sheetWMm, h: sheetHMm }, lookShown.rect)
+    const from = { zoom: scaleRef.current, pan: panStateRef.current.pan }
+    const glide = lookGlide(from, to, prefersReducedMotion())
+    const land = () => {
+      lookFrame.current = null
+      if (lookShown.rect) {
+        setZoomMode('manual')
+        setZoom(to.zoom)
+        setPan(to.pan)
+      } else {
+        setZoomMode('fit')
+        setPan({ x: 0, y: 0 })
+      }
+    }
+    if (glide.durationMs === 0) return land()
+    setZoomMode('manual')
+    const start = performance.now()
+    const step = (now: number) => {
+      const t = now - start
+      if (t >= glide.durationMs) return land()
+      const p = glide.at(t)
+      setZoom(p.zoom)
+      setPan(p.pan)
+      lookFrame.current = requestAnimationFrame(step)
+    }
+    lookFrame.current = requestAnimationFrame(step)
+  }, [lookShown, svg, containerSize, sheetWMm, sheetHMm, cancelLook])
   const zoomActual = useCallback(() => {
     setZoom(1)
     setZoomMode('manual')
@@ -822,6 +882,8 @@ export function DrawingsWorkspace() {
     if (!el) return
     const onWheel = (e: WheelEvent) => {
       e.preventDefault()
+      // The user's own zoom stops the agent's glide.
+      cancelLook()
       const rect = el.getBoundingClientRect()
       const cursorX = e.clientX - rect.left
       const cursorY = e.clientY - rect.top
@@ -854,7 +916,7 @@ export function DrawingsWorkspace() {
     }
     el.addEventListener('wheel', onWheel, { passive: false })
     return () => el.removeEventListener('wheel', onWheel)
-  }, [zoomMode, zoom, fitScale, sheetWPx, sheetHPx])
+  }, [zoomMode, zoom, fitScale, sheetWPx, sheetHPx, cancelLook])
 
   // ── Drag a selected view to move it ──────────────────────────────
   // Press on the SELECTED view and drag: a ghost outline follows the cursor
@@ -1037,6 +1099,8 @@ export function DrawingsWorkspace() {
   const onCanvasMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     // Ignore clicks on the zoom toolbar so the buttons still work.
     if ((e.target as HTMLElement).closest('button')) return
+    // The user's own press stops the agent's glide.
+    cancelLook()
     // A dimension is clicked to open its properties, or dragged to move it.
     const dimEl = (e.target as Element).closest('[data-dim-id]')
     if (dimEl) {
@@ -1080,7 +1144,7 @@ export function DrawingsWorkspace() {
     panStateRef.current.startPan = { ...panStateRef.current.pan }
     el.style.cursor = 'grabbing'
     e.preventDefault()
-  }, [beginViewDrag, sheetWMm])
+  }, [beginViewDrag, sheetWMm, cancelLook])
 
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
@@ -1323,6 +1387,7 @@ export function DrawingsWorkspace() {
       >
         {activeDrawing ? (
           svg ? (
+            <>
             <div
               ref={sheetRef}
               className="absolute top-1/2 left-1/2 bg-white shadow-md [&>svg]:block [&>svg]:w-full [&>svg]:h-full [&_[data-dim-id]]:cursor-pointer [&_[data-dim-id]:hover]:fill-[#d97706] [&_[data-dim-id]:hover]:font-bold [&_[data-dim-editing]]:fill-[#d97706] [&_[data-dim-editing]]:font-bold"
@@ -1336,6 +1401,38 @@ export function DrawingsWorkspace() {
               }}
               dangerouslySetInnerHTML={svgMarkup}
             />
+            {lookShown?.rect && (
+              // The space the agent is looking at, outlined on the sheet. It
+              // rides the sheet's own box and transform, in % of the paper,
+              // so it follows every pan and zoom without re-measuring.
+              <div
+                aria-hidden
+                data-agent-look={lookShown.space ?? ''}
+                className="pointer-events-none absolute top-1/2 left-1/2"
+                style={{
+                  width: `${displayW}px`,
+                  height: `${displayH}px`,
+                  transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px))`,
+                }}
+              >
+                <div
+                  className="absolute rounded-[2px] border-2 border-[#d4006a] shadow-[0_0_0_3px_rgba(212,0,106,0.18)]"
+                  style={{
+                    left: `${(lookShown.rect.x0 / sheetWMm) * 100}%`,
+                    top: `${(lookShown.rect.y0 / sheetHMm) * 100}%`,
+                    width: `${((lookShown.rect.x1 - lookShown.rect.x0) / sheetWMm) * 100}%`,
+                    height: `${((lookShown.rect.y1 - lookShown.rect.y0) / sheetHMm) * 100}%`,
+                  }}
+                >
+                  {lookShown.space && (
+                    <span className="absolute bottom-full left-0 mb-1 whitespace-nowrap rounded-sm bg-[#d4006a] px-1.5 py-0.5 font-mono text-[11px] leading-none text-white">
+                      {lookShown.space}
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+            </>
           ) : (
             <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
               {loading ? 'Rendering…' : ''}

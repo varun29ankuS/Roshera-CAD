@@ -1983,6 +1983,201 @@ pub async fn drawing_spaces(
     }
 }
 
+/// Query of [`render_png`]: one space (`?space=view:FRONT/band:top`) or the
+/// whole sheet, and the image's long edge in pixels.
+#[derive(Debug, Deserialize)]
+pub struct DrawingPngQuery {
+    #[serde(default)]
+    pub space: Option<String>,
+    #[serde(default)]
+    pub px: Option<u32>,
+}
+
+/// A space's id in a drafter's words, for the look's caption:
+/// `view:FRONT/band:top/lane:2` -> "FRONT top band, lane 2".
+fn space_words(id: &str) -> String {
+    let mut parts = id.split('/');
+    let head = parts.next().unwrap_or(id);
+    let mut words = match head.split_once(':') {
+        Some(("view", v)) => v.to_string(),
+        Some(("table", t)) => format!("{t} table"),
+        Some(("free", n)) => format!("free paper {n}"),
+        _ => head.replace('-', " "),
+    };
+    let mut nested = false;
+    for p in parts {
+        nested = true;
+        match p.split_once(':') {
+            Some(("band", side)) => words.push_str(&format!(" {side} band")),
+            Some(("lane", n)) => words.push_str(&format!(", lane {n}")),
+            _ => words.push_str(&format!(" {p}")),
+        }
+    }
+    if head.starts_with("view:") && !nested {
+        words.push_str(" view");
+    }
+    words
+}
+
+/// A finding's measured value against its tolerance, as the caption and the
+/// agent read it: `4.1 mm vs 6.5..8.5`.
+fn measured_vs_tolerance(f: &geometry_engine::drawing::Finding) -> String {
+    let n = |v: f64| format!("{}", (v * 100.0).round() / 100.0);
+    let range = match (f.tolerance.min, f.tolerance.max) {
+        (Some(a), Some(b)) => format!("{}..{}", n(a), n(b)),
+        (Some(a), None) => format!(">= {}", n(a)),
+        (None, Some(b)) => format!("<= {}", n(b)),
+        (None, None) => "no tolerance".to_string(),
+    };
+    format!("{} {} vs {range}", n(f.measured), f.unit)
+}
+
+/// The look's caption: the space in words, its score, and its worst finding
+/// by rule id with the measured value against the tolerance (errors before
+/// warnings); for the whole sheet, its grade and worst space.
+fn look_caption(map: &SpaceMap, space: Option<&geometry_engine::drawing::Space>) -> String {
+    use geometry_engine::drawing::Severity;
+    let worst_of = |s: &geometry_engine::drawing::Space| -> String {
+        let f = s
+            .findings
+            .iter()
+            .find(|f| f.severity == Severity::Error)
+            .or_else(|| s.findings.first());
+        match f {
+            Some(f) => format!(
+                "{}: {} {} ({})",
+                space_words(&s.id),
+                f.rule.id(),
+                f.message,
+                measured_vs_tolerance(f)
+            ),
+            None => format!("{}: no findings", space_words(&s.id)),
+        }
+    };
+    match space {
+        Some(s) => format!("{} -- score {:.2}", worst_of(s), s.score),
+        None => {
+            let worst = map.worst.as_deref().and_then(|w| map.space(w));
+            match worst {
+                Some(w) if w.score < 1.0 => format!(
+                    "the whole sheet, grade {:.2}; worst {}",
+                    map.grade,
+                    worst_of(w)
+                ),
+                _ => format!("the whole sheet, grade {:.2}", map.grade),
+            }
+        }
+    }
+}
+
+/// `GET /api/drawings/{id}/render.png?space=<id>&px=<n>` -- the agent's
+/// EYES on a sheet: the whole sheet, or one space of the space map with a
+/// margin, its box outlined and the texts its findings name marked, as a PNG
+/// whose long edge is `px` (default 1600, 64..=4096; outside is refused, not
+/// clamped). Rendered from the SAME stored sheet and the same SVG the preview
+/// shows (render facts cleared, nothing recorded, nothing gated), and the
+/// crop's box is read from the space map of that very sheet, so the picture
+/// and the numbers cannot disagree.
+///
+/// When an AGENT looks (the request carries `X-Roshera-Agent`, as every MCP
+/// call does), the look is SHOWN: one `AgentShow` `sheet_space` frame goes to
+/// every open app (the app opens the drawing, glides to the space and
+/// outlines it, captioned with the space's worst finding). The route emits
+/// it, so the agent never has to remember to; a non-agent fetch (a script, a
+/// future app thumbnail) never moves the user's view. Response headers:
+/// `x-roshera-crop` (the paper shown, mm `x0,y0,x1,y1`), `x-roshera-shown-to`
+/// (how many apps the look reached; absent when not shown).
+pub async fn render_png(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<DrawingPngQuery>,
+) -> Result<Response, ApiError> {
+    use geometry_engine::drawing::raster::{SHEET_PNG_MAX_PX, SHEET_PNG_MIN_PX};
+    use geometry_engine::drawing::{render_drawing_png, SheetCrop, SHEET_PNG_DEFAULT_PX};
+    let px = q.px.unwrap_or(SHEET_PNG_DEFAULT_PX);
+    if !(SHEET_PNG_MIN_PX..=SHEET_PNG_MAX_PX).contains(&px) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("px {px} is outside {SHEET_PNG_MIN_PX}..={SHEET_PNG_MAX_PX}"),
+        )
+        .with_hint("px is the image's long edge in pixels; omit it for 1600."));
+    }
+    let (_model, handle, _owner) = fetch_owned_drawing_for_export(&state, id).await?;
+    let mut sheet = { handle.read().await.clone() };
+    sheet.render_facts = Default::default();
+    let space = q
+        .space
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let wanted = space.clone();
+    let rendered = tokio::task::spawn_blocking(move || {
+        let layout = compute_layout(&sheet);
+        let map = space_map(&sheet, &layout);
+        let (crop, shown) = match wanted.as_deref() {
+            None => (SheetCrop::whole(&sheet), None),
+            Some(sid) => {
+                let Some(crop) = SheetCrop::of_space(&sheet, &layout, &map, sid) else {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("drawing {id} has no space '{sid}'"),
+                    )
+                    .with_hint("Read the ids from GET /api/drawings/{id}/spaces."));
+                };
+                (crop, map.space(sid).cloned())
+            }
+        };
+        let caption = look_caption(&map, shown.as_ref());
+        let out = render_drawing_png(&sheet, &crop, px).map_err(|e| {
+            ApiError::new(ErrorCode::KernelError, format!("sheet render failed: {e}"))
+        })?;
+        Ok((out, shown.map(|s| s.rect), caption))
+    })
+    .await
+    .map_err(|_| ApiError::new(ErrorCode::KernelError, "sheet render failed"))??;
+    let (out, rect, caption) = rendered;
+
+    let agent_looked = headers.contains_key("x-roshera-agent");
+    let shown_to = if agent_looked {
+        let action = crate::agent_show::ShowAction::SheetSpace {
+            drawing_id: id,
+            space,
+            rect: rect.map(|r| crate::agent_show::SheetRect {
+                x0: r.x0,
+                y0: r.y0,
+                x1: r.x1,
+                y1: r.y1,
+            }),
+            caption: Some(caption),
+        };
+        Some(crate::agent_show::publish(&action)?)
+    } else {
+        None
+    };
+
+    let c = out.crop;
+    let mut response = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/png".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        out.png,
+    )
+        .into_response();
+    let h = response.headers_mut();
+    if let Ok(v) =
+        header::HeaderValue::from_str(&format!("{:.3},{:.3},{:.3},{:.3}", c.x0, c.y0, c.x1, c.y1))
+    {
+        h.insert("x-roshera-crop", v);
+    }
+    if let Some(n) = shown_to {
+        h.insert("x-roshera-shown-to", header::HeaderValue::from(n));
+    }
+    Ok(response)
+}
+
 // ── Semantic readback (campaign #55 Slice 2) ────────────────────────
 
 /// Live solid-soundness disclosure for one solid a sheet's views reference

@@ -93,7 +93,8 @@ console.log("(w1) WORKBENCH status shape");
     // verbs (gdt_fcf_update / _delete, gdt_datum_update / _delete,
     // gdt_dimensional_delete).
     // 19 -> 20 (2026-11-20): drawing_spaces.
-    drawing: 20,
+    // 20 -> 21 (2026-11-20): drawing_look.
+    drawing: 21,
     analysis: 14,
     labels: 11,
     // 15 -> 16 (2026-08-11, task #10): `recipe_get` — retrieval of a
