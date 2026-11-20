@@ -160,3 +160,25 @@ in kb_data.ts, and per-card schemas in the app.
     releasable, and if not, what blocks it?". Add only the terms a tool, card or one
     of those questions needs. The first design artefact is that list for the
     aerospace supplier slice.
+
+## Recorded as the LAST step: an agent-native PLM (Varun: "this will be the last step")
+
+**What it is.** An agent-native PLM for the supplier tier and startups, which interoperates up into the OEM's PLM rather than replacing it. It is built on the same substrate as everything above: timeline, ontology, work graph and cards. The timeline already provides history and branches.
+
+**What is still to build.** Each item below is missing today:
+- part master and numbering;
+- lifecycle and release states;
+- EBOM, MBOM, configurations and effectivity;
+- the ECR, ECO and ECN workflow, with where-used impact;
+- documents and certs;
+- requirements traceability;
+- the quality loop;
+- legally valid e-signatures and audit export;
+- export-controlled access and a supplier portal;
+- multi-CAD files;
+- ERP, MES and OEM-PLM integration;
+- system-of-record reliability.
+
+**Order.** Start with the aerospace supplier slice: revision, release, change, first article inspection, signatures and classification. Then follow the identities. Move up-market only once suppliers depend on it.
+
+**Timing.** It comes after kernel trust, the workflow, identity and ontology work, and the environment. Focus now is on what can be done now.
