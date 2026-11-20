@@ -40,10 +40,9 @@ pub enum PdfRenderError {
 /// page at the sheet's physical dimensions).
 ///
 /// The page is sized from the drawing's [`SheetSize`](super::types::SheetSize)
-/// — at the standard 72 DPI the PDF spec assumes, one user-space unit
-/// equals 1/72 inch, and the SVG's `viewBox` is in millimetres, so we
-/// hand `svg2pdf` the SVG and let it pick up the explicit
-/// `width="<n>mm" height="<n>mm"` declarations to size the page.
+/// — one PDF user-space unit is 1/72 inch; the SVG's explicit
+/// `width="<n>mm" height="<n>mm"` size the page, read by `usvg` and written
+/// by `svg2pdf` at one and the same dpi.
 pub fn render_drawing_pdf(drawing: &Drawing) -> Result<Vec<u8>, PdfRenderError> {
     let svg = render_drawing_svg(drawing);
 
@@ -61,12 +60,13 @@ pub fn render_drawing_pdf(drawing: &Drawing) -> Result<Vec<u8>, PdfRenderError> 
     let tree = svg2pdf::usvg::Tree::from_str(&svg, &options)
         .map_err(|e| PdfRenderError::SvgParse(e.to_string()))?;
 
-    svg2pdf::to_pdf(
-        &tree,
-        svg2pdf::ConversionOptions::default(),
-        svg2pdf::PageOptions::default(),
-    )
-    .map_err(|e| PdfRenderError::Conversion(e.to_string()))
+    // `usvg` resolves the sheet's `width="420mm"` into pixels at
+    // `options.dpi` (96 by default); `svg2pdf` must turn those pixels into
+    // points at the SAME dpi, or the page is 96/72 = 4/3 too large and a
+    // sheet stating SCALE 1:1 prints at 4:3.
+    let page = svg2pdf::PageOptions { dpi: options.dpi };
+    svg2pdf::to_pdf(&tree, svg2pdf::ConversionOptions::default(), page)
+        .map_err(|e| PdfRenderError::Conversion(e.to_string()))
 }
 
 #[cfg(test)]
@@ -116,6 +116,41 @@ mod tests {
             tail.windows(5).any(|w| w == b"%%EOF"),
             "PDF terminates with %%EOF"
         );
+    }
+
+    /// The page's `/MediaBox` (PDF points, 1/72 in) of a rendered sheet.
+    fn media_box(bytes: &[u8]) -> [f64; 4] {
+        let text = String::from_utf8_lossy(bytes);
+        let at = text.find("/MediaBox").expect("a /MediaBox");
+        let open = at + text[at..].find('[').expect("[");
+        let close = open + text[open..].find(']').expect("]");
+        let nums: Vec<f64> = text[open + 1..close]
+            .split_whitespace()
+            .map(|n| n.parse().expect("a number"))
+            .collect();
+        [nums[0], nums[1], nums[2], nums[3]]
+    }
+
+    /// A sheet prints at its ISO size: an A3 sheet is a 420 × 297 mm page,
+    /// 1190.55 × 841.89 pt, and an A1 sheet 841 × 594 mm. The page is
+    /// measured off the PDF itself, at 72 pt per inch. (Every PDF was
+    /// 4/3 too large: `usvg` reads the sheet's millimetres at 96 px per
+    /// inch and `svg2pdf` wrote those pixels as points, so a sheet stating
+    /// SCALE 1:1 printed at 4:3.)
+    #[test]
+    fn a_sheet_prints_at_its_iso_paper_size() {
+        let pt_per_mm = 72.0 / 25.4;
+        for (size, w_mm, h_mm) in [(SheetSize::A3, 420.0, 297.0), (SheetSize::A1, 841.0, 594.0)] {
+            let bytes = render_drawing_pdf(&Drawing::new("Page size", size)).expect("pdf render");
+            let [x0, y0, x1, y1] = media_box(&bytes);
+            let (w, h) = (x1 - x0, y1 - y0);
+            assert!(
+                (w - w_mm * pt_per_mm).abs() < 0.5 && (h - h_mm * pt_per_mm).abs() < 0.5,
+                "{size:?}: page {w:.2} × {h:.2} pt, expected {:.2} × {:.2} pt ({w_mm} × {h_mm} mm)",
+                w_mm * pt_per_mm,
+                h_mm * pt_per_mm
+            );
+        }
     }
 
     /// The output's last meaningful tokens must contain `%%EOF` —
