@@ -202,9 +202,21 @@ impl GdtSidecar {
         self.annotations.remove(&feature).unwrap_or_default()
     }
 
-    /// Iterate `(feature, &annotations)` over every annotated feature.
+    /// Iterate `(feature, &annotations)` over every annotated feature, in
+    /// feature-PID order.
     pub fn iter(&self) -> impl Iterator<Item = (PersistentId, &[Annotation])> {
-        self.annotations.iter().map(|(k, v)| (*k, v.as_slice()))
+        // In feature-PID order, never the map's: the sheet places one FCF
+        // block per (feature, annotation) in this order, and HashMap order
+        // differs per process, so the same part drew its frames in different
+        // places on two builds (found by the space map's id-stability test,
+        // 2026-11-20).
+        let mut features: Vec<(PersistentId, &[Annotation])> = self
+            .annotations
+            .iter()
+            .map(|(k, v)| (*k, v.as_slice()))
+            .collect();
+        features.sort_by_key(|(k, _)| *k);
+        features.into_iter()
     }
 
     /// Number of distinct annotated features.
@@ -260,6 +272,30 @@ mod tests {
         assert_eq!(s.annotations(f), &[ann]);
         assert_eq!(s.annotated_feature_count(), 1);
         assert!(!s.is_empty());
+    }
+
+    /// `iter` walks features in PID order, whatever order the map holds them
+    /// in: the sheet places its FCF blocks in this order, and the same part
+    /// drew its frames in different places on two builds while it followed
+    /// HashMap order. Mutation: iterate `self.annotations` directly -> RED
+    /// (24 scattered PIDs come back in hash order).
+    #[test]
+    fn iter_walks_features_in_pid_order() {
+        let mut s = GdtSidecar::new();
+        for k in 0..24u32 {
+            s.attach(
+                PersistentId::root(format!("face-{k}").as_bytes()),
+                Annotation::Geometric(FeatureControlFrame::form(
+                    GeometricCharacteristic::Flatness,
+                    0.05,
+                )),
+            );
+        }
+        let order: Vec<PersistentId> = s.iter().map(|(f, _)| f).collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order.len(), 24);
+        assert_eq!(order, sorted, "features in PID order");
     }
 
     #[test]
