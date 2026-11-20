@@ -1704,6 +1704,22 @@ fn dimension_ink_check(
         stale = true;
         notes.push(format!("tolerance: {why}"));
     }
+    // An angle's printed number IS its claim, and the number re-measured is
+    // its value: a label that no longer states that value (to the places it
+    // is written to) prints a number nothing checked.
+    if dim.kind == "angle" {
+        let states_value =
+            super::dimension_edit::label_value(&dim.label).is_some_and(|(v, places)| {
+                (v - dim.value).abs() <= 0.5 * 10f64.powi(-(places as i32)) + 1e-9
+            });
+        if !states_value {
+            stale = true;
+            notes.push(format!(
+                "label: the sheet prints '{}', which does not state its value {:.3}\u{00B0}",
+                dim.label, dim.value
+            ));
+        }
+    }
     if !ink.authored.is_empty() {
         notes.push(format!(
             "authored text, not verified: {}",

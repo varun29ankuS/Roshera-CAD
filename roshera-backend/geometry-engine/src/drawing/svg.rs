@@ -593,7 +593,10 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
 /// and stored in `SheetLayout.dimensions`. This function reads those values
 /// and emits the SVG elements — nothing more.
 ///
-/// Angle / point callouts have degenerate `line` (start == end), which the
+/// An angular dimension inks its extension lines, its arc and its
+/// arrowheads; its `line` is degenerate at the angle's vertex.
+///
+/// Point callouts have degenerate `line` (start == end), which the
 /// `dim_line` helper emits as a zero-length line that is invisible on the
 /// page; the text is the meaningful ink for those.
 fn render_dimensions(out: &mut String, layout: &SheetLayout) {
@@ -603,7 +606,7 @@ fn render_dimensions(out: &mut String, layout: &SheetLayout) {
             let [p0, p1] = pd.line;
             (p0[0] - p1[0]).abs() < 1e-9 && (p0[1] - p1[1]).abs() < 1e-9
         };
-        if !is_degenerate {
+        if !is_degenerate || pd.arc.is_some() {
             // Each extension line as its pieces: a line broken round another
             // dimension's number is inked in two (the same pieces the
             // quality check tests).
@@ -612,13 +615,19 @@ fn render_dimensions(out: &mut String, layout: &SheetLayout) {
                     dim_line(out, seg[0][0], seg[0][1], seg[1][0], seg[1][1]);
                 }
             }
-            dim_line(
-                out,
-                pd.line[0][0],
-                pd.line[0][1],
-                pd.line[1][0],
-                pd.line[1][1],
-            );
+            if !is_degenerate {
+                dim_line(
+                    out,
+                    pd.line[0][0],
+                    pd.line[0][1],
+                    pd.line[1][0],
+                    pd.line[1][1],
+                );
+            }
+            // An angular dimension's line is its arc.
+            for seg in crate::drawing::layout::arc_chords(pd) {
+                dim_line(out, seg[0][0], seg[0][1], seg[1][0], seg[1][1]);
+            }
             for ar in &pd.arrows {
                 ink_arrow(out, ar, AR_L, AR_W);
             }

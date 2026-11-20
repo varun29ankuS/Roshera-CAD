@@ -174,8 +174,18 @@ pub(crate) fn placed_line_segments(pd: &PlacedDimension) -> Vec<[[f64; 2]; 2]> {
     std::iter::once(pd.line)
         .chain(extension_line_pieces(pd, 0))
         .chain(extension_line_pieces(pd, 1))
+        .chain(arc_chords(pd))
         .filter(|s| (s[0][0] - s[1][0]).hypot(s[0][1] - s[1][1]) > 1e-6)
         .collect()
+}
+
+/// The chords an angular dimension's arc is inked with; empty for every
+/// other dimension.
+pub(crate) fn arc_chords(pd: &PlacedDimension) -> Vec<[[f64; 2]; 2]> {
+    pd.arc
+        .as_ref()
+        .map(|arc| arc.points.windows(2).map(|w| [w[0], w[1]]).collect())
+        .unwrap_or_default()
 }
 
 /// The inked pieces of extension line `i` (0 or 1) of a placed dimension:
@@ -392,7 +402,37 @@ pub struct PlacedDimension {
     /// and the quality check alike.
     #[serde(default)]
     pub ext_breaks: [Vec<[f64; 2]>; 2],
+    /// The dimension line of an ANGULAR dimension (ISO 129-1): an arc about
+    /// the angle's vertex, from one extension line to the other, its
+    /// arrowheads (`arrows`) touching them. `None` for a straight dimension,
+    /// a leader and a point callout; an angular dimension's `line` is
+    /// degenerate at the vertex. `#[serde(default)]` keeps stored layouts
+    /// parsing.
+    #[serde(default)]
+    pub arc: Option<DimArc>,
 }
+
+/// The arc of an angular dimension, in sheet space.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DimArc {
+    /// The angle's vertex: the arc's centre.
+    pub centre: [f64; 2],
+    /// The arc's radius (sheet mm).
+    pub radius: f64,
+    /// The arc as inked, from the first extension line to the second:
+    /// points on the circle, ends included.
+    pub points: Vec<[f64; 2]>,
+}
+
+/// Radius of an angular dimension's arc on paper (mm): room for its number
+/// and two arrowheads on a bevel only a few millimetres long.
+pub(crate) const ANGLE_ARC_RADIUS_MM: f64 = 10.0;
+/// Chords an angular dimension's arc is inked with.
+const ANGLE_ARC_CHORDS: usize = 24;
+/// How far (degrees) the angle a bevel's lines make on the sheet may differ
+/// from the number it states before the arc is refused: the arc must show
+/// the angle it is labelled with.
+const ANGLE_ARC_AGREEMENT_DEG: f64 = 0.05;
 
 // ── Hole-tag placement ────────────────────────────────────────────────────────
 
@@ -1714,9 +1754,10 @@ fn place_profile_table(
             y1: r.y1 + 1.0,
         };
         !dimensions.iter().any(|pd| {
-            std::iter::once(&pd.line)
-                .chain(pd.ext.iter())
-                .any(|seg| segment_crosses_rect(seg, &grown))
+            std::iter::once(pd.line)
+                .chain(pd.ext.iter().copied())
+                .chain(arc_chords(pd))
+                .any(|seg| segment_crosses_rect(&seg, &grown))
         })
     };
     let at = |x0: f64, y0: f64| Rect2 {
@@ -1969,9 +2010,10 @@ fn place_hole_table(
             y1: r.y1 + 1.0,
         };
         !dimensions.iter().any(|pd| {
-            std::iter::once(&pd.line)
-                .chain(pd.ext.iter())
-                .any(|seg| segment_crosses_rect(seg, &grown))
+            std::iter::once(pd.line)
+                .chain(pd.ext.iter().copied())
+                .chain(arc_chords(pd))
+                .any(|seg| segment_crosses_rect(&seg, &grown))
         })
     };
 
@@ -2696,6 +2738,128 @@ fn dim_to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
     ]
 }
 
+/// The angular dimension of an angle measured from an end face
+/// ([`super::cone_angles::END_FACE_REFERENCE`]): vertex `a`, the corner where
+/// the bevel's side line meets the end face, and `b` a point further along
+/// that side line (sheet space, [`super::dimensioning::project_records`]).
+/// One extension line continues the end face's line past the corner, the
+/// other the bevel's side line; the arc about the corner runs between them
+/// with its arrowheads on them, and the number stands beyond the end face's
+/// line, clear of the part.
+///
+/// `None` -- the angle takes a leader -- for any other angle, a view that
+/// does not show the end face edge-on, or one in which the two lines do not
+/// make the stated angle: the arc is never drawn sweeping another angle than
+/// its number.
+fn angular_dimension(
+    view: &ProjectedView,
+    sheet_h: f64,
+    d: &crate::drawing::dimensioning::Dimension2d,
+    a: [f64; 2],
+    b: [f64; 2],
+    owner: usize,
+) -> Option<PlacedDimension> {
+    use crate::math::Point3;
+    if d.kind != "angle" {
+        return None;
+    }
+    let reference = d
+        .datum
+        .as_ref()
+        .filter(|r| r.kind == super::cone_angles::END_FACE_REFERENCE)?;
+    let unit = |v: [f64; 2]| -> Option<[f64; 2]> {
+        let n = v[0].hypot(v[1]);
+        (n > 1e-9).then(|| [v[0] / n, v[1] / n])
+    };
+    // The end face's line runs through the corner and the end face's centre
+    // on the axis; outward is from the axis to the corner.
+    let o = reference.origin;
+    let centre = dim_to_sheet(
+        view,
+        sheet_h,
+        super::projection::project_point(view.projection, Point3::new(o[0], o[1], o[2])),
+    );
+    let u = unit([a[0] - centre[0], a[1] - centre[1]])?;
+    let side = [b[0] - a[0], b[1] - a[1]];
+    let side_len = side[0].hypot(side[1]);
+    let g = unit(side)?;
+    let sweep = (u[0] * g[0] + u[1] * g[1]).clamp(-1.0, 1.0).acos();
+    if (sweep.to_degrees() - d.value).abs() > ANGLE_ARC_AGREEMENT_DEG {
+        return None;
+    }
+    let turn = if u[0] * g[1] - u[1] * g[0] >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let r = ANGLE_ARC_RADIUS_MM;
+    let start = u[1].atan2(u[0]);
+    let at = |t: f64, rad: f64| [a[0] + rad * t.cos(), a[1] + rad * t.sin()];
+    let points: Vec<[f64; 2]> = (0..=ANGLE_ARC_CHORDS)
+        .map(|i| at(start + turn * sweep * i as f64 / ANGLE_ARC_CHORDS as f64, r))
+        .collect();
+    let end = start + turn * sweep;
+    // Each arrowhead's tip on its extension line, its body along the arc.
+    let tangent = |t: f64| [-t.sin() * turn, t.cos() * turn];
+    let t0 = tangent(start);
+    let t1 = tangent(end);
+    let along = |dir: [f64; 2], from: f64, to: f64| -> [[f64; 2]; 2] {
+        [
+            [a[0] + dir[0] * from, a[1] + dir[1] * from],
+            [a[0] + dir[0] * to, a[1] + dir[1] * to],
+        ]
+    };
+    // The end face's line: from a gap off the corner to past the arc. The
+    // bevel's side line is drawn ink up to `b` already; its extension starts
+    // a gap beyond it (and is empty when the arc meets the side line
+    // itself).
+    let ext0 = along(u, GAP, r + EXT);
+    let ext1 = if side_len + GAP < r + EXT {
+        along(g, side_len + GAP, r + EXT)
+    } else {
+        along(g, r + EXT, r + EXT)
+    };
+    // The number stands on the far side of the end face's line, over the
+    // arc's first end: the end face is the part's end, so beyond its line
+    // there is no part (inside the angle the number would sit over the
+    // view, among the flange or hub behind the bevel).
+    let away = [u[1] * turn, -u[0] * turn];
+    let text_w = d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
+    let half_across = 0.5 * (away[0].abs() * text_w + away[1].abs() * DIM_TEXT_FONT_MM);
+    let off = TGAP + half_across;
+    let text_centre = [
+        a[0] + u[0] * r + away[0] * off,
+        a[1] + u[1] * r + away[1] * off,
+    ];
+    Some(PlacedDimension {
+        line: [a, a],
+        ext: [ext0, ext1],
+        arrows: [
+            ArrowSpec {
+                tip: *points.first()?,
+                dir: t0,
+            },
+            ArrowSpec {
+                tip: *points.last()?,
+                dir: [-t1[0], -t1[1]],
+            },
+        ],
+        text_anchor: [text_centre[0], text_centre[1] + 0.5 * DIM_TEXT_FONT_MM],
+        text_rot_deg: 0.0,
+        label: d.label.clone(),
+        dim_id: d.id.clone(),
+        owner_view: owner,
+        stack: None,
+        boxed: false,
+        ext_breaks: Default::default(),
+        arc: Some(DimArc {
+            centre: a,
+            radius: r,
+            points,
+        }),
+    })
+}
+
 /// Place all dimension callouts for one view in sheet space.
 ///
 /// This is the **single implementation** of the Lin-sort stacking logic
@@ -2926,6 +3090,12 @@ pub(crate) fn place_dimensions_routed(
                 }
                 _ => false,
             };
+        // A bevel's angle, measured from its end face: an angular dimension
+        // (ISO 129-1), its arc between the end face's line and the bevel's.
+        if let Some(pd) = angular_dimension(view, sheet_h, d, a, b, owner) {
+            result.push(pd);
+            continue;
+        }
         let leader = if (d.kind == "hole_callout" || small_circle) && (dx > 1e-6 || dy > 1e-6) {
             Some((
                 [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])],
@@ -3226,6 +3396,7 @@ pub(crate) fn place_dimensions_routed(
                 stack: None,
                 boxed: false,
                 ext_breaks: Default::default(),
+                arc: None,
             });
             if let Some(note) = note {
                 // Second line: text only (degenerate geometry, like a point
@@ -3255,6 +3426,7 @@ pub(crate) fn place_dimensions_routed(
                     stack: None,
                     boxed: false,
                     ext_breaks: Default::default(),
+                    arc: None,
                 });
             }
             continue;
@@ -3288,6 +3460,7 @@ pub(crate) fn place_dimensions_routed(
                 stack: None,
                 boxed: false,
                 ext_breaks: Default::default(),
+                arc: None,
             });
             continue;
         }
@@ -3583,6 +3756,7 @@ pub(crate) fn place_dimensions_routed(
                 stack: None,
                 boxed: false,
                 ext_breaks: Default::default(),
+                arc: None,
             });
         }
     }
@@ -3862,8 +4036,9 @@ pub(crate) fn dimension_band_depths(
     };
     let (mut below, mut left) = (0.0_f64, 0.0_f64);
     for pd in place_dimensions(view, 0.0, 0, tabled_face_ids) {
-        let stacked = (pd.ext[1][0][0] - pd.ext[1][1][0]).abs() > 1e-9
-            || (pd.ext[1][0][1] - pd.ext[1][1][1]).abs() > 1e-9;
+        let stacked = pd.arc.is_none()
+            && ((pd.ext[1][0][0] - pd.ext[1][1][0]).abs() > 1e-9
+                || (pd.ext[1][0][1] - pd.ext[1][1][1]).abs() > 1e-9);
         if !stacked {
             // A leader or a point callout.
             continue;
@@ -3890,6 +4065,13 @@ pub(crate) fn shift_placed_dimension(pd: &mut PlacedDimension, by: [f64; 2]) {
         (seg[0][0] - seg[1][0]).abs() < 1e-9 && (seg[0][1] - seg[1][1]).abs() < 1e-9
     };
     let [dx, dy] = by;
+    if pd.arc.is_some() {
+        // An angular dimension: its arc and extension lines stay on the
+        // feature; the number moves.
+        pd.text_anchor[0] += dx;
+        pd.text_anchor[1] += dy;
+        return;
+    }
     if degenerate(&pd.line) {
         // Point callout / a leader's second text line.
         for p in pd

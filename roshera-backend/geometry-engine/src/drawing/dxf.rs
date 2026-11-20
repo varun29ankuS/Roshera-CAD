@@ -1201,7 +1201,7 @@ fn dimension_ink(pd: &PlacedDimension, sheet_h: f64) -> Vec<Entity> {
     let mut out = Vec::new();
     let [l0, l1] = pd.line;
     let has_line = (l0[0] - l1[0]).abs() > 1e-9 || (l0[1] - l1[1]).abs() > 1e-9;
-    if has_line {
+    if has_line || pd.arc.is_some() {
         for i in 0..pd.ext.len() {
             for seg in extension_line_pieces(pd, i) {
                 let (a, b) = (up(seg[0]), up(seg[1]));
@@ -1210,7 +1210,13 @@ fn dimension_ink(pd: &PlacedDimension, sheet_h: f64) -> Vec<Entity> {
                 }
             }
         }
-        out.push(line_entity(LAYER_DIMENSIONS, up(l0), up(l1)));
+        if has_line {
+            out.push(line_entity(LAYER_DIMENSIONS, up(l0), up(l1)));
+        }
+        // An angular dimension's line is its arc, inked as its chords.
+        for seg in super::layout::arc_chords(pd) {
+            out.push(line_entity(LAYER_DIMENSIONS, up(seg[0]), up(seg[1])));
+        }
         for ar in &pd.arrows {
             // `dir` points from the tip toward the base (SVG frame); the
             // y-flip turns it with the sheet.

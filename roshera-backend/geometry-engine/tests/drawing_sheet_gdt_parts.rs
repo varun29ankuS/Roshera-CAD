@@ -19,9 +19,12 @@
 //! found no room on any sheet the search tried.
 
 use geometry_engine::drawing::completeness::{dimension_omissions, OmissionReason};
-use geometry_engine::drawing::dimensioning::standard_drawing_auto_with_projection;
+use geometry_engine::drawing::dimensioning::{
+    standard_drawing_auto, standard_drawing_auto_with_projection, Dimension2d,
+};
 use geometry_engine::drawing::frame_for_drawing;
 use geometry_engine::drawing::layout::compute_layout;
+use geometry_engine::drawing::sheet_certificate::{certify_drawing, SheetFactKind, SheetVerdict};
 use geometry_engine::drawing::svg::frame_rect;
 use geometry_engine::drawing::types::{Drawing, ProjectionAngle, SheetSize};
 use geometry_engine::drawing::verify::{find_ink_outside_frame, verify_drawing, Severity};
@@ -386,4 +389,397 @@ fn a_toleranced_aerofoil_rib_goes_on_a2_or_smaller() {
         "a 300 mm rib belongs on A2 or smaller: {what}"
     );
     assert_clean_and_filled(&m, &d, &what);
+}
+
+// ── Cone angles: each stated by the convention for its kind ─────────────────
+
+/// The EN 1092-1 DN50 weld neck of [`en1092_weld_neck_with_gdt`] with its
+/// weld end prepared the way ASME B16.25 and ISO 9692-1 specify it: the
+/// bevel `bevel_deg` from the END FACE (the plane square to the pipe axis),
+/// down to the 1.6 mm root face, so the bevel cone's half-angle to the axis
+/// is `90 - bevel_deg`. (That fixture runs `dr / tan`, which puts its bevel
+/// 37.5 deg to the AXIS: a 52.5 deg preparation.) Returns the bevel face,
+/// which carries a persistent id as a face the app's history minted does.
+fn weld_neck_with_weld_prep(bevel_deg: f64) -> (BRepModel, SolidId, u32) {
+    use geometry_engine::primitives::surface::Cone;
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("weld-neck".to_string()));
+    let bevel_dr = 30.15 - (27.25 + 1.6);
+    let bevel_dz = bevel_dr * bevel_deg.to_radians().tan();
+    let meridian = [
+        (27.25, -2.0),
+        (51.0, -2.0),
+        (51.0, 0.0),
+        (82.5, 0.0),
+        (82.5, 18.0),
+        (37.0, 18.0),
+        (30.15, 46.0 - bevel_dz),
+        (27.25 + 1.6, 46.0),
+        (27.25, 46.0),
+    ];
+    let opts = RevolveOptions {
+        axis_origin: Point3::new(0.0, 0.0, 0.0),
+        axis_direction: Vector3::new(0.0, 0.0, 1.0),
+        angle: std::f64::consts::TAU,
+        segments: 96,
+        ..Default::default()
+    };
+    let mut s = revolve_meridian(&mut m, &meridian, opts).expect("revolve weld neck");
+    m.set_event_key(None);
+    for k in 0..4 {
+        let a = (45.0 + 90.0 * k as f64).to_radians();
+        s = drill(&mut m, s, 62.5 * a.cos(), 62.5 * a.sin(), -1.0, 9.0, 20.0);
+    }
+    let half = (90.0 - bevel_deg).to_radians();
+    let bevel = solid_faces(&m, s)
+        .into_iter()
+        .find(|&f| {
+            let face = m.faces.get(f).expect("face");
+            m.surfaces
+                .get(face.surface_id)
+                .and_then(|surf| surf.as_any().downcast_ref::<Cone>())
+                .is_some_and(|c| (c.half_angle - half).abs() < 1e-6)
+        })
+        .expect("the bevel cone");
+    ensure_pid(&mut m, bevel, "bevel");
+    (m, s, bevel)
+}
+
+/// The cone-angle dimensions of the sheet that name one of `faces`.
+fn cone_angles(d: &Drawing, faces: &[u32]) -> Vec<Dimension2d> {
+    d.views
+        .iter()
+        .flat_map(|v| v.dimensions.iter())
+        .filter(|x| x.kind == "angle" && x.entities.iter().any(|e| faces.contains(e)))
+        .cloned()
+        .collect()
+}
+
+fn all_labels(d: &Drawing) -> Vec<String> {
+    d.views
+        .iter()
+        .flat_map(|v| v.dimensions.iter().map(|x| x.label.clone()))
+        .collect()
+}
+
+/// A weld bevel is stated the way its preparation is specified: 37.5 deg
+/// from the end face, not its 52.5 deg half-angle to the axis, and with no
+/// `∠` in front of it (ISO 129-1 writes an angle as a bare number and its
+/// degree sign; `∠` is the angularity symbol). The dimension names the end
+/// face as what the number is measured from.
+///
+/// Mutation: state every cone by its half-angle again (make
+/// `cone_angles::apply_cone_angle_conventions` return the records
+/// unchanged) -> the sheet reads `∠ 52.5°` -> RED.
+#[test]
+fn a_weld_bevel_reads_its_angle_from_the_end_face() {
+    let (m, s, bevel) = weld_neck_with_weld_prep(37.5);
+    let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+    let all = all_labels(&d);
+    let angles = cone_angles(&d, &[bevel]);
+    assert_eq!(angles.len(), 1, "the bevel's angle, once: {all:?}");
+    let a = &angles[0];
+    assert_eq!(a.label, "37.5\u{00B0}", "{all:?}");
+    assert!((a.value - 37.5).abs() < 1e-9, "{all:?}");
+    assert!(
+        !all.iter()
+            .any(|l| l.contains("52.5") || l.contains('\u{2220}')),
+        "no half-angle and no angle sign on the sheet: {all:?}"
+    );
+    let reference = a.datum.as_ref().expect("the angle names its reference");
+    assert_eq!(reference.kind, "end_face", "{reference:?}");
+    // The reference is the weld end's plane, z = 46.
+    assert!((reference.origin[2] - 46.0).abs() < 1e-6, "{reference:?}");
+}
+
+/// The bevel's angle is drawn as an angular dimension (ISO 129-1): an arc
+/// about the corner where the bevel meets the end face, between an extension
+/// line continuing the end face's line and the bevel's own side line, the arc
+/// sweeping the 37.5 deg its number states. The reference is on the paper,
+/// not only in the data.
+///
+/// Mutation: place the bevel's angle on a plain leader again (make
+/// `layout::angular_dimension` return `None`) -> no arc -> RED.
+#[test]
+fn a_weld_bevel_is_drawn_as_an_arc_from_the_end_face() {
+    let (m, s, bevel) = weld_neck_with_weld_prep(37.5);
+    let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+    let (vi, dim) = d
+        .views
+        .iter()
+        .enumerate()
+        .find_map(|(i, v)| {
+            v.dimensions
+                .iter()
+                .find(|x| x.kind == "angle" && x.entities.contains(&bevel))
+                .map(|x| (i, x.clone()))
+        })
+        .expect("the bevel angle");
+    let layout = compute_layout(&d);
+    let pd = layout
+        .dimensions
+        .iter()
+        .find(|p| p.dim_id == dim.id && p.owner_view == vi)
+        .expect("the bevel angle is placed");
+    assert_eq!(pd.label, "37.5\u{00B0}");
+    let arc = pd.arc.as_ref().expect("an arc, not a leader");
+    let c = arc.centre;
+    assert!(arc.points.len() >= 3, "{arc:?}");
+    for p in &arc.points {
+        let r = (p[0] - c[0]).hypot(p[1] - c[1]);
+        assert!(
+            (r - arc.radius).abs() < 1e-6,
+            "the arc is a circle about the corner"
+        );
+    }
+    let dir = |p: [f64; 2]| {
+        let n = (p[0] - c[0]).hypot(p[1] - c[1]);
+        [(p[0] - c[0]) / n, (p[1] - c[1]) / n]
+    };
+    let (u, g) = (dir(arc.points[0]), dir(*arc.points.last().expect("arc")));
+    let sweep = (u[0] * g[0] + u[1] * g[1])
+        .clamp(-1.0, 1.0)
+        .acos()
+        .to_degrees();
+    assert!((sweep - 37.5).abs() < 0.05, "the arc sweeps {sweep} deg");
+    // Its arrowheads touch the arc's ends.
+    assert_eq!(pd.arrows[0].tip, arc.points[0]);
+    assert_eq!(pd.arrows[1].tip, *arc.points.last().expect("arc"));
+    // One extension line continues the end face: square to the pipe axis,
+    // which FRONT shows vertical, so it is horizontal on the sheet, level
+    // with the corner.
+    assert!(
+        pd.ext.iter().any(|e| (e[0][1] - c[1]).abs() < 1e-6
+            && (e[1][1] - c[1]).abs() < 1e-6
+            && (e[0][0] - e[1][0]).abs() > 1.0),
+        "an extension line on the end face: {:?}",
+        pd.ext
+    );
+    // The corner is the root face's rim, Ø57.7, at the end face z 46.
+    let view = &d.views[vi];
+    let sheet_h = d.sheet_size.height();
+    let end_y = (sheet_h - view.position_mm[1]) - dim.a[1] * view.scale;
+    assert!((c[1] - end_y).abs() < 1e-6, "corner {c:?} on the end face");
+    assert!(
+        ((c[0] - view.position_mm[0]).abs() - 28.85 * view.scale).abs() < 1e-6,
+        "corner {c:?} on the root face's rim (view at {:?}, 1:{})",
+        view.position_mm,
+        1.0 / view.scale
+    );
+    // The SVG inks it: the number, and the arc's chords.
+    let svg = geometry_engine::drawing::svg::render_drawing_svg(&d);
+    assert!(svg.contains(">37.5\u{00B0}<"), "the number is inked");
+    // Set ROSHERA_DUMP_SHEET_DIR=<dir> to LOOK at the sheet.
+    if let Ok(dir) = std::env::var("ROSHERA_DUMP_SHEET_DIR") {
+        let pdf = geometry_engine::drawing::pdf::render_drawing_pdf(&d).expect("pdf");
+        std::fs::write(std::path::Path::new(&dir).join("weld_neck_bevel.pdf"), pdf)
+            .expect("write pdf");
+    }
+    // And the sheet stays clean with it: no number on another's, no ink off
+    // the frame, nothing left unplaced.
+    let what = describe(&m, &d);
+    assert_eq!(verify_drawing(&d).error_count(), 0, "{what}");
+    let outside = find_ink_outside_frame(&layout, frame_rect(&d.sheet_size));
+    assert!(outside.is_empty(), "{outside:?}: {what}");
+    assert!(
+        !dimension_omissions(&m, &d)
+            .iter()
+            .any(|o| o.reason == OmissionReason::NotPlaced),
+        "{what}"
+    );
+}
+
+/// A steep cone that does NOT end the part is not a weld bevel: a stepped
+/// shaft's 68 deg shoulder cone meets the shoulder face (square to the axis,
+/// facing out, a convex edge -- everything a bevel's root face is), but the
+/// pin carries on beyond that face. It is stated by its included angle.
+///
+/// Mutation: drop the open-end check in `cone_angles::bevel_end` (no point
+/// of the part "beyond" the end plane) -> the shoulder reads 21.8° from a
+/// face that is not an end -> RED.
+#[test]
+fn a_steep_cone_short_of_the_part_end_is_not_a_bevel() {
+    use geometry_engine::primitives::surface::Cone;
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("stepped-shaft".to_string()));
+    let meridian = [
+        (4.0, 0.0),
+        (20.0, 0.0),
+        (20.0, 10.0),
+        (15.0, 12.0),
+        (8.0, 12.0),
+        (8.0, 30.0),
+        (4.0, 30.0),
+    ];
+    let opts = RevolveOptions {
+        axis_origin: Point3::new(0.0, 0.0, 0.0),
+        axis_direction: Vector3::new(0.0, 0.0, 1.0),
+        angle: std::f64::consts::TAU,
+        segments: 96,
+        ..Default::default()
+    };
+    let s = revolve_meridian(&mut m, &meridian, opts).expect("revolve shaft");
+    m.set_event_key(None);
+    let cones: Vec<u32> = solid_faces(&m, s)
+        .into_iter()
+        .filter(|&f| {
+            let face = m.faces.get(f).expect("face");
+            m.surfaces
+                .get(face.surface_id)
+                .and_then(|surf| surf.as_any().downcast_ref::<Cone>())
+                .is_some()
+        })
+        .collect();
+    assert!(!cones.is_empty(), "fixture: the shoulder is a cone");
+    let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+    let all = all_labels(&d);
+    let angles = cone_angles(&d, &cones);
+    assert_eq!(angles.len(), 1, "the shoulder's angle, once: {all:?}");
+    let included = 2.0 * (5.0f64 / 2.0).atan().to_degrees();
+    assert!(
+        (angles[0].value - included).abs() < 1e-6,
+        "included {included}: {all:?}"
+    );
+    assert!(angles[0].datum.is_none(), "{:?}", angles[0].datum);
+}
+
+/// The certificate re-measures the number the sheet prints: the bevel's
+/// 37.5 deg is checked against the live solid measured the same way, from
+/// its end face. A stored value that was tampered with, a label whose number
+/// no longer states the stored value, and the same sheet against the part
+/// re-cut to a 30 deg preparation are each caught.
+///
+/// Mutation: re-measure the live bevel by its half-angle (the sheet's 37.5
+/// against the solid's 52.5) -> the honest sheet is stale -> RED; drop the
+/// label-number check -> the relabelled sheet certifies -> RED.
+#[test]
+fn the_printed_bevel_angle_is_re_measured_on_the_solid() {
+    let (m, s, bevel) = weld_neck_with_weld_prep(37.5);
+    let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+    let fact_of = |m: &BRepModel, d: &Drawing| {
+        let cert = certify_drawing(m, d);
+        cert.facts
+            .iter()
+            .find(|f| {
+                f.kind == SheetFactKind::Dimension && f.unit == "deg" && f.face_ids.contains(&bevel)
+            })
+            .map(|f| (f.label.clone(), f.live.verdict, f.live.measured))
+            .expect("the bevel's angle is a sheet fact")
+    };
+    let (label, verdict, measured) = fact_of(&m, &d);
+    assert_eq!(label, "37.5\u{00B0}");
+    assert_eq!(verdict, SheetVerdict::Consistent, "{label} {measured:?}");
+    assert!((measured.expect("re-measured") - 37.5).abs() < 1e-6);
+
+    let edit = |d: &Drawing, f: &dyn Fn(&mut Dimension2d)| -> Drawing {
+        let mut d = d.clone();
+        for v in &mut d.views {
+            for x in &mut v.dimensions {
+                if x.kind == "angle" && x.entities.contains(&bevel) {
+                    f(x);
+                }
+            }
+        }
+        d
+    };
+    // The half-angle stored as if it were the bevel's angle.
+    let wrong = edit(&d, &|x| {
+        x.value = 52.5;
+        x.label = "52.5\u{00B0}".to_string();
+    });
+    assert_eq!(fact_of(&m, &wrong).1, SheetVerdict::Stale);
+    // The label alone says 52.5 over a stored 37.5.
+    let relabelled = edit(&d, &|x| x.label = "52.5\u{00B0}".to_string());
+    assert_eq!(fact_of(&m, &relabelled).1, SheetVerdict::Stale);
+
+    // The same sheet against the part re-cut to a 30 deg preparation.
+    let (m30, _, bevel30) = weld_neck_with_weld_prep(30.0);
+    assert_eq!(bevel30, bevel, "fixture: the re-cut bevel is the same face");
+    let (_, verdict, measured) = fact_of(&m30, &d);
+    assert_eq!(verdict, SheetVerdict::Stale, "{measured:?}");
+    assert!((measured.expect("re-measured") - 30.0).abs() < 1e-6);
+}
+
+/// A conical recess -- a countersink with no hole under it, which the hole
+/// recogniser does not claim -- states its INCLUDED angle, 90 deg, the way a
+/// countersink is specified; its 45 deg half-angle is not printed. The
+/// countersunk hole beside it keeps its callout's `× 90°`.
+///
+/// Mutation: state a cavity cone by its half-angle (drop the included-angle
+/// branch of `cone_angles`) -> `45°` -> RED.
+#[test]
+fn a_countersink_reads_its_included_angle() {
+    use geometry_engine::primitives::surface::Cone;
+    let solid = |g: GeometryId| match g {
+        GeometryId::Solid(s) => s,
+        o => panic!("{o:?}"),
+    };
+    let cut = |m: &mut BRepModel, key: &str, a: SolidId, b: SolidId| {
+        m.set_event_key(Some(key.to_string()));
+        let out = boolean_operation(m, a, b, BooleanOp::Difference, BooleanOptions::default())
+            .expect(key);
+        m.set_event_key(None);
+        out
+    };
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("plate".to_string()));
+    let mut s = solid(
+        TopologyBuilder::new(&mut m)
+            .create_box_3d(80.0, 60.0, 20.0)
+            .unwrap(),
+    );
+    m.set_event_key(None);
+    // A Ø9 THRU hole countersunk Ø18 × 90° from the top face, at x = -20.
+    let bore = solid(
+        TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(-20.0, 0.0, -15.0), Vector3::Z, 4.5, 30.0)
+            .unwrap(),
+    );
+    s = cut(&mut m, "bore", s, bore);
+    let csk = solid(
+        TopologyBuilder::new(&mut m)
+            .create_cone_3d(Point3::new(-20.0, 0.0, 5.5), Vector3::Z, 4.5, 9.0, 4.5)
+            .unwrap(),
+    );
+    s = cut(&mut m, "countersink", s, csk);
+    // A Ø16 × 90° conical recess from the top face, its point 8 deep.
+    let recess = solid(
+        TopologyBuilder::new(&mut m)
+            .create_cone_3d(Point3::new(20.0, 0.0, 2.0), Vector3::Z, 0.0, 8.0, 8.0)
+            .unwrap(),
+    );
+    s = cut(&mut m, "recess", s, recess);
+    let cones: Vec<u32> = solid_faces(&m, s)
+        .into_iter()
+        .filter(|&f| {
+            let face = m.faces.get(f).expect("face");
+            m.surfaces
+                .get(face.surface_id)
+                .and_then(|surf| surf.as_any().downcast_ref::<Cone>())
+                .is_some()
+        })
+        .collect();
+    let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+    let all = all_labels(&d);
+    let angles = cone_angles(&d, &cones);
+    assert_eq!(angles.len(), 1, "the recess's angle, once: {all:?}");
+    assert_eq!(angles[0].label, "90\u{00B0}", "{all:?}");
+    assert!((angles[0].value - 90.0).abs() < 1e-6, "{all:?}");
+    let stacks = &d
+        .hole_features
+        .as_ref()
+        .expect("the hole is a stack")
+        .stacks;
+    assert!(
+        stacks
+            .iter()
+            .any(|st| st.label().ends_with("\u{00D8}18.00 \u{00D7} 90\u{00B0}")),
+        "the countersunk hole's callout keeps its included angle: {:?}",
+        stacks.iter().map(|st| st.label()).collect::<Vec<_>>()
+    );
+    assert!(
+        !all.iter()
+            .any(|l| l.contains('\u{2220}') || l.contains("45\u{00B0}")),
+        "{all:?}"
+    );
 }

@@ -38,7 +38,7 @@ pub struct Dimension2d {
     pub kind: String,
     pub value: f64,
     pub unit: String,
-    /// Drawing label, e.g. "Ø20.00", "40.00", "∠30.0°", "R3.00", "0.50 × 45°".
+    /// Drawing label, e.g. "Ø20.00", "40.00", "30°", "R3.00", "0.50 × 45°".
     pub label: String,
     /// View-space endpoints of the measured span. For an angle (no linear
     /// span) `a == b` at the feature anchor.
@@ -64,9 +64,13 @@ pub struct Dimension2d {
     #[serde(default)]
     pub pid: Option<String>,
     /// Reference datum carried from `DimensionRecord::datum` (campaign #55
-    /// Slice 1). `Some` only for `"position"` callouts, whose number is
-    /// meaningless without knowing what it is measured from. `None` for every
-    /// other kind. `#[serde(default)]` keeps older serialized drawings parsing.
+    /// Slice 1). `Some` for `"position"` callouts, whose number is
+    /// meaningless without knowing what it is measured from, and for a
+    /// bevel's angle, measured from its end face (kind
+    /// [`super::cone_angles::END_FACE_REFERENCE`]). `None` for every other
+    /// dimension. A consumer after a position's reference filters on
+    /// `kind == "position"`. `#[serde(default)]` keeps older serialized
+    /// drawings parsing.
     #[serde(default)]
     pub datum: Option<DatumDescriptor>,
     /// Bound GD&T dimensional tolerance (campaign #55 Slice 4), joined from the
@@ -241,7 +245,14 @@ pub(crate) fn project_records(
             ),
             "angle" => {
                 let p = cone_generator_point(model, &d, anchor, projection).unwrap_or(anchor);
-                (p, p)
+                // A bevel's angle is measured from its end face: `a` is the
+                // corner where the bevel's side line meets the end face, `b`
+                // a point further along that side line, so the layout draws
+                // the angle between the two lines ([`super::cone_angles`]).
+                match bevel_corner(model, &d, projection) {
+                    Some(corner) if (corner - p).magnitude() > 1e-9 => (corner, p),
+                    _ => (p, p),
+                }
             }
             _ => (anchor, anchor),
         };
@@ -320,6 +331,23 @@ fn cone_generator_point(
     )
 }
 
+/// Where a bevel's side line meets its end face in this view: on the
+/// generator [`cone_generator_point`] picks, at the station of the end face
+/// (the record's reference, [`super::cone_angles::END_FACE_REFERENCE`]).
+/// `None` for an angle not measured from an end face.
+fn bevel_corner(
+    model: &BRepModel,
+    d: &crate::readable::DimensionRecord,
+    projection: ProjectionType,
+) -> Option<Point3> {
+    let datum = d.datum.as_ref()?;
+    if datum.kind != super::cone_angles::END_FACE_REFERENCE {
+        return None;
+    }
+    let end = Point3::new(datum.origin[0], datum.origin[1], datum.origin[2]);
+    cone_generator_point(model, d, end, projection)
+}
+
 /// Callouts that actually READ in this view: drop the ones whose measured span
 /// projects edge-on (e.g. a Z height in Top view), since their line collapses
 /// to a point and would clutter without informing. Angles are kept (point
@@ -382,8 +410,9 @@ pub(crate) fn candidates_from_records(
         })
         .collect();
     // Drawing convention: a linear dimension shows just its value — strip the
-    // analytic axis tag ("X 80.00" → "80.00"). Ø (diameter), R (radius) and
-    // ∠ (angle) prefixes are kept; they are not axis tags.
+    // analytic axis tag ("X 80.00" → "80.00"). Ø (diameter) and R (radius)
+    // prefixes are kept; they are not axis tags. An angle has no prefix: it
+    // is a bare number and its degree sign (ISO 129-1, `cone_angles`).
     for d in &mut dims {
         let first = d.label.chars().next();
         if matches!(first, Some(c) if c.is_ascii_uppercase() && c != 'R' && c != 'S') {

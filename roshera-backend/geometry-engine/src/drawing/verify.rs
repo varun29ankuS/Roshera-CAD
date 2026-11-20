@@ -1805,6 +1805,7 @@ mod harness_invariant_tests {
             stack: None,
             boxed: false,
             ext_breaks: Default::default(),
+            arc: None,
         }
     }
 
@@ -1846,6 +1847,7 @@ mod harness_invariant_tests {
             stack: None,
             boxed: false,
             ext_breaks: Default::default(),
+            arc: None,
         }
     }
 

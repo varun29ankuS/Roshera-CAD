@@ -247,12 +247,14 @@ pub(crate) fn closed_bore_faces(model: &BRepModel, solid_id: SolidId) -> HashSet
 }
 
 /// The solid's dimension table as a drawing owes it: `extract_dimensions`
-/// with every arc stated the way this module's docs describe. The sheet is
+/// with every arc stated the way this module's docs describe and every cone
+/// angle by its drawing convention ([`super::cone_angles`]). The sheet is
 /// built from it and the certificate re-measures against it.
 pub(crate) fn drafting_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<DimensionRecord> {
     let records = extract_dimensions(model, solid_id);
     let walls = cylinder_walls(model, solid_id);
-    apply_arc_conventions(model, records, &walls)
+    let records = apply_arc_conventions(model, records, &walls);
+    super::cone_angles::apply_cone_angle_conventions(model, solid_id, records)
 }
 
 /// Rewrite the records of every open cylinder wall (see the module docs).

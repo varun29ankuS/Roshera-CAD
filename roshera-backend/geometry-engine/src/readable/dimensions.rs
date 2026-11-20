@@ -34,9 +34,13 @@ use uuid::Uuid;
 /// - `"datum"` — a designated kernel `Datum` explicitly bound to the solid.
 ///   (Reserved for Spec C; not yet emitted — Spec C must wire the
 ///   datum-to-part association path through `BRepModel::solid_location_descriptor_cached`.)
+/// - `"end_face"` — on a drawing's bevel ANGLE, not a position: the plane
+///   square to the cone's axis through the bevel's end, `origin` its centre
+///   on the axis (`drawing::cone_angles`). Never emitted by
+///   `extract_dimensions`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatumDescriptor {
-    /// `"part_corner"` or `"datum"`.
+    /// `"part_corner"`, `"datum"` or `"end_face"`.
     pub kind: String,
     /// Human name shown in the callout, e.g. `"part corner"` or the datum's
     /// authored name.
@@ -156,7 +160,9 @@ pub struct DimensionRecord {
     /// Reference datum for position dimensions (X/Y offset records).
     ///
     /// `None` for every non-`"position"` kind (diameter, length, angle,
-    /// extent) — serde-default guarantees additive backwards compat.
+    /// extent) — serde-default guarantees additive backwards compat. (The
+    /// drawing's table restates a bevel's angle from its end face and
+    /// names that face here: `drawing::cone_angles`.)
     /// Position records always carry `Some(DatumDescriptor)` so a reader
     /// never sees a position number without knowing its reference.
     #[serde(default)]

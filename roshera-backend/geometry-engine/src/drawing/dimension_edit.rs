@@ -272,7 +272,7 @@ fn value_run(label: &str) -> Option<(usize, usize)> {
 }
 
 /// The value a label states, with the number of decimals it is written to.
-fn label_value(label: &str) -> Option<(f64, usize)> {
+pub(crate) fn label_value(label: &str) -> Option<(f64, usize)> {
     let (s, e) = value_run(label)?;
     let text = label[s..e].replace(',', ".");
     let decimals = text.split_once('.').map_or(0, |(_, frac)| frac.len());

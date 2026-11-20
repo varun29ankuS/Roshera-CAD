@@ -296,9 +296,15 @@ fn a_countersink_and_a_drill_point_are_recognised() {
     assert!(inks(&svg, "\u{21A7} 12"));
     // The cone's own records (an angle, and a "diameter" read off the uncut
     // surface bound) are stated by the callout, not inked beside it.
+    // (Both cones are the stacks': any angle dimension on the sheet is a
+    // stray one. An angle prints as a bare number since ISO 129-1 labels, so
+    // a prefix test would no longer see it.)
     let ls = labels(&d);
     assert!(
-        !ls.iter().any(|l| l.starts_with('\u{2220}')),
+        !d.views
+            .iter()
+            .flat_map(|v| v.dimensions.iter())
+            .any(|x| x.kind == "angle"),
         "no stray cone angle: {ls:?}"
     );
     let cert = certify_drawing(&m, &d);
