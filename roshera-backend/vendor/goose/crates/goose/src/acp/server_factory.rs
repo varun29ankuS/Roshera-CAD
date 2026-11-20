@@ -15,6 +15,11 @@ pub struct AcpServerFactoryConfig {
     pub goose_platform: GoosePlatform,
     pub additional_source_roots: Vec<SourceRoot>,
     pub enable_scheduler: bool,
+    /// Upper bound on sessions whose agent (and with it every extension
+    /// process) stays loaded per connection; least-recently-used sessions
+    /// beyond it are unloaded and reload from the session store on next use.
+    /// `None` falls back to `GOOSE_MAX_ACTIVE_AGENTS`, then goose's default.
+    pub max_active_sessions: Option<usize>,
 }
 
 pub struct AcpServer {
@@ -82,6 +87,7 @@ impl AcpServer {
             goose_platform: self.config.goose_platform.clone(),
             additional_source_roots: self.config.additional_source_roots.clone(),
             scheduler,
+            max_active_sessions: self.config.max_active_sessions,
         })
         .await?;
         info!("Created new ACP agent");
@@ -102,6 +108,7 @@ mod tests {
             goose_platform: GoosePlatform::GooseCli,
             additional_source_roots: Vec::new(),
             enable_scheduler,
+            max_active_sessions: None,
         })
     }
 

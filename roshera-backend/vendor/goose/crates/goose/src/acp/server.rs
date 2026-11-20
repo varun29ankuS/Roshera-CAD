@@ -67,7 +67,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, OnceCell};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tokio_util::sync::CancellationToken;
@@ -169,7 +169,13 @@ const PROVIDER_CONFIG_STATUS_CHECK_CONCURRENCY: usize = 16;
 /// The ACP session ID maps directly to a `sessions` row. The `sessions` HashMap
 /// below is keyed by session ID.
 struct GooseAcpSession {
-    agent: Arc<Agent>,
+    /// Weak on purpose: the `AgentManager`'s LRU cache is the one owner of a
+    /// loaded session agent. Holding it strongly here pinned every agent this
+    /// connection ever opened (and each agent's extension processes) for the
+    /// connection's whole life, so the session cap never unloaded anything.
+    /// A dead `Weak` means the session was evicted; `get_session_agent`
+    /// reloads it from the session store.
+    agent: Weak<Agent>,
 }
 
 struct ActivePromptRun {
@@ -186,6 +192,9 @@ pub struct GooseAcpAgentOptions {
     pub goose_platform: GoosePlatform,
     pub additional_source_roots: Vec<SourceRoot>,
     pub scheduler: Option<Arc<dyn SchedulerTrait>>,
+    /// Cap on loaded session agents; `None` reads `GOOSE_MAX_ACTIVE_AGENTS`,
+    /// then falls back to the `AgentManager` default.
+    pub max_active_sessions: Option<usize>,
 }
 
 pub struct GooseAcpAgent {
@@ -609,7 +618,10 @@ impl GooseAcpAgent {
             options.disable_session_naming,
             options.goose_platform.clone(),
         );
-        let agent_manager = Arc::new(AgentManager::new(agent_config, None).await?);
+        let max_active_sessions = options
+            .max_active_sessions
+            .or_else(|| Config::global().get_goose_max_active_agents().ok());
+        let agent_manager = Arc::new(AgentManager::new(agent_config, max_active_sessions).await?);
 
         Ok(Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -904,7 +916,9 @@ impl GooseAcpAgent {
     }
 
     async fn register_acp_session(&self, session_id: String, agent: Arc<Agent>) {
-        let acp_session = GooseAcpSession { agent };
+        let acp_session = GooseAcpSession {
+            agent: Arc::downgrade(&agent),
+        };
         self.sessions.lock().await.insert(session_id, acp_session);
     }
 
@@ -1502,8 +1516,11 @@ impl GooseAcpAgent {
 
         {
             let sessions = self.sessions.lock().await;
-            if let Some(session) = sessions.get(session_id) {
-                return Ok(session.agent.clone());
+            if let Some(agent) = sessions
+                .get(session_id)
+                .and_then(|session| session.agent.upgrade())
+            {
+                return Ok(agent);
             }
         }
 
@@ -1572,7 +1589,7 @@ impl GooseAcpAgent {
             let sessions = self.sessions.lock().await;
             sessions
                 .get(session_id)
-                .map(|session| session.agent.clone())
+                .and_then(|session| session.agent.upgrade())
         };
         if let Some(agent) = agent {
             agent.discard_pending_steers(session_id).await;
@@ -2299,6 +2316,7 @@ pub async fn run(builtins: Vec<String>, enable_scheduler: bool) -> Result<()> {
             goose_platform: GoosePlatform::GooseCli,
             additional_source_roots: Vec::new(),
             enable_scheduler,
+            max_active_sessions: None,
         },
     );
     let agent = server.create_agent().await?;

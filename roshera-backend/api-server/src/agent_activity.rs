@@ -449,6 +449,15 @@ impl AgentActivityRegistry {
         }
     }
 
+    /// `true` while a `session/prompt` sent on `connection_id` has not had
+    /// its response observed — the orphan reaper (`acp_orphan_reaper`)
+    /// never tears down a connection mid-turn.
+    pub(crate) fn turn_in_flight_on_connection(&self, connection_id: &str) -> bool {
+        self.pending_prompts
+            .iter()
+            .any(|entry| entry.key().0 == connection_id)
+    }
+
     /// `DELETE /acp` terminated a connection: drop the sessions bound
     /// to it (ring included) and any pending entries — this is the
     /// "cleaned up when the session ends" bound.

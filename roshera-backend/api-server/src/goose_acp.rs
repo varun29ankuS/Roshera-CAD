@@ -824,6 +824,9 @@ pub(crate) fn acp_router(
             // The scheduler is its own background-cron surface with its
             // own review needed; off for slice 1.
             enable_scheduler: false,
+            // Every loaded session holds one `node roshera-mcp` process;
+            // see [`max_agent_sessions`] for the bound and why.
+            max_active_sessions: Some(max_agent_sessions()),
         },
     ));
     let router = goose::acp::transport::create_acp_router(server);
@@ -835,14 +838,40 @@ pub(crate) fn acp_router(
     // carries the sessionId this surface's minted key must bind to —
     // the POST itself returns a bare 202), and cleans up on connection
     // DELETE. Pure observation: every byte is forwarded untouched.
+    let inner = router
+        .layer(axum::middleware::from_fn_with_state(
+            (auth_manager, ai_provider_manager),
+            inject_roshera_mcp_server,
+        ))
+        .layer(axum::middleware::from_fn(
+            crate::agent_activity::observe_acp_transport,
+        ));
+    // The orphan reaper DELETEs connections no client holds an SSE stream
+    // on any more (browser reload, closed tab, client rebuild after a 404)
+    // — goose's transport keeps those, and their `node roshera-mcp`
+    // processes, alive forever otherwise. Its DELETE goes through `inner`
+    // (so `observe_acp_transport` cleans up turn bookkeeping) but not
+    // through the epoch layer below (a stale connection must still be
+    // deletable). See `acp_orphan_reaper.rs`.
+    let reaper = Arc::new(crate::acp_orphan_reaper::AcpOrphanReaper::new(
+        crate::acp_orphan_reaper::AcpOrphanReaper::grace_from_env(),
+        crate::acp_orphan_reaper::MAX_TURN_DEFERRAL,
+        inner.clone(),
+        Arc::new(|connection_id: &str| {
+            crate::agent_activity::global().turn_in_flight_on_connection(connection_id)
+        }),
+    ));
+    tracing::info!(
+        target: "goose_acp",
+        max_agent_sessions = max_agent_sessions(),
+        orphan_grace_secs = reaper.grace().as_secs(),
+        "ACP session cap and orphaned-connection reaper configured"
+    );
     Some(
-        router
+        inner
             .layer(axum::middleware::from_fn_with_state(
-                (auth_manager, ai_provider_manager),
-                inject_roshera_mcp_server,
-            ))
-            .layer(axum::middleware::from_fn(
-                crate::agent_activity::observe_acp_transport,
+                reaper,
+                crate::acp_orphan_reaper::track_acp_connections,
             ))
             // Outermost of the inner layers (still under `acp_gate` + auth
             // at the merge site): a connection minted under a previous
@@ -864,6 +893,46 @@ pub(crate) fn acp_router(
             // must be distinguishable from death.
             .layer(axum::middleware::from_fn(acp_sse_keepalive)),
     )
+}
+
+/// Default upper bound on agent sessions kept loaded per ACP connection.
+///
+/// Each loaded session owns one `node roshera-mcp/dist/index.js` process
+/// (tens of MB resident), and goose's own default is 100 per connection.
+/// `acp-client.ts` uses exactly ONE session per connection (a rebuild opens
+/// a new connection, not a second session), so 4 never evicts the session
+/// a tab is using, leaves headroom for a client that opens a few sessions
+/// side by side, and caps a client that loops `session/new` on one
+/// connection at 4 processes instead of 100. An evicted session is not
+/// lost: its history lives in goose's SQLite session store and it reloads,
+/// re-spawning its extension, on next use. The bound ACROSS connections is
+/// the orphan reaper's job (`acp_orphan_reaper.rs`), not this cap's.
+const DEFAULT_MAX_AGENT_SESSIONS: usize = 4;
+
+/// Env override for [`DEFAULT_MAX_AGENT_SESSIONS`].
+const MAX_AGENT_SESSIONS_ENV: &str = "ROSHERA_MAX_AGENT_SESSIONS";
+
+/// [`MAX_AGENT_SESSIONS_ENV`] if it is a positive integer, else
+/// [`DEFAULT_MAX_AGENT_SESSIONS`] (a bad value is logged, never fatal).
+fn max_agent_sessions() -> usize {
+    parse_max_agent_sessions(std::env::var(MAX_AGENT_SESSIONS_ENV).ok().as_deref())
+}
+
+fn parse_max_agent_sessions(raw: Option<&str>) -> usize {
+    match raw {
+        None => DEFAULT_MAX_AGENT_SESSIONS,
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(cap) if cap > 0 => cap,
+            _ => {
+                tracing::warn!(
+                    target: "goose_acp",
+                    value = %raw,
+                    "{MAX_AGENT_SESSIONS_ENV} must be a positive integer; using                      the default of {DEFAULT_MAX_AGENT_SESSIONS}"
+                );
+                DEFAULT_MAX_AGENT_SESSIONS
+            }
+        },
+    }
 }
 
 // ── SSE keepalive ──────────────────────────────────────────────────────
@@ -1352,6 +1421,24 @@ mod tests {
     /// injects. Test-only: production never needs a goose
     /// `ExtensionConfig` directly, only the JSON `mcpServers` entry —
     /// goose itself does this conversion on receipt.
+    /// The session cap is small by default, overridable, and never zero —
+    /// a zero or garbage override must not disable the bound (goose would
+    /// otherwise fall back to 100 sessions, one node process each).
+    #[test]
+    fn max_agent_sessions_defaults_small_and_rejects_bad_overrides() {
+        assert_eq!(parse_max_agent_sessions(None), DEFAULT_MAX_AGENT_SESSIONS);
+        assert_eq!(DEFAULT_MAX_AGENT_SESSIONS, 4);
+        assert_eq!(parse_max_agent_sessions(Some("2")), 2);
+        assert_eq!(parse_max_agent_sessions(Some(" 7 ")), 7);
+        for bad in ["0", "-1", "many", ""] {
+            assert_eq!(
+                parse_max_agent_sessions(Some(bad)),
+                DEFAULT_MAX_AGENT_SESSIONS,
+                "override {bad:?} must fall back to the default"
+            );
+        }
+    }
+
     fn extension_config_from_injected_entry(entry: &serde_json::Value) -> ExtensionConfig {
         let name = entry["name"].as_str().unwrap_or_default().to_string();
         let cmd = entry["command"].as_str().unwrap_or_default().to_string();

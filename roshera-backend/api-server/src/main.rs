@@ -13,6 +13,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod acp_gate;
+mod acp_orphan_reaper;
 mod acp_provider_epoch;
 mod agent_activity;
 mod agent_registry;
