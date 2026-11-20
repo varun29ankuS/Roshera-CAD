@@ -1178,7 +1178,7 @@ pub fn standard_drawing_hlr_with_projection(
         }
         dedup_dimensions_global(&mut probe);
         count_equal_features(&mut probe);
-        dimension_band_gaps(&probe.views, &bores)
+        dimension_band_gaps(&probe.views, &bores, angle)
     };
     let placement = place_four_view(&sheet, fe, te, re, no_iso, scale, angle, vgap, hgap);
     // A finite, positive scale can still be too large to MEASURE against: at
@@ -1601,9 +1601,23 @@ fn layout_four_view_gap(
 /// plate). `views` are the orthographic views with their deduplicated
 /// dimensions; `tabled` the bore faces whose diameter the hole table states
 /// (those are not inked in the stack).
+///
+/// Which views own the gaps depends on the projection `angle`
+/// ([`core_cell`]). A view's lanes run left of it and below it under either
+/// angle. Third angle puts TOP over FRONT and RIGHT right of FRONT: TOP's
+/// lower lanes are between the rows, RIGHT's left lanes between the columns,
+/// and FRONT's and TOP's left lanes have the sheet's left margin. First angle
+/// reflects the block: FRONT and RIGHT are the upper row, so THEIR lower lanes
+/// are between the rows, and FRONT and TOP are the right-hand column, so
+/// THEIR left lanes are between the columns, beside RIGHT and the isometric.
+/// Sized the third-angle way, a first-angle weld-neck flange's face view had
+/// its Ø102, Ø74 and PCD Ø125 unplaced on every sheet the search tried, and
+/// the sheet came out on A2 at 1:2 filling 8% of the paper (a demo sheet,
+/// 2026-11-19).
 fn dimension_band_gaps(
     views: &[super::types::ProjectedView],
     tabled: &std::collections::HashSet<u32>,
+    angle: super::types::ProjectionAngle,
 ) -> (f64, f64) {
     // How deep each view's lanes run when it has the room it wants, measured
     // by the layout's own placement (so a chain that shares one lane counts
@@ -1628,15 +1642,25 @@ fn dimension_band_gaps(
     // above their view: `layout::place_dimensions_routed`). [`VGAP`] holds
     // three lanes: the third line sits STANDOFF + 2 STACK = 27 mm below the
     // upper view, clear of the lower view's title glyphs.
-    let spill_below = (front.0.max(right.0) - LANES_UNDER_BOTTOM_ROW_MM).max(0.0);
-    let vgap = (top.0 + BAND_TO_TITLE_MM + spill_below).clamp(VGAP, MAX_GAP);
+    // (upper row, lower row) lower-lane depths and (right column, left
+    // column) left-lane depths, as the angle arranges the views.
+    let ((upper, lower), (right_column, left_column)) = match angle {
+        super::types::ProjectionAngle::Third => {
+            ((top.0, front.0.max(right.0)), (right.1, front.1.max(top.1)))
+        }
+        super::types::ProjectionAngle::First => {
+            ((front.0.max(right.0), top.0), (front.1.max(top.1), right.1))
+        }
+    };
+    let spill_below = (lower - LANES_UNDER_BOTTOM_ROW_MM).max(0.0);
+    let vgap = (upper + BAND_TO_TITLE_MM + spill_below).clamp(VGAP, MAX_GAP);
     // Between the columns: the right-hand view's lanes on its left, and
     // whatever of the left column's lanes will not fit beside it (those go to
     // the right of their view). The gap is not widened for a hole callout's
     // leader: widening it shrank a flange sheet's scale to 0.75; the leader's
     // shoulder row is routed around the neighbouring views instead.
-    let spill_left = (front.1.max(top.1) - PAD_LEFT).max(0.0);
-    let hgap = (right.1 + BAND_TO_VIEW_MM + spill_left).clamp(HGAP, MAX_GAP);
+    let spill_left = (left_column - PAD_LEFT).max(0.0);
+    let hgap = (right_column + BAND_TO_VIEW_MM + spill_left).clamp(HGAP, MAX_GAP);
     (vgap, hgap)
 }
 
@@ -2043,7 +2067,7 @@ pub fn standard_drawing_auto_with_projection(
             );
         }
     };
-    let plan = plan_sheet(model, solid_id, part_uuid)?;
+    let plan = plan_sheet(model, solid_id, part_uuid, angle)?;
     let t = std::time::Instant::now();
     let mut views = Vec::new();
     let seed = build_sheet(
@@ -2540,7 +2564,7 @@ fn auto_sheet(
     angle: super::types::ProjectionAngle,
 ) -> Result<super::types::Drawing, super::projection::ProjectionError> {
     let _adjacency = crate::readable::adjacency::AdjacencyCacheScope::enter(model);
-    let plan = plan_sheet(model, solid_id, part_uuid)?;
+    let plan = plan_sheet(model, solid_id, part_uuid, angle)?;
     build_sheet(
         model,
         solid_id,
@@ -2565,6 +2589,7 @@ fn plan_sheet(
     model: &BRepModel,
     solid_id: SolidId,
     part_uuid: uuid::Uuid,
+    angle: super::types::ProjectionAngle,
 ) -> Result<SheetPlan, super::projection::ProjectionError> {
     use super::types::{Drawing, ViewSource};
     let source = ViewSource::Part {
@@ -2623,7 +2648,7 @@ fn plan_sheet(
                 .filter(|f| !called_out.contains(f))
                 .collect();
         lap("bore_face_ids", t);
-        let (vgap, hgap) = dimension_band_gaps(&band_probe.views, &tabled);
+        let (vgap, hgap) = dimension_band_gaps(&band_probe.views, &tabled, angle);
         // How deep each orthographic view's left-hand lanes run (FRONT,
         // TOP, RIGHT), paper mm.
         let left_bands: Vec<f64> = band_probe
@@ -4587,7 +4612,7 @@ fn section_layout_gaps(drawing: &super::types::Drawing) -> (f64, f64) {
         .filter(|f| !called_out.contains(f))
         .collect();
     let n = drawing.views.len().min(3);
-    dimension_band_gaps(&drawing.views[..n], &tabled)
+    dimension_band_gaps(&drawing.views[..n], &tabled, drawing.projection)
 }
 
 ///
@@ -5170,7 +5195,7 @@ mod tests {
                 seed.views[0].scale
             );
             let _scope = crate::readable::adjacency::AdjacencyCacheScope::enter(m);
-            let plan = plan_sheet(m, *s, uuid::Uuid::nil()).expect("plan");
+            let plan = plan_sheet(m, *s, uuid::Uuid::nil(), angle).expect("plan");
             let shape = SheetShape::of(&seed, &plan, angle);
             let pref = |dr: &super::super::types::Drawing| {
                 shape.preference(
