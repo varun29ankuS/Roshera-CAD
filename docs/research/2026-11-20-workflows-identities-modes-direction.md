@@ -93,3 +93,34 @@ Varun: "this is why we need omnigraph", then: record it, no trial now.
 ## Next
 
 Finish the remaining product gaps first. Then design: workflow and gate templates, modes, routing with its eval set, and the Blackboard rebuild (stage strip and checkpoint cards).
+
+## Agreed: an engineering ontology as the schema layer (Varun: "yes please... I like it")
+
+Today "ontology" in Roshera means only the TOOL ontology: the benches in
+agent_registry.rs and the drift gate. There is no shared, typed definition of the
+engineering concepts. Each lives in its own place: kernel Rust types, prose playbooks
+in kb_data.ts, and per-card schemas in the app.
+
+- **One small, typed Roshera engineering ontology**, written once, possibly in
+  LinkML YAML or as Omnigraph's schema. Every term maps to a standard:
+  - QIF (ISO 23952) for characteristics, inspection plans and results;
+  - STEP AP242 for geometry and PMI;
+  - IOF Core (MIT licence) for parts, processes, suppliers and requirements.
+- **The kernel stays the truth.** The ontology names and connects what the kernel
+  certifies; it does not replace the kernel's types.
+- **Generated from the one source**, the "ontology-to-tools compilation" pattern
+  (arXiv 2602.03439):
+  - MCP tool schemas with their constraints enforced at write time;
+  - card schemas;
+  - playbook structure;
+  - routing eval labels;
+  - the Omnigraph schema.
+- **First slice (aerospace supplier):** Part, Revision, Feature, Characteristic
+  (key-characteristic flag), Datum, FCF, Requirement, Standard, Material, Process,
+  Gate, Signature, Person, AgentRun, Evidence.
+- **First visible win:** a QIF export of the sheet's characteristic list, for
+  first article inspection.
+- **References:**
+  - NIST OntoSTEP;
+  - BrepPMIOnt;
+  - the NIST AP242+QIF reference knowledge graphs, as a test case.
