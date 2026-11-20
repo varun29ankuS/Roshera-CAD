@@ -1463,6 +1463,96 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "required": ["part_id"]
             }),
         ),
+        // Correcting authored GD&T in place: PATCH / DELETE
+        // /api/agent/parts/{id}/fcf/{annotation_id}, PATCH / DELETE
+        // /api/agent/parts/{id}/datums/{label}, DELETE
+        // /api/agent/parts/{id}/size-tolerance/{annotation_id} (handlers/gdt.rs).
+        // Each records a `gdt_*` design event, so each edit is undoable.
+        t(
+            "gdt_fcf_update",
+            Drawing,
+            Stable,
+            Curated,
+            "Edit/fix an authored Feature Control Frame by annotation_id: only the fields given change; returns the re-evaluated verdict. Recorded on the timeline (undoable).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
+                    "annotation_id": {"type": "string", "description": "the frame's annotation_id (gdt_fcf result / gdt_report)"},
+                    "characteristic": {"type": "string", "enum": ["flatness", "perpendicularity", "parallelism", "position"], "description": "new GD&T characteristic"},
+                    "tolerance_mm": {"type": "number", "exclusiveMinimum": 0, "description": "new tolerance zone width in millimetres"},
+                    "datum_refs": {"type": "array", "items": {"type": "string"}, "description": "new ordered datum labels, replacing the old list ([] for flatness)"},
+                    "modifier": {"type": "string", "enum": ["rfs", "mmc", "lmc"], "description": "material condition; the kernel evaluates RFS only"},
+                    "basic": ntuple(2, "new basic dims [x, y] mm relative to the DRF origin (position)"),
+                    "target_face": {"type": "integer", "description": "move the frame to this kernel face id"},
+                    "target_selector": {"type": "string", "description": "move the frame to a face by description: JSON string shaped like select_face"}
+                },
+                "required": ["part_id", "annotation_id"]
+            }),
+        ),
+        t(
+            "gdt_fcf_delete",
+            Drawing,
+            Stable,
+            Curated,
+            "Delete an authored Feature Control Frame by annotation_id. Recorded on the timeline (undoable).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
+                    "annotation_id": {"type": "string", "description": "the frame's annotation_id (gdt_fcf result / gdt_report)"}
+                },
+                "required": ["part_id", "annotation_id"]
+            }),
+        ),
+        t(
+            "gdt_datum_update",
+            Drawing,
+            Stable,
+            Curated,
+            "Re-letter a datum and/or move it to another face; refused while a frame references a re-lettered datum. Recorded on the timeline (undoable).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
+                    "label": {"type": "string", "description": "the datum's current letter, e.g. 'A'"},
+                    "new_label": {"type": "string", "description": "the new letter, e.g. 'C'"},
+                    "face_id": {"type": "integer", "description": "move the datum to this kernel face id; mutually exclusive with selector"},
+                    "selector": {"type": "string", "description": "move the datum to a face by description: JSON string shaped like select_face"}
+                },
+                "required": ["part_id", "label"]
+            }),
+        ),
+        t(
+            "gdt_datum_delete",
+            Drawing,
+            Stable,
+            Curated,
+            "Delete a datum by letter; refused (datum_referenced, naming the frames) while any frame references it. Recorded on the timeline (undoable).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
+                    "label": {"type": "string", "description": "the datum letter to delete, e.g. 'B'"}
+                },
+                "required": ["part_id", "label"]
+            }),
+        ),
+        t(
+            "gdt_dimensional_delete",
+            Drawing,
+            Stable,
+            Curated,
+            "Delete a size (dimensional) tolerance by annotation_id; an FCF id is refused. Recorded on the timeline (undoable).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
+                    "annotation_id": {"type": "string", "description": "the size tolerance's annotation_id (gdt_report)"}
+                },
+                "required": ["part_id", "annotation_id"]
+            }),
+        ),
         // ═══════════════════ ANALYSIS ═══════════════════
         t(
             "point_query",
@@ -2187,7 +2277,11 @@ mod tests {
         // drawing_dimension_properties + iso286_limits -- an agent reads and
         // sets a sheet dimension's properties as a person does in the drawing tab
         // (GET/PATCH /api/drawings/{id}/dimensions, GET /api/iso286).
-        assert_eq!(tools.len(), 107, "expected 107 tools, got {}", tools.len());
+        // 107 -> 112 (2026-11-20): gdt_fcf_update, gdt_fcf_delete,
+        // gdt_datum_update, gdt_datum_delete, gdt_dimensional_delete -- the
+        // agent corrects GD&T it authored in place (PATCH / DELETE on the
+        // existing handlers/gdt.rs routes) instead of undoing the timeline.
+        assert_eq!(tools.len(), 112, "expected 112 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2204,7 +2298,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 119, "107 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 124, "112 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");

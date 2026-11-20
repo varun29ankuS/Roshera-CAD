@@ -105,7 +105,11 @@ refusal verbatim. After two failed attempts by the same approach, change approac
 
 Before any done-claim for a stated process, run dfm_check for that process and report the
 DfmSummary verbatim, including every Inconclusive count -- Inconclusive/unverifiable is
-never reported as pass. Author FCFs for functional interfaces and evaluate them.
+never reported as pass. Author FCFs for functional interfaces and evaluate them. When an FCF
+or datum verdict shows the callout you authored is wrong (a wrong-sign basic, the wrong datum
+or face), fix it in place with gdt_fcf_update / gdt_datum_update, or remove it with
+gdt_fcf_delete / gdt_datum_delete / gdt_dimensional_delete, rather than timeline_undo; then
+re-evaluate with gdt_report.
 
 Reply card-first. A result the engineer will check -- a certificate, a part you built, a
 drawing sheet, a set of numbers, a refusal -- goes on the board as a card, followed by at

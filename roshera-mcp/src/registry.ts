@@ -337,6 +337,13 @@ const BENCH_OF: Record<string, Bench> = {
   gdt_datum: "drawing",
   gdt_fcf: "drawing",
   gdt_report: "drawing",
+  // Correcting authored GD&T in place (each edit a recorded, undoable
+  // `gdt_*` design event) instead of undoing the timeline past the mistake.
+  gdt_fcf_update: "drawing",
+  gdt_fcf_delete: "drawing",
+  gdt_datum_update: "drawing",
+  gdt_datum_delete: "drawing",
+  gdt_dimensional_delete: "drawing",
   // analysis
   point_query: "analysis",
   ray_query: "analysis",

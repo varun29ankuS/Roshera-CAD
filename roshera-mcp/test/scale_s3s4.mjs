@@ -87,7 +87,12 @@ console.log("(w1) WORKBENCH status shape");
   const EXPECTED_BENCH_COUNTS = {
     sketch: 15,
     assembly: 12,
-    drawing: 8,
+    // 8 -> 19 (2026-11-20). This pin sat stale at 8 while the bench grew to
+    // 14 (drawing_set_dimension / _projection / _title, drawing_dimensions,
+    // drawing_dimension_properties, iso286_limits); +5 = the GD&T correction
+    // verbs (gdt_fcf_update / _delete, gdt_datum_update / _delete,
+    // gdt_dimensional_delete).
+    drawing: 19,
     analysis: 14,
     labels: 11,
     // 15 -> 16 (2026-08-11, task #10): `recipe_get` — retrieval of a

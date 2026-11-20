@@ -11,6 +11,7 @@
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail, BASE, ApiError, scopeHeaders, readRefusable, withStructured, TIMEOUT_MS, PART_ID_DOC } from "../core.js";
+import { typedErrorResult } from "../gates.js";
 
 // ─── Compact-verdict helpers ───────────────────────────────────────────
 
@@ -103,6 +104,87 @@ function refusalFrom(e: unknown): ReturnType<typeof fail> | null {
     return fail(new ApiError(`REFUSED: ${msg}`, e.status, e.body));
   } catch {
     return fail(new ApiError(`REFUSED: ${e.body}`, e.status, e.body));
+  }
+}
+
+/**
+ * A refused GD&T EDIT (update / delete) as a typed refusal with a top-level
+ * `reason` — the shape the Blackboard's `roshera:refusal` card requires.
+ *
+ * The edit routes answer `{ "error": <code>, "message": <sentence> }`
+ * (handlers/gdt.rs `refusal`), not a catalogue body, so `refusalOrFail`'s
+ * `error`-first order (timeline.ts) would lift the CODE as the reason. Here
+ * the sentence is the reason and the code is `error_code`; a catalogue body
+ * (`error_code` present) keeps its own `error` sentence, code and hint. The
+ * body rides verbatim as `refused`, so a 409 `datum_referenced` keeps the
+ * `annotations` it names — exactly the frames to fix first. 404 is included:
+ * `annotation_not_found` / `annotation_not_on_part` / `datum_not_found` are
+ * the commonest refused deletes. A non-JSON body (a transport failure, an
+ * extractor rejection) falls through to `fail()`.
+ */
+function gdtEditRefusal(e: unknown) {
+  if (e instanceof ApiError && [404, 409, 422].includes(e.status)) {
+    let body: unknown;
+    try {
+      body = JSON.parse(e.body);
+    } catch {
+      return fail(e);
+    }
+    if (body !== null && typeof body === "object") {
+      const b = body as Record<string, unknown>;
+      const words = (k: string) =>
+        typeof b[k] === "string" && (b[k] as string).length > 0 ? (b[k] as string) : null;
+      const catalogue = words("error_code");
+      const reason = catalogue
+        ? words("error") ?? words("message") ?? e.message
+        : words("message") ?? words("reason") ?? words("error") ?? e.message;
+      const code = catalogue ?? words("error");
+      return typedErrorResult({
+        refused: body,
+        reason,
+        ...(code !== null ? { error_code: code } : {}),
+        retryable: b.retryable === true,
+        ...(words("hint") !== null ? { hint: words("hint") } : {}),
+      });
+    }
+  }
+  return fail(e);
+}
+
+/** An edit that names nothing to change: refused before any request, so no
+ *  no-op `gdt_*_update` event is recorded. */
+function noChange(tool: string, fields: string) {
+  return typedErrorResult({
+    refused: true,
+    error_code: "no_change_specified",
+    reason: `${tool} names nothing to change; pass at least one of ${fields}`,
+    retryable: false,
+  });
+}
+
+/**
+ * The undo disclosure every GD&T edit result carries, read from the server's
+ * own `persistence` field — never assumed. `"timeline"` means the route
+ * recorded a `gdt_*` design event, so `timeline_undo` takes the edit back.
+ */
+function undoDisclosure(persistence: unknown): { persistence: unknown; undoable: boolean; undo: string } {
+  const undoable = persistence === "timeline";
+  return {
+    persistence: persistence ?? null,
+    undoable,
+    undo: undoable
+      ? "Recorded on the timeline as a design event: timeline_undo takes this edit back."
+      : `The server reported persistence '${String(persistence)}': this edit is not recorded on the timeline and cannot be undone.`,
+  };
+}
+
+/** Parse an optional selector JSON string; `undefined` when absent/blank. */
+function parseSelector(raw: string | undefined, field: string): { value?: unknown; error?: ReturnType<typeof fail> } {
+  if (raw === undefined || raw.trim().length === 0) return {};
+  try {
+    return { value: JSON.parse(raw) };
+  } catch {
+    return { error: fail(new Error(`${field} is not valid JSON: ${raw}`)) };
   }
 }
 
@@ -367,6 +449,256 @@ export function registerGdtTools(server: ToolHost): void {
         });
       } catch (e) {
         return fail(e);
+      }
+    },
+  );
+
+  // ── Correcting authored GD&T ───────────────────────────────────────────
+  //
+  // One verb per edit, the label_create / label_rename / label_delete shape:
+  // an `action` on gdt_fcf would make its required characteristic and
+  // tolerance_mm optional for every call (and break its schema parity with
+  // the backend row). Each route records a `gdt_*` design event through the
+  // kernel mediators (geometry_engine::gdt::edit), so an edit is corrected in
+  // place — and is itself undoable — instead of undoing the timeline back
+  // past the mistake.
+
+  server.tool(
+    "gdt_fcf_update",
+    "EDIT / FIX an authored Feature Control Frame by annotation_id (from gdt_fcf " +
+      "or gdt_report). Only the fields given change: basic dims (e.g. a wrong " +
+      "sign), zone width, datum_refs, characteristic, modifier, or the target " +
+      "face. Returns the re-evaluated certified verdict. Recorded on the " +
+      "timeline (undoable). Correct a wrong frame with this, not timeline_undo.",
+    {
+      part_id: z.number().int().describe(PART_ID_DOC),
+      annotation_id: z
+        .string()
+        .min(1)
+        .describe("the frame's annotation_id (gdt_fcf result / gdt_report)"),
+      characteristic: z
+        .enum(["flatness", "perpendicularity", "parallelism", "position"])
+        .optional()
+        .describe("new GD&T characteristic"),
+      tolerance_mm: z.number().positive().optional().describe("new tolerance zone width in millimetres"),
+      datum_refs: z
+        .array(z.string())
+        .optional()
+        .describe("new ordered datum labels, replacing the old list ([] for flatness)"),
+      modifier: z
+        .enum(["rfs", "mmc", "lmc"])
+        .optional()
+        .describe("material condition; the kernel evaluates RFS only (MMC/LMC → not_evaluable)"),
+      basic: z
+        .array(z.number()).length(2)
+        .optional()
+        .describe("new basic dims [x, y] mm relative to the DRF origin (position)"),
+      target_face: z
+        .number()
+        .int()
+        .optional()
+        .describe("move the frame to this kernel face id"),
+      target_selector: z
+        .string()
+        .optional()
+        .describe("move the frame to a face by description: JSON string shaped like select_face"),
+    },
+    async ({
+      part_id,
+      annotation_id,
+      characteristic,
+      tolerance_mm,
+      datum_refs,
+      modifier,
+      basic,
+      target_face,
+      target_selector,
+    }) => {
+      const sel = parseSelector(target_selector, "target_selector");
+      if (sel.error) return sel.error;
+      // Only the fields given: the route keeps every omitted one.
+      const body: Record<string, unknown> = {
+        ...(characteristic !== undefined ? { characteristic } : {}),
+        ...(tolerance_mm !== undefined ? { tolerance_mm } : {}),
+        ...(datum_refs !== undefined ? { datum_refs } : {}),
+        ...(modifier !== undefined ? { modifier } : {}),
+        ...(basic !== undefined ? { basic } : {}),
+        ...(target_face !== undefined ? { face_id: target_face } : {}),
+        ...(sel.value !== undefined ? { selector: sel.value } : {}),
+      };
+      if (Object.keys(body).length === 0) {
+        return noChange(
+          "gdt_fcf_update",
+          "characteristic, tolerance_mm, datum_refs, modifier, basic, target_face, target_selector",
+        );
+      }
+      try {
+        const r: any = await api(
+          "PATCH",
+          `/api/agent/parts/${part_id}/fcf/${encodeURIComponent(annotation_id)}`,
+          body,
+        );
+        const verdict: any = r?.verdict;
+        return withStructured(
+          ok({
+            part_id,
+            annotation_id: r?.annotation_id ?? annotation_id,
+            annotation_pid: r?.annotation_pid,
+            modifier: r?.modifier ?? null,
+            verdict: verdict != null ? compactGdtVerdict(verdict) : "(no verdict)",
+            verdict_detail: verdict ?? null,
+            ...undoDisclosure(r?.persistence),
+          }),
+        );
+      } catch (e) {
+        return gdtEditRefusal(e);
+      }
+    },
+  );
+
+  server.tool(
+    "gdt_fcf_delete",
+    "DELETE / REMOVE an authored Feature Control Frame by annotation_id (from " +
+      "gdt_fcf or gdt_report). Recorded on the timeline (undoable). Drop a wrong " +
+      "frame with this, not timeline_undo.",
+    {
+      part_id: z.number().int().describe(PART_ID_DOC),
+      annotation_id: z
+        .string()
+        .min(1)
+        .describe("the frame's annotation_id (gdt_fcf result / gdt_report)"),
+    },
+    async ({ part_id, annotation_id }) => {
+      try {
+        const r: any = await api(
+          "DELETE",
+          `/api/agent/parts/${part_id}/fcf/${encodeURIComponent(annotation_id)}`,
+        );
+        return withStructured(
+          ok({
+            part_id,
+            annotation_id: r?.annotation_id ?? annotation_id,
+            deleted: r?.success === true,
+            ...undoDisclosure(r?.persistence),
+          }),
+        );
+      } catch (e) {
+        return gdtEditRefusal(e);
+      }
+    },
+  );
+
+  server.tool(
+    "gdt_datum_update",
+    "EDIT a datum by its current letter: re-letter it (new_label) and/or move " +
+      "it to another surface (by id or selector). Re-lettering a datum a frame " +
+      "references is REFUSED (409, naming the frames). Recorded on the timeline " +
+      "(undoable).",
+    {
+      part_id: z.number().int().describe(PART_ID_DOC),
+      label: z.string().min(1).describe("the datum's current letter, e.g. 'A'"),
+      new_label: z.string().min(1).optional().describe("the new letter, e.g. 'C'"),
+      face_id: z
+        .number()
+        .int()
+        .optional()
+        .describe("move the datum to this kernel face id; mutually exclusive with selector"),
+      selector: z
+        .string()
+        .optional()
+        .describe("move the datum to a face by description: JSON string shaped like select_face"),
+    },
+    async ({ part_id, label, new_label, face_id, selector }) => {
+      const sel = parseSelector(selector, "selector");
+      if (sel.error) return sel.error;
+      const body: Record<string, unknown> = {
+        ...(new_label !== undefined ? { label: new_label } : {}),
+        ...(face_id !== undefined ? { face_id } : {}),
+        ...(sel.value !== undefined ? { selector: sel.value } : {}),
+      };
+      if (Object.keys(body).length === 0) {
+        return noChange("gdt_datum_update", "new_label, face_id, selector");
+      }
+      try {
+        const r: any = await api(
+          "PATCH",
+          `/api/agent/parts/${part_id}/datums/${encodeURIComponent(label)}`,
+          body,
+        );
+        return withStructured(
+          ok({
+            part_id,
+            label: r?.label ?? new_label ?? label,
+            previous_label: label,
+            kind: r?.kind,
+            persistent_id: r?.persistent_id,
+            face_id: r?.face_id ?? null,
+            ...undoDisclosure(r?.persistence),
+          }),
+        );
+      } catch (e) {
+        return gdtEditRefusal(e);
+      }
+    },
+  );
+
+  server.tool(
+    "gdt_datum_delete",
+    "DELETE / REMOVE a datum by its letter. REFUSED (409 datum_referenced, " +
+      "naming the frames) while any FCF references it — edit or delete those " +
+      "frames first. Recorded on the timeline (undoable).",
+    {
+      part_id: z.number().int().describe(PART_ID_DOC),
+      label: z.string().min(1).describe("the datum letter to delete, e.g. 'B'"),
+    },
+    async ({ part_id, label }) => {
+      try {
+        const r: any = await api(
+          "DELETE",
+          `/api/agent/parts/${part_id}/datums/${encodeURIComponent(label)}`,
+        );
+        return withStructured(
+          ok({
+            part_id,
+            label: r?.label ?? label,
+            deleted: r?.success === true,
+            ...undoDisclosure(r?.persistence),
+          }),
+        );
+      } catch (e) {
+        return gdtEditRefusal(e);
+      }
+    },
+  );
+
+  server.tool(
+    "gdt_dimensional_delete",
+    "DELETE / REMOVE a size tolerance (±, limits or fit on a feature) by " +
+      "annotation_id (gdt_report, kind 'dimensional'). An FCF id is REFUSED " +
+      "(use gdt_fcf_delete). Recorded on the timeline (undoable).",
+    {
+      part_id: z.number().int().describe(PART_ID_DOC),
+      annotation_id: z
+        .string()
+        .min(1)
+        .describe("the size tolerance's annotation_id (gdt_report)"),
+    },
+    async ({ part_id, annotation_id }) => {
+      try {
+        const r: any = await api(
+          "DELETE",
+          `/api/agent/parts/${part_id}/size-tolerance/${encodeURIComponent(annotation_id)}`,
+        );
+        return withStructured(
+          ok({
+            part_id,
+            annotation_id: r?.annotation_id ?? annotation_id,
+            deleted: r?.success === true,
+            ...undoDisclosure(r?.persistence),
+          }),
+        );
+      } catch (e) {
+        return gdtEditRefusal(e);
       }
     },
   );

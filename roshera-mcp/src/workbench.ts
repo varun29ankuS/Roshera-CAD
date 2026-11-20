@@ -74,8 +74,16 @@ export const SWITCHABLE_BENCHES: Bench[] = [
  * exactly the overshoot again, per the same policy — this is an attention
  * budget, and one more read-only retrieval verb on the bench an agent enters
  * precisely to consult history is squarely what that budget is for.
+ *
+ * 46 -> 50 (2026-11-20): the five GD&T correction verbs (gdt_fcf_update,
+ * gdt_fcf_delete, gdt_datum_update, gdt_datum_delete, gdt_dimensional_delete)
+ * joined the drawing bench, which already measured 31 + 14 = 45 after the
+ * drawing_set_* / drawing_dimensions / iso286_limits additions; it now
+ * measures 31 + 19 = 50 and is the sole max. Raised by exactly the overshoot,
+ * same policy: an agent enters the drawing bench to author and correct
+ * callouts, and fixing a wrong frame in place is what that bench is for.
  */
-export const LIVE_SURFACE_CEILING = 46;
+export const LIVE_SURFACE_CEILING = 50;
 
 /** Callback that flips real server tool handles on a bench switch. */
 export type ApplyTransition = (toEnable: string[], toDisable: string[]) => void;

@@ -244,6 +244,64 @@ async fn undo_takes_back_the_last_gdt_edit_and_redo_restores_it() {
     );
 }
 
+/// The agent's correction verbs (roshera-mcp `gdt_fcf_delete` /
+/// `gdt_datum_delete`) promise their edit is undoable. Prove it for the
+/// DELETES, not only for a PATCH: delete the frame, then the now-unreferenced
+/// datum; one undo brings the datum back, a second brings the frame back.
+#[tokio::test]
+async fn undo_restores_a_deleted_frame_and_a_deleted_datum() {
+    let state = make_test_state().await;
+    let (part, _) = make_box(&state, [0.0, 0.0, 0.0], 10.0, 10.0, 10.0).await;
+    let id = datum_and_frame(&state, part, 0.05).await;
+    let before = gdt_of(&state, part).await;
+    assert_eq!(frames_of(&before).len(), 1, "{before}");
+    assert_eq!(datums_of(&before).len(), 1, "{before}");
+
+    let (s, body) = dispatch(&state, del(&format!("/api/agent/parts/{part}/fcf/{id}"))).await;
+    assert_eq!(s, StatusCode::OK, "frame delete; body = {body}");
+    assert_eq!(body["persistence"], "timeline", "{body}");
+    let (s, body) = dispatch(&state, del(&format!("/api/agent/parts/{part}/datums/A"))).await;
+    assert_eq!(s, StatusCode::OK, "datum delete; body = {body}");
+    let emptied = gdt_of(&state, part).await;
+    assert!(frames_of(&emptied).is_empty(), "{emptied}");
+    assert!(datums_of(&emptied).is_empty(), "{emptied}");
+
+    let _ = state.timeline_recorder.settle().await;
+    let session = crate::handlers::timeline::live_session_id(&timeline_engine::BranchId::main());
+    let undo = || async {
+        let (s, undone) = dispatch(
+            &state,
+            post(
+                "/api/timeline/undo",
+                json!({ "session_id": session.to_string() }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{undone}");
+        assert_ne!(undone["success"], false, "{undone}");
+    };
+
+    undo().await;
+    let after_one = gdt_of(&state, part).await;
+    assert_eq!(
+        datums_of(&after_one),
+        datums_of(&before),
+        "the first undo puts the datum back; body = {after_one}"
+    );
+    assert!(
+        frames_of(&after_one).is_empty(),
+        "the frame is still deleted; body = {after_one}"
+    );
+
+    undo().await;
+    let after_two = gdt_of(&state, part).await;
+    assert_eq!(
+        frames_of(&after_two),
+        frames_of(&before),
+        "the second undo puts the frame back, same id and tolerance; body = {after_two}"
+    );
+}
+
 /// The FCF blocks of a registered drawing, as `(tolerance_text, datums)`.
 async fn sheet_frames(state: &AppState, drawing: &str) -> Vec<(String, Vec<String>)> {
     let (s, sheet) = dispatch(state, get(&format!("/api/drawings/{drawing}"))).await;
