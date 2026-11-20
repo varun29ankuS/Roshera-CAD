@@ -11,7 +11,13 @@
 //! * `summary.json` -- what a benchmark needs without parsing ink: import
 //!   verdict, stage timings, the sheet (size, views, scale), every dimension
 //!   as inked, the hole table, the layout check by issue kind, and the sheet
-//!   certificate (sound, complete, counts, each omission with its reason).
+//!   certificate (sound, complete, counts, each omission with its reason),
+//!   and the space map's grade, below-bar count and findings by rule;
+//! * `spaces.json` -- the whole space map (`drawing::spaces`): every space
+//!   with its box, contents, findings and score;
+//! * `spaces.svg` -- `ours.svg` with every space's box drawn over it
+//!   (colour by kind, red where the space is below the bar), to check by eye
+//!   that the boxes sit where the dimensions and tables are.
 //!
 //! One part per process on purpose: a part that panics or runs away costs the
 //! caller (`roshera-eval/drawing-bench/bench.py`) one entry, not the whole
@@ -26,6 +32,7 @@ use std::time::Instant;
 use export_engine::ExportEngine;
 use geometry_engine::drawing::dimension_edit::dimension_ink;
 use geometry_engine::drawing::layout::compute_layout;
+use geometry_engine::drawing::spaces::{space_map, SpaceKind, SpaceMap};
 use geometry_engine::drawing::title_block::compute_render_facts;
 use geometry_engine::drawing::{
     analyse_natural_frame, certify_drawing, frame_for_drawing, render_drawing_dxf,
@@ -65,6 +72,58 @@ fn write_summary(dir: &Path, summary: &Value) {
 fn enter_stage(dir: &Path, summary: &mut Value, stage: &str) {
     summary["stage"] = json!(stage);
     write_summary(dir, summary);
+}
+
+/// `svg` with every space of `map` outlined on top: one colour per kind,
+/// red and thicker where the space is below the bar, its id written small at
+/// its top-left corner.
+fn spaces_overlay(svg: &str, map: &SpaceMap) -> String {
+    let mut g = String::from("<g id=\"space-map-overlay\" fill=\"none\">\n");
+    for sp in &map.spaces {
+        let colour = match sp.kind {
+            SpaceKind::Frame => "#888888",
+            SpaceKind::TitleBlock | SpaceKind::NotesStrip => "#7b3fbf",
+            SpaceKind::TableColumn | SpaceKind::Table => "#c77d00",
+            SpaceKind::ViewCell => "#1f6fd1",
+            SpaceKind::ViewGeometry => "#00a0a0",
+            SpaceKind::Band => "#2aa02a",
+            SpaceKind::Lane => "#d12fa6",
+            SpaceKind::Free => "#9fc5e8",
+        };
+        let below = sp.score < map.bar;
+        let (stroke, width) = if below {
+            ("#e00000", 0.45)
+        } else {
+            (colour, 0.25)
+        };
+        let r = sp.rect;
+        let dash = if sp.kind == SpaceKind::Free {
+            " stroke-dasharray=\"2 1\""
+        } else {
+            ""
+        };
+        g.push_str(&format!(
+            "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" stroke=\"{stroke}\" stroke-width=\"{width}\"{dash}/>\n",
+            r.x0,
+            r.y0,
+            r.width().max(0.2),
+            r.height().max(0.2)
+        ));
+        if sp.kind != SpaceKind::Frame {
+            let id = sp.id.replace('&', "&amp;").replace('<', "&lt;");
+            g.push_str(&format!(
+                "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"1.6\" fill=\"{stroke}\" stroke=\"none\">{id} {:.2}</text>\n",
+                r.x0 + 0.4,
+                r.y0 + 1.8,
+                sp.score
+            ));
+        }
+    }
+    g.push_str("</g>\n");
+    match svg.rfind("</svg>") {
+        Some(at) => format!("{}{g}{}", &svg[..at], &svg[at..]),
+        None => format!("{svg}{g}"),
+    }
 }
 
 fn main() {
@@ -208,6 +267,13 @@ fn main() {
         }
     }
     let layout = compute_layout(&drawing);
+    // The space map, from the same layout the quality check and renderer use.
+    let spaces = space_map(&drawing, &layout);
+    if let Ok(text) = serde_json::to_string(&spaces) {
+        if let Err(e) = std::fs::write(dir.join("spaces.json"), text) {
+            eprintln!("could not write spaces.json: {e}");
+        }
+    }
     // The views' dimensions (view mm) and every placed callout, to read why
     // a dimension was or was not placed.
     let views_dims: Vec<Value> = drawing
@@ -324,6 +390,31 @@ fn main() {
             }))
             .collect::<Vec<_>>(),
     });
+    // The ten lowest-scoring spaces and the rules that put them there.
+    let mut low: Vec<&geometry_engine::drawing::spaces::Space> =
+        spaces.spaces.iter().filter(|s| s.score < 1.0).collect();
+    low.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.id.cmp(&b.id)));
+    let worst_spaces: Vec<Value> = low
+        .iter()
+        .take(10)
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "score": s.score,
+                "rules": s.findings.iter().map(|f| f.rule.id()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    summary["spaces"] = json!({
+        "grade": spaces.grade,
+        "bar": spaces.bar,
+        "below_bar": spaces.below_bar,
+        "spaces": spaces.spaces.len(),
+        "worst": spaces.worst,
+        // rule id -> [errors, warnings]
+        "by_rule": spaces.by_rule,
+        "worst_spaces": worst_spaces,
+    });
     summary["certificate"] = match &certified {
         Ok(cert) => {
             let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
@@ -361,6 +452,9 @@ fn main() {
     match catch_unwind(AssertUnwindSafe(|| render_drawing_svg(&drawing))) {
         Ok(svg) => {
             let wrote = std::fs::write(dir.join("ours.svg"), &svg).is_ok();
+            if let Err(e) = std::fs::write(dir.join("spaces.svg"), spaces_overlay(&svg, &spaces)) {
+                eprintln!("could not write spaces.svg: {e}");
+            }
             renders.insert(
                 "svg".into(),
                 json!({ "ok": wrote, "ms": ms(t), "bytes": svg.len() }),

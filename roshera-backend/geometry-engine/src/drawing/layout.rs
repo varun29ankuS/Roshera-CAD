@@ -1444,7 +1444,7 @@ pub(crate) fn tabled_face_ids(drawing: &Drawing) -> std::collections::HashSet<u3
 
 /// Pitch constant used when computing zone cells: keeps layout and renderer in
 /// sync without a separate file-level const in svg.rs.
-const ZONE_FONT_MM: f64 = 3.6;
+pub(crate) const ZONE_FONT_MM: f64 = 3.6;
 
 /// Place zone-grid reference marks in the frame margin.
 ///
@@ -1602,7 +1602,7 @@ const TABLE_CELL_PAD: f64 = 1.0;
 /// Row height (mm) for the table.
 const TABLE_ROW_H: f64 = 6.5;
 /// Gap between the table right edge and the frame / title-block left edge.
-const TABLE_MARGIN: f64 = 3.0;
+pub(crate) const TABLE_MARGIN: f64 = 3.0;
 
 // ── Table paper: one rule for the placers and the sheet search ───────────────
 
@@ -4040,7 +4040,7 @@ fn nominal_text_window(lo: f64, hi: f64, text_w: f64, tc: f64) -> (f64, f64) {
 
 /// Clearance between a stacked dimension's number and an extension line
 /// (paper mm): the line's width and the quality check's 0.2 mm tolerance.
-const TEXT_LINE_CLEAR: f64 = 0.3;
+pub(crate) const TEXT_LINE_CLEAR: f64 = 0.3;
 
 /// Where along its span a number that fits it is centred: the middle, unless
 /// an end of another dimension of the stack (whose extension line runs across

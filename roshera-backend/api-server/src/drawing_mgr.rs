@@ -60,13 +60,14 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use dashmap::DashMap;
+use geometry_engine::drawing::layout::compute_layout;
 use geometry_engine::drawing::types::{ViewEdit, ViewEditError, ViewMove};
 use geometry_engine::drawing::{
     added_view, answer_query, certify_drawing, render_drawing_dxf, render_drawing_pdf,
-    render_drawing_svg, standard_drawing_auto_with_projection,
+    render_drawing_svg, space_map, standard_drawing_auto_with_projection,
     standard_drawing_hlr_with_projection, verify_drawing, Drawing, DrawingAnswer,
     DrawingQualityReport, DrawingQuery, ProjectedViewId, ProjectionAngle, ProjectionType,
-    SheetReadbackCertificate, SheetSize, TitleBlock, ViewSource,
+    SheetReadbackCertificate, SheetSize, SpaceMap, TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
 use geometry_engine::primitives::provenance::SoundnessReading;
@@ -1944,6 +1945,42 @@ pub async fn drawing_quality(
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
     let guard = handle.read().await;
     Ok(Json(verify_drawing(&guard)))
+}
+
+/// Query of [`drawing_spaces`]: narrow the map to one space and the spaces
+/// under it (`?space=view:FRONT/band:top`).
+#[derive(Debug, Deserialize)]
+pub struct DrawingSpacesQuery {
+    #[serde(default)]
+    pub space: Option<String>,
+}
+
+/// `GET /api/drawings/{id}/spaces` -- the sheet's space map: every space
+/// (frame, title block, notes, tables, view cells with their geometry, bands
+/// and lanes, free paper) with its findings and score, the sheet's grade
+/// (its WORST space, never a mean), the count of spaces below the bar and
+/// every finding worst first. Computed from the one layout the renderer
+/// inks. `?space=<id>` returns that space and its descendants (grade and
+/// below_bar stay the whole sheet's); an unknown id is refused typed.
+pub async fn drawing_spaces(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<DrawingSpacesQuery>,
+) -> Result<Json<SpaceMap>, ApiError> {
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let guard = handle.read().await;
+    let layout = compute_layout(&guard);
+    let map = space_map(&guard, &layout);
+    match q.space.as_deref().filter(|s| !s.trim().is_empty()) {
+        None => Ok(Json(map)),
+        Some(space) => map.focus(space).map(Json).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("drawing {id} has no space '{space}'"),
+            )
+            .with_hint("Read the ids from GET /api/drawings/{id}/spaces without `space`.")
+        }),
+    }
 }
 
 // ── Semantic readback (campaign #55 Slice 2) ────────────────────────

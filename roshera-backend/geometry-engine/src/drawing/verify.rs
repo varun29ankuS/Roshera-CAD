@@ -197,6 +197,15 @@ const ALIGN_TOL_MM: f64 = 2.0;
 /// Below this fraction of the printable area, the sheet reads as empty.
 pub(crate) const MIN_UTILIZATION: f64 = 0.10;
 
+/// The fraction of the printable area (the frame less the title block) that
+/// `geometry_area` sheet mm² of view geometry covers, in `[0, 1]`: the one
+/// measure behind [`DrawingQualityReport::sheet_utilization`] and the space
+/// map's `EMPTY` rule (`super::spaces`).
+pub(crate) fn utilization_of(geometry_area: f64, frame: &Rect2, title_block: &Rect2) -> f64 {
+    let printable = (frame.area() - title_block.area()).max(1.0);
+    (geometry_area / printable).clamp(0.0, 1.0)
+}
+
 /// Verify a drawing's layout/annotation quality. Pure function of the
 /// `Drawing` — no kernel access — so it is cheap to run on every
 /// generated sheet and to gate in tests.
@@ -316,8 +325,7 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     }
 
     // Sheet utilization.
-    let printable = (frame.area() - title_block.area()).max(1.0);
-    let utilization = (ink_area / printable).clamp(0.0, 1.0);
+    let utilization = utilization_of(ink_area, &frame, &title_block);
     if utilization < MIN_UTILIZATION {
         issues.push(warning(
             DrawingIssueKind::SheetUnderutilized,
@@ -793,10 +801,35 @@ fn check_callout_lines_clear_of_text(
     layout: &super::layout::SheetLayout,
     issues: &mut Vec<DrawingIssue>,
 ) {
-    let texts: Vec<&super::layout::SheetItem> = layout
+    for (di, ti) in find_lines_through_text(layout) {
+        let (Some(pd), Some(t)) = (layout.dimensions.get(di), layout.items.get(ti)) else {
+            continue;
+        };
+        issues.push(error(
+            DrawingIssueKind::DimensionLabelCollision,
+            format!(
+                "a line of callout '{}' runs through '{}'",
+                pd.label,
+                t.text.as_deref().unwrap_or("?"),
+            ),
+            None,
+        ));
+    }
+}
+
+/// Every (placed dimension, text item) pair where a line of the dimension
+/// (its dimension line or a leader's shoulder, its extension lines or a
+/// leader's leg, an angular arc's chords) runs through the text, as indices
+/// into `layout.dimensions` and `layout.items`. The one measurement behind
+/// [`check_callout_lines_clear_of_text`] and the space map's `TEXT-CLEAR`
+/// rule (`super::spaces`), so the quality report and the agent's eyes cannot
+/// disagree about a struck-through number.
+pub(crate) fn find_lines_through_text(layout: &super::layout::SheetLayout) -> Vec<(usize, usize)> {
+    let texts: Vec<(usize, &super::layout::SheetItem)> = layout
         .items
         .iter()
-        .filter(|it| {
+        .enumerate()
+        .filter(|(_, it)| {
             matches!(
                 it.kind,
                 SheetItemKind::DimensionText
@@ -806,13 +839,14 @@ fn check_callout_lines_clear_of_text(
             )
         })
         .collect();
-    for pd in &layout.dimensions {
+    let mut out = Vec::new();
+    for (di, pd) in layout.dimensions.iter().enumerate() {
         let own = super::layout::placed_text_box(pd);
         let lines = super::layout::placed_line_segments(pd);
         if lines.is_empty() {
             continue;
         }
-        for t in &texts {
+        for (ti, t) in &texts {
             if t.kind == SheetItemKind::DimensionText
                 && t.owner_view == Some(pd.owner_view)
                 && t.bbox == own
@@ -834,18 +868,11 @@ fn check_callout_lines_clear_of_text(
                 .iter()
                 .any(|s| super::layout::segment_crosses_rect(s, &inner))
             {
-                issues.push(error(
-                    DrawingIssueKind::DimensionLabelCollision,
-                    format!(
-                        "a line of callout '{}' runs through '{}'",
-                        pd.label,
-                        t.text.as_deref().unwrap_or("?"),
-                    ),
-                    None,
-                ));
+                out.push((di, *ti));
             }
         }
     }
+    out
 }
 
 /// The hole table (the union of its borders) must not sit on a view's
@@ -1143,7 +1170,7 @@ pub struct TextCollision {
 /// `HoleTableBorder` (ink, not text) and `DatumMarker` / `ProjectionSymbol`
 /// (documented, intentional adjacency — see their doc comments on
 /// [`SheetItemKind`]).
-fn is_text_item(kind: SheetItemKind) -> bool {
+pub(crate) fn is_text_item(kind: SheetItemKind) -> bool {
     matches!(
         kind,
         SheetItemKind::ViewLabel

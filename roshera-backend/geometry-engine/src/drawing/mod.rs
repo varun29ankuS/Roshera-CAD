@@ -43,6 +43,7 @@ pub mod round_part;
 pub mod section_comprehension;
 pub mod section_view;
 pub mod sheet_certificate;
+pub mod spaces;
 pub mod svg;
 pub mod title_block;
 pub mod types;
@@ -83,6 +84,7 @@ pub use sheet_certificate::{
     certify_drawing, LiveCheck, SheetFact, SheetFactKind, SheetReadbackCertificate, SheetVerdict,
     VerdictCounts,
 };
+pub use spaces::{space_map, Finding, Rule, Space, SpaceKind, SpaceMap, SPACE_BAR};
 pub use svg::render_drawing_svg;
 pub use types::{
     Drawing, DrawingId, GeneralTolerance, PlacedDatumSymbol, PlacedFcfBlock, Polyline2d,

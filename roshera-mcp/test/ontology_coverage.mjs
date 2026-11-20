@@ -177,7 +177,9 @@ console.log("(o3) ratchet floor (encodes observed reality, never aspiration)");
 // Raised 121 → 127 (2026-11-20): the measured size after gdt_fcf_update,
 // gdt_fcf_delete, gdt_datum_update, gdt_datum_delete and
 // gdt_dimensional_delete ("drawing") — correcting authored GD&T in place.
-const FLOOR_TOTAL = 127;
+// Raised 127 → 128 (2026-11-20): drawing_spaces ("drawing") — the sheet
+// as its scored spaces.
+const FLOOR_TOTAL = 128;
 if (names.length >= FLOOR_TOTAL)
   pass(`registry size ${names.length} ≥ floor ${FLOOR_TOTAL}`);
 else

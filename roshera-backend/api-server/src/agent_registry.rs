@@ -1308,6 +1308,23 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "required": ["drawing_id"]
             }),
         ),
+        // The space map (GET /api/drawings/{id}/spaces, drawing_mgr.rs): the
+        // sheet as a hierarchy of spaces, each scored, graded by its worst.
+        t(
+            "drawing_spaces",
+            Drawing,
+            Experimental,
+            Curated,
+            "See a sheet as its spaces (title block, notes, tables, each view cell with its bands and lanes of dimensions -- evenly pitched? rows aligned? -- and free paper), worst first, each with its drafting-craft findings (ALIGN-ROW, LANE-PITCH, TEXT-CLEAR, TEXT-HEIGHT, TRAILING-ZERO, ...) and score; grade = the worst space.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "space": {"type": "string", "description": "one space id (e.g. 'view:FRONT/band:top') to narrow to it and the spaces under it"}
+                },
+                "required": ["drawing_id"]
+            }),
+        ),
         t(
             "drawing_dimension_properties",
             Drawing,
@@ -2281,7 +2298,9 @@ mod tests {
         // gdt_datum_update, gdt_datum_delete, gdt_dimensional_delete -- the
         // agent corrects GD&T it authored in place (PATCH / DELETE on the
         // existing handlers/gdt.rs routes) instead of undoing the timeline.
-        assert_eq!(tools.len(), 112, "expected 112 tools, got {}", tools.len());
+        // 112 -> 113 (2026-11-20): drawing_spaces -- the agent sees a sheet
+        // as its scored spaces (GET /api/drawings/{id}/spaces).
+        assert_eq!(tools.len(), 113, "expected 113 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2298,7 +2317,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 124, "112 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 125, "113 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");

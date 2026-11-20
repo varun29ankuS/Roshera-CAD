@@ -283,6 +283,7 @@ const READ_ONLY = new Set<string>([
   // definition declares `effects`, read by isReadOnly() below.
   "drawing_query",
   "drawing_read_semantics",
+  "drawing_spaces",
   "gdt_report",
   "export_part",
   "drawing_export_sheet",

@@ -82,8 +82,13 @@ export const SWITCHABLE_BENCHES: Bench[] = [
  * measures 31 + 19 = 50 and is the sole max. Raised by exactly the overshoot,
  * same policy: an agent enters the drawing bench to author and correct
  * callouts, and fixing a wrong frame in place is what that bench is for.
+ *
+ * 50 -> 51 (2026-11-20): drawing_spaces joined the drawing bench (31 + 20 =
+ * 51, the sole max). Raised by exactly the overshoot, same policy: an agent
+ * enters the drawing bench to make a sheet right, and seeing the sheet as its
+ * scored spaces is what it needs to do that.
  */
-export const LIVE_SURFACE_CEILING = 50;
+export const LIVE_SURFACE_CEILING = 51;
 
 /** Callback that flips real server tool handles on a bench switch. */
 export type ApplyTransition = (toEnable: string[], toDisable: string[]) => void;

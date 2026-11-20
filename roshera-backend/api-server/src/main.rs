@@ -11466,6 +11466,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/drawings/{id}/quality",
             get(drawing_mgr::drawing_quality),
         )
+        // The space map (agent eyes on a sheet, slice 1): every space of the
+        // sheet with its findings and score, graded by the worst space.
+        .route(
+            "/api/drawings/{id}/spaces",
+            get(drawing_mgr::drawing_spaces),
+        )
         // Semantic readback (campaign #55 Slice 2): the queryable sheet model +
         // live-checked certificate, and the certificate-only cheap poll.
         .route(

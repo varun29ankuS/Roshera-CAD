@@ -16,6 +16,7 @@ Inputs (override with the environment variables named):
 Per part it writes `<out>/<id>/`:
 
   ours.svg / ours.pdf / ours.dxf / summary.json   (export-engine example `drawing_bench`)
+  spaces.json / spaces.svg                        the space map and its boxes over the sheet
   freecad.svg / freecad.json                      (`freecad_sheet.py` under freecadcmd)
   ours.png, freecad.png, reference.png
   contact.png                                     reference | ours | FreeCAD
@@ -215,21 +216,33 @@ def aggregate(rows):
     }
 
 
+def top_rules(by_rule, n=3):
+    """The n rules with the most findings, errors first: 'TEXT-HEIGHT 1E/21W'."""
+    ranked = sorted(by_rule.items(), key=lambda kv: (-kv[1][0], -(kv[1][0] + kv[1][1]), kv[0]))
+    return ", ".join("%s %dE/%dW" % (k, v[0], v[1]) for k, v in ranked[:n])
+
+
 def results_md(agg, rows, out):
-    lines = ["| id | set | ours | faces | sheet ms | inked | not dim. | layout err | sound | complete | FreeCAD | FC ms |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    lines = ["| id | set | ours | faces | sheet ms | inked | not dim. | layout err | sound | complete "
+             "| grade | below bar | top failing rules | FreeCAD | FC ms |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         s = r.get("ours") or {}
         c = s.get("certificate", {})
         f = r.get("freecad") or {}
+        sp = s.get("spaces") or {}
         if s.get("stage") == "done":
-            lines.append("| %s | %s | ok | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            lines.append("| %s | %s | ok | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
                 r["id"], r["set"], s.get("solid", {}).get("faces"), s["sheet"].get("ms"),
                 s["sheet"].get("dimensions_inked"), c.get("counts", {}).get("not_dimensioned"),
                 s.get("quality", {}).get("errors"), "yes" if c.get("sound") else "NO",
-                "yes" if c.get("complete") else "no", "ok" if f.get("ok") else "FAILED", f.get("sheet_ms", "")))
+                "yes" if c.get("complete") else "no",
+                "%.3f" % sp["grade"] if sp.get("grade") is not None else "",
+                "%s / %s" % (sp.get("below_bar"), sp.get("spaces")) if sp else "",
+                top_rules(sp.get("by_rule") or {}),
+                "ok" if f.get("ok") else "FAILED", f.get("sheet_ms", "")))
         else:
-            lines.append("| %s | %s | FAILED at %s | | | | | | | | %s | %s |" % (
+            lines.append("| %s | %s | FAILED at %s | | | | | | | | | | | %s | %s |" % (
                 r["id"], r["set"], s.get("stage", "start"), "ok" if f.get("ok") else "FAILED", f.get("sheet_ms", "")))
     with open(os.path.join(out, "results.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -320,6 +333,14 @@ def a_checks(row, folder):
         "section_dims": sum(v.get("dimensions", 0) for v in views if v["name"].startswith("SECTION")),
         "a10_exports": all(s.get("renders", {}).get(k, {}).get("ok") for k in ("svg", "pdf", "dxf")),
         "svg": svg_checks(os.path.join(folder, "ours.svg")),
+        # C: drafting craft from the space map (absent on sheets from before
+        # the map): the grade is the worst space, never a mean.
+        "c_grade": (s.get("spaces") or {}).get("grade"),
+        "c_below_bar": (s.get("spaces") or {}).get("below_bar"),
+        "c_bar": (s.get("spaces") or {}).get("bar"),
+        "c_spaces": (s.get("spaces") or {}).get("spaces"),
+        "c_worst": (s.get("spaces") or {}).get("worst"),
+        "c_by_rule": (s.get("spaces") or {}).get("by_rule") or {},
     }
 
 
@@ -385,6 +406,30 @@ def summarize_checks(rows):
         "section_dims_total": sum(b["section_dims"] for b in built),
         "a10_all_exports": sum(1 for b in built if b["a10_exports"]),
     })
+    graded = [b for b in built if b.get("c_grade") is not None]
+    if graded:
+        rules = {}
+        for b in graded:
+            for k, (e, w) in b["c_by_rule"].items():
+                a = rules.setdefault(k, [0, 0, 0])
+                a[0] += e
+                a[1] += w
+                a[2] += 1
+        grades = [b["c_grade"] for b in graded]
+        # the bar each sheet was scored against (drawing::spaces::SPACE_BAR)
+        bar = next((b["c_bar"] for b in graded if b.get("c_bar") is not None), 0.8)
+        out.update({
+            "c_graded": len(graded),
+            # the worst sheet's grade and the median sheet's: per-sheet grades
+            # are worst-space minima, these only order the sheets
+            "c_grade_min": round(min(grades), 3),
+            "c_grade_median": round(pct(grades, 0.5), 3),
+            "c_sheets_at_or_above_bar": sum(1 for g in grades if g >= bar),
+            "c_below_bar_total": sum(b["c_below_bar"] or 0 for b in graded),
+            "c_below_bar_median": pct([b["c_below_bar"] or 0 for b in graded], 0.5),
+            # rule -> [errors, warnings, sheets with a finding of that rule]
+            "c_findings_by_rule": dict(sorted(rules.items())),
+        })
     return out
 
 

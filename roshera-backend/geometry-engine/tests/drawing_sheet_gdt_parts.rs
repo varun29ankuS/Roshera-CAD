@@ -893,3 +893,131 @@ fn a_countersink_reads_its_included_angle() {
         "{all:?}"
     );
 }
+
+/// The space map of a real sheet: every placed dimension is held by exactly
+/// one space (none unassigned, none counted twice), every space hangs from a
+/// space that exists, the grade is the worst space's score, and the same part
+/// laid out twice gives the same ids, boxes and scores. The flange and the
+/// rib, drawn first angle as the agent drew them (the rib carries its
+/// ordinate table).
+#[test]
+fn the_space_map_holds_every_placed_dimension_once_with_stable_ids() {
+    use geometry_engine::drawing::spaces::{space_map, SpaceKind};
+    type Build = fn() -> (BRepModel, SolidId);
+    let parts: [(&str, Build); 2] = [
+        ("flange", en1092_weld_neck_with_gdt),
+        ("rib", naca2412_rib_with_gdt),
+    ];
+    for (what, build) in parts {
+        let sheet = || {
+            let (mut m, s) = build();
+            let _ = frame_for_drawing(&mut m, s);
+            standard_drawing_auto_with_projection(&m, s, uuid::Uuid::nil(), ProjectionAngle::First)
+                .expect("sheet")
+        };
+        let d1 = sheet();
+        let l1 = compute_layout(&d1);
+        let map = space_map(&d1, &l1);
+        assert!(!l1.dimensions.is_empty(), "{what}: a dimensioned sheet");
+        let mut held = vec![0usize; l1.dimensions.len()];
+        for s in &map.spaces {
+            assert_eq!(
+                s.contents.placements.len(),
+                s.contents.dimensions.len(),
+                "{what}: {}",
+                s.id
+            );
+            for &k in &s.contents.placements {
+                held[k] += 1;
+            }
+            if let Some(p) = &s.parent {
+                assert!(map.space(p).is_some(), "{what}: {} hangs from {p}", s.id);
+            }
+        }
+        let wrong: Vec<(usize, usize, String)> = held
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n != 1)
+            .map(|(k, n)| (k, *n, l1.dimensions[k].label.clone()))
+            .collect();
+        assert!(wrong.is_empty(), "{what}: held != once: {wrong:?}");
+        let worst = map
+            .spaces
+            .iter()
+            .map(|s| s.score)
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(map.grade, worst, "{what}: the grade is the worst space");
+        for kind in [
+            SpaceKind::Frame,
+            SpaceKind::TitleBlock,
+            SpaceKind::NotesStrip,
+            SpaceKind::ViewCell,
+            SpaceKind::Lane,
+        ] {
+            assert!(
+                map.spaces.iter().any(|s| s.kind == kind),
+                "{what}: no {kind:?} space"
+            );
+        }
+        if what == "rib" {
+            assert!(
+                map.space("table:profile").is_some(),
+                "the rib's ordinate table"
+            );
+        }
+
+        let d2 = sheet();
+        let l2 = compute_layout(&d2);
+        let item_diff: Vec<String> = l1
+            .items
+            .iter()
+            .zip(&l2.items)
+            .filter(|(a, b)| a.bbox != b.bbox || a.text != b.text)
+            .map(|(a, b)| format!("{:?} {:?} {:?} vs {:?}", a.kind, a.text, a.bbox, b.bbox))
+            .chain(
+                l1.dimensions
+                    .iter()
+                    .zip(&l2.dimensions)
+                    .filter(|(a, b)| {
+                        a.line != b.line || a.text_anchor != b.text_anchor || a.ext != b.ext
+                    })
+                    .map(|(a, b)| format!("dim {} {:?} vs {:?}", a.label, a.ext, b.ext)),
+            )
+            .collect();
+        assert!(
+            item_diff.is_empty(),
+            "{what}: two builds laid out differently: {item_diff:#?}"
+        );
+        let again = space_map(&d2, &l2);
+        let key = |m: &geometry_engine::drawing::spaces::SpaceMap| -> Vec<String> {
+            m.spaces
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} {:.6} {:.6} {:.6} {:.6} {:.9} {:?}",
+                        s.id,
+                        s.rect.x0,
+                        s.rect.y0,
+                        s.rect.x1,
+                        s.rect.y1,
+                        s.score,
+                        s.contents.dimensions
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            key(&map),
+            key(&again),
+            "{what}: the same sheet, the same map"
+        );
+        eprintln!(
+            "{what}: {} grade {:.3} below_bar {} of {} spaces, by rule {:?}",
+            d1.sheet_size.label(),
+            map.grade,
+            map.below_bar,
+            map.spaces.len(),
+            map.by_rule
+        );
+    }
+}

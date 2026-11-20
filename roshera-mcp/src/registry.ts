@@ -234,6 +234,7 @@ const EXPERIMENTAL = new Set<string>([
   "drawing_set_title",
   "drawing_dimensions",
   "drawing_dimension_properties",
+  "drawing_spaces",
   "iso286_limits",
   "dfm_check",
   "kb_lookup",
@@ -331,6 +332,9 @@ const BENCH_OF: Record<string, Bench> = {
   drawing_set_projection: "drawing",
   drawing_set_title: "drawing",
   drawing_dimensions: "drawing",
+  // The space map: the agent sees a sheet as its scored spaces
+  // (GET /api/drawings/{id}/spaces), graded by the worst.
+  drawing_spaces: "drawing",
   drawing_dimension_properties: "drawing",
   iso286_limits: "drawing",
   dimension_part: "drawing",

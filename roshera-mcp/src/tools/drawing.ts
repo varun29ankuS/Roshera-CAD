@@ -344,6 +344,90 @@ export function registerDrawingTools(server: ToolHost): void {
     },
   );
 
+  // ── drawing_spaces ─────────────────────────────────────────────────────
+  server.tool(
+    "drawing_spaces",
+    "SEE A SHEET REGION BY REGION: title block, notes, tables, each view " +
+      "cell with its four annotation bands and their dimension rows (evenly " +
+      "pitched? aligned?). Each region has a stable id, its outline in mm, " +
+      "what it holds, its drafting-craft findings (row alignment and pitch, " +
+      "text clearance and height, crowding, unused paper, table anchoring, " +
+      "view alignment, leader angles, trailing zeros: measured vs tolerance, " +
+      "severity) and a score. grade = the WORST region, never a mean; " +
+      "below_bar counts regions needing work; worst first. `space` narrows " +
+      "to one region and those under it.",
+    {
+      drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
+      space: z
+        .string()
+        .optional()
+        .describe("one space id (e.g. 'view:FRONT/band:top') to narrow to it and the spaces under it"),
+    },
+    async ({ drawing_id, space }) => {
+      try {
+        const q = space ? `?space=${encodeURIComponent(space)}` : "";
+        const r = await api("GET", `/api/drawings/${drawing_id}/spaces${q}`);
+        const spaces: any[] = Array.isArray(r?.spaces) ? r.spaces : [];
+        const worst = spaces
+          .filter((s) => typeof s?.score === "number" && s.score < 1)
+          .sort((a, b) => a.score - b.score || String(a.id).localeCompare(String(b.id)));
+        const finding = (f: any): string => {
+          const t = f?.tolerance ?? {};
+          const range =
+            t.min != null && t.max != null
+              ? `${t.min}..${t.max}`
+              : t.min != null
+                ? `>= ${t.min}`
+                : t.max != null
+                  ? `<= ${t.max}`
+                  : "";
+          const m = typeof f?.measured === "number" ? +f.measured.toFixed(3) : f?.measured;
+          return `${f?.severity === "error" ? "ERROR" : "warn"} ${f?.rule}: ${f?.message} [${m} ${f?.unit ?? ""} vs ${range}]`;
+        };
+        // The text the agent reads stays compact: the worst spaces, each with
+        // its first findings; the whole map rides in structuredContent only.
+        const SHOWN_SPACES = 12;
+        const SHOWN_FINDINGS = 5;
+        const summary = worst.slice(0, SHOWN_SPACES).map((s) => {
+          const lines: string[] = (s.findings ?? []).map(finding);
+          return {
+            space: s.id,
+            kind: s.kind,
+            score: +Number(s.score).toFixed(3),
+            below_bar: s.score < (r?.bar ?? 0.8),
+            findings:
+              lines.length > SHOWN_FINDINGS
+                ? [...lines.slice(0, SHOWN_FINDINGS), `+${lines.length - SHOWN_FINDINGS} more`]
+                : lines,
+          };
+        });
+        const grade = typeof r?.grade === "number" ? +r.grade.toFixed(3) : null;
+        const compact = {
+          drawing_id,
+          focus: r?.focus ?? null,
+          grade,
+          bar: r?.bar ?? null,
+          below_bar: r?.below_bar ?? null,
+          worst: r?.worst ?? null,
+          by_rule: r?.by_rule ?? {},
+          headline:
+            `grade ${grade ?? "?"} (worst space ${r?.worst ?? "none"}), ` +
+            `${r?.below_bar ?? "?"} of ${spaces.length} spaces below the bar ${r?.bar ?? "?"}`,
+          worst_spaces: summary,
+          more_spaces_with_findings: Math.max(0, worst.length - SHOWN_SPACES),
+          clean_spaces: spaces.length - worst.length,
+          note: "the whole map (every space's box, contents and findings) is in structuredContent.map; narrow with `space`",
+        };
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(compact, null, 2) }],
+          structuredContent: { ...compact, map: r },
+        };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
   // ── iso286_limits ──────────────────────────────────────────────────────
   server.tool(
     "iso286_limits",

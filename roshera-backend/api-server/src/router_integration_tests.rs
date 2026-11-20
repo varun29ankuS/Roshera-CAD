@@ -13716,3 +13716,92 @@ async fn iso_286_limits_are_served_from_the_kernel_tables() {
         assert_eq!(refused["details"]["reason"], reason, "{refused}");
     }
 }
+
+/// `GET /api/drawings/{id}/spaces` serves the stored sheet's space map: the
+/// frame, the view cells and their bands, every space scored, the grade the
+/// WORST space's score, below_bar the count under the bar, the ten rules;
+/// `?space=` narrows to one space and its descendants with the sheet's grade
+/// kept; an unknown space is refused typed, an unknown drawing is a 404.
+#[tokio::test]
+async fn the_spaces_route_serves_the_sheet_space_map() {
+    let state = make_test_state().await;
+    let drawing_id = bored_part_with_drawing(&state, "").await;
+
+    let (s, map) = dispatch(
+        &state,
+        json_get(&format!("/api/drawings/{drawing_id}/spaces")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{map}");
+    let spaces = map["spaces"].as_array().expect("spaces");
+    let ids: Vec<&str> = spaces.iter().filter_map(|s| s["id"].as_str()).collect();
+    for want in [
+        "frame",
+        "title-block",
+        "notes",
+        "view:FRONT",
+        "view:FRONT/geometry",
+        "view:FRONT/band:top",
+    ] {
+        assert!(ids.contains(&want), "{want} missing from {ids:?}");
+    }
+    let scores: Vec<f64> = spaces.iter().filter_map(|s| s["score"].as_f64()).collect();
+    assert_eq!(scores.len(), spaces.len(), "every space is scored");
+    let worst = scores.iter().copied().fold(f64::INFINITY, f64::min);
+    assert_eq!(
+        map["grade"].as_f64(),
+        Some(worst),
+        "the grade is the worst space"
+    );
+    let bar = map["bar"].as_f64().expect("bar");
+    assert_eq!(
+        map["below_bar"].as_u64(),
+        Some(scores.iter().filter(|s| **s < bar).count() as u64)
+    );
+    assert_eq!(
+        map["rules"].as_array().map(Vec::len),
+        Some(10),
+        "{}",
+        map["rules"]
+    );
+    assert!(map["findings"].is_array());
+
+    let (s, front) = dispatch(
+        &state,
+        json_get(&format!(
+            "/api/drawings/{drawing_id}/spaces?space=view:FRONT"
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{front}");
+    assert_eq!(front["focus"], "view:FRONT");
+    assert_eq!(front["grade"], map["grade"], "the sheet's grade is kept");
+    let narrowed: Vec<&str> = front["spaces"]
+        .as_array()
+        .expect("spaces")
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert!(narrowed.contains(&"view:FRONT/band:top"), "{narrowed:?}");
+    assert!(
+        narrowed.iter().all(|id| id.starts_with("view:FRONT")),
+        "{narrowed:?}"
+    );
+
+    let (s, refused) = dispatch(
+        &state,
+        json_get(&format!(
+            "/api/drawings/{drawing_id}/spaces?space=view:NOPE"
+        )),
+    )
+    .await;
+    assert!(s.is_client_error(), "{s} {refused}");
+    assert_eq!(refused["error_code"], "invalid_parameter", "{refused}");
+
+    let (s, _) = dispatch(
+        &state,
+        json_get(&format!("/api/drawings/{}/spaces", Uuid::new_v4())),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
