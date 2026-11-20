@@ -320,8 +320,20 @@ console.log("\n(h2) ratchet floors (encode observed reality, never aspiration)")
 //                        these held-out cases, so, as on 2026-09-24, the
 //                        floors are lowered to the measured 42 / 80 and both
 //                        misses stay printed above as known gaps.
+//   2026-11-20 (the agent's hands, slice 3): six layout verbs joined the
+//                        drawing bench and first cost two cases ("scratch
+//                        lane" -> timeline_branch, "200 mm shipping envelope"
+//                        -> get_part). The ranker now scales a SHEET verb
+//                        (drawing bench, experimental -- read from the
+//                        registry) down, and keeps its name out of the
+//                        name-token rarity, when the query carries no sheet
+//                        context (metatools.ts `SHEET_VERB_OUT_OF_CONTEXT`;
+//                        the context words are read from the registry too).
+//                        Not written for these cases: it was driven by the
+//                        recall set's "move the part 10mm to the left".
+//                        Measured 42 / 81; the any-floor rises to 81.
 const FLOOR_HIT1 = 42;
-const FLOOR_HITANY = 80;
+const FLOOR_HITANY = 81;
 if (hit1 >= FLOOR_HIT1) pass(`hit@1 ${hit1}/${CASES.length} ≥ floor ${FLOOR_HIT1}`);
 else fail(`hit@1 REGRESSED: ${hit1}/${CASES.length} < floor ${FLOOR_HIT1}`);
 if (hitAny >= FLOOR_HITANY) pass(`hit@any ${hitAny}/${CASES.length} ≥ floor ${FLOOR_HITANY}`);

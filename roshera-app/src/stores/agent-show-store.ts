@@ -4,7 +4,8 @@ import { useHistoryView } from '@/stores/history-view-store'
 import { FRAME_FIT, useSceneStore } from '@/stores/scene-store'
 import { fetchChapters, partChapters } from '@/lib/chapters-api'
 import { findFeature, presetFor, showCaption, type ShowAction } from '@/lib/agent-show'
-import { isSheetRect, type SheetRect } from '@/lib/sheet-look'
+import { isSheetRect, prefersReducedMotion, type SheetRect } from '@/lib/sheet-look'
+import { actJudgeCaption, GHOST_MS, judgeDelayMs, type SheetMove, type SheetScore } from '@/lib/sheet-hands'
 
 /**
  * The agent driving the app (Varun 2026-11-14: drive, with Pause / Take
@@ -24,6 +25,13 @@ interface AgentShowState {
    *  workspace (it glides there and outlines it); `seq` makes a repeated
    *  look at the same space glide again. Null = no look. */
   sheetLook: SheetLook | null
+  /** The agent's last layout verb on a sheet (ACT), drawn by the Drawing
+   *  workspace: the moved boxes glide old -> new, a ghost fades at the old
+   *  place (lib/sheet-hands). `seq` restarts the animation. */
+  sheetAct: SheetActShow | null
+  /** The judgement after it (JUDGE): each touched space flashes its score
+   *  change, worst first. */
+  sheetJudge: SheetJudgeShow | null
   receive: (a: ShowAction) => Promise<void>
   pause: () => void
   resume: () => void
@@ -40,6 +48,27 @@ export interface SheetLook {
   seq: number
 }
 
+export interface SheetActShow {
+  drawingId: string
+  verb: string
+  moves: SheetMove[]
+  rule: string | null
+  caption: string
+  seq: number
+  /** When it arrived (ms since the epoch): the judgement that follows waits
+   *  out the rest of its glide. */
+  at: number
+}
+
+export interface SheetJudgeShow {
+  drawingId: string
+  spaces: SheetScore[]
+  caption: string
+  seq: number
+  /** How long the flashes wait for the act's glide (`judgeDelayMs`). */
+  afterMs: number
+}
+
 let lookSeq = 0
 
 export const useAgentShowStore = create<AgentShowState>((set, get) => ({
@@ -48,6 +77,8 @@ export const useAgentShowStore = create<AgentShowState>((set, get) => ({
   missed: 0,
   faces: null,
   sheetLook: null,
+  sheetAct: null,
+  sheetJudge: null,
   receive: async (a) => {
     if (get().paused) {
       set((s) => ({ missed: s.missed + 1 }))
@@ -110,11 +141,52 @@ export const useAgentShowStore = create<AgentShowState>((set, get) => ({
         })
         return
       }
+      case 'sheet_act': {
+        // The verb already changed the sheet; the workspace re-reads it and
+        // animates the change over it (DrawingsWorkspace, lib/sheet-hands).
+        useDocModeStore.getState().openDrawing(a.drawing_id)
+        lookSeq += 1
+        set({
+          sheetAct: {
+            drawingId: a.drawing_id,
+            verb: a.verb,
+            moves: a.moves,
+            rule: a.rule ?? null,
+            caption,
+            seq: lookSeq,
+            at: Date.now(),
+          },
+        })
+        return
+      }
+      case 'sheet_judge': {
+        // JUDGE comes after ACT: the route sends both at once, so a judgement
+        // of the sheet whose act is still on screen keeps the act's caption
+        // (what was done and why) in front of its own verdict, and its
+        // flashes wait out the rest of the glide (none under reduced motion).
+        useDocModeStore.getState().openDrawing(a.drawing_id)
+        lookSeq += 1
+        const act = get().sheetAct
+        const sinceAct = act !== null && act.drawingId === a.drawing_id ? Date.now() - act.at : null
+        const following = sinceAct !== null && sinceAct < GHOST_MS
+        if (following && act) set({ showing: { caption: actJudgeCaption(act.caption, caption), at: Date.now() } })
+        set({
+          sheetJudge: {
+            drawingId: a.drawing_id,
+            spaces: a.spaces,
+            caption,
+            seq: lookSeq,
+            afterMs: following ? judgeDelayMs(sinceAct, prefersReducedMotion()) : 0,
+          },
+        })
+        return
+      }
     }
   },
   pause: () => set({ paused: true }),
   resume: () => set({ paused: false, missed: 0 }),
-  // Take over leaves the sheet where it is: the outline goes, the view stays.
-  takeOver: () => set({ paused: true, showing: null, faces: null, sheetLook: null }),
-  dismiss: () => set({ showing: null, faces: null, sheetLook: null }),
+  // Take over leaves the sheet where it is: the outline, the act and the
+  // judgement go, the view stays.
+  takeOver: () => set({ paused: true, showing: null, faces: null, sheetLook: null, sheetAct: null, sheetJudge: null }),
+  dismiss: () => set({ showing: null, faces: null, sheetLook: null, sheetAct: null, sheetJudge: null }),
 }))

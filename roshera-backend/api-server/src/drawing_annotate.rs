@@ -60,6 +60,7 @@ fn edit_refusal(drawing: Uuid, dimension: &str, e: DimensionEditError) -> ApiErr
         DimensionEditError::BadText(_) => (ErrorCode::InvalidParameter, "bad_text"),
         DimensionEditError::BadShift => (ErrorCode::InvalidParameter, "bad_move"),
         DimensionEditError::UnsignedWaiver => (ErrorCode::InvalidParameter, "unsigned_suppression"),
+        DimensionEditError::BadLane { .. } => (ErrorCode::InvalidParameter, "bad_lane"),
     };
     ApiError::new(code, e.to_string()).with_details(serde_json::json!({
         "gate": "dimension_annotation",

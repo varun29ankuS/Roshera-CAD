@@ -318,6 +318,16 @@ pub enum ErrorCode {
     /// (`overlaps` | `off_sheet` | `title_block` | `wrong_side`),
     /// `drawing_id`, `view_id`, and for `overlaps` the `other` view's name.
     ViewPlacementRefused,
+    /// **A layout verb refused** (`POST /api/drawings/{id}/layout`, the
+    /// agent's hands on a sheet). The verb has no room where it was asked to
+    /// put something, names nothing on the sheet, or its result would make
+    /// the sheet unsound, stop stating a value the sheet stated, or add a
+    /// layout error. Nothing on the sheet changed. Mapped to HTTP 409: the
+    /// request is well-formed, the SHEET refuses it. `details` carries `gate`
+    /// (`"layout_verb"`), `reason` (a stable code: `no_room`,
+    /// `drops_value`, `unsound`, `layout_error`, `view_has_roles`, ...),
+    /// `verb` and `drawing_id`.
+    LayoutVerbRefused,
 
     // ── Idempotency layer ─────────────────────────────────────────
     /// `Idempotency-Key` header was sent with an empty value.
@@ -575,7 +585,8 @@ impl ErrorCode {
             | ErrorCode::SheetUnsound
             | ErrorCode::SheetQuality
             | ErrorCode::DrawingOwnerUnresolvable
-            | ErrorCode::ViewPlacementRefused => StatusCode::CONFLICT,
+            | ErrorCode::ViewPlacementRefused
+            | ErrorCode::LayoutVerbRefused => StatusCode::CONFLICT,
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
             // Well-formed request, semantically unacceptable value —
@@ -703,6 +714,8 @@ impl ErrorCode {
             | ErrorCode::DrawingOwnerUnresolvable
             // The same drop on the same sheet earns the same refusal.
             | ErrorCode::ViewPlacementRefused
+            // The same verb on the same sheet earns the same refusal.
+            | ErrorCode::LayoutVerbRefused
             | ErrorCode::PermissionDenied
             | ErrorCode::MethodNotAllowed => false,
 
@@ -755,6 +768,7 @@ impl ErrorCode {
             ErrorCode::SheetQuality => "sheet_quality",
             ErrorCode::DrawingOwnerUnresolvable => "drawing_owner_unresolvable",
             ErrorCode::ViewPlacementRefused => "view_placement_refused",
+            ErrorCode::LayoutVerbRefused => "layout_verb_refused",
             ErrorCode::IdempotencyKeyEmpty => "idempotency_key_empty",
             ErrorCode::IdempotencyKeyTooLong => "idempotency_key_too_long",
             ErrorCode::IdempotencyKeyReused => "idempotency_key_reused",
@@ -815,6 +829,7 @@ impl ErrorCode {
             ErrorCode::SheetQuality,
             ErrorCode::DrawingOwnerUnresolvable,
             ErrorCode::ViewPlacementRefused,
+            ErrorCode::LayoutVerbRefused,
             ErrorCode::IdempotencyKeyEmpty,
             ErrorCode::IdempotencyKeyTooLong,
             ErrorCode::IdempotencyKeyReused,

@@ -7,6 +7,7 @@
  */
 import { chapterTitle, type Chapter } from './chapters-api.ts'
 import type { SheetRect } from './sheet-look.ts'
+import type { SheetMove, SheetScore } from './sheet-hands.ts'
 
 export type Workspace = 'part' | 'assembly' | 'drawing' | 'dfm'
 export type NamedView = 'iso' | 'front' | 'back' | 'top' | 'bottom' | 'left' | 'right' | 'fit'
@@ -25,6 +26,29 @@ export type ShowAction =
       drawing_id: string
       space?: string | null
       rect?: SheetRect | null
+      caption?: string | null
+    }
+  // The agent's hands acted on a sheet (a layout verb): what moved, from
+  // where to where (lib/sheet-hands), and why by rule id.
+  | {
+      action: 'sheet_act'
+      drawing_id: string
+      verb: string
+      moves: SheetMove[]
+      rule?: string | null
+      caption?: string | null
+    }
+  // ... and the judgement: each touched space's score change.
+  | {
+      action: 'sheet_judge'
+      drawing_id: string
+      spaces: SheetScore[]
+      grade_before: number
+      grade_after: number
+      below_bar_before: number
+      below_bar_after: number
+      sound?: boolean | null
+      complete?: boolean | null
       caption?: string | null
     }
 
@@ -65,5 +89,11 @@ export function showCaption(a: ShowAction): string {
       return `the part after step ${a.sequence}`
     case 'sheet_space':
       return a.space ? `the sheet space ${a.space}` : 'the whole sheet'
+    case 'sheet_act':
+      return `${a.verb.replace(/_/g, ' ')}: ${a.moves.map((m) => m.id).join(', ')}${a.rule ? ` (${a.rule})` : ''}`
+    case 'sheet_judge': {
+      const verdict = a.sound === true ? 'SOUND' : a.sound === false ? 'UNSOUND' : 'not certified'
+      return `grade ${a.grade_before.toFixed(2)} → ${a.grade_after.toFixed(2)}, below bar ${a.below_bar_before} → ${a.below_bar_after}, ${verdict}`
+    }
   }
 }

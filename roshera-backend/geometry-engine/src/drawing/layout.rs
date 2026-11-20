@@ -465,6 +465,218 @@ pub struct SheetLayout {
     pub dimensions: Vec<PlacedDimension>,
     /// Placed hole-tag callouts in the axial view (if a hole table exists).
     pub hole_tags: Vec<PlacedHoleTag>,
+    /// The leader of each feature control frame that has one: the one place
+    /// the SVG, the DXF and the space map's `LEADER-ANGLE` rule read it from.
+    #[serde(default)]
+    pub gdt_leaders: Vec<GdtLeader>,
+}
+
+/// A feature control frame's leader as inked: from the middle of the frame's
+/// side that faces its target to the target on the feature.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GdtLeader {
+    /// Index into `drawing.fcf_blocks` (and the n-th `FcfBlock` item).
+    pub fcf: usize,
+    /// Index into `drawing.views`.
+    pub owner_view: usize,
+    /// The frame end of the leader.
+    pub from: [f64; 2],
+    /// The feature end.
+    pub to: [f64; 2],
+}
+
+impl GdtLeader {
+    /// The leader as one segment.
+    pub fn segment(&self) -> [[f64; 2]; 2] {
+        [self.from, self.to]
+    }
+}
+
+/// Shortest leader inked (mm): a frame sitting on its target needs none.
+pub(crate) const GDT_LEADER_MIN_MM: f64 = 1.0;
+
+/// Where a frame's leader leaves it: the middle of the frame side that faces
+/// `to` -- the bottom when the target is below the frame, the top when above,
+/// else the near end. A leader from the bottom of a frame to a target above
+/// it was drawn straight back through the frame.
+pub(crate) fn gdt_leader_origin(frame: &Rect2, to: [f64; 2]) -> [f64; 2] {
+    let cx = 0.5 * (frame.x0 + frame.x1);
+    let cy = 0.5 * (frame.y0 + frame.y1);
+    if to[1] >= frame.y1 {
+        [cx, frame.y1]
+    } else if to[1] <= frame.y0 {
+        [cx, frame.y0]
+    } else if to[0] < frame.x0 {
+        [frame.x0, cy]
+    } else {
+        [frame.x1, cy]
+    }
+}
+
+/// Height of a datum feature symbol's filled triangle below its letter box
+/// (mm): the apex is where the symbol touches what it stands on. The SVG
+/// inks it at exactly this height.
+pub(crate) const GDT_DATUM_TRI_H: f64 = GDT_BOX_HALF * 0.85;
+
+/// Where a datum feature symbol touches what it stands on: the apex of its
+/// triangle, below the centre of its letter box.
+pub(crate) fn datum_tip(symbol_box: &Rect2) -> [f64; 2] {
+    [
+        0.5 * (symbol_box.x0 + symbol_box.x1),
+        symbol_box.y1 + GDT_DATUM_TRI_H,
+    ]
+}
+
+/// The feature control frame a datum symbol is HOSTED on: the first frame
+/// of the same feature in the same view (ISO 5459 lets a datum feature
+/// indicator stand on its feature's frame). A datum symbol with a host
+/// travels with it; one without stands on the feature itself.
+pub(crate) fn datum_host(drawing: &Drawing, datum: usize) -> Option<usize> {
+    let sym = drawing.datum_symbols.get(datum)?;
+    let pid = sym.feature_pid.as_deref()?;
+    drawing
+        .fcf_blocks
+        .iter()
+        .position(|f| f.owner_view == sym.owner_view && f.feature_pid.as_deref() == Some(pid))
+}
+
+/// The letter box of a datum symbol standing on a frame at `frame`: above
+/// its left end, the triangle's apex on the frame's top edge.
+pub(crate) fn hosted_datum_box(frame: &Rect2) -> Rect2 {
+    let cx = frame.x0 + GDT_BOX_HALF;
+    let cy = frame.y0 - GDT_DATUM_TRI_H - GDT_BOX_HALF;
+    Rect2 {
+        x0: cx - GDT_BOX_HALF,
+        y0: cy - GDT_BOX_HALF,
+        x1: cx + GDT_BOX_HALF,
+        y1: cy + GDT_BOX_HALF,
+    }
+}
+
+/// The views' own line work on the sheet, mm: what a frame or a datum
+/// symbol stands on or keeps off, and what a leader must not run across.
+pub(crate) struct ViewInk {
+    /// Edge segments (hidden ones when the view shows them), centre lines and
+    /// the cutting-plane line, each with its view's index.
+    pub segments: Vec<(usize, [[f64; 2]; 2])>,
+    /// True circles: holes, bores, outlines (`centre, radius, view`).
+    pub outlines: Vec<([f64; 2], f64, usize)>,
+    /// Pitch circles (centre lines).
+    pub pitch_circles: Vec<([f64; 2], f64)>,
+    /// The boxes of shaded pictorials (their image is ink everywhere).
+    pub pictorials: Vec<Rect2>,
+}
+
+/// The line work of every view of `drawing`, in sheet mm.
+pub(crate) fn view_ink(drawing: &Drawing, layout: &SheetLayout) -> ViewInk {
+    let sheet_h = drawing.sheet_size.height();
+    let mut ink = ViewInk {
+        segments: Vec::new(),
+        outlines: Vec::new(),
+        pitch_circles: Vec::new(),
+        pictorials: Vec::new(),
+    };
+    for (vi, v) in drawing.views.iter().enumerate() {
+        if v.shaded_raster.is_some() {
+            if let Some(g) = layout
+                .items
+                .iter()
+                .find(|it| it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(vi))
+            {
+                ink.pictorials.push(g.bbox);
+            }
+            continue;
+        }
+        let at = |p: [f64; 2]| dim_to_sheet(v, sheet_h, p);
+        let hidden: &[super::types::Polyline2d] = if v.show_hidden {
+            &v.hidden_polylines
+        } else {
+            &[]
+        };
+        for pl in v.polylines.iter().chain(hidden.iter()) {
+            for w in pl.points.windows(2) {
+                ink.segments.push((vi, [at(w[0]), at(w[1])]));
+            }
+        }
+        for c in &v.centerlines {
+            for s in &c.segments {
+                if c.kind == "pitch_circle" {
+                    ink.pitch_circles.push((at([s[0], s[1]]), s[2] * v.scale));
+                } else {
+                    ink.segments
+                        .push((vi, [at([s[0], s[1]]), at([s[2], s[3]])]));
+                }
+            }
+        }
+        let hidden_circles: &[super::types::ProjectedCircle] = if v.show_hidden {
+            &v.hidden_circles
+        } else {
+            &[]
+        };
+        for c in v.circles.iter().chain(hidden_circles.iter()) {
+            ink.outlines.push((at([c.cx, c.cy]), c.r * v.scale, vi));
+        }
+        if let Some(cpl) = drawing
+            .cutting_plane_line
+            .as_ref()
+            .filter(|c| c.ax_view_idx == vi)
+        {
+            ink.segments.push((vi, [at(cpl.p0), at(cpl.p1)]));
+        }
+    }
+    ink
+}
+
+/// Whether segment `s` runs ACROSS the circle `(c, r)`: in through its
+/// outline and out again, both crossings inside the segment. A leader that
+/// enters a circle to reach a target inside it, or ends on its outline,
+/// crosses it once and does not run across it.
+pub(crate) fn segment_runs_across_circle(s: &[[f64; 2]; 2], c: [f64; 2], r: f64) -> bool {
+    let (dx, dy) = (s[1][0] - s[0][0], s[1][1] - s[0][1]);
+    let (fx, fy) = (s[0][0] - c[0], s[0][1] - c[1]);
+    let a = dx * dx + dy * dy;
+    if a <= 1e-18 {
+        return false;
+    }
+    let b = 2.0 * (fx * dx + fy * dy);
+    let k = fx * fx + fy * fy - r * r;
+    let disc = b * b - 4.0 * a * k;
+    if disc <= 0.0 {
+        return false;
+    }
+    let root = disc.sqrt();
+    let (t0, t1) = ((-b - root) / (2.0 * a), (-b + root) / (2.0 * a));
+    // A crossing at an end (a leader ending on the outline) is not one; the
+    // two must also be apart (a tangent graze is not a crossing).
+    let eps = 1e-4;
+    t0 > eps && t1 < 1.0 - eps && (t1 - t0) * a.sqrt() > 0.05
+}
+
+/// The leaders of the frames `items` places (in `drawing.fcf_blocks` order,
+/// the n-th `FcfBlock` item being `fcf_blocks[n]`), each to its placed
+/// target ([`super::types::GdtPlacement::leader_to`]) or its own.
+pub(crate) fn gdt_leaders_of(drawing: &Drawing, items: &[SheetItem]) -> Vec<GdtLeader> {
+    let frames = items.iter().filter(|it| it.kind == SheetItemKind::FcfBlock);
+    drawing
+        .fcf_blocks
+        .iter()
+        .zip(frames)
+        .enumerate()
+        .filter_map(|(n, (fcf, item))| {
+            let placed = fcf
+                .placement_key()
+                .and_then(|k| drawing.gdt_placements.get(&k))
+                .and_then(|p| p.leader_to);
+            let to = placed.or(fcf.leader_to)?;
+            let from = gdt_leader_origin(&item.bbox, to);
+            ((to[0] - from[0]).hypot(to[1] - from[1]) > GDT_LEADER_MIN_MM).then_some(GdtLeader {
+                fcf: n,
+                owner_view: fcf.owner_view,
+                from,
+                to,
+            })
+        })
+        .collect()
 }
 
 // ── view_geometry_rect (canonical, single implementation) ──────────────────────
@@ -1386,6 +1598,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         let gdt_items = place_gdt_annotations(drawing, &items);
         items.extend(gdt_items);
     }
+    let gdt_leaders = gdt_leaders_of(drawing, &items);
 
     SheetLayout {
         sheet: Rect2 {
@@ -1397,6 +1610,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         items,
         dimensions: all_placed,
         hole_tags,
+        gdt_leaders,
     }
 }
 
@@ -2607,6 +2821,14 @@ pub(crate) const GDT_BLOCK_H: f64 = 5.6;
 /// Internal horizontal padding inside each FCF cell, mm.
 const GDT_CELL_PAD: f64 = 1.0;
 
+/// A feature control frame's size on the paper `(width, height)`, mm: one
+/// cell per token, one row.
+pub(crate) fn fcf_frame_size(fcf: &super::types::PlacedFcfBlock) -> (f64, f64) {
+    let w = fcf.full_text().chars().count() as f64 * GLYPH_ADVANCE_EM * GDT_FONT_MM
+        + 2.0 * GDT_CELL_PAD * (1 + fcf.datum_labels.len().max(1)) as f64;
+    (w, GDT_BLOCK_H)
+}
+
 /// Place GD&T datum symbols and FCF blocks from `drawing.datum_symbols` and
 /// `drawing.fcf_blocks` as [`SheetItem`]s.
 ///
@@ -2659,8 +2881,18 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
             .any(|it| bbox.intersects(&it.bbox, LABEL_TOL))
     };
 
+    // A datum symbol whose feature carries a frame stands ON that frame
+    // (ISO 5459) and is placed with it, after the frames; the others stand on
+    // their feature, placed first.
+    let hosts: Vec<Option<usize>> = (0..drawing.datum_symbols.len())
+        .map(|i| datum_host(drawing, i))
+        .collect();
+
     // ── Datum symbols ────────────────────────────────────────────────────
-    for sym in &drawing.datum_symbols {
+    for (di, sym) in drawing.datum_symbols.iter().enumerate() {
+        if hosts[di].is_some() {
+            continue;
+        }
         // The stored anchor is the sheet-space centre of the boxed letter.
         // Candidate positions: stored anchor (primary), then four cardinal
         // offsets of `GDT_BOX_HALF * 3` mm for collision fallback.
@@ -2727,22 +2959,32 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
     }
 
     // ── FCF blocks ───────────────────────────────────────────────────────
-    for fcf in &drawing.fcf_blocks {
-        // Estimate block width: one cell per token.
+    for (fi, fcf) in drawing.fcf_blocks.iter().enumerate() {
         let full = fcf.full_text();
-        let text_w = full.chars().count() as f64 * GLYPH_ADVANCE_EM * GDT_FONT_MM
-            + 2.0 * GDT_CELL_PAD * (1 + fcf.datum_labels.len().max(1)) as f64;
-        let block_h = GDT_BLOCK_H;
+        let (text_w, block_h) = fcf_frame_size(fcf);
+        // A frame that carries a datum symbol needs room for it on top.
+        let carries_datum = hosts.contains(&Some(fi));
 
         // Primary position: stored anchor (top-left of the glyph cell).
         let [ax, ay] = fcf.anchor;
 
-        let bbox_at = |x0: f64, y0: f64| -> Rect2 {
+        let frame_at = |x0: f64, y0: f64| -> Rect2 {
             Rect2 {
                 x0,
                 y0,
                 x1: x0 + text_w,
                 y1: y0 + block_h,
+            }
+        };
+        // What the ladder keeps clear: the frame, and the datum symbol it
+        // carries.
+        let bbox_at = |x0: f64, y0: f64| -> Rect2 {
+            let f = frame_at(x0, y0);
+            if carries_datum {
+                let d = hosted_datum_box(&f);
+                Rect2 { y0: d.y0, ..f }
+            } else {
+                f
             }
         };
 
@@ -2803,13 +3045,23 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
             None => Vec::new(),
         };
 
+        // A frame a layout verb put by hand goes exactly there
+        // (`Drawing::gdt_placements`); the verb checked it clear when it was
+        // put, and the layout check reports it if it no longer is.
+        let placed_by_hand = fcf
+            .placement_key()
+            .and_then(|k| drawing.gdt_placements.get(&k))
+            .map(|p| p.anchor);
         // Try Phase 1 candidates first, then Phase 2, then Phase 3.
-        let chosen = phase1
-            .iter()
-            .chain(phase2.iter())
-            .chain(phase3.iter())
-            .find(|&&[x0, y0]| !collides(&bbox_at(x0, y0), &result))
-            .copied()
+        let chosen = placed_by_hand
+            .or_else(|| {
+                phase1
+                    .iter()
+                    .chain(phase2.iter())
+                    .chain(phase3.iter())
+                    .find(|&&[x0, y0]| !collides(&bbox_at(x0, y0), &result))
+                    .copied()
+            })
             // Last resort: the nearest row down from the anchor that is at
             // least clear of every GD&T symbol already placed. It may sit on
             // other ink (the layout check then reports it), but two frames
@@ -2829,9 +3081,45 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
         let [x0, y0] = chosen;
         result.push(SheetItem {
             kind: SheetItemKind::FcfBlock,
-            bbox: bbox_at(x0, y0),
+            bbox: frame_at(x0, y0),
             owner_view: Some(fcf.owner_view),
             text: Some(full),
+        });
+    }
+
+    // ── Datum symbols standing on their feature's frame ──────────────────
+    // On the frame's top edge at its left end (the right end when the left
+    // is taken); wherever the frame went -- by the ladder or by a layout
+    // verb -- the symbol goes with it.
+    for (di, sym) in drawing.datum_symbols.iter().enumerate() {
+        let Some(host) = hosts[di] else {
+            continue;
+        };
+        let Some(frame) = result
+            .iter()
+            .filter(|it| it.kind == SheetItemKind::FcfBlock)
+            .nth(host)
+            .map(|it| it.bbox)
+        else {
+            continue;
+        };
+        let left = hosted_datum_box(&frame);
+        let shift = (frame.x1 - frame.x0) - 2.0 * GDT_BOX_HALF;
+        let right = Rect2 {
+            x0: left.x0 + shift,
+            x1: left.x1 + shift,
+            ..left
+        };
+        let bbox = if collides(&left, &result) && !collides(&right, &result) {
+            right
+        } else {
+            left
+        };
+        result.push(SheetItem {
+            kind: SheetItemKind::DatumSymbol,
+            bbox,
+            owner_view: Some(sym.owner_view),
+            text: Some(sym.label.clone()),
         });
     }
 
@@ -3096,6 +3384,10 @@ pub(crate) fn place_dimensions_routed(
         String,
         (super::dimension_edit::DimInk, Option<[f64; 2]>),
     > = std::collections::HashMap::new();
+    // Where a layout verb put a dimension: its band and lane
+    // ([`super::dimension_edit::DimPlacement`]), honoured before the search.
+    let mut pins: std::collections::HashMap<String, super::dimension_edit::DimPlacement> =
+        std::collections::HashMap::new();
     let shown: Vec<crate::drawing::dimensioning::Dimension2d> = view
         .dimensions
         .iter()
@@ -3108,6 +3400,9 @@ pub(crate) fn place_dimensions_routed(
             let mut inked = d.clone();
             inked.label = ink.label.clone();
             inks.insert(d.id.clone(), (ink, edit.and_then(|e| e.text_shift_mm)));
+            if let Some(p) = edit.and_then(|e| e.placement).filter(|p| !p.is_empty()) {
+                pins.insert(d.id.clone(), p);
+            }
             Some(inked)
         })
         .collect();
@@ -3279,7 +3574,18 @@ pub(crate) fn place_dimensions_routed(
             // A leader goes to the view's right (the vertical lanes own the
             // left) unless it would leave the frame there.
             let point_leader = r == 0.0;
-            let preferred = if fits(1.0) || !fits(-1.0) { 1.0 } else { -1.0 };
+            // A shoulder put on one side by a layout verb goes there when it
+            // fits; else the view's right, unless that leaves the frame.
+            let pinned_side = match pins.get(&d.id).and_then(|p| p.band) {
+                Some(super::spaces::BandSide::Left) => Some(-1.0),
+                Some(super::spaces::BandSide::Right) => Some(1.0),
+                _ => None,
+            };
+            let preferred = match pinned_side {
+                Some(s) if fits(s) => s,
+                _ if fits(1.0) || !fits(-1.0) => 1.0,
+                _ => -1.0,
+            };
             // How far the shoulder row rises above the feature: 45 degrees
             // for a hole callout, and no more than a short rise for a POINT
             // leader -- an arc's radius, a fillet, a chamfer. At 45 degrees
@@ -3685,7 +3991,7 @@ pub(crate) fn place_dimensions_routed(
             let outside = text_w > d.span;
             // Past one end of the span: right of a horizontal one (left when
             // that place is taken), above a vertical one (below when taken).
-            let outside_centres: Vec<f64> = if horizontal {
+            let mut outside_centres: Vec<f64> = if horizontal {
                 vec![
                     d.hi + AR_OUTSIDE_CLEAR + 0.5 * text_w,
                     d.lo - AR_OUTSIDE_CLEAR - 0.5 * text_w,
@@ -3696,6 +4002,21 @@ pub(crate) fn place_dimensions_routed(
                     d.hi + AR_OUTSIDE_CLEAR + 0.5 * text_w,
                 ]
             };
+            // A chain a layout verb put on one line (`drawing_align`): a
+            // label taken outside its span goes past the end AWAY from the
+            // links it shares the line with, or it would sit on theirs (the
+            // flange's "2" above its "18").
+            if let Some(p) = pins.get(&d.dim_id) {
+                let mate = |o: &&Lin| o.dim_id != d.dim_id && pins.get(&o.dim_id) == Some(p);
+                let below = stack.iter().filter(mate).any(|o| o.hi <= d.lo + CHAIN_EPS);
+                let above = stack.iter().filter(mate).any(|o| o.lo >= d.hi - CHAIN_EPS);
+                // The first centre is past the high end for a horizontal
+                // stack, the low end for a vertical one.
+                let first_is_high = horizontal;
+                if (below && !above && !first_is_high) || (above && !below && first_is_high) {
+                    outside_centres.reverse();
+                }
+            }
             // A rect from `(along, across)` corners in this stack's axes.
             let rect = |a0: f64, a1: f64, c0: f64, c1: f64| -> Rect2 {
                 let (c0, c1) = (c0.min(c1), c0.max(c1));
@@ -3730,7 +4051,32 @@ pub(crate) fn place_dimensions_routed(
             } else {
                 &[(true, false), (true, true), (false, false)]
             };
-            'search: for &(strict, out_of_span) in passes {
+            // A dimension a layout verb put in a band and lane
+            // ([`super::dimension_edit::DimPlacement`]) is tried there first
+            // -- its band only (a band its line cannot run along is not
+            // honoured), its lane only -- and goes through the search below
+            // when that place has no room.
+            let pin = pins.get(&d.dim_id).map(|p| {
+                let side = p.band.and_then(|b| {
+                    use super::spaces::BandSide;
+                    match (horizontal, b) {
+                        (true, BandSide::Bottom) | (false, BandSide::Left) => Some(0usize),
+                        (true, BandSide::Top) | (false, BandSide::Right) => Some(1usize),
+                        _ => None,
+                    }
+                });
+                let lane = p.lane.map(|l| (l as usize).saturating_sub(1));
+                (side, lane)
+            });
+            let mut tries: Vec<(bool, bool, Option<usize>, Option<usize>)> = Vec::new();
+            if let Some((side, lane)) = pin.filter(|(s, l)| s.is_some() || l.is_some()) {
+                tries.push((false, outside, side, lane));
+                if !outside {
+                    tries.push((false, true, side, lane));
+                }
+            }
+            tries.extend(passes.iter().map(|&(s, o)| (s, o, None, None)));
+            'search: for &(strict, out_of_span, only_side, only_lane) in &tries {
                 let centres: Vec<f64> = if out_of_span {
                     outside_centres.clone()
                 } else {
@@ -3738,7 +4084,13 @@ pub(crate) fn place_dimensions_routed(
                 };
                 let air = if out_of_span { OUTSIDE_TEXT_AIR } else { 0.0 };
                 for (si, &(out, edge)) in sides.iter().enumerate() {
+                    if only_side.is_some_and(|s| s != si) {
+                        continue;
+                    }
                     for lane in 0..MAX_LANES {
+                        if only_lane.is_some_and(|l| lane > l) {
+                            break;
+                        }
                         let level = edge + out * (STANDOFF + lane as f64 * STACK);
                         // The text is always above a horizontal line and to
                         // the left of a vertical one, whichever side the
@@ -3758,6 +4110,9 @@ pub(crate) fn place_dimensions_routed(
                             if near < lo_limit || far > hi_limit {
                                 break;
                             }
+                        }
+                        if only_lane.is_some_and(|l| lane < l) {
+                            continue;
                         }
                         for &tc in &centres {
                             let (a0, a1) = (

@@ -83,7 +83,11 @@ itself as intent; it must never wear the notation or the weight of a certified c
 Before you call a sheet finished, look at it: read drawing_spaces -- its grade is the
 worst space, never a mean -- then drawing_look on the worst space. The image tells you
 how the sheet reads; every number still comes from the findings. Fix what is below the
-bar, or name it as open.
+bar, or name it as open. Fix it with the layout verbs (drawing_move_dimension,
+drawing_align, drawing_move_view, drawing_reattach_leader, drawing_remove_view,
+drawing_remove_dimension): each answers the score change of every space it touched; a
+refusal means the sheet would have gone unsound, lost a value or gained a layout error --
+read its reason, never work around it.
 
 Numbers: every clearance, tap drill, fit class, or tolerance band comes from
 kb_lookup(kind:"reference", ...), which returns {value, source} -- never from memory or a

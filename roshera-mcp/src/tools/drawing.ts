@@ -455,7 +455,7 @@ export function registerDrawingTools(server: ToolHost): void {
   // call carries X-Roshera-Agent), so the agent never has to remember to.
   server.tool(
     "drawing_look",
-    "LOOK AT A SHEET: render the drawing as a PNG image and see it -- the " +
+    "LOOK AT A SHEET as a picture: render the drawing as a PNG image and see it -- the " +
       "whole sheet, or one region (an id from drawing_spaces) cropped with a " +
       "margin, outlined in magenta, the texts its findings name tinted orange " +
       "-- with that region's findings beside the image. The person's open app " +

@@ -30,6 +30,7 @@ pub mod cone_angles;
 pub mod dimension_edit;
 pub mod dimensioning;
 pub mod dxf;
+pub mod hands;
 pub mod hole_features;
 pub mod hole_table;
 pub mod layout;
@@ -64,6 +65,11 @@ pub use dimensioning::{
     CuttingPlaneLine, Dimension2d, SectionSlotRule,
 };
 pub use dxf::{render_drawing_dxf, DxfRenderError};
+pub use hands::{
+    assess, certificate_gate, judge_caption, sheet_delta, Act, ActMove, Assessed, HandsRefusal,
+    LayoutEdit, LeaderSide, LeaderTarget, Plan, SheetDelta, SpaceChange, Subject,
+    LAYOUT_UPDATE_EVENT,
+};
 pub use hole_table::{build_hole_table, tag_letter, HoleSite};
 pub use natural_frame::{analyse_natural_frame, FrameAnalysis, NoNaturalFrame};
 pub use part_frame::{

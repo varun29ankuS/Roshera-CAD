@@ -176,6 +176,13 @@ console.log("\n(f2) ratchet floors (encode observed reality, never aspiration)")
 // fuzzy) measured hit@1 = 27/33, hit@any = 33/33 here — and, more importantly,
 // lifted the UNFITTED test/find_tool_heldout.mjs from 27/88 to 44/88 hit@1.
 // That held-out file is the generalisation number; this one is the ratchet.
+// 2026-11-20 (the agent's hands, slice 3): six layout verbs whose names carry
+// "move", "view" and "dimension" first took "move the part 10mm to the left"
+// (transform), "what are the overall dimensions of this part" (dimension_part)
+// and "give me a sectioned view" (section_view) off #1. Fixed in the RANKER,
+// not here: a sheet verb (drawing bench, experimental) is scaled down, and its
+// name kept out of the name-token rarity, when the query carries no sheet
+// context (metatools.ts `SHEET_VERB_OUT_OF_CONTEXT`). Measured 27/33 again.
 const FLOOR_HIT1 = 27;
 const FLOOR_HITANY = 33;
 if (hit1 >= FLOOR_HIT1) pass(`hit@1 ${hit1}/${CASES.length} ≥ floor ${FLOOR_HIT1}`);

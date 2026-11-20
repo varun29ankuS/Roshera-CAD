@@ -130,7 +130,7 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     // build time and are absent from the layout.
     // The drawing is passed through to access `fcf_blocks[].leader_to` for
     // leader-line rendering (Task 6 fix wave: concern 2).
-    render_gdt_annotations(&mut out, drawing, &layout);
+    render_gdt_annotations(&mut out, &layout);
 
     // FOR REVIEW across the drawing area until a person approves the sheet.
     // Inked LAST: the views paint opaque backgrounds, so a watermark under
@@ -967,27 +967,13 @@ fn render_datum_marker(out: &mut String, layout: &SheetLayout) {
 /// emits the box + label but not the hatched triangle because the `dxf` crate's
 /// HATCH entity support for R2000 portable output is incomplete.  The SVG is
 /// the authoritative shopfloor output; the DXF is for CAD re-editing.
-fn render_gdt_annotations(out: &mut String, drawing: &super::types::Drawing, layout: &SheetLayout) {
+fn render_gdt_annotations(out: &mut String, layout: &SheetLayout) {
     use super::layout::{GDT_BLOCK_H, GDT_BOX_HALF, GDT_FONT_MM};
 
-    // Build an index from ordering-index → leader_to for FCF blocks.
-    //
-    // Keying by (owner_view, full_text) would silently overwrite duplicate
-    // FCFs that share the same text and view — the second entry wins and the
-    // first gets the wrong leader target.  Keying by the position in
-    // `drawing.fcf_blocks` is always unique.  The layout's FcfBlock items are
-    // emitted in the same order as `drawing.fcf_blocks` by
-    // `place_gdt_annotations`, so the n-th FcfBlock layout item corresponds
-    // to `drawing.fcf_blocks[n]`, and the index below is stable.
-    let fcf_leaders: Vec<Option<[f64; 2]>> =
-        drawing.fcf_blocks.iter().map(|fcf| fcf.leader_to).collect();
-
-    // Track how many FcfBlock items we have rendered so far — used to index
-    // into `fcf_leaders` (which mirrors the ordering of `drawing.fcf_blocks`).
-    // `place_gdt_annotations` emits one FcfBlock item per entry in
-    // `drawing.fcf_blocks`, in the same order, so the n-th FcfBlock item in
-    // the layout corresponds to `drawing.fcf_blocks[n]` and
-    // `fcf_leaders[n]`.
+    // The frames' leaders as the layout placed them (`SheetLayout::
+    // gdt_leaders`, keyed by the frame's index in `drawing.fcf_blocks`): the
+    // one source the DXF and the space map's LEADER-ANGLE rule read too.
+    // The n-th FcfBlock item is `drawing.fcf_blocks[n]`.
     let mut fcf_item_idx: usize = 0;
 
     for item in layout
@@ -1020,7 +1006,7 @@ fn render_gdt_annotations(out: &mut String, drawing: &super::types::Drawing, lay
                 );
                 // Filled equilateral triangle below the box (pointing down toward
                 // the feature edge).  Base at box bottom, apex at half + tri_h below.
-                let tri_h = half * 0.85;
+                let tri_h = super::layout::GDT_DATUM_TRI_H;
                 let tri_bx0 = cx - half;
                 let tri_bx1 = cx + half;
                 let tri_by = cy + half; // box bottom edge
@@ -1072,26 +1058,18 @@ fn render_gdt_annotations(out: &mut String, drawing: &super::types::Drawing, lay
                 }
 
                 // ── Leader line (Task 6 fix wave, concern 2) ──────────────
-                // Draw a thin line from the FCF frame's bottom-centre to the
-                // feature-edge location stored in `PlacedFcfBlock::leader_to`.
-                // Keyed by ordering index (not full_text): two identical FCFs
-                // in the same view would previously overwrite each other in a
-                // HashMap keyed by (owner_view, text), routing both leaders to
-                // the second entry's target.  Index is always unique.
-                if let Some(Some([lx, ly])) = fcf_leaders.get(fcf_item_idx) {
-                    // Leader origin: bottom-centre of the FCF frame.
-                    let lx0 = tx; // already computed as horizontal centre
-                    let ly0 = b.y1;
-                    // Only draw the leader if it has meaningful length (> 1 mm).
-                    let len = ((lx - lx0).powi(2) + (ly - ly0).powi(2)).sqrt();
-                    if len > 1.0 {
-                        let _ = write!(
-                            out,
-                            "  <line class=\"gdt-leader\" \
-                             x1=\"{lx0:.3}\" y1=\"{ly0:.3}\" \
-                             x2=\"{lx:.3}\" y2=\"{ly:.3}\" />\n"
-                        );
-                    }
+                // From the middle of the frame side facing the feature to the
+                // feature, as the layout placed it. Keyed by the frame's
+                // index (never its text: two identical frames in one view
+                // each keep their own target).
+                if let Some(l) = layout.gdt_leaders.iter().find(|l| l.fcf == fcf_item_idx) {
+                    let ([lx0, ly0], [lx, ly]) = (l.from, l.to);
+                    let _ = write!(
+                        out,
+                        "  <line class=\"gdt-leader\" \
+                         x1=\"{lx0:.3}\" y1=\"{ly0:.3}\" \
+                         x2=\"{lx:.3}\" y2=\"{ly:.3}\" />\n"
+                    );
                 }
                 fcf_item_idx += 1;
             }

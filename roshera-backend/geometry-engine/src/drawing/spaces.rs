@@ -241,11 +241,13 @@ pub enum Rule {
     TextHeight,
     #[serde(rename = "TRAILING-ZERO")]
     TrailingZero,
+    #[serde(rename = "DATUM-ATTACH")]
+    DatumAttach,
 }
 
 impl Rule {
     /// Every rule, in report order.
-    pub const ALL: [Rule; 10] = [
+    pub const ALL: [Rule; 11] = [
         Rule::AlignRow,
         Rule::LanePitch,
         Rule::TextClear,
@@ -256,6 +258,7 @@ impl Rule {
         Rule::LeaderAngle,
         Rule::TextHeight,
         Rule::TrailingZero,
+        Rule::DatumAttach,
     ];
 
     /// The stable id, e.g. `"LANE-PITCH"`.
@@ -271,6 +274,7 @@ impl Rule {
             Rule::LeaderAngle => "LEADER-ANGLE",
             Rule::TextHeight => "TEXT-HEIGHT",
             Rule::TrailingZero => "TRAILING-ZERO",
+            Rule::DatumAttach => "DATUM-ATTACH",
         }
     }
 
@@ -284,9 +288,10 @@ impl Rule {
             Rule::Empty => "cells, zones and tables cover at least 50 % of the frame (house tolerance; ISO 5457 sizes the sheet to the drawing); views under verify's 10 % utilization is an error",
             Rule::TableAnchor => "table edges on the frame / title-block grid within 3.5 mm (ISO 7200, ISO 5457)",
             Rule::ViewAlign => "projected views on FRONT's axis within 0.1 mm, 2 mm an error (ISO 128-3 / ISO 5456-2); gutters round FRONT equal within 5 mm",
-            Rule::LeaderAngle => "leader leg at 30-60 degrees to its shoulder and crossing no other line (ISO 128-22 practice)",
+            Rule::LeaderAngle => "leader leg at 30-60 degrees to its shoulder and crossing no other line (ISO 128-22 practice); a feature control frame's leader at least 30 degrees off the frame edge it leaves and crossing no dimension line or other leader",
             Rule::TextHeight => "capital height at least 2.5 mm (ISO 3098), 3.5 mm on A3 and larger (design spec)",
             Rule::TrailingZero => "no trailing zeros in a value (ISO 129-1); stacked deviations and limits exempt",
+            Rule::DatumAttach => "a datum feature symbol stands on its feature's frame when the feature has one, else on the feature's outline or an extension line, never on a dimension line (ISO 5459); its triangle's apex within 0.5 mm",
         }
     }
 }
@@ -554,7 +559,7 @@ fn segment_rect_distance(s: &[[f64; 2]; 2], r: &Rect2) -> f64 {
 
 /// Whether two segments cross at a point interior to both (a shared end, as
 /// where two chained dimensions meet, is not a crossing).
-fn segments_cross(a: &[[f64; 2]; 2], b: &[[f64; 2]; 2]) -> bool {
+pub(crate) fn segments_cross(a: &[[f64; 2]; 2], b: &[[f64; 2]; 2]) -> bool {
     let d = |p: [f64; 2], q: [f64; 2], r: [f64; 2]| {
         (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
     };
@@ -595,7 +600,7 @@ fn shape_of(pd: &PlacedDimension) -> DimShape {
 /// The part of a dimension that decides where it sits: its text and its
 /// dimension line (or shoulder, or arc), not the extension lines that reach
 /// back to the part.
-fn core_box(pd: &PlacedDimension) -> Rect2 {
+pub(crate) fn core_box(pd: &PlacedDimension) -> Rect2 {
     let mut r = placed_text_box(pd);
     if !degenerate(&pd.line) {
         r = union(r, seg_rect(&pd.line));
@@ -732,7 +737,7 @@ fn dim_name(pd: &PlacedDimension, k: usize) -> String {
 }
 
 /// A space id fragment for a view name: upper case, spaces as `-`.
-fn view_key(name: &str) -> String {
+pub(crate) fn view_key(name: &str) -> String {
     name.trim()
         .chars()
         .map(|c| if c.is_whitespace() { '-' } else { c })
@@ -1295,7 +1300,21 @@ pub fn space_map(drawing: &Drawing, layout: &SheetLayout) -> SpaceMap {
     );
     rule_table_anchor(&mut b, &frame, title.as_ref(), notes.as_ref(), &tables);
     rule_view_align(&mut b, drawing, &cells);
-    rule_leader_angle(&mut b, layout, &holder);
+    // A frame's leader is in its view's cell (the frame's own space).
+    let fcf_spaces: Vec<String> = layout
+        .gdt_leaders
+        .iter()
+        .map(|l| {
+            cells
+                .iter()
+                .find(|c| c.0 == l.owner_view)
+                .map(|c| c.1.clone())
+                .unwrap_or_else(|| "frame".to_string())
+        })
+        .collect();
+    let ink = super::layout::view_ink(drawing, layout);
+    rule_leader_angle(&mut b, layout, &holder, &fcf_spaces, &ink.outlines);
+    rule_datum_attach(&mut b, drawing, layout, &cells, &ink);
     rule_text_height(&mut b, drawing, layout, &item_space, title.is_some());
     rule_trailing_zero(&mut b, layout, &holder, &item_space);
 
@@ -1876,13 +1895,29 @@ fn rule_view_align(b: &mut Builder, drawing: &Drawing, cells: &[(usize, String, 
 }
 
 /// `LEADER-ANGLE`: each leader's leg at 30 to 60 degrees to its shoulder,
-/// crossing no other dimension's line.
-fn rule_leader_angle(b: &mut Builder, layout: &SheetLayout, holder: &[String]) {
+/// crossing no other dimension's line; and each feature control frame's
+/// leader ([`rule_frame_leaders`]). `fcf_spaces[i]` is the space of
+/// `layout.gdt_leaders[i]`.
+fn rule_leader_angle(
+    b: &mut Builder,
+    layout: &SheetLayout,
+    holder: &[String],
+    fcf_spaces: &[String],
+    outlines: &[([f64; 2], f64, usize)],
+) {
     for (k, pd) in layout.dimensions.iter().enumerate() {
         if shape_of(pd) != DimShape::Leader {
             continue;
         }
         let leg = pd.ext[0];
+        leader_across_circles(
+            b,
+            &holder[k],
+            &leg,
+            outlines,
+            &format!("'{}'", pd.label),
+            dim_name(pd, k),
+        );
         let (lx, ly) = (leg[1][0] - leg[0][0], leg[1][1] - leg[0][1]);
         let (sx, sy) = (pd.line[1][0] - pd.line[0][0], pd.line[1][1] - pd.line[0][1]);
         let cos = ((lx * sx + ly * sy) / (lx.hypot(ly) * sx.hypot(sy))).clamp(-1.0, 1.0);
@@ -1941,6 +1976,162 @@ fn rule_leader_angle(b: &mut Builder, layout: &SheetLayout, holder: &[String]) {
                         pd.label, other.label
                     ),
                     vec![dim_name(pd, k), dim_name(other, m)],
+                );
+            }
+        }
+    }
+    rule_frame_leaders(b, layout, holder, fcf_spaces, outlines);
+}
+
+/// `LEADER-ANGLE`: a leader that runs ACROSS a drawn circle -- a hole, a
+/// bore, an outline: in through it and out again -- reads as pointing at
+/// that feature (the flange's flatness frame was led across a bolt hole to
+/// the bore's centre). Crossing an outline once, to reach a target inside
+/// it, or ending on it, is how a leader reaches its feature and is not
+/// counted. One finding per leader, counting the circles it runs across.
+fn leader_across_circles(
+    b: &mut Builder,
+    space: &str,
+    leader: &[[f64; 2]; 2],
+    outlines: &[([f64; 2], f64, usize)],
+    what: &str,
+    subject: String,
+) {
+    let across = outlines
+        .iter()
+        .filter(|(c, r, _)| super::layout::segment_runs_across_circle(leader, *c, *r))
+        .count();
+    if across > 0 {
+        b.find(
+            space,
+            Rule::LeaderAngle,
+            Severity::Warning,
+            across as f64,
+            "count",
+            Tolerance::at_most(0.0),
+            format!("the leader of {what} runs across {across} drawn circle(s) (a hole or an outline) on its way"),
+            vec![subject],
+        );
+    }
+}
+
+/// The name a feature control frame is reported under: `fcf:<n>`, its index
+/// on the sheet (what `drawing_reattach_leader` addresses).
+pub fn fcf_name(n: usize) -> String {
+    format!("fcf:{n}")
+}
+
+/// `LEADER-ANGLE` for the leaders of feature control frames
+/// ([`SheetLayout::gdt_leaders`]), in the space of the frame's view: a
+/// leader leaves its frame at least 30 degrees off the frame edge it leaves
+/// (near-parallel to the frame it reads as part of it; square to it is
+/// ISO 1101's own figure, so there is no upper bound), and crosses no
+/// dimension line, dimension leader or other frame's leader -- the bolt-hole
+/// frames of a flange's face view were each drawn back across the view to
+/// their holes and crossed one another.
+fn rule_frame_leaders(
+    b: &mut Builder,
+    layout: &SheetLayout,
+    holder: &[String],
+    fcf_spaces: &[String],
+    outlines: &[([f64; 2], f64, usize)],
+) {
+    let frames: Vec<Rect2> = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::FcfBlock)
+        .map(|it| it.bbox)
+        .collect();
+    for (i, l) in layout.gdt_leaders.iter().enumerate() {
+        let Some(space) = fcf_spaces.get(i) else {
+            continue;
+        };
+        let name = fcf_name(l.fcf);
+        let (dx, dy) = (l.to[0] - l.from[0], l.to[1] - l.from[1]);
+        // A leader leaving a frame's END (its left or right side) is measured
+        // against that vertical edge; one leaving its top or bottom against
+        // the horizontal edge.
+        let leaves_end = frames.get(l.fcf).is_some_and(|f| {
+            ((l.from[0] - f.x0).abs() < 1e-9 || (l.from[0] - f.x1).abs() < 1e-9)
+                && l.from[1] > f.y0 + 1e-9
+                && l.from[1] < f.y1 - 1e-9
+        });
+        let to_horizontal = dy.abs().atan2(dx.abs()).to_degrees();
+        let off_edge = if leaves_end {
+            90.0 - to_horizontal
+        } else {
+            to_horizontal
+        };
+        if off_edge < LEADER_ANGLE_MIN_DEG {
+            b.find(
+                space,
+                Rule::LeaderAngle,
+                Severity::Warning,
+                off_edge,
+                "deg",
+                Tolerance::at_least(LEADER_ANGLE_MIN_DEG),
+                format!("the leader of frame {name} leaves its frame at {off_edge:.1} degrees"),
+                vec![name.clone()],
+            );
+        }
+        let seg = l.segment();
+        leader_across_circles(
+            b,
+            space,
+            &seg,
+            outlines,
+            &format!("frame {name}"),
+            name.clone(),
+        );
+        // Other frames' leaders: each crossing pair once (from the lower index).
+        for (j, o) in layout.gdt_leaders.iter().enumerate() {
+            if j <= i || !segments_cross(&seg, &o.segment()) {
+                continue;
+            }
+            let other = fcf_name(o.fcf);
+            let mut spaces = vec![space.clone()];
+            if let Some(os) = fcf_spaces.get(j).filter(|os| *os != space) {
+                spaces.push(os.clone());
+            }
+            for s in spaces {
+                b.find(
+                    &s,
+                    Rule::LeaderAngle,
+                    Severity::Warning,
+                    1.0,
+                    "count",
+                    Tolerance::at_most(0.0),
+                    format!("the leader of frame {name} crosses the leader of frame {other}"),
+                    vec![name.clone(), other.clone()],
+                );
+            }
+        }
+        // Dimension lines and leaders.
+        for (k, pd) in layout.dimensions.iter().enumerate() {
+            let crossings = placed_line_segments(pd)
+                .iter()
+                .filter(|s| segments_cross(&seg, s))
+                .count();
+            if crossings == 0 {
+                continue;
+            }
+            let mut spaces = vec![space.clone()];
+            if let Some(h) = holder.get(k).filter(|h| *h != space) {
+                spaces.push(h.clone());
+            }
+            for s in spaces {
+                b.find(
+                    &s,
+                    Rule::LeaderAngle,
+                    Severity::Warning,
+                    crossings as f64,
+                    "count",
+                    Tolerance::at_most(0.0),
+                    format!(
+                        "the leader of frame {name} crosses a line of '{}'",
+                        pd.label
+                    ),
+                    vec![name.clone(), dim_name(pd, k)],
                 );
             }
         }
@@ -2059,6 +2250,142 @@ fn rule_trailing_zero(
             ),
             texts,
         );
+    }
+}
+
+/// `DATUM-ATTACH` tolerance: how far a datum symbol's triangle apex may sit
+/// from what it stands on (mm).
+pub(crate) const DATUM_ATTACH_TOL_MM: f64 = 0.5;
+
+fn point_rect_distance(p: [f64; 2], r: &Rect2) -> f64 {
+    let dx = (r.x0 - p[0]).max(p[0] - r.x1).max(0.0);
+    let dy = (r.y0 - p[1]).max(p[1] - r.y1).max(0.0);
+    dx.hypot(dy)
+}
+
+/// `DATUM-ATTACH`: each datum feature symbol stands on what it designates.
+/// On its feature's frame when the feature carries one (the symbol travels
+/// with the frame: `layout::datum_host`), its apex on the frame's top edge;
+/// otherwise on the feature's outline or an extension line of its view --
+/// never on a dimension line (ISO 5459: a datum symbol on a dimension line
+/// designates that size feature's AXIS, a different datum), never floating.
+/// An error: a symbol that stands on the wrong thing states a different
+/// datum. Found on the flange: datum A was left on the Ø165 line and B in
+/// empty paper when their frames moved to their holes.
+fn rule_datum_attach(
+    b: &mut Builder,
+    drawing: &Drawing,
+    layout: &SheetLayout,
+    cells: &[(usize, String, Rect2, Rect2)],
+    ink: &super::layout::ViewInk,
+) {
+    let frames: Vec<Rect2> = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::FcfBlock)
+        .map(|it| it.bbox)
+        .collect();
+    for (i, sym) in drawing.datum_symbols.iter().enumerate() {
+        let Some(item) = layout.items.iter().find(|it| {
+            it.kind == SheetItemKind::DatumSymbol
+                && it.owner_view == Some(sym.owner_view)
+                && it.text.as_deref() == Some(sym.label.as_str())
+        }) else {
+            continue;
+        };
+        let space = cells
+            .iter()
+            .find(|c| c.0 == sym.owner_view)
+            .map(|c| c.1.clone())
+            .unwrap_or_else(|| "frame".to_string());
+        let tip = super::layout::datum_tip(&item.bbox);
+        let name = format!("datum {}", sym.label);
+        let host = super::layout::datum_host(drawing, i);
+        if let Some(h) = host.and_then(|h| frames.get(h).map(|r| (h, *r))) {
+            let (n, frame) = h;
+            let on_top = (tip[1] - frame.y0).abs() <= DATUM_ATTACH_TOL_MM
+                && tip[0] >= frame.x0 - DATUM_ATTACH_TOL_MM
+                && tip[0] <= frame.x1 + DATUM_ATTACH_TOL_MM;
+            if !on_top {
+                let off = point_rect_distance(
+                    tip,
+                    &Rect2 {
+                        y1: frame.y0,
+                        ..frame
+                    },
+                );
+                b.find(
+                    &space,
+                    Rule::DatumAttach,
+                    Severity::Error,
+                    off,
+                    "mm",
+                    Tolerance::at_most(DATUM_ATTACH_TOL_MM),
+                    format!(
+                        "{name} is not on its feature's frame {} (its apex is {off:.1} mm from it)",
+                        fcf_name(n)
+                    ),
+                    vec![name.clone(), fcf_name(n)],
+                );
+            }
+            continue;
+        }
+        // No frame to stand on: the feature's outline or an extension line,
+        // never a dimension line.
+        let mut on_dim_line: Option<String> = None;
+        let mut nearest = f64::INFINITY;
+        for (k, pd) in layout.dimensions.iter().enumerate() {
+            let mut lines = vec![pd.line];
+            lines.extend(super::layout::arc_chords(pd));
+            if lines
+                .iter()
+                .filter(|s| !degenerate(s))
+                .any(|s| point_segment_distance(tip, s) <= DATUM_ATTACH_TOL_MM)
+            {
+                on_dim_line = Some(dim_name(pd, k));
+                break;
+            }
+            for e in 0..2 {
+                for piece in super::layout::extension_line_pieces(pd, e) {
+                    nearest = nearest.min(point_segment_distance(tip, &piece));
+                }
+            }
+        }
+        if let Some(dim) = on_dim_line {
+            b.find(
+                &space,
+                Rule::DatumAttach,
+                Severity::Error,
+                0.0,
+                "mm",
+                Tolerance::at_least(DATUM_ATTACH_TOL_MM),
+                format!("{name} stands on the dimension line of {dim}: that designates the dimensioned feature's axis, not the datum feature"),
+                vec![name.clone(), dim],
+            );
+            continue;
+        }
+        for (v, s) in &ink.segments {
+            if *v == sym.owner_view {
+                nearest = nearest.min(point_segment_distance(tip, s));
+            }
+        }
+        for (c, r, v) in &ink.outlines {
+            if *v == sym.owner_view {
+                nearest = nearest.min(((tip[0] - c[0]).hypot(tip[1] - c[1]) - r).abs());
+            }
+        }
+        if nearest > DATUM_ATTACH_TOL_MM {
+            b.find(
+                &space,
+                Rule::DatumAttach,
+                Severity::Error,
+                nearest,
+                "mm",
+                Tolerance::at_most(DATUM_ATTACH_TOL_MM),
+                format!("{name} floats: its apex is {nearest:.1} mm from the nearest outline or extension line of its view"),
+                vec![name.clone()],
+            );
+        }
     }
 }
 

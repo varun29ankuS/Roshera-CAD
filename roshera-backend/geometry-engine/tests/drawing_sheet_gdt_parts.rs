@@ -1316,3 +1316,964 @@ fn the_look_pictures_of_the_flange_and_the_rib() {
     }
     eprintln!("look pictures in {}", dir.display());
 }
+
+// -- Hands (agent eyes slice 3): layout verbs on the flange sheet ---------
+
+/// The flange's (or the rib's) first-angle sheet with the model it was drawn
+/// from: the certificate gate needs the model.
+fn sheet_with_model(build: fn() -> (BRepModel, SolidId)) -> (BRepModel, Drawing) {
+    let (mut m, s) = build();
+    let _ = frame_for_drawing(&mut m, s);
+    let d = standard_drawing_auto_with_projection(&m, s, uuid::Uuid::nil(), ProjectionAngle::First)
+        .expect("sheet");
+    (m, d)
+}
+
+fn map_of(d: &Drawing) -> geometry_engine::drawing::SpaceMap {
+    geometry_engine::drawing::spaces::space_map(d, &compute_layout(d))
+}
+
+/// The verb `plan` assessed on `d` and passed through the certificate gate
+/// against the model: the hands' whole kernel path, as the route runs it.
+fn act(
+    m: &BRepModel,
+    d: &Drawing,
+    plan: Result<geometry_engine::drawing::hands::Plan, geometry_engine::drawing::HandsRefusal>,
+) -> Result<geometry_engine::drawing::Assessed, geometry_engine::drawing::HandsRefusal> {
+    use geometry_engine::drawing::hands;
+    let a = hands::assess(d, plan?)?;
+    hands::certificate_gate(&certify_drawing(m, d), &certify_drawing(m, &a.plan.drawing))?;
+    Ok(a)
+}
+
+/// Everything the sheet inks, as numbers: every placed dimension's lines and
+/// text anchor, every layout item's box, every frame leader.
+fn layout_print(d: &Drawing) -> Vec<String> {
+    let l = compute_layout(d);
+    l.dimensions
+        .iter()
+        .map(|p| format!("{} {:?} {:?} {:?}", p.dim_id, p.line, p.ext, p.text_anchor))
+        .chain(
+            l.items
+                .iter()
+                .map(|i| format!("{:?} {:?} {:?}", i.kind, i.text, i.bbox)),
+        )
+        .chain(l.gdt_leaders.iter().map(|g| format!("{g:?}")))
+        .collect()
+}
+
+/// The angle a placed leader's leg makes with its shoulder (degrees, 0..90).
+fn leader_angle(pd: &geometry_engine::drawing::layout::PlacedDimension) -> f64 {
+    let (lx, ly) = (
+        pd.ext[0][1][0] - pd.ext[0][0][0],
+        pd.ext[0][1][1] - pd.ext[0][0][1],
+    );
+    let (sx, sy) = (pd.line[1][0] - pd.line[0][0], pd.line[1][1] - pd.line[0][1]);
+    let a = ((lx * sx + ly * sy) / (lx.hypot(ly) * sx.hypot(sy)))
+        .clamp(-1.0, 1.0)
+        .acos()
+        .to_degrees();
+    if a > 90.0 {
+        180.0 - a
+    } else {
+        a
+    }
+}
+
+fn frame_findings(map: &geometry_engine::drawing::SpaceMap) -> Vec<String> {
+    map.findings
+        .iter()
+        .filter(|f| {
+            f.rule == geometry_engine::drawing::Rule::LeaderAngle
+                && f.subjects.iter().any(|s| s.starts_with("fcf:"))
+        })
+        .map(|f| format!("{}: {}", f.space, f.message))
+        .collect()
+}
+
+/// RED for the rule: the flange's position frames were placed by the ladder
+/// far from their holes and their leaders run back across TOP, crossing one
+/// another and the diameters' lines -- and the space map did not see a
+/// single one (frame leaders were not in the layout). They are now laid out
+/// (`SheetLayout::gdt_leaders`, the one source the SVG and DXF ink) and
+/// scored by `LEADER-ANGLE` in the frame's view.
+///
+/// Mutation: drop the `rule_frame_leaders` call -> no frame finding, fails.
+#[test]
+fn the_flange_frame_leaders_are_seen_by_leader_angle() {
+    let (_m, d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let l = compute_layout(&d);
+    assert_eq!(l.gdt_leaders.len(), 6, "six frames, six leaders");
+    let map = map_of(&d);
+    let found = frame_findings(&map);
+    // The ladder's frames run back across TOP's bolt holes and outlines.
+    assert!(
+        found.iter().any(|f| f.contains("runs across")),
+        "a frame leader runs across a hole: {found:#?}"
+    );
+    // Two frames' leaders that cross are seen too. (The automatic sheet's
+    // crossing pair went when the flatness frame moved to FRONT, where its
+    // face is seen; two TOP frames swapped in place are crossed instead.)
+    let frames: Vec<[f64; 2]> = l
+        .items
+        .iter()
+        .filter(|i| i.kind == geometry_engine::drawing::layout::SheetItemKind::FcfBlock)
+        .map(|i| [i.bbox.x0, i.bbox.y0])
+        .collect();
+    let mut crossed = Vec::new();
+    for i in 0..4 {
+        for j in i + 1..4 {
+            let mut s = d.clone();
+            for (k, at) in [(i, frames[j]), (j, frames[i])] {
+                let key = s.fcf_blocks[k].placement_key().expect("key");
+                s.gdt_placements.insert(
+                    key,
+                    geometry_engine::drawing::types::GdtPlacement {
+                        anchor: at,
+                        leader_to: None,
+                    },
+                );
+            }
+            crossed.extend(
+                frame_findings(&map_of(&s))
+                    .into_iter()
+                    .filter(|f| f.contains("crosses the leader of frame")),
+            );
+        }
+    }
+    assert!(
+        !crossed.is_empty(),
+        "swapped frames' leaders cross and are seen"
+    );
+    // The SVG inks the leaders the layout holds: from the frame side facing
+    // the feature.
+    let svg = geometry_engine::drawing::render_drawing_svg(&d);
+    for g in &l.gdt_leaders {
+        let needle = format!(
+            "x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\"",
+            g.from[0], g.from[1], g.to[0], g.to[1]
+        );
+        assert!(svg.contains(&needle), "the SVG inks leader {g:?}");
+    }
+}
+
+/// The hub's angle callout hangs on a leader 62 mm long at 14 degrees to its
+/// shoulder (LEADER-ANGLE). `drawing_reattach_leader` re-routes it short, at
+/// 30-60 degrees, its text clear: the leader is in band, its band's score
+/// rises, the certificate passes, the recorded edit replays to the same
+/// sheet, and the record it replaced puts the sheet back exactly (undo).
+#[test]
+fn reattaching_the_hub_angle_leader_brings_it_into_band() {
+    use geometry_engine::drawing::hands;
+    let (m, d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let before = compute_layout(&d);
+    let pd = before
+        .dimensions
+        .iter()
+        .find(|p| p.dim_id == "d27")
+        .expect("d27 placed");
+    let was = leader_angle(pd);
+    assert!(was < 30.0, "the automatic leader is shallow: {was}");
+    let a = act(&m, &d, hands::reattach_leader(&d, "d27", None, None)).expect("re-routed");
+    let after = compute_layout(&a.plan.drawing);
+    let pd2 = after
+        .dimensions
+        .iter()
+        .find(|p| p.dim_id == "d27")
+        .expect("still placed");
+    let now = leader_angle(pd2);
+    assert!((30.0..=60.0).contains(&now), "in band: {now}");
+    let leg = |p: &geometry_engine::drawing::layout::PlacedDimension| {
+        (p.ext[0][1][0] - p.ext[0][0][0]).hypot(p.ext[0][1][1] - p.ext[0][0][1])
+    };
+    assert!(
+        leg(pd2) < 0.5 * leg(pd),
+        "shorter: {} -> {}",
+        leg(pd),
+        leg(pd2)
+    );
+    let band = a
+        .delta
+        .spaces_changed
+        .iter()
+        .find(|c| c.space == "view:FRONT/band:right")
+        .expect("its band changed");
+    assert!(band.after > band.before, "{band:?}");
+    assert!(a
+        .delta
+        .issues_resolved
+        .iter()
+        .any(|f| f.rule == geometry_engine::drawing::Rule::LeaderAngle
+            && f.subjects.contains(&"d27".to_string())));
+    assert!(
+        !a.map_after
+            .findings
+            .iter()
+            .any(|f| f.rule == geometry_engine::drawing::Rule::LeaderAngle
+                && f.subjects.contains(&"d27".to_string())),
+        "no LEADER-ANGLE names d27 after"
+    );
+    assert_eq!(a.act.rule.as_deref(), Some("LEADER-ANGLE"));
+    assert!(
+        a.act.caption.contains("fixes LEADER-ANGLE"),
+        "{}",
+        a.act.caption
+    );
+    let mv = &a.act.moves[0];
+    assert!(
+        mv.from.is_some() && mv.to.is_some() && mv.from != mv.to,
+        "{mv:?}"
+    );
+
+    // Replay: the recorded edit, through JSON, on the sheet it was made on.
+    let wire = serde_json::to_value(&a.plan.edit).expect("ser");
+    let edit: hands::LayoutEdit = serde_json::from_value(wire).expect("de");
+    let mut replayed = d.clone();
+    replayed.apply_layout_edit(&edit).expect("applies");
+    assert_eq!(
+        layout_print(&replayed),
+        layout_print(&a.plan.drawing),
+        "replay = live"
+    );
+    // Undo: the record it replaced (none) put back -> the exact prior layout.
+    let key = d
+        .find_dimension("d27")
+        .and_then(|x| x.key.clone())
+        .expect("key");
+    let mut undone = a.plan.drawing.clone();
+    undone.apply_dimension_edit(
+        &key,
+        d.dimension_edits.get(&key).cloned().unwrap_or_default(),
+    );
+    assert_eq!(
+        layout_print(&undone),
+        layout_print(&d),
+        "undo restores the exact layout"
+    );
+}
+
+/// The six frames on TOP, re-placed one by one beside their features (the
+/// bolt holes' and the bore's leaders ended on the hole's edge): every frame
+/// leader is short and crosses nothing, and TOP climbs out from under the
+/// bar.
+#[test]
+fn reattaching_the_frames_uncrosses_their_leaders() {
+    use geometry_engine::drawing::hands::{reattach_leader, LeaderTarget};
+    let (m, mut d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let start = map_of(&d);
+    let top_before = start.space("view:TOP").expect("TOP").score;
+    let auto_len: Vec<f64> = {
+        let l = compute_layout(&d);
+        (0..6)
+            .map(|n| {
+                l.gdt_leaders
+                    .iter()
+                    .find(|g| g.fcf == n)
+                    .map_or(0.0, |g| (g.to[0] - g.from[0]).hypot(g.to[1] - g.from[1]))
+            })
+            .collect()
+    };
+    for n in 0..6 {
+        let target = (n < 5).then_some(LeaderTarget::Nearest);
+        let a = act(
+            &m,
+            &d,
+            reattach_leader(&d, &format!("fcf:{n}"), None, target),
+        )
+        .unwrap_or_else(|e| panic!("fcf:{n}: {e:?}"));
+        d = a.plan.drawing;
+    }
+    let map = map_of(&d);
+    let left = frame_findings(&map);
+    assert!(left.is_empty(), "no frame leader is flagged: {left:#?}");
+    let l = compute_layout(&d);
+    for g in &l.gdt_leaders {
+        // Short: 40 mm at most, and under half the automatic leader -- the
+        // flatness frame (fcf:5) excepted from the half: in FRONT, beside
+        // the face it points at, its automatic leader is already short, and
+        // it must be no longer.
+        let len = (g.to[0] - g.from[0]).hypot(g.to[1] - g.from[1]);
+        let shorter = if g.fcf == 5 {
+            len <= auto_len[g.fcf] + 1e-9
+        } else {
+            len < 0.5 * auto_len[g.fcf]
+        };
+        assert!(
+            len <= 40.0 && shorter,
+            "frame {} leader {len:.1} mm (automatic {:.1} mm)",
+            g.fcf,
+            auto_len[g.fcf]
+        );
+    }
+    // The bolt frames end on their hole's edge (r 9 mm), not its centre.
+    for n in 0..4 {
+        let to = l
+            .gdt_leaders
+            .iter()
+            .find(|g| g.fcf == n)
+            .expect("leader")
+            .to;
+        let c = d.fcf_blocks[n].leader_to.expect("centre");
+        let r = (to[0] - c[0]).hypot(to[1] - c[1]);
+        assert!(
+            (r - 9.0).abs() < 1e-6,
+            "fcf:{n} ends {r} from the hole centre"
+        );
+    }
+    let top_after = map.space("view:TOP").expect("TOP").score;
+    assert!(top_after > top_before, "TOP {top_before} -> {top_after}");
+    assert!(
+        top_after >= geometry_engine::drawing::SPACE_BAR,
+        "TOP clears the bar: {top_after}"
+    );
+}
+
+/// A dimension moved to another lane is there (its line STANDOFF + 3 STACK
+/// from the outline in lane 4), the band's LANE-PITCH says the move made a
+/// gap, and putting it back to lane 1 closes it -- the layout exactly as it
+/// was. A slide moves the text along its line by exactly the offset.
+#[test]
+fn moving_a_dimension_changes_its_lane_and_the_scores_follow() {
+    use geometry_engine::drawing::hands::move_dimension;
+    use geometry_engine::drawing::Rule;
+    let (m, d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let geo_x0 = compute_layout(&d)
+        .items
+        .iter()
+        .find(|i| {
+            i.kind == geometry_engine::drawing::layout::SheetItemKind::ViewGeometry
+                && i.owner_view == Some(0)
+        })
+        .expect("FRONT")
+        .bbox
+        .x0;
+    let a = act(&m, &d, move_dimension(&d, "d20", None, Some(4), None)).expect("moved");
+    let l = compute_layout(&a.plan.drawing);
+    let x = l
+        .dimensions
+        .iter()
+        .find(|p| p.dim_id == "d20")
+        .expect("placed")
+        .line[0][0];
+    assert!(
+        (geo_x0 - x - (11.0 + 3.0 * 8.0)).abs() < 1e-9,
+        "lane 4: {}",
+        geo_x0 - x
+    );
+    assert!(
+        a.delta
+            .issues_created
+            .iter()
+            .any(|f| f.rule == Rule::LanePitch),
+        "the gap it left is LANE-PITCH: {:?}",
+        a.delta.issues_created
+    );
+    let band = a
+        .delta
+        .spaces_changed
+        .iter()
+        .find(|c| c.space == "view:FRONT/band:left")
+        .expect("band");
+    assert!(band.after < band.before, "worse: {band:?}");
+    let back = act(
+        &m,
+        &a.plan.drawing,
+        move_dimension(&a.plan.drawing, "d20", None, Some(1), None),
+    )
+    .expect("back");
+    assert!(back
+        .delta
+        .issues_resolved
+        .iter()
+        .any(|f| f.rule == Rule::LanePitch));
+    let line = |d: &Drawing| {
+        compute_layout(d)
+            .dimensions
+            .iter()
+            .find(|p| p.dim_id == "d20")
+            .map(|p| (p.line, p.text_anchor))
+    };
+    assert_eq!(
+        line(&back.plan.drawing),
+        line(&d),
+        "lane 1 again: where it was"
+    );
+
+    let slid = act(&m, &d, move_dimension(&d, "d20", None, None, Some(-6.0))).expect("slid");
+    let (_, t0) = line(&d).expect("placed");
+    let (_, t1) = line(&slid.plan.drawing).expect("placed");
+    assert!(
+        (t1[1] - t0[1] + 6.0).abs() < 1e-9 && (t1[0] - t0[0]).abs() < 1e-9,
+        "{t0:?} -> {t1:?}"
+    );
+    // A band its line cannot run in is refused, typed; so is a lane for a
+    // leader, and a band with no room.
+    use geometry_engine::drawing::spaces::BandSide;
+    assert_eq!(
+        move_dimension(&d, "d20", Some(BandSide::Top), None, None)
+            .map(|_| ())
+            .unwrap_err()
+            .reason,
+        "band_not_along"
+    );
+    assert_eq!(
+        move_dimension(&d, "d27", None, Some(2), None)
+            .map(|_| ())
+            .unwrap_err()
+            .reason,
+        "no_lanes"
+    );
+    assert_eq!(
+        move_dimension(&d, "d23", Some(BandSide::Top), None, None)
+            .map(|_| ())
+            .unwrap_err()
+            .reason,
+        "no_room"
+    );
+    assert_eq!(
+        move_dimension(&d, "nope", None, Some(2), None)
+            .map(|_| ())
+            .unwrap_err()
+            .reason,
+        "no_such_dimension"
+    );
+}
+
+/// `drawing_align` puts the raised face's "2" and the plate's "18" -- a
+/// chain, end to end -- on one line, the "2" outside its span past the end
+/// away from the "18"; "48" overlaps both and is refused.
+#[test]
+fn align_puts_a_chain_on_one_line_and_refuses_an_overlap() {
+    use geometry_engine::drawing::hands::align;
+    let (m, d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let a = act(&m, &d, align(&d, &["d20".into(), "d24".into()])).expect("aligned");
+    let l = compute_layout(&a.plan.drawing);
+    let x = |id: &str| {
+        l.dimensions
+            .iter()
+            .find(|p| p.dim_id == id)
+            .expect("placed")
+            .line[0][0]
+    };
+    assert!(
+        (x("d20") - x("d24")).abs() < 1e-9,
+        "one line: {} vs {}",
+        x("d20"),
+        x("d24")
+    );
+    let refused = align(&d, &["d2".into(), "d24".into()])
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(refused.reason, "overlap");
+    assert!(
+        refused.message.contains("'48'") && refused.message.contains("'18'"),
+        "{}",
+        refused.message
+    );
+}
+
+/// With the frames brought beside their features, FRONT's gutters differ
+/// (TOP 13.3 mm, RIGHT 28 mm: VIEW-ALIGN). Moving RIGHT along its projection
+/// line to the same gutter resolves it and RIGHT stays on its line; the
+/// isometric lines up level with TOP; a view dragged where another is, or
+/// off its projection line, is refused. (On the automatic sheet the ladder's
+/// frames stand in FRONT / TOP's gutter, which then measures below zero: no
+/// move of RIGHT can match it, so the frames go first, as an agent would.)
+#[test]
+fn moving_views_closes_a_gutter_and_keeps_projection_lines() {
+    use geometry_engine::drawing::hands::{move_view, reattach_leader, LeaderTarget};
+    use geometry_engine::drawing::layout::view_geometry_rect;
+    let (m, mut d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    for n in 0..6 {
+        let target = (n < 5).then_some(LeaderTarget::Nearest);
+        let a = act(
+            &m,
+            &d,
+            reattach_leader(&d, &format!("fcf:{n}"), None, target),
+        )
+        .unwrap_or_else(|e| panic!("fcf:{n}: {e:?}"));
+        d = a.plan.drawing;
+    }
+    let h = d.sheet_size.height();
+    let centre = |d: &Drawing, name: &str| {
+        let v = d.views.iter().find(|v| v.name == name).expect("view");
+        let g = view_geometry_rect(v, h).expect("geo");
+        [0.5 * (g.x0 + g.x1), 0.5 * (g.y0 + g.y1)]
+    };
+    let gutters = |map: &geometry_engine::drawing::SpaceMap| {
+        map.findings.iter().any(|f| {
+            f.rule == geometry_engine::drawing::Rule::ViewAlign && f.message.contains("gutters")
+        })
+    };
+    assert!(gutters(&map_of(&d)), "the gutter finding is there to fix");
+    // The spread as the rule measures it (its finding's measured value):
+    // RIGHT's gutter is the wider one, by that much.
+    let before = map_of(&d);
+    let spread = before
+        .findings
+        .iter()
+        .find(|f| {
+            f.rule == geometry_engine::drawing::Rule::ViewAlign && f.message.contains("gutters")
+        })
+        .expect("the gutter finding");
+    let shift = spread.measured;
+    assert!(shift > 5.0, "{}", spread.message);
+    let c = centre(&d, "RIGHT");
+    let a = act(
+        &m,
+        &d,
+        move_view(&d, "RIGHT", Some([c[0] + shift, c[1]]), None),
+    )
+    .expect("moved");
+    assert!(
+        !gutters(&a.map_after),
+        "the gutters agree now: {:?}",
+        a.map_after
+            .findings
+            .iter()
+            .filter(|f| f.rule == geometry_engine::drawing::Rule::ViewAlign)
+            .map(|f| &f.message)
+            .collect::<Vec<_>>()
+    );
+    let f = a
+        .delta
+        .spaces_changed
+        .iter()
+        .find(|s| s.space == "view:FRONT")
+        .expect("FRONT");
+    assert!(f.after > f.before, "{f:?}");
+    let ri = a
+        .plan
+        .drawing
+        .views
+        .iter()
+        .position(|v| v.name == "RIGHT")
+        .expect("RIGHT");
+    assert_eq!(
+        geometry_engine::drawing::layout::view_alignment(&a.plan.drawing, ri),
+        Some(true)
+    );
+
+    let iso = act(&m, &d, move_view(&d, "ISOMETRIC", None, Some("TOP"))).expect("levelled");
+    assert!((centre(&iso.plan.drawing, "ISOMETRIC")[1] - centre(&d, "TOP")[1]).abs() < 0.1);
+
+    assert_eq!(
+        move_view(&d, "SECTION A-A", None, Some("FRONT"))
+            .map(|_| ())
+            .unwrap_err()
+            .reason,
+        "overlaps"
+    );
+    assert_eq!(
+        move_view(&d, "RIGHT", None, Some("TOP"))
+            .map(|_| ())
+            .unwrap_err()
+            .reason,
+        "not_reached"
+    );
+    assert_eq!(
+        move_view(&d, "RIGHT", Some([1.0, 1.0]), Some("TOP"))
+            .map(|_| ())
+            .unwrap_err()
+            .reason,
+        "one_target"
+    );
+}
+
+/// RED for the re-indexing: removing RIGHT (index 2) used to leave SECTION
+/// A-A's index (4) past the end of the views. Now every index follows its
+/// view, the sheet certifies, renders and maps; RIGHT stated no value, so
+/// the gate lets it go, and FRONT's gutter finding goes with it. TOP carries
+/// the section's plane, the datums and frames, and is refused; FRONT's
+/// dimensions are stated nowhere else, and its removal is refused naming
+/// them.
+#[test]
+fn removing_a_view_keeps_every_index_and_every_value() {
+    use geometry_engine::drawing::hands::remove_view;
+    let (m, d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let a = act(&m, &d, remove_view(&d, "RIGHT")).expect("removed");
+    let r = &a.plan.drawing;
+    assert!(!r.views.iter().any(|v| v.name == "RIGHT"));
+    let sec = r.section.expect("section kept");
+    assert_eq!(r.views[sec.section_view_idx].name, "SECTION A-A");
+    let ax = r.axial_view_idx.expect("axial kept");
+    assert_eq!(r.views[ax].name, "TOP");
+    assert_eq!(
+        r.views[r.cutting_plane_line.as_ref().expect("plane").ax_view_idx].name,
+        "TOP"
+    );
+    // Every frame and datum is still in the view it was in (TOP, or FRONT
+    // for the raised face's flatness frame and datum A).
+    for (f, f0) in r.fcf_blocks.iter().zip(&d.fcf_blocks) {
+        assert_eq!(r.views[f.owner_view].name, d.views[f0.owner_view].name);
+    }
+    for (s, s0) in r.datum_symbols.iter().zip(&d.datum_symbols) {
+        assert_eq!(r.views[s.owner_view].name, d.views[s0.owner_view].name);
+    }
+    assert!(r
+        .fcf_blocks
+        .iter()
+        .all(|f| ["TOP", "FRONT"].contains(&r.views[f.owner_view].name.as_str())));
+    assert!(certify_drawing(&m, r).sound, "the sheet stays sound");
+    let _ = geometry_engine::drawing::render_drawing_png(
+        r,
+        &geometry_engine::drawing::SheetCrop::whole(r),
+        400,
+    )
+    .expect("renders");
+    assert!(a
+        .delta
+        .issues_resolved
+        .iter()
+        .any(|f| f.rule == geometry_engine::drawing::Rule::ViewAlign));
+
+    let top = remove_view(&d, "TOP").map(|_| ()).unwrap_err();
+    assert_eq!(top.reason, "view_has_roles");
+    assert!(
+        top.message.contains("section") || top.message.contains("cutting-plane"),
+        "{}",
+        top.message
+    );
+    // FRONT carries the raised face's flatness frame and datum A (the face
+    // is seen there edge-on): refused for that first.
+    let front = remove_view(&d, "FRONT").map(|_| ()).unwrap_err();
+    assert_eq!(front.reason, "view_has_roles", "{}", front.message);
+    // With those held by TOP instead (as the sheet once had them), the
+    // value gate refuses it, naming FRONT's dimensions.
+    let mut s = d.clone();
+    let top_idx = s.views.iter().position(|v| v.name == "TOP").expect("TOP");
+    let front_idx = s
+        .views
+        .iter()
+        .position(|v| v.name == "FRONT")
+        .expect("FRONT");
+    for f in s
+        .fcf_blocks
+        .iter_mut()
+        .filter(|f| f.owner_view == front_idx)
+    {
+        f.owner_view = top_idx;
+    }
+    for x in s
+        .datum_symbols
+        .iter_mut()
+        .filter(|x| x.owner_view == front_idx)
+    {
+        x.owner_view = top_idx;
+    }
+    let front = act(&m, &s, remove_view(&s, "FRONT"))
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(front.reason, "drops_value");
+    assert!(
+        front.message.contains("'48'"),
+        "names what would be lost: {}",
+        front.message
+    );
+}
+
+/// A suppression of a value the sheet states nowhere else is refused; ink
+/// pushed past the frame is refused (sliding Ø165's number off the paper
+/// once lowered the sheet's empty-paper finding).
+#[test]
+fn verbs_that_lose_a_value_or_leave_the_paper_are_refused() {
+    use geometry_engine::drawing::hands::{move_dimension, remove_dimension};
+    let (m, d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let gone = act(&m, &d, remove_dimension(&d, "d23", "agent", "test"))
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(gone.reason, "drops_value");
+    assert!(gone.message.contains("Ø165"), "{}", gone.message);
+    let off = act(&m, &d, move_dimension(&d, "d23", None, None, Some(-420.0)))
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(off.reason, "off_sheet");
+    assert_eq!(
+        remove_dimension(&d, "d23", " ", "")
+            .map(|_| ())
+            .unwrap_err()
+            .reason,
+        "unsigned_suppression"
+    );
+}
+
+/// The scripted improvement the hands exist for: on the flange sheet, re-route
+/// the hub angle's leader and the six frames -- every step through the
+/// certificate gate -- and fewer spaces sit under the bar while the grade never
+/// falls. Not an agent run: it proves the verbs can move the scores. The grade
+/// is the title block's lettering before and after (1.68 mm field labels, a
+/// TEXT-HEIGHT error no layout verb reaches): with every datum symbol on its
+/// frame the automatic sheet's TOP is no longer below it. The sheet before and after is
+/// written as PNG under the test target dir (`hands/`).
+#[test]
+fn the_scripted_leader_fixes_clear_spaces_and_keep_the_grade() {
+    use geometry_engine::drawing::hands::{reattach_leader, LeaderTarget};
+    use geometry_engine::drawing::raster::{render_drawing_png, SheetCrop};
+    let (m, d0) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let start = map_of(&d0);
+    let mut d = d0.clone();
+    // The hub angle's leader, the four bolt frames and the bore's size frame
+    // (each leader ended on its hole's edge), and the flatness frame, whose
+    // leader ends on the raised face itself.
+    let mut steps = vec![("d27".to_string(), None)];
+    for n in 0..5 {
+        steps.push((format!("fcf:{n}"), Some(LeaderTarget::Nearest)));
+    }
+    steps.push(("fcf:5".to_string(), None));
+    for (subject, target) in steps {
+        let a = act(&m, &d, reattach_leader(&d, &subject, None, target))
+            .unwrap_or_else(|e| panic!("{subject}: {e:?}"));
+        assert!(
+            certify_drawing(&m, &a.plan.drawing).sound,
+            "{subject}: sound"
+        );
+        eprintln!(
+            "{subject}: grade {:.3} -> {:.3}, below bar {} -> {} | {}",
+            a.delta.grade_before,
+            a.delta.grade_after,
+            a.delta.below_bar_before,
+            a.delta.below_bar_after,
+            a.act.caption
+        );
+        d = a.plan.drawing;
+    }
+    let end = map_of(&d);
+    eprintln!(
+        "flange: grade {:.3} -> {:.3}, below bar {} -> {}; worst {:?}",
+        start.grade, end.grade, start.below_bar, end.below_bar, end.worst
+    );
+    for f in end.findings.iter().filter(|f| f.space != "title-block") {
+        eprintln!("  left: {} {:?} {}", f.space, f.rule, f.message);
+    }
+    // Nothing the frames carried is left behind, and no leader runs across a
+    // hole: every datum symbol stands on its feature's frame after the move
+    // (B on its bolt hole's position frame, A on the raised face's flatness
+    // frame), and the flatness leader ends on the raised face, not in the
+    // bore.
+    let datum = |m: &geometry_engine::drawing::SpaceMap| -> Vec<String> {
+        m.findings
+            .iter()
+            .filter(|f| f.rule == geometry_engine::drawing::Rule::DatumAttach)
+            .map(|f| f.message.clone())
+            .collect()
+    };
+    assert!(
+        datum(&end).is_empty(),
+        "every datum on its frame: {:#?}",
+        datum(&end)
+    );
+    let across: Vec<String> = end
+        .findings
+        .iter()
+        .filter(|f| f.message.contains("runs across"))
+        .map(|f| f.message.clone())
+        .collect();
+    assert!(
+        across.is_empty(),
+        "no leader runs across a hole: {across:#?}"
+    );
+    let l = compute_layout(&d);
+    let flat = l
+        .gdt_leaders
+        .iter()
+        .find(|g| g.fcf == 5)
+        .expect("the flatness leader");
+    let axis = d0.fcf_blocks[4].leader_to.expect("the bore's centre");
+    // The raised face is on the underside: TOP would see it only through
+    // the part, so its frame is in FRONT, where the face is the drawn step
+    // line, and the leader ends on that line beside the bore (FRONT shares
+    // TOP's x: the axis is the bore centre's x).
+    let flat_view = d.views[d.fcf_blocks[5].owner_view].projection;
+    assert_eq!(
+        flat_view,
+        geometry_engine::drawing::ProjectionType::Front,
+        "the flatness frame is where the raised face is seen"
+    );
+    let x = (flat.to[0] - axis[0]).abs();
+    assert!(
+        x > 27.25 + 0.5 && x < 51.0 - 0.5,
+        "on the raised face's line (x {x:.2} from the axis), not across the bore"
+    );
+    assert_eq!(
+        d.datum_symbols
+            .iter()
+            .find(|s| s.label == "A")
+            .map(|s| s.owner_view),
+        Some(d.fcf_blocks[5].owner_view),
+        "datum A is in its frame's view"
+    );
+    // No frame sits in a hole: every frame clear of the bore's disc and of
+    // each bolt hole's.
+    let mut voids = vec![(axis, 27.25)];
+    for n in 0..4 {
+        voids.push((d0.fcf_blocks[n].leader_to.expect("hole centre"), 9.0));
+    }
+    for (n, f) in l
+        .items
+        .iter()
+        .filter(|i| i.kind == geometry_engine::drawing::layout::SheetItemKind::FcfBlock)
+        .enumerate()
+    {
+        for (c, rad) in &voids {
+            let nx = c[0].clamp(f.bbox.x0, f.bbox.x1);
+            let ny = c[1].clamp(f.bbox.y0, f.bbox.y1);
+            assert!(
+                (nx - c[0]).hypot(ny - c[1]) >= *rad,
+                "frame fcf:{n} sits in a hole of r {rad}"
+            );
+        }
+    }
+    assert!(
+        end.grade >= start.grade,
+        "grade {} -> {}",
+        start.grade,
+        end.grade
+    );
+    assert!(
+        end.below_bar < start.below_bar,
+        "below bar {} -> {}",
+        start.below_bar,
+        end.below_bar
+    );
+    assert_eq!(
+        end.worst.as_deref(),
+        Some("title-block"),
+        "what is left is the title block's lettering"
+    );
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hands");
+    std::fs::create_dir_all(&dir).expect("dir");
+    for (name, sheet) in [("flange-before", &d0), ("flange-after", &d)] {
+        let png = render_drawing_png(sheet, &SheetCrop::whole(sheet), 2000).expect("png");
+        std::fs::write(dir.join(format!("{name}.png")), &png.png).expect("write");
+    }
+    eprintln!("hands pictures in {}", dir.display());
+}
+
+/// A frame is never put inside a hole. With the flatness frame held by TOP
+/// (as the sheet once had it, its leader to the raised face's ring between
+/// the hub and the bolt circle), the clearest place beside its target was
+/// the open bore, and `drawing_reattach_leader` put the frame there, its
+/// leader crossing the bore's rings. Every place inside a drawn hole is
+/// refused now.
+///
+/// Mutation: drop the void test in `frame_box_clear` -> the frame lands in
+/// the bore, fails.
+#[test]
+fn a_frame_is_never_put_in_a_hole() {
+    use geometry_engine::drawing::hands::reattach_leader;
+    let (m, mut d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let top = d.views.iter().position(|v| v.name == "TOP").expect("TOP");
+    let axis = d.fcf_blocks[4].leader_to.expect("the bore's centre");
+    d.fcf_blocks[5].owner_view = top;
+    // A point of the ring 36 mm out, 0.3 rad round from the axis.
+    d.fcf_blocks[5].leader_to =
+        Some([axis[0] + 36.0 * 0.3f64.cos(), axis[1] + 36.0 * 0.3f64.sin()]);
+    for s in d.datum_symbols.iter_mut().filter(|s| s.label == "A") {
+        s.owner_view = top;
+    }
+    let a = act(&m, &d, reattach_leader(&d, "fcf:5", None, None)).expect("moved");
+    let l = compute_layout(&a.plan.drawing);
+    let frame = l
+        .items
+        .iter()
+        .filter(|i| i.kind == geometry_engine::drawing::layout::SheetItemKind::FcfBlock)
+        .nth(5)
+        .expect("frame 5")
+        .bbox;
+    let mut holes = vec![(axis, 27.25)];
+    for n in 0..4 {
+        holes.push((d.fcf_blocks[n].leader_to.expect("hole centre"), 9.0));
+    }
+    for (c, r) in holes {
+        let nx = c[0].clamp(frame.x0, frame.x1);
+        let ny = c[1].clamp(frame.y0, frame.y1);
+        assert!(
+            (nx - c[0]).hypot(ny - c[1]) >= r,
+            "the frame {frame:?} sits in the hole of r {r} at {c:?}"
+        );
+    }
+}
+
+/// Every verb's recorded edit, through JSON, replayed on the sheet it was
+/// made on, gives the sheet the verb planned -- the property the timeline's
+/// `drawing.layout.update` replay (and so undo / redo / restart) rests on.
+#[test]
+fn every_verb_replays_to_the_sheet_it_planned() {
+    use geometry_engine::drawing::hands::{self, LeaderTarget};
+    let (m, d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let h = d.sheet_size.height();
+    let right = {
+        let v = d.views.iter().find(|v| v.name == "RIGHT").expect("RIGHT");
+        let g = geometry_engine::drawing::layout::view_geometry_rect(v, h).expect("geo");
+        [0.5 * (g.x0 + g.x1) + 18.8, 0.5 * (g.y0 + g.y1)]
+    };
+    let plans = [
+        (
+            "move_dimension lane",
+            hands::move_dimension(&d, "d20", None, Some(4), None),
+        ),
+        (
+            "move_dimension slide",
+            hands::move_dimension(&d, "d20", None, None, Some(-6.0)),
+        ),
+        ("align", hands::align(&d, &["d20".into(), "d24".into()])),
+        (
+            "move_view to",
+            hands::move_view(&d, "RIGHT", Some(right), None),
+        ),
+        (
+            "move_view align_with",
+            hands::move_view(&d, "ISOMETRIC", None, Some("TOP")),
+        ),
+        (
+            "reattach_leader dimension",
+            hands::reattach_leader(&d, "d27", None, None),
+        ),
+        (
+            "reattach_leader frame",
+            hands::reattach_leader(&d, "fcf:0", None, Some(LeaderTarget::Nearest)),
+        ),
+        ("remove_view", hands::remove_view(&d, "RIGHT")),
+    ];
+    for (what, plan) in plans {
+        let a = act(&m, &d, plan).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        let wire = serde_json::to_string(&a.plan.edit).expect("ser");
+        let edit: hands::LayoutEdit = serde_json::from_str(&wire).expect("de");
+        assert!(!edit.is_empty(), "{what}: an edit is recorded");
+        let mut replayed = d.clone();
+        replayed
+            .apply_layout_edit(&edit)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(
+            layout_print(&replayed),
+            layout_print(&a.plan.drawing),
+            "{what}: replay = live"
+        );
+    }
+}
+
+/// The gate's soundness branch: a result whose certificate goes unsound
+/// where it was sound is refused, naming the facts.
+#[test]
+fn the_certificate_gate_refuses_an_unsound_result() {
+    use geometry_engine::drawing::hands::certificate_gate;
+    let (m, d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let before = certify_drawing(&m, &d);
+    assert!(before.sound, "the flange sheet is sound");
+    let mut after = before.clone();
+    after.sound = false;
+    after.facts[0].live.verdict = SheetVerdict::Stale;
+    let refused = certificate_gate(&before, &after).map(|_| ()).unwrap_err();
+    assert_eq!(refused.reason, "unsound");
+    assert!(
+        refused
+            .message
+            .contains(&after.facts[0].label.to_lowercase()),
+        "{}",
+        refused.message
+    );
+    assert!(
+        certificate_gate(&before, &before).is_ok(),
+        "an unchanged certificate passes"
+    );
+}

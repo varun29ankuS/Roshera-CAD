@@ -791,7 +791,35 @@ pub struct PlacedFcfBlock {
     pub annotation_id: Option<String>,
 }
 
+/// Where a layout verb put a feature control frame
+/// (`drawing_reattach_leader`), keyed on the sheet by
+/// [`PlacedFcfBlock::placement_key`] so a rebuilt sheet puts the same frame
+/// there again. Sheet mm, y down.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GdtPlacement {
+    /// Top-left of the frame.
+    pub anchor: [f64; 2],
+    /// Where its leader ends on the feature; `None` keeps the frame's own
+    /// target ([`PlacedFcfBlock::leader_to`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_to: Option<[f64; 2]>,
+}
+
 impl PlacedFcfBlock {
+    /// The durable handle a placement of this frame is recorded under: the
+    /// annotation's own id when it was authored as an event, else its
+    /// feature's persistent id and its index on that feature. `None` for a
+    /// frame with neither (an older sheet): it cannot be placed by hand.
+    pub fn placement_key(&self) -> Option<String> {
+        if let Some(id) = &self.annotation_id {
+            return Some(format!("annotation:{id}"));
+        }
+        match (&self.feature_pid, self.annotation_index) {
+            (Some(pid), Some(i)) => Some(format!("feature:{pid}#{i}")),
+            _ => None,
+        }
+    }
+
     /// Full text content of the FCF frame, concatenated for bbox estimation.
     pub fn full_text(&self) -> String {
         let mut s = self.characteristic_glyph.clone();
@@ -1105,6 +1133,13 @@ pub struct Drawing {
     /// older sheets parsing.
     #[serde(default)]
     pub dimension_edits: super::dimension_edit::DimensionEdits,
+    /// Feature control frames a layout verb put by hand, by
+    /// [`PlacedFcfBlock::placement_key`]: the layout puts each exactly there
+    /// instead of searching. Each is part of a recorded
+    /// `drawing.layout.update` event. `serde(default)` keeps older sheets
+    /// parsing.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub gdt_placements: std::collections::BTreeMap<String, GdtPlacement>,
     /// The rigid move the part was drawn under, when it was not drawn where
     /// the model holds it: an assembly placement undone and/or the part
     /// squared to its natural frame ([`super::part_frame`]). Every view,
@@ -1167,6 +1202,7 @@ impl Drawing {
             round_part: None,
             hole_features: None,
             dimension_edits: super::dimension_edit::DimensionEdits::new(),
+            gdt_placements: std::collections::BTreeMap::new(),
             drawn_frame: None,
             profile_table: None,
             render_facts: RenderFacts::default(),
@@ -1197,10 +1233,113 @@ impl Drawing {
     }
 
     /// Remove a view by id; returns true if anything was removed.
+    ///
+    /// Everything the sheet holds BY VIEW INDEX follows: the axial view, the
+    /// cutting-plane line, the section, the profile table, and every datum
+    /// symbol and feature control frame keep pointing at the view they were
+    /// drawn in (indices past the removed view shift down by one). What
+    /// belonged to the removed view itself goes with it: its GD&T ink (no
+    /// view left to draw it in), the axial / section / profile-table role.
+    /// Removing RIGHT from a flange sheet used to leave SECTION A-A's index
+    /// pointing past the end of the views.
     pub fn remove_view(&mut self, id: ProjectedViewId) -> bool {
-        let before = self.views.len();
-        self.views.retain(|v| v.id != id);
-        before != self.views.len()
+        let Some(gone) = self.views.iter().position(|v| v.id == id) else {
+            return false;
+        };
+        self.views.remove(gone);
+        // The index a view now has, or `None` for the removed one.
+        let follow = |i: usize| -> Option<usize> {
+            match i.cmp(&gone) {
+                std::cmp::Ordering::Less => Some(i),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(i - 1),
+            }
+        };
+        self.axial_view_idx = self.axial_view_idx.and_then(follow);
+        if let Some(cpl) = self.cutting_plane_line.take() {
+            self.cutting_plane_line = follow(cpl.ax_view_idx).map(|ax| {
+                let mut c = cpl;
+                c.ax_view_idx = ax;
+                c
+            });
+        }
+        if let Some(sec) = self.section.take() {
+            self.section = follow(sec.section_view_idx).map(|i| SectionSemantics {
+                section_view_idx: i,
+                ..sec
+            });
+        }
+        if let Some(t) = self.profile_table.as_mut() {
+            t.owner_view = t.owner_view.and_then(follow);
+        }
+        self.datum_symbols
+            .retain_mut(|s| match follow(s.owner_view) {
+                Some(i) => {
+                    s.owner_view = i;
+                    true
+                }
+                None => false,
+            });
+        self.fcf_blocks.retain_mut(|f| match follow(f.owner_view) {
+            Some(i) => {
+                f.owner_view = i;
+                true
+            }
+            None => false,
+        });
+        true
+    }
+
+    /// What view `index` holds besides its own geometry and dimensions -- the
+    /// roles and ink that make it more than a picture: the axial view the
+    /// hole table reads, the cutting plane, the section, the profile table's
+    /// view, datum symbols and feature control frames. Empty for a view whose
+    /// removal loses only the view itself.
+    pub fn view_roles(&self, index: usize) -> Vec<String> {
+        let mut roles = Vec::new();
+        if self.axial_view_idx == Some(index) {
+            roles.push("the axial view the hole table and tags are read in".to_string());
+        }
+        if self
+            .cutting_plane_line
+            .as_ref()
+            .is_some_and(|c| c.ax_view_idx == index)
+        {
+            roles.push("the cutting-plane line".to_string());
+        }
+        if self
+            .section
+            .as_ref()
+            .is_some_and(|s| s.section_view_idx == index)
+        {
+            roles.push("the section".to_string());
+        }
+        if self
+            .profile_table
+            .as_ref()
+            .is_some_and(|t| t.owner_view == Some(index))
+        {
+            roles.push("the view the profile table is read against".to_string());
+        }
+        let datums: Vec<&str> = self
+            .datum_symbols
+            .iter()
+            .filter(|s| s.owner_view == index)
+            .map(|s| s.label.as_str())
+            .collect();
+        if !datums.is_empty() {
+            roles.push(format!("datum symbol(s) {}", datums.join(", ")));
+        }
+        let frames: Vec<String> = self
+            .fcf_blocks
+            .iter()
+            .filter(|f| f.owner_view == index)
+            .map(|f| f.full_text().trim().to_string())
+            .collect();
+        if !frames.is_empty() {
+            roles.push(format!("feature control frame(s) {}", frames.join("; ")));
+        }
+        roles
     }
 
     /// Apply an engineer's edit to one view: hidden lines on/off, a new name,

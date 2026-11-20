@@ -1149,6 +1149,7 @@ fn hole_tag_collision_with_dimension_text_flagged() {
             tag: "A1".to_string(),
             owner_view: 0,
         }],
+        gdt_leaders: Vec::new(),
     };
 
     // The verify_drawing path works at the Drawing level; check the collision

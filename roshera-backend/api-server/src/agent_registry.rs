@@ -1344,6 +1344,109 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "required": ["drawing_id"]
             }),
         ),
+        // Agent hands (POST /api/drawings/{id}/layout, drawing_hands.rs): one
+        // layout verb per tool, each recorded and undoable, refused when the
+        // sheet would go unsound or stop stating a value, answered with the
+        // score change of every space it touched; shown in the user's app.
+        t(
+            "drawing_move_dimension",
+            Drawing,
+            Experimental,
+            Curated,
+            "Move one sheet dimension to another band (top, bottom, left, right of its view) or lane (1 = nearest the outline), or slide its text along its line; recorded and undoable, answered with each touched space's score change.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "dimension": {"type": "string", "description": "dimension id from drawing_spaces / drawing_dimensions"},
+                    "band": {"type": "string", "enum": ["top", "bottom", "left", "right"], "description": "the band of its view"},
+                    "lane": {"type": "integer", "minimum": 1, "description": "the lane of the band, 1 = nearest the outline"},
+                    "offset_mm": {"type": "number", "description": "slide the text along its line, mm (right or down positive)"}
+                },
+                "required": ["drawing_id", "dimension"]
+            }),
+        ),
+        t(
+            "drawing_align",
+            Drawing,
+            Experimental,
+            Curated,
+            "Put parallel dimensions of one view on one line (one lane of one band), the lane nearest the outline that holds them all; refused when two overlap along the line.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "dimensions": {"type": "array", "items": {"type": "string"}, "minItems": 2, "description": "dimension ids to put on one line"}
+                },
+                "required": ["drawing_id", "dimensions"]
+            }),
+        ),
+        t(
+            "drawing_move_view",
+            Drawing,
+            Experimental,
+            Curated,
+            "Move a view on its sheet: its geometry's centre to a point (paper mm), or onto the projection line of another view; projected views stay on their lines and FRONT carries them.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "view": {"type": "string", "description": "view name (FRONT) or space id (view:FRONT)"},
+                    "to": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "where the view's geometry centre goes, [x, y] paper mm, y down"},
+                    "align_with": {"type": "string", "description": "a view to line it up with"}
+                },
+                "required": ["drawing_id", "view"]
+            }),
+        ),
+        t(
+            "drawing_reattach_leader",
+            Drawing,
+            Experimental,
+            Curated,
+            "Re-route a leader short at 30-60 degrees with its text clear of the views and crossing no line: a dimension's leader callout, or a feature control frame (fcf:<n>), whose leader can be ended on the edge of its feature.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "dimension": {"type": "string", "description": "a dimension id on a leader, or a frame 'fcf:<n>' from drawing_spaces"},
+                    "side": {"type": "string", "enum": ["left", "right"], "description": "which side of its feature the text or frame goes"},
+                    "target": {"type": "string", "enum": ["nearest"], "description": "frames: end the leader on the nearest edge of its feature"}
+                },
+                "required": ["drawing_id", "dimension"]
+            }),
+        ),
+        t(
+            "drawing_remove_view",
+            Drawing,
+            Experimental,
+            Curated,
+            "Take a view that adds no information off a sheet (the RIGHT view of a round part repeats FRONT); refused when a dimension would be stated on no view or the view carries the section, datums or frames.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "view": {"type": "string", "description": "view name (RIGHT) or space id (view:RIGHT)"}
+                },
+                "required": ["drawing_id", "view"]
+            }),
+        ),
+        t(
+            "drawing_remove_dimension",
+            Drawing,
+            Experimental,
+            Curated,
+            "Take a dimension the sheet already states elsewhere off it, as a signed, recorded suppression; refused when the sheet would no longer state its value.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "dimension": {"type": "string", "description": "dimension id from drawing_dimensions"},
+                    "by": {"type": "string", "description": "who removes it"},
+                    "reason": {"type": "string", "description": "why"}
+                },
+                "required": ["drawing_id", "dimension", "by"]
+            }),
+        ),
         t(
             "drawing_dimension_properties",
             Drawing,
@@ -2321,7 +2424,11 @@ mod tests {
         // as its scored spaces (GET /api/drawings/{id}/spaces).
         // 113 -> 114 (2026-11-20): drawing_look -- the agent sees a sheet, or one
         // space of it, as an image (GET /api/drawings/{id}/render.png).
-        assert_eq!(tools.len(), 114, "expected 114 tools, got {}", tools.len());
+        // 114 -> 120 (2026-11-20): the agent's hands on a sheet --
+        // drawing_move_dimension, drawing_align, drawing_move_view,
+        // drawing_reattach_leader, drawing_remove_view, drawing_remove_dimension
+        // (POST /api/drawings/{id}/layout).
+        assert_eq!(tools.len(), 120, "expected 120 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2338,7 +2445,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 126, "114 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 132, "120 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");

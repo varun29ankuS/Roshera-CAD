@@ -434,6 +434,33 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                     )),
                 }
             }
+            // One layout verb (`drawing_move_dimension`, `drawing_align`,
+            // `drawing_move_view`, `drawing_reattach_leader`,
+            // `drawing_remove_view`, `drawing_remove_dimension`): its whole
+            // edit in one event, so one undo takes it back. Applied all or
+            // nothing, as the live verb was; an edit that no longer applies
+            // (a moved view that no longer fits) is stated, never half-done.
+            geometry_engine::drawing::LAYOUT_UPDATE_EVENT => {
+                let edit = params(e).and_then(|p| p.get("edit")).and_then(|v| {
+                    serde_json::from_value::<geometry_engine::drawing::LayoutEdit>(v.clone()).ok()
+                });
+                match (target, edit) {
+                    (Some(id), Some(edit)) => {
+                        if let Some(d) = out.drawings.get_mut(&id) {
+                            if let Err(err) = d.apply_layout_edit(&edit) {
+                                out.issues.push(format!(
+                                    "sequence {}: a layout edit no longer applies: {err}",
+                                    e.sequence_number
+                                ));
+                            }
+                        }
+                    }
+                    _ => out.issues.push(format!(
+                        "sequence {}: a layout edit could not be read",
+                        e.sequence_number
+                    )),
+                }
+            }
             "drawing.delete" => {
                 if let Some(id) = target {
                     out.drawings.remove(&id);

@@ -92,8 +92,15 @@ export const SWITCHABLE_BENCHES: Bench[] = [
  * 52, the sole max). Raised by exactly the overshoot, same policy: seeing the
  * sheet, or one space of it, as a picture is the other half of the agent's
  * eyes on a drawing.
+ *
+ * 52 -> 58 (2026-11-20): the agent's hands joined the drawing bench --
+ * drawing_move_dimension, drawing_align, drawing_move_view,
+ * drawing_reattach_leader, drawing_remove_view, drawing_remove_dimension
+ * (31 + 27 = 58, the sole max). Raised by exactly the overshoot, same policy:
+ * the eyes find the worst space and these are the verbs that fix it; a bench
+ * that can see a defect and not touch it is half a bench.
  */
-export const LIVE_SURFACE_CEILING = 52;
+export const LIVE_SURFACE_CEILING = 58;
 
 /** Callback that flips real server tool handles on a bench switch. */
 export type ApplyTransition = (toEnable: string[], toDisable: string[]) => void;

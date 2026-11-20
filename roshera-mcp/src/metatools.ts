@@ -282,12 +282,19 @@ function nameTokensOf(name: string): string[] {
  * per search, over BOTH name tokens and purpose words (stemmed). A token in
  * `df` of `N` docs weighs `ln((n+1)/df)`: unique ≈ ln(n), ubiquitous ≈ small.
  */
-function buildIdf(table: ToolTable): { nameIdf: Map<string, number>; purposeIdf: Map<string, number> } {
+function buildIdf(
+  table: ToolTable,
+  counts: (name: string) => boolean = () => true,
+): { nameIdf: Map<string, number>; purposeIdf: Map<string, number> } {
   const nameDf = new Map<string, number>();
   const purposeDf = new Map<string, number>();
   const all = table.all();
   for (const entry of all) {
-    for (const tok of new Set(nameTokensOf(entry.name))) nameDf.set(tok, (nameDf.get(tok) ?? 0) + 1);
+    // `counts` decides whose NAME tokens are counted (see rankTools); every
+    // purpose is counted.
+    if (counts(entry.name)) {
+      for (const tok of new Set(nameTokensOf(entry.name))) nameDf.set(tok, (nameDf.get(tok) ?? 0) + 1);
+    }
     for (const w of new Set(tokenize(entry.description))) purposeDf.set(w, (purposeDf.get(w) ?? 0) + 1);
   }
   const n = all.length;
@@ -367,6 +374,51 @@ function scoreTool(
   return score;
 }
 
+/**
+ * A SHEET verb works on a drawing that already exists: a drawing-bench tool
+ * registered experimental (drawing_read_semantics, drawing_move_view, ...),
+ * as opposed to the stable drawing tools that start from the part
+ * (make_drawing, dimension_part, gdt_fcf). Their names carry generic verbs --
+ * move, view, remove, dimension, align -- and a name-token hit outweighs a
+ * synonym's, so "move the part 10mm to the left" ranked drawing_move_dimension
+ * above transform (2026-11-20). With no SHEET CONTEXT in the query a sheet
+ * verb's score is scaled by this factor: it still answers, below the part's
+ * own verbs.
+ */
+const SHEET_VERB_OUT_OF_CONTEXT = 0.5;
+
+/** A sheet verb, by its registration: drawing bench, experimental. */
+function isSheetVerb(name: string): boolean {
+  const { bench, stability } = metaFor(name);
+  return bench === "drawing" && stability === "experimental";
+}
+
+/**
+ * The words that put a query in a sheet's context: the drawing bench's own
+ * name, and every NAME token that only drawing-bench tools carry and that no
+ * other tool's name or purpose uses ("sheet", "semantic", "projection", ...).
+ * Read from the registry on every search, never listed by hand: a generic
+ * verb a part tool also speaks of ("move" is in transform's purpose, "view"
+ * in section_view's name) is not context.
+ */
+function sheetContextTokens(table: ToolTable): Set<string> {
+  const drawingNames = new Set<string>();
+  const elsewhere = new Set<string>();
+  for (const entry of table.all()) {
+    const { bench } = metaFor(entry.name);
+    if (bench === "drawing") {
+      for (const t of nameTokensOf(entry.name)) drawingNames.add(t);
+    } else {
+      for (const t of nameTokensOf(entry.name)) elsewhere.add(t);
+      // A word a part verb (the core bench) speaks of is not sheet context.
+      if (bench === "core") for (const t of tokenize(entry.description)) elsewhere.add(t);
+    }
+  }
+  const context = new Set<string>([stem("drawing")]);
+  for (const t of drawingNames) if (!elsewhere.has(t)) context.add(t);
+  return context;
+}
+
 /** Rank the whole table against a query; deterministic total order. */
 export function rankTools(
   table: ToolTable,
@@ -377,13 +429,22 @@ export function rankTools(
   const queryTokens = tokenize(query);
   const queryCreates = queryTokens.some((t) => CREATE_VERB_STEMS.has(t));
   const queryMutates = queryTokens.some((t) => MUTATE_VERB_STEMS.has(t));
-  const { nameIdf, purposeIdf } = buildIdf(table);
+  const context = sheetContextTokens(table);
+  const sheetContext = queryTokens.some((t) => context.has(t));
+  // Out of a sheet's context the sheet verbs are not competitors, so their
+  // NAMES do not dilute the rarity of the name tokens they share with the
+  // part's verbs either: six layout verbs named "...dimension" / "...view"
+  // lowered dimension_part's and section_view's own name-token weight.
+  const competes = (name: string) => sheetContext || !!benchFilter || !isSheetVerb(name);
+  const { nameIdf, purposeIdf } = buildIdf(table, competes);
   const scored: Scored[] = [];
   for (const entry of table.all()) {
     const { bench } = metaFor(entry.name);
     if (benchFilter && bench !== benchFilter) continue;
     const purposeWords = new Set(tokenize(entry.description));
-    const score = scoreTool(entry, queryTokens, queryCreates, queryMutates, purposeWords, nameIdf, purposeIdf);
+    let score = scoreTool(entry, queryTokens, queryCreates, queryMutates, purposeWords, nameIdf, purposeIdf);
+    // A bench filter is itself the context: the caller asked for the bench.
+    if (!sheetContext && !benchFilter && isSheetVerb(entry.name)) score *= SHEET_VERB_OUT_OF_CONTEXT;
     if (score <= 0) continue;
     scored.push({
       name: entry.name,

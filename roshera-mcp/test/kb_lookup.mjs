@@ -455,7 +455,10 @@ console.log("(2) TIER 2: playbook chunks + tool_sequence resolve against the tab
     // 888 -> 959 (2026-11-20): the LOOK step (drawing_spaces, then
     // drawing_look on the worst space) and the text-height rule corrected to
     // 2.5 mm capitals, 3.5 mm on A3 and up (ISO 3098 / BS 8888).
-    manufacturing_drawing: 959,
+    // 959 -> 1066 (2026-11-20, slice 3): the HANDS paragraph (the six layout
+    // verbs, each answering the score change and refused if the sheet would go
+    // unsound or lose a value); "removing a single view" left NOT AVAILABLE.
+    manufacturing_drawing: 1066,
   };
   for (const [key, tokens] of Object.entries(PLAYBOOK_TOKENS)) {
     const p = await lookup("playbook", key);

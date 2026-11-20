@@ -788,41 +788,22 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
     }
 
     // ── GD&T FCF leader lines (Task 6 fix wave, concern 2) ───────────────
-    // Leader lines from each FCF block's bottom-centre to its stored
-    // `leader_to` feature-edge position.  Emitted as DXF LINE entities on
-    // the GDT_FCF layer, matching the house leader style (thin tier).
-    // The filled datum-feature triangle is NOT emitted in DXF (DXF hatch
-    // portability constraint — documented in Task 6 concern 3).
-    //
-    // The layout's FcfBlock items are emitted in the same order as
-    // `drawing.fcf_blocks` by `place_gdt_annotations`, so the n-th FcfBlock
-    // layout item corresponds to `drawing.fcf_blocks[n]`.  We key by ordering
-    // index (not by full_text): two identical FCFs in the same view would
-    // otherwise map to the same (owner_view, text) key and the first would get
-    // the second's leader bbox.
-    {
-        let mut fcf_layout_items = layout
-            .items
-            .iter()
-            .filter(|it| it.kind == SheetItemKind::FcfBlock);
-
-        for fcf in &drawing.fcf_blocks {
-            // Advance the layout-item iterator in lock-step with fcf_blocks.
-            let frame_item = fcf_layout_items.next();
-            if let (Some([lx, ly_svg]), Some(frame)) = (fcf.leader_to, frame_item) {
-                let b = &frame.bbox;
-                let lx0 = 0.5 * (b.x0 + b.x1);
-                let ly0_svg = b.y1; // SVG y-down bottom of frame
-                let lx0_dxf = lx0;
-                let ly0_dxf = sheet_h - ly0_svg; // DXF y-up
-                let lx1_dxf = lx;
-                let ly1_dxf = sheet_h - ly_svg;
-                let len = ((lx1_dxf - lx0_dxf).powi(2) + (ly1_dxf - ly0_dxf).powi(2)).sqrt();
-                if len > 1.0 {
-                    add_line(dxf, LAYER_GDT_FCF, lx0_dxf, ly0_dxf, lx1_dxf, ly1_dxf);
-                }
-            }
-        }
+    // Each frame's leader exactly as the layout placed it
+    // (`SheetLayout::gdt_leaders`: from the frame side facing the feature to
+    // the feature), the one source the SVG and the space map read too.
+    // Emitted as DXF LINE entities on the GDT_FCF layer, matching the house
+    // leader style (thin tier). The filled datum-feature triangle is NOT
+    // emitted in DXF (DXF hatch portability constraint — documented in Task 6
+    // concern 3).
+    for l in &layout.gdt_leaders {
+        add_line(
+            dxf,
+            LAYER_GDT_FCF,
+            l.from[0],
+            sheet_h - l.from[1],
+            l.to[0],
+            sheet_h - l.to[1],
+        );
     }
 
     // ── Datum-origin marker (SVG parity) ─────────────────────────────────

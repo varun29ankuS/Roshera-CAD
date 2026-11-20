@@ -44,6 +44,7 @@ mod documents;
 mod documents_tests;
 mod drawing_annotate;
 mod drawing_edit;
+mod drawing_hands;
 mod drawing_mgr;
 #[cfg(test)]
 mod drawing_ownership_tests;
@@ -11477,6 +11478,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/drawings/{id}/render.png",
             get(drawing_mgr::render_png),
+        )
+        // Agent hands (slice 3): one layout verb per call, certificate-gated,
+        // recorded as one `drawing.layout.update` event, answered with the
+        // space-map delta, shown in every open app for an agent's call.
+        .route(
+            "/api/drawings/{id}/layout",
+            post(drawing_hands::layout_verb),
         )
         // Semantic readback (campaign #55 Slice 2): the queryable sheet model +
         // live-checked certificate, and the certificate-only cheap poll.

@@ -165,6 +165,34 @@ pub struct DimensionEdit {
     /// Set when the dimension is taken off the sheet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppressed: Option<Waiver>,
+    /// Which band of its view, and which lane of that band, the dimension
+    /// was put in (a layout verb: `drawing_move_dimension`,
+    /// `drawing_align`). The layout honours it before its own search and
+    /// falls back to that search when the lane has no room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<DimPlacement>,
+}
+
+/// Where a dimension was put among its view's annotation bands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DimPlacement {
+    /// The band (side of the view's geometry). A straight dimension takes
+    /// only the two bands its line can run along (a horizontal one top or
+    /// bottom, a vertical one left or right); a leader callout's shoulder
+    /// goes left or right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band: Option<super::spaces::BandSide>,
+    /// The lane, 1 = nearest the outline (`STANDOFF` out), each next one
+    /// `STACK` further.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<u32>,
+}
+
+impl DimPlacement {
+    /// True when it pins nothing.
+    pub fn is_empty(&self) -> bool {
+        self.band.is_none() && self.lane.is_none()
+    }
 }
 
 impl DimensionEdit {
@@ -175,6 +203,7 @@ impl DimensionEdit {
             && self.suffix.is_empty()
             && self.text_shift_mm.is_none()
             && self.suppressed.is_none()
+            && self.placement.is_none_or(|p| p.is_empty())
     }
 }
 
@@ -213,6 +242,9 @@ pub enum DimensionEditError {
     /// A suppression without a name.
     #[error("suppressing a dimension needs the name of who suppresses it")]
     UnsignedWaiver,
+    /// A lane outside the layout's lanes.
+    #[error("a dimension's lane is 1 (nearest the outline) to {max}")]
+    BadLane { max: usize },
 }
 
 /// The kinds a size tolerance can be inked on: the label states one value.
@@ -626,6 +658,12 @@ pub fn validate_dimension_edit(
             .all(|c| c.is_finite() && c.abs() <= MAX_DIM_SHIFT_MM)
         {
             return Err(DimensionEditError::BadShift);
+        }
+    }
+    if let Some(lane) = edit.placement.and_then(|p| p.lane) {
+        let max = super::layout::MAX_LANES;
+        if lane == 0 || lane as usize > max {
+            return Err(DimensionEditError::BadLane { max });
         }
     }
     if let Some(w) = &edit.suppressed {

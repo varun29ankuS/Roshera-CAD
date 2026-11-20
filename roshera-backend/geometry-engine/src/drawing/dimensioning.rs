@@ -3417,34 +3417,74 @@ fn view_to_sheet(vx: f64, vy: f64, pos: [f64; 2], scale: f64, sheet_h: f64) -> [
 /// views is uncommon but not forbidden (e.g. an isometric-only pictorial
 /// reference); it is documented: no orthographic view → no sheet symbology
 /// for that item.
+///
+/// `outward` says `normal_w` is a planar face's OUTWARD normal (its sign
+/// means something). Such a face is only pointed at where it is seen: a view
+/// it faces (outward normal against the camera). A face no view faces -- a
+/// flange's raised face on the underside, with no BOTTOM view -- is hidden
+/// face-on from above, so a leader there would point through the part; it
+/// goes to the view that sees it EDGE-ON (FRONT first), where it is a drawn
+/// line. An axis (`outward == false`) has no side: the most nearly axial
+/// view, as before.
 fn best_view_for_plane_normal(
     normal_w: [f64; 3],
+    outward: bool,
     views: &[super::types::ProjectedView],
 ) -> Option<usize> {
-    let mut best_idx: Option<usize> = None;
-    let mut best_dot = f64::NEG_INFINITY;
-    for (i, v) in views.iter().enumerate() {
-        // Camera look-at direction (pointing INTO the scene, −ve of camera
-        // position). Mirrors `view_dir` in the dedup logic above.
-        let cam: [f64; 3] = match v.projection {
-            ProjectionType::Front => [0.0, -1.0, 0.0],
-            ProjectionType::Top => [0.0, 0.0, -1.0],
-            ProjectionType::Right => [-1.0, 0.0, 0.0],
-            ProjectionType::Bottom => [0.0, 0.0, 1.0],
-            ProjectionType::Left => [1.0, 0.0, 0.0],
-            _ => continue, // skip Isometric / Custom for annotation views
-        };
-        // A plane whose outward normal ≈ cam direction reads as an edge in
-        // that view — that is where datum triangles and FCF leaders land.
-        let dot = cam[0] * normal_w[0] + cam[1] * normal_w[1] + cam[2] * normal_w[2];
-        let adot = dot.abs();
-        if adot > best_dot {
-            best_dot = adot;
-            best_idx = Some(i);
+    // Camera look-at direction (pointing INTO the scene), per orthographic
+    // view; Isometric / Custom are skipped for annotation views. Mirrors
+    // `view_dir` in the dedup logic above.
+    let cams: Vec<(usize, f64, u8)> = views
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            let (cam, rank): ([f64; 3], u8) = match v.projection {
+                ProjectionType::Front => ([0.0, -1.0, 0.0], 0),
+                ProjectionType::Right => ([-1.0, 0.0, 0.0], 1),
+                ProjectionType::Left => ([1.0, 0.0, 0.0], 2),
+                ProjectionType::Top => ([0.0, 0.0, -1.0], 3),
+                ProjectionType::Bottom => ([0.0, 0.0, 1.0], 4),
+                _ => return None,
+            };
+            Some((i, dot3(cam, normal_w), rank))
+        })
+        .collect();
+    if !outward {
+        let mut best: Option<(usize, f64)> = None;
+        for &(i, dot, _) in &cams {
+            if best.is_none_or(|(_, b)| dot.abs() > b) {
+                best = Some((i, dot.abs()));
+            }
+        }
+        return best.map(|(i, _)| i);
+    }
+    // Seen face-on: the view the face turns most toward (dot most negative).
+    let mut facing: Option<(usize, f64)> = None;
+    for &(i, dot, _) in &cams {
+        if dot < -FACE_SEEN_COS && facing.is_none_or(|(_, b)| dot < b) {
+            facing = Some((i, dot));
         }
     }
-    best_idx
+    if let Some((i, _)) = facing {
+        return Some(i);
+    }
+    // Seen edge-on: the view most nearly along the face (|dot| least),
+    // FRONT before the side views before TOP / BOTTOM on a tie.
+    let mut edge: Option<(usize, f64, u8)> = None;
+    for &(i, dot, rank) in &cams {
+        let better = edge.is_none_or(|(_, b, r)| {
+            dot.abs() < b - 1e-9 || ((dot.abs() - b).abs() <= 1e-9 && rank < r)
+        });
+        if better {
+            edge = Some((i, dot.abs(), rank));
+        }
+    }
+    edge.map(|(i, _, _)| i)
 }
+
+/// A planar face is seen face-on in a view when its outward normal turns
+/// toward the camera by more than this cosine (60 degrees off the axis).
+const FACE_SEEN_COS: f64 = 0.5;
 
 /// Auto-populate `drawing.datum_symbols` and `drawing.fcf_blocks` from the
 /// model's GDT sidecar and DRF for `solid_id`.
@@ -3505,16 +3545,24 @@ pub(crate) fn attach_gdt_annotations(
             // Choose the best orthographic view.  Skip when none exists —
             // placing a datum symbol in a non-orthographic view would produce
             // a geometrically wrong position (m4: no-orthographic-view guard).
-            let Some(view_idx) = best_view_for_plane_normal(normal_w, &drawing.views) else {
+            let outward = matches!(datum.kind, crate::gdt::model::DatumKind::Plane);
+            let Some(view_idx) = best_view_for_plane_normal(normal_w, outward, &drawing.views)
+            else {
                 continue;
             };
             let Some(view) = drawing.views.get(view_idx) else {
                 continue;
             };
 
-            // Project the datum feature origin to sheet space (the symbol
-            // anchor point).  The symbol box is centred on this point.
-            let vp = project_to_view(view.projection, origin_w);
+            // Project the datum feature to sheet space (the symbol anchor
+            // point): a plane's on the face itself, where it is drawn (its
+            // surface origin can sit on the axis, off the face); an axis's
+            // origin.
+            let vp = outward
+                .then(|| model.face_by_pid(datum.feature))
+                .flatten()
+                .and_then(|face_id| planar_face_target(model, face_id, view))
+                .unwrap_or_else(|| project_to_view(view.projection, origin_w));
             let anchor = view_to_sheet(vp[0], vp[1], view.position_mm, view.scale, sheet_h);
 
             drawing.datum_symbols.push(PlacedDatumSymbol {
@@ -3600,15 +3648,26 @@ pub(crate) fn attach_gdt_annotations(
         // Choose the view for this annotation.  Skip when no orthographic
         // view exists — placing an FCF in a non-orthographic view produces
         // a wrong position (m4: no-orthographic-view guard).
-        let Some(view_idx) = best_view_for_plane_normal(normal_w, &drawing.views) else {
+        let is_plane = surface.as_any().downcast_ref::<Plane>().is_some();
+        let Some(view_idx) = best_view_for_plane_normal(normal_w, is_plane, &drawing.views) else {
             continue;
         };
         let Some(view) = drawing.views.get(view_idx) else {
             continue;
         };
 
-        // Project the feature origin → sheet space (leader target).
-        let vp = project_to_view(view.projection, origin_w);
+        // The leader's target, in the view: for a plane, a point ON the face
+        // (its surface origin can lie anywhere on the plane: a revolved
+        // flange's raised face has it on the axis, inside the bore, so the
+        // flatness leader pointed into the hole), in a view that sees it; for
+        // a cylinder, its axis point (a hole's centre;
+        // `drawing_reattach_leader` can end it on the hole's edge).
+        let vp = if is_plane {
+            planar_face_target(model, face_id, view)
+                .unwrap_or_else(|| project_to_view(view.projection, origin_w))
+        } else {
+            project_to_view(view.projection, origin_w)
+        };
         let leader_to = view_to_sheet(vp[0], vp[1], view.position_mm, view.scale, sheet_h);
 
         // Build one PlacedFcfBlock per annotation on this feature.
@@ -3665,6 +3724,231 @@ pub(crate) fn attach_gdt_annotations(
             });
         }
     }
+}
+
+/// Grid a planar face's target is searched on, per side.
+const FACE_TARGET_GRID: usize = 48;
+
+/// Where a leader to the planar face `face_id` ends in `view` (view space,
+/// pre-scale): the point inside the face's outline -- inside its outer loop,
+/// outside its holes -- farthest from every line the view draws, so the
+/// leader lands on the face itself where no other feature is drawn (a
+/// flange's raised face: the clear band of its annulus, never the bore). A
+/// face seen edge-on is a line: the middle of its first edge. `None` when the
+/// face has no loops to sample.
+fn planar_face_target(
+    model: &crate::primitives::topology_builder::BRepModel,
+    face_id: crate::primitives::face::FaceId,
+    view: &super::types::ProjectedView,
+) -> Option<[f64; 2]> {
+    let face = model.faces.get(face_id)?;
+    let mut segs: Vec<[[f64; 2]; 2]> = Vec::new();
+    // Where each loop's segments start in `segs` (the outer loop first).
+    let mut loop_starts: Vec<usize> = Vec::new();
+    for loop_id in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+        loop_starts.push(segs.len());
+        let Some(lp) = model.loops.get(loop_id) else {
+            continue;
+        };
+        for edge_id in &lp.edges {
+            let Some(edge) = model.edges.get(*edge_id) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let n = if curve.is_linear(crate::math::Tolerance::default()) {
+                2
+            } else {
+                32
+            };
+            let (t0, t1) = (edge.param_range.start, edge.param_range.end);
+            let mut prev: Option<[f64; 2]> = None;
+            for i in 0..n {
+                let t = t0 + (t1 - t0) * i as f64 / (n - 1) as f64;
+                let Ok(p) = curve.point_at(t) else {
+                    prev = None;
+                    continue;
+                };
+                let q = project_to_view(view.projection, [p.x, p.y, p.z]);
+                if let Some(a) = prev {
+                    segs.push([a, q]);
+                }
+                prev = Some(q);
+            }
+        }
+    }
+    let first = *segs.first()?;
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for s in &segs {
+        for p in s {
+            x0 = x0.min(p[0]);
+            y0 = y0.min(p[1]);
+            x1 = x1.max(p[0]);
+            y1 = y1.max(p[1]);
+        }
+    }
+    let mid = [
+        0.5 * (first[0][0] + first[1][0]),
+        0.5 * (first[0][1] + first[1][1]),
+    ];
+    if x1 - x0 < 1e-6 || y1 - y0 < 1e-6 {
+        return Some(edge_on_target(&segs, &loop_starts, view).unwrap_or(mid));
+    }
+    let seg_dist = |p: [f64; 2], s: &[[f64; 2]; 2]| -> f64 {
+        let (dx, dy) = (s[1][0] - s[0][0], s[1][1] - s[0][1]);
+        let l2 = dx * dx + dy * dy;
+        let t = if l2 <= 1e-18 {
+            0.0
+        } else {
+            (((p[0] - s[0][0]) * dx + (p[1] - s[0][1]) * dy) / l2).clamp(0.0, 1.0)
+        };
+        (p[0] - s[0][0] - t * dx).hypot(p[1] - s[0][1] - t * dy)
+    };
+    // Inside the face: an odd number of its loop segments crosses the ray
+    // from the point toward +x (outer loop and holes alike).
+    let inside = |p: [f64; 2]| -> bool {
+        let mut odd = false;
+        for s in &segs {
+            let (a, b) = (s[0], s[1]);
+            if (a[1] > p[1]) != (b[1] > p[1]) {
+                let x = a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+                if x > p[0] {
+                    odd = !odd;
+                }
+            }
+        }
+        odd
+    };
+    let view_lines: Vec<[[f64; 2]; 2]> = view
+        .polylines
+        .iter()
+        .chain(view.hidden_polylines.iter())
+        .flat_map(|pl| {
+            pl.points
+                .windows(2)
+                .map(|w| [w[0], w[1]])
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut best: Option<([f64; 2], f64)> = None;
+    for i in 0..FACE_TARGET_GRID {
+        for j in 0..FACE_TARGET_GRID {
+            let p = [
+                x0 + (x1 - x0) * (i as f64 + 0.5) / FACE_TARGET_GRID as f64,
+                y0 + (y1 - y0) * (j as f64 + 0.5) / FACE_TARGET_GRID as f64,
+            ];
+            if !inside(p) {
+                continue;
+            }
+            let mut clear = segs.iter().map(|s| seg_dist(p, s)).fold(f64::MAX, f64::min);
+            for s in &view_lines {
+                clear = clear.min(seg_dist(p, s));
+            }
+            for c in view.circles.iter().chain(view.hidden_circles.iter()) {
+                clear = clear.min(((p[0] - c.cx).hypot(p[1] - c.cy) - c.r).abs());
+            }
+            if best.is_none_or(|(_, b)| clear > b + 1e-9) {
+                best = Some((p, clear));
+            }
+        }
+    }
+    Some(best.map_or(mid, |(p, _)| p))
+}
+
+/// Where a leader ends on a planar face seen EDGE-ON (its outline projects to
+/// one line): a point of that line on material -- inside the outer loop's
+/// span, outside every hole's span (a flange's raised face from the side:
+/// the ring beside the bore, never across it) -- farthest from the view's
+/// lines that cross or end near it (hidden bores, bolt holes, steps); lines
+/// lying along the face's own line are the face itself and do not count.
+/// `None` when no such point exists.
+fn edge_on_target(
+    segs: &[[[f64; 2]; 2]],
+    loop_starts: &[usize],
+    view: &super::types::ProjectedView,
+) -> Option<[f64; 2]> {
+    let outer_end = loop_starts.get(1).copied().unwrap_or(segs.len());
+    let span = |ss: &[[[f64; 2]; 2]]| -> Option<([f64; 2], [f64; 2])> {
+        let mut pts = ss.iter().flat_map(|s| s.iter().copied());
+        let first = pts.next()?;
+        Some(pts.fold((first, first), |(lo, hi), p| {
+            (
+                [lo[0].min(p[0]), lo[1].min(p[1])],
+                [hi[0].max(p[0]), hi[1].max(p[1])],
+            )
+        }))
+    };
+    let (lo, hi) = span(segs.get(..outer_end)?)?;
+    // The face's line runs along x (seen from the side) or along y.
+    let along_x = hi[0] - lo[0] >= hi[1] - lo[1];
+    let (a, b) = if along_x {
+        (lo[0], hi[0])
+    } else {
+        (lo[1], hi[1])
+    };
+    let fixed = if along_x {
+        0.5 * (lo[1] + hi[1])
+    } else {
+        0.5 * (lo[0] + hi[0])
+    };
+    if b - a < 1e-6 {
+        return None;
+    }
+    let holes: Vec<(f64, f64)> = loop_starts
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(k, &s)| {
+            let e = loop_starts.get(k + 1).copied().unwrap_or(segs.len());
+            let (l, h) = span(segs.get(s..e)?)?;
+            Some(if along_x { (l[0], h[0]) } else { (l[1], h[1]) })
+        })
+        .collect();
+    let on_line = |p: [f64; 2]| -> bool {
+        let off = if along_x { p[1] } else { p[0] };
+        (off - fixed).abs() < 1e-6
+    };
+    let cross: Vec<[[f64; 2]; 2]> = view
+        .polylines
+        .iter()
+        .chain(view.hidden_polylines.iter())
+        .flat_map(|pl| {
+            pl.points
+                .windows(2)
+                .map(|w| [w[0], w[1]])
+                .collect::<Vec<_>>()
+        })
+        .filter(|s| !(on_line(s[0]) && on_line(s[1])))
+        .collect();
+    let point = |u: f64| if along_x { [u, fixed] } else { [fixed, u] };
+    let seg_dist = |p: [f64; 2], s: &[[f64; 2]; 2]| -> f64 {
+        let (dx, dy) = (s[1][0] - s[0][0], s[1][1] - s[0][1]);
+        let l2 = dx * dx + dy * dy;
+        let t = if l2 <= 1e-18 {
+            0.0
+        } else {
+            (((p[0] - s[0][0]) * dx + (p[1] - s[0][1]) * dy) / l2).clamp(0.0, 1.0)
+        };
+        (p[0] - s[0][0] - t * dx).hypot(p[1] - s[0][1] - t * dy)
+    };
+    let mut best: Option<([f64; 2], f64)> = None;
+    for i in 0..FACE_TARGET_GRID {
+        let u = a + (b - a) * (i as f64 + 0.5) / FACE_TARGET_GRID as f64;
+        if holes.iter().any(|&(l, h)| u > l - 1e-9 && u < h + 1e-9) {
+            continue;
+        }
+        let p = point(u);
+        // The span's own ends count as lines too: keep off the corners.
+        let mut clear = (u - a).min(b - u);
+        for s in &cross {
+            clear = clear.min(seg_dist(p, s));
+        }
+        if best.is_none_or(|(_, c)| clear > c + 1e-9) {
+            best = Some((p, clear));
+        }
+    }
+    best.map(|(p, _)| p)
 }
 
 /// What a sheet inks for one GD&T annotation: the characteristic glyph, the

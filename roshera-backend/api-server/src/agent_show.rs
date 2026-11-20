@@ -72,6 +72,67 @@ pub enum ShowAction {
         #[serde(default)]
         caption: Option<String>,
     },
+    /// The agent's HANDS acted on a sheet (slice 3): every moved thing glides
+    /// from its old box to its new one, a faint ghost stays at the old place a
+    /// moment, and the caption says what was done and why by rule id.
+    /// Emitted by `POST /api/drawings/{id}/layout` itself for an agent's
+    /// request.
+    SheetAct {
+        drawing_id: uuid::Uuid,
+        verb: String,
+        moves: Vec<SheetMove>,
+        /// The rule that named what was moved, e.g. `LEADER-ANGLE`.
+        #[serde(default)]
+        rule: Option<String>,
+        #[serde(default)]
+        caption: Option<String>,
+    },
+    /// The JUDGE after an act: each touched space flashes its score change
+    /// (green better, red worse), worst first, and the bar shows the grade
+    /// change and the certificate's verdict.
+    SheetJudge {
+        drawing_id: uuid::Uuid,
+        spaces: Vec<SheetScore>,
+        grade_before: f64,
+        grade_after: f64,
+        below_bar_before: usize,
+        below_bar_after: usize,
+        /// The certificate after the act: `None` when it could not be read.
+        #[serde(default)]
+        sound: Option<bool>,
+        #[serde(default)]
+        complete: Option<bool>,
+        #[serde(default)]
+        caption: Option<String>,
+    },
+}
+
+/// One thing an act moved: its box before and after (`None` where it did not
+/// exist: a removed view has no `to`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SheetMove {
+    /// `dimension`, `view` or `frame`.
+    pub kind: String,
+    /// Its id: a dimension id, a view name, `fcf:<n>`.
+    pub id: String,
+    #[serde(default)]
+    pub from: Option<SheetRect>,
+    #[serde(default)]
+    pub to: Option<SheetRect>,
+}
+
+/// One space's score change after an act.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SheetScore {
+    pub space: String,
+    #[serde(default)]
+    pub before: Option<f64>,
+    #[serde(default)]
+    pub after: Option<f64>,
+    #[serde(default)]
+    pub rect: Option<SheetRect>,
 }
 
 /// A box on the drawing paper, mm, origin top-left, y down -- the space map's
@@ -113,10 +174,56 @@ pub struct ShowResponse {
     pub delivered_to: usize,
 }
 
+fn rect_ok(r: &SheetRect) -> bool {
+    [r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.is_finite()) && r.x1 >= r.x0 && r.y1 >= r.y0
+}
+
+fn score_ok(s: Option<f64>) -> bool {
+    s.is_none_or(|v| v.is_finite() && (0.0..=1.0).contains(&v))
+}
+
 /// Every check the type system cannot make: a feature needs a name or an
 /// anchor; a face list is not empty.
 fn validate(a: &ShowAction) -> Result<(), String> {
     match a {
+        ShowAction::SheetAct { moves, .. } => {
+            if moves.is_empty() {
+                return Err("an act moves at least one thing".into());
+            }
+            for m in moves {
+                if !matches!(m.kind.as_str(), "dimension" | "view" | "frame")
+                    || m.id.trim().is_empty()
+                {
+                    return Err("a moved thing is a dimension, view or frame with an id".into());
+                }
+                if m.from.is_none() && m.to.is_none() {
+                    return Err("a moved thing has an old box, a new box or both".into());
+                }
+                if m.from.iter().chain(m.to.iter()).any(|r| !rect_ok(r)) {
+                    return Err("a sheet box is finite with x1 >= x0 and y1 >= y0".into());
+                }
+            }
+            Ok(())
+        }
+        ShowAction::SheetJudge {
+            spaces,
+            grade_before,
+            grade_after,
+            ..
+        } => {
+            if !score_ok(Some(*grade_before)) || !score_ok(Some(*grade_after)) {
+                return Err("a grade is between 0 and 1".into());
+            }
+            for s in spaces {
+                if s.space.trim().is_empty() || !score_ok(s.before) || !score_ok(s.after) {
+                    return Err("a judged space has an id and scores between 0 and 1".into());
+                }
+                if s.rect.as_ref().is_some_and(|r| !rect_ok(r)) {
+                    return Err("a sheet box is finite with x1 >= x0 and y1 >= y0".into());
+                }
+            }
+            Ok(())
+        }
         ShowAction::Feature { name, anchor, .. }
             if name.as_deref().map(str::trim).unwrap_or("").is_empty() && anchor.is_none() =>
         {

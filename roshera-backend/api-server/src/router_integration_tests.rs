@@ -13760,7 +13760,8 @@ async fn the_spaces_route_serves_the_sheet_space_map() {
     );
     assert_eq!(
         map["rules"].as_array().map(Vec::len),
-        Some(10),
+        // 10 -> 11 (2026-11-20, slice 3 follow-up): DATUM-ATTACH.
+        Some(11),
         "{}",
         map["rules"]
     );
@@ -14068,4 +14069,335 @@ async fn an_agent_show_of_a_sheet_space_is_checked() {
     )
     .await;
     assert!(s.is_client_error(), "{s} {body}");
+}
+
+// -- Agent hands (slice 3): POST /api/drawings/{id}/layout ------------------
+
+/// Everything a registered sheet inks, as numbers: each placed dimension's
+/// line, extension lines and text anchor, each layout item's box.
+async fn sheet_print(state: &AppState, id: Uuid) -> Vec<String> {
+    let handle = state.drawings.get(&id).expect("drawing registered");
+    let d = handle.read().await.clone();
+    let l = geometry_engine::drawing::layout::compute_layout(&d);
+    l.dimensions
+        .iter()
+        .map(|p| format!("{} {:?} {:?} {:?}", p.dim_id, p.line, p.ext, p.text_anchor))
+        .chain(
+            l.items
+                .iter()
+                .map(|i| format!("{:?} {:?} {:?}", i.kind, i.text, i.bbox)),
+        )
+        .collect()
+}
+
+/// A straight dimension on the sheet with a durable key: its id, and how far
+/// its line sits from its view's geometry.
+async fn a_straight_dimension(state: &AppState, id: Uuid) -> (String, f64) {
+    let handle = state.drawings.get(&id).expect("drawing registered");
+    let d = handle.read().await.clone();
+    let l = geometry_engine::drawing::layout::compute_layout(&d);
+    let len = |s: &[[f64; 2]; 2]| (s[1][0] - s[0][0]).hypot(s[1][1] - s[0][1]);
+    l.dimensions
+        .iter()
+        .filter(|p| {
+            p.arc.is_none() && len(&p.line) > 1e-6 && len(&p.ext[0]) > 1e-6 && len(&p.ext[1]) > 1e-6
+        })
+        .filter(|p| d.find_dimension(&p.dim_id).is_some_and(|x| x.key.is_some()))
+        .find_map(|p| {
+            let geo = l.items.iter().find(|i| {
+                i.kind == geometry_engine::drawing::layout::SheetItemKind::ViewGeometry
+                    && i.owner_view == Some(p.owner_view)
+            })?;
+            let g = geo.bbox;
+            let horizontal = (p.line[0][1] - p.line[1][1]).abs() < 1e-6;
+            let dist = if horizontal {
+                (p.line[0][1] - g.y1).max(g.y0 - p.line[0][1])
+            } else {
+                (g.x0 - p.line[0][0]).max(p.line[0][0] - g.x1)
+            };
+            Some((p.dim_id.clone(), dist))
+        })
+        .expect("a straight, addressable dimension on the bored box's sheet")
+}
+
+fn layout_post(drawing: &str, body: Value, agent: bool) -> Request<Body> {
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/drawings/{drawing}/layout"))
+        .header("content-type", "application/json");
+    if agent {
+        req = req.header("X-Roshera-Agent", "Claude");
+    }
+    req.body(Body::from(body.to_string()))
+        .expect("static request must build")
+}
+
+async fn layout_events(state: &AppState) -> Vec<Value> {
+    let _ = state.timeline_recorder.settle().await;
+    let timeline = state.timeline.read().await;
+    timeline
+        .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+        .expect("events")
+        .iter()
+        .filter_map(|e| match &e.operation {
+            timeline_engine::types::Operation::Generic {
+                command_type,
+                parameters,
+            } if command_type == geometry_engine::drawing::LAYOUT_UPDATE_EVENT => {
+                // The recorder keeps the operation's own parameters under
+                // `params`, beside its input / output refs.
+                Some(parameters.get("params").unwrap_or(parameters).clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The agent's hands through the REAL router (disconnection gate: the
+/// `/layout` route, the `drawing.layout.update` event, its replay arm in
+/// `timeline_engine::drawing_history`, the AgentShow act and judge frames):
+///
+/// * a dimension moved to lane 3 is there; the answer carries the space-map
+///   delta (spaces_changed with before/after, grade, below_bar, issues) and
+///   the certificate; ONE event records the edit and the act/judge frames;
+/// * the agent's call is SHOWN: a `sheet_act` frame (old box -> new box,
+///   caption) then a `sheet_judge` frame (the changed spaces, the grade, the
+///   verdict); a person's call is not;
+/// * a rebuilt sheet (history replay) puts it in lane 3 again;
+/// * a verb that would drop a value is refused (409, `layout_verb_refused`,
+///   `details.reason` = `drops_value`), changes nothing, records nothing; a
+///   body that is no verb is refused;
+/// * one undo takes the verb back: the exact prior layout.
+#[tokio::test]
+async fn a_layout_verb_is_gated_recorded_reported_shown_and_undone() {
+    let state = make_test_state().await;
+    let drawing = bored_part_with_drawing(&state, "").await;
+    let id = Uuid::parse_str(&drawing).expect("uuid");
+    let before = sheet_print(&state, id).await;
+    let (dim, dist) = a_straight_dimension(&state, id).await;
+    let lane_of = |dist: f64| ((dist - 11.0) / 8.0).round() as i32 + 1;
+    let current = lane_of(dist);
+
+    // The nearest other lane with room. A lane without room is refused
+    // (`no_room`), changes nothing and records nothing -- the small sheet's
+    // frame ends some lanes.
+    let mut rx = crate::geometry_broadcaster().subscribe();
+    let mut found = None;
+    for target in [1, 2, 3, 4, 5].into_iter().filter(|l| *l != current) {
+        let (s, r) = dispatch(
+            &state,
+            layout_post(
+                &drawing,
+                json!({ "verb": "move_dimension", "dimension": dim, "lane": target }),
+                true,
+            ),
+        )
+        .await;
+        if s == StatusCode::OK {
+            found = Some((target, r));
+            break;
+        }
+        assert_eq!(s, StatusCode::CONFLICT, "{r}");
+        assert_eq!(r["details"]["reason"], "no_room", "{r}");
+        assert_eq!(
+            sheet_print(&state, id).await,
+            before,
+            "a refusal changes nothing"
+        );
+        assert!(
+            layout_events(&state).await.is_empty(),
+            "a refusal records nothing"
+        );
+    }
+    let (target, r) = found.expect("some other lane of the band has room");
+    assert_eq!(r["success"], true);
+    assert_eq!(r["verb"], "move_dimension");
+    let changed = r["spaces_changed"].as_array().expect("spaces_changed");
+    assert!(!changed.is_empty(), "a lane change touches spaces: {r}");
+    for c in changed {
+        assert!(
+            c["space"].is_string() && c.get("before").is_some() && c.get("after").is_some(),
+            "{c}"
+        );
+    }
+    let key = |c: &Value| c["after"].as_f64().or(c["before"].as_f64()).unwrap_or(1.0);
+    assert!(
+        changed.windows(2).all(|w| key(&w[0]) <= key(&w[1])),
+        "worst first: {changed:?}"
+    );
+    for k in ["grade_before", "grade_after"] {
+        assert!(r[k].is_number(), "{k}: {r}");
+    }
+    assert!(r["below_bar_before"].is_number() && r["below_bar_after"].is_number());
+    assert!(r["issues_created"].is_array() && r["issues_resolved"].is_array());
+    assert_eq!(r["certificate"]["sound"], true, "{r}");
+    // It is in the lane asked for: STANDOFF (11 mm) + (lane - 1) STACK (8 mm)
+    // from its view's geometry.
+    {
+        let handle = state.drawings.get(&id).expect("drawing");
+        let d = handle.read().await.clone();
+        let l = geometry_engine::drawing::layout::compute_layout(&d);
+        let p = l
+            .dimensions
+            .iter()
+            .find(|p| p.dim_id == dim)
+            .expect("still placed");
+        let g = l
+            .items
+            .iter()
+            .find(|i| {
+                i.kind == geometry_engine::drawing::layout::SheetItemKind::ViewGeometry
+                    && i.owner_view == Some(p.owner_view)
+            })
+            .expect("its view")
+            .bbox;
+        let horizontal = (p.line[0][1] - p.line[1][1]).abs() < 1e-6;
+        let d_out = if horizontal {
+            (p.line[0][1] - g.y1).max(g.y0 - p.line[0][1])
+        } else {
+            (g.x0 - p.line[0][0]).max(p.line[0][0] - g.x1)
+        };
+        let want = 11.0 + f64::from(target - 1) * 8.0;
+        assert!(
+            (d_out - want).abs() < 1e-6,
+            "lane {target}: {d_out} mm out, want {want}"
+        );
+    }
+    let after = sheet_print(&state, id).await;
+    assert_ne!(after, before, "the sheet changed");
+
+    // Shown: act then judge, for this drawing.
+    let mut frames = Vec::new();
+    while let Ok(text) = rx.try_recv() {
+        let f: Value = serde_json::from_str(&text).unwrap_or_default();
+        if f["type"] == "AgentShow" && f["payload"]["drawing_id"] == drawing.as_str() {
+            frames.push(f["payload"].clone());
+        }
+    }
+    assert_eq!(frames.len(), 2, "act and judge: {frames:?}");
+    assert_eq!(frames[0]["action"], "sheet_act");
+    assert_eq!(frames[0]["verb"], "move_dimension");
+    let mv = &frames[0]["moves"][0];
+    assert_eq!(mv["kind"], "dimension");
+    assert_eq!(mv["id"], dim.as_str());
+    assert!(
+        mv["from"].is_object() && mv["to"].is_object() && mv["from"] != mv["to"],
+        "{mv}"
+    );
+    assert!(
+        frames[0]["caption"]
+            .as_str()
+            .is_some_and(|c| c.contains("lane")),
+        "{}",
+        frames[0]
+    );
+    assert_eq!(frames[1]["action"], "sheet_judge");
+    assert_eq!(frames[1]["sound"], true);
+    assert!(frames[1]["caption"]
+        .as_str()
+        .is_some_and(|c| c.contains("grade") && c.contains("SOUND")));
+    assert!(r["shown_to"].as_u64().is_some_and(|n| n >= 1), "{r}");
+
+    // One event, carrying the edit and the frames.
+    let events = layout_events(&state).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    let p = &events[0];
+    assert_eq!(p["verb"], "move_dimension");
+    assert!(
+        p["edit"]["dimension_edits"][0]["edit"]["placement"]["lane"] == target,
+        "{p}"
+    );
+    assert_eq!(p["show"]["act"]["action"], "sheet_act");
+    assert_eq!(p["show"]["judge"]["action"], "sheet_judge");
+
+    // Replay: the sheet rebuilt from the history keeps the move.
+    let history = {
+        let _ = state.timeline_recorder.settle().await;
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("events");
+        all.sort_by_key(|e| e.sequence_number);
+        all
+    };
+    crate::drawing_mgr::rebuild_sheets_from_history(&state, history).await;
+    assert_eq!(
+        sheet_print(&state, id).await,
+        after,
+        "the rebuilt sheet replays the verb"
+    );
+
+    // Refused: a dimension stated nowhere else is not suppressed by a layout
+    // verb; nothing changes and nothing is recorded. A person's call is not
+    // shown either way.
+    let (s, refused) = dispatch(
+        &state,
+        layout_post(
+            &drawing,
+            json!({ "verb": "remove_dimension", "dimension": dim, "by": "agent" }),
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error_code"], "layout_verb_refused", "{refused}");
+    assert_eq!(refused["details"]["reason"], "drops_value", "{refused}");
+    assert_eq!(refused["details"]["verb"], "remove_dimension");
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("no longer state")),
+        "{refused}"
+    );
+    assert_eq!(
+        sheet_print(&state, id).await,
+        after,
+        "a refusal changes nothing"
+    );
+    assert_eq!(
+        layout_events(&state).await.len(),
+        1,
+        "a refusal records nothing"
+    );
+    while let Ok(text) = rx.try_recv() {
+        let f: Value = serde_json::from_str(&text).unwrap_or_default();
+        assert!(
+            !(f["type"] == "AgentShow" && f["payload"]["drawing_id"] == drawing.as_str()),
+            "nothing shown: {f}"
+        );
+    }
+    let (s, bad) = dispatch(
+        &state,
+        layout_post(&drawing, json!({ "verb": "paint_it_red" }), true),
+    )
+    .await;
+    assert!(s.is_client_error(), "{s} {bad}");
+    let (s, _) = dispatch(
+        &state,
+        layout_post(
+            &Uuid::new_v4().to_string(),
+            json!({ "verb": "remove_view", "view": "RIGHT" }),
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Undo: the verb is one step; the exact prior layout comes back.
+    let session = crate::handlers::timeline::live_session_id(&timeline_engine::BranchId::main());
+    let (us, undone) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/undo",
+            json!({ "session_id": session.to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(us, StatusCode::OK, "{undone}");
+    assert_ne!(undone["success"], false, "{undone}");
+    assert_eq!(
+        sheet_print(&state, id).await,
+        before,
+        "undo restores the exact prior layout"
+    );
 }

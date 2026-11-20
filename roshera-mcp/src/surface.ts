@@ -25,6 +25,7 @@ import { registerLensTools } from "./tools/lens.js";
 import { registerServedTools, loadCheckedInDefs, type ServedRegistry } from "./served.js";
 import { registerGdtTools } from "./tools/gdt.js";
 import { registerDrawingTools } from "./tools/drawing.js";
+import { registerDrawingHandsTools } from "./tools/drawing_hands.js";
 import { registerKbTools } from "./tools/kb.js";
 
 /**
@@ -146,6 +147,8 @@ export function buildTableWithControls(served: ServedRegistry | null = loadCheck
   if (served !== null) registerServedTools(table, served);
   registerGdtTools(table);
   registerDrawingTools(table);
+  // The agent's hands on a sheet: layout verbs (POST /api/drawings/{id}/layout).
+  registerDrawingHandsTools(table);
   // kb_lookup — FULL table only, by design (policy KB §1.1): never added to
   // CORE_SURFACE / MINIMAL_SURFACE, so the knowledge base costs the resident
   // minimal surface zero tokens; discovery rides find_tool, dispatch invoke.

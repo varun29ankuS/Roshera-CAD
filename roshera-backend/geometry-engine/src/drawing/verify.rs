@@ -1651,6 +1651,7 @@ mod harness_invariant_tests {
             items: Vec::new(),
             dimensions: Vec::new(),
             hole_tags: Vec::new(),
+            gdt_leaders: Vec::new(),
         }
     }
 

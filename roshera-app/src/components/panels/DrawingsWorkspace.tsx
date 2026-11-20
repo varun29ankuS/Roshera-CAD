@@ -21,7 +21,7 @@
  */
 
 import { SheetPanel } from './SheetPanel'
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   X,
 } from '@/components/ui/icons'
@@ -79,7 +79,16 @@ import {
   type SheetQuality,
 } from '@/lib/drawing-drag'
 import { fitSheetScale } from '@/lib/sheet-fit'
-import { lookGlide, prefersReducedMotion, PX_PER_MM, sheetLookTarget } from '@/lib/sheet-look'
+import { lookGlide, prefersReducedMotion, PX_PER_MM, sheetLookTarget, type SheetRect } from '@/lib/sheet-look'
+import {
+  actRunning,
+  flashOpacity,
+  ghostOpacity,
+  GHOST_OPACITY,
+  judgeFlashes,
+  judgeRunning,
+  movedBoxAt,
+} from '@/lib/sheet-hands'
 import { useAgentShowStore } from '@/stores/agent-show-store'
 import { withScreenInk } from '@/lib/sheet-screen-ink'
 import { exportRefusalText } from '@/lib/export-refusal'
@@ -860,6 +869,64 @@ export function DrawingsWorkspace() {
     }
     lookFrame.current = requestAnimationFrame(step)
   }, [lookShown, svg, containerSize, sheetWMm, sheetHMm, cancelLook])
+
+  // ── The agent's hands (agent eyes, slice 3) ──────────────────────
+  // ACT: a layout verb's `sheet_act` frame -- the sheet is re-read (the verb
+  // already changed it) and each moved thing's box glides from its old
+  // place to its new one over the fresh sheet, a faint ghost fading at the
+  // old place. JUDGE: the `sheet_judge` frame that follows -- each touched
+  // space flashes its score change, green better, red worse, worst first.
+  // Reduced motion: no glide, no fade, no stagger -- the same boxes and
+  // captions at once. Take over clears both (the store), leaving the sheet.
+  const sheetAct = useAgentShowStore((s) => s.sheetAct)
+  const sheetJudge = useAgentShowStore((s) => s.sheetJudge)
+  const actShown = sheetAct !== null && activeDrawing?.id === sheetAct.drawingId ? sheetAct : null
+  const judgeShown = sheetJudge !== null && activeDrawing?.id === sheetJudge.drawingId ? sheetJudge : null
+  const [actT, setActT] = useState(0)
+  const [judgeT, setJudgeT] = useState(0)
+  const handsReduced = prefersReducedMotion()
+  const actSeq = actShown?.seq ?? null
+  const actDrawing = actShown?.drawingId ?? null
+  // The verb changed the sheet: show the new one under the animation.
+  useEffect(() => {
+    if (actSeq !== null && actDrawing !== null) void refreshActive(actDrawing)
+  }, [actSeq, actDrawing, refreshActive])
+  useEffect(() => {
+    if (actSeq === null) return
+    let frame = 0
+    const start = performance.now()
+    const tick = (now: number) => {
+      const t = now - start
+      setActT(t)
+      if (actRunning(t)) frame = requestAnimationFrame(tick)
+    }
+    frame = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(frame)
+  }, [actSeq])
+  const flashes = useMemo(
+    () => (judgeShown ? judgeFlashes(judgeShown.spaces, handsReduced, judgeShown.afterMs) : []),
+    [judgeShown, handsReduced],
+  )
+  const judgeSeq = judgeShown?.seq ?? null
+  useEffect(() => {
+    if (judgeSeq === null) return
+    let frame = 0
+    const start = performance.now()
+    const tick = (now: number) => {
+      const t = now - start
+      setJudgeT(t)
+      if (judgeRunning(flashes, t)) frame = requestAnimationFrame(tick)
+    }
+    frame = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(frame)
+  }, [judgeSeq, flashes])
+  const pct = (r: SheetRect) => ({
+    left: `${(r.x0 / sheetWMm) * 100}%`,
+    top: `${(r.y0 / sheetHMm) * 100}%`,
+    width: `${(Math.max(r.x1 - r.x0, 0.5) / sheetWMm) * 100}%`,
+    height: `${(Math.max(r.y1 - r.y0, 0.5) / sheetHMm) * 100}%`,
+  })
+
   const zoomActual = useCallback(() => {
     setZoom(1)
     setZoomMode('manual')
@@ -1430,6 +1497,63 @@ export function DrawingsWorkspace() {
                     </span>
                   )}
                 </div>
+              </div>
+            )}
+            {(actShown || flashes.length > 0) && (
+              // The agent's hands: the act's moving boxes and ghosts, then the
+              // judge's score flashes, riding the sheet's box like the look.
+              <div
+                aria-hidden
+                data-agent-hands={actShown?.verb ?? 'judge'}
+                className="pointer-events-none absolute top-1/2 left-1/2"
+                style={{
+                  width: `${displayW}px`,
+                  height: `${displayH}px`,
+                  transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px))`,
+                }}
+              >
+                {actShown?.moves.map((m) => {
+                  const ghost = ghostOpacity(m, actT, handsReduced)
+                  const box = movedBoxAt(m, actT, handsReduced)
+                  return (
+                    <Fragment key={`${m.kind}:${m.id}`}>
+                      {ghost > 0 && m.from && (
+                        <div
+                          data-act-ghost={m.id}
+                          className="absolute rounded-[2px] border border-dashed border-[#d4006a] bg-[#d4006a]/10"
+                          style={{ ...pct(m.from), opacity: ghost / GHOST_OPACITY }}
+                        />
+                      )}
+                      {box && actRunning(actT) && (
+                        <div
+                          data-act-box={m.id}
+                          className="absolute rounded-[2px] border-2 border-[#d4006a] shadow-[0_0_0_3px_rgba(212,0,106,0.18)]"
+                          style={pct(box)}
+                        />
+                      )}
+                    </Fragment>
+                  )
+                })}
+                {flashes.map((f) => {
+                  const o = flashOpacity(f, judgeT, handsReduced)
+                  if (o <= 0) return null
+                  return (
+                    <div
+                      key={f.space}
+                      data-judge-space={f.space}
+                      data-judge-verdict={f.verdict}
+                      className="absolute rounded-[2px] border-2"
+                      style={{ ...pct(f.rect), borderColor: f.color, backgroundColor: `${f.color}1f`, opacity: o }}
+                    >
+                      <span
+                        className="absolute bottom-full left-0 mb-1 whitespace-nowrap rounded-sm px-1.5 py-0.5 font-mono text-[11px] leading-none text-white"
+                        style={{ backgroundColor: f.color }}
+                      >
+                        {f.space} {f.label}
+                      </span>
+                    </div>
+                  )
+                })}
               </div>
             )}
             </>

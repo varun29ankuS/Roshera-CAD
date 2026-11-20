@@ -150,6 +150,7 @@ fn layout_of(d: &Drawing, geos: &[Rect2], dims: Vec<PlacedDimension>) -> SheetLa
         items,
         dimensions: dims,
         hole_tags: Vec::new(),
+        gdt_leaders: Vec::new(),
     }
 }
 
@@ -580,7 +581,8 @@ fn every_rule_has_a_stable_id_and_basis() {
             "VIEW-ALIGN",
             "LEADER-ANGLE",
             "TEXT-HEIGHT",
-            "TRAILING-ZERO"
+            "TRAILING-ZERO",
+            "DATUM-ATTACH"
         ]
     );
     for r in Rule::ALL {
@@ -669,4 +671,191 @@ fn crossing_leaders_are_one_finding() {
         .filter(|f| f.rule == Rule::LeaderAngle && f.unit == "count")
         .collect();
     assert_eq!(crossings.len(), 1, "{crossings:#?}");
+}
+
+// -- DATUM-ATTACH ------------------------------------------------------------
+
+fn datum_sheet(hosted: bool) -> Drawing {
+    let mut d = sheet(SheetSize::A4);
+    d.datum_symbols
+        .push(crate::drawing::types::PlacedDatumSymbol {
+            label: "A".to_string(),
+            anchor: [0.0, 0.0],
+            owner_view: 0,
+            feature_pid: Some("aa".to_string()),
+        });
+    if hosted {
+        d.fcf_blocks.push(crate::drawing::types::PlacedFcfBlock {
+            characteristic_glyph: "\u{23E5}".to_string(),
+            tolerance_text: "0.05".to_string(),
+            datum_labels: Vec::new(),
+            anchor: [120.0, 150.0],
+            leader_to: None,
+            owner_view: 0,
+            feature_pid: Some("aa".to_string()),
+            annotation_index: Some(0),
+            annotation_id: None,
+        });
+    }
+    d
+}
+
+const FRAME_BOX: Rect2 = Rect2 {
+    x0: 120.0,
+    y0: 150.0,
+    x1: 140.0,
+    y1: 155.6,
+};
+
+/// A datum symbol of a feature that carries a frame stands on that frame:
+/// on it, clean; anywhere else, an error naming the frame.
+///
+/// Mutation: drop the `rule_datum_attach` call -> the stray symbol is not
+/// found, red.
+#[test]
+fn a_datum_symbol_stands_on_its_features_frame() {
+    let d = datum_sheet(true);
+    let mut on = layout_of(&d, &[GEO], Vec::new());
+    on.items.push(item(
+        SheetItemKind::FcfBlock,
+        FRAME_BOX,
+        Some(0),
+        Some("\u{23E5} 0.05"),
+    ));
+    let stand = crate::drawing::layout::hosted_datum_box(&FRAME_BOX);
+    on.items
+        .push(item(SheetItemKind::DatumSymbol, stand, Some(0), Some("A")));
+    assert!(
+        !has_rule(&space_map(&d, &on), Rule::DatumAttach),
+        "on its frame: clean"
+    );
+
+    let mut off = layout_of(&d, &[GEO], Vec::new());
+    off.items.push(item(
+        SheetItemKind::FcfBlock,
+        FRAME_BOX,
+        Some(0),
+        Some("\u{23E5} 0.05"),
+    ));
+    let stray = Rect2 {
+        x0: 60.0,
+        y0: 60.0,
+        x1: 65.6,
+        y1: 65.6,
+    };
+    off.items
+        .push(item(SheetItemKind::DatumSymbol, stray, Some(0), Some("A")));
+    let map = space_map(&d, &off);
+    let f = map
+        .findings
+        .iter()
+        .find(|f| f.rule == Rule::DatumAttach)
+        .expect("a stray datum symbol is found");
+    assert_eq!(f.severity, Severity::Error);
+    assert!(f.message.contains("fcf:0"), "{}", f.message);
+}
+
+/// A datum symbol with no frame to stand on stands on its feature or an
+/// extension line; on a dimension line it designates the dimensioned
+/// feature's axis, a different datum: an error. Floating: an error.
+#[test]
+fn an_unhosted_datum_symbol_never_stands_on_a_dimension_line() {
+    let d = datum_sheet(false);
+    let dim = hdim("d1", "40", 110.0, 150.0, 10.0, &GEO); // line at y 90
+    let tip_box = |x: f64, y: f64| {
+        let h = crate::drawing::layout::GDT_DATUM_TRI_H;
+        Rect2 {
+            x0: x - 2.8,
+            y0: y - h - 5.6,
+            x1: x + 2.8,
+            y1: y - h,
+        }
+    };
+    let mut on_line = layout_of(&d, &[GEO], vec![dim.clone()]);
+    on_line.items.push(item(
+        SheetItemKind::DatumSymbol,
+        tip_box(130.0, 90.0),
+        Some(0),
+        Some("A"),
+    ));
+    let map = space_map(&d, &on_line);
+    let f = map
+        .findings
+        .iter()
+        .find(|f| f.rule == Rule::DatumAttach)
+        .expect("on a dimension line");
+    assert!(f.message.contains("dimension line"), "{}", f.message);
+
+    let mut on_ext = layout_of(&d, &[GEO], vec![dim.clone()]);
+    // The left extension line runs x 110 from y 98.5 up to 88.5.
+    on_ext.items.push(item(
+        SheetItemKind::DatumSymbol,
+        tip_box(110.0, 95.0),
+        Some(0),
+        Some("A"),
+    ));
+    assert!(
+        !has_rule(&space_map(&d, &on_ext), Rule::DatumAttach),
+        "on an extension line: clean"
+    );
+
+    let mut floating = layout_of(&d, &[GEO], vec![dim]);
+    floating.items.push(item(
+        SheetItemKind::DatumSymbol,
+        tip_box(30.0, 30.0),
+        Some(0),
+        Some("A"),
+    ));
+    let map = space_map(&d, &floating);
+    let f = map
+        .findings
+        .iter()
+        .find(|f| f.rule == Rule::DatumAttach)
+        .expect("floating");
+    assert!(f.message.contains("floats"), "{}", f.message);
+}
+
+/// A leader that runs ACROSS a drawn circle (in and out again) is flagged;
+/// one that ends on the circle's outline is how it reaches its feature.
+///
+/// Mutation: drop `leader_across_circles` from the dimension-leader loop ->
+/// red.
+#[test]
+fn a_leader_running_across_a_hole_is_flagged() {
+    let mut d = sheet(SheetSize::A4);
+    let h = d.sheet_size.height();
+    // A hole of r 5 at sheet (130, 120) (view space y up from the sheet foot).
+    d.views[0]
+        .circles
+        .push(crate::drawing::types::ProjectedCircle {
+            cx: 130.0,
+            cy: h - 120.0,
+            r: 5.0,
+            face_ids: Vec::new(),
+        });
+    let across = layout_of(
+        &d,
+        &[GEO],
+        vec![leader("d1", "R5", [110.0, 121.0], [150.0, 119.0], 8.0)],
+    );
+    let map = space_map(&d, &across);
+    assert!(
+        map.findings.iter().any(
+            |f| f.rule == Rule::LeaderAngle && f.message.contains("runs across 1 drawn circle")
+        ),
+        "{:#?}",
+        map.findings
+    );
+    let onto = layout_of(
+        &d,
+        &[GEO],
+        vec![leader("d1", "R5", [125.0, 120.0], [105.0, 100.0], 8.0)],
+    );
+    let map = space_map(&d, &onto);
+    assert!(
+        !map.findings
+            .iter()
+            .any(|f| f.message.contains("runs across")),
+        "ending on the outline is not running across it"
+    );
 }

@@ -138,8 +138,10 @@ const table = buildTable();
   // sees a sheet as its scored spaces.
   // 128 -> 129 (2026-11-20): drawing_look (kernel, "drawing") -- the agent
   // sees a sheet, or one space of it, as an image.
-  if (table.size === 129) pass("table holds 129 tools (124 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 129`);
+  // 129 -> 135 (2026-11-20): the agent's hands on a sheet -- six layout verbs
+  // (kernel, "drawing"; POST /api/drawings/{id}/layout).
+  if (table.size === 135) pass("table holds 135 tools (130 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 135`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -174,8 +176,9 @@ const table = buildTable();
   // 119 -> 124 (2026-11-20): the five GD&T edit / delete tools.
   // 124 -> 125 (2026-11-20): drawing_spaces.
   // 125 -> 126 (2026-11-20): drawing_look.
-  if (full.length === 126) pass("full surface exposes exactly 126 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 126`);
+  // 126 -> 132 (2026-11-20): the six layout verbs (agent hands).
+  if (full.length === 132) pass("full surface exposes exactly 132 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 132`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");

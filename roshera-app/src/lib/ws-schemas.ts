@@ -156,6 +156,15 @@ export const sketchSessionSchema = z.object({
   updated_at: z.number(),
 })
 
+// A box on the drawing paper, mm, origin top-left, y down: finite, x1 >= x0,
+// y1 >= y0 (the space map's frame).
+const sheetRectSchema = z
+  .object({ x0: z.number().finite(), y0: z.number().finite(), x1: z.number().finite(), y1: z.number().finite() })
+  .refine((r) => r.x1 >= r.x0 && r.y1 >= r.y0, 'an inverted sheet box')
+
+// A space map score or grade: between 0 and 1.
+const score = z.number().finite().min(0).max(1)
+
 // ─── Discriminated union of every accepted ServerMessage variant ────
 
 export const serverMessageSchema = z.discriminatedUnion('type', [
@@ -243,10 +252,49 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
         action: z.literal('sheet_space'),
         drawing_id: z.string().uuid(),
         space: z.string().min(1).nullish(),
-        rect: z
-          .object({ x0: z.number().finite(), y0: z.number().finite(), x1: z.number().finite(), y1: z.number().finite() })
-          .refine((r) => r.x1 >= r.x0 && r.y1 >= r.y0, 'an inverted sheet box')
-          .nullish(),
+        rect: sheetRectSchema.nullish(),
+        caption: z.string().nullish(),
+      }),
+      // The agent's hands acted on a sheet (POST /api/drawings/{id}/layout
+      // emits it): each moved thing's old and new box (one may be absent: a
+      // removed view has no new box), the rule that named it, the caption.
+      z.object({
+        action: z.literal('sheet_act'),
+        drawing_id: z.string().uuid(),
+        verb: z.string().min(1),
+        moves: z
+          .array(
+            z
+              .object({
+                kind: z.enum(['dimension', 'view', 'frame']),
+                id: z.string().min(1),
+                from: sheetRectSchema.nullish(),
+                to: sheetRectSchema.nullish(),
+              })
+              .refine((m) => !!m.from || !!m.to, 'a move with neither box'),
+          )
+          .min(1),
+        rule: z.string().nullish(),
+        caption: z.string().nullish(),
+      }),
+      // ... and judged it: each touched space's score before and after.
+      z.object({
+        action: z.literal('sheet_judge'),
+        drawing_id: z.string().uuid(),
+        spaces: z.array(
+          z.object({
+            space: z.string().min(1),
+            before: score.nullish(),
+            after: score.nullish(),
+            rect: sheetRectSchema.nullish(),
+          }),
+        ),
+        grade_before: score,
+        grade_after: score,
+        below_bar_before: z.number().int().nonnegative(),
+        below_bar_after: z.number().int().nonnegative(),
+        sound: z.boolean().nullish(),
+        complete: z.boolean().nullish(),
         caption: z.string().nullish(),
       }),
     ]),
