@@ -440,7 +440,9 @@ console.log("(2) TIER 2: playbook chunks + tool_sequence resolve against the tab
     bearing_seat: 189,
     // 174 -> 372 (0d42fc2f, 2026-11-11): SPEC FIRST -- type, facing, size and
     // class are established (or asked) before any geometry.
-    flange: 372,
+    // 372 -> 433 (2026-11-21): datum B is the bore, never a bolt hole whose
+    // own frame then references B (the kernel refuses that frame now).
+    flange: 433,
     bolt_pattern: 190,
     snap_fit: 206,
     // Part-family playbooks (2026-11-18, authored in kb_data.ts, not the vault
@@ -458,7 +460,10 @@ console.log("(2) TIER 2: playbook chunks + tool_sequence resolve against the tab
     // 959 -> 1066 (2026-11-20, slice 3): the HANDS paragraph (the six layout
     // verbs, each answering the score change and refused if the sheet would go
     // unsound or lose a value); "removing a single view" left NOT AVAILABLE.
-    manufacturing_drawing: 1066,
+    // 1066 -> 1303 (2026-11-21, slice 4): the IMPROVE LOOP -- rule -> verb
+    // map, the rules no verb reaches, the stop rule (two tries on one space),
+    // undo a verb that makes a space worse, and the end-of-loop report.
+    manufacturing_drawing: 1303,
   };
   for (const [key, tokens] of Object.entries(PLAYBOOK_TOKENS)) {
     const p = await lookup("playbook", key);
