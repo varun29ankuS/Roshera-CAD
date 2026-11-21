@@ -14,125 +14,43 @@
 // usage: node agent-eval/run.mjs [--model sonnet] [--out runs/agent-eval]
 //        [--only id,id] [--repeats 1] [--timeout-min 20] [--label baseline]
 
-import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync, createWriteStream, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { TASKS, promptFor } from "./tasks.mjs";
+import { api, freshEpisodeScope, parseArgs, runClaude } from "./common.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const args = Object.fromEntries(
-  process.argv.slice(2).reduce((acc, a, i, all) => {
-    if (a.startsWith("--")) acc.push([a.slice(2), all[i + 1]?.startsWith("--") ? "true" : all[i + 1]]);
-    return acc;
-  }, []),
-);
+const args = parseArgs(process.argv.slice(2));
 const MODEL = args.model ?? "sonnet";
 const LABEL = args.label ?? "baseline";
 const OUT = resolve(args.out ?? join(here, "..", "runs", "agent-eval", LABEL));
 const ONLY = args.only ? new Set(args.only.split(",")) : null;
 const REPEATS = Number(args.repeats ?? 1);
 const TIMEOUT_MS = Number(args["timeout-min"] ?? 20) * 60_000;
-const BASE = process.env.ROSHERA_URL ?? "http://127.0.0.1:8081";
-const MCP_ENTRY = resolve(here, "..", "..", "roshera-mcp", "dist", "index.js");
-
-const KEY = readFileSync(join(homedir(), ".roshera", "api_key"), "utf8").trim();
-const AUTH = { Authorization: `ApiKey ${KEY}` };
-
-async function api(method, path, body, headers = {}) {
-  const res = await fetch(`${BASE}${path}`, {
-    method,
-    headers: { "Content-Type": "application/json", ...AUTH, ...headers },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const text = await res.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = { raw: text };
-  }
-  return { status: res.status, json };
-}
-
-function agentEnv() {
-  const env = { ...process.env };
-  for (const k of Object.keys(env)) {
-    if (k.startsWith("ANTHROPIC_") || k.startsWith("CLAUDE_CODE_USE_")) delete env[k];
-  }
-  return env;
-}
 
 /** Run one episode; resolves to its record. */
 async function episode(task, rep) {
   const name = `agent-eval:${LABEL}:${task.id}:${rep}`;
-  const doc = await api("POST", "/api/documents", { name });
-  const part = await api("POST", "/api/parts", { name });
-  const documentId = doc.json?.id;
-  const partId = part.json?.id;
-  if (!documentId || !partId) {
-    return { task: task.id, rep, outcome: "SETUP_FAILED", detail: { doc, part } };
+  const scope = await freshEpisodeScope(name);
+  if (scope.error) {
+    return { task: task.id, rep, outcome: "SETUP_FAILED", detail: scope.error };
   }
+  const { documentId, partId } = scope;
   const work = join(tmpdir(), `roshera-agent-eval-${process.pid}-${task.id}-${rep}`);
-  mkdirSync(work, { recursive: true });
-  const mcpConfig = join(work, "mcp.json");
-  writeFileSync(
-    mcpConfig,
-    JSON.stringify({
-      mcpServers: {
-        roshera: {
-          command: "node",
-          args: [MCP_ENTRY],
-          // No secret here: the MCP server reads ~/.roshera/api_key itself.
-          env: {
-            ROSHERA_URL: BASE,
-            ROSHERA_DOCUMENT: documentId,
-            ROSHERA_PART: partId,
-            ROSHERA_AMBIENT_PERCEPTION: "cert",
-          },
-        },
-      },
-    }),
-  );
   mkdirSync(OUT, { recursive: true });
   const streamPath = join(OUT, `${task.id}-${rep}.jsonl`);
-  const stream = createWriteStream(streamPath);
   const started = Date.now();
-  const claudeArgs = [
-    "-p",
-    promptFor(task),
-    "--model",
-    MODEL,
-    "--output-format",
-    "stream-json",
-    "--verbose",
-    "--mcp-config",
-    mcpConfig,
-    "--strict-mcp-config",
-    "--tools",
-    "",
-    "--allowedTools",
-    "mcp__roshera",
-    "--no-session-persistence",
-  ];
-  const exit = await new Promise((done) => {
-    const child = spawn("claude", claudeArgs, {
-      cwd: work,
-      env: agentEnv(),
-      shell: process.platform === "win32",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stderr = "";
-    child.stdout.pipe(stream);
-    child.stderr.on("data", (d) => (stderr += d));
-    const timer = setTimeout(() => child.kill(), TIMEOUT_MS);
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      done({ code, signal, stderr: stderr.slice(-2000) });
-    });
+  const exit = await runClaude({
+    prompt: promptFor(task),
+    model: MODEL,
+    work,
+    streamPath,
+    documentId,
+    partId,
+    timeoutMs: TIMEOUT_MS,
   });
-  stream.end();
   const seconds = Math.round((Date.now() - started) / 1000);
   const check = await checkResult(task, partId);
   rmSync(work, { recursive: true, force: true });
