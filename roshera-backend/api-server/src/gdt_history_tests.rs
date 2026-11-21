@@ -571,6 +571,26 @@ async fn every_gdt_refusal_changes_nothing() {
             "repeated_datum_ref",
         ),
         (
+            // The bottom face IS datum A: a frame on it referencing A would
+            // locate the datum feature relative to itself.
+            post(
+                &fcf,
+                json!({ "characteristic": "parallelism", "tolerance_mm": 0.05,
+                        "datum_refs": ["A"], "selector": face_along(-1.0) }),
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "frame_references_own_datum",
+        ),
+        (
+            // The top face's frame references A: A cannot move onto it.
+            patch(
+                &format!("/api/agent/parts/{part}/datums/A"),
+                json!({ "selector": face_along(1.0) }),
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "datum_on_own_frame",
+        ),
+        (
             patch(&format!("{fcf}/{id}"), json!({ "tolerance_mm": 0.0 })),
             StatusCode::UNPROCESSABLE_ENTITY,
             "non_positive_tolerance",

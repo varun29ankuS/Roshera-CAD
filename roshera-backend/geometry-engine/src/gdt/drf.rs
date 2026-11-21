@@ -93,6 +93,18 @@ pub enum GdtError {
         label: String,
         annotations: Vec<String>,
     },
+
+    /// Moving the datum onto this feature would make the feature's own frames
+    /// reference it, and a datum feature cannot be located relative to itself
+    /// (ASME Y14.5-2018 7.11, ISO 5459). Edit those frames first.
+    #[error(
+        "datum '{label}' on solid {solid} cannot move onto a feature whose frames {annotations:?} reference it: a datum feature cannot be located relative to itself; edit those frames first"
+    )]
+    DatumOnOwnFrame {
+        solid: SolidId,
+        label: String,
+        annotations: Vec<String>,
+    },
 }
 
 /// The result of resolving a [`Datum`] at the current model state.

@@ -111,6 +111,7 @@ function certificateLine(cert: any): string {
     c.render_only ? `${c.render_only} render_only` : null,
     c.unprovenanced ? `${c.unprovenanced} unprovenanced` : null,
     c.omitted ? `${c.omitted} OMITTED` : null,
+    c.invalid ? `${c.invalid} INVALID` : null,
     c.not_dimensioned ? `${c.not_dimensioned} NOT DIMENSIONED` : null,
     c.waived ? `${c.waived} waived` : null,
   ].filter(Boolean);

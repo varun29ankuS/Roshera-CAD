@@ -2833,7 +2833,7 @@ fn replay_gdt(
             let new_label = str_field(inner, "new_label", kind)?;
             let t = target(model)?;
             let datum = model
-                .gdt_update_datum(solid, label, Some(new_label), Some(t))
+                .gdt_update_datum_as_recorded(solid, label, Some(new_label), Some(t))
                 .map_err(|e| kernel_err(kind, &e))?;
             same_kind(datum.kind)
         }
@@ -2848,7 +2848,7 @@ fn replay_gdt(
             let id = str_field(inner, "annotation_id", kind)?;
             let t = target(model)?;
             model
-                .gdt_create_annotation(solid, id, t, annotation()?)
+                .gdt_create_annotation_as_recorded(solid, id, t, annotation()?)
                 .map(|_| ())
                 .map_err(|e| kernel_err(kind, &e))
         }
@@ -2856,7 +2856,7 @@ fn replay_gdt(
             let id = str_field(inner, "annotation_id", kind)?;
             let t = target(model)?;
             model
-                .gdt_update_annotation(solid, id, Some(t), annotation()?)
+                .gdt_update_annotation_as_recorded(solid, id, Some(t), annotation()?)
                 .map(|_| ())
                 .map_err(|e| kernel_err(kind, &e))
         }
@@ -5795,6 +5795,16 @@ mod tests {
                         .unwrap_or_default()
                 },
             ),
+            // `RecordedOperation::new(hands::LAYOUT_UPDATE_EVENT)`: a layout
+            // verb records the kernel's layout-update kind. It is a dotted
+            // drawing event (replayed by `drawing_history`, no B-Rep arm),
+            // excluded exactly like the dotted kinds above.
+            ("api-server/src/drawing_hands.rs", "hands", |_code| {
+                Some(geometry_engine::drawing::LAYOUT_UPDATE_EVENT)
+                    .filter(|kind| !kind.contains('.'))
+                    .map(|kind| vec![kind.to_string()])
+                    .unwrap_or_default()
+            }),
         ];
 
         let mut recorded: BTreeSet<String> = BTreeSet::new();

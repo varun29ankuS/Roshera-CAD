@@ -1030,10 +1030,14 @@ async function sheetExportGate(args: any): Promise<any | null> {
   // whose reason read "0 stale ... 0 dangling" beside an EMPTY witness list:
   // a refusal that will not say what it found.
   const omitted = Number(counts.omitted ?? 0);
-  if (cert.sound === false || stale > 0 || dangling > 0 || omitted > 0) {
+  // And a fourth: `invalid` facts are inked faithfully but state what cannot
+  // be inspected (a frame on datum B's own feature referencing B). Only
+  // re-referencing the frame fixes one; regeneration redraws it as it is.
+  const invalid = Number(counts.invalid ?? 0);
+  if (cert.sound === false || stale > 0 || dangling > 0 || omitted > 0 || invalid > 0) {
     const facts: any[] = Array.isArray(cert.facts) ? cert.facts : [];
     const isUnsound = (v: unknown) =>
-      v === "stale" || v === "dangling" || v === "omitted";
+      v === "stale" || v === "dangling" || v === "omitted" || v === "invalid";
     const offending = facts
       .filter((f) => isUnsound(f?.live?.verdict))
       .slice(0, 8)
@@ -1049,14 +1053,21 @@ async function sheetExportGate(args: any): Promise<any | null> {
         "every bore the model carries, so a feature missing here is present " +
         "on a fresh sheet."
       : "";
+    const invalidFacts = facts.filter((f) => f?.live?.verdict === "invalid").slice(0, 8);
+    const invalidRemedy = invalidFacts.length
+      ? " Regeneration does NOT fix an invalid frame: " +
+        invalidFacts.map((f) => String(f.live?.detail ?? f.label)).join("; ") +
+        " -- re-reference it with gdt_fcf_update (or re-letter the datums) first."
+      : "";
     return gateRefusal({
       gate: "sheet_unsound",
       reason:
         `drawing ${drawingId} is UNSOUND against the live model: ${stale} ` +
         `stale fact(s) (the model moved since this sheet was projected), ` +
         `${dangling} dangling fact(s) (a referenced face no longer exists) ` +
-        `and ${omitted} omitted fact(s) (the model carries a feature this ` +
-        "sheet does not show). A sheet that disagrees with the model — or " +
+        `${omitted} omitted fact(s) (the model carries a feature this ` +
+        `sheet does not show) and ${invalid} invalid fact(s) (a frame that ` +
+        "cannot be inspected). A sheet that disagrees with the model — or " +
         "silently leaves part of it out — would have a shop machine the " +
         "wrong part.",
       unsound_facts: offending,
@@ -1064,6 +1075,7 @@ async function sheetExportGate(args: any): Promise<any | null> {
         "Regenerate the sheet from the current model with make_drawing (it " +
         "returns a new drawing_id) and export that." +
         omissionRemedy +
+        invalidRemedy +
         " There is no override: regeneration is one cheap call, and no flow " +
         "legitimately ships a sheet that disagrees with the model it claims " +
         "to describe.",

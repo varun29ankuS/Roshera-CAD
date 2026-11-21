@@ -412,6 +412,40 @@ check("acknowledge_layout_issues does NOT bypass an omission", () => {
   assert.equal(counts.pdf, pdfCountBeforeOmission);
 });
 
+// ─── 3c. an INVALID frame: inked faithfully, uninspectable ──────────────────
+// A frame on datum B's own feature referencing B (history recorded before the
+// kernel refused that) certifies `invalid`. Regeneration redraws it as it is,
+// so the remedy must say to re-reference the frame, and the frame is a witness.
+
+cert = {
+  sound: false,
+  counts: { consistent: 5, stale: 0, dangling: 0, omitted: 0, invalid: 1 },
+  facts: [
+    { label: "25.00", live: { verdict: "consistent" } },
+    {
+      label: "⌖ Ø0.5 | A | B",
+      live: {
+        verdict: "invalid",
+        detail:
+          "⌖ Ø0.5 | A | B: this frame is on datum B's own feature and references B; " +
+          "a datum feature cannot be located relative to itself",
+      },
+    },
+  ],
+  quality: { passed: true, sheet_utilization: 0.41, issues: [] },
+};
+const i1 = await call("drawing_export_sheet", exportArgs);
+check("a sheet with an INVALID frame is refused; the remedy is re-referencing, not regenerating", () => {
+  assert.ok(isRefusal(i1, "sheet_unsound"));
+  assert.equal(counts.pdf, pdfCountBeforeOmission, "artifact endpoint never hit");
+  const j = firstJson(i1);
+  assert.match(j.reason, /1 invalid/, "the reason counts the invalid frame");
+  assert.match(j.unsound_facts.join(" "), /\[invalid\]/, "the frame is a witness");
+  assert.match(j.how_to_proceed, /does NOT fix an invalid frame/);
+  assert.match(j.how_to_proceed, /gdt_fcf_update/);
+  assert.match(j.how_to_proceed, /relative to itself/, "the kernel's reason is carried");
+});
+
 // ─── 4. unreadable certificate fails CLOSED ─────────────────────────────────
 
 // Captured rather than hardcoded: the property this check actually owns is

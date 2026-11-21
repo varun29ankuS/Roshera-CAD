@@ -664,6 +664,23 @@ pub(crate) fn datum_refusal(err: GdtError) -> Refusal {
                 "annotations": annotations,
             })),
         ),
+        GdtError::DatumOnOwnFrame {
+            solid,
+            label,
+            annotations,
+        } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "datum_on_own_frame",
+                "message": format!(
+                    "datum '{label}' on part {solid} cannot move onto a feature whose own \
+                     frame(s) reference it: a datum feature cannot be located relative to \
+                     itself; re-reference those frames to the datums ranked before '{label}' \
+                     first"
+                ),
+                "annotations": annotations,
+            })),
+        ),
     }
 }
 
@@ -707,6 +724,10 @@ pub(crate) fn edit_refusal(err: GdtEditError) -> Refusal {
         GdtEditError::KindMismatch { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, "annotation_kind_mismatch")
         }
+        GdtEditError::FrameReferencesOwnDatum { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "frame_references_own_datum",
+        ),
     };
     refusal(status, code, message)
 }
@@ -817,7 +838,9 @@ pub struct UpdateDatumRequest {
 /// - 404: part or datum not found.
 /// - 409: the new letter is taken (`duplicate_label`), or a frame references
 ///   the datum being re-lettered (`datum_referenced`, naming the frames).
-/// - 422: the new face cannot establish a datum.
+/// - 422: the new face cannot establish a datum, or its own frames
+///   reference this datum (`datum_on_own_frame`, naming the frames: a datum
+///   feature cannot be located relative to itself).
 pub async fn update_datum_handler(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,

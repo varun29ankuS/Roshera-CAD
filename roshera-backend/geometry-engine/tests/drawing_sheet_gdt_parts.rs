@@ -141,8 +141,10 @@ fn drill(m: &mut BRepModel, s: SolidId, x: f64, y: f64, z0: f64, r: f64, h: f64)
 /// square to the pipe axis) down to a 1.6 mm root face -- the bevel falls
 /// `dr * tan 37.5` along the axis over its `dr` of wall, so its cone's
 /// half-angle to the axis is 52.5 deg -- the Ø54.5 bore through; 4 x Ø18 on
-/// Ø125. Datum A the raised face, datum B a bolt hole, a Ø0.5 position frame
-/// on every bolt hole.
+/// Ø125. Datum A the raised face, datum B the bore, a Ø0.5 position frame to
+/// A|B on every bolt hole. (B was once a bolt hole, whose own frame then
+/// referenced B -- the datum feature located relative to itself; the kernel
+/// refuses that frame now, ASME Y14.5 7.11.)
 fn en1092_weld_neck_with_gdt() -> (BRepModel, SolidId) {
     let mut m = BRepModel::new();
     m.set_event_key(Some("flange".to_string()));
@@ -172,14 +174,15 @@ fn en1092_weld_neck_with_gdt() -> (BRepModel, SolidId) {
         let a = (45.0 + 90.0 * k as f64).to_radians();
         s = drill(&mut m, s, 62.5 * a.cos(), 62.5 * a.sin(), -1.0, 9.0, 20.0);
     }
-    // The flange playbook's DRF: A the seating (raised) face, B one bolt
-    // hole, the full bolt pattern positioned to A|B; flatness on the seating
-    // face and the bore's size tolerance besides.
+    // The flange playbook's DRF: A the seating (raised) face, B the bore
+    // (the locating axis), the full bolt pattern positioned to A|B; flatness
+    // on the seating face and the bore's size tolerance besides.
     let raised = planar_face(&m, s, -Vector3::Z, 2.0);
     datum(&mut m, s, "A", raised);
+    let bore = *cylinder_faces(&m, s, 27.25).first().expect("the bore");
+    datum(&mut m, s, "B", bore);
     let holes = cylinder_faces(&m, s, 9.0);
     assert_eq!(holes.len(), 4, "four bolt holes");
-    datum(&mut m, s, "B", holes[0]);
     for (k, &f) in holes.iter().enumerate() {
         let a = (45.0 + 90.0 * k as f64).to_radians();
         position(
@@ -201,8 +204,6 @@ fn en1092_weld_neck_with_gdt() -> (BRepModel, SolidId) {
         )),
     )
     .expect("flatness");
-    let bore = *cylinder_faces(&m, s, 27.25).first().expect("bore");
-    ensure_pid(&mut m, bore, "bore");
     m.gdt_create_annotation(
         s,
         "size-bore",
@@ -2047,7 +2048,7 @@ fn the_scripted_leader_fixes_clear_spaces_and_keep_the_grade() {
     }
     // Nothing the frames carried is left behind, and no leader runs across a
     // hole: every datum symbol stands on its feature's frame after the move
-    // (B on its bolt hole's position frame, A on the raised face's flatness
+    // (B on the bore's size frame, A on the raised face's flatness
     // frame), and the flatness leader ends on the raised face, not in the
     // bore.
     let datum = |m: &geometry_engine::drawing::SpaceMap| -> Vec<String> {

@@ -110,6 +110,13 @@ pub enum SheetVerdict {
     /// ([`super::dimension_edit::Waiver`]). Listed, with the name; the sheet
     /// stays complete because the gap is signed for.
     Waived,
+    /// The sheet inks the model faithfully, but what it states cannot be
+    /// inspected: a feature control frame on datum B's own feature that
+    /// references B locates the datum feature relative to itself (ASME
+    /// Y14.5-2018 7.11, ISO 5459). Live edits refuse such a frame; history
+    /// recorded before that rule can still hold one, and the sheet must not
+    /// certify it. Makes the sheet unsound; [`LiveCheck::detail`] says why.
+    Invalid,
 }
 
 impl SheetVerdict {
@@ -124,6 +131,7 @@ impl SheetVerdict {
             SheetVerdict::Omitted => "omitted",
             SheetVerdict::NotDimensioned => "not_dimensioned",
             SheetVerdict::Waived => "waived",
+            SheetVerdict::Invalid => "invalid",
         }
     }
 }
@@ -250,6 +258,11 @@ pub struct VerdictCounts {
     /// Model dimensions a named person took off the sheet.
     #[serde(default)]
     pub waived: usize,
+    /// Facts the sheet states that cannot be inspected (a frame locating a
+    /// datum feature relative to itself). `serde(default)`: older
+    /// certificates had none to count.
+    #[serde(default)]
+    pub invalid: usize,
 }
 
 impl VerdictCounts {
@@ -265,6 +278,7 @@ impl VerdictCounts {
                 SheetVerdict::Omitted => c.omitted += 1,
                 SheetVerdict::NotDimensioned => c.not_dimensioned += 1,
                 SheetVerdict::Waived => c.waived += 1,
+                SheetVerdict::Invalid => c.invalid += 1,
             }
         }
         c
@@ -294,7 +308,9 @@ pub struct SheetReadbackCertificate {
     /// - every entity the sheet names still resolves in the live model (no
     ///   `dangling`);
     /// - every bore the live model carries has a counterpart on the sheet (no
-    ///   `omitted`).
+    ///   `omitted`);
+    /// - nothing the sheet states is uninspectable (no `invalid` -- a frame
+    ///   locating a datum feature relative to itself).
     ///
     /// The third clause is what makes this a two-way claim. Until Task 17 the
     /// certificate walked only the sheet's own collections, so it could say
@@ -346,14 +362,17 @@ pub struct SheetReadbackCertificate {
 }
 
 impl SheetReadbackCertificate {
-    /// Facts whose verdict is `stale`, `dangling` or `omitted` — the ones a
-    /// reader must not trust the sheet on. Exactly the set `sound` is the
-    /// emptiness of, so the two can never disagree.
+    /// Facts whose verdict is `stale`, `dangling`, `omitted` or `invalid` —
+    /// the ones a reader must not trust the sheet on. Exactly the set `sound`
+    /// is the emptiness of, so the two can never disagree.
     pub fn unsound_facts(&self) -> impl Iterator<Item = &SheetFact> {
         self.facts.iter().filter(|f| {
             matches!(
                 f.live.verdict,
-                SheetVerdict::Stale | SheetVerdict::Dangling | SheetVerdict::Omitted
+                SheetVerdict::Stale
+                    | SheetVerdict::Dangling
+                    | SheetVerdict::Omitted
+                    | SheetVerdict::Invalid
             )
         })
     }
@@ -610,7 +629,18 @@ fn fcf_live_check(model: &BRepModel, block: &super::types::PlacedFcfBlock) -> Li
         && ink.tolerance == block.tolerance_text
         && ink.datums == block.datum_labels;
     if same {
-        annotation_check(SheetVerdict::Consistent, None)
+        match crate::gdt::edit::own_datum_ref(model, pid, annotation) {
+            Some(label) => annotation_check(
+                SheetVerdict::Invalid,
+                Some(format!(
+                    "{}: this frame is on datum {label}'s own feature and references {label}; \
+                     a datum feature cannot be located relative to itself (ASME Y14.5 7.11, \
+                     ISO 5459) -- reference only the datums ranked before {label}",
+                    block.full_text()
+                )),
+            ),
+            None => annotation_check(SheetVerdict::Consistent, None),
+        }
     } else {
         annotation_check(
             SheetVerdict::Stale,
@@ -1603,8 +1633,11 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
     };
 
     let counts = VerdictCounts::tally(&facts);
-    let sound =
-        missing_part.is_none() && counts.stale == 0 && counts.dangling == 0 && counts.omitted == 0;
+    let sound = missing_part.is_none()
+        && counts.stale == 0
+        && counts.dangling == 0
+        && counts.omitted == 0
+        && counts.invalid == 0;
     let complete = counts.omitted == 0 && counts.not_dimensioned == 0;
     let omission_summary = super::completeness::omission_summary(&omissions);
     SheetReadbackCertificate {
@@ -2616,6 +2649,76 @@ mod tests {
                 .iter()
                 .any(|f| f.kind == SheetFactKind::Fcf && f.live.verdict == SheetVerdict::Omitted),
             "a frame the part carries and the sheet does not show is omitted"
+        );
+    }
+
+    /// History recorded before the self-reference rule can hold a frame on
+    /// datum B's own feature that references B. Replay keeps it; the sheet
+    /// inks it faithfully, and the certificate must still refuse to call the
+    /// sheet sound: a datum feature cannot be located relative to itself.
+    #[test]
+    fn a_frame_referencing_its_own_features_datum_is_invalid_and_unsound() {
+        use crate::drawing::dimensioning::standard_drawing_auto;
+        use crate::gdt::model::{Annotation, FeatureControlFrame, GeometricCharacteristic};
+        use crate::gdt::FeatureTarget;
+        use crate::primitives::surface::Plane;
+
+        let mut m = BRepModel::new();
+        m.set_event_key(Some("gdt-plate".into()));
+        let s = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(40.0, 30.0, 10.0)
+            .expect("box"));
+        m.set_event_key(None);
+        let along = |m: &BRepModel, nz: f64| {
+            crate::gdt::drf::solid_face_ids(m, s)
+                .into_iter()
+                .find(|&f| {
+                    let face = m.faces.get(f).expect("face");
+                    m.surfaces
+                        .get(face.surface_id)
+                        .and_then(|x| x.as_any().downcast_ref::<Plane>())
+                        .is_some_and(|p| (p.normal * face.orientation.sign()).z * nz > 0.99)
+                })
+                .expect("a face along Z")
+        };
+        let (bottom, top) = (along(&m, -1.0), along(&m, 1.0));
+        m.gdt_designate_datum(s, "A", FeatureTarget::Face(bottom))
+            .expect("datum A");
+        m.gdt_designate_datum(s, "B", FeatureTarget::Face(top))
+            .expect("datum B");
+        let par = |datum: &str| {
+            Annotation::Geometric(FeatureControlFrame::orientation(
+                GeometricCharacteristic::Parallelism,
+                0.05,
+                datum,
+            ))
+        };
+        m.gdt_create_annotation_as_recorded(s, "par", FeatureTarget::Face(top), par("B"))
+            .expect("recorded history replays as recorded");
+        let sheet = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+        let cert = certify_drawing(&m, &sheet);
+        let fcf = cert
+            .facts
+            .iter()
+            .find(|f| f.kind == SheetFactKind::Fcf)
+            .expect("the frame is inked");
+        assert_eq!(fcf.live.verdict, SheetVerdict::Invalid);
+        let detail = fcf.live.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("datum B's own feature") && detail.contains("relative to itself"),
+            "the reason is stated: {detail:?}"
+        );
+        assert_eq!(cert.counts.invalid, 1);
+        assert!(!cert.sound, "an uninspectable frame does not certify");
+        assert_eq!(cert.unsound_facts().count(), 1);
+
+        // Re-referencing the frame to A (a live, valid edit) makes it sound.
+        m.gdt_update_annotation(s, "par", None, par("A"))
+            .expect("B's frame to A");
+        let rebuilt = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("rebuilt");
+        assert!(
+            certify_drawing(&m, &rebuilt).sound,
+            "fixed, the sheet is true"
         );
     }
 }

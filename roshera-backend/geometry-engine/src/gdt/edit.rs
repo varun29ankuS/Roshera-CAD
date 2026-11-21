@@ -54,6 +54,15 @@
 //! datum a frame references cannot be deleted or re-lettered
 //! ([`GdtError::DatumReferenced`]) — the frame would silently lose its
 //! reference.
+//!
+//! A datum feature cannot be located relative to itself (ASME Y14.5-2018
+//! 7.11, ISO 5459): a live frame on datum B's feature that references B is
+//! refused ([`GdtEditError::FrameReferencesOwnDatum`]), and so is moving a
+//! datum onto a feature whose frames reference it ([`GdtError::DatumOnOwnFrame`]).
+//! Replay keeps history recorded before the rule as recorded (the
+//! `*_as_recorded` mediators), and the sheet certificate states each such
+//! frame invalid (`SheetVerdict::Invalid`) — nothing saved is lost, and
+//! nothing invalid certifies.
 
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -133,6 +142,15 @@ pub enum GdtEditError {
         owner: SolidId,
         solid: SolidId,
     },
+
+    /// The frame sits on the feature designated datum `label` and references
+    /// `label`: a datum feature cannot be located relative to itself (ASME
+    /// Y14.5-2018 7.11, ISO 5459). Its frame references only the datums ranked
+    /// before it -- datum B's position frame reads `|A|`, never `|A|B|`.
+    #[error(
+        "frame '{id}' is on datum {label}'s own feature and references {label}: a datum feature cannot be located relative to itself; reference only the datums ranked before {label}"
+    )]
+    FrameReferencesOwnDatum { id: String, label: String },
 
     /// An edit would change what kind of annotation this is.
     #[error("annotation '{id}' is a {found} tolerance; it cannot be edited into a {expected} one")]
@@ -274,6 +292,61 @@ pub fn validate_size(tolerance: &DimensionalTolerance) -> Result<(), GdtEditErro
         }
     }
     Ok(())
+}
+
+/// The datum letters designated on `feature`, on any part (a persistent id
+/// belongs to one part).
+fn datum_letters_on(model: &BRepModel, feature: PersistentId) -> Vec<&str> {
+    model
+        .drf
+        .values()
+        .flat_map(|f| f.datums.iter())
+        .filter(|d| d.feature == feature)
+        .map(|d| d.label.as_str())
+        .collect()
+}
+
+/// The letter of the datum on `feature` that `annotation` references, when
+/// it references one: a frame placed there would locate the datum feature
+/// relative to itself.
+pub(crate) fn own_datum_ref(
+    model: &BRepModel,
+    feature: PersistentId,
+    annotation: &Annotation,
+) -> Option<String> {
+    let Annotation::Geometric(fcf) = annotation else {
+        return None;
+    };
+    let own = datum_letters_on(model, feature);
+    fcf.datum_refs
+        .iter()
+        .find(|r| own.contains(&r.label.as_str()))
+        .map(|r| r.label.clone())
+}
+
+/// Refuse a live frame on `feature` that references the datum on `feature`.
+fn refuse_own_datum_ref(
+    model: &BRepModel,
+    id: &str,
+    feature: PersistentId,
+    annotation: &Annotation,
+) -> Result<(), GdtEditError> {
+    match own_datum_ref(model, feature, annotation) {
+        Some(label) => Err(GdtEditError::FrameReferencesOwnDatum {
+            id: id.to_string(),
+            label,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Whether an edit is a live request (every rule applies) or the replay of
+/// recorded history (kept as recorded, so nothing saved is lost; the sheet
+/// certificate judges what the history holds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditSource {
+    Live,
+    Recorded,
 }
 
 /// Validate any annotation for `solid`.
@@ -445,9 +518,34 @@ impl BRepModel {
 
     /// Re-letter a datum and/or move it to another feature, keeping its
     /// precedence, and record `gdt_datum_update`. A datum a frame references
-    /// cannot be re-lettered ([`GdtError::DatumReferenced`]).
+    /// cannot be re-lettered ([`GdtError::DatumReferenced`]), nor moved onto a
+    /// feature whose own frames reference it ([`GdtError::DatumOnOwnFrame`]).
     pub fn gdt_update_datum(
         &mut self,
+        solid: SolidId,
+        label: &str,
+        new_label: Option<&str>,
+        target: Option<FeatureTarget>,
+    ) -> Result<Datum, GdtError> {
+        self.update_datum_from(EditSource::Live, solid, label, new_label, target)
+    }
+
+    /// [`Self::gdt_update_datum`] replaying recorded history: kept as recorded
+    /// even where it puts the datum under its own feature's frame (the sheet
+    /// certificate states that frame invalid). Timeline replay only.
+    pub fn gdt_update_datum_as_recorded(
+        &mut self,
+        solid: SolidId,
+        label: &str,
+        new_label: Option<&str>,
+        target: Option<FeatureTarget>,
+    ) -> Result<Datum, GdtError> {
+        self.update_datum_from(EditSource::Recorded, solid, label, new_label, target)
+    }
+
+    fn update_datum_from(
+        &mut self,
+        source: EditSource,
         solid: SolidId,
         label: &str,
         new_label: Option<&str>,
@@ -493,6 +591,33 @@ impl BRepModel {
                 self.face_by_pid(current.feature),
             ),
         };
+        if source == EditSource::Live && feature != current.feature {
+            let annotations: Vec<String> = self
+                .gdt
+                .annotations(feature)
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| match a {
+                    Annotation::Geometric(fcf) => {
+                        fcf.datum_refs.iter().any(|r| r.label == new_label)
+                    }
+                    Annotation::Dimensional(_) => false,
+                })
+                .map(|(i, _)| {
+                    self.gdt
+                        .annotation_id(feature, i)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{}#{i}", pid_hex(feature)))
+                })
+                .collect();
+            if !annotations.is_empty() {
+                return Err(GdtError::DatumOnOwnFrame {
+                    solid,
+                    label: new_label.to_string(),
+                    annotations,
+                });
+            }
+        }
         let updated = Datum::new(new_label, kind, feature);
         if let Some(slot) = self
             .drf
@@ -553,9 +678,35 @@ impl BRepModel {
     }
 
     /// Attach a new identified annotation to a feature of `solid` and record
-    /// `gdt_annotation_create`. Returns the feature's persistent id.
+    /// `gdt_annotation_create`. Returns the feature's persistent id. A frame
+    /// referencing the datum on its own feature is refused
+    /// ([`GdtEditError::FrameReferencesOwnDatum`]).
     pub fn gdt_create_annotation(
         &mut self,
+        solid: SolidId,
+        id: &str,
+        target: FeatureTarget,
+        annotation: Annotation,
+    ) -> Result<PersistentId, GdtEditError> {
+        self.create_annotation_from(EditSource::Live, solid, id, target, annotation)
+    }
+
+    /// [`Self::gdt_create_annotation`] replaying recorded history: a frame
+    /// that references the datum on its own feature is kept as recorded (the
+    /// sheet certificate states it invalid). Timeline replay only.
+    pub fn gdt_create_annotation_as_recorded(
+        &mut self,
+        solid: SolidId,
+        id: &str,
+        target: FeatureTarget,
+        annotation: Annotation,
+    ) -> Result<PersistentId, GdtEditError> {
+        self.create_annotation_from(EditSource::Recorded, solid, id, target, annotation)
+    }
+
+    fn create_annotation_from(
+        &mut self,
+        source: EditSource,
         solid: SolidId,
         id: &str,
         target: FeatureTarget,
@@ -566,6 +717,9 @@ impl BRepModel {
         }
         let (feature, face) = self.annotation_target(solid, target)?;
         validate_annotation(self, solid, &annotation)?;
+        if source == EditSource::Live {
+            refuse_own_datum_ref(self, id, feature, &annotation)?;
+        }
         let recorded = serde_json::to_value(&annotation).unwrap_or(Value::Null);
         if !self.gdt.attach_identified(id, solid, feature, annotation) {
             return Err(GdtEditError::DuplicateAnnotationId { id: id.to_string() });
@@ -606,9 +760,35 @@ impl BRepModel {
 
     /// Replace identified annotation `id` (optionally moving it to another
     /// feature) and record `gdt_annotation_update` with its full new state.
-    /// The annotation keeps its kind (a frame stays a frame).
+    /// The annotation keeps its kind (a frame stays a frame), and a frame may
+    /// not come to reference the datum on its own feature
+    /// ([`GdtEditError::FrameReferencesOwnDatum`]).
     pub fn gdt_update_annotation(
         &mut self,
+        solid: SolidId,
+        id: &str,
+        target: Option<FeatureTarget>,
+        annotation: Annotation,
+    ) -> Result<PersistentId, GdtEditError> {
+        self.update_annotation_from(EditSource::Live, solid, id, target, annotation)
+    }
+
+    /// [`Self::gdt_update_annotation`] replaying recorded history, kept as
+    /// recorded (see [`Self::gdt_create_annotation_as_recorded`]). Timeline
+    /// replay only.
+    pub fn gdt_update_annotation_as_recorded(
+        &mut self,
+        solid: SolidId,
+        id: &str,
+        target: Option<FeatureTarget>,
+        annotation: Annotation,
+    ) -> Result<PersistentId, GdtEditError> {
+        self.update_annotation_from(EditSource::Recorded, solid, id, target, annotation)
+    }
+
+    fn update_annotation_from(
+        &mut self,
+        source: EditSource,
         solid: SolidId,
         id: &str,
         target: Option<FeatureTarget>,
@@ -627,6 +807,9 @@ impl BRepModel {
             None => (home.feature, self.face_by_pid(home.feature)),
         };
         validate_annotation(self, solid, &annotation)?;
+        if source == EditSource::Live {
+            refuse_own_datum_ref(self, id, feature, &annotation)?;
+        }
         let recorded = serde_json::to_value(&annotation).unwrap_or(Value::Null);
         self.gdt.remove_identified(id);
         self.gdt.attach_identified(id, solid, feature, annotation);
@@ -864,6 +1047,106 @@ mod tests {
             .expect("an unreferenced datum re-letters");
         m.gdt_delete_datum(s, "D").expect("and deletes");
         assert!(m.drf.get(&s).is_none_or(|f| f.is_empty()));
+    }
+
+    /// A datum feature cannot be located relative to itself (ASME Y14.5-2018
+    /// 7.11, ISO 5459): the frame on datum B's feature may reference A, never
+    /// B. Every live edit that would make such a frame is refused and changes
+    /// nothing -- creating it, editing a frame into it, or moving the datum
+    /// onto a feature whose frame already references that letter.
+    #[test]
+    fn a_frame_may_not_reference_the_datum_on_its_own_feature() {
+        let mut m = BRepModel::new();
+        let s = plate(&mut m, "p", 10.0, 10.0, 10.0);
+        let bottom = face_along(&m, s, -1.0);
+        let top = face_along(&m, s, 1.0);
+        m.gdt_designate_datum(s, "A", FeatureTarget::Face(bottom))
+            .expect("A");
+        m.gdt_designate_datum(s, "B", FeatureTarget::Face(top))
+            .expect("B");
+        let before = (m.drf.clone(), m.gdt.clone());
+        let own = |refs: &[&str]| {
+            Annotation::Geometric(frame(GeometricCharacteristic::Parallelism, 0.05, refs))
+        };
+        for refs in [&["B"][..], &["A", "B"][..]] {
+            let err = m
+                .gdt_create_annotation(s, "par", FeatureTarget::Face(top), own(refs))
+                .expect_err("a frame on B's feature referencing B");
+            assert_eq!(
+                err,
+                GdtEditError::FrameReferencesOwnDatum {
+                    id: "par".into(),
+                    label: "B".into(),
+                },
+                "{refs:?}"
+            );
+            assert_eq!(
+                (m.drf.clone(), m.gdt.clone()),
+                before,
+                "{refs:?} changed the model"
+            );
+        }
+        m.gdt_create_annotation(s, "par", FeatureTarget::Face(top), own(&["A"]))
+            .expect("B's own frame references A");
+        let before = (m.drf.clone(), m.gdt.clone());
+        assert_eq!(
+            m.gdt_update_annotation(s, "par", None, own(&["B"])),
+            Err(GdtEditError::FrameReferencesOwnDatum {
+                id: "par".into(),
+                label: "B".into(),
+            })
+        );
+        assert_eq!(
+            (m.drf.clone(), m.gdt.clone()),
+            before,
+            "the update changed the model"
+        );
+        // Moving A onto the top face would make "par" (on top, to A) reference
+        // the datum on its own feature.
+        m.gdt_delete_datum(s, "B").expect("B is unreferenced");
+        let before = (m.drf.clone(), m.gdt.clone());
+        assert_eq!(
+            m.gdt_update_datum(s, "A", None, Some(FeatureTarget::Face(top))),
+            Err(GdtError::DatumOnOwnFrame {
+                solid: s,
+                label: "A".into(),
+                annotations: vec!["par".into()],
+            })
+        );
+        assert_eq!(
+            (m.drf.clone(), m.gdt.clone()),
+            before,
+            "the move changed the model"
+        );
+    }
+
+    /// History recorded before the rule is replayed AS RECORDED: the frame is
+    /// kept (nothing saved is lost) and the sheet certificate states it
+    /// invalid. Only live edits are refused.
+    #[test]
+    fn a_recorded_self_referencing_frame_replays_as_recorded() {
+        let mut m = BRepModel::new();
+        let s = plate(&mut m, "p", 10.0, 10.0, 10.0);
+        let bottom = face_along(&m, s, -1.0);
+        let top = face_along(&m, s, 1.0);
+        m.gdt_designate_datum(s, "A", FeatureTarget::Face(bottom))
+            .expect("A");
+        m.gdt_designate_datum(s, "B", FeatureTarget::Face(top))
+            .expect("B");
+        let own = Annotation::Geometric(frame(GeometricCharacteristic::Parallelism, 0.05, &["B"]));
+        m.gdt_create_annotation_as_recorded(s, "par", FeatureTarget::Face(top), own.clone())
+            .expect("replay keeps what the history recorded");
+        assert!(m.gdt.identified("par").is_some());
+        m.gdt_update_annotation_as_recorded(s, "par", None, own.clone())
+            .expect("and its recorded updates");
+        let top_pid = m.face_pid(top).expect("pid");
+        assert_eq!(
+            own_datum_ref(&m, top_pid, &own).as_deref(),
+            Some("B"),
+            "the certificate's question: does this frame reference its own feature's datum"
+        );
+        let on_a = Annotation::Geometric(frame(GeometricCharacteristic::Parallelism, 0.05, &["A"]));
+        assert_eq!(own_datum_ref(&m, top_pid, &on_a), None);
     }
 
     /// The datum frame follows the part through a boolean: a face that
