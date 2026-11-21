@@ -112,10 +112,11 @@ fn describe(d: &Drawing) -> String {
     )
 }
 
-/// Full size on the smallest sheet that holds the views at 1:1, clean, and
-/// not mostly empty paper.
+/// On the smallest sheet that holds the views (since 2026-11-21, "smallest
+/// sheet", Varun: A3 at 1:2, no longer A2 at 1:1), clean, and not mostly empty
+/// paper.
 ///
-/// The smallest such sheet is A2, not the A3 a drafter would use: the
+/// Full size would need A2, not the A3 a drafter would use: the
 /// automatic sheet always draws FRONT, TOP, RIGHT, the isometric and SECTION
 /// A-A, and at 1:1 that column is 47 (SECTION) + 165 (TOP) + 47 (FRONT) mm of
 /// views plus their gaps, about 304 mm, where A3's drawing area is 203 mm
@@ -123,7 +124,7 @@ fn describe(d: &Drawing) -> String {
 /// RIGHT view -- which repeats FRONT on a solid of revolution -- left out),
 /// which the sheet does not have yet.
 #[test]
-fn a_weld_neck_flange_is_drawn_full_size_on_a_small_sheet() {
+fn a_weld_neck_flange_is_drawn_on_the_smallest_sheet() {
     let (m, s) = weld_neck_flange();
     let t = std::time::Instant::now();
     let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
@@ -138,13 +139,13 @@ fn a_weld_neck_flange_is_drawn_full_size_on_a_small_sheet() {
     let what = describe(&d);
     eprintln!("{what}");
     assert!(
-        matches!(d.sheet_size, SheetSize::A4 | SheetSize::A3 | SheetSize::A2),
-        "a Ø165 flange belongs on A2 or smaller: {what}"
+        matches!(d.sheet_size, SheetSize::A4 | SheetSize::A3),
+        "a Ø165 flange belongs on A3 or smaller: {what}"
     );
     for v in d.views.iter().filter(|v| v.name != "ISOMETRIC") {
         assert!(
-            (v.scale - 1.0).abs() < 1e-9,
-            "{} is not full size: {what}",
+            v.scale >= 0.5 - 1e-9,
+            "{} is reduced past 1:2: {what}",
             v.name
         );
     }

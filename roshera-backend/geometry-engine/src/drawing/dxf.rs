@@ -595,6 +595,10 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
     // (same value: the bore's axial-view centre after collision offset).
     // y_dxf = sheet_h − y_svg (y-up conversion).
     for ht in &layout.hole_tags {
+        // A tag drawn away from its bore: its leader, as the SVG inks it.
+        if let Some([[x0, y0], [x1, y1]]) = ht.leader {
+            add_line(dxf, LAYER_HOLE_TAGS, x0, sheet_h - y0, x1, sheet_h - y1);
+        }
         let x = ht.text_anchor[0];
         let y = sheet_h - ht.text_anchor[1];
         add_text(

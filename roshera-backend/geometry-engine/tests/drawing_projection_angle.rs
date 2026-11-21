@@ -239,8 +239,16 @@ fn assert_same_placement(a: &Drawing, b: &Drawing) {
 }
 
 /// Switching an existing sheet equals building it in the other angle, on
-/// every layout shape: four views (box), a section band (flange, A3) and a
-/// section in the isometric's cell (small part, A4). And back again.
+/// every layout shape where both angles are drawn on the same sheet: four
+/// views (box) and a section in the isometric's cell (flange, A4). And back
+/// again; and on every shape, switching there and back is the sheet itself.
+///
+/// Switching keeps the sheet (`set_projection` re-places the views; it
+/// never re-chooses paper), while building chooses it: since 2026-11-21 a
+/// sheet whose text does not fit is redrawn one size up. The small bored
+/// block's third-angle views have a layout error on A4 at 2:1 that its
+/// first-angle ones do not, so it is built third angle on A3 and first angle
+/// on A4 -- the one case pinned as different.
 #[test]
 fn switching_a_sheet_equals_building_it_in_the_other_angle() {
     for (label, (m, part)) in [
@@ -256,6 +264,27 @@ fn switching_a_sheet_equals_building_it_in_the_other_angle() {
             ProjectionAngle::First,
         )
         .expect("first");
+        for start in [&third, &first] {
+            let other = if start.projection == ProjectionAngle::Third {
+                ProjectionAngle::First
+            } else {
+                ProjectionAngle::Third
+            };
+            let mut there_and_back = start.clone();
+            set_projection(&mut there_and_back, other).expect("switch");
+            set_projection(&mut there_and_back, start.projection).expect("switch back");
+            assert_same_placement(&there_and_back, start);
+        }
+        let same_sheet = third.sheet_size == first.sheet_size
+            && (third.views[0].scale - first.views[0].scale).abs() < 1e-12;
+        if !same_sheet {
+            assert_eq!(
+                label, "small",
+                "{label}: third angle on {:?} at {}, first on {:?} at {}",
+                third.sheet_size, third.views[0].scale, first.sheet_size, first.views[0].scale
+            );
+            continue;
+        }
         let mut switched = third.clone();
         set_projection(&mut switched, ProjectionAngle::First).expect("switch");
         assert_eq!(switched.projection, ProjectionAngle::First, "{label}");

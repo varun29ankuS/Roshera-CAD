@@ -2042,9 +2042,9 @@ pub fn standard_drawing_auto(
 ///
 /// The sheet and its scale are chosen by SEARCH over (sheet, ISO 5455 scale)
 /// pairs, starting from the size ladder's sheet. The ladder's sheet is built
-/// exactly as before: the smallest ISO sheet for the part's size at the fill
-/// scale, drawn full size on a larger sheet when one holds it at 1:1
-/// ([`SheetChoice::Auto`]); when that sheet is short of PAPER (a dimension
+/// as the smallest ISO sheet for the part's size at the fill scale (larger
+/// only when a busy part's views would be too small to read:
+/// [`SheetChoice::Auto`]); when that sheet is short of PAPER (a dimension
 /// found no room, or the hole table no free paper: [`short_of_paper`]) it is
 /// redrawn up to two sizes larger at no larger scale
 /// ([`SheetChoice::Capped`]). Then every pair the views -- SECTION A-A
@@ -2052,16 +2052,19 @@ pub fn standard_drawing_auto(
 /// sheet's hole and ordinate tables ([`SheetShape::fits`]) is considered
 /// (with the pictorial one ISO step smaller where its full-scale cell is
 /// what keeps the views off a sheet: [`SheetShape::candidate`]), and the
-/// most preferred one ([`SheetShape::preference`]: a
-/// sheet that is not mostly empty paper, full size when that is legible,
-/// then the smaller sheet, then the larger scale) is drawn at its exact
+/// most preferred one ([`SheetShape::preference`]: a legible
+/// sheet that is not mostly empty paper, then the smaller sheet, then the
+/// larger scale; full size only breaks a tie) is drawn at its exact
 /// scale ([`SheetChoice::Exact`]) when it is preferred over the ladder's
 /// sheet or that sheet is still short of paper. It replaces the ladder's
 /// sheet only when it is no worse in any count of [`SheetScore`] and better
 /// by those counts or, on equal counts, by preference ([`takes_over`]): the
-/// result is never worse than the ladder's.
+/// result is never worse than the ladder's. When the best sheet then still
+/// has layout errors, the next sheet up is drawn too, and taken only with
+/// fewer of them ([`escape_candidate`]).
 ///
-/// So the search draws one sheet more than the ladder did, at most. A view's
+/// So the search draws two sheets more than the ladder did, at most -- the
+/// second only for a sheet with errors. A view's
 /// line work, dimensions and pictorial depend on the part and direction
 /// only, so every sheet after the first places copies of the first one's
 /// views ([`build_sheet`]).
@@ -2112,6 +2115,41 @@ pub fn standard_drawing_auto_with_projection(
                 s.utilization,
                 t.elapsed().as_secs_f64() * 1e3
             );
+            // What each built sheet falls short by, per kind: which layout
+            // errors and which dimensions found no room.
+            let quality = super::verify::verify_drawing(d);
+            for issue in quality
+                .issues
+                .iter()
+                .filter(|i| i.severity == super::verify::Severity::Error)
+            {
+                eprintln!("[draw-profile]   error {:?}: {}", issue.kind, issue.message);
+            }
+            let placed: std::collections::HashSet<(usize, String)> =
+                super::layout::compute_layout(d)
+                    .dimensions
+                    .iter()
+                    .map(|pd| {
+                        let id = pd.dim_id.strip_suffix("-note").unwrap_or(&pd.dim_id);
+                        (pd.owner_view, id.to_string())
+                    })
+                    .collect();
+            // A location or size the hole table states is not owed a place
+            // (as `sheet_shortfall_and_utilization` counts).
+            let tabled = super::layout::tabled_face_ids(d);
+            for (vi, v) in d.views.iter().enumerate() {
+                for dim in &v.dimensions {
+                    let by_table = matches!(dim.kind.as_str(), "position" | "diameter")
+                        && !dim.entities.is_empty()
+                        && dim.entities.iter().all(|e| tabled.contains(e));
+                    if !by_table && !placed.contains(&(vi, dim.id.clone())) {
+                        eprintln!(
+                            "[draw-profile]   not placed {} {} {} '{}'",
+                            v.name, dim.id, dim.kind, dim.label
+                        );
+                    }
+                }
+            }
         }
     };
     let plan = plan_sheet(model, solid_id, part_uuid, angle)?;
@@ -2183,37 +2221,99 @@ pub fn standard_drawing_auto_with_projection(
         false,
         ladder.1.utilization,
     );
-    let Some(c) = shape.candidate(
+    let ladder_sheet = ladder.0.sheet_size;
+    search_sheets(
+        &shape,
+        (ladder.0, ladder.1, ladder_pref, ladder_sheet, ladder_scale),
+        &mut built,
+        |c| {
+            let t = std::time::Instant::now();
+            let d = build_sheet(
+                model,
+                solid_id,
+                part_uuid,
+                angle,
+                &plan,
+                SheetChoice::Exact(c.sheet, c.scale, c.pictorial),
+                &mut views,
+            )?;
+            let s = SheetScore::of(&d);
+            report(&d, &s, t);
+            Ok((d, s))
+        },
+    )
+}
+
+/// The search after the size ladder: which sheets to `build` and which to
+/// keep. First the most preferred pair -- the smallest sheet, at the largest
+/// scale the views fit it ([`SheetShape::candidate`]); then, when the best
+/// sheet so far still has layout errors, more room for them
+/// ([`escape_candidate`]). A built sheet replaces the best only by
+/// [`takes_over`], never worse than the ladder's sheet in any count.
+/// `ladder` is `(sheet, score, preference, sheet size, scale)`.
+fn search_sheets<D, E>(
+    shape: &SheetShape,
+    ladder: (D, SheetScore, Preference, super::types::SheetSize, f64),
+    built: &mut Vec<(super::types::SheetSize, f64, f64)>,
+    mut build: impl FnMut(SheetCandidate) -> Result<(D, SheetScore), E>,
+) -> Result<D, E> {
+    let (ladder_sheet, ladder_score, ladder_pref, ladder_size, ladder_scale) = ladder;
+    let mut best = (
+        ladder_sheet,
+        ladder_score,
+        ladder_pref,
+        ladder_size,
+        ladder_scale,
+    );
+    let mut try_one = |c: SheetCandidate,
+                       built: &mut Vec<(super::types::SheetSize, f64, f64)>,
+                       best: &mut (D, SheetScore, Preference, super::types::SheetSize, f64)|
+     -> Result<(), E> {
+        let (d, s) = build(c)?;
+        built.push((c.sheet, c.scale, c.pictorial));
+        let pref = shape.preference(
+            &c.sheet,
+            c.scale,
+            c.pictorial < c.scale - 1e-12,
+            s.utilization,
+        );
+        if takes_over(&ladder_score, (&best.1, best.2), (&s, pref)) {
+            *best = (d, s, pref, c.sheet, c.scale);
+        }
+        Ok(())
+    };
+    if let Some(c) = shape.candidate(
         ladder_scale,
         ladder_pref,
-        short_of_paper(ladder.1.shortfall()),
-        &built,
-    ) else {
-        return Ok(ladder.0);
-    };
-    let t = std::time::Instant::now();
-    let d = build_sheet(
-        model,
-        solid_id,
-        part_uuid,
-        angle,
-        &plan,
-        SheetChoice::Exact(c.sheet, c.scale, c.pictorial),
-        &mut views,
-    )?;
-    let s = SheetScore::of(&d);
-    report(&d, &s, t);
-    let pref = shape.preference(
-        &c.sheet,
-        c.scale,
-        c.pictorial < c.scale - 1e-12,
-        s.utilization,
-    );
-    if takes_over(&ladder.1, (&ladder.1, ladder_pref), (&s, pref)) {
-        Ok(d)
-    } else {
-        Ok(ladder.0)
+        short_of_paper(ladder_score.shortfall()),
+        built,
+    ) {
+        try_one(c, built, &mut best)?;
     }
+    if let Some(c) = escape_candidate(shape, &best.3, best.4, &best.1, built) {
+        try_one(c, built, &mut best)?;
+    }
+    Ok(best.0)
+}
+
+/// More room for a sheet with layout errors -- its text does not fit the
+/// views: the next larger sheet, at the largest scale it holds the views at
+/// ([`SheetShape::roomier`]), taken only with fewer errors ([`takes_over`]).
+/// "Smallest sheet" (Varun 11-21) puts parts on smaller paper, and a part
+/// drawn 1:2 on A3 had nine dimension texts over its views where 1:1 on A1
+/// had none. Tried AFTER the most preferred pair: built in its place, it
+/// drew NIST CTC 03 on A0 at 1:2 where A1 at 1:2 (never built) was the
+/// smaller sheet. `None` for a sheet without errors.
+fn escape_candidate(
+    shape: &SheetShape,
+    sheet: &super::types::SheetSize,
+    scale: f64,
+    score: &SheetScore,
+    built: &[(super::types::SheetSize, f64, f64)],
+) -> Option<SheetCandidate> {
+    (score.errors > 0)
+        .then(|| shape.roomier(sheet, scale, built))
+        .flatten()
 }
 
 /// Does a built `candidate` replace the `best` sheet so far? Only when it is
@@ -2282,19 +2382,24 @@ impl SheetScore {
 }
 
 /// Drafting preference of a (sheet, scale), lower is better: `(tier, sheet
-/// rank, -utilization)`. Tier 0: the views fill at least the
-/// under-utilization threshold AND are full size, legibly; tier 1: they fill
-/// it, legibly; tiers 2 and 3: the same with the pictorial drawn a scale
-/// smaller than the views ([`SheetShape::candidate`]); tier 4
-/// ([`EMPTY_TIER`]): mostly empty paper, or too small to read. Within a tier
-/// the smaller sheet, then the fuller one (on one sheet: the larger scale) --
-/// paper is not spent only to fill it: a 30 mm part drawn 2:1 on A4 is not
-/// redrawn 5:1 on A3.
+/// rank, -utilization, not full size)` -- "smallest sheet, well filled"
+/// (Varun 11-21). Tier 0: the views fill at least the under-utilization
+/// threshold, legibly; tier 1: the same with the pictorial drawn a scale
+/// smaller than the views ([`SheetShape::candidate`]); tier 2
+/// ([`EMPTY_TIER`]): mostly empty paper, or too small to read. A part is
+/// never moved up a sheet only to fill paper (Varun 11-21, on a Ø80 hub
+/// that a fill target would have drawn 2:1 on A2 rather than 1:1 on A3):
+/// only a sheet left mostly empty, or one short of paper, loses. Within a tier
+/// the smaller sheet, then the fuller one (on one sheet: the larger ISO
+/// scale), and full size only breaks an exact tie. Paper is not spent to
+/// draw a part full size (the bench drew 8 of 18 parts 1:1 on A0, filling
+/// 5-34 %), nor only to fill it: a 30 mm part drawn 2:1 on A4 is not redrawn
+/// 5:1 on A3.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-struct Preference(u8, u8, f64);
+struct Preference(u8, u8, f64, u8);
 
 /// The tier of a sheet left mostly empty, or drawn too small to read.
-const EMPTY_TIER: u8 = 4;
+const EMPTY_TIER: u8 = 2;
 
 /// A (sheet, exact scale) worth building, with the scale its pictorial is
 /// drawn at (the views' scale, or one ISO step smaller).
@@ -2600,18 +2705,16 @@ impl SheetShape {
         // A busy part's views must be a legible size on paper, or its
         // extension lines crowd (see [`MIN_BUSY_VIEW_PAPER_MM`]).
         let legible = !self.busy || self.max_dim * scale >= MIN_BUSY_VIEW_PAPER_MM;
-        let tier = match (filled && legible, full_size, reduced) {
-            (false, _, _) => EMPTY_TIER,
-            (true, true, false) => 0,
-            (true, false, false) => 1,
-            (true, true, true) => 2,
-            (true, false, true) => 3,
+        let tier = match (filled && legible, reduced) {
+            (false, _) => EMPTY_TIER,
+            (true, false) => 0,
+            (true, true) => 1,
         };
         let rank = SEARCH_SHEETS
             .iter()
             .position(|s| s == sheet)
             .unwrap_or(SEARCH_SHEETS.len()) as u8;
-        Preference(tier, rank, -util)
+        Preference(tier, rank, -util, u8::from(!full_size))
     }
 
     /// [`Self::preference`] of a sheet not built yet.
@@ -2622,6 +2725,34 @@ impl SheetShape {
             pictorial < scale - 1e-12,
             self.utilization(sheet, scale, pictorial),
         )
+    }
+
+    /// More room than `sheet` at `scale`: the NEXT larger ISO sheet only, at
+    /// the largest ISO scale no smaller than `scale` that the views fit
+    /// there, the pictorial at the views' scale -- none of the `built`
+    /// triples. One sheet up, never more: a 30 mm block with one layout
+    /// error on A4 at 2:1 was otherwise redrawn 5:1 on A2. `None` past A0 or
+    /// when the next sheet holds the views at no such scale.
+    fn roomier(
+        &self,
+        sheet: &super::types::SheetSize,
+        scale: f64,
+        built: &[(super::types::SheetSize, f64, f64)],
+    ) -> Option<SheetCandidate> {
+        let s = larger_sheet(sheet)?;
+        let k = ISO_SCALES.iter().copied().find(|&k| {
+            k > scale - 1e-12
+                && self.fits(&s, k, k)
+                && !built
+                    .iter()
+                    .any(|(bs, bk, bp)| *bs == s && (bk - k).abs() < 1e-9 && (bp - k).abs() < 1e-9)
+        })?;
+        Some(SheetCandidate {
+            sheet: s,
+            scale: k,
+            pictorial: k,
+            preference: self.estimated(&s, k, k),
+        })
     }
 
     /// The one sheet worth building after the size ladder's sheet, drawn at
@@ -2940,6 +3071,7 @@ fn plan_sheet(
             "[draw-profile] pass1_extents (project-only): {:.1} ms",
             t_p1.elapsed().as_secs_f64() * 1e3
         );
+        eprintln!("[draw-profile] gaps vgap {vgap:.1} hgap {hgap:.1} left bands {left_bands:?}");
     }
     let max_dim = extents
         .iter()
@@ -3018,33 +3150,13 @@ fn build_sheet(
         }
     }
     let free = matches!(choice, SheetChoice::Auto);
-    // Drafting practice: a part that would be reduced is drawn full size on a
-    // larger sheet when one holds it at 1:1 -- up to two sizes up for the
-    // part alone, and as far as A0 when it is the part's DIMENSIONS that need
-    // the room (a small part with forty dimensions does not fit the sheet its
-    // size alone would pick). When no sheet holds it at 1:1, the sheet that
-    // gives the largest scale is used (the smallest such sheet).
-    if scale < 1.0 && free {
-        let mut candidate = sheet;
-        let steps = if vgap > VGAP || hgap > HGAP { 4 } else { 2 };
-        for _ in 0..steps {
-            let Some(next) = larger_sheet(&candidate) else {
-                break;
-            };
-            let (s, p) = layout_four_view_gap(
-                &next, extents[0], extents[1], extents[2], extents[3], angle, vgap, hgap,
-            );
-            candidate = next;
-            if s > scale {
-                sheet = candidate;
-                scale = s;
-                positions = p;
-            }
-            if s >= 1.0 {
-                break;
-            }
-        }
-    }
+    // A part that would be reduced is NOT moved to a larger sheet to draw it
+    // full size ("smallest sheet, well filled", Varun 11-21: that put parts
+    // 1:1 on A0 with 5-34 % of the paper used). A larger sheet is taken only
+    // when this one is short of paper (the ladder in
+    // `standard_drawing_auto_with_projection`) or the views would be too
+    // small to read (below); the search then draws the smallest sheet at the
+    // largest ISO scale the views fit ([`SheetShape::candidate`]).
 
     // A small part whose dimensions need room is drawn ENLARGED: at 1:1 a
     // 30 mm part with forty dimensions has its extension lines a millimetre
@@ -5251,6 +5363,13 @@ pub(crate) fn attach_section_view(
     let rule = section_slot_rule(&drawing.sheet_size);
     // The re-placement keeps the room the views' own dimension stacks need.
     let (vgap, hgap) = section_layout_gaps(drawing);
+    if draw_profile_enabled() {
+        let scale = drawing.views.first().map_or(0.0, |v| v.scale);
+        eprintln!(
+            "[draw-profile] section re-layout on {} at {scale}: vgap {vgap:.1} hgap {hgap:.1}",
+            drawing.sheet_size.label()
+        );
+    }
 
     // Compute the section view's position by running the layout solver with the
     // section extent in place of (or appended to) the ISO slot.  This guarantees
@@ -5701,8 +5820,8 @@ mod tests {
             table,
             utilization: 0.2,
         };
-        let full = Preference(0, 2, -0.3);
-        let reduced = Preference(1, 1, -0.2);
+        let full = Preference(0, 2, -0.3, 0);
+        let reduced = Preference(1, 1, -0.2, 1);
         let seed = score(2, 1, 0);
         // Equal counts: preference decides.
         assert!(takes_over(&seed, (&seed, reduced), (&score(2, 1, 0), full)));
@@ -5844,8 +5963,8 @@ mod tests {
     /// would fill legibly, and such a pair ranks below every pair that fills
     /// a sheet with the pictorial at the views' scale.
     ///
-    /// Mutation: rank a reduced pictorial with the full-scale one (tiers 2
-    /// and 3 back to 0 and 1) -> full size on A2 with a 1:2 pictorial
+    /// Mutation: rank a reduced pictorial with the full-scale one (tier 1
+    /// back to 0) -> full size on A2 with a 1:2 pictorial
     /// outranks A3 drawn 1:2 throughout -> RED.
     #[test]
     fn a_reduced_pictorial_ranks_below_a_full_scale_one() {
@@ -5866,6 +5985,222 @@ mod tests {
         // A2 at 1:1 holds the views only with the pictorial at 1:2.
         assert!(!shape.fits(&SheetSize::A2, 1.0, 1.0));
         assert!(shape.fits(&SheetSize::A2, 1.0, 0.5));
+    }
+
+    /// Sheet choice is "smallest sheet, well filled" (Varun 11-21): a part
+    /// that fits a smaller sheet legibly at a reduced ISO scale is drawn
+    /// there, not full size on a larger sheet it leaves mostly empty (the
+    /// bench put 8 of 18 parts on A0 at 1:1 filling 5-34 %). On one sheet the
+    /// larger scale wins; 1:1 only breaks an exact tie.
+    ///
+    /// Mutation: rank full size ahead of the sheet (the old tier 0) -> A1 at
+    /// 1:1 outranks A3 at 1:2 -> RED; rank the fuller sheet first
+    /// (utilization before sheet rank) -> A2 filled well outranks the thin A3
+    /// -> RED.
+    #[test]
+    fn the_smaller_sheet_wins_over_full_size() {
+        use super::super::types::SheetSize;
+        let shape = rib_shape(false);
+        let a3_half = shape.preference(&SheetSize::A3, 0.5, false, 0.20);
+        let a1_full = shape.preference(&SheetSize::A1, 1.0, false, 0.12);
+        assert!(a3_half < a1_full, "{a3_half:?} vs {a1_full:?}");
+        // On one sheet, the fuller (larger-scale) pair.
+        let a3_fuller = shape.preference(&SheetSize::A3, 2.0, false, 0.45);
+        assert!(a3_fuller < a3_half, "{a3_fuller:?} vs {a3_half:?}");
+        // 1:1 breaks an exact tie.
+        let tie_full = shape.preference(&SheetSize::A3, 1.0, false, 0.20);
+        assert!(tie_full < a3_half, "{tie_full:?} vs {a3_half:?}");
+        // Never up a sheet only to fill paper (Varun 11-21): a thinly filled
+        // A3 at 1:2 beats A2 filled well at 1:1.
+        let a3_thin = shape.preference(&SheetSize::A3, 0.5, false, 0.133);
+        let a2_well = shape.preference(&SheetSize::A2, 1.0, false, 0.27);
+        assert!(a3_thin < a2_well, "{a3_thin:?} vs {a2_well:?}");
+        // A sheet left mostly empty still ranks below one that is filled.
+        let a4_empty = shape.preference(&SheetSize::A4, 0.2, false, 0.05);
+        assert!(a1_full < a4_empty, "{a1_full:?} vs {a4_empty:?}");
+    }
+
+    /// A ladder sheet whose text does not fit (layout errors) is answered
+    /// with more room: the next larger sheet, one size up and never more.
+    /// The rib on A3 at 1:2 with errors is tried on A2 at 1:2 (A2 holds it at
+    /// 1:1 only with a reduced pictorial; A1 at 1:1 is two sizes up); clean,
+    /// it is not moved.
+    ///
+    /// Mutation: drop the `score.errors > 0` test in `escape_candidate`, or
+    /// let `roomier` climb past the next sheet -> RED.
+    #[test]
+    fn a_sheet_whose_text_does_not_fit_tries_more_room() {
+        use super::super::types::SheetSize;
+        let shape = rib_shape(false);
+        let built = [(SheetSize::A3, 0.5, 0.5)];
+        let score = |errors| SheetScore {
+            errors,
+            unplaced: 0,
+            table: 0,
+            utilization: 0.107,
+        };
+        let roomy =
+            escape_candidate(&shape, &SheetSize::A3, 0.5, &score(9), &built).expect("more room");
+        assert_eq!(
+            (roomy.sheet, roomy.scale),
+            (SheetSize::A2, 0.5),
+            "{roomy:?}"
+        );
+        let clean = escape_candidate(&shape, &SheetSize::A3, 0.5, &score(0), &built);
+        assert!(clean.is_none(), "a clean sheet is not moved up: {clean:?}");
+        // Already drawn there: nothing more one size up.
+        let tried = [(SheetSize::A3, 0.5, 0.5), (SheetSize::A2, 0.5, 0.5)];
+        assert!(shape.roomier(&SheetSize::A3, 0.5, &tried).is_none());
+        assert!(shape.roomier(&SheetSize::A0, 0.002, &[]).is_none());
+    }
+
+    /// The search builds the most preferred pair FIRST and escapes to more
+    /// room only from the best sheet after it: escaping from the ladder's
+    /// sheet in its place drew NIST CTC 03 (A1 at 1:5, 11 errors) on A0 at
+    /// 1:2, and A1 at 1:2 -- the smaller sheet, as clean -- was never built.
+    /// Scores scripted as measured there: every built sheet has 6 errors.
+    ///
+    /// Mutation: try `escape_candidate` from the ladder's sheet before the
+    /// preferred pair -> the result is the escape's larger sheet -> RED.
+    #[test]
+    fn the_search_tries_the_smallest_sheet_before_escaping() {
+        use super::super::types::SheetSize;
+        let shape = rib_shape(false);
+        let score = |errors, utilization| SheetScore {
+            errors,
+            unplaced: 0,
+            table: 0,
+            utilization,
+        };
+        let ladder_pref = shape.preference(&SheetSize::A1, 0.2, false, 0.046);
+        let mut built = vec![(SheetSize::A1, 0.2, 0.2)];
+        let mut tried: Vec<(SheetSize, f64)> = Vec::new();
+        let got = search_sheets(
+            &shape,
+            (
+                (SheetSize::A1, 0.2),
+                score(11, 0.046),
+                ladder_pref,
+                SheetSize::A1,
+                0.2,
+            ),
+            &mut built,
+            |c| {
+                tried.push((c.sheet, c.scale));
+                Ok::<_, ()>(((c.sheet, c.scale), score(6, 0.15)))
+            },
+        )
+        .expect("search");
+        let first = *tried.first().expect("a sheet was built");
+        let preferred = shape
+            .candidate(0.2, ladder_pref, false, &[(SheetSize::A1, 0.2, 0.2)])
+            .expect("a preferred pair");
+        assert_eq!(
+            first,
+            (preferred.sheet, preferred.scale),
+            "built first: {tried:?}"
+        );
+        assert_eq!(got, first, "the smaller sheet is kept: {tried:?}");
+    }
+
+    /// D6, held at the layout itself (the integration fixture's automatic
+    /// sheet moved to A4, where SECTION A-A takes the isometric's cell and
+    /// the five-view packing is not used): a Ø120 x 14 flange's short, wide
+    /// section packed as a band above the TOP/ISO row draws every view larger
+    /// on A3 than the old full-height third column, which pinned it at 0.75.
+    ///
+    /// Mutation: make `layout_five_view` always take `five_view_column` ->
+    /// the five views fit A3 no larger than the column does -> RED.
+    #[test]
+    fn a_short_wide_section_packs_as_a_band_not_a_column() {
+        use super::super::types::{ProjectionAngle, SheetSize};
+        // The harness's flange: a Ø120 x 14 disc with a Ø50 bore.
+        let mut m = BRepModel::new();
+        let disc = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 60.0, 14.0)
+            .expect("disc"));
+        let bore = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, -5.0), Vector3::Z, 25.0, 24.0)
+            .expect("bore"));
+        let s = crate::operations::boolean::boolean_operation(
+            &mut m,
+            disc,
+            bore,
+            crate::operations::boolean::BooleanOp::Difference,
+            crate::operations::boolean::BooleanOptions::default(),
+        )
+        .expect("bore cut");
+        let angle = ProjectionAngle::Third;
+        let _scope = crate::readable::adjacency::AdjacencyCacheScope::enter(&m);
+        let plan = plan_sheet(&m, s, uuid::Uuid::nil(), angle).expect("plan");
+        let sheet = build_sheet(
+            &m,
+            s,
+            uuid::Uuid::nil(),
+            angle,
+            &plan,
+            SheetChoice::Exact(SheetSize::A3, 0.5, 0.5),
+            &mut Vec::new(),
+        )
+        .expect("A3 sheet");
+        let shape = SheetShape::of(&sheet, &plan, angle);
+        let [front, top, right, iso] = shape.core;
+        let (section, (vgap, hgap)) = shape.section.expect("the flange is sectioned");
+        let five = layout_five_view(
+            &SheetSize::A3,
+            front,
+            top,
+            right,
+            iso,
+            section,
+            angle,
+            vgap,
+            hgap,
+            None,
+        );
+        let column = five_view_column(
+            &SheetSize::A3,
+            front,
+            top,
+            right,
+            iso,
+            section,
+            angle,
+            vgap,
+            hgap,
+            None,
+        );
+        assert!(five.2, "the five views fit A3");
+        assert!(
+            five.0 > column.0 + 1e-9,
+            "band {} vs column {}",
+            five.0,
+            column.0
+        );
+    }
+
+    /// The size ladder's seed stays on the sheet the part's size picks, at
+    /// the fill scale: it no longer climbs sheets to reach 1:1 (that is the
+    /// search's choice, and the search prefers the smaller sheet). A 170 mm
+    /// cube-ish block picks A3; it used to be redrawn full size on A2.
+    ///
+    /// Mutation: restore the seed's full-size upsizing in `build_sheet` ->
+    /// the seed is A2 at 1:1 -> RED.
+    #[test]
+    fn the_seed_does_not_climb_sheets_to_reach_full_size() {
+        let mut m = BRepModel::new();
+        let s = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(170.0, 150.0, 150.0)
+            .expect("box"));
+        let angle = super::super::types::ProjectionAngle::Third;
+        let seed = auto_sheet(&m, s, uuid::Uuid::nil(), angle).expect("seed");
+        assert_eq!(
+            (seed.sheet_size, seed.views[0].scale < 1.0),
+            (super::super::types::SheetSize::A3, true),
+            "seed on {:?} at {}",
+            seed.sheet_size,
+            seed.views[0].scale
+        );
     }
 
     /// The searched sheet is never worse than the size ladder's (the search's

@@ -732,7 +732,14 @@ fn flange_od_silhouette_closes_on_both_sides_in_front_and_right() {
 /// placed above the TOP/ISO row where neither side needs a dimension-band
 /// gap) — yields the larger scale. On this fixture `five_view_band` wins:
 /// every view reaches scale `1.0` and `sheet_utilization` becomes `0.2938`
-/// (measured; also confirms the floor asserted below with headroom).
+/// (measured on A3).
+///
+/// Since 2026-11-21 ("smallest sheet", Varun) the automatic sheet of this
+/// fixture is A4 at 1:2 (utilization 0.1635), where SECTION A-A takes the
+/// isometric's cell and the five-view packing is not used at all; the D6
+/// packing is held by the unit test
+/// `a_short_wide_section_packs_as_a_band_not_a_column` in `dimensioning.rs`.
+/// Here the automatic sheet stays clean and is not mostly empty paper.
 #[test]
 fn flange_sheet_utilization_clears_the_pre_fix_floor() {
     let (m, part) = flange();
@@ -740,10 +747,9 @@ fn flange_sheet_utilization_clears_the_pre_fix_floor() {
     let report = verify_drawing(&drawing);
     assert!(report.passed, "issues: {:?}", report.issues);
     assert!(
-        report.sheet_utilization > 0.25,
-        "D6: flange sheet utilization {:.4} must clear 0.25 — the pre-fix grid measured \
-         0.1652 (every view pinned at scale 0.75 by a full-height section column with an \
-         empty bottom-right cell); the fixed packing measures 0.2938 (scale 1.0)",
+        // verify::MIN_UTILIZATION, the under-utilization threshold.
+        report.sheet_utilization >= 0.10,
+        "flange sheet utilization {:.4} leaves the sheet mostly empty",
         report.sheet_utilization
     );
 }

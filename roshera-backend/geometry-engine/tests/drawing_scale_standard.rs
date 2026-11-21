@@ -3,8 +3,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 //! A sheet states its scale, and the statement is the truth: views are laid
-//! out at ISO 5455 scales only, a part that fits full size on a larger sheet
-//! is drawn full size, and every printed scale is the scale drawn. Found
+//! out at ISO 5455 scales only, a small part is never reduced, and every
+//! printed scale is the scale drawn. Found
 //! live: a Ø80 hub went on A4 at 0.75 while its views and title block read
 //! "1:1" (the label rounded 1:1.33 to 1:1).
 
@@ -68,9 +68,12 @@ fn a_sheet_states_the_scale_it_draws_at_and_uses_iso_5455_scales() {
         .iter()
         .find(|v| matches!(v.projection, ProjectionType::Front))
         .expect("front");
-    assert_eq!(
-        front.scale, 1.0,
-        "an 80 mm part fits full size on a standard sheet"
+    // Since 2026-11-21 ("smallest sheet") the full-size pin is not the point:
+    // the hub must never be REDUCED, at whatever sheet it is drawn.
+    assert!(
+        front.scale >= 1.0,
+        "an 80 mm part fits a standard sheet unreduced, drawn at {}",
+        front.scale
     );
 
     // Every printed scale is the scale drawn.

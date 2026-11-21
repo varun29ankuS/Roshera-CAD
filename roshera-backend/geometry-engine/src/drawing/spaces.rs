@@ -65,8 +65,9 @@ use super::layout::{
 };
 use super::types::{Drawing, ProjectionType, SheetSize};
 use super::verify::{
-    find_lines_through_text, find_text_collisions, frame_rect, is_text_item, on_projection_line,
-    projection_line_offset, utilization_of, Severity, MIN_UTILIZATION,
+    find_lines_through_text, find_tag_leaders_through_text, find_text_collisions, frame_rect,
+    is_text_item, on_projection_line, projection_line_offset, utilization_of, Severity,
+    MIN_UTILIZATION,
 };
 
 // ── Scoring constants ─────────────────────────────────────────────────────
@@ -1544,6 +1545,28 @@ fn rule_text_clear(
                 Tolerance::at_least(TEXT_LINE_CLEAR),
                 format!("a line of '{}' runs through '{}'", pd.label, text_of(t)),
                 vec![dim_name(pd, di), text_of(t)],
+            );
+        }
+    }
+    // A hole tag's leader through a text: the same reading the quality
+    // report makes (`verify::find_tag_leaders_through_text`).
+    for (gi, ti) in find_tag_leaders_through_text(layout) {
+        let tag = &layout.hole_tags[gi];
+        let t = &layout.items[ti];
+        if let Some(s) = &item_space[ti] {
+            b.find(
+                s,
+                Rule::TextClear,
+                Severity::Error,
+                0.0,
+                "mm",
+                Tolerance::at_least(TEXT_LINE_CLEAR),
+                format!(
+                    "the leader of hole tag '{}' runs through '{}'",
+                    tag.tag,
+                    text_of(t)
+                ),
+                vec![tag.tag.clone(), text_of(t)],
             );
         }
     }

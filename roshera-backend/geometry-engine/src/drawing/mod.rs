@@ -35,6 +35,7 @@ pub mod hole_features;
 pub mod hole_table;
 pub mod layout;
 pub mod natural_frame;
+pub mod ordinate;
 pub mod part_frame;
 pub mod pdf;
 pub mod profile_table;

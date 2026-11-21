@@ -339,15 +339,16 @@ fn assert_clean_and_filled(m: &BRepModel, d: &Drawing, what: &str) {
 }
 
 /// A Ø165 weld-neck flange with its datums and bolt-hole position frames,
-/// drawn first angle, is full size on A2 or smaller with every dimension
-/// placed -- the face view's Ø102, Ø74 and PCD Ø125 included -- and its views
-/// fill the paper.
+/// drawn first angle, is on A3 -- where a drafter would put it -- with every
+/// dimension placed (the face view's Ø102, Ø74 and PCD Ø125 included) and its
+/// views filling the paper.
 ///
-/// A3, where a drafter would put it, needs a round-part layout (the face
-/// view beside SECTION A-A, the RIGHT view that repeats FRONT left out): at
-/// 1:1 the five views stack about 330 mm tall where A3 has 267.
+/// Since 2026-11-21 ("smallest sheet", Varun) it is drawn 1:2 on A3, not 1:1
+/// on A2. Full size on A3 needs a round-part layout (the face view beside
+/// SECTION A-A, the RIGHT view that repeats FRONT left out): at 1:1 the five
+/// views stack about 330 mm tall where A3 has 267.
 #[test]
-fn a_first_angle_toleranced_weld_neck_flange_is_full_size_and_complete() {
+fn a_first_angle_toleranced_weld_neck_flange_is_on_a3_and_complete() {
     let (mut m, s) = en1092_weld_neck_with_gdt();
     let _ = frame_for_drawing(&mut m, s);
     let d = standard_drawing_auto_with_projection(&m, s, uuid::Uuid::nil(), ProjectionAngle::First)
@@ -356,13 +357,13 @@ fn a_first_angle_toleranced_weld_neck_flange_is_full_size_and_complete() {
     eprintln!("flange: {what}");
     assert_clean_and_filled(&m, &d, &what);
     assert!(
-        matches!(d.sheet_size, SheetSize::A4 | SheetSize::A3 | SheetSize::A2),
-        "a Ø165 flange belongs on A2 or smaller: {what}"
+        matches!(d.sheet_size, SheetSize::A4 | SheetSize::A3),
+        "a Ø165 flange belongs on A3 or smaller: {what}"
     );
     for v in d.views.iter().filter(|v| v.name != "ISOMETRIC") {
         assert!(
-            (v.scale - 1.0).abs() < 1e-9,
-            "{} is not full size: {what}",
+            v.scale >= 0.5 - 1e-9,
+            "{} is reduced past 1:2: {what}",
             v.name
         );
     }
@@ -490,11 +491,24 @@ fn two_tabled_holes_close_in_y_are_two_rows_not_one_interval() {
         "two table rows read as one interval: {:?}",
         redundant(&doctored)
     );
-    // Inked, they would print on each other's lines: still reported.
+    // Inked, both are drawn, and staggered to opposite sides of the view
+    // (their lines 0.09 mm apart on paper would read as one), so neither is
+    // reported. Before the stagger they were reported as one interval.
     let mut inked = doctored.clone();
     inked.hole_sites.clear();
+    let placed: Vec<String> = compute_layout(&inked)
+        .dimensions
+        .iter()
+        .map(|p| p.label.clone())
+        .collect();
+    for want in ["17.9", "18.08"] {
+        assert!(
+            placed.iter().any(|l| l.contains(want)),
+            "{want} is drawn: {placed:?}"
+        );
+    }
     assert!(
-        redundant(&inked)
+        !redundant(&inked)
             .iter()
             .any(|msg| msg.contains("17.9") && msg.contains("18.08")),
         "{:?}",
@@ -1589,15 +1603,17 @@ fn reattaching_the_frames_uncrosses_their_leaders() {
     assert!(left.is_empty(), "no frame leader is flagged: {left:#?}");
     let l = compute_layout(&d);
     for g in &l.gdt_leaders {
-        // Short: 40 mm at most, and under half the automatic leader -- the
-        // flatness frame (fcf:5) excepted from the half: in FRONT, beside
-        // the face it points at, its automatic leader is already short, and
-        // it must be no longer.
+        // Short: 40 mm at most, and shorter than the automatic leader -- the
+        // flatness frame (fcf:5) only no longer: in FRONT, beside the face it
+        // points at, its automatic leader is already short. (It was "under
+        // half the automatic" on the A2 1:1 sheet, whose automatic leaders
+        // were long; on the A3 1:2 sheet of 2026-11-21 they are already
+        // about 22 mm.)
         let len = (g.to[0] - g.from[0]).hypot(g.to[1] - g.from[1]);
         let shorter = if g.fcf == 5 {
             len <= auto_len[g.fcf] + 1e-9
         } else {
-            len < 0.5 * auto_len[g.fcf]
+            len < auto_len[g.fcf] - 1e-9
         };
         assert!(
             len <= 40.0 && shorter,
@@ -1606,7 +1622,8 @@ fn reattaching_the_frames_uncrosses_their_leaders() {
             auto_len[g.fcf]
         );
     }
-    // The bolt frames end on their hole's edge (r 9 mm), not its centre.
+    // The bolt frames end on their hole's edge (r 9 mm at the views' scale),
+    // not its centre.
     for n in 0..4 {
         let to = l
             .gdt_leaders
@@ -1616,8 +1633,9 @@ fn reattaching_the_frames_uncrosses_their_leaders() {
             .to;
         let c = d.fcf_blocks[n].leader_to.expect("centre");
         let r = (to[0] - c[0]).hypot(to[1] - c[1]);
+        let k = d.views[d.fcf_blocks[n].owner_view].scale;
         assert!(
-            (r - 9.0).abs() < 1e-6,
+            (r - 9.0 * k).abs() < 1e-6,
             "fcf:{n} ends {r} from the hole centre"
         );
     }
@@ -2090,10 +2108,13 @@ fn the_scripted_leader_fixes_clear_spaces_and_keep_the_grade() {
         geometry_engine::drawing::ProjectionType::Front,
         "the flatness frame is where the raised face is seen"
     );
+    // Paper millimetres: the bore (r 27.25) and the raised face (r 51) at the
+    // views' scale.
+    let k = d.views[d.fcf_blocks[5].owner_view].scale;
     let x = (flat.to[0] - axis[0]).abs();
     assert!(
-        x > 27.25 + 0.5 && x < 51.0 - 0.5,
-        "on the raised face's line (x {x:.2} from the axis), not across the bore"
+        x > 27.25 * k + 0.5 && x < 51.0 * k - 0.5,
+        "on the raised face's line (x {x:.2} from the axis at {k}), not across the bore"
     );
     assert_eq!(
         d.datum_symbols
@@ -2105,9 +2126,9 @@ fn the_scripted_leader_fixes_clear_spaces_and_keep_the_grade() {
     );
     // No frame sits in a hole: every frame clear of the bore's disc and of
     // each bolt hole's.
-    let mut voids = vec![(axis, 27.25)];
+    let mut voids = vec![(axis, 27.25 * k)];
     for n in 0..4 {
-        voids.push((d0.fcf_blocks[n].leader_to.expect("hole centre"), 9.0));
+        voids.push((d0.fcf_blocks[n].leader_to.expect("hole centre"), 9.0 * k));
     }
     for (n, f) in l
         .items
@@ -2166,9 +2187,13 @@ fn a_frame_is_never_put_in_a_hole() {
     let top = d.views.iter().position(|v| v.name == "TOP").expect("TOP");
     let axis = d.fcf_blocks[4].leader_to.expect("the bore's centre");
     d.fcf_blocks[5].owner_view = top;
-    // A point of the ring 36 mm out, 0.3 rad round from the axis.
-    d.fcf_blocks[5].leader_to =
-        Some([axis[0] + 36.0 * 0.3f64.cos(), axis[1] + 36.0 * 0.3f64.sin()]);
+    // A point of the ring 36 mm out (paper: at the views' scale), 0.3 rad
+    // round from the axis.
+    let k = d.views[top].scale;
+    d.fcf_blocks[5].leader_to = Some([
+        axis[0] + 36.0 * k * 0.3f64.cos(),
+        axis[1] + 36.0 * k * 0.3f64.sin(),
+    ]);
     for s in d.datum_symbols.iter_mut().filter(|s| s.label == "A") {
         s.owner_view = top;
     }
@@ -2181,9 +2206,9 @@ fn a_frame_is_never_put_in_a_hole() {
         .nth(5)
         .expect("frame 5")
         .bbox;
-    let mut holes = vec![(axis, 27.25)];
+    let mut holes = vec![(axis, 27.25 * k)];
     for n in 0..4 {
-        holes.push((d.fcf_blocks[n].leader_to.expect("hole centre"), 9.0));
+        holes.push((d.fcf_blocks[n].leader_to.expect("hole centre"), 9.0 * k));
     }
     for (c, r) in holes {
         let nx = c[0].clamp(frame.x0, frame.x1);

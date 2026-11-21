@@ -338,6 +338,10 @@ pub(crate) const POINT_LEADER_MAX_RISE: f64 = 15.0;
 /// Two dimensions share a lane when their spans do not overlap by more than
 /// this: the two links of a chain meet at one extension line.
 pub(crate) const CHAIN_EPS: f64 = 1e-6;
+/// Two extension lines on one side of a view closer than this (paper mm),
+/// and not one shared line, read as one line: the quality check reports it
+/// and the stack search staggers the second to the other side.
+pub(crate) const EXT_LINES_APART_MM: f64 = 0.5;
 /// Most lanes one side of a view is searched for room on: far beyond what a
 /// sheet holds (the frame ends the search first); it bounds the search when
 /// no frame is given.
@@ -438,9 +442,9 @@ const ANGLE_ARC_AGREEMENT_DEG: f64 = 0.05;
 
 /// A placed hole-tag callout in sheet space.
 ///
-/// The tag ("A1", "B2", …) is centred on the bore's axial-view centre,
-/// with a deterministic offset if that position would collide with existing
-/// dimension text (offset applied outward from the view centre).
+/// The tag ("A1", "B2", …) is on its bore in the axial view, or out on a
+/// leader from the bore's edge where the paper on it is taken
+/// ([`place_hole_tags`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacedHoleTag {
     /// Sheet-space centre of the tag label.
@@ -449,6 +453,10 @@ pub struct PlacedHoleTag {
     pub tag: String,
     /// Index into `drawing.views` of the axial view.
     pub owner_view: usize,
+    /// The leader from the bore's edge to the tag's edge (sheet mm), when
+    /// the tag is drawn away from its bore.
+    #[serde(default)]
+    pub leader: Option<[[f64; 2]; 2]>,
 }
 
 // ── Sheet layout ───────────────────────────────────────────────────────────────
@@ -1583,7 +1591,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     // at the line's sheet-space endpoints as CuttingPlaneLabel items.
     // These enter the layout so text-collision invariants cover them.
     if let Some(cpl) = &drawing.cutting_plane_line {
-        let cp_label_items = place_cutting_plane_labels(drawing, cpl, h, &items);
+        let cp_label_items = place_cutting_plane_labels(drawing, cpl, h, &items, &all_placed);
         items.extend(cp_label_items);
     }
 
@@ -2481,111 +2489,199 @@ fn place_hole_table(
     }
 
     // ── Hole-tag callouts ─────────────────────────────────────────────────────
-    // Place tag text at each bore's axial-view centre, with a deterministic
-    // offset if that position would collide with existing dimension text.
-    let mut placed_tags: Vec<PlacedHoleTag> = Vec::new();
-    let callout_lines: Vec<[[f64; 2]; 2]> =
-        dimensions.iter().flat_map(placed_line_segments).collect();
-
-    let axial_idx = match drawing.axial_view_idx {
-        Some(i) => i,
-        None => return (placed_tags, new_items),
+    let Some(axial_idx) = drawing.axial_view_idx else {
+        return (Vec::new(), new_items);
     };
-    let axial_view = match drawing.views.get(axial_idx) {
-        Some(v) => v,
-        None => return (placed_tags, new_items),
+    let Some(axial_view) = drawing.views.get(axial_idx) else {
+        return (Vec::new(), new_items);
     };
-
-    // Build obstacle set: all DimensionText items + already-placed HoleTag items.
-    let mut obstacles: Vec<Rect2> = existing
+    // Every piece of text already on the sheet, and the table just placed.
+    let obstacles: Vec<Rect2> = existing
         .iter()
+        .chain(new_items.iter())
         .filter(|it| {
             matches!(
                 it.kind,
-                SheetItemKind::DimensionText | SheetItemKind::HoleTag
+                SheetItemKind::DimensionText
+                    | SheetItemKind::HoleTag
+                    | SheetItemKind::ViewLabel
+                    | SheetItemKind::CuttingPlaneLabel
+                    | SheetItemKind::HoleTableBorder
+                    | SheetItemKind::HoleTableText
             )
         })
         .map(|it| it.bbox)
         .collect();
+    let callout_lines: Vec<[[f64; 2]; 2]> =
+        dimensions.iter().flat_map(placed_line_segments).collect();
+    let frame = super::svg::frame_rect(&drawing.sheet_size);
+    let placed = place_hole_tags(
+        axial_view,
+        axial_idx,
+        sites,
+        sheet_h,
+        frame,
+        obstacles,
+        &callout_lines,
+    );
+    let mut tags = Vec::with_capacity(placed.len());
+    for (tag, item) in placed {
+        new_items.push(item);
+        tags.push(tag);
+    }
+    (tags, new_items)
+}
 
+/// Paper between a hole's edge and a tag drawn on a leader, and between one
+/// ring of candidate places and the next, mm.
+const HOLE_TAG_LEADER_STEP_MM: f64 = 3.0;
+
+/// Rings of leader places tried round a hole before the tag is left on it.
+const HOLE_TAG_LEADER_RINGS: usize = 5;
+
+/// Bores whose axial-view centres agree to this (view mm) are on one axis
+/// and share one tag.
+const HOLE_TAG_SAME_AXIS_MM: f64 = 1e-3;
+
+/// Place each tabled hole's tag ("A1") in the axial view, clear of the
+/// `obstacles` (every text on the sheet and the hole table), of the other
+/// tags, and of every callout's line.
+///
+/// On the hole first -- its centre, then four places 4 mm off it, read with
+/// the hole they sit on. When the paper there is taken (small holes close
+/// together, drawn reduced: holes 14 mm apart are 7 mm apart at 1:2), the tag
+/// moves out on a LEADER from the hole's edge: rings of places 3 mm apart,
+/// eight directions each, the first whose tag is clear and inside the frame
+/// and whose leader crosses no text. The tag fell back onto the hole
+/// regardless, over its neighbour's tag or the view's title, and the sheet
+/// reported the overlap; that is now only what is left when no place within
+/// five rings is free, and the overlap is still reported.
+pub(crate) fn place_hole_tags(
+    axial_view: &ProjectedView,
+    axial_idx: usize,
+    sites: &[HoleSite],
+    sheet_h: f64,
+    frame: Rect2,
+    mut obstacles: Vec<Rect2>,
+    callout_lines: &[[[f64; 2]; 2]],
+) -> Vec<(PlacedHoleTag, SheetItem)> {
+    // Holes on one axis in the axial view (two bores in line, at different
+    // depths: one row each in the table) share one centre there, and so one
+    // tag, "A1, A2" -- two tags on one point can only be printed over each
+    // other (part 115: five such pairs).
+    let mut groups: Vec<([f64; 2], String, f64)> = Vec::new();
     for site in sites {
-        let centre = match site.axial_centre {
-            Some(c) => c,
-            None => continue,
+        let Some(centre) = site.axial_centre else {
+            continue;
         };
-        // Convert view-space centre to sheet space.
+        match groups.iter_mut().find(|(c, _, _)| {
+            (c[0] - centre[0]).abs() < HOLE_TAG_SAME_AXIS_MM
+                && (c[1] - centre[1]).abs() < HOLE_TAG_SAME_AXIS_MM
+        }) {
+            Some((_, text, dia)) => {
+                text.push_str(", ");
+                text.push_str(&site.tag);
+                *dia = dia.max(site.diameter_mm);
+            }
+            None => groups.push((centre, site.tag.clone(), site.diameter_mm)),
+        }
+    }
+    let mut out = Vec::new();
+    // The leaders of the tags placed so far: a later tag must not sit on one
+    // (part 107 at 1:5: A4 was put on A1's leader).
+    let mut tag_leaders: Vec<[[f64; 2]; 2]> = Vec::new();
+    for (centre, tag, diameter_mm) in groups {
         let sx = axial_view.position_mm[0] + centre[0] * axial_view.scale;
         let sy = (sheet_h - axial_view.position_mm[1]) - centre[1] * axial_view.scale;
-
-        // Tag text bbox at the raw position.
-        let tag_text = &site.tag;
-        let tag_font = HOLE_TAG_FONT_MM;
-        let half_w = tag_text.chars().count() as f64 * GLYPH_ADVANCE_EM * tag_font * 0.5;
-        let half_h = tag_font * 0.5;
-
-        // Try the bore centre first, then 4 deterministic offsets.
+        let half_w = tag.chars().count() as f64 * GLYPH_ADVANCE_EM * HOLE_TAG_FONT_MM * 0.5;
+        let half_h = HOLE_TAG_FONT_MM * 0.5;
+        let rect_at = |cx: f64, cy: f64| Rect2 {
+            x0: cx - half_w,
+            y0: cy - half_h,
+            x1: cx + half_w,
+            y1: cy + half_h,
+        };
+        let inside = |r: &Rect2| {
+            r.x0 >= frame.x0 && r.y0 >= frame.y0 && r.x1 <= frame.x1 && r.y1 <= frame.y1
+        };
+        let free = |r: &Rect2, obstacles: &[Rect2], tag_leaders: &[[[f64; 2]; 2]]| {
+            inside(r)
+                && !obstacles.iter().any(|o| r.intersects(o, 0.2))
+                && !tag_leaders.iter().any(|l| segment_crosses_rect(l, r))
+                // Nor on a callout's line: a leader leg crossing the bore must
+                // not strike through its tag.
+                && !callout_lines.iter().any(|l| segment_crosses_rect(l, r))
+        };
+        // On the hole: its centre, then four places 4 mm off it.
         const OFFSET: f64 = 4.0;
-        let candidates: [[f64; 2]; 5] = [
+        let on_hole = [
             [sx, sy],
             [sx, sy - OFFSET],
             [sx + OFFSET, sy],
             [sx, sy + OFFSET],
             [sx - OFFSET, sy],
         ];
-
-        let mut chosen_anchor = [sx, sy];
-        for &[cx, cy] in &candidates {
-            let bbox = Rect2 {
-                x0: cx - half_w,
-                y0: cy - half_h,
-                x1: cx + half_w,
-                y1: cy + half_h,
-            };
-            // Nor on a callout's line: a leader leg crossing the bore must
-            // not strike through its tag.
-            if !obstacles.iter().any(|o| bbox.intersects(o, 0.2))
-                && !callout_lines.iter().any(|l| segment_crosses_rect(l, &bbox))
-            {
-                chosen_anchor = [cx, cy];
-                let new_bbox = Rect2 {
-                    x0: cx - half_w,
-                    y0: cy - half_h,
-                    x1: cx + half_w,
-                    y1: cy + half_h,
-                };
-                obstacles.push(new_bbox);
-                break;
+        let mut chosen: Option<([f64; 2], Option<[[f64; 2]; 2]>)> = on_hole
+            .iter()
+            .find(|&&[cx, cy]| free(&rect_at(cx, cy), &obstacles, &tag_leaders))
+            .map(|&c| (c, None));
+        // Out on a leader from the hole's edge.
+        if chosen.is_none() {
+            let r_hole = 0.5 * diameter_mm * axial_view.scale;
+            'rings: for ring in 1..=HOLE_TAG_LEADER_RINGS {
+                let reach = r_hole + ring as f64 * HOLE_TAG_LEADER_STEP_MM;
+                for k in 0..8 {
+                    let a = k as f64 * std::f64::consts::FRAC_PI_4;
+                    let (ux, uy) = (a.cos(), a.sin());
+                    // The tag's centre sits beyond `reach` by its own
+                    // half-extent along the direction, so the leader ends on
+                    // the tag's edge.
+                    let along = (half_w * ux.abs()).max(half_h * uy.abs());
+                    let (cx, cy) = (sx + ux * (reach + along), sy + uy * (reach + along));
+                    let r = rect_at(cx, cy);
+                    let leader = [
+                        [sx + ux * r_hole, sy + uy * r_hole],
+                        [sx + ux * reach, sy + uy * reach],
+                    ];
+                    let leader_clear = !obstacles.iter().any(|o| {
+                        let inner = Rect2 {
+                            x0: o.x0 + 0.2,
+                            y0: o.y0 + 0.2,
+                            x1: o.x1 - 0.2,
+                            y1: o.y1 - 0.2,
+                        };
+                        inner.x1 > inner.x0
+                            && inner.y1 > inner.y0
+                            && segment_crosses_rect(&leader, &inner)
+                    });
+                    if free(&r, &obstacles, &tag_leaders) && leader_clear {
+                        chosen = Some(([cx, cy], Some(leader)));
+                        break 'rings;
+                    }
+                }
             }
         }
-        // Fall through to the least-bad position if all collide (last candidate).
-        let (tx, ty) = (chosen_anchor[0], chosen_anchor[1]);
-        let bbox = Rect2 {
-            x0: tx - half_w,
-            y0: ty - half_h,
-            x1: tx + half_w,
-            y1: ty + half_h,
-        };
-        // Ensure the obstacle list has the chosen bbox (it was added in the loop
-        // only when a non-colliding slot was found; add it now regardless).
-        if !obstacles.contains(&bbox) {
-            obstacles.push(bbox);
-        }
-
-        new_items.push(SheetItem {
-            kind: SheetItemKind::HoleTag,
-            bbox,
-            owner_view: Some(axial_idx),
-            text: Some(tag_text.clone()),
-        });
-
-        placed_tags.push(PlacedHoleTag {
-            text_anchor: [tx, ty],
-            tag: tag_text.clone(),
-            owner_view: axial_idx,
-        });
+        // No place is free: on the hole, and the sheet reports the overlap.
+        let (anchor, leader) = chosen.unwrap_or(([sx, sy], None));
+        let bbox = rect_at(anchor[0], anchor[1]);
+        obstacles.push(bbox);
+        tag_leaders.extend(leader);
+        out.push((
+            PlacedHoleTag {
+                text_anchor: anchor,
+                tag: tag.clone(),
+                owner_view: axial_idx,
+                leader,
+            },
+            SheetItem {
+                kind: SheetItemKind::HoleTag,
+                bbox,
+                owner_view: Some(axial_idx),
+                text: Some(tag),
+            },
+        ));
     }
-
-    (placed_tags, new_items)
+    out
 }
 
 /// Does the segment pass through the open interior of `r`? Exact
@@ -2697,6 +2793,7 @@ pub(crate) fn place_cutting_plane_labels(
     cpl: &super::dimensioning::CuttingPlaneLine,
     sheet_h: f64,
     existing: &[SheetItem],
+    dimensions: &[PlacedDimension],
 ) -> Vec<SheetItem> {
     let Some(ax_view) = drawing.views.get(cpl.ax_view_idx) else {
         return Vec::new();
@@ -2737,21 +2834,26 @@ pub(crate) fn place_cutting_plane_labels(
     // rejected when its bbox intersects existing text or geometry ink. The
     // live ring-plate sheet planted an "A" on the TOP view's Ø callout —
     // nudged constants can't fix that class; consulting the layout can.
+    // Nor on a dimension's line: the letter was placed after every dimension
+    // and checked only against their numbers, and a dimension line ran
+    // through it (NIST CTC 03: '211.46' through 'A').
+    let lines: Vec<[[f64; 2]; 2]> = dimensions.iter().flat_map(placed_line_segments).collect();
     let collides = |r: &Rect2| -> bool {
-        existing.iter().any(|it| {
-            matches!(
-                it.kind,
-                SheetItemKind::ViewGeometry
-                    | SheetItemKind::DimensionText
-                    | SheetItemKind::ViewLabel
-                    | SheetItemKind::HoleTag
-                    | SheetItemKind::NoteText
-                    | SheetItemKind::HoleTableText
-                    | SheetItemKind::HoleTableBorder // Negative tol = clearance (see `place_hole_table::fits`):
-                                                     // reject candidates within 0.5 mm of existing ink, tighter
-                                                     // than the verifier's 0.2 mm overlap threshold.
-            ) && r.intersects(&it.bbox, -0.5)
-        })
+        lines.iter().any(|l| segment_crosses_rect(l, r))
+            || existing.iter().any(|it| {
+                matches!(
+                    it.kind,
+                    SheetItemKind::ViewGeometry
+                        | SheetItemKind::DimensionText
+                        | SheetItemKind::ViewLabel
+                        | SheetItemKind::HoleTag
+                        | SheetItemKind::NoteText
+                        | SheetItemKind::HoleTableText
+                        | SheetItemKind::HoleTableBorder // Negative tol = clearance (see `place_hole_table::fits`):
+                                                         // reject candidates within 0.5 mm of existing ink, tighter
+                                                         // than the verifier's 0.2 mm overlap threshold.
+                ) && r.intersects(&it.bbox, -0.5)
+            })
     };
     // Candidate anchors per end, deterministic order: walk OUTWARD along
     // the line (4 / 8 / 12 / 16 mm beyond the tip — far enough to clear a
@@ -3974,6 +4076,16 @@ pub(crate) fn place_dimensions_routed(
     // is the part's edge on that side.
     let mut stack_texts: Vec<Rect2> = Vec::new();
     let mut stack_lines: Vec<Rect2> = Vec::new();
+    // The lines of the callouts this view has placed already -- its leaders
+    // (legs and shoulders) -- with the earlier views': a number in a lane
+    // must not sit on one. Only earlier views' lines were read, and the leg
+    // of this view's own "16× R1" ran through the '54.01' stacked after it
+    // (CADGenBench 107 drawn 1:2).
+    let lane_text_blockers: Vec<[[f64; 2]; 2]> = result
+        .iter()
+        .flat_map(placed_line_segments)
+        .chain(ink_lines.iter().copied())
+        .collect();
     for (stack, horizontal) in [(&horiz, true), (&vert, false)] {
         let sides: [(f64, f64); 2] = if horizontal {
             [(1.0, bbox[3]), (-1.0, bbox[1])]
@@ -3981,6 +4093,13 @@ pub(crate) fn place_dimensions_routed(
             [(-1.0, bbox[0]), (1.0, bbox[2])]
         };
         let mut lanes: [Vec<Vec<(f64, f64)>>; 2] = [Vec::new(), Vec::new()];
+        // Where each side's dimensions stand (sheet mm along the stack): a
+        // dimension whose two extension lines would run beside one's, a hair
+        // apart, goes to the other side -- staggered, the two lines leave the part in
+        // opposite directions (NIST CTC 03: 35.5, 35.82 and 36.49 from one
+        // datum, their lines 0.16 mm apart at 1:2, read as one). One line
+        // shared exactly (a common datum) is one line, drawn once.
+        let mut ends: [Vec<(f64, f64)>; 2] = [Vec::new(), Vec::new()];
         for d in stack.iter() {
             let text_w = d.text_w;
             // A label wider than its span goes OUTSIDE, past one extension
@@ -4082,9 +4201,41 @@ pub(crate) fn place_dimensions_routed(
                 } else {
                     vec![d.tc]
                 };
+                // A number in its span may slide along the dimension line,
+                // between the arrowheads, past a leader leg that crosses the
+                // lane where it would sit -- tried only when the leg is what
+                // refused the centre. Pushed out a lane at a time instead, a
+                // number blocked by a long leg went past the whole leg: a
+                // stack 110 mm deep, and CADGenBench 107 redrawn 1:5.
+                let slides: Vec<f64> = if out_of_span {
+                    Vec::new()
+                } else {
+                    let lo = d.lo + AR_L + 0.5 + 0.5 * text_w;
+                    let hi = d.hi - AR_L - 0.5 - 0.5 * text_w;
+                    if hi > lo {
+                        [0.25, 0.75, 0.0, 1.0]
+                            .iter()
+                            .map(|k| lo + k * (hi - lo))
+                            .filter(|c| (c - d.tc).abs() > 0.5)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                };
                 let air = if out_of_span { OUTSIDE_TEXT_AIR } else { 0.0 };
                 for (si, &(out, edge)) in sides.iter().enumerate() {
                     if only_side.is_some_and(|s| s != si) {
+                        continue;
+                    }
+                    // Both ends beside (or on) one placed dimension's ends,
+                    // not exactly its interval: the whole dimension would
+                    // print on that one's lines.
+                    let on_its_lines = ends[si].iter().any(|&(p0, p1)| {
+                        let near = |a: f64, b: f64| (a - b).abs() < EXT_LINES_APART_MM;
+                        let same = (p0 - d.lo).abs() < CHAIN_EPS && (p1 - d.hi).abs() < CHAIN_EPS;
+                        near(p0, d.lo) && near(p1, d.hi) && !same
+                    });
+                    if strict && on_its_lines {
                         continue;
                     }
                     for lane in 0..MAX_LANES {
@@ -4114,7 +4265,16 @@ pub(crate) fn place_dimensions_routed(
                         if only_lane.is_some_and(|l| lane < l) {
                             continue;
                         }
-                        for &tc in &centres {
+                        let mut leg_in_the_way = false;
+                        let candidates: Vec<(f64, bool)> = centres
+                            .iter()
+                            .map(|&c| (c, false))
+                            .chain(slides.iter().map(|&c| (c, true)))
+                            .collect();
+                        for &(tc, slid) in &candidates {
+                            if slid && !leg_in_the_way {
+                                break;
+                            }
                             let (a0, a1) = (
                                 d.lo.min(tc - 0.5 * text_w - air),
                                 d.hi.max(tc + 0.5 * text_w + air),
@@ -4130,9 +4290,14 @@ pub(crate) fn place_dimensions_routed(
                             }
                             let text =
                                 rect(tc - 0.5 * text_w, tc + 0.5 * text_w, text_far, level - TGAP);
-                            // An earlier view's leader leg crossing this
-                            // lane would strike through the number.
-                            if ink_lines.iter().any(|l| segment_crosses_rect(l, &text)) {
+                            // A leader leg crossing this lane -- an earlier
+                            // view's, or this view's -- would strike through
+                            // the number.
+                            if lane_text_blockers
+                                .iter()
+                                .any(|l| segment_crosses_rect(l, &text))
+                            {
+                                leg_in_the_way = true;
                                 continue;
                             }
                             // The dimension line runs out under a label taken
@@ -4155,6 +4320,7 @@ pub(crate) fn place_dimensions_routed(
                                 lanes[si].push(Vec::new());
                             }
                             lanes[si][lane].push((a0, a1));
+                            ends[si].push((d.lo, d.hi));
                             spot = Some((si, level, tc, text, lines, out_of_span));
                             break 'search;
                         }
@@ -4499,12 +4665,27 @@ pub(crate) fn dimension_band_depths(
     let Some(gr) = view_geometry_rect(view, 0.0) else {
         return (0.0, 0.0);
     };
-    let (mut below, mut left) = (0.0_f64, 0.0_f64);
-    for pd in place_dimensions(view, 0.0, 0, tabled_face_ids) {
-        let stacked = pd.arc.is_none()
+    let stacked = |pd: &PlacedDimension| {
+        pd.arc.is_none()
             && ((pd.ext[1][0][0] - pd.ext[1][1][0]).abs() > 1e-9
-                || (pd.ext[1][0][1] - pd.ext[1][1][1]).abs() > 1e-9);
-        if !stacked {
+                || (pd.ext[1][0][1] - pd.ext[1][1][1]).abs() > 1e-9)
+    };
+    // The stacks measured on their own: in this probe -- no frame, no
+    // neighbours -- a leader's shoulder lands anywhere, and its leg then
+    // pushed the numbers it crossed out lane after lane (a stack measured
+    // 110 mm deep where the sheet needs a third of it). On the sheet the
+    // leaders route round the lanes and a number slides past a leg.
+    let leaders: std::collections::HashSet<String> =
+        place_dimensions(view, 0.0, 0, tabled_face_ids)
+            .iter()
+            .filter(|pd| !stacked(pd))
+            .map(|pd| pd.dim_id.clone())
+            .collect();
+    let mut stacks_only = view.clone();
+    stacks_only.dimensions.retain(|d| !leaders.contains(&d.id));
+    let (mut below, mut left) = (0.0_f64, 0.0_f64);
+    for pd in place_dimensions(&stacks_only, 0.0, 0, tabled_face_ids) {
+        if !stacked(&pd) {
             // A leader or a point callout.
             continue;
         }
@@ -4655,6 +4836,185 @@ mod tests {
             shaded_raster: None,
             hatch_polylines: Vec::new(),
             polyline_sources: Vec::new(),
+        }
+    }
+
+    fn tag_site(tag: &str, centre: [f64; 2]) -> HoleSite {
+        HoleSite {
+            tag: tag.to_string(),
+            group: "A".to_string(),
+            diameter_mm: 2.4,
+            x_label: "\u{2014}".to_string(),
+            y_label: "\u{2014}".to_string(),
+            x_mm: 0.0,
+            y_mm: 0.0,
+            dia_label: "\u{00D8}2.4".to_string(),
+            depth_label: "THRU".to_string(),
+            is_through: true,
+            depth_mm: Some(5.0),
+            axial_centre: Some(centre),
+            world_centre: None,
+            face_entities: Vec::new(),
+            datum: None,
+            tolerance: None,
+        }
+    }
+
+    /// A hole tag whose bore is crowded -- small holes close together, drawn
+    /// reduced (part 107 on A3 at 1:2: holes 14 mm apart are 7 mm apart, and
+    /// "A1" was printed over "A2") -- moves out on a leader from the bore's
+    /// edge to free paper, instead of falling back onto the bore over the
+    /// text there. Its leader crosses no text, and no tag overlaps another
+    /// or any text.
+    ///
+    /// Mutation: drop the leader rings in `place_hole_tags` -> A1 falls back
+    /// onto its bore, over the text there -> RED.
+    #[test]
+    fn a_crowded_hole_tag_moves_out_on_a_leader() {
+        let mut view = simple_view("TOP", ProjectionType::Top, [100.0, 100.0]);
+        view.scale = 0.5;
+        let sheet_h = 297.0;
+        let sites = [tag_site("A1", [0.0, 0.0]), tag_site("A2", [0.0, 14.0])];
+        // A1's bore at sheet (100, 197); text beside it takes the tag's place
+        // on the bore and all four places 4 mm off it (without covering the
+        // bore itself).
+        let text = |x0: f64, y0: f64, x1: f64, y1: f64| Rect2 { x0, y0, x1, y1 };
+        let (sx, sy) = (100.0, 197.0);
+        let obstacles = vec![
+            text(94.0, 195.0, 98.5, 199.0),   // west of the bore
+            text(98.0, 190.0, 102.0, 193.0),  // north
+            text(103.0, 196.0, 107.0, 199.0), // east
+            text(98.0, 201.0, 102.0, 204.0),  // south
+        ];
+        let frame = Rect2 {
+            x0: 10.0,
+            y0: 10.0,
+            x1: 410.0,
+            y1: 287.0,
+        };
+        let placed = place_hole_tags(&view, 0, &sites, sheet_h, frame, obstacles.clone(), &[]);
+        assert_eq!(placed.len(), 2);
+        let (a1, a1_item) = &placed[0];
+        let leader = a1
+            .leader
+            .expect("A1 is drawn away from its bore, on a leader");
+        // The leader starts on the bore's edge (r 0.6 mm on paper).
+        let start = (leader[0][0] - sx).hypot(leader[0][1] - sy);
+        assert!((start - 0.6).abs() < 1e-9, "starts {start} from the centre");
+        for o in &obstacles {
+            assert!(
+                !a1_item.bbox.intersects(o, 0.2),
+                "A1 {:?} on text {o:?}",
+                a1_item.bbox
+            );
+        }
+        // No tag on another, and A2 clear of the text too.
+        assert!(!placed[0].1.bbox.intersects(&placed[1].1.bbox, 0.2));
+        for o in &obstacles {
+            assert!(!placed[1].1.bbox.intersects(o, 0.2), "A2 on text {o:?}");
+        }
+    }
+
+    /// A tag is not put on another tag's leader: on part 107 drawn 1:5, A4
+    /// landed on the leader A1 had just been given. The second bore sits
+    /// where the first tag's leader runs.
+    ///
+    /// Mutation: drop the `tag_leaders` test from `place_hole_tags` -> A2 is
+    /// put on A1's leader -> RED.
+    #[test]
+    fn a_hole_tag_is_not_put_on_another_tags_leader() {
+        let mut view = simple_view("TOP", ProjectionType::Top, [100.0, 100.0]);
+        view.scale = 0.5;
+        // A1's bore at sheet (100, 197). Text takes its place on the bore
+        // and the four places 4 mm off it, but not the paper due east of
+        // it: A1 goes out east, its leader along y 197 from x 100.6 to
+        // 103.6. A2's bore at (101, 198.5): its tag there is clear of
+        // every text and of A1's tag, but A1's leader runs through it.
+        let text = |x0: f64, y0: f64, x1: f64, y1: f64| Rect2 { x0, y0, x1, y1 };
+        let obstacles = vec![
+            text(101.0, 195.2, 103.4, 196.5), // on the bore and east of it, above the leader
+            text(98.0, 191.0, 102.0, 194.0),  // north
+            text(98.0, 201.5, 102.0, 203.0),  // south
+            text(93.0, 195.0, 97.0, 199.0),   // west
+        ];
+        let sites = [tag_site("A1", [0.0, 0.0]), tag_site("A2", [2.0, -3.0])];
+        let frame = Rect2 {
+            x0: 10.0,
+            y0: 10.0,
+            x1: 410.0,
+            y1: 287.0,
+        };
+        let placed = place_hole_tags(&view, 0, &sites, 297.0, frame, obstacles, &[]);
+        let leaders: Vec<[[f64; 2]; 2]> = placed.iter().filter_map(|(t, _)| t.leader).collect();
+        assert!(!leaders.is_empty(), "fixture: a tag goes out on a leader");
+        for (t, item) in &placed {
+            for l in placed
+                .iter()
+                .filter(|(o, _)| o.tag != t.tag)
+                .filter_map(|(o, _)| o.leader)
+            {
+                assert!(
+                    !segment_crosses_rect(&l, &item.bbox),
+                    "{} {:?} is on another tag's leader {l:?}",
+                    t.tag,
+                    item.bbox
+                );
+            }
+        }
+    }
+
+    /// A section letter "A" is placed clear of every dimension's LINE, not
+    /// only of their numbers: it is placed after them, and on NIST CTC 03 the
+    /// line of '211.46' ran through it.
+    ///
+    /// Mutation: drop the dimension lines from `place_cutting_plane_labels`'
+    /// collision test -> the letter lands on the line -> RED.
+    #[test]
+    fn a_section_letter_is_clear_of_dimension_lines() {
+        let mut d = Drawing::new("letters", SheetSize::A3);
+        d.add_view(simple_view("TOP", ProjectionType::Top, [100.0, 100.0]));
+        let cpl = crate::drawing::dimensioning::CuttingPlaneLine {
+            ax_view_idx: 0,
+            p0: [-10.0, 0.0],
+            p1: [10.0, 0.0],
+            arrow_dir: [0.0, 1.0],
+        };
+        // The p1 end is at sheet (110, 197); its first place is 4 mm beyond,
+        // at x 114. A vertical dimension line runs right through it.
+        let line = [[114.0, 180.0], [114.0, 215.0]];
+        let pd = PlacedDimension {
+            line,
+            ext: [[line[0], line[0]], [line[1], line[1]]],
+            arrows: [
+                ArrowSpec {
+                    tip: line[0],
+                    dir: [0.0, 1.0],
+                },
+                ArrowSpec {
+                    tip: line[1],
+                    dir: [0.0, -1.0],
+                },
+            ],
+            text_anchor: [150.0, 150.0],
+            text_rot_deg: 0.0,
+            label: "35".to_string(),
+            dim_id: "d1".to_string(),
+            owner_view: 0,
+            stack: None,
+            boxed: false,
+            ext_breaks: [Vec::new(), Vec::new()],
+            arc: None,
+        };
+        let letters = place_cutting_plane_labels(&d, &cpl, 297.0, &[], std::slice::from_ref(&pd));
+        assert_eq!(letters.len(), 2);
+        for l in &letters {
+            assert!(
+                !placed_line_segments(&pd)
+                    .iter()
+                    .any(|s| segment_crosses_rect(s, &l.bbox)),
+                "the letter at {:?} is on the dimension line",
+                l.bbox
+            );
         }
     }
 
@@ -5203,6 +5563,150 @@ mod tests {
         assert!(
             !segment_crosses_rect(&line, &text),
             "the earlier line runs through the number: {text:?}"
+        );
+    }
+
+    /// A stacked dimension's number is not put where a leader THIS view has
+    /// already placed runs (CADGenBench 107 drawn 1:2: the leg of RIGHT's
+    /// "16× R1" ran through the '54.01' stacked in the top band after it).
+    /// Only earlier views' lines were read.
+    ///
+    /// Mutation: read only `ink_lines` in the lane search again -> the
+    /// number sits on the leg -> RED.
+    #[test]
+    fn a_stacked_dimension_number_is_not_put_on_this_views_leader() {
+        // The view at sheet x 90..110, y 137..157.
+        let mut view = simple_view("RIGHT", ProjectionType::Right, [100.0, 150.0]);
+        // A fillet's radius at the view's top-left corner, its shoulder to
+        // the right of the view. Another view's title beside the view takes
+        // every shoulder row near the corner, so the leader climbs to the
+        // first free row above it: its leg runs long, across the top band
+        // over the view (107's leg rose 33 mm).
+        let mut radius = pos_dim("16× R1", [-9.0, 9.0], [-9.0, 8.0]);
+        radius.kind = "radius".to_string();
+        // A short length at the top edge, its number in the span, where the
+        // leg crosses the band.
+        view.dimensions = vec![radius, len_dim("4", [0.0, 10.0], [4.0, 10.0])];
+        // From the frame's bottom up to y 100: the free rows are above it.
+        let title = Rect2 {
+            x0: 121.0,
+            y0: 100.0,
+            x1: 160.0,
+            y1: 165.0,
+        };
+        // The frame ends just below the view: the length goes in the top band.
+        let placed = place_dimensions_routed(
+            &view,
+            297.0,
+            0,
+            &std::collections::HashSet::new(),
+            Some([10.0, 10.0, 400.0, 160.0]),
+            &[title],
+            &[],
+            &crate::drawing::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+        );
+        assert_eq!(placed.len(), 2, "both placed");
+        let leader = placed.iter().find(|p| p.label == "16× R1").expect("leader");
+        let number = placed.iter().find(|p| p.label == "4").expect("number");
+        let t = placed_text_box(number);
+        assert!(
+            !placed_line_segments(leader)
+                .iter()
+                .any(|l| segment_crosses_rect(l, &t)),
+            "the leader runs through the number {t:?}"
+        );
+    }
+
+    /// A number whose place in its span is crossed by a leader leg slides
+    /// along its dimension line past the leg and keeps its lane, instead of
+    /// being pushed out lane after lane past the whole leg (CADGenBench 107:
+    /// a stack measured 110 mm deep, and the sheet redrawn 1:5).
+    ///
+    /// Mutation: never try the `slides` -> the number goes out a lane -> RED.
+    #[test]
+    fn a_number_slides_past_a_leader_leg_and_keeps_its_lane() {
+        let mut view = simple_view("RIGHT", ProjectionType::Right, [100.0, 150.0]);
+        let mut radius = pos_dim("16× R1", [-9.0, 9.0], [-9.0, 8.0]);
+        radius.kind = "radius".to_string();
+        // The whole top edge: its number's centre (x 100) is where the leg
+        // crosses the first lane.
+        view.dimensions = vec![radius, len_dim("20", [-10.0, 10.0], [10.0, 10.0])];
+        let title = Rect2 {
+            x0: 121.0,
+            y0: 100.0,
+            x1: 160.0,
+            y1: 165.0,
+        };
+        let placed = place_dimensions_routed(
+            &view,
+            297.0,
+            0,
+            &std::collections::HashSet::new(),
+            Some([10.0, 10.0, 400.0, 160.0]),
+            &[title],
+            &[],
+            &crate::drawing::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+        );
+        let leader = placed.iter().find(|p| p.label == "16× R1").expect("leader");
+        let number = placed.iter().find(|p| p.label == "20").expect("number");
+        let t = placed_text_box(number);
+        assert!(
+            !placed_line_segments(leader)
+                .iter()
+                .any(|l| segment_crosses_rect(l, &t)),
+            "the leader runs through the number {t:?}"
+        );
+        // The first lane above the view's top edge (sheet y 137).
+        assert!(
+            (number.line[0][1] - (137.0 - STANDOFF)).abs() < 1e-9,
+            "the number kept the first lane: its line at y {}",
+            number.line[0][1]
+        );
+    }
+
+    /// The room a view's stacks need is measured from its stacks: a probe's
+    /// leaders (shoulders anywhere, no frame, no neighbours) must not push
+    /// the numbers out and inflate the depth the sheet then reserves
+    /// (CADGenBench 107: 110 mm, its sheet redrawn 1:5).
+    ///
+    /// Mutation: measure with the leader callouts placed -> the depth grows
+    /// -> RED.
+    #[test]
+    fn band_depth_is_the_stacks_room_not_the_leaders() {
+        // A view drawn 1:2 (the section re-layout measures the built
+        // views), a ladder of four heights on its left, three fillets at
+        // its bottom-left corner: at 1:2 their leader legs cross the left
+        // lanes, and the probe measured the left band 40 mm deep where its
+        // stacks need 24.
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        view.scale = 0.5;
+        let mut dims: Vec<_> = (0..4)
+            .map(|k| {
+                let top = -5.0 + 5.0 * k as f64;
+                len_dim(&format!("{}", 10 + k), [-10.0, -10.0], [-10.0, top])
+            })
+            .collect();
+        for i in 0..3 {
+            let mut r = pos_dim(
+                &format!("R{i}"),
+                [-9.0 + 0.3 * i as f64, -9.0],
+                [-9.0, -8.0],
+            );
+            r.id = format!("r{i}");
+            r.kind = "radius".to_string();
+            dims.push(r);
+        }
+        view.dimensions = dims;
+        let mut stacks = view.clone();
+        stacks.dimensions.retain(|d| d.kind != "radius");
+        let none = std::collections::HashSet::new();
+        let with = dimension_band_depths(&view, &none);
+        let without = dimension_band_depths(&stacks, &none);
+        assert!(
+            (with.0 - without.0).abs() < 1e-9 && (with.1 - without.1).abs() < 1e-9,
+            "depth with leaders {with:?}, stacks alone {without:?}"
         );
     }
 

@@ -286,6 +286,8 @@ fn write_stylesheet(out: &mut String) {
         "    .hole-tag { font: 700 3.6px sans-serif; fill: #111; \
          text-anchor: middle; dominant-baseline: alphabetic; }\n",
     );
+    // A tag drawn away from its bore: a thin leader, as a dimension leader.
+    out.push_str("    .hole-tag-leader { fill: none; stroke: #111; stroke-width: 0.18; }\n");
     // Hole-table outer border — 0.25 mm; inner separators handled as thin lines.
     out.push_str("    .hole-table-border { fill: none; stroke: #111; stroke-width: 0.25; }\n");
     out.push_str("    .hole-table-inner { fill: none; stroke: #111; stroke-width: 0.18; }\n");
@@ -790,10 +792,18 @@ fn render_view_labels(out: &mut String, layout: &SheetLayout) {
 
 /// Ink hole-tag callouts from the layout's `HoleTag` items.
 ///
-/// Each tag is a small centred label ("A1", "B3") placed at the bore centre
-/// in the axial view. Uses the same `hole-tag` CSS class so it can be styled
-/// independently from dimension text.
+/// Each tag is a small centred label ("A1", "B3") on its bore in the axial
+/// view, or out on a thin leader from the bore's edge
+/// ([`super::layout::place_hole_tags`]). Uses the `hole-tag` CSS class so it
+/// can be styled independently from dimension text.
 fn render_hole_tags(out: &mut String, layout: &SheetLayout) {
+    for leader in layout.hole_tags.iter().filter_map(|t| t.leader) {
+        let [[x1, y1], [x2, y2]] = leader;
+        let _ = writeln!(
+            out,
+            "  <line class=\"hole-tag-leader\" x1=\"{x1:.3}\" y1=\"{y1:.3}\" x2=\"{x2:.3}\" y2=\"{y2:.3}\"/>"
+        );
+    }
     for item in layout
         .items
         .iter()

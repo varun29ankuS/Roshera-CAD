@@ -450,7 +450,8 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     }
 
     // ── RedundantDimension detection ─────────────────────────────────────
-    check_redundant_dimensions(drawing, h, &mut issues);
+    check_redundant_dimensions(drawing, &mut issues);
+    check_extension_lines_apart(&layout, &mut issues);
 
     // ── DimensionLabelCollision detection ─────────────────────────────────
     check_dimension_label_collisions(&layout, &mut issues);
@@ -558,7 +559,7 @@ fn check_alignment(
 ///    same orientation (H or V) have interval endpoints that coincide within
 ///    0.5 mm in sheet space. This catches "10.00 plate-thickness + 10.00
 ///    bore-length both stacked on the same vertical interval in FRONT".
-fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<DrawingIssue>) {
+fn check_redundant_dimensions(drawing: &Drawing, issues: &mut Vec<DrawingIssue>) {
     // Build the tabled-face-id set from the drawing's hole sites (same set
     // that `place_dimensions` uses to suppress rendering). Position dims for
     // tabled bores are excluded from the cross-view duplicate check.
@@ -632,7 +633,8 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
 
     // ── Same-view same-interval check ────────────────────────────────────
     // Within each view, look for pairs of dimensions with the same orientation
-    // whose projected intervals (lo..hi in sheet space) coincide within 0.5 mm.
+    // whose intervals (lo..hi in the view's part millimetres) coincide within
+    // `SAME_INTERVAL_MM`.
     //
     // Only dimensions that are INKED take part: a bore's size and location
     // the hole table states are rows of the table, not lines on the view
@@ -656,24 +658,20 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
         }
         let mut lins: Vec<Lin> = Vec::new();
         for d in v.dimensions.iter().filter(|d| !stated_by_table(d)) {
-            let a = [
-                v.position_mm[0] + d.a[0] * v.scale,
-                (sheet_h - v.position_mm[1]) - d.a[1] * v.scale,
-            ];
-            let b = [
-                v.position_mm[0] + d.b[0] * v.scale,
-                (sheet_h - v.position_mm[1]) - d.b[1] * v.scale,
-            ];
-            let dx = (a[0] - b[0]).abs();
-            let dy = (a[1] - b[1]).abs();
-            if d.kind == "angle" || (dx < 1e-6 && dy < 1e-6) {
+            let dx = (d.a[0] - d.b[0]).abs();
+            let dy = (d.a[1] - d.b[1]).abs();
+            // An arc's radius is a leader on that arc, not an interval: two
+            // radius callouts in line are two features (as the dimension
+            // selector treats them). They were reported as one interval
+            // stated twice ('11× R3' and '5× R4.1', CADGenBench 115).
+            if d.kind == "angle" || d.kind == "radius" || (dx < 1e-6 && dy < 1e-6) {
                 continue;
             }
             let orient = if dx >= dy { 'H' } else { 'V' };
             let (lo, hi) = if orient == 'H' {
-                (a[0].min(b[0]), a[0].max(b[0]))
+                (d.a[0].min(d.b[0]), d.a[0].max(d.b[0]))
             } else {
-                (a[1].min(b[1]), a[1].max(b[1]))
+                (d.a[1].min(d.b[1]), d.a[1].max(d.b[1]))
             };
             lins.push(Lin {
                 lo,
@@ -687,22 +685,107 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
                 if lins[i].orient != lins[j].orient {
                     continue;
                 }
-                let lo_match = (lins[i].lo - lins[j].lo).abs() < 0.5;
-                let hi_match = (lins[i].hi - lins[j].hi).abs() < 0.5;
-                if lo_match && hi_match {
-                    issues.push(error(
-                        DrawingIssueKind::RedundantDimension,
-                        format!(
-                            "view '{}': '{}' and '{}' bracket the same interval",
-                            v.name, lins[i].label, lins[j].label
-                        ),
-                        Some(v.name.clone()),
-                    ));
+                // The same interval stated twice, on the part (two different
+                // intervals the scale puts on top of each other are not one:
+                // that is what their drawn lines say, below).
+                let same = (lins[i].lo - lins[j].lo).abs() < SAME_INTERVAL_MM
+                    && (lins[i].hi - lins[j].hi).abs() < SAME_INTERVAL_MM;
+                if !same {
+                    continue;
                 }
+                issues.push(error(
+                    DrawingIssueKind::RedundantDimension,
+                    format!(
+                        "view '{}': '{}' and '{}' bracket the same interval",
+                        v.name, lins[i].label, lins[j].label
+                    ),
+                    Some(v.name.clone()),
+                ));
             }
         }
     }
 }
+
+/// Two placed dimensions print on each other's lines when an extension line
+/// of one runs beside an extension line of the other, closer than
+/// [`super::layout::EXT_LINES_APART_MM`] and along more than a millimetre of
+/// both, without being the same line (a shared datum line is drawn once):
+/// the two read as one thick line, and which feature each number belongs to
+/// cannot be told. Read from the DRAWN lines: two near-equal intervals drawn
+/// on opposite sides of the view (staggered) are clear. One
+/// `RedundantDimension` per pair.
+fn check_extension_lines_apart(
+    layout: &super::layout::SheetLayout,
+    issues: &mut Vec<DrawingIssue>,
+) {
+    let dims = &layout.dimensions;
+    for i in 0..dims.len() {
+        for j in (i + 1)..dims.len() {
+            let (a, b) = (&dims[i], &dims[j]);
+            if a.owner_view != b.owner_view || a.arc.is_some() || b.arc.is_some() {
+                continue;
+            }
+            let close = |ea: &[[f64; 2]; 2], eb: &[[f64; 2]; 2]| {
+                let vertical = |e: &[[f64; 2]; 2]| (e[0][0] - e[1][0]).abs() < 1e-9;
+                let horizontal = |e: &[[f64; 2]; 2]| (e[0][1] - e[1][1]).abs() < 1e-9;
+                let (along, across) = if vertical(ea) && vertical(eb) {
+                    (1, 0)
+                } else if horizontal(ea) && horizontal(eb) {
+                    (0, 1)
+                } else {
+                    return false;
+                };
+                let gap = (ea[0][across] - eb[0][across]).abs();
+                let (a0, a1) = (
+                    ea[0][along].min(ea[1][along]),
+                    ea[0][along].max(ea[1][along]),
+                );
+                let (b0, b1) = (
+                    eb[0][along].min(eb[1][along]),
+                    eb[0][along].max(eb[1][along]),
+                );
+                let overlap = a1.min(b1) - a0.max(b0);
+                // Beside each other, or the very same line (a shared datum
+                // line, drawn once) -- the pair is then on each other's
+                // lines only if their OTHER lines are beside each other.
+                gap < super::layout::EXT_LINES_APART_MM && overlap > 1.0
+            };
+            let apart = |ea: &[[f64; 2]; 2], eb: &[[f64; 2]; 2]| {
+                (ea[0][0] - eb[0][0]).abs().max((ea[0][1] - eb[0][1]).abs())
+                    > super::layout::CHAIN_EPS
+                    || (ea[1][0] - eb[1][0]).abs().max((ea[1][1] - eb[1][1]).abs())
+                        > super::layout::CHAIN_EPS
+            };
+            // The WHOLE dimension on the other's lines, as the interval check
+            // it replaces had it (both ends): each extension line of one
+            // beside one of the other's, and not both the same lines. One
+            // pair of close lines alone is not reported here.
+            let beside = [(0usize, 1usize), (1, 0)].iter().any(|&(i, j)| {
+                close(&a.ext[0], &b.ext[i])
+                    && close(&a.ext[1], &b.ext[j])
+                    && (apart(&a.ext[0], &b.ext[i]) || apart(&a.ext[1], &b.ext[j]))
+            });
+            if beside {
+                issues.push(error(
+                    DrawingIssueKind::RedundantDimension,
+                    format!(
+                        "'{}' and '{}' print on each other's lines: their extension lines \
+                         run less than {} mm apart",
+                        a.label,
+                        b.label,
+                        super::layout::EXT_LINES_APART_MM
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+}
+
+/// Two dimensions in one view state the same interval when both its ends
+/// agree to this many PART millimetres: they would print the same value to
+/// the hundredth.
+const SAME_INTERVAL_MM: f64 = 0.01;
 
 /// Collision tolerance for dimension-text bounding boxes (ISO 129 practice).
 const DIM_TEXT_COLLISION_TOL_MM: f64 = 0.2;
@@ -801,6 +884,20 @@ fn check_callout_lines_clear_of_text(
     layout: &super::layout::SheetLayout,
     issues: &mut Vec<DrawingIssue>,
 ) {
+    for (gi, ti) in find_tag_leaders_through_text(layout) {
+        let (Some(tag), Some(t)) = (layout.hole_tags.get(gi), layout.items.get(ti)) else {
+            continue;
+        };
+        issues.push(error(
+            DrawingIssueKind::DimensionLabelCollision,
+            format!(
+                "the leader of hole tag '{}' runs through '{}'",
+                tag.tag,
+                t.text.as_deref().unwrap_or("?")
+            ),
+            None,
+        ));
+    }
     for (di, ti) in find_lines_through_text(layout) {
         let (Some(pd), Some(t)) = (layout.dimensions.get(di), layout.items.get(ti)) else {
             continue;
@@ -869,6 +966,55 @@ pub(crate) fn find_lines_through_text(layout: &super::layout::SheetLayout) -> Ve
                 .any(|s| super::layout::segment_crosses_rect(s, &inner))
             {
                 out.push((di, *ti));
+            }
+        }
+    }
+    out
+}
+
+/// Every (hole tag, text item) pair where the tag's leader -- drawn when the
+/// tag sits away from its bore ([`super::layout::place_hole_tags`]) -- runs
+/// through the text, as indices into `layout.hole_tags` and `layout.items`:
+/// the same texts and the same tolerance as [`find_lines_through_text`]. The
+/// tag's own text is not counted (the leader ends on its edge).
+pub(crate) fn find_tag_leaders_through_text(
+    layout: &super::layout::SheetLayout,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (gi, tag) in layout.hole_tags.iter().enumerate() {
+        let Some(leader) = tag.leader else {
+            continue;
+        };
+        for (ti, t) in layout.items.iter().enumerate() {
+            if !matches!(
+                t.kind,
+                SheetItemKind::DimensionText
+                    | SheetItemKind::HoleTag
+                    | SheetItemKind::CuttingPlaneLabel
+                    | SheetItemKind::ViewLabel
+            ) {
+                continue;
+            }
+            let own = t.kind == SheetItemKind::HoleTag
+                && t.text.as_deref() == Some(tag.tag.as_str())
+                && t.bbox.x0 <= tag.text_anchor[0]
+                && tag.text_anchor[0] <= t.bbox.x1
+                && t.bbox.y0 <= tag.text_anchor[1]
+                && tag.text_anchor[1] <= t.bbox.y1;
+            if own {
+                continue;
+            }
+            let inner = Rect2 {
+                x0: t.bbox.x0 + DIM_TEXT_COLLISION_TOL_MM,
+                y0: t.bbox.y0 + DIM_TEXT_COLLISION_TOL_MM,
+                x1: t.bbox.x1 - DIM_TEXT_COLLISION_TOL_MM,
+                y1: t.bbox.y1 - DIM_TEXT_COLLISION_TOL_MM,
+            };
+            if inner.x1 > inner.x0
+                && inner.y1 > inner.y0
+                && super::layout::segment_crosses_rect(&leader, &inner)
+            {
+                out.push((gi, ti));
             }
         }
     }

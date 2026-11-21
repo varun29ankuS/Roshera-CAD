@@ -502,6 +502,87 @@ fn redundant_dimension_same_view_same_interval_flagged() {
     assert!(!report.passed, "RedundantDimension is Severity::Error");
 }
 
+/// Two distinct intervals the scale puts close together (1 mm apart on the
+/// part, 0.2 mm on paper at 1:5) are two intervals, never "one stated twice"
+/// (the verifier's report was the defect `drawing_explicit_scale_fit`
+/// documents); the layout staggers them to opposite sides of the view, so
+/// their extension lines do not run beside each other (NIST CTC 03: 35.5,
+/// 35.82, 36.49). And an arc's radius is a leader on that arc, not an
+/// interval: two radius callouts in line are two features, not reported at
+/// all (the dimension selector already skips them). Found on the bench:
+/// '11× R3' and '5× R4.1' reported as one interval on a part drawn 1:2.
+///
+/// Mutation: count radius callouts as intervals; compare the intervals on
+/// paper again; or drop the stagger from the stack search -> RED.
+#[test]
+fn distinct_intervals_and_radius_callouts_are_not_redundant() {
+    // Drawn 1:2: the two spans end 0.6 mm apart on the part, 0.3 mm on
+    // paper, clear of the view's title (above its left end).
+    let mut fifth = rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [100.0, 100.0],
+        100.0,
+        60.0,
+        vec![
+            dim("35.00", [60.0, -6.0], [95.0, -6.0]),
+            dim("35.60", [60.0, -6.0], [95.6, -6.0]),
+        ],
+    );
+    fifth.scale = 0.5;
+    let mut d = Drawing::new("DistinctAtOneHalf", SheetSize::A3);
+    d.add_view(fifth);
+    // Two intervals, never "one stated twice"; and drawn staggered -- one
+    // below the view, one above -- their extension lines leave the part in
+    // opposite directions, and nothing prints on anything.
+    let report = verify_drawing(&d);
+    let overlap: Vec<&str> = report
+        .issues
+        .iter()
+        .filter(|i| i.kind == DrawingIssueKind::RedundantDimension)
+        .map(|i| i.message.as_str())
+        .collect();
+    assert!(
+        overlap.is_empty(),
+        "35 and 35.6 are two intervals, drawn apart at 1:2: {overlap:?}"
+    );
+    let layout = geometry_engine::drawing::layout::compute_layout(&d);
+    let levels: Vec<f64> = layout.dimensions.iter().map(|p| p.line[0][1]).collect();
+    let view_top = layout
+        .items
+        .iter()
+        .find(|i| i.kind == geometry_engine::drawing::layout::SheetItemKind::ViewGeometry)
+        .map(|i| i.bbox.y0)
+        .expect("the view");
+    assert!(
+        levels.iter().any(|&y| y < view_top) && levels.iter().any(|&y| y > view_top),
+        "one above the view, one below: {levels:?} (view top {view_top})"
+    );
+
+    let radius = |label: &str, a: [f64; 2], b: [f64; 2]| Dimension2d {
+        kind: "radius".to_string(),
+        ..dim(label, a, b)
+    };
+    let mut d = Drawing::new("RadiusCallouts", SheetSize::A3);
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [100.0, 100.0],
+        100.0,
+        60.0,
+        vec![
+            radius("11× R3", [20.0, 30.0], [23.0, 30.0]),
+            radius("5× R4.1", [20.0, 30.0], [23.0, 30.0]),
+        ],
+    ));
+    let report = verify_drawing(&d);
+    assert!(
+        !report.has(DrawingIssueKind::RedundantDimension),
+        "two radius callouts are not one interval; issues={:?}",
+        report.issues
+    );
+}
+
 /// DETECTOR PROOF — `ViewLabelCollision` via label-on-neighbour-geometry
 /// (I-2 silent-success window, permanent invariant).
 ///
@@ -1148,6 +1229,7 @@ fn hole_tag_collision_with_dimension_text_flagged() {
             text_anchor: [107.0, 102.0],
             tag: "A1".to_string(),
             owner_view: 0,
+            leader: None,
         }],
         gdt_leaders: Vec::new(),
     };
