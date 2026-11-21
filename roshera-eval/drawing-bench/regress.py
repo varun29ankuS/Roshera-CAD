@@ -35,6 +35,8 @@ import sys
 UNDERFILLED = 0.10
 # A utilization gain this large is an improvement on its own.
 UTIL_GAIN = 0.02
+# Grades are written to 3+ decimals; a difference below this is float noise.
+GRADE_EPS = 1e-6
 
 
 def _load(path):
@@ -52,7 +54,12 @@ def _facts(s):
     sheet = s.get("sheet") or {}
     views = sheet.get("views") or []
     util = q.get("sheet_utilization")
+    sp = s.get("spaces") or {}
     return {
+        # the space map (drafting craft): the grade is the WORST space's score;
+        # None on sheets from before the map existed
+        "grade": float(sp["grade"]) if sp.get("grade") is not None else None,
+        "below_bar": int(sp["below_bar"]) if sp.get("below_bar") is not None else None,
         "drawn": s.get("stage") == "done",
         "errors": int(q.get("errors") or 0),
         "not_dim": int(counts.get("not_dimensioned") or 0),
@@ -68,7 +75,11 @@ def _facts(s):
 
 def judge(before, after):
     """{'verdict': 'better'|'same'|'worse', 'why': [..], 'before': facts, 'after': facts}."""
-    b, a = _facts(before), _facts(after)
+    return judge_facts(_facts(before), _facts(after))
+
+
+def judge_facts(b, a):
+    """`judge` on facts already read (a run's summaries, or the floors file)."""
     worse, better = [], []
     if b["drawn"] and not a["drawn"]:
         worse.append("sheet no longer draws")
@@ -93,6 +104,19 @@ def judge(before, after):
             worse.append(f"utilization {b['util']:.3f} -> {a['util']:.3f} (under-filled)")
         elif a["util"] - b["util"] >= UTIL_GAIN:
             better.append(f"utilization {b['util']:.3f} -> {a['util']:.3f}")
+    if b["grade"] is not None:
+        if a["grade"] is None:
+            if a["drawn"]:
+                worse.append("space map missing")
+        else:
+            if a["grade"] < b["grade"] - GRADE_EPS:
+                worse.append(f"grade {b['grade']:.3f} -> {a['grade']:.3f}")
+            elif a["grade"] > b["grade"] + GRADE_EPS:
+                better.append(f"grade {b['grade']:.3f} -> {a['grade']:.3f}")
+            if a["below_bar"] > b["below_bar"]:
+                worse.append(f"spaces below bar {b['below_bar']} -> {a['below_bar']}")
+            elif a["below_bar"] < b["below_bar"]:
+                better.append(f"spaces below bar {b['below_bar']} -> {a['below_bar']}")
     if a["ms"] > 1.5 * b["ms"] and a["ms"] - b["ms"] > 5000:
         worse.append(f"sheet time {b['ms']} -> {a['ms']} ms")
     if not b["drawn"] and a["drawn"]:
@@ -114,6 +138,43 @@ def compare(before_dir, after_dir):
             v = {"verdict": "worse", "why": ["no result after the change"], "before": _facts(b), "after": None}
         else:
             v = judge(b, a)
+        rows.append({"id": pid, **v})
+        if v["verdict"] == "worse":
+            worse.append(pid)
+    return rows, worse
+
+
+FLOORS_VERSION = 1
+
+
+def write_floors(run_dir, path):
+    """Snapshot every part's facts from an observed run into `path` (checked
+    in; runs/ is not). Floors encode what was measured, never an aspiration."""
+    parts = {}
+    for pid in sorted(os.listdir(run_dir)):
+        s = _load(os.path.join(run_dir, pid, "summary.json"))
+        if s is not None:
+            parts[pid] = _facts(s)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"version": FLOORS_VERSION, "from_run": os.path.basename(os.path.normpath(run_dir)),
+                   "parts": parts}, f, indent=1, sort_keys=True)
+        f.write("\n")
+    return parts
+
+
+def check_floors(path, after_dir):
+    """Judge `after_dir` against the floors file with the before/after rules.
+    Returns (rows sorted by id, ids of parts that fell below their floor)."""
+    floors = _load(path)
+    if not floors or floors.get("version") != FLOORS_VERSION:
+        raise SystemExit(f"floors file {path} missing or not version {FLOORS_VERSION}")
+    rows, worse = [], []
+    for pid, b in sorted(floors["parts"].items()):
+        a = _load(os.path.join(after_dir, pid, "summary.json"))
+        if a is None:
+            v = {"verdict": "worse", "why": ["no result after the change"], "before": b, "after": None}
+        else:
+            v = judge_facts(b, _facts(a))
         rows.append({"id": pid, **v})
         if v["verdict"] == "worse":
             worse.append(pid)
@@ -157,11 +218,20 @@ def markdown(rows, worse):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--before", required=True)
-    ap.add_argument("--after", required=True)
+    ap.add_argument("--before", default="", help="an earlier run directory")
+    ap.add_argument("--floors", default="", help="the checked-in floors file (instead of --before)")
+    ap.add_argument("--after", required=True, help="the run to judge")
+    ap.add_argument("--write-floors", default="",
+                    help="snapshot --after into this floors file and judge nothing")
     ap.add_argument("--md", default="")
     args = ap.parse_args()
-    rows, worse = compare(args.before, args.after)
+    if args.write_floors:
+        parts = write_floors(args.after, args.write_floors)
+        sys.stdout.write(f"floors: {len(parts)} parts from {args.after} -> {args.write_floors}\n")
+        return 0
+    if bool(args.before) == bool(args.floors):
+        ap.error("give exactly one of --before or --floors")
+    rows, worse = check_floors(args.floors, args.after) if args.floors else compare(args.before, args.after)
     text = markdown(rows, worse)
     if args.md:
         with open(args.md, "w", encoding="utf-8") as f:

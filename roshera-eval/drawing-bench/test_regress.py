@@ -14,8 +14,8 @@ import regress  # noqa: E402
 
 
 def summary(errors=0, not_dim=0, complete=True, sound=True, stage="done", ms=1000, stale=0,
-            util=0.3, size="A3", scale=1.0):
-    return {
+            util=0.3, size="A3", scale=1.0, grade=None, below_bar=None):
+    s = {
         "stage": stage,
         "quality": {"errors": errors, "warnings": 0, "passed": errors == 0, "sheet_utilization": util},
         "certificate": {
@@ -26,6 +26,11 @@ def summary(errors=0, not_dim=0, complete=True, sound=True, stage="done", ms=100
         "sheet": {"ms": ms, "ok": stage == "done", "size": size, "dimensions_inked": 10,
                   "views": [{"name": "FRONT", "scale": scale}]},
     }
+    if grade is not None:
+        # the space map's record, as drawing_bench writes it
+        s["spaces"] = {"grade": grade, "below_bar": below_bar, "bar": 0.8, "spaces": 20,
+                       "worst": "title_block", "by_rule": {}}
+    return s
 
 
 def write(root, pid, s):
@@ -82,6 +87,39 @@ class Judge(unittest.TestCase):
     def test_unchanged_is_same(self):
         self.assertEqual(regress.judge(summary(errors=1), summary(errors=1))["verdict"], "same")
 
+    # The space map (drafting craft): the grade is the sheet's WORST space.
+    def test_a_lower_grade_is_worse(self):
+        v = regress.judge(summary(grade=0.6, below_bar=3), summary(grade=0.5, below_bar=3))
+        self.assertEqual(v["verdict"], "worse")
+        self.assertIn("grade 0.600 -> 0.500", v["why"])
+
+    def test_more_spaces_below_the_bar_is_worse_even_at_the_same_grade(self):
+        v = regress.judge(summary(grade=0.6, below_bar=3), summary(grade=0.6, below_bar=4))
+        self.assertEqual(v["verdict"], "worse")
+        self.assertIn("spaces below bar 3 -> 4", v["why"])
+
+    def test_a_higher_grade_or_fewer_spaces_below_is_better(self):
+        self.assertEqual(regress.judge(summary(grade=0.5, below_bar=3),
+                                       summary(grade=0.7, below_bar=3))["verdict"], "better")
+        self.assertEqual(regress.judge(summary(grade=0.5, below_bar=3),
+                                       summary(grade=0.5, below_bar=1))["verdict"], "better")
+
+    def test_a_better_grade_bought_with_a_new_layout_error_is_worse(self):
+        v = regress.judge(summary(grade=0.5, below_bar=3), summary(grade=0.9, below_bar=0, errors=1))
+        self.assertEqual(v["verdict"], "worse")
+
+    def test_float_noise_in_the_grade_is_not_a_change(self):
+        v = regress.judge(summary(grade=0.6, below_bar=3), summary(grade=0.6 - 1e-9, below_bar=3))
+        self.assertEqual(v["verdict"], "same")
+
+    def test_a_sheet_from_before_the_space_map_is_not_judged_on_it(self):
+        self.assertEqual(regress.judge(summary(), summary(grade=0.4, below_bar=9))["verdict"], "same")
+
+    def test_losing_the_space_map_is_worse(self):
+        v = regress.judge(summary(grade=0.6, below_bar=3), summary())
+        self.assertEqual(v["verdict"], "worse")
+        self.assertIn("space map missing", v["why"])
+
 
 class Run(unittest.TestCase):
     def test_compare_dirs_flags_any_worse_part(self):
@@ -101,6 +139,50 @@ class Run(unittest.TestCase):
             write(before, "101", summary())
             os.makedirs(after)
             _, worse = regress.compare(before, after)
+            self.assertEqual(worse, ["101"])
+
+
+class Floors(unittest.TestCase):
+    """The ratchet: a checked-in snapshot of each part's facts from an observed
+    run (runs/ is gitignored), judged with the same rules as before/after."""
+
+    def test_floors_written_from_a_run_hold_each_parts_facts(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = os.path.join(d, "run")
+            write(run, "101", summary(errors=2, grade=0.55, below_bar=4))
+            path = os.path.join(d, "floors.json")
+            regress.write_floors(run, path)
+            with open(path, encoding="utf-8") as f:
+                floors = json.load(f)
+            self.assertEqual(floors["parts"]["101"]["errors"], 2)
+            self.assertEqual(floors["parts"]["101"]["grade"], 0.55)
+            self.assertEqual(floors["parts"]["101"]["below_bar"], 4)
+
+    def test_a_run_below_its_floors_fails_and_one_at_them_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            base, path = os.path.join(d, "base"), os.path.join(d, "floors.json")
+            write(base, "101", summary(grade=0.55, below_bar=4))
+            write(base, "102", summary(grade=0.70, below_bar=1))
+            regress.write_floors(base, path)
+            same = os.path.join(d, "same")
+            write(same, "101", summary(grade=0.55, below_bar=4))
+            write(same, "102", summary(grade=0.70, below_bar=1))
+            _, worse = regress.check_floors(path, same)
+            self.assertEqual(worse, [])
+            slipped = os.path.join(d, "slipped")
+            write(slipped, "101", summary(grade=0.55, below_bar=4))
+            write(slipped, "102", summary(grade=0.60, below_bar=1))
+            _, worse = regress.check_floors(path, slipped)
+            self.assertEqual(worse, ["102"])
+
+    def test_a_part_with_a_floor_but_no_result_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            base, path = os.path.join(d, "base"), os.path.join(d, "floors.json")
+            write(base, "101", summary(grade=0.55, below_bar=4))
+            regress.write_floors(base, path)
+            empty = os.path.join(d, "empty")
+            os.makedirs(empty)
+            _, worse = regress.check_floors(path, empty)
             self.assertEqual(worse, ["101"])
 
 
