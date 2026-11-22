@@ -2297,13 +2297,14 @@ fn search_sheets<D, E>(
 }
 
 /// More room for a sheet with layout errors -- its text does not fit the
-/// views: the next larger sheet, at the largest scale it holds the views at
+/// views -- or short of paper ([`short_of_paper`]: a dimension found no
+/// room, Varun 11-21's "shortage of paper"): the next larger sheet, at the largest scale it holds the views at
 /// ([`SheetShape::roomier`]), taken only with fewer errors ([`takes_over`]).
 /// "Smallest sheet" (Varun 11-21) puts parts on smaller paper, and a part
 /// drawn 1:2 on A3 had nine dimension texts over its views where 1:1 on A1
 /// had none. Tried AFTER the most preferred pair: built in its place, it
 /// drew NIST CTC 03 on A0 at 1:2 where A1 at 1:2 (never built) was the
-/// smaller sheet. `None` for a sheet without errors.
+/// smaller sheet. `None` for a sheet without errors that is not short.
 fn escape_candidate(
     shape: &SheetShape,
     sheet: &super::types::SheetSize,
@@ -2311,7 +2312,7 @@ fn escape_candidate(
     score: &SheetScore,
     built: &[(super::types::SheetSize, f64, f64)],
 ) -> Option<SheetCandidate> {
-    (score.errors > 0)
+    (score.errors > 0 || short_of_paper(score.shortfall()))
         .then(|| shape.roomier(sheet, scale, built))
         .flatten()
 }
@@ -3290,7 +3291,11 @@ fn build_sheet(
     // ── Section view (Task 9) ─────────────────────────────────────────────────
     // When the part has internal features (bore sites populated above), add
     // SECTION A-A placed by the deterministic section_slot_rule.
-    attach_section_view(model, solid_id, &mut drawing, &dims, exact_scale);
+    let cap = match choice {
+        SheetChoice::Capped(_, cap) => Some(cap),
+        SheetChoice::Auto | SheetChoice::Exact(..) => None,
+    };
+    attach_section_view(model, solid_id, &mut drawing, &dims, exact_scale, cap);
 
     // ── GD&T sidecar bridge (Task 6 fix wave) ────────────────────────────────
     // Iterate the model's DRF (datum designations) and GDT sidecar
@@ -5311,12 +5316,19 @@ fn section_layout_gaps(drawing: &super::types::Drawing) -> (f64, f64) {
 /// `exact`: `(scale, pictorial)` -- every view is drawn at exactly `scale`
 /// and the isometric at exactly `pictorial` (a sheet the automatic search
 /// chose) instead of at the slot layout's own fill scale.
+///
+/// `cap`: without `exact`, the re-fit draws the views no larger than this
+/// (the size ladder's redraw of a sheet short of paper,
+/// [`SheetChoice::Capped`]): re-fitted freely, part 103's redraw on A0 "at
+/// no larger scale" than 1:2 came out 1:1, its views filled the larger
+/// sheet, and 27 dimensions found no room.
 pub(crate) fn attach_section_view(
     model: &BRepModel,
     solid_id: SolidId,
     drawing: &mut super::types::Drawing,
     dims: &[crate::readable::DimensionRecord],
     exact: Option<(f64, f64)>,
+    cap: Option<f64>,
 ) {
     use super::section_view::section_view;
     use super::types::ViewSource;
@@ -5392,8 +5404,24 @@ pub(crate) fn attach_section_view(
             let front_ext = drawing.views.first().map(|v| v.extent).unwrap_or_default();
             let top_ext = drawing.views.get(1).map(|v| v.extent).unwrap_or_default();
             let right_ext = drawing.views.get(2).map(|v| v.extent).unwrap_or_default();
-            let (s, pos) = match exact {
-                Some((s, _)) => (
+            let free = || {
+                layout_four_view_gap(
+                    &drawing.sheet_size,
+                    front_ext,
+                    top_ext,
+                    right_ext,
+                    section_unit.extent, // ISO slot carries section extent
+                    drawing.projection,
+                    vgap,
+                    hgap,
+                )
+            };
+            let fixed = match exact {
+                Some((s, _)) => Some(s),
+                None => cap.filter(|&c| free().0 > c),
+            };
+            let (s, pos) = match fixed {
+                Some(s) => (
                     s,
                     place_four_view(
                         &drawing.sheet_size,
@@ -5408,16 +5436,7 @@ pub(crate) fn attach_section_view(
                     )
                     .positions,
                 ),
-                None => layout_four_view_gap(
-                    &drawing.sheet_size,
-                    front_ext,
-                    top_ext,
-                    right_ext,
-                    section_unit.extent, // ISO slot carries section extent
-                    drawing.projection,
-                    vgap,
-                    hgap,
-                ),
+                None => free(),
             };
             for (i, v) in drawing.views.iter_mut().take(3).enumerate() {
                 v.scale = s;
@@ -5440,18 +5459,27 @@ pub(crate) fn attach_section_view(
                 .get(3)
                 .map(|v| scaled_extent(v.extent, k))
                 .unwrap_or_default();
-            let (s, pos, _) = layout_five_view(
-                &drawing.sheet_size,
-                front_ext,
-                top_ext,
-                right_ext,
-                iso_ext,
-                section_unit.extent,
-                drawing.projection,
-                vgap,
-                hgap,
-                exact.map(|(s, _)| s),
-            );
+            let five = |scale: Option<f64>| {
+                layout_five_view(
+                    &drawing.sheet_size,
+                    front_ext,
+                    top_ext,
+                    right_ext,
+                    iso_ext,
+                    section_unit.extent,
+                    drawing.projection,
+                    vgap,
+                    hgap,
+                    scale,
+                )
+            };
+            let mut fitted = five(exact.map(|(s, _)| s));
+            if exact.is_none() {
+                if let Some(c) = cap.filter(|&c| fitted.0 > c) {
+                    fitted = five(Some(c));
+                }
+            }
+            let (s, pos, _) = fitted;
             for (i, v) in drawing.views.iter_mut().take(4).enumerate() {
                 v.scale = if i == 3 { s * k } else { s };
                 v.position_mm = pos[i];
@@ -6054,6 +6082,41 @@ mod tests {
         assert!(shape.roomier(&SheetSize::A0, 0.002, &[]).is_none());
     }
 
+    /// A best sheet with dimensions that found no room is short of paper,
+    /// and gets more room too, even with no layout errors: part 103 was drawn
+    /// on A1 at 0 errors with 47 dimensions left off, where A0 held them all
+    /// (Varun 11-21: up a sheet for "a shortage of paper").
+    ///
+    /// Mutation: escape only on `score.errors > 0` -> RED.
+    #[test]
+    fn a_sheet_short_of_paper_tries_more_room() {
+        use super::super::types::SheetSize;
+        let shape = rib_shape(false);
+        let built = [(SheetSize::A3, 0.5, 0.5)];
+        let short = SheetScore {
+            errors: 0,
+            unplaced: 47,
+            table: 0,
+            utilization: 0.107,
+        };
+        let roomy =
+            escape_candidate(&shape, &SheetSize::A3, 0.5, &short, &built).expect("more room");
+        assert_eq!(
+            (roomy.sheet, roomy.scale),
+            (SheetSize::A2, 0.5),
+            "{roomy:?}"
+        );
+        let table_short = SheetScore {
+            unplaced: 0,
+            table: 1,
+            ..short
+        };
+        assert!(
+            escape_candidate(&shape, &SheetSize::A3, 0.5, &table_short, &built).is_some(),
+            "a hole table with no free paper"
+        );
+    }
+
     /// The search builds the most preferred pair FIRST and escapes to more
     /// room only from the best sheet after it: escaping from the ladder's
     /// sheet in its place drew NIST CTC 03 (A1 at 1:5, 11 errors) on A0 at
@@ -6103,18 +6166,8 @@ mod tests {
         assert_eq!(got, first, "the smaller sheet is kept: {tried:?}");
     }
 
-    /// D6, held at the layout itself (the integration fixture's automatic
-    /// sheet moved to A4, where SECTION A-A takes the isometric's cell and
-    /// the five-view packing is not used): a Ø120 x 14 flange's short, wide
-    /// section packed as a band above the TOP/ISO row draws every view larger
-    /// on A3 than the old full-height third column, which pinned it at 0.75.
-    ///
-    /// Mutation: make `layout_five_view` always take `five_view_column` ->
-    /// the five views fit A3 no larger than the column does -> RED.
-    #[test]
-    fn a_short_wide_section_packs_as_a_band_not_a_column() {
-        use super::super::types::{ProjectionAngle, SheetSize};
-        // The harness's flange: a Ø120 x 14 disc with a Ø50 bore.
+    /// The harness's flange: a Ø120 x 14 disc with a Ø50 bore (sectioned).
+    fn bored_flange() -> (BRepModel, SolidId) {
         let mut m = BRepModel::new();
         let disc = sid(TopologyBuilder::new(&mut m)
             .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 60.0, 14.0)
@@ -6130,6 +6183,60 @@ mod tests {
             crate::operations::boolean::BooleanOptions::default(),
         )
         .expect("bore cut");
+        (m, s)
+    }
+
+    /// The size ladder's redraw of a sheet short of paper is drawn no larger
+    /// than its cap, SECTION A-A's re-fit included: part 103 short on A1 at
+    /// 1:2 was redrawn on A0 "at no larger scale", and the section re-layout
+    /// then re-fitted every view to 1:1 -- the views filled the larger sheet
+    /// and 27 dimensions found no room, so A1 was kept with 47 left off.
+    ///
+    /// Mutation: drop the cap from `attach_section_view`'s free re-fit -> the
+    /// flange on A0 is drawn far above 1:2 -> RED.
+    #[test]
+    fn a_capped_sheet_stays_capped_through_the_section_refit() {
+        use super::super::types::{ProjectionAngle, SheetSize};
+        let (m, s) = bored_flange();
+        let angle = ProjectionAngle::Third;
+        let _scope = crate::readable::adjacency::AdjacencyCacheScope::enter(&m);
+        let plan = plan_sheet(&m, s, uuid::Uuid::nil(), angle).expect("plan");
+        for sheet_size in [SheetSize::A0, SheetSize::A3] {
+            let sheet = build_sheet(
+                &m,
+                s,
+                uuid::Uuid::nil(),
+                angle,
+                &plan,
+                SheetChoice::Capped(sheet_size, 0.5),
+                &mut Vec::new(),
+            )
+            .expect("capped sheet");
+            assert!(sheet.section.is_some(), "the flange is sectioned");
+            for v in &sheet.views {
+                assert!(
+                    v.scale <= 0.5 + 1e-9,
+                    "{:?}: {:?} drawn at {}",
+                    sheet_size,
+                    v.name,
+                    v.scale
+                );
+            }
+        }
+    }
+
+    /// D6, held at the layout itself (the integration fixture's automatic
+    /// sheet moved to A4, where SECTION A-A takes the isometric's cell and
+    /// the five-view packing is not used): a Ø120 x 14 flange's short, wide
+    /// section packed as a band above the TOP/ISO row draws every view larger
+    /// on A3 than the old full-height third column, which pinned it at 0.75.
+    ///
+    /// Mutation: make `layout_five_view` always take `five_view_column` ->
+    /// the five views fit A3 no larger than the column does -> RED.
+    #[test]
+    fn a_short_wide_section_packs_as_a_band_not_a_column() {
+        use super::super::types::{ProjectionAngle, SheetSize};
+        let (m, s) = bored_flange();
         let angle = ProjectionAngle::Third;
         let _scope = crate::readable::adjacency::AdjacencyCacheScope::enter(&m);
         let plan = plan_sheet(&m, s, uuid::Uuid::nil(), angle).expect("plan");
