@@ -1502,6 +1502,30 @@ fn iso_raster_px(iso_extent: super::types::ViewExtent, scale: f64) -> (usize, us
     (px_w.max(MIN_SIDE), px_h.max(MIN_SIDE))
 }
 
+/// How finely to mesh the solid for a shaded picture `px_w` x `px_h` pixels
+/// of `iso_extent` (view units): no finer than the picture can show. The
+/// chord is half of what one pixel covers on the part and an edge may run
+/// eight pixels -- below a pixel nothing is visible. Meshing the picture at
+/// the kernel's default (0.1 mm edges) took 20 s on a 130 mm turned part
+/// (CADGenBench 109) for a 204 x 640 pixel cell.
+fn raster_tessellation(
+    iso_extent: super::types::ViewExtent,
+    px_w: usize,
+    px_h: usize,
+) -> crate::tessellation::TessellationParams {
+    let per_px =
+        (iso_extent.width() / px_w.max(1) as f64).max(iso_extent.height() / px_h.max(1) as f64);
+    let fine = crate::tessellation::TessellationParams::default();
+    if !(per_px.is_finite() && per_px > 0.0) {
+        return fine;
+    }
+    crate::tessellation::TessellationParams {
+        chord_tolerance: fine.chord_tolerance.max(0.5 * per_px),
+        max_edge_length: fine.max_edge_length.max(8.0 * per_px),
+        ..fine
+    }
+}
+
 /// Render the deterministic SHADED-SOLID isometric raster for the pictorial
 /// cell. The image REPLACES the wireframe line work in the SVG/PDF output so a
 /// shop reader sees a recognizable solid, not see-through HLR edges.
@@ -1539,7 +1563,7 @@ fn shaded_iso_raster(
         height: px_h,
         view: CanonicalView::Isometric,
         mode: RenderMode::Shaded,
-        tessellation: TessellationParams::default(),
+        tessellation: raster_tessellation(iso_extent, px_w, px_h),
     };
     // Key light for the pictorial (Varun: "lights have to be used properly").
     // The default HEADLIGHT lambert collapses an iso cube to one uniform gray
@@ -1549,7 +1573,14 @@ fn shaded_iso_raster(
     // 0.25 ambient floor keeping every face readable. Deterministic constant;
     // only this presentation path uses it (render_solid stays headlight).
     let key_light = Vector3::new(-0.4, -0.6, 0.8).normalize().ok()?;
+    let t_render = std::time::Instant::now();
     let frame = render_solid_lit(model, solid_id, key_light, &opts)?;
+    if draw_profile_enabled() {
+        eprintln!(
+            "[draw-profile]   shaded iso raster {px_w}x{px_h}: {:.1} ms",
+            t_render.elapsed().as_secs_f64() * 1e3
+        );
+    }
     let png = frame.to_png().ok()?;
     Some(super::types::ShadedRaster {
         png_base64: STANDARD.encode(&png),
@@ -7509,5 +7540,75 @@ mod tests {
         assert!(in_view("TOP"), "Ø5 dimensioned in its circle view");
         assert!(!in_view("FRONT"), "Ø5 not repeated in FRONT");
         assert!(!in_view("RIGHT"), "Ø5 not repeated in RIGHT");
+    }
+}
+
+#[cfg(test)]
+mod raster_tessellation_tests {
+    use super::*;
+
+    /// The shaded pictorial is meshed at the picture's own resolution: on a
+    /// 130 mm part drawn into a 204 x 640 pixel cell one pixel covers about
+    /// 0.2 mm, so the chord is half that and an edge may run 8 pixels -- not
+    /// the kernel's 0.1 mm edge cap, which cut every fillet into strips. A
+    /// tiny part drawn large keeps the finer default.
+    #[test]
+    fn the_pictorial_is_meshed_no_finer_than_its_pixels() {
+        let big = super::super::types::ViewExtent {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 40.0,
+            max_y: 130.0,
+        };
+        let (w, h) = (204, 640);
+        let per_px = (40.0 / w as f64).max(130.0 / h as f64);
+        let p = raster_tessellation(big, w, h);
+        assert!(
+            (p.chord_tolerance - 0.5 * per_px).abs() < 1e-12,
+            "chord {}",
+            p.chord_tolerance
+        );
+        assert!(
+            (p.max_edge_length - 8.0 * per_px).abs() < 1e-12,
+            "edge {}",
+            p.max_edge_length
+        );
+
+        let tiny = super::super::types::ViewExtent {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 0.5,
+            max_y: 0.5,
+        };
+        let fine = crate::tessellation::TessellationParams::default();
+        let q = raster_tessellation(tiny, 640, 640);
+        assert_eq!(
+            q.chord_tolerance, fine.chord_tolerance,
+            "a tiny part keeps the fine chord"
+        );
+        assert_eq!(
+            q.max_edge_length, fine.max_edge_length,
+            "and the fine edge cap"
+        );
+    }
+
+    /// The shaded pictorial the sheet draws is the one meshed this way: the
+    /// production render reads its tessellation from `raster_tessellation`.
+    #[test]
+    fn the_sheet_pictorial_render_uses_the_pixel_tessellation() {
+        let src = include_str!("dimensioning.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("split always yields a first element");
+        let start = production
+            .find("fn shaded_iso_raster(")
+            .expect("shaded_iso_raster is defined");
+        let body = &production[start..];
+        let body = &body[..body.find("\n}\n").expect("its body ends")];
+        assert!(
+            body.contains("tessellation: raster_tessellation(iso_extent, px_w, px_h)"),
+            "the pictorial render must mesh at its own pixel size"
+        );
     }
 }
