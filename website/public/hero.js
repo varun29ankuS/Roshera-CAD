@@ -4069,7 +4069,22 @@ void main() {
             p.y += grow * 0.3 * (0.6 * sin(p.x * 0.33 + ph + uTime * 0.45) + 0.3 * sin(p.x * 0.91 + ph * 1.7 - uTime * 0.7) + 0.1 * sin(p.x * 2.3 + ph * 3.1));
             p.z += grow * 0.4 * (0.6 * sin(p.x * 0.27 + ph * 1.3 - uTime * 0.35) + 0.3 * sin(p.x * 0.83 + ph * 2.3 + uTime * 0.6));
             float j1 = h(seed.y * 311.0 + 1.0) - 0.5, j2 = h(seed.y * 173.0 + 2.0) - 0.5;
-            p.y += j1 * (0.04 + 0.3 * s); p.z += j2 * (0.04 + 0.4 * s);
+            // Each stream widens as real flow does, x metres downstream: a
+            // jet linearly (half-width R + 0.09 x, about a 5 degree half
+            // angle), a wake as sqrt(x); a tip vortex's core grows below.
+            float x = s * (kind == 1.0 ? 36.0 : 30.0);
+            vec2 jetOff = vec2(position.y - uNozzle.x, position.z - side * uNozzle.y);
+            float jetB = uNozzle.z + 0.09 * x;
+            float wakeD = 0.04 + 0.11 * sqrt(x);
+            if (kind == 1.0) {
+              vec2 grown = jetOff * (jetB / uNozzle.z) + vec2(j1, j2) * 0.5 * (jetB - uNozzle.z);
+              p.y += grown.x - jetOff.x; p.z += grown.y - jetOff.y;
+              jetOff = grown;
+            } else if (kind == 2.0) {
+              p.y += j1 * 0.04; p.z += j2 * 0.04;
+            } else {
+              p.y += j1 * 2.0 * wakeD; p.z += j2 * (0.04 + 0.08 * sqrt(x));
+            }
             if (kind == 2.0) {
               float a = lane * 6.2831 + s * 26.0 * side;
               float r = 0.07 + 0.5 * pow(s, 0.8);
@@ -4085,11 +4100,9 @@ void main() {
               // Exhaust jet: about 2.5 U_inf through the potential core,
               // then the centreline decays as 1/x while the jet spreads; a
               // Gaussian profile across it.
-              vec2 off = vec2(position.y - uNozzle.x, position.z - side * uNozzle.y)
-                + vec2(j1 * (0.04 + 0.3 * s), j2 * (0.04 + 0.4 * s));
-              float b = uNozzle.z * (1.0 + 1.5 * s);
-              float centre = 1.0 + 1.5 * min(1.0, 0.12 / max(s, 1e-3));
-              speed = 1.0 + (centre - 1.0) * exp(-2.0 * dot(off, off) / (b * b));
+              // Potential core about six diameters long.
+              float centre = 1.0 + 1.5 * min(1.0, 12.0 * uNozzle.z / max(x, 1e-3));
+              speed = 1.0 + (centre - 1.0) * exp(-2.0 * dot(jetOff, jetOff) / (jetB * jetB));
             } else if (kind == 2.0) {
               // Wingtip vortex (Lamb-Oseen): swirl Gamma/(2 pi r) (1 - e^(-r^2/rc^2)),
               // fastest just outside the core; the core grows downstream and
@@ -4107,7 +4120,7 @@ void main() {
               // edge, deepest on the wake's centreline (Gaussian across it),
               // recovering as x^(-1/2) while the wake widens.
               float eta = 2.0 * j1;
-              speed = 1.0 - 0.55 / sqrt(1.0 + 12.0 * s) * exp(-3.0 * eta * eta);
+              speed = 1.0 - 0.55 / sqrt(1.0 + 0.4 * x) * exp(-3.0 * eta * eta);
             }
             // One scale for the whole field: 0.3 U_inf (blue) .. 2.6 U_inf (red).
             vSpeed = (speed - 0.3) / 2.3;
