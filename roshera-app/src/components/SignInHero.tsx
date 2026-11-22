@@ -277,14 +277,15 @@ export function SignInHero() {
         uniforms: {
           uTime: { value: 0 },
           uScale: { value: window.innerHeight },
+          uPale: { value: new THREE.Color(pal.wakePale) },
+          uDeep: { value: new THREE.Color(pal.wakeDeep) },
           uAlpha: { value: pal.wakeAlpha },
-          uGamma: { value: pal.wakeGamma },
           uNozzle: { value: new THREE.Vector3(NOZZLE.y, NOZZLE.z, NOZZLE.exitRadius) },
         },
         vertexShader: `
           attribute vec4 seed;
           uniform float uTime; uniform float uScale; uniform vec3 uNozzle;
-          varying float vAlpha; varying float vSpeed;
+          varying float vAlpha; varying float vCore;
           float h(float n) { return fract(sin(n * 91.345) * 47453.53); }
           void main() {
             float kind = seed.z, side = seed.w, lane = seed.x;
@@ -306,7 +307,6 @@ export function SignInHero() {
             if (kind == 1.0) {
               vec2 grown = jetOff * (jetB / uNozzle.z) + vec2(j1, j2) * 0.5 * (jetB - uNozzle.z);
               p.y += grown.x - jetOff.x; p.z += grown.y - jetOff.y;
-              jetOff = grown;
             } else if (kind == 2.0) {
               p.y += j1 * 0.04; p.z += j2 * 0.04;
             } else {
@@ -317,64 +317,19 @@ export function SignInHero() {
               float r = 0.07 + 0.5 * pow(s, 0.8);
               p.y += r * sin(a); p.z += side * r * cos(a) - side * 0.5 * s;
             }
-            // The local flow speed |u| / U_inf in the aircraft's frame, from
-            // where the particle is in its stream -- as a CFD plot of
-            // velocity magnitude colours it; no particle gets a colour of its
-            // own. s is the distance downstream (0 at the source), j1 / j2
-            // the particle's offset from its stream's centreline.
-            float speed;
-            if (kind == 1.0) {
-              // Exhaust jet: about 2.5 U_inf through the potential core,
-              // then the centreline decays as 1/x while the jet spreads; a
-              // Gaussian profile across it.
-              // Potential core about six diameters long.
-              float centre = 1.0 + 1.5 * min(1.0, 12.0 * uNozzle.z / max(x, 1e-3));
-              speed = 1.0 + (centre - 1.0) * exp(-2.0 * dot(jetOff, jetOff) / (jetB * jetB));
-            } else if (kind == 2.0) {
-              // Wingtip vortex (Lamb-Oseen): swirl Gamma/(2 pi r) (1 - e^(-r^2/rc^2)),
-              // fastest just outside the core; the core grows downstream and
-              // carries an axial deficit.
-              float r = 0.07 + 0.5 * pow(s, 0.8);
-              float rc = 0.12 + 0.25 * s;
-              float e = exp(-(r * r) / (rc * rc));
-              // Gamma / 2 pi sized so the peak swirl is about U_inf, a
-              // fighter's tip vortex at manoeuvre lift.
-              float swirl = 0.22 / r * (1.0 - e);
-              float axial = 1.0 - 0.3 * e;
-              speed = sqrt(axial * axial + swirl * swirl);
-            } else {
-              // Wing and tail wake: the velocity deficit behind the trailing
-              // edge, deepest on the wake's centreline (Gaussian across it),
-              // recovering as x^(-1/2) while the wake widens.
-              float eta = 2.0 * j1;
-              speed = 1.0 - 0.55 / sqrt(1.0 + 0.4 * x) * exp(-3.0 * eta * eta);
-            }
-            // One scale for the whole field: 0.3 U_inf (blue) .. 2.6 U_inf (red).
-            vSpeed = (speed - 0.3) / 2.3;
+            vCore = kind == 1.0 ? 1.0 : (kind == 2.0 ? 0.85 : 0.35 + 0.55 * lane);
             vAlpha = smoothstep(0.0, 0.025, s) * (1.0 - smoothstep(0.4, 1.0, s)) * (kind == 1.0 ? 0.75 : 0.55);
             vec4 mv = modelViewMatrix * vec4(p, 1.0);
             gl_PointSize = clamp(uScale * 0.11 / -mv.z, 1.5, 6.0);
             gl_Position = projectionMatrix * mv;
           }`,
         fragmentShader: `
-          uniform float uAlpha; uniform float uGamma;
-          varying float vAlpha; varying float vSpeed;
-          // Turbo, the rainbow colormap CFD plots use (A. Mikhailov, Google,
-          // 2019; polynomial fit): blue (slow) -> cyan -> green -> yellow ->
-          // red (fast).
-          vec3 turbo(float x) {
-            x = clamp(x, 0.0, 1.0);
-            vec4 v4 = vec4(1.0, x, x * x, x * x * x);
-            vec2 v2 = v4.zw * v4.z;
-            return vec3(
-              dot(v4, vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234)) + dot(v2, vec2(-152.94239396, 59.28637943)),
-              dot(v4, vec4(0.09140261, 2.19418839, 4.84296658, -14.18503333)) + dot(v2, vec2(4.27729857, 2.82956604)),
-              dot(v4, vec4(0.10667330, 12.64194608, -60.58204836, 110.36276771)) + dot(v2, vec2(-89.90310912, 27.34824973)));
-          }
+          uniform vec3 uPale; uniform vec3 uDeep; uniform float uAlpha;
+          varying float vAlpha; varying float vCore;
           void main() {
             vec2 q = gl_PointCoord - 0.5; float d = dot(q, q);
             if (d > 0.25) discard;
-            gl_FragColor = vec4(pow(turbo(vSpeed), vec3(uGamma)), uAlpha * vAlpha * (1.0 - d * 3.0));
+            gl_FragColor = vec4(mix(uPale, uDeep, vCore), uAlpha * vAlpha * (1.0 - d * 3.0));
           }`,
       }),
     )
