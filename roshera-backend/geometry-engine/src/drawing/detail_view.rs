@@ -281,8 +281,8 @@ fn clipped_view(
 /// title, clear of every inked item (a dimensioned view with its dimension
 /// footprint). `None` when the sheet has no such paper.
 fn free_slot(drawing: &super::types::Drawing, c: [f64; 2], r: f64, k: f64) -> Option<[f64; 2]> {
-    let w = drawing.sheet_size.width();
-    let h = drawing.sheet_size.height();
+    let w = drawing.sheet().width();
+    let h = drawing.sheet().height();
     let (ml, mr, mt, mb) = super::svg::frame_margins(&drawing.sheet_size);
     let layout = super::layout::compute_layout(drawing);
     let obstacles: Vec<super::layout::Rect2> = layout

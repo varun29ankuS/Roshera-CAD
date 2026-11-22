@@ -557,8 +557,8 @@ fn stacked_pattern_dimensions_clear_the_view_below() {
 fn assert_leaders_inside_frame(d: &Drawing) {
     let layout = geometry_engine::drawing::layout::compute_layout(d);
     let a4 = matches!(d.sheet_size, geometry_engine::drawing::types::SheetSize::A4);
-    let (x0, x1) = (if a4 { 15.0 } else { 20.0 }, d.sheet_size.width() - 10.0);
-    let (y0, y1) = (10.0, d.sheet_size.height() - 10.0);
+    let (x0, x1) = (if a4 { 15.0 } else { 20.0 }, d.sheet().width() - 10.0);
+    let (y0, y1) = (10.0, d.sheet().height() - 10.0);
     for pd in &layout.dimensions {
         let v = &d.views[pd.owner_view];
         let Some(dim) = v.dimensions.iter().find(|x| x.id == pd.dim_id) else {
@@ -713,7 +713,7 @@ fn a_pattern_leader_stays_inside_the_frame() {
         } else {
             20.0
         },
-        x1: d.sheet_size.width() - 10.0,
+        x1: d.sheet().width() - 10.0,
     };
     let mut checked = 0;
     for pd in &layout.dimensions {
@@ -831,7 +831,7 @@ fn callout_text_is_clear_of_other_views_centre_lines() {
     }
     let (d, _) = sheet(&m, s, "three_patterns_centrelines");
     let layout = compute_layout(&d);
-    let h = d.sheet_size.height();
+    let h = d.sheet().height();
     let to_sheet = |v: &geometry_engine::drawing::types::ProjectedView, p: [f64; 2]| {
         [
             v.position_mm[0] + p[0] * v.scale,
@@ -986,7 +986,7 @@ fn leader_legs_do_not_cross_other_holes() {
         standard_drawing_hlr(&m, s, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("A3 at 1:1");
     for (route, d) in [("auto", &auto), ("explicit", &explicit)] {
         let layout = compute_layout(d);
-        let h = d.sheet_size.height();
+        let h = d.sheet().height();
         let mut crossings = Vec::new();
         for pd in &layout.dimensions {
             let v = &d.views[pd.owner_view];

@@ -525,7 +525,7 @@ fn a_blended_hub_sheet_calls_out_its_fillet_and_its_chamfer() {
             let tip = inked[0].arrows[0].tip;
             let want = [
                 front.position_mm[0] + callout.a[0] * front.scale,
-                (d.sheet_size.height() - front.position_mm[1]) - callout.a[1] * front.scale,
+                (d.sheet().height() - front.position_mm[1]) - callout.a[1] * front.scale,
             ];
             assert!(
                 (tip[0] - want[0]).hypot(tip[1] - want[1]) < 1e-6,

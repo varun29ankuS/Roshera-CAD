@@ -337,6 +337,7 @@ fn main() {
         "ok": true,
         "ms": sheet_ms,
         "size": drawing.sheet_size.label(),
+        "orientation": drawing.orientation.label(),
         "projection": drawing.projection,
         "views": drawing.views.iter().map(|v| json!({
             "name": v.name,

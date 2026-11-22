@@ -190,8 +190,8 @@ fn sheet_rect(drawing: &Drawing) -> Rect2 {
     Rect2 {
         x0: 0.0,
         y0: 0.0,
-        x1: drawing.sheet_size.width(),
-        y1: drawing.sheet_size.height(),
+        x1: drawing.sheet().width(),
+        y1: drawing.sheet().height(),
     }
 }
 
@@ -295,7 +295,7 @@ pub fn render_drawing_png(
         usvg::Tree::from_str(&svg, &options).map_err(|e| RasterError::SvgParse(e.to_string()))?;
     // Tree units per paper mm, read off the parsed tree (the sheet's
     // `width="..mm"` at usvg's dpi), never assumed.
-    let k = f64::from(tree.size().width()) / drawing.sheet_size.width();
+    let k = f64::from(tree.size().width()) / drawing.sheet().width();
     if !(k.is_finite() && k > 0.0) {
         return Err(RasterError::SvgParse(format!(
             "the sheet SVG has no usable size ({} units wide)",

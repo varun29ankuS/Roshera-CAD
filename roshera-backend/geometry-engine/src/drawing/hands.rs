@@ -507,7 +507,7 @@ fn obstacles(
             .map(|o| (o.0, o.1))
             .collect(),
         pictorials: vi.pictorials,
-        frame: frame_rect(&d.sheet_size),
+        frame: frame_rect(&d.sheet()),
     }
 }
 
@@ -946,7 +946,7 @@ pub fn move_view(
         ));
     }
     let vi = resolve_view(d, view)?;
-    let sheet_h = d.sheet_size.height();
+    let sheet_h = d.sheet().height();
     let v = &d.views[vi];
     let geo = view_geometry_rect(v, sheet_h).ok_or_else(|| {
         refuse(
@@ -1305,7 +1305,7 @@ fn reattach_frame(
     // bore. The smallest such circle is the feature itself (a counterbore's
     // and a raised face's circles are larger).
     let circle = d.views.get(fcf.owner_view).and_then(|v| {
-        let sheet_h = d.sheet_size.height();
+        let sheet_h = d.sheet().height();
         v.circles
             .iter()
             .map(|c| {
@@ -1779,7 +1779,7 @@ pub fn assess(before: &Drawing, plan: Plan) -> Result<Assessed, HandsRefusal> {
     let la = compute_layout(&plan.drawing);
     // Ink pushed past the drawing frame is refused too: sliding a number off
     // the paper once LOWERED the sheet's empty-paper finding.
-    let frame = frame_rect(&before.sheet_size);
+    let frame = frame_rect(&before.sheet());
     let outside_before = find_ink_outside_frame(&lb, frame).len();
     let outside: Vec<String> = find_ink_outside_frame(&la, frame)
         .into_iter()

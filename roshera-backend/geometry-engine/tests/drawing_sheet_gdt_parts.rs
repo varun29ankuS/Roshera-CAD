@@ -318,7 +318,7 @@ fn assert_clean_and_filled(m: &BRepModel, d: &Drawing, what: &str) {
     let report = verify_drawing(d);
     assert_eq!(report.error_count(), 0, "layout errors: {what}");
     let layout = compute_layout(d);
-    let outside = find_ink_outside_frame(&layout, frame_rect(&d.sheet_size));
+    let outside = find_ink_outside_frame(&layout, frame_rect(&d.sheet()));
     assert!(
         outside.is_empty(),
         "ink outside the frame {outside:?}: {what}"
@@ -682,7 +682,7 @@ fn a_weld_bevel_is_drawn_as_an_arc_from_the_end_face() {
     );
     // The corner is the root face's rim, Ø57.7, at the end face z 46.
     let view = &d.views[vi];
-    let sheet_h = d.sheet_size.height();
+    let sheet_h = d.sheet().height();
     let end_y = (sheet_h - view.position_mm[1]) - dim.a[1] * view.scale;
     assert!((c[1] - end_y).abs() < 1e-6, "corner {c:?} on the end face");
     assert!(
@@ -704,7 +704,7 @@ fn a_weld_bevel_is_drawn_as_an_arc_from_the_end_face() {
     // the frame, nothing left unplaced.
     let what = describe(&m, &d);
     assert_eq!(verify_drawing(&d).error_count(), 0, "{what}");
-    let outside = find_ink_outside_frame(&layout, frame_rect(&d.sheet_size));
+    let outside = find_ink_outside_frame(&layout, frame_rect(&d.sheet()));
     assert!(outside.is_empty(), "{outside:?}: {what}");
     assert!(
         !dimension_omissions(&m, &d)
@@ -1122,7 +1122,7 @@ fn the_whole_sheet_renders_as_a_png_at_the_sheet_aspect() {
     use geometry_engine::drawing::raster::{render_drawing_png, SheetCrop, SHEET_PNG_DEFAULT_PX};
     assert_eq!(SHEET_PNG_DEFAULT_PX, 1600);
     let (d, _, _) = mapped_sheet(en1092_weld_neck_with_gdt);
-    let (w, h) = (d.sheet_size.width(), d.sheet_size.height());
+    let (w, h) = (d.sheet().width(), d.sheet().height());
     for px in [1600u32, 700] {
         let out = render_drawing_png(&d, &SheetCrop::whole(&d), px).expect("png");
         let pm = decode_png(&out.png);
@@ -1154,7 +1154,7 @@ fn a_space_crop_shows_the_space_its_outline_and_its_dimensions() {
     use geometry_engine::drawing::raster::{render_drawing_png, SheetCrop};
     use geometry_engine::drawing::spaces::SpaceKind;
     let (d, layout, map) = mapped_sheet(en1092_weld_neck_with_gdt);
-    let (sw, sh) = (d.sheet_size.width(), d.sheet_size.height());
+    let (sw, sh) = (d.sheet().width(), d.sheet().height());
     let texts_in = |r: &Rect2| -> Vec<Rect2> {
         layout
             .items
@@ -1813,7 +1813,7 @@ fn moving_views_closes_a_gutter_and_keeps_projection_lines() {
         .unwrap_or_else(|e| panic!("fcf:{n}: {e:?}"));
         d = a.plan.drawing;
     }
-    let h = d.sheet_size.height();
+    let h = d.sheet().height();
     let centre = |d: &Drawing, name: &str| {
         let v = d.views.iter().find(|v| v.name == name).expect("view");
         let g = view_geometry_rect(v, h).expect("geo");
@@ -2227,7 +2227,7 @@ fn a_frame_is_never_put_in_a_hole() {
 fn every_verb_replays_to_the_sheet_it_planned() {
     use geometry_engine::drawing::hands::{self, LeaderTarget};
     let (m, d) = sheet_with_model(en1092_weld_neck_with_gdt);
-    let h = d.sheet_size.height();
+    let h = d.sheet().height();
     let right = {
         let v = d.views.iter().find(|v| v.name == "RIGHT").expect("RIGHT");
         let g = geometry_engine::drawing::layout::view_geometry_rect(v, h).expect("geo");

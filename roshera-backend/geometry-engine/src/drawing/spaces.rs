@@ -963,7 +963,7 @@ struct LaneWork {
 /// [`compute_layout`](super::layout::compute_layout)). Pure and
 /// deterministic: the same sheet gives the same map, ids included.
 pub fn space_map(drawing: &Drawing, layout: &SheetLayout) -> SpaceMap {
-    let frame = frame_rect(&drawing.sheet_size);
+    let frame = frame_rect(&drawing.sheet());
     let mut b = Builder { spaces: Vec::new() };
     b.push("frame".into(), SpaceKind::Frame, frame, None, None);
 

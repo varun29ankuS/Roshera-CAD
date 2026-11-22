@@ -62,6 +62,7 @@ let lastPdfQuery = undefined;
 // were captured in one variable a test could not tell a correct forward from a
 // collapsed one.
 let lastMakeAckUnsound = undefined;
+let lastMakeOrientation = undefined;
 let lastPdfAckUnsound = undefined;
 
 // The live sheet certificate the stub serves — mutated between phases.
@@ -101,6 +102,7 @@ const stub = http.createServer((req, res) => {
     if (req.method === "POST" && url.startsWith("/api/parts/9/drawing")) {
       counts.make++;
       lastMakeAckUnsound = new URLSearchParams(qs ?? "").get("acknowledge_unsound");
+      lastMakeOrientation = new URLSearchParams(qs ?? "").get("orientation");
       return send({
         id: DRAWING,
         quality: { passed: true, sheet_utilization: 0.4, issues: [] },
@@ -336,6 +338,19 @@ const a2 = await call("make_drawing", { part_id: 9 });
 check("make_drawing never defaults acknowledge_unsound onto a call that omitted it", () => {
   assert.equal(firstJson(a2).refused, undefined);
   assert.equal(lastMakeAckUnsound, null, "an omission must stay an omission on the wire");
+});
+
+// Sheet orientation: make_drawing's `orientation` reaches the creation route
+// as `?orientation=`, where the server lays every sheet it draws that way up;
+// omitted, it stays omitted (the server's search then tries both).
+const or1 = await call("make_drawing", { part_id: 9, orientation: "portrait" });
+check("make_drawing forwards orientation to the creation route", () => {
+  assert.equal(firstJson(or1).refused, undefined);
+  assert.equal(lastMakeOrientation, "portrait", "the orientation reached the wire");
+});
+await call("make_drawing", { part_id: 9 });
+check("make_drawing sends no orientation when none was asked for", () => {
+  assert.equal(lastMakeOrientation, null, "the search chooses when none is asked for");
 });
 
 rmSync(OUT, { force: true });

@@ -41,7 +41,7 @@ use super::layout::{
     compute_layout, PlacedDimension, SheetItemKind, CAP_HEIGHT_OF_EM, DIM_TEXT_FONT_MM,
     GLYPH_ADVANCE_EM, NOTES_BOTTOM_BASELINE_MM, NOTES_FONT_MM, NOTES_LINE_PITCH_MM,
 };
-use super::types::{Drawing, ProjectedView, SheetSize};
+use super::types::{Drawing, ProjectedView, Sheet, SheetSize};
 
 /// Errors produced during DXF rendering.
 #[derive(Debug, Error)]
@@ -171,7 +171,7 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     }
 
     // -- Sheet frame ---------------------------------------------------
-    emit_sheet_frame(&mut dxf, &drawing.sheet_size);
+    emit_sheet_frame(&mut dxf, &drawing.sheet());
 
     // -- Views ---------------------------------------------------------
     // DXF is a VECTOR interchange format: its consumers (AutoCAD, FreeCAD,
@@ -182,7 +182,7 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     // including the isometric, precisely for this fallback), so the DXF
     // isometric stays clean wireframe line work. `view.shaded_raster` is never
     // consulted in this module.
-    let sheet_h = drawing.sheet_size.height();
+    let sheet_h = drawing.sheet().height();
     // Each view is ONE block holding its line work, inserted once on the
     // view's layer. FreeCAD makes a document object per model-space entity:
     // the bracket sheet's thousands of loose view polylines (3 617 objects)
@@ -297,26 +297,21 @@ fn sanitise_layer_name(raw: &str) -> String {
 /// Emit the outer sheet trim line + the inner drawing frame on
 /// LAYER_FRAME. Matches the SVG renderer's geometry so SVG/PDF/DXF
 /// look identical when overlaid.
-fn emit_sheet_frame(dxf: &mut DxfDrawing, sheet: &SheetSize) {
-    let w = sheet.width();
-    let h = sheet.height();
+fn emit_sheet_frame(dxf: &mut DxfDrawing, sheet: &Sheet) {
+    let (w, h) = sheet.dims();
     // Outer trim (faint).
     add_rect(dxf, LAYER_FRAME, 0.0, 0.0, w, h);
     // Inner drawing frame — match the SVG renderer's margins exactly.
-    let (ml, mr, mt, mb) = frame_margins(sheet);
+    let (ml, mr, mt, mb) = frame_margins(&sheet.size);
     add_rect(dxf, LAYER_FRAME, ml, mb, w - mr, h - mt);
 }
 
-/// Mirror of `svg.rs::frame_margins` — A4 gets a wider left margin
-/// (binder punches), every other size shares the same 20/10/10/10
-/// scheme.
+/// `svg.rs::frame_margins`, the one margin table (a copy here could drift
+/// from the frame the SVG draws).
 ///
 /// Returns `(left, right, top, bottom)` in mm.
 fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
-    match sheet {
-        SheetSize::A4 => (15.0, 10.0, 10.0, 10.0),
-        _ => (20.0, 10.0, 10.0, 10.0),
-    }
+    super::svg::frame_margins(sheet)
 }
 
 /// Emit every polyline in a view as an LWPOLYLINE on the view's
@@ -886,7 +881,7 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
 /// DXF is y-up, so every y is flipped against the sheet height.
 fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
     use super::title_block::{title_block_layout, CellStyle};
-    let sheet_h = drawing.sheet_size.height();
+    let sheet_h = drawing.sheet().height();
     let fy = |y: f64| sheet_h - y;
     let tb = title_block_layout(drawing);
     let rect = |dxf: &mut DxfDrawing, r: &super::layout::Rect2| {
@@ -1816,7 +1811,7 @@ mod tests {
             Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, ViewExtent, ViewSource,
         };
         let mut drawing = Drawing::new("LabelTest", SheetSize::A3);
-        let sheet_h = drawing.sheet_size.height();
+        let sheet_h = drawing.sheet().height();
 
         for (name, proj, pos) in [
             ("FRONT", ProjectionType::Front, [80.0, 110.0_f64]),
@@ -1926,7 +1921,7 @@ mod tests {
             Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, ViewExtent, ViewSource,
         };
         let mut drawing = Drawing::new("VertDim", SheetSize::A3);
-        let sheet_h = drawing.sheet_size.height();
+        let sheet_h = drawing.sheet().height();
 
         // One FRONT view with a horizontal AND a vertical dimension —
         // the vertical one (dy > dx) is placed rotated (text_rot_deg = -90).

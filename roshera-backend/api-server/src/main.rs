@@ -89,6 +89,8 @@ mod refusal_token_tests;
 mod router_integration_tests;
 #[cfg(test)]
 mod sheet_export_gate_tests;
+#[cfg(test)]
+mod sheet_orientation_tests;
 mod sketch;
 mod transactions;
 #[cfg(test)]

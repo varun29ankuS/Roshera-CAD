@@ -173,7 +173,7 @@ fn sheet_with_iso() -> Drawing {
 
 /// Sheet-space (y-down) centre of a view's geometry.
 fn centre(d: &Drawing, v: &geometry_engine::drawing::types::ProjectedView) -> [f64; 2] {
-    let r = view_geometry_rect(v, d.sheet_size.height()).expect("geometry");
+    let r = view_geometry_rect(v, d.sheet().height()).expect("geometry");
     [0.5 * (r.x0 + r.x1), 0.5 * (r.y0 + r.y1)]
 }
 

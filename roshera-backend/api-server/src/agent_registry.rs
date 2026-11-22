@@ -1240,7 +1240,8 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "properties": {
                     "part_id": {"type": "integer", "description": "kernel part/solid id from list_parts"},
                     "name": {"type": "string", "description": "title-block name for the sheet"},
-                    "projection": {"type": "string", "enum": ["first", "third"], "description": "first-angle (ISO) or third-angle (ASME, default)"}
+                    "projection": {"type": "string", "enum": ["first", "third"], "description": "first-angle (ISO) or third-angle (ASME, default)"},
+                    "orientation": {"type": "string", "enum": ["landscape", "portrait"], "description": "paper orientation; omit to let the sheet search try both and keep the better"}
                 },
                 "required": ["part_id"]
             }),

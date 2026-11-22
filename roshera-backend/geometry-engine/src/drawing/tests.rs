@@ -565,14 +565,19 @@ fn drawing_add_remove_view_round_trips() {
 
 #[test]
 fn sheet_size_dimensions_are_correct() {
-    assert_eq!(SheetSize::A4.width(), 297.0);
-    assert_eq!(SheetSize::A4.height(), 210.0);
-    assert_eq!(SheetSize::A3.width(), 420.0);
-    assert_eq!(SheetSize::A0.height(), 841.0);
+    assert_eq!(SheetSize::A4.landscape().width(), 297.0);
+    assert_eq!(SheetSize::A4.landscape().height(), 210.0);
+    assert_eq!(SheetSize::A3.landscape().width(), 420.0);
+    assert_eq!(SheetSize::A0.landscape().height(), 841.0);
     let c = SheetSize::Custom {
         width: 500.0,
         height: 400.0,
     };
-    assert_eq!(c.width(), 500.0);
-    assert_eq!(c.height(), 400.0);
+    assert_eq!(c.landscape().width(), 500.0);
+    assert_eq!(c.landscape().height(), 400.0);
+    // Portrait turns an ISO size; a custom sheet keeps the dimensions given.
+    assert_eq!(SheetSize::A4.portrait().dims(), (210.0, 297.0));
+    assert_eq!(SheetSize::A1.portrait().dims(), (594.0, 841.0));
+    assert_eq!(c.portrait().dims(), (500.0, 400.0));
+    assert!(!c.portrait().is_portrait());
 }

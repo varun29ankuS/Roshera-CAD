@@ -64,10 +64,10 @@ use geometry_engine::drawing::layout::compute_layout;
 use geometry_engine::drawing::types::{ViewEdit, ViewEditError, ViewMove};
 use geometry_engine::drawing::{
     added_view, answer_query, certify_drawing, render_drawing_dxf, render_drawing_pdf,
-    render_drawing_svg, space_map, standard_drawing_auto_with_projection,
+    render_drawing_svg, space_map, standard_drawing_auto_with_options,
     standard_drawing_hlr_with_projection, verify_drawing, Drawing, DrawingAnswer,
     DrawingQualityReport, DrawingQuery, ProjectedViewId, ProjectionAngle, ProjectionType,
-    SheetReadbackCertificate, SheetSize, SpaceMap, TitleBlock, ViewSource,
+    SheetOrientation, SheetReadbackCertificate, SheetSize, SpaceMap, TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
 use geometry_engine::primitives::provenance::SoundnessReading;
@@ -206,9 +206,16 @@ impl DrawingManager {
         }
     }
 
-    /// Allocate a fresh, empty drawing owned by `owner`. Returns its UUID.
-    pub fn create(&self, name: impl Into<String>, sheet_size: SheetSize, owner: ModelKey) -> Uuid {
-        let mut drawing = Drawing::new(name, sheet_size);
+    /// Allocate a fresh, empty drawing owned by `owner`, on `sheet` (a
+    /// [`geometry_engine::drawing::Sheet`], or a bare [`SheetSize`] laid
+    /// landscape). Returns its UUID.
+    pub fn create(
+        &self,
+        name: impl Into<String>,
+        sheet: impl Into<geometry_engine::drawing::Sheet>,
+        owner: ModelKey,
+    ) -> Uuid {
+        let mut drawing = Drawing::new(name, sheet);
         stamp_issue_date(&mut drawing);
         let id = drawing.id.0;
         self.drawings.insert(
@@ -399,6 +406,12 @@ pub struct CreateDrawingRequest {
     pub name: String,
     #[serde(default = "default_sheet_size")]
     pub sheet_size: SheetSize,
+    /// `"landscape"` (default) or `"portrait"`. A custom size keeps the
+    /// dimensions given and its orientation is the one they have: an
+    /// orientation given with custom dimensions that say the other is
+    /// refused, never silently overridden.
+    #[serde(default)]
+    pub orientation: Option<SheetOrientation>,
 }
 
 fn default_sheet_size() -> SheetSize {
@@ -598,16 +611,30 @@ pub async fn create_drawing(
         ));
     }
     let name = req.name.clone();
-    let sheet = req.sheet_size;
-    let id = state
-        .drawings
-        .create(req.name, req.sheet_size, owner.clone());
+    let sheet =
+        geometry_engine::drawing::Sheet::new(req.sheet_size, req.orientation.unwrap_or_default());
+    if let Some(asked) = req.orientation {
+        if asked != sheet.orientation {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "a {} sheet is {}: its dimensions say so, and orientation '{}' contradicts them",
+                    sheet.label(),
+                    sheet.orientation.label(),
+                    asked.label()
+                ),
+            )
+            .with_hint("Give the custom width and height the way up you want, or omit orientation."));
+        }
+    }
+    let id = state.drawings.create(req.name, sheet, owner.clone());
     record_under_owner_document(&owner, || {
         state.drawings.record_event(
             RecordedOperation::new("drawing.create")
                 .with_parameters(serde_json::json!({
                     "name": name,
-                    "sheet_size": sheet,
+                    "sheet_size": sheet.size,
+                    "orientation": sheet.orientation,
                 }))
                 .with_output_drawing(id),
         );
@@ -1000,7 +1027,7 @@ pub async fn add_view(
                     ErrorCode::InvalidParameter,
                     format!(
                         "no free space on the {} sheet for view '{}' at scale {}",
-                        snapshot.sheet_size.label(),
+                        snapshot.sheet().describe(),
                         req.name,
                         scale
                     ),
@@ -1440,6 +1467,11 @@ pub struct PartDrawingQuery {
     /// `first` or `third` (default) angle projection.
     #[serde(default)]
     pub projection: Option<ProjectionAngle>,
+    /// `landscape` or `portrait` paper. Omitted: the automatic sheet tries
+    /// both and keeps the better; given: every sheet it draws is laid so
+    /// (with `?scale=`, the fixed A3 sheet is laid so).
+    #[serde(default)]
+    pub orientation: Option<SheetOrientation>,
 }
 
 /// `GET /api/parts/{id}/drawing.svg` — ONE-CALL engineering drawing of a part by
@@ -1487,6 +1519,7 @@ async fn build_standard_drawing_off_lock(
     part_uuid: Uuid,
     scale: Option<f64>,
     projection: ProjectionAngle,
+    orientation: Option<SheetOrientation>,
 ) -> Result<Drawing, SheetBuildError> {
     // Brief read lock: validate the solid exists, snapshot, release.
     let snap = {
@@ -1516,13 +1549,22 @@ async fn build_standard_drawing_off_lock(
                 &owned,
                 solid_id,
                 part_uuid,
-                SheetSize::A3,
+                geometry_engine::drawing::Sheet::new(
+                    SheetSize::A3,
+                    orientation.unwrap_or_default(),
+                ),
                 scale,
                 projection,
             )
             .map_err(SheetBuildError::from_kernel),
-            None => standard_drawing_auto_with_projection(&owned, solid_id, part_uuid, projection)
-                .map_err(SheetBuildError::from_kernel),
+            None => standard_drawing_auto_with_options(
+                &owned,
+                solid_id,
+                part_uuid,
+                projection,
+                orientation,
+            )
+            .map_err(SheetBuildError::from_kernel),
         };
         built.map(|mut drawing| {
             drawing.drawn_frame = drawn_frame;
@@ -1676,6 +1718,7 @@ async fn drawing_svg_for_solid(
         part_uuid,
         q.scale,
         q.projection.unwrap_or_default(),
+        q.orientation,
     )
     .await
     .map_err(|e| e.into_api_error(solid_id))?;
@@ -1847,6 +1890,7 @@ async fn create_part_drawing_inner(
         part_uuid,
         q.scale,
         q.projection.unwrap_or_default(),
+        q.orientation,
     )
     .await
     .map_err(|e| match e {
@@ -1881,6 +1925,7 @@ async fn create_part_drawing_inner(
     let mut drawing = drawing;
     drawing.stabilize_view_ids();
     let drawing_name = drawing.name.clone();
+    let drawn_on = drawing.sheet();
     let drawing_id = state.drawings.insert(drawing, owner.clone());
     // L3 (2026-08-16 residuals): this route also gates on `acknowledge_
     // unsound` (`refuse_unsound_solid` above), and its event ALREADY
@@ -1904,18 +1949,31 @@ async fn create_part_drawing_inner(
             || {
                 state.drawings.record_event(
                     RecordedOperation::new("drawing.create_from_part")
-                        .with_parameters(serde_json::json!({
-                            // The sheet's name, so a rebuild from history
-                            // restores it (drawing_history).
-                            "name": drawing_name,
-                            "solid_id": solid_id,
-                            "part_uuid": part_uuid,
-                            "sheet_size": SheetSize::A3,
-                            "quality_passed": quality.passed,
-                            "quality_issues": quality.issues.len(),
-                            "acknowledge_unsound": q.acknowledge_unsound,
-                            "projection": q.projection.unwrap_or_default(),
-                        }))
+                        .with_parameters({
+                            let mut p = serde_json::json!({
+                                // The sheet's name, so a rebuild from history
+                                // restores it (drawing_history).
+                                "name": drawing_name,
+                                "solid_id": solid_id,
+                                "part_uuid": part_uuid,
+                                // The paper the sheet was drawn on (a record;
+                                // a rebuild searches again).
+                                "sheet_size": drawn_on.size,
+                                "drawn_orientation": drawn_on.orientation,
+                                "quality_passed": quality.passed,
+                                "quality_issues": quality.issues.len(),
+                                "acknowledge_unsound": q.acknowledge_unsound,
+                                "projection": q.projection.unwrap_or_default(),
+                            });
+                            // The orientation ASKED FOR, only when one was:
+                            // a rebuild keeps it (replay reads this key); a
+                            // sheet without one is left to the search there
+                            // as it was here.
+                            if let Some(o) = q.orientation {
+                                p["orientation"] = serde_json::json!(o);
+                            }
+                            p
+                        })
                         // #32: record the source solid as an INPUT so the
                         // feature-DAG projection links the sheet downstream
                         // of its part. A mould on the part then marks the
@@ -3397,6 +3455,7 @@ mod tests {
             Uuid::nil(),
             None,
             ProjectionAngle::First,
+            None,
         )
         .await
         .expect("off-lock auto drawing");
@@ -3439,6 +3498,7 @@ mod tests {
             Uuid::nil(),
             None,
             ProjectionAngle::Third,
+            None,
         )
         .await
         .expect("off-lock auto drawing");
@@ -3468,6 +3528,7 @@ mod tests {
             Uuid::nil(),
             Some(1.0),
             ProjectionAngle::Third,
+            None,
         )
         .await
         .expect("off-lock scaled drawing");
@@ -3485,6 +3546,7 @@ mod tests {
             Uuid::nil(),
             None,
             ProjectionAngle::Third,
+            None,
         )
         .await
         .expect_err("unknown solid must be rejected");
@@ -3515,6 +3577,7 @@ mod tests {
             Uuid::nil(),
             Some(1000.0),
             ProjectionAngle::Third,
+            None,
         )
         .await
         .expect_err("1000:1 fits no arrangement on A3");
@@ -3586,6 +3649,7 @@ mod tests {
                 Uuid::nil(),
                 Some(raw),
                 ProjectionAngle::Third,
+                None,
             )
             .await
             .expect_err("a non-ratio scale must be refused");

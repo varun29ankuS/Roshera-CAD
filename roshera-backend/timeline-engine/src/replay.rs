@@ -335,11 +335,22 @@ pub fn rederive_part_drawing(
     // assembly placement undone, a turned part squared), on a copy: a sheet
     // re-derived on replay must be the sheet the live route made, and it
     // records the move so its certificate re-measures in the same frame.
+    // The paper's orientation, when the sheet was created with one asked
+    // for: kept on the re-derived sheet as it was on the live one. A sheet
+    // recorded without one (and every sheet from before the choice existed)
+    // leaves it to the search, as the live route did.
+    let orientation: Option<geometry_engine::drawing::SheetOrientation> = inner
+        .get("orientation")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
     let mut framed = BRepModel::new();
     geometry_engine::primitives::snapshot::ModelSnapshot::take(model).restore(&mut framed);
     let (_, drawn_frame) = geometry_engine::drawing::frame_for_drawing(&mut framed, solid_id);
-    let mut drawing = match geometry_engine::drawing::standard_drawing_auto_with_projection(
-        &framed, solid_id, part_uuid, projection,
+    let mut drawing = match geometry_engine::drawing::standard_drawing_auto_with_options(
+        &framed,
+        solid_id,
+        part_uuid,
+        projection,
+        orientation,
     ) {
         Ok(d) => d,
         Err(e) => {

@@ -258,10 +258,10 @@ fn trimmed(v: f64) -> String {
 /// Lay out the title block of `drawing` at its place on the sheet: the
 /// bottom-right corner of the frame.
 pub fn title_block_layout(drawing: &Drawing) -> TitleBlockLayout {
-    let sheet = &drawing.sheet_size;
-    let (w_sheet, h_sheet) = (sheet.width(), sheet.height());
-    let (ml, mr, mt, mb) = frame_margins(sheet);
-    let (w, h) = title_block_size(sheet);
+    let sheet = drawing.sheet();
+    let (w_sheet, h_sheet) = sheet.dims();
+    let (ml, mr, mt, mb) = frame_margins(&sheet.size);
+    let (w, h) = title_block_size(&sheet.size);
     let frame_w = (w_sheet - ml - mr).max(0.0);
     let frame_h = (h_sheet - mt - mb).max(0.0);
     let x = ml + frame_w - w;

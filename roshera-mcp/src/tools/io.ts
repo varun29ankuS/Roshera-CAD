@@ -170,12 +170,20 @@ export function registerIoTools(server: ToolHost) {
         .enum(["first", "third"])
         .optional()
         .describe("first-angle (ISO) or third-angle (ASME, default)"),
+      orientation: z
+        .enum(["landscape", "portrait"])
+        .optional()
+        .describe(
+          "paper orientation (ISO 5457); omit to let the sheet search try both and keep the better " +
+            "(a part standing on end goes portrait); given, every sheet it draws is laid so",
+        ),
     },
-    async ({ part_id, name, acknowledge_unsound, projection }) => {
+    async ({ part_id, name, acknowledge_unsound, projection, orientation }) => {
       try {
         const params = new URLSearchParams();
         if (name) params.set("name", name);
         if (projection) params.set("projection", projection);
+        if (orientation) params.set("orientation", orientation);
         if (acknowledge_unsound === true) params.set("acknowledge_unsound", "true");
         const qs = params.toString() ? `?${params.toString()}` : "";
         const r = await api("POST", `/api/parts/${part_id}/drawing${qs}`);

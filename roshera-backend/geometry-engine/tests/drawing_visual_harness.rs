@@ -279,7 +279,7 @@ fn no_ink_outside_frame_on_either_fixture() {
     for (name, (m, part)) in [("flange", flange()), ("box", plain_box())] {
         let drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
         let layout = compute_layout(&drawing);
-        let frame = frame_rect(&drawing.sheet_size);
+        let frame = frame_rect(&drawing.sheet());
         let hits = find_ink_outside_frame(&layout, frame);
         assert!(
             hits.is_empty(),

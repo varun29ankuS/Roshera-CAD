@@ -29,7 +29,7 @@ fn idx(d: &Drawing, p: fn(&ProjectionType) -> bool) -> usize {
 }
 
 fn rect(d: &Drawing, i: usize) -> Rect2 {
-    view_geometry_rect(&d.views[i], d.sheet_size.height()).expect("rect")
+    view_geometry_rect(&d.views[i], d.sheet().height()).expect("rect")
 }
 
 fn centre(r: &Rect2) -> [f64; 2] {

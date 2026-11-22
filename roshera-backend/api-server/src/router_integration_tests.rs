@@ -11539,7 +11539,7 @@ async fn dragging_a_view_is_resolved_refused_or_recorded() {
         async move { handle.read().await.clone() }
     };
     let d0 = sheet(&state).await;
-    let h = d0.sheet_size.height();
+    let h = d0.sheet().height();
     let view = |d: &geometry_engine::drawing::types::Drawing, kind: &str| {
         d.views
             .iter()

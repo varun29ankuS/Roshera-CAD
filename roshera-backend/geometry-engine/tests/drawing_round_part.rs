@@ -278,7 +278,7 @@ fn assert_sheet_is_clean(name: &str, d: &Drawing) {
         verify_drawing, Severity,
     };
     let layout = compute_layout(d);
-    let frame = frame_rect(&d.sheet_size);
+    let frame = frame_rect(&d.sheet());
 
     let outside = find_ink_outside_frame(&layout, frame);
     assert!(

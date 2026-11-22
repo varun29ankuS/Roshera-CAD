@@ -47,6 +47,7 @@ import {
   DrawingRefusal,
   setDrawingDimension,
   setDrawingProjection,
+  sheetDimensionsMm,
   addView,
   createSolidDrawing,
   listDocumentParts,
@@ -95,32 +96,8 @@ import { exportRefusalText } from '@/lib/export-refusal'
 
 // CSS pixels per millimetre at the standard 96 DPI mapping (PX_PER_MM, from
 // lib/sheet-look, the one number the agent's look aims with too). At zoom
-// `1.0` the sheet renders at its true physical size.
-
-function sheetDimensionsMm(sheet: Drawing['sheet_size']): [number, number] {
-  if (typeof sheet === 'string') {
-    switch (sheet) {
-      case 'A4':
-        return [297, 210]
-      case 'A3':
-        return [420, 297]
-      case 'A2':
-        return [594, 420]
-      case 'A1':
-        return [841, 594]
-      case 'A0':
-        return [1189, 841]
-      default:
-        return [297, 210]
-    }
-  }
-  // Custom variant: serde tags the struct payload as `{ CUSTOM: { width, height } }`.
-  if (sheet && typeof sheet === 'object' && 'CUSTOM' in sheet) {
-    const c = (sheet as { CUSTOM: { width: number; height: number } }).CUSTOM
-    return [c.width, c.height]
-  }
-  return [297, 210]
-}
+// `1.0` the sheet renders at its true physical size (`sheetDimensionsMm`
+// gives the paper's width x height, orientation applied).
 
 // Drawing summary held in the sidebar — { id, name } pulled by issuing a
 // `getDrawing` per id (the kernel doesn't expose a summary list endpoint;
@@ -738,7 +715,9 @@ export function DrawingsWorkspace() {
   // Sheet physical dimensions + scaled display dimensions.
   const [sheetWMm, sheetHMm] = useMemo(
     () =>
-      activeDrawing ? sheetDimensionsMm(activeDrawing.sheet_size) : [297, 210],
+      activeDrawing
+        ? sheetDimensionsMm(activeDrawing.sheet_size, activeDrawing.orientation)
+        : [297, 210],
     [activeDrawing],
   )
   const sheetWPx = sheetWMm * PX_PER_MM

@@ -1530,7 +1530,7 @@ fn hole_table_and_tags_emitted_in_dxf() {
         "six-hole plate must have hole sites"
     );
 
-    let sheet_h = dwg.sheet_size.height();
+    let sheet_h = dwg.sheet().height();
     let layout = compute_layout(&dwg);
 
     let dxf_bytes = render_drawing_dxf(&dwg).expect("dxf render");
@@ -2053,7 +2053,7 @@ fn ring_plate_datum_marker_at_table_origin() {
     // "part_corner" datum every X/Y table value measures from.
     let ax = dwg.axial_view_idx.expect("axial view");
     let view = &dwg.views[ax];
-    let sheet_h = dwg.sheet_size.height();
+    let sheet_h = dwg.sheet().height();
     let sx = view.position_mm[0] + view.extent.min_x * view.scale;
     let sy = (sheet_h - view.position_mm[1]) - view.extent.min_y * view.scale;
     let cx = 0.5 * (marker.bbox.x0 + marker.bbox.x1);
@@ -2712,7 +2712,7 @@ fn a4_section_sheet_keeps_shaded_isometric_pictorial() {
     let ext_w = iso.extent.width() * iso.scale;
     let ext_h = iso.extent.height() * iso.scale;
     assert!(
-        ext_w <= 0.35 * dwg.sheet_size.width() && ext_h <= 0.35 * dwg.sheet_size.height(),
+        ext_w <= 0.35 * dwg.sheet().width() && ext_h <= 0.35 * dwg.sheet().height(),
         "pictorial must be compact (got {ext_w:.1}x{ext_h:.1} mm on {})",
         dwg.sheet_size.label()
     );

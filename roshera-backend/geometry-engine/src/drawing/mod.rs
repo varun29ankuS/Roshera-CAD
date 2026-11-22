@@ -62,9 +62,10 @@ pub use dimension_edit::{
 };
 pub use dimensioning::{
     added_view, auto_dimensions, candidate_dimensions, section_slot_rule, set_projection,
-    standard_drawing, standard_drawing_auto, standard_drawing_auto_with_projection,
-    standard_drawing_hlr, standard_drawing_hlr_with_projection, visible_dimensions,
-    CuttingPlaneLine, Dimension2d, SectionSlotRule,
+    standard_drawing, standard_drawing_auto, standard_drawing_auto_with_options,
+    standard_drawing_auto_with_projection, standard_drawing_hlr,
+    standard_drawing_hlr_with_projection, visible_dimensions, CuttingPlaneLine, Dimension2d,
+    SectionSlotRule,
 };
 pub use dxf::{render_drawing_dxf, DxfRenderError};
 pub use hands::{
@@ -101,7 +102,8 @@ pub use svg::render_drawing_svg;
 pub use types::{
     Drawing, DrawingId, GeneralTolerance, PlacedDatumSymbol, PlacedFcfBlock, Polyline2d,
     PolylineRole, PolylineSource, ProjectedView, ProjectedViewId, ProjectionAngle, ProjectionType,
-    SectionSemantics, ShadedRaster, SheetSize, TitleBlock, ToleranceRef, ViewExtent, ViewSource,
+    SectionSemantics, ShadedRaster, Sheet, SheetOrientation, SheetSize, TitleBlock, ToleranceRef,
+    ViewExtent, ViewSource,
 };
 pub use verify::{verify_drawing, DrawingIssue, DrawingIssueKind, DrawingQualityReport, Severity};
 pub use visibility::{is_point_hidden, project_solid_edges_visibility, ViewEdges};

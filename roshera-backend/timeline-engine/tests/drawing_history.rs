@@ -207,6 +207,32 @@ fn sheet_edits_survive_a_rebuild_and_a_dimension_change() {
     assert!(reads_8, "the rebuilt sheet shows the edited bore");
 }
 
+/// A sheet created on the paper orientation an engineer or agent asked for
+/// is rebuilt on it: a restart or a dimension edit re-derives the sheet from
+/// the part, and it must not turn the paper back to whatever the search
+/// prefers. A sheet recorded without one is left to the search (landscape for
+/// this block, as before the choice existed).
+///
+/// Mutation: drop the `orientation` read in `replay::rederive_part_drawing`
+/// -> the portrait sheet is rebuilt landscape -> RED.
+#[test]
+fn a_sheet_keeps_the_orientation_it_was_created_on() {
+    use geometry_engine::drawing::SheetOrientation;
+    let (asked, left) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut events = plate();
+    let mut portrait = from_part(3, 3, asked);
+    if let Operation::Generic { parameters, .. } = &mut portrait.operation {
+        parameters["params"]["orientation"] = json!("portrait");
+    }
+    events.extend([portrait, from_part(4, 3, left), mould(1, "radius", 4.0, 5)]);
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    let d = built.drawings.get(&asked).expect("the portrait sheet");
+    assert_eq!(d.orientation, SheetOrientation::Portrait);
+    assert!(d.sheet().height() > d.sheet().width());
+    let d = built.drawings.get(&left).expect("the searched sheet");
+    assert_eq!(d.orientation, SheetOrientation::Landscape);
+}
+
 #[test]
 fn a_removed_standard_view_stays_removed() {
     let did = Uuid::new_v4();
@@ -648,7 +674,7 @@ fn centre(
     d: &geometry_engine::drawing::types::Drawing,
     v: &geometry_engine::drawing::types::ProjectedView,
 ) -> [f64; 2] {
-    let r = geometry_engine::drawing::layout::view_geometry_rect(v, d.sheet_size.height())
+    let r = geometry_engine::drawing::layout::view_geometry_rect(v, d.sheet().height())
         .expect("geometry");
     [0.5 * (r.x0 + r.x1), 0.5 * (r.y0 + r.y1)]
 }

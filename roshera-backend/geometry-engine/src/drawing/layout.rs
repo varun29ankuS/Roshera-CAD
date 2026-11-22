@@ -580,7 +580,7 @@ pub(crate) struct ViewInk {
 
 /// The line work of every view of `drawing`, in sheet mm.
 pub(crate) fn view_ink(drawing: &Drawing, layout: &SheetLayout) -> ViewInk {
-    let sheet_h = drawing.sheet_size.height();
+    let sheet_h = drawing.sheet().height();
     let mut ink = ViewInk {
         segments: Vec::new(),
         outlines: Vec::new(),
@@ -718,8 +718,8 @@ pub fn free_view_position(
     view: &ProjectedView,
     near: Option<usize>,
 ) -> Option<[f64; 2]> {
-    let sheet_h = drawing.sheet_size.height();
-    let frame = super::svg::frame_rect(&drawing.sheet_size);
+    let sheet_h = drawing.sheet().height();
+    let frame = super::svg::frame_rect(&drawing.sheet());
     let target = near
         .and_then(|i| drawing.views.get(i))
         .and_then(|v| view_geometry_rect(v, sheet_h))
@@ -734,11 +734,11 @@ fn free_view_position_near(
     view: &ProjectedView,
     target: [f64; 2],
 ) -> Option<[f64; 2]> {
-    let sheet_h = drawing.sheet_size.height();
+    let sheet_h = drawing.sheet().height();
     let mut probe = view.clone();
     probe.position_mm = [0.0, 0.0];
     let base = view_geometry_rect(&probe, sheet_h)?;
-    let frame = super::svg::frame_rect(&drawing.sheet_size);
+    let frame = super::svg::frame_rect(&drawing.sheet());
     let pad = VIEW_PLACEMENT_CLEARANCE_MM;
     let obstacles: Vec<Rect2> = compute_layout(drawing)
         .items
@@ -802,7 +802,7 @@ pub fn rescaled_view_position(
     index: usize,
     scale: f64,
 ) -> Option<RescalePlacement> {
-    let sheet_h = drawing.sheet_size.height();
+    let sheet_h = drawing.sheet().height();
     let old = view_geometry_rect(drawing.views.get(index)?, sheet_h)?;
     let mut view = drawing.views[index].clone();
     view.scale = scale;
@@ -857,7 +857,7 @@ pub fn rescaled_view_position(
 /// True when `r` (sheet mm, y-down) sits inside the frame and clear, by
 /// [`VIEW_PLACEMENT_CLEARANCE_MM`], of everything laid out on `drawing`.
 fn spot_is_clear(drawing: &Drawing, r: &Rect2) -> bool {
-    let frame = super::svg::frame_rect(&drawing.sheet_size);
+    let frame = super::svg::frame_rect(&drawing.sheet());
     if r.x0 < frame.x0 + 2.0
         || r.x1 > frame.x1 - 2.0
         || r.y0 < frame.y0 + 2.0
@@ -929,12 +929,12 @@ pub fn aligned_view_position(
     parent: usize,
     side: ViewSide,
 ) -> Option<[f64; 2]> {
-    let sheet_h = drawing.sheet_size.height();
+    let sheet_h = drawing.sheet().height();
     let mut probe = view.clone();
     probe.position_mm = [0.0, 0.0];
     let base = view_geometry_rect(&probe, sheet_h)?;
     let anchor = view_geometry_rect(drawing.views.get(parent)?, sheet_h)?;
-    let frame = super::svg::frame_rect(&drawing.sheet_size);
+    let frame = super::svg::frame_rect(&drawing.sheet());
     let pad = VIEW_PLACEMENT_CLEARANCE_MM;
     let obstacles: Vec<Rect2> = compute_layout(drawing)
         .items
@@ -987,9 +987,9 @@ pub fn aligned_view_position(
 
 /// The title block's rect (sheet mm, y-down): bottom-right of the frame,
 /// where `svg::render_title_block` draws it.
-fn title_block_rect(sheet: &super::types::SheetSize) -> Rect2 {
-    let (ml, mr, mt, mb) = frame_margins(sheet);
-    let (tb_w, tb_h) = title_block_size(sheet);
+fn title_block_rect(sheet: &super::types::Sheet) -> Rect2 {
+    let (ml, mr, mt, mb) = frame_margins(&sheet.size);
+    let (tb_w, tb_h) = title_block_size(&sheet.size);
     let frame_w = (sheet.width() - ml - mr).max(0.0);
     let frame_h = (sheet.height() - mt - mb).max(0.0);
     let x0 = ml + frame_w - tb_w;
@@ -1018,7 +1018,7 @@ fn parent_front(drawing: &Drawing) -> Option<usize> {
 /// the sheet, FRONT with no projected views, or a view with no geometry).
 pub fn view_alignment(drawing: &Drawing, index: usize) -> Option<bool> {
     let parent = parent_front(drawing)?;
-    let sheet_h = drawing.sheet_size.height();
+    let sheet_h = drawing.sheet().height();
     let front = view_geometry_rect(drawing.views.get(parent)?, sheet_h)?;
     let offset = |v: &ProjectedView| -> Option<f64> {
         let r = view_geometry_rect(v, sheet_h)?;
@@ -1073,7 +1073,7 @@ pub(crate) fn resolve_view_drag(
     let Some(parent) = parent_front(drawing) else {
         return Ok(vec![own(requested)]);
     };
-    let sheet_h = drawing.sheet_size.height();
+    let sheet_h = drawing.sheet().height();
 
     if index == parent {
         let delta = [
@@ -1159,9 +1159,9 @@ pub(crate) fn check_moved_views(
 ) -> Result<(), super::types::ViewEditError> {
     use super::types::ViewEditError;
     use super::verify::{rect_contains, view_footprint, SLACK_MM};
-    let sheet_h = drawing.sheet_size.height();
-    let frame = super::verify::frame_rect(&drawing.sheet_size);
-    let title_block = title_block_rect(&drawing.sheet_size);
+    let sheet_h = drawing.sheet().height();
+    let frame = super::verify::frame_rect(&drawing.sheet());
+    let title_block = title_block_rect(&drawing.sheet());
     let footprint = |i: usize| -> Option<Rect2> {
         let v = drawing.views.get(i)?;
         view_geometry_rect(v, sheet_h).map(|g| view_footprint(v, g))
@@ -1268,7 +1268,7 @@ pub fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<Rect2> {
 /// Collision is checked against every already-placed label AND every
 /// `ViewGeometry` item AND the title block, with `LABEL_TOL` tolerance.
 pub fn place_view_labels(drawing: &Drawing, placed: &[SheetItem]) -> Vec<SheetItem> {
-    let h = drawing.sheet_size.height();
+    let h = drawing.sheet().height();
     let mut result: Vec<SheetItem> = Vec::new();
 
     for (idx, view) in drawing.views.iter().enumerate() {
@@ -1396,8 +1396,8 @@ pub fn place_view_labels(drawing: &Drawing, placed: &[SheetItem]) -> Vec<SheetIt
 ///   is computed once here; both the renderer and the verifier consume it.
 /// - `TitleBlock` item from `svg::{frame_margins, title_block_size}`.
 pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
-    let w = drawing.sheet_size.width();
-    let h = drawing.sheet_size.height();
+    let w = drawing.sheet().width();
+    let h = drawing.sheet().height();
     let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
     let frame_w = (w - ml - mr).max(0.0);
     let frame_h = (h - mt - mb).max(0.0);
@@ -1407,7 +1407,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     // ── TitleBlock ────────────────────────────────────────────────────────
     items.push(SheetItem {
         kind: SheetItemKind::TitleBlock,
-        bbox: title_block_rect(&drawing.sheet_size),
+        bbox: title_block_rect(&drawing.sheet()),
         owner_view: None,
         text: None,
     });
@@ -1463,7 +1463,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     let mut all_placed: Vec<PlacedDimension> = Vec::new();
     for (idx, view) in drawing.views.iter().enumerate() {
         let (fml, fmr, fmt, fmb) = frame_margins(&drawing.sheet_size);
-        let frame = [fml, fmt, drawing.sheet_size.width() - fmr, h - fmb];
+        let frame = [fml, fmt, drawing.sheet().width() - fmr, h - fmb];
         // Other views' geometry and titles: a leader's shoulder text must not
         // print over them.
         // Every piece of text already placed (earlier views' dimensions) and
@@ -2019,14 +2019,14 @@ pub(crate) fn notes_width(drawing: &Drawing) -> f64 {
 /// outline, the bottom-left corner, then scans right to left. Both scan from
 /// the bottom of the frame up.
 pub(crate) fn table_spot(
-    sheet: &super::types::SheetSize,
+    sheet: &super::types::Sheet,
     notes_w: f64,
     paper: TablePaper,
     anchor: Option<Rect2>,
     clear: impl Fn(&Rect2) -> bool,
 ) -> Result<Rect2, Rect2> {
-    let (ml, mr, mt, mb) = frame_margins(sheet);
-    let (tb_w, tb_h) = title_block_size(sheet);
+    let (ml, mr, mt, mb) = frame_margins(&sheet.size);
+    let (tb_w, tb_h) = title_block_size(&sheet.size);
     let frame_w = sheet.width() - ml - mr;
     let frame_h = sheet.height() - mt - mb;
     let tb_x0 = ml + frame_w - tb_w;
@@ -2129,7 +2129,7 @@ pub(crate) fn table_spot(
 /// the layout places them by ([`table_spot`])? What the sheet search asks of
 /// a (sheet, scale) before building it.
 pub(crate) fn tables_find_paper(
-    sheet: &super::types::SheetSize,
+    sheet: &super::types::Sheet,
     notes_w: f64,
     tables: &[(TablePaper, Option<Rect2>)],
     obstacles: &[Rect2],
@@ -2254,13 +2254,7 @@ fn place_profile_table(
             .map(|g| g.bbox)
     });
     // Nowhere free: above the title block; the layout check reports it.
-    let chosen = match table_spot(
-        &drawing.sheet_size,
-        notes_width(drawing),
-        paper,
-        anchor,
-        clear,
-    ) {
+    let chosen = match table_spot(&drawing.sheet(), notes_width(drawing), paper, anchor, clear) {
         Ok(r) | Err(r) => r,
     };
 
@@ -2380,13 +2374,7 @@ fn place_hole_table(
     // residual overlap. (The table used to fall straight back to it before
     // the scan, and on a sheet whose views filled the right it was printed
     // across one.)
-    let chosen = match table_spot(
-        &drawing.sheet_size,
-        notes_width(drawing),
-        paper,
-        anchor,
-        clear,
-    ) {
+    let chosen = match table_spot(&drawing.sheet(), notes_width(drawing), paper, anchor, clear) {
         Ok(r) | Err(r) => r,
     };
 
@@ -2523,7 +2511,7 @@ fn place_hole_table(
         .collect();
     let callout_lines: Vec<[[f64; 2]; 2]> =
         dimensions.iter().flat_map(placed_line_segments).collect();
-    let frame = super::svg::frame_rect(&drawing.sheet_size);
+    let frame = super::svg::frame_rect(&drawing.sheet());
     let placed = place_hole_tags(
         axial_view,
         axial_idx,
@@ -5192,7 +5180,7 @@ mod tests {
     /// hole -> RED.
     #[test]
     fn a_leader_is_routed_round_a_hole_tags_place() {
-        let h = SheetSize::A3.height();
+        let h = SheetSize::A3.landscape().height();
         let sheet = |sites: Vec<HoleSite>| {
             let mut view = simple_view("TOP", ProjectionType::Top, [200.0, 150.0]);
             let mut radius = pos_dim("4× R2", [-9.0, -9.0], [-9.0, -7.0]);

@@ -557,8 +557,9 @@ pub struct ProjectedEllipse {
     pub face_ids: Vec<u32>,
 }
 
-/// Paper sizes, ISO 216 series. Dimensions in millimetres, landscape
-/// orientation.
+/// Paper sizes, ISO 216 series: the size only. Which way up the paper is
+/// drawn is a [`SheetOrientation`]; the two together are a [`Sheet`], which
+/// is what carries the sheet's width and height.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum SheetSize {
@@ -567,7 +568,9 @@ pub enum SheetSize {
     A2,
     A1,
     A0,
-    /// User-defined sheet dimensions (width × height in mm).
+    /// User-defined sheet dimensions (width × height in mm), taken as given:
+    /// a custom sheet's orientation is read off its dimensions, never applied
+    /// to them ([`Sheet::new`]).
     Custom {
         width: f64,
         height: f64,
@@ -575,30 +578,32 @@ pub enum SheetSize {
 }
 
 impl SheetSize {
-    /// Sheet width in millimetres.
-    pub fn width(&self) -> f64 {
+    /// `(width, height)` in millimetres of the sheet laid landscape (the long
+    /// edge across); a custom sheet's dimensions as given.
+    fn landscape_dims(&self) -> (f64, f64) {
         match self {
-            Self::A4 => 297.0,
-            Self::A3 => 420.0,
-            Self::A2 => 594.0,
-            Self::A1 => 841.0,
-            Self::A0 => 1189.0,
-            Self::Custom { width, .. } => *width,
+            Self::A4 => (297.0, 210.0),
+            Self::A3 => (420.0, 297.0),
+            Self::A2 => (594.0, 420.0),
+            Self::A1 => (841.0, 594.0),
+            Self::A0 => (1189.0, 841.0),
+            Self::Custom { width, height } => (*width, *height),
         }
     }
 
-    /// Sheet height in millimetres.
-    pub fn height(&self) -> f64 {
-        match self {
-            Self::A4 => 210.0,
-            Self::A3 => 297.0,
-            Self::A2 => 420.0,
-            Self::A1 => 594.0,
-            Self::A0 => 841.0,
-            Self::Custom { height, .. } => *height,
-        }
+    /// This size laid landscape: the long edge across.
+    pub fn landscape(self) -> Sheet {
+        Sheet::new(self, SheetOrientation::Landscape)
     }
 
+    /// This size laid portrait: the long edge up.
+    pub fn portrait(self) -> Sheet {
+        Sheet::new(self, SheetOrientation::Portrait)
+    }
+
+    /// The ISO name of the size (`"A4"`), the title block's SIZE cell. The
+    /// orientation is not part of the name: an A4 sheet is an A4 sheet either
+    /// way up (ISO 5457, ISO 7200).
     pub fn label(&self) -> String {
         match self {
             Self::A4 => "A4".to_string(),
@@ -608,6 +613,98 @@ impl SheetSize {
             Self::A0 => "A0".to_string(),
             Self::Custom { width, height } => format!("Custom {width:.0}×{height:.0}mm"),
         }
+    }
+}
+
+/// Which way up a sheet is drawn (ISO 5457): landscape, the long edge across
+/// (every sheet before the choice existed, and the default), or portrait, the
+/// long edge up. The title block sits bottom-right of the frame either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SheetOrientation {
+    #[default]
+    Landscape,
+    Portrait,
+}
+
+impl SheetOrientation {
+    /// `"landscape"` / `"portrait"`, as the wire spells it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Landscape => "landscape",
+            Self::Portrait => "portrait",
+        }
+    }
+}
+
+/// A sheet as it is drawn: its ISO size and its orientation. Every consumer
+/// that needs the paper's width or height reads them from here, so a portrait
+/// sheet is portrait everywhere (frame, title block, zones, layout, search,
+/// SVG / PDF / DXF / raster, quality check and certificate).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Sheet {
+    pub size: SheetSize,
+    pub orientation: SheetOrientation,
+}
+
+impl Sheet {
+    /// `size` laid `orientation`. A custom size keeps the dimensions it was
+    /// given, and its orientation is the one those dimensions have (taller
+    /// than wide is portrait): a custom sheet is never silently turned.
+    pub fn new(size: SheetSize, orientation: SheetOrientation) -> Self {
+        let orientation = match size {
+            SheetSize::Custom { width, height } => {
+                if height > width {
+                    SheetOrientation::Portrait
+                } else {
+                    SheetOrientation::Landscape
+                }
+            }
+            _ => orientation,
+        };
+        Self { size, orientation }
+    }
+
+    /// `(width, height)` in millimetres, oriented.
+    pub fn dims(&self) -> (f64, f64) {
+        let (w, h) = self.size.landscape_dims();
+        match (self.size, self.orientation) {
+            (SheetSize::Custom { .. }, _) | (_, SheetOrientation::Landscape) => (w, h),
+            (_, SheetOrientation::Portrait) => (h, w),
+        }
+    }
+
+    /// Sheet width in millimetres, oriented.
+    pub fn width(&self) -> f64 {
+        self.dims().0
+    }
+
+    /// Sheet height in millimetres, oriented.
+    pub fn height(&self) -> f64 {
+        self.dims().1
+    }
+
+    /// Is the long edge up?
+    pub fn is_portrait(&self) -> bool {
+        self.orientation == SheetOrientation::Portrait
+    }
+
+    /// The ISO size name (`"A4"`): [`SheetSize::label`].
+    pub fn label(&self) -> String {
+        self.size.label()
+    }
+
+    /// The size and orientation, for a report (`"A4 portrait"`).
+    pub fn describe(&self) -> String {
+        format!("{} {}", self.size.label(), self.orientation.label())
+    }
+}
+
+/// A bare size is the landscape sheet of that size: every sheet before
+/// orientation existed was landscape.
+impl From<SheetSize> for Sheet {
+    fn from(size: SheetSize) -> Self {
+        size.landscape()
     }
 }
 
@@ -1045,7 +1142,13 @@ impl ProjectionAngle {
 pub struct Drawing {
     pub id: DrawingId,
     pub name: String,
+    /// The ISO size of the paper. Its width and height depend on
+    /// `orientation` too: read them from [`Drawing::sheet`], never from here.
     pub sheet_size: SheetSize,
+    /// Which way up the paper is drawn. `#[serde(default)]` reads every sheet
+    /// from before the choice existed as landscape, which they all were.
+    #[serde(default)]
+    pub orientation: SheetOrientation,
     pub views: Vec<ProjectedView>,
     /// First- or third-angle arrangement of the orthographic views, with the
     /// matching projection symbol and note. `#[serde(default)]` reads older
@@ -1203,11 +1306,15 @@ impl Drawing {
         "GENERAL TOLERANCES: ISO 2768-m.".to_string()
     }
 
-    pub fn new(name: impl Into<String>, sheet_size: SheetSize) -> Self {
+    /// An empty drawing on `sheet`: a [`Sheet`], or a bare [`SheetSize`]
+    /// (laid landscape).
+    pub fn new(name: impl Into<String>, sheet: impl Into<Sheet>) -> Self {
+        let sheet: Sheet = sheet.into();
         Self {
             id: DrawingId::new(),
             name: name.into(),
-            sheet_size,
+            sheet_size: sheet.size,
+            orientation: sheet.orientation,
             views: Vec::new(),
             projection: ProjectionAngle::default(),
             title_block: TitleBlock::default(),
@@ -1230,6 +1337,12 @@ impl Drawing {
             profile_table: None,
             render_facts: RenderFacts::default(),
         }
+    }
+
+    /// The sheet as drawn: its size laid in its orientation. The one source
+    /// of the paper's width and height.
+    pub fn sheet(&self) -> Sheet {
+        Sheet::new(self.sheet_size, self.orientation)
     }
 
     /// Give every view its [`stable_view_id`] (derived from this drawing's
@@ -1615,6 +1728,44 @@ mod tests {
         assert_eq!(d.document_unit, LengthUnit::Millimetre);
         assert_eq!(d.general_tolerance, GeneralTolerance::default());
         assert!((d.general_tolerance.linear_mm - 0.1).abs() < 1e-12);
+    }
+
+    /// A sheet serialized before orientation existed has no `orientation`
+    /// key and reads as the landscape sheet it was drawn on; a portrait sheet
+    /// round-trips as portrait, and its paper is the size turned.
+    ///
+    /// Mutation: default the field to portrait -> the legacy sheet reads
+    /// 297 x 420 -> RED; ignore the orientation in `Sheet::dims` -> the
+    /// portrait A4 reads 297 x 210 -> RED.
+    #[test]
+    fn a_sheet_from_before_orientation_reads_landscape() {
+        let legacy = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "legacy",
+            "sheet_size": "A3",
+            "views": []
+        }"#;
+        let d: Drawing = serde_json::from_str(legacy).expect("legacy sheet parses");
+        assert_eq!(d.orientation, SheetOrientation::Landscape);
+        assert_eq!(d.sheet().dims(), (420.0, 297.0));
+
+        let mut p = Drawing::new("tall", SheetSize::A4.portrait());
+        assert_eq!(p.sheet().dims(), (210.0, 297.0));
+        assert_eq!(p.sheet().label(), "A4", "the SIZE cell keeps the ISO name");
+        let json = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(json["orientation"], "portrait");
+        assert_eq!(json["sheet_size"], "A4");
+        let back: Drawing = serde_json::from_value(json).expect("round trip");
+        assert_eq!(back.sheet(), SheetSize::A4.portrait());
+
+        // A custom sheet keeps its dimensions; its orientation is theirs.
+        p.sheet_size = SheetSize::Custom {
+            width: 300.0,
+            height: 500.0,
+        };
+        p.orientation = SheetOrientation::Landscape;
+        assert_eq!(p.sheet().dims(), (300.0, 500.0));
+        assert!(p.sheet().is_portrait());
     }
 
     /// ADDITIVE SERDE GATE (campaign #55 Slice 1): a pre-#55 serialized drawing

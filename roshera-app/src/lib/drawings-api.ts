@@ -22,7 +22,9 @@ const API_HOST = import.meta.env.VITE_API_URL || ''
 
 // ── Wire types — mirror geometry-engine/src/drawing/types.rs ────────
 
-/** Engineering paper size. The kernel reports A4 as 297×210 (landscape). */
+/** Engineering paper size (ISO 216): the size only. Which way up it is drawn
+ *  is the drawing's {@link SheetOrientation}; {@link sheetDimensionsMm} gives
+ *  the two together as the paper's width × height. */
 export type SheetSize =
   | 'A4'
   | 'A3'
@@ -30,6 +32,31 @@ export type SheetSize =
   | 'A1'
   | 'A0'
   | { CUSTOM: { width: number; height: number } }
+
+/** Which way up the paper is drawn (ISO 5457). Absent on sheets from before
+ *  the choice existed — those are landscape. */
+export type SheetOrientation = 'landscape' | 'portrait'
+
+/** The paper's [width, height] in mm, as the kernel lays it: an ISO size
+ *  landscape (long edge across) or portrait (long edge up); a custom size as
+ *  given, whatever the orientation says (the kernel never turns one). */
+export function sheetDimensionsMm(
+  sheet: SheetSize,
+  orientation: SheetOrientation = 'landscape',
+): [number, number] {
+  if (typeof sheet === 'object' && sheet && 'CUSTOM' in sheet) {
+    return [sheet.CUSTOM.width, sheet.CUSTOM.height]
+  }
+  const landscape: Record<string, [number, number]> = {
+    A4: [297, 210],
+    A3: [420, 297],
+    A2: [594, 420],
+    A1: [841, 594],
+    A0: [1189, 841],
+  }
+  const [w, h] = landscape[sheet] ?? [297, 210]
+  return orientation === 'portrait' ? [h, w] : [w, h]
+}
 
 /** Projection preset. `kind` is the discriminator (serde tag = "kind"). */
 export type ProjectionType =
@@ -115,6 +142,8 @@ export interface Drawing {
   id: string
   name: string
   sheet_size: SheetSize
+  /** Landscape or portrait; absent (pre-orientation server) = landscape. */
+  orientation?: SheetOrientation
   views: ProjectedView[]
   /** Optional in the wire shape so the frontend continues to render
    *  against a pre-upgrade api-server that doesn't know the field
@@ -223,11 +252,15 @@ export async function getDrawing(id: string): Promise<Drawing> {
 }
 
 /** Allocate a fresh empty drawing. Returns its server-side UUID. */
-export async function createDrawing(name: string, sheet_size: SheetSize = 'A3'): Promise<string> {
+export async function createDrawing(
+  name: string,
+  sheet_size: SheetSize = 'A3',
+  orientation: SheetOrientation = 'landscape',
+): Promise<string> {
   const r = await fetch(`${API_HOST}/api/drawings`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, sheet_size }),
+    body: JSON.stringify({ name, sheet_size, orientation }),
   })
   const { id } = await jsonOrThrow<{ id: string }>(r, 'createDrawing')
   return id

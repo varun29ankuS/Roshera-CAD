@@ -144,8 +144,8 @@ fn layout_of(d: &Drawing, geos: &[Rect2], dims: Vec<PlacedDimension>) -> SheetLa
         sheet: Rect2 {
             x0: 0.0,
             y0: 0.0,
-            x1: d.sheet_size.width(),
-            y1: d.sheet_size.height(),
+            x1: d.sheet().width(),
+            y1: d.sheet().height(),
         },
         items,
         dimensions: dims,
@@ -437,7 +437,7 @@ fn free_rectangles_avoid_ink_and_are_deterministic() {
 #[test]
 fn a_floating_table_gets_table_anchor_and_an_anchored_one_does_not() {
     let d = sheet(SheetSize::A4);
-    let frame = frame_rect(&d.sheet_size);
+    let frame = frame_rect(&d.sheet());
     let floating = Rect2 {
         x0: 60.0,
         y0: 200.0,
@@ -823,7 +823,7 @@ fn an_unhosted_datum_symbol_never_stands_on_a_dimension_line() {
 #[test]
 fn a_leader_running_across_a_hole_is_flagged() {
     let mut d = sheet(SheetSize::A4);
-    let h = d.sheet_size.height();
+    let h = d.sheet().height();
     // A hole of r 5 at sheet (130, 120) (view space y up from the sheet foot).
     d.views[0]
         .circles

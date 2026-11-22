@@ -221,8 +221,8 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
         return finalize(issues, 0.0);
     }
 
-    let w = drawing.sheet_size.width();
-    let h = drawing.sheet_size.height();
+    let w = drawing.sheet().width();
+    let h = drawing.sheet().height();
 
     // ── Single layout computation — all geometry reads come from here ────
     // `compute_layout` is the one canonical placement model: it owns
@@ -1386,8 +1386,8 @@ pub fn find_text_collisions(layout: &super::layout::SheetLayout) -> Vec<TextColl
 /// `frame_margins` produces internally to `verify_drawing`, exposed here so
 /// callers (the harness) can feed [`find_ink_outside_frame`] the exact rect
 /// the renderer draws, without duplicating the margin table.
-pub fn frame_rect(sheet: &super::types::SheetSize) -> Rect2 {
-    let (ml, mr, mt, mb) = frame_margins(sheet);
+pub fn frame_rect(sheet: &super::types::Sheet) -> Rect2 {
+    let (ml, mr, mt, mb) = frame_margins(&sheet.size);
     Rect2 {
         x0: ml,
         y0: mt,
@@ -1984,10 +1984,10 @@ mod harness_invariant_tests {
     #[test]
     fn frame_rect_is_inset_from_sheet() {
         use crate::drawing::types::SheetSize;
-        let r = frame_rect(&SheetSize::A3);
+        let r = frame_rect(&SheetSize::A3.landscape());
         assert!(r.x0 > 0.0 && r.y0 > 0.0);
-        assert!(r.x1 < SheetSize::A3.width());
-        assert!(r.y1 < SheetSize::A3.height());
+        assert!(r.x1 < SheetSize::A3.landscape().width());
+        assert!(r.y1 < SheetSize::A3.landscape().height());
     }
 
     // ── find_span_overflows ────────────────────────────────────────────────

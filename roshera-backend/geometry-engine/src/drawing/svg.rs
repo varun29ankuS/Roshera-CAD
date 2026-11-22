@@ -36,13 +36,13 @@ use std::fmt::Write;
 use super::layout::{
     compute_layout, view_geometry_rect, ArrowSpec, SheetItemKind, SheetLayout, AR_L, AR_W,
 };
-use super::types::{Drawing, ProjectedView, SheetSize};
+use super::types::{Drawing, ProjectedView, Sheet, SheetSize};
 
 /// Render a [`Drawing`] to a complete SVG document string.
 pub fn render_drawing_svg(drawing: &Drawing) -> String {
-    let w = drawing.sheet_size.width();
-    let h = drawing.sheet_size.height();
-    let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
+    let sheet = drawing.sheet();
+    let (w, h) = sheet.dims();
+    let (ml, mr, mt, mb) = frame_margins(&sheet.size);
 
     let frame_x = ml;
     let frame_y = mt;
@@ -355,7 +355,8 @@ fn write_stylesheet(out: &mut String) {
 // Sheet geometry
 // ---------------------------------------------------------------------
 
-/// Frame margins (left, right, top, bottom) in mm.
+/// Frame margins (left, right, top, bottom) in mm. The same either way up:
+/// the wider filing margin stays on the left edge (ISO 5457).
 pub(crate) fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
     match sheet {
         SheetSize::A4 => (15.0, 10.0, 10.0, 10.0),
@@ -364,9 +365,9 @@ pub(crate) fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
 }
 
 /// The drawing frame (the border inside the margins) in sheet millimetres,
-/// y down.
-pub fn frame_rect(sheet: &SheetSize) -> super::layout::Rect2 {
-    let (ml, mr, mt, mb) = frame_margins(sheet);
+/// y down, on the sheet as oriented.
+pub fn frame_rect(sheet: &Sheet) -> super::layout::Rect2 {
+    let (ml, mr, mt, mb) = frame_margins(&sheet.size);
     super::layout::Rect2 {
         x0: ml,
         y0: mt,

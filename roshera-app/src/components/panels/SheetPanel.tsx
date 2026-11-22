@@ -96,8 +96,12 @@ export function SheetPanel({
         >
           {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </button>
-        <span className="rounded border border-border px-1.5 py-px font-mono text-[11px]" title="Sheet size">
+        <span
+          className="rounded border border-border px-1.5 py-px font-mono text-[11px]"
+          title={`Sheet size, ${drawing.orientation ?? 'landscape'}`}
+        >
           {typeof drawing.sheet_size === 'string' ? drawing.sheet_size : `${drawing.sheet_size.CUSTOM.width}×${drawing.sheet_size.CUSTOM.height}`}
+          {drawing.orientation === 'portrait' && typeof drawing.sheet_size === 'string' ? ' portrait' : ''}
         </span>
         <span className="text-[11px] text-muted-foreground" title={`${dimensionCount} dimensions on ${views.length} views`}>
           {views.length} views · {dimensionCount} dims

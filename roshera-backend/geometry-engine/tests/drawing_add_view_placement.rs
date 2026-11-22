@@ -55,7 +55,7 @@ fn an_added_view_lands_on_free_sheet_inside_the_frame() {
         .last()
         .expect("the new view's geometry")
         .bbox;
-    let frame = frame_rect(&d.sheet_size);
+    let frame = frame_rect(&d.sheet());
     assert!(
         new_rect.x0 >= frame.x0
             && new_rect.x1 <= frame.x1
@@ -130,7 +130,7 @@ fn an_added_view_is_aligned_by_the_projection_convention() {
             .iter()
             .position(|v| v.projection == ProjectionType::Front)
             .expect("FRONT");
-        let sheet_h = d.sheet_size.height();
+        let sheet_h = d.sheet().height();
         let front = compute_layout(&d)
             .items
             .iter()
@@ -149,7 +149,7 @@ fn an_added_view_is_aligned_by_the_projection_convention() {
                 .unwrap_or_else(|| {
                     panic!(
                         "{angle:?} {name}: no room on the {side:?} of FRONT {front:?}; frame {:?}; views {:?}",
-                        geometry_engine::drawing::svg::frame_rect(&d.sheet_size),
+                        geometry_engine::drawing::svg::frame_rect(&d.sheet()),
                         compute_layout(&d)
                             .items
                             .iter()
