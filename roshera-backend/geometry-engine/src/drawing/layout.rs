@@ -270,6 +270,9 @@ pub enum SheetItemKind {
     /// The letter "A" at each end of the cutting-plane line in the axial view
     /// (ISO 128: section indicator label). Collision-policed like all text items.
     CuttingPlaneLabel,
+    /// The letter beside a DETAIL view's circle on its parent view (ISO
+    /// 128-3), naming the enlarged view. Collision-policed like all text.
+    DetailLabel,
     /// The datum-origin marker at the part corner in the axial view: a small
     /// crosshair + circle + "0,0" label showing WHERE the hole table's X/Y
     /// columns measure from. Without it a machinist cannot locate the datum.
@@ -1596,6 +1599,9 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         let cp_label_items = place_cutting_plane_labels(drawing, cpl, h, &items, &all_placed);
         items.extend(cp_label_items);
     }
+    // Each DETAIL's letter beside its circle on the parent view.
+    let detail_labels = place_detail_labels(drawing, h, &items, &all_placed);
+    items.extend(detail_labels);
 
     // ── GD&T datum symbols + FCF blocks (Task 6) ──────────────────────
     // Read STORED annotations from `drawing.datum_symbols` and
@@ -2508,6 +2514,7 @@ fn place_hole_table(
                     | SheetItemKind::HoleTag
                     | SheetItemKind::ViewLabel
                     | SheetItemKind::CuttingPlaneLabel
+                    | SheetItemKind::DetailLabel
                     | SheetItemKind::HoleTableBorder
                     | SheetItemKind::HoleTableText
             )
@@ -2892,6 +2899,75 @@ pub(crate) fn place_datum_marker(drawing: &Drawing, sheet_h: f64) -> Option<Shee
 /// font (`VIEW_LABEL_FONT_MM`) — ISO practice for section letters.
 ///
 /// Both items are collision-policed through the layout like all other text items.
+/// The letter of each DETAIL beside its circle on the parent view
+/// ([`super::types::DetailSemantics`]), as `DetailLabel` items: the first of
+/// eight places just outside the circle, starting above-right and going round,
+/// clear of every text, dimension line and other view; the last tried when
+/// none is (and the sheet check reports the overlap). The circle's own view
+/// is not an obstacle -- the letter sits on the part beside its circle, as
+/// ISO 128-3 draws it.
+pub(crate) fn place_detail_labels(
+    drawing: &Drawing,
+    sheet_h: f64,
+    existing: &[SheetItem],
+    dimensions: &[PlacedDimension],
+) -> Vec<SheetItem> {
+    let font = VIEW_LABEL_FONT_MM;
+    let lines: Vec<[[f64; 2]; 2]> = dimensions.iter().flat_map(placed_line_segments).collect();
+    let mut placed: Vec<SheetItem> = Vec::new();
+    for d in &drawing.details {
+        let Some(view) = drawing.views.get(d.parent_view_idx) else {
+            continue;
+        };
+        let centre = dim_to_sheet(view, sheet_h, d.centre);
+        let reach = d.radius * view.scale + 1.0;
+        let half_w = d.letter.chars().count() as f64 * GLYPH_ADVANCE_EM * font * 0.5;
+        let bbox_at = |cx: f64, cy: f64| Rect2 {
+            x0: cx - half_w,
+            y0: cy - 0.5 * font,
+            x1: cx + half_w,
+            y1: cy + 0.5 * font,
+        };
+        let collides = |r: &Rect2| {
+            lines.iter().any(|l| segment_crosses_rect(l, r))
+                || existing.iter().chain(placed.iter()).any(|it| {
+                    let other_view = it.kind == SheetItemKind::ViewGeometry
+                        && it.owner_view != Some(d.parent_view_idx);
+                    let text = matches!(
+                        it.kind,
+                        SheetItemKind::DimensionText
+                            | SheetItemKind::ViewLabel
+                            | SheetItemKind::HoleTag
+                            | SheetItemKind::NoteText
+                            | SheetItemKind::HoleTableText
+                            | SheetItemKind::HoleTableBorder
+                            | SheetItemKind::CuttingPlaneLabel
+                            | SheetItemKind::DetailLabel
+                    );
+                    (other_view || text) && r.intersects(&it.bbox, -0.5)
+                })
+        };
+        let mut bbox = bbox_at(centre[0] + reach, centre[1] - reach);
+        for k in 0..8 {
+            // Above-right first (y grows down the sheet), then round.
+            let a = -std::f64::consts::FRAC_PI_4 + k as f64 * std::f64::consts::FRAC_PI_4;
+            let out = reach + half_w.max(0.5 * font) + 0.5;
+            let cand = bbox_at(centre[0] + out * a.cos(), centre[1] + out * a.sin());
+            bbox = cand;
+            if !collides(&cand) {
+                break;
+            }
+        }
+        placed.push(SheetItem {
+            kind: SheetItemKind::DetailLabel,
+            bbox,
+            owner_view: Some(d.parent_view_idx),
+            text: Some(d.letter.clone()),
+        });
+    }
+    placed
+}
+
 pub(crate) fn place_cutting_plane_labels(
     drawing: &Drawing,
     cpl: &super::dimensioning::CuttingPlaneLine,
@@ -3080,6 +3156,7 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
                         | SheetItemKind::HoleTableText
                         | SheetItemKind::NoteText
                         | SheetItemKind::CuttingPlaneLabel
+                        | SheetItemKind::DetailLabel
                         | SheetItemKind::DatumSymbol
                         | SheetItemKind::FcfBlock
                 )
@@ -5530,6 +5607,7 @@ mod tests {
             key: None,
             members: Vec::new(),
             member_points: Vec::new(),
+            chain_from: None,
         }
     }
 

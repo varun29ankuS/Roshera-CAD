@@ -27,6 +27,7 @@ pub mod arcs;
 pub mod centerlines;
 pub mod completeness;
 pub mod cone_angles;
+pub mod detail_view;
 pub mod dimension_edit;
 pub mod dimensioning;
 pub mod dxf;

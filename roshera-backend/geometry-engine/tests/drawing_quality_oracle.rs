@@ -83,6 +83,7 @@ fn dim(label: &str, a: [f64; 2], b: [f64; 2]) -> Dimension2d {
         key: None,
         members: Vec::new(),
         member_points: Vec::new(),
+        chain_from: None,
     }
 }
 
@@ -113,6 +114,7 @@ fn dim_with_entities(
         key: None,
         members: Vec::new(),
         member_points: Vec::new(),
+        chain_from: None,
     }
 }
 
@@ -678,6 +680,7 @@ fn dimension_label_collision_flagged() {
                 key: None,
                 members: Vec::new(),
                 member_points: Vec::new(),
+                chain_from: None,
             },
             Dimension2d {
                 id: "angle_b".to_string(),
@@ -696,6 +699,7 @@ fn dimension_label_collision_flagged() {
                 key: None,
                 members: Vec::new(),
                 member_points: Vec::new(),
+                chain_from: None,
             },
         ],
     ));
@@ -759,6 +763,7 @@ fn dimension_on_geometry_flagged() {
             key: None,
             members: Vec::new(),
             member_points: Vec::new(),
+            chain_from: None,
         }],
     ));
     let report = verify_drawing(&d);
@@ -1332,6 +1337,7 @@ fn hole_tag_forced_onto_dimension_text_fires_collision() {
         key: None,
         members: Vec::new(),
         member_points: Vec::new(),
+        chain_from: None,
     };
 
     let mut d = Drawing::new("TagCollision", SheetSize::A3);
@@ -2140,6 +2146,7 @@ fn hole_table_on_dimension_text_fires_collision() {
         key: None,
         members: Vec::new(),
         member_points: Vec::new(),
+        chain_from: None,
     };
 
     let mut d = Drawing::new("TableCollision", SheetSize::A4);

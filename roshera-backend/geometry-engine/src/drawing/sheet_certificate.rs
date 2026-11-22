@@ -423,6 +423,70 @@ fn dimension_live_check(
     }
 }
 
+/// Live-check a CHAIN location ([`super::dimensioning::Dimension2d::chain_from`]):
+/// the distance from the `anchor` feature's location to this one's (`pid`),
+/// both re-measured on the live model. The two records must locate their
+/// features from ONE datum origin along ONE axis -- only then is the
+/// difference of their offsets a distance between the features -- and a
+/// chain that does not is `Invalid`, never consistent. Each offset is signed
+/// by its record's direction along the shared axis.
+fn chain_live_check(
+    pid: &Option<String>,
+    anchor: &str,
+    sheet_value: f64,
+    live: &HashMap<&str, &DimensionRecord>,
+) -> LiveCheck {
+    let refuse = |verdict: SheetVerdict, detail: Option<String>| LiveCheck {
+        measured: None,
+        deviation: None,
+        verdict,
+        detail,
+    };
+    let Some(pid) = pid else {
+        return refuse(SheetVerdict::Unprovenanced, None);
+    };
+    let (Some(far), Some(near)) = (live.get(pid.as_str()), live.get(anchor)) else {
+        return refuse(SheetVerdict::Dangling, None);
+    };
+    let unit = |v: [f64; 3]| {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        (n > 1e-12).then(|| [v[0] / n, v[1] / n, v[2] / n])
+    };
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let same_datum = match (&far.datum, &near.datum) {
+        (Some(a), Some(b)) => (0..3).all(|i| (a.origin[i] - b.origin[i]).abs() <= 1e-6),
+        _ => false,
+    };
+    let axis = unit(far.direction)
+        .zip(unit(near.direction))
+        .filter(|(a, b)| {
+            far.kind == "position" && near.kind == "position" && dot(*a, *b).abs() >= 1.0 - 1e-9
+        });
+    let Some((axis, near_dir)) = axis.filter(|_| same_datum) else {
+        return refuse(
+            SheetVerdict::Invalid,
+            Some(
+                "a chain joins two locations from one datum along one axis; \
+                 these two are not"
+                    .to_string(),
+            ),
+        );
+    };
+    // Both offsets along `axis`, from the shared datum origin.
+    let measured = (far.value - near.value * dot(near_dir, axis)).abs();
+    let dev = (measured - sheet_value).abs();
+    LiveCheck {
+        measured: Some(measured),
+        deviation: Some(dev),
+        verdict: if dev <= CERT_DIM_ORACLE_MM {
+            SheetVerdict::Consistent
+        } else {
+            SheetVerdict::Stale
+        },
+        detail: None,
+    }
+}
+
 /// Live-check a hole-table row by re-measuring its bore faces against the
 /// analytic table (holes carry face ids, not a PID).
 ///
@@ -1132,9 +1196,11 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
         .map(|s| super::arcs::drafting_dimensions(model, s))
         .unwrap_or_default();
     let mut live_by_pid: HashMap<String, f64> = HashMap::new();
+    let mut live_record_by_pid: HashMap<&str, &DimensionRecord> = HashMap::new();
     for d in &live_dims {
         if let Some(pid) = &d.pid {
             live_by_pid.insert(pid.clone(), d.value);
+            live_record_by_pid.insert(pid.as_str(), d);
         }
     }
 
@@ -1178,7 +1244,10 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
             // the tolerance and text authored on it -- from the same function
             // the layout and every renderer ink it with.
             let ink = super::dimension_edit::dimension_ink(dim, edit, drawing.document_unit);
-            let mut live = dimension_live_check(&dim.pid, dim.value, &live_by_pid);
+            let mut live = match &dim.chain_from {
+                Some(anchor) => chain_live_check(&dim.pid, anchor, dim.value, &live_record_by_pid),
+                None => dimension_live_check(&dim.pid, dim.value, &live_by_pid),
+            };
             dimension_ink_check(model, dim, edit, &ink, &mut live);
             counted_members_check(dim, &live_members, &mut live);
             facts.push(SheetFact {
@@ -1810,6 +1879,68 @@ mod tests {
     };
     use crate::math::{Point3, Vector3};
     use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+    /// A location record from the part corner `origin`, `value` along
+    /// `direction`.
+    fn located(pid: &str, value: f64, direction: [f64; 3], origin: [f64; 3]) -> DimensionRecord {
+        DimensionRecord {
+            id: pid.to_string(),
+            kind: "position".to_string(),
+            value,
+            unit: "mm".to_string(),
+            label: format!("X {value}"),
+            entities: vec![1],
+            anchor: [0.0; 3],
+            direction,
+            axis: Some([0.0, 0.0, 1.0]),
+            pid: Some(pid.to_string()),
+            datum: Some(crate::readable::dimensions::DatumDescriptor {
+                kind: "part_corner".to_string(),
+                name: "part corner".to_string(),
+                origin,
+            }),
+        }
+    }
+
+    /// A chain is re-measured as the distance between its two features'
+    /// live locations -- consistent when the sheet's number is that, stale
+    /// when the model moved, each offset signed by its record's direction --
+    /// and REFUSED (invalid, never consistent) when its two records do not
+    /// share one datum and one axis: their offsets are then not on one line.
+    ///
+    /// Mutation: drop the same-datum test -> the cross-datum chain certifies
+    /// -> RED.
+    #[test]
+    fn a_chain_is_the_distance_between_two_live_locations_from_one_datum() {
+        let o = [0.0, 0.0, 0.0];
+        let near = located("near", 35.5, [1.0, 0.0, 0.0], o);
+        let far = located("far", 36.49, [1.0, 0.0, 0.0], o);
+        let other_datum = located("other", 36.49, [1.0, 0.0, 0.0], [5.0, 0.0, 0.0]);
+        let across = located("across", 36.49, [0.0, 1.0, 0.0], o);
+        // A feature on the datum's other side: offset 2 along -X is -2.
+        let behind = located("behind", 2.0, [-1.0, 0.0, 0.0], o);
+        let live: HashMap<&str, &DimensionRecord> = [&near, &far, &other_datum, &across, &behind]
+            .into_iter()
+            .map(|r| (r.id.as_str(), r))
+            .collect();
+        let check = |pid: &str, anchor: &str, value: f64| {
+            chain_live_check(&Some(pid.to_string()), anchor, value, &live)
+        };
+        let ok = check("far", "near", 0.99);
+        assert_eq!(ok.verdict, SheetVerdict::Consistent, "{ok:?}");
+        assert!(
+            (ok.measured.unwrap_or(f64::NAN) - 0.99).abs() < 1e-9,
+            "{ok:?}"
+        );
+        assert_eq!(check("far", "near", 1.5).verdict, SheetVerdict::Stale);
+        let signed = check("near", "behind", 37.5);
+        assert_eq!(signed.verdict, SheetVerdict::Consistent, "{signed:?}");
+        assert_eq!(check("other", "near", 0.99).verdict, SheetVerdict::Invalid);
+        assert_eq!(check("across", "near", 0.99).verdict, SheetVerdict::Invalid);
+        assert_eq!(check("gone", "near", 0.99).verdict, SheetVerdict::Dangling);
+        let unprovenanced = chain_live_check(&None, "near", 0.99, &live);
+        assert_eq!(unprovenanced.verdict, SheetVerdict::Unprovenanced);
+    }
 
     fn sid(g: GeometryId) -> SolidId {
         match g {

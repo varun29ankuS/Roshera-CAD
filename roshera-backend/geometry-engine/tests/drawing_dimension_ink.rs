@@ -32,6 +32,7 @@ fn dim(kind: &str, label: &str, value: f64) -> Dimension2d {
         key: Some("pid-0".to_string()),
         members: Vec::new(),
         member_points: Vec::new(),
+        chain_from: None,
     }
 }
 

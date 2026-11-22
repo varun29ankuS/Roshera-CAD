@@ -107,6 +107,18 @@ pub struct Dimension2d {
     /// `#[serde(default)]` keeps older serialized drawings parsing.
     #[serde(default)]
     pub member_points: Vec<[f64; 2]>,
+    /// A location stated from ANOTHER feature instead of from the datum (a
+    /// chain, ISO 129-1): the pid of that feature's location record, from
+    /// the same datum along the same axis. `pid` is still this feature's own
+    /// location record and `value` the distance between the two; the
+    /// certificate re-measures both live and checks the difference, and the
+    /// feature counts as located only while the anchor is located from the
+    /// datum. Drawn in a DETAIL view, where features too close together to
+    /// read from the datum at the sheet's scale are dimensioned. `None` for
+    /// every other dimension. `#[serde(default)]` keeps older serialized
+    /// drawings parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_from: Option<String>,
 }
 
 impl Dimension2d {
@@ -295,6 +307,7 @@ pub(crate) fn project_records(
             key,
             members: Vec::new(),
             member_points: Vec::new(),
+            chain_from: None,
         });
     }
     out
@@ -2524,7 +2537,7 @@ const SEARCH_SHEETS: [super::types::SheetSize; 4] = [
 ];
 
 /// ISO 5455 recommended scales, largest first (the 1-2-5 series).
-const ISO_SCALES: [f64; 14] = [
+pub(crate) const ISO_SCALES: [f64; 14] = [
     50.0, 20.0, 10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002,
 ];
 
@@ -3402,6 +3415,11 @@ fn build_sheet(
     // attach it as a compact pictorial in genuinely free sheet space. Runs
     // LAST so its free-space search sees every placed item as an obstacle.
     attach_pictorial_iso(model, solid_id, source, &mut drawing, extents[3], min_span);
+
+    // Features too close together to read from the datum at this scale:
+    // circled and drawn again enlarged, located by chains there. Last, so
+    // its free-paper search sees every placed item.
+    super::detail_view::attach_detail_views(&mut drawing);
 
     if prof {
         eprintln!(
@@ -6620,6 +6638,7 @@ mod tests {
             key: None,
             members: Vec::new(),
             member_points: Vec::new(),
+            chain_from: None,
         };
         let mut d = Drawing::new("t", SheetSize::A3);
         let mut top = super::super::projection::project_solid_view(

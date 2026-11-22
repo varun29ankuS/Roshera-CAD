@@ -201,6 +201,7 @@ pub fn dimension_omissions(model: &BRepModel, drawing: &Drawing) -> Vec<Dimensio
         .flat_map(|v| v.dimensions.iter())
         .flat_map(statements)
         .collect();
+    let chain_located = chain_located(inked.iter().flatten().copied());
     let stated_bores = super::sheet_certificate::stated_bore_faces(drawing);
     // The bore locations a hole-table row or callout states, per view: they
     // are not inked as dimensions, but the sheet prints their numbers. A
@@ -232,6 +233,14 @@ pub fn dimension_omissions(model: &BRepModel, drawing: &Drawing) -> Vec<Dimensio
             v.projection == projection && v.shaded_raster.is_none() && Some(i) != section_view
         });
         let candidates = candidates_from_records(model, records.clone(), projection, MIN_SPAN);
+        // The locations this view owes that a chain states, as they read
+        // from the datum: a location that states the same place is stated
+        // by the chain too (`chain_covers`).
+        let chained: Vec<Dimension2d> = candidates
+            .iter()
+            .filter(|c| c.pid.as_deref().is_some_and(|p| chain_located.contains(p)))
+            .cloned()
+            .collect();
         let inked_here: &[&Dimension2d] = owner
             .and_then(|i| inked.get(i))
             .map_or(&[][..], |v| v.as_slice());
@@ -248,7 +257,9 @@ pub fn dimension_omissions(model: &BRepModel, drawing: &Drawing) -> Vec<Dimensio
             let hole_stated_here: &[&Dimension2d] = owner
                 .and_then(|i| hole_stated.get(i))
                 .map_or(&[][..], |v| v.as_slice());
+            let by_chain = chain_covers(&c, &chained);
             if inked_identities.contains(&id)
+                || by_chain
                 || by_hole_statement
                 || same_statement(&c, inked_here)
                 || same_statement(&c, hole_stated_here)
@@ -297,6 +308,54 @@ pub fn dimension_omissions(model: &BRepModel, drawing: &Drawing) -> Vec<Dimensio
     out
 }
 
+/// The location records (by pid) a CHAIN states
+/// ([`Dimension2d::chain_from`]), from the inked dimensions: a feature counts
+/// as located only while its chain is inked AND the chain's anchor is itself
+/// located -- from the datum, or by a chain that is (to any depth). Remove
+/// the anchor and the whole chain is owed again.
+pub(crate) fn chain_located<'d>(inked: impl Iterator<Item = &'d Dimension2d>) -> HashSet<&'d str> {
+    let inked: Vec<&Dimension2d> = inked.collect();
+    let from_datum: HashSet<&str> = inked
+        .iter()
+        .filter(|d| d.chain_from.is_none())
+        .filter_map(|d| d.pid.as_deref())
+        .collect();
+    let chains: Vec<(&str, &str)> = inked
+        .iter()
+        .filter_map(|d| Some((d.pid.as_deref()?, d.chain_from.as_deref()?)))
+        .collect();
+    let mut located: HashSet<&str> = HashSet::new();
+    loop {
+        let before = located.len();
+        for &(far, anchor) in &chains {
+            if from_datum.contains(anchor) || located.contains(anchor) {
+                located.insert(far);
+            }
+        }
+        if located.len() == before {
+            return located;
+        }
+    }
+}
+
+/// Does a CHAIN state the location `c` owes? When `c` is itself one of the
+/// `chained` locations (by its record), or states the same place as one of
+/// them ([`same_statement`]): two features at one location from the datum
+/// are both stated by one number, and when that number becomes a chain in
+/// a DETAIL view the chain states both (NIST FTC 08: faces 255 and 267 at
+/// 29.91, the second reported not dimensioned once 255's moved).
+fn chain_covers(c: &Dimension2d, chained: &[Dimension2d]) -> bool {
+    if c.kind != "position" {
+        return false;
+    }
+    let by_record = c
+        .pid
+        .as_deref()
+        .is_some_and(|p| chained.iter().any(|x| x.pid.as_deref() == Some(p)));
+    let refs: Vec<&Dimension2d> = chained.iter().collect();
+    by_record || same_statement(c, &refs)
+}
+
 /// One line per (view, kind) for a person: `"3 angles not dimensioned on
 /// FRONT"`. Waived omissions are not counted here.
 pub fn omission_summary(omissions: &[DimensionOmission]) -> Vec<String> {
@@ -339,4 +398,77 @@ pub fn omission_summary(omissions: &[DimensionOmission]) -> Vec<String> {
             format!("{n} {plural} not dimensioned on {view}")
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn location(pid: &str, chain_from: Option<&str>) -> Dimension2d {
+        Dimension2d {
+            id: pid.to_string(),
+            kind: "position".to_string(),
+            value: 1.0,
+            unit: "mm".to_string(),
+            label: "1".to_string(),
+            a: [0.0, 0.0],
+            b: [1.0, 0.0],
+            entities: Vec::new(),
+            axis3: None,
+            dir3: None,
+            pid: Some(pid.to_string()),
+            datum: None,
+            tolerance: None,
+            key: None,
+            members: Vec::new(),
+            member_points: Vec::new(),
+            chain_from: chain_from.map(str::to_string),
+        }
+    }
+
+    /// A location stated by the same number as a chain-located one is
+    /// covered by that chain too; a location elsewhere is not.
+    ///
+    /// Mutation: cover by record only (drop the `same_statement` arm) ->
+    /// the coincident feature is owed -> RED.
+    #[test]
+    fn a_chain_states_a_coincident_location_too() {
+        let mut chained = location("p255", None);
+        chained.a = [0.0, 0.0];
+        chained.b = [29.91, 0.0];
+        chained.value = 29.91;
+        let mut coincident = location("p267", None);
+        coincident.a = [0.0, 3.0];
+        coincident.b = [29.91, 3.0];
+        coincident.value = 29.91;
+        let mut elsewhere = location("p300", None);
+        elsewhere.a = [0.0, 0.0];
+        elsewhere.b = [40.0, 0.0];
+        elsewhere.value = 40.0;
+        let chained = vec![chained];
+        assert!(chain_covers(&chained[0], &chained), "its own record");
+        assert!(chain_covers(&coincident, &chained), "the same place");
+        assert!(!chain_covers(&elsewhere, &chained), "another place");
+    }
+
+    /// A chain locates its feature only while its anchor is located from
+    /// the datum (to any depth: A from the datum, B from A, C from B). Take
+    /// the anchor off the sheet and the whole chain is owed again.
+    ///
+    /// Mutation: credit every inked chain regardless of its anchor -> B and
+    /// C stay located without A -> RED.
+    #[test]
+    fn a_chain_locates_its_feature_only_while_its_anchor_is_located() {
+        let a = location("A", None);
+        let b = location("B", Some("A"));
+        let c = location("C", Some("B"));
+        let all = chain_located([&a, &b, &c].into_iter());
+        assert!(all.contains("B") && all.contains("C"), "{all:?}");
+        assert!(
+            !all.contains("A"),
+            "A is located from the datum, not by a chain"
+        );
+        let without_anchor = chain_located([&b, &c].into_iter());
+        assert!(without_anchor.is_empty(), "{without_anchor:?}");
+    }
 }

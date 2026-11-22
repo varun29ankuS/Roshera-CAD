@@ -857,6 +857,24 @@ pub struct SectionSemantics {
     pub section_view_idx: usize,
 }
 
+/// A DETAIL view (ISO 128-3): a region of a parent view, circled and
+/// lettered there, drawn again enlarged where features too close together to
+/// read at the sheet's scale are dimensioned ([`super::detail_view`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DetailSemantics {
+    /// The detail's letter: "B" in "DETAIL B (2:1)" and beside its circle.
+    pub letter: String,
+    /// Index into [`Drawing::views`] of the view the circle is drawn on.
+    pub parent_view_idx: usize,
+    /// Index into [`Drawing::views`] of the enlarged view.
+    pub detail_view_idx: usize,
+    /// The circle's centre in the parent's (and the detail's) view
+    /// coordinates, millimetres on the part.
+    pub centre: [f64; 2],
+    /// The circle's radius, millimetres on the part.
+    pub radius: f64,
+}
+
 /// Structured general-tolerance record (campaign #55 Slice 1).
 ///
 /// The prose `tolerance_note` remains the render source; THIS record is the
@@ -1097,6 +1115,10 @@ pub struct Drawing {
     /// `#[serde(default)]` keeps older serialized drawings parsing.
     #[serde(default)]
     pub section: Option<SectionSemantics>,
+    /// The sheet's DETAIL views, each with its circle on its parent view.
+    /// `#[serde(default)]` keeps older serialized drawings parsing.
+    #[serde(default)]
+    pub details: Vec<DetailSemantics>,
     /// The document length unit this sheet was built in (campaign #55 Slice 1).
     /// The prose `unit_note` remains the render source; this enum is the
     /// readback source (the note strings do not parse cleanly). Defaults to
@@ -1197,6 +1219,7 @@ impl Drawing {
             datum_symbols: Vec::new(),
             fcf_blocks: Vec::new(),
             section: None,
+            details: Vec::new(),
             document_unit: LengthUnit::default(),
             general_tolerance: GeneralTolerance::default(),
             round_part: None,
@@ -1272,6 +1295,18 @@ impl Drawing {
         if let Some(t) = self.profile_table.as_mut() {
             t.owner_view = t.owner_view.and_then(follow);
         }
+        // A detail goes with either of its views: its circle means nothing
+        // without the enlarged view, nor the enlarged view without its circle.
+        self.details.retain_mut(
+            |d| match (follow(d.parent_view_idx), follow(d.detail_view_idx)) {
+                (Some(p), Some(v)) => {
+                    d.parent_view_idx = p;
+                    d.detail_view_idx = v;
+                    true
+                }
+                _ => false,
+            },
+        );
         self.datum_symbols
             .retain_mut(|s| match follow(s.owner_view) {
                 Some(i) => {
@@ -1313,6 +1348,14 @@ impl Drawing {
             .is_some_and(|s| s.section_view_idx == index)
         {
             roles.push("the section".to_string());
+        }
+        for d in &self.details {
+            if d.parent_view_idx == index {
+                roles.push(format!("the circle of DETAIL {}", d.letter));
+            }
+            if d.detail_view_idx == index {
+                roles.push(format!("DETAIL {}", d.letter));
+            }
         }
         if self
             .profile_table

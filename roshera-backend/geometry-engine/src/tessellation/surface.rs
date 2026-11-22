@@ -11041,23 +11041,6 @@ impl<'a> FaceMembership<'a> {
     }
 }
 
-/// Cache of a loop's projected UV polygon (see [`project_loop_uv_unwrapped`])
-/// and its derived trim-membership data, keyed by [`crate::primitives::r#loop::LoopId`].
-///
-/// Building this polygon takes 20 boundary samples per edge, each a
-/// `Surface::closest_point` solve — cheap once per face (`FaceMembership`)
-/// but ruinous when the same handful of faces are probed
-/// thousands of times per drawing view (HLR's broad-phase occlusion grid,
-/// `drawing::visibility::OcclusionGrid`). That repetition is inherent, not a
-/// bug: a genuinely visible sample point has no occluder, so the occlusion
-/// test cannot early-exit and must run every candidate face's trim-membership
-/// test to completion. Building the polygon once per loop and reusing it
-/// turns the per-test cost back into a handful of dot products instead of a
-/// full re-sample-and-project.
-///
-/// `LoopId` is unique and stable only for the `&BRepModel` snapshot a cache
-/// was built against — never share one `LoopUvCache` instance across two
-/// different model states (a mutating operation can retarget a loop slot).
 // A loop cache for membership tests made while a [`MembershipCacheScope`]
 // is open over one model: each face loop is projected into (u, v) once for
 // the scope instead of once per query. `footpoint_in_face` reads it; the
@@ -11128,6 +11111,23 @@ pub(crate) fn point_inside_face_uv_scoped(u: f64, v: f64, face: &Face, model: &B
     }
 }
 
+/// Cache of a loop's projected UV polygon (see [`project_loop_uv_unwrapped`])
+/// and its derived trim-membership data, keyed by [`crate::primitives::r#loop::LoopId`].
+///
+/// Building this polygon takes 20 boundary samples per edge, each a
+/// `Surface::closest_point` solve — cheap once per face (`FaceMembership`)
+/// but ruinous when the same handful of faces are probed
+/// thousands of times per drawing view (HLR's broad-phase occlusion grid,
+/// `drawing::visibility::OcclusionGrid`). That repetition is inherent, not a
+/// bug: a genuinely visible sample point has no occluder, so the occlusion
+/// test cannot early-exit and must run every candidate face's trim-membership
+/// test to completion. Building the polygon once per loop and reusing it
+/// turns the per-test cost back into a handful of dot products instead of a
+/// full re-sample-and-project.
+///
+/// `LoopId` is unique and stable only for the `&BRepModel` snapshot a cache
+/// was built against — never share one `LoopUvCache` instance across two
+/// different model states (a mutating operation can retarget a loop slot).
 pub(crate) struct LoopUvCache {
     entries: DashMap<crate::primitives::r#loop::LoopId, Arc<CachedLoopUv>>,
 }

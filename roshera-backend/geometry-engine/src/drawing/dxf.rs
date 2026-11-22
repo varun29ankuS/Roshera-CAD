@@ -529,6 +529,48 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
         );
     }
 
+    // ── DETAIL views: each circle on its parent view, and its letter ──
+    // The same ink the SVG draws (`render_detail_circles`): the circle in
+    // the parent's frame, the letter from the `DetailLabel` layout items.
+    for d in &drawing.details {
+        let Some(view) = drawing.views.get(d.parent_view_idx) else {
+            continue;
+        };
+        let s = view.scale;
+        let circle = Circle {
+            center: Point::new(
+                view.position_mm[0] + s * d.centre[0],
+                view.position_mm[1] + s * d.centre[1],
+                0.0,
+            ),
+            radius: s * d.radius,
+            normal: Vector::z_axis(),
+            ..Circle::default()
+        };
+        let mut ent = Entity::new(EntityType::Circle(circle));
+        ent.common.layer = LAYER_VIEW_LABELS.to_string();
+        dxf.add_entity(ent);
+    }
+    for item in &layout.items {
+        if item.kind != SheetItemKind::DetailLabel {
+            continue;
+        }
+        let text = item.text.as_deref().unwrap_or("");
+        if text.is_empty() {
+            continue;
+        }
+        add_text(
+            dxf,
+            LAYER_VIEW_LABELS,
+            0.5 * (item.bbox.x0 + item.bbox.x1),
+            sheet_h - item.bbox.y1,
+            3.6,
+            0.0,
+            text,
+            HorizontalTextJustification::Center,
+        );
+    }
+
     // ── Dimension callout text ──────────────────────────────────────────
     // Emitted from PlacedDimension (anchor + rotation), NOT from the
     // DimensionText items' bboxes: a rotated label's bbox midpoint is NOT
@@ -1929,6 +1971,7 @@ mod tests {
                     key: None,
                     members: Vec::new(),
                     member_points: Vec::new(),
+                    chain_from: None,
                 },
                 Dimension2d {
                     id: "h".to_string(),
@@ -1947,6 +1990,7 @@ mod tests {
                     key: None,
                     members: Vec::new(),
                     member_points: Vec::new(),
+                    chain_from: None,
                 },
             ],
             centerlines: Vec::new(),

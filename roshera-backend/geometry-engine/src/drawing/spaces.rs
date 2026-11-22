@@ -682,7 +682,9 @@ fn cap_height_of(kind: SheetItemKind) -> Option<f64> {
         SheetItemKind::HoleTableText => TABLE_TEXT_FONT_MM,
         SheetItemKind::HoleTag => HOLE_TAG_FONT_MM,
         SheetItemKind::NoteText => NOTES_FONT_MM,
-        SheetItemKind::ViewLabel | SheetItemKind::CuttingPlaneLabel => VIEW_LABEL_FONT_MM,
+        SheetItemKind::ViewLabel
+        | SheetItemKind::CuttingPlaneLabel
+        | SheetItemKind::DetailLabel => VIEW_LABEL_FONT_MM,
         SheetItemKind::ZoneRef => ZONE_FONT_MM,
         SheetItemKind::DatumSymbol | SheetItemKind::FcfBlock => GDT_FONT_MM,
         _ => return None,
@@ -1372,7 +1374,8 @@ fn item_spaces(
             | SheetItemKind::DatumSymbol
             | SheetItemKind::FcfBlock
             | SheetItemKind::DatumMarker
-            | SheetItemKind::CuttingPlaneLabel => it
+            | SheetItemKind::CuttingPlaneLabel
+            | SheetItemKind::DetailLabel => it
                 .owner_view
                 .and_then(cell_of)
                 .or_else(|| Some("frame".to_string())),

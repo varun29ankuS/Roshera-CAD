@@ -375,6 +375,7 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
                     | SheetItemKind::DimensionText
                     | SheetItemKind::NoteText
                     | SheetItemKind::CuttingPlaneLabel
+                    | SheetItemKind::DetailLabel
                     | SheetItemKind::DatumSymbol
                     | SheetItemKind::FcfBlock
             )
@@ -825,6 +826,7 @@ fn check_dimension_label_collisions(
                 SheetItemKind::DimensionText
                     | SheetItemKind::HoleTag
                     | SheetItemKind::CuttingPlaneLabel
+                    | SheetItemKind::DetailLabel
             )
         })
         .collect();
@@ -948,6 +950,7 @@ pub(crate) fn find_lines_through_text(layout: &super::layout::SheetLayout) -> Ve
                 SheetItemKind::DimensionText
                     | SheetItemKind::HoleTag
                     | SheetItemKind::CuttingPlaneLabel
+                    | SheetItemKind::DetailLabel
                     | SheetItemKind::ViewLabel
             )
         })
@@ -1007,6 +1010,7 @@ pub(crate) fn find_tag_leaders_through_text(
                 SheetItemKind::DimensionText
                     | SheetItemKind::HoleTag
                     | SheetItemKind::CuttingPlaneLabel
+                    | SheetItemKind::DetailLabel
                     | SheetItemKind::ViewLabel
             ) {
                 continue;
@@ -1342,6 +1346,7 @@ pub(crate) fn is_text_item(kind: SheetItemKind) -> bool {
             | SheetItemKind::ZoneRef
             | SheetItemKind::NoteText
             | SheetItemKind::CuttingPlaneLabel
+            | SheetItemKind::DetailLabel
             | SheetItemKind::DatumSymbol
             | SheetItemKind::FcfBlock
     )

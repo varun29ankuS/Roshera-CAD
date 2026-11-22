@@ -114,6 +114,10 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
         render_cutting_plane(&mut out, drawing, cpl, h, &layout);
     }
 
+    // DETAIL views: each one's circle on its parent view and its letter
+    // beside it (the enlarged view itself is inked with the other views).
+    render_detail_circles(&mut out, drawing, h, &layout);
+
     // Notes strip — inked from NoteText layout items (campaign-B debt retired).
     // Routed through layout so text-collision invariants cover them.
     render_notes_from_layout(&mut out, &layout);
@@ -312,6 +316,8 @@ fn write_stylesheet(out: &mut String) {
          stroke-linecap: round; }\n",
     );
     out.push_str("    .cutting-plane-arrow { fill: #111; stroke: none; }\n");
+    // A DETAIL's circle on its parent view: a continuous narrow line (ISO 128).
+    out.push_str("    .detail-circle { fill: none; stroke: #111; stroke-width: 0.25; }\n");
     out.push_str(
         "    .cutting-plane-label { font: 700 3.6px sans-serif; fill: #111; \
          text-anchor: middle; dominant-baseline: alphabetic; }\n",
@@ -1678,6 +1684,38 @@ fn render_cutting_plane(
         let _ = write!(
             out,
             "  <text class=\"cutting-plane-label\" x=\"{cx:.3}\" y=\"{cy:.3}\">A</text>\n"
+        );
+    }
+}
+
+/// Each DETAIL's circle on its parent view (a continuous narrow line round
+/// the region the detail enlarges) and its letter, from the `DetailLabel`
+/// layout items (the same `.cutting-plane-label` lettering as SECTION A-A's).
+fn render_detail_circles(out: &mut String, drawing: &Drawing, h: f64, layout: &SheetLayout) {
+    for d in &drawing.details {
+        let Some(view) = drawing.views.get(d.parent_view_idx) else {
+            continue;
+        };
+        let cx = view.position_mm[0] + d.centre[0] * view.scale;
+        let cy = (h - view.position_mm[1]) - d.centre[1] * view.scale;
+        let _ = write!(
+            out,
+            "  <circle class=\"detail-circle\" cx=\"{cx:.3}\" cy=\"{cy:.3}\" r=\"{:.3}\" />\n",
+            d.radius * view.scale
+        );
+    }
+    for item in layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::DetailLabel)
+    {
+        let cx = (item.bbox.x0 + item.bbox.x1) * 0.5;
+        let cy = item.bbox.y1;
+        let text = item.text.as_deref().unwrap_or("");
+        let _ = write!(
+            out,
+            "  <text class=\"cutting-plane-label\" x=\"{cx:.3}\" y=\"{cy:.3}\">{}</text>\n",
+            escape_xml(text)
         );
     }
 }
