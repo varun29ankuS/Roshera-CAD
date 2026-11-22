@@ -2635,11 +2635,28 @@ pub(crate) fn place_hole_tags(
     callout_lines: &[[[f64; 2]; 2]],
 ) -> Vec<(PlacedHoleTag, SheetItem)> {
     let groups = hole_tag_groups(sites);
+    // Each tag's place centred on its hole: a tag placed earlier and moved
+    // off its own hole must not take a later tag's (part 115: 'A5, A6' went
+    // out onto the place of 'A7, A8', which then found none).
+    let hole_places: Vec<Rect2> = groups
+        .iter()
+        .map(|(centre, tag, _)| {
+            let [cx, cy] = hole_tag_centre(axial_view, *centre, sheet_h);
+            let [hw, hh] = hole_tag_half_extent(tag);
+            Rect2 {
+                x0: cx - hw,
+                y0: cy - hh,
+                x1: cx + hw,
+                y1: cy + hh,
+            }
+        })
+        .collect();
     let mut out = Vec::new();
     // The leaders of the tags placed so far: a later tag must not sit on one
     // (part 107 at 1:5: A4 was put on A1's leader).
     let mut tag_leaders: Vec<[[f64; 2]; 2]> = Vec::new();
-    for (centre, tag, diameter_mm) in groups {
+    for (gi, (centre, tag, diameter_mm)) in groups.into_iter().enumerate() {
+        let later_places = hole_places.get(gi + 1..).unwrap_or_default();
         let [sx, sy] = hole_tag_centre(axial_view, centre, sheet_h);
         let [half_w, half_h] = hole_tag_half_extent(&tag);
         let rect_at = |cx: f64, cy: f64| Rect2 {
@@ -2658,6 +2675,8 @@ pub(crate) fn place_hole_tags(
                 // Nor on a callout's line: a leader leg crossing the bore must
                 // not strike through its tag.
                 && !callout_lines.iter().any(|l| segment_crosses_rect(l, r))
+                // Nor on a later tag's place on its hole.
+                && !later_places.iter().any(|o| r.intersects(o, 0.2))
         };
         // On the hole: its centre, then four places 4 mm off it.
         const OFFSET: f64 = 4.0;
@@ -2690,7 +2709,7 @@ pub(crate) fn place_hole_tags(
                         [sx + ux * r_hole, sy + uy * r_hole],
                         [sx + ux * reach, sy + uy * reach],
                     ];
-                    let leader_clear = !obstacles.iter().any(|o| {
+                    let leader_clear = !obstacles.iter().chain(later_places).any(|o| {
                         let inner = Rect2 {
                             x0: o.x0 + 0.2,
                             y0: o.y0 + 0.2,
@@ -3707,7 +3726,21 @@ pub(crate) fn place_dimensions_routed(
         } else {
             None
         };
-        if let Some((centre, r)) = leader {
+        if let Some((head_centre, r)) = leader {
+            // Where the arrow may touch: a counted point callout ("11× R3")
+            // states every member, and its leader may end on any of them --
+            // the head's first, then the others in order. From its head's
+            // fillet alone, four counted radii of part 115 found no clear row
+            // and their legs were drawn across the view and its hole tags.
+            let tips: Vec<[f64; 2]> = std::iter::once(head_centre)
+                .chain(
+                    d.member_points
+                        .iter()
+                        .skip(1)
+                        .filter(|_| r == 0.0)
+                        .map(|p| dim_to_sheet(view, sheet_h, *p)),
+                )
+                .collect();
             // Callouts already placed -- this view's, and (`ink_lines`) the
             // lines of earlier views': this callout's text must not sit on
             // their lines, nor its leg and shoulder run through their text.
@@ -3779,7 +3812,7 @@ pub(crate) fn place_dimensions_routed(
             // the leg from a point on the far side of a view climbed to the
             // top of the sheet, and on a busy part a dozen of them crossed
             // it.
-            let rise = |elbow_x: f64| -> f64 {
+            let rise = |centre: [f64; 2], elbow_x: f64| -> f64 {
                 let run = (elbow_x - centre[0]).abs();
                 if point_leader {
                     run.min(POINT_LEADER_MAX_RISE)
@@ -3812,92 +3845,95 @@ pub(crate) fn place_dimensions_routed(
                 .unwrap_or(f64::NEG_INFINITY);
             let bottom = frame.map(|f| f[3] - 1.0).unwrap_or(f64::INFINITY);
             let mut placed: Option<(f64, f64, f64)> = None;
-            for &(side, elbow_x) in &shoulders {
-                let nominal = (centre[1] - rise(elbow_x)).max(top);
-                // The shoulder + text box for a row at `y`.
-                let text_box = |y: f64| {
-                    let (x0, x1) = if side > 0.0 {
-                        (elbow_x, elbow_x + text_w + 2.0)
-                    } else {
-                        (elbow_x - text_w - 2.0, elbow_x)
+            let mut centre = head_centre;
+            for &tip in &tips {
+                centre = tip;
+                for &(side, elbow_x) in &shoulders {
+                    let nominal = (centre[1] - rise(centre, elbow_x)).max(top);
+                    // The shoulder + text box for a row at `y`.
+                    let text_box = |y: f64| {
+                        let (x0, x1) = if side > 0.0 {
+                            (elbow_x, elbow_x + text_w + 2.0)
+                        } else {
+                            (elbow_x - text_w - 2.0, elbow_x)
+                        };
+                        Rect2 {
+                            x0,
+                            y0: y - TGAP - DIM_TEXT_FONT_MM,
+                            x1,
+                            y1: y + below,
+                        }
                     };
-                    Rect2 {
-                        x0,
-                        y0: y - TGAP - DIM_TEXT_FONT_MM,
-                        x1,
-                        y1: y + below,
-                    }
-                };
-                // The view's OTHER holes, in sheet space: a leg from this hole to
-                // its shoulder must not run through one (a countersink leader on
-                // a busy plate cut straight through a counterbore). The hole's
-                // own rings -- counterbore, countersink -- are concentric with it
-                // and are not obstacles.
-                let other_holes: Vec<([f64; 2], f64)> = view
-                    .circles
-                    .iter()
-                    .map(|c| (dim_to_sheet(view, sheet_h, [c.cx, c.cy]), c.r * view.scale))
-                    .filter(|(c, cr)| {
-                        let dist = (c[0] - centre[0]).hypot(c[1] - centre[1]);
-                        // Not concentric with this hole, and not a circle that
-                        // ENCLOSES it (a round part's own outline, a raised face):
-                        // every leg starts inside those and must cross them.
-                        dist > r + 0.5 && dist + r > *cr
-                    })
-                    .collect();
-                let leg_is_clear = |y: f64| {
-                    let (vx, vy) = (elbow_x - centre[0], y - centre[1]);
-                    let len = vx.hypot(vy).max(1e-9);
-                    let tip = [centre[0] + vx / len * r, centre[1] + vy / len * r];
-                    let (ux, uy) = (elbow_x - tip[0], y - tip[1]);
-                    let len2 = (ux * ux + uy * uy).max(1e-12);
-                    let clear_of_holes = other_holes.iter().all(|(c, cr)| {
-                        let t =
-                            (((c[0] - tip[0]) * ux + (c[1] - tip[1]) * uy) / len2).clamp(0.0, 1.0);
-                        (tip[0] + ux * t - c[0]).hypot(tip[1] + uy * t - c[1]) >= cr + 0.3
-                    });
-                    // Nor may it run through another view, a view title or text
-                    // already placed: the mounting plate's counterbore leader was
-                    // drawn straight through "SECTION A-A (1:1)". Tested
-                    // exactly: sampled at 63 points, a long leg stepped over a
-                    // line of text.
-                    let leg = [tip, [elbow_x, y]];
-                    let clear_of_ink = obstacles.iter().all(|o| !segment_crosses_rect(&leg, o));
-                    clear_of_holes && clear_of_ink
-                };
-                // This callout's own lines and text at a row `y`: the text as
-                // the layout boxes it (`placed_text_box`: one font height
-                // above the shoulder's TGAP), the leg and the shoulder.
-                let own_ink = |y: f64| -> (Rect2, [[[f64; 2]; 2]; 2]) {
-                    let (x0, x1) = if side > 0.0 {
-                        (elbow_x, elbow_x + text_w + 2.0)
-                    } else {
-                        (elbow_x - text_w - 2.0, elbow_x)
+                    // The view's OTHER holes, in sheet space: a leg from this hole to
+                    // its shoulder must not run through one (a countersink leader on
+                    // a busy plate cut straight through a counterbore). The hole's
+                    // own rings -- counterbore, countersink -- are concentric with it
+                    // and are not obstacles.
+                    let other_holes: Vec<([f64; 2], f64)> = view
+                        .circles
+                        .iter()
+                        .map(|c| (dim_to_sheet(view, sheet_h, [c.cx, c.cy]), c.r * view.scale))
+                        .filter(|(c, cr)| {
+                            let dist = (c[0] - centre[0]).hypot(c[1] - centre[1]);
+                            // Not concentric with this hole, and not a circle that
+                            // ENCLOSES it (a round part's own outline, a raised face):
+                            // every leg starts inside those and must cross them.
+                            dist > r + 0.5 && dist + r > *cr
+                        })
+                        .collect();
+                    let leg_is_clear = |y: f64| {
+                        let (vx, vy) = (elbow_x - centre[0], y - centre[1]);
+                        let len = vx.hypot(vy).max(1e-9);
+                        let tip = [centre[0] + vx / len * r, centre[1] + vy / len * r];
+                        let (ux, uy) = (elbow_x - tip[0], y - tip[1]);
+                        let len2 = (ux * ux + uy * uy).max(1e-12);
+                        let clear_of_holes = other_holes.iter().all(|(c, cr)| {
+                            let t = (((c[0] - tip[0]) * ux + (c[1] - tip[1]) * uy) / len2)
+                                .clamp(0.0, 1.0);
+                            (tip[0] + ux * t - c[0]).hypot(tip[1] + uy * t - c[1]) >= cr + 0.3
+                        });
+                        // Nor may it run through another view, a view title or text
+                        // already placed: the mounting plate's counterbore leader was
+                        // drawn straight through "SECTION A-A (1:1)". Tested
+                        // exactly: sampled at 63 points, a long leg stepped over a
+                        // line of text.
+                        let leg = [tip, [elbow_x, y]];
+                        let clear_of_ink = obstacles.iter().all(|o| !segment_crosses_rect(&leg, o));
+                        clear_of_holes && clear_of_ink
                     };
-                    let cx = 0.5 * (x0 + x1);
-                    let text = Rect2 {
-                        x0: cx - 0.5 * text_w,
-                        y0: y - TGAP - DIM_TEXT_FONT_MM,
-                        x1: cx + 0.5 * text_w,
-                        y1: y - TGAP,
+                    // This callout's own lines and text at a row `y`: the text as
+                    // the layout boxes it (`placed_text_box`: one font height
+                    // above the shoulder's TGAP), the leg and the shoulder.
+                    let own_ink = |y: f64| -> (Rect2, [[[f64; 2]; 2]; 2]) {
+                        let (x0, x1) = if side > 0.0 {
+                            (elbow_x, elbow_x + text_w + 2.0)
+                        } else {
+                            (elbow_x - text_w - 2.0, elbow_x)
+                        };
+                        let cx = 0.5 * (x0 + x1);
+                        let text = Rect2 {
+                            x0: cx - 0.5 * text_w,
+                            y0: y - TGAP - DIM_TEXT_FONT_MM,
+                            x1: cx + 0.5 * text_w,
+                            y1: y - TGAP,
+                        };
+                        let (vx, vy) = (elbow_x - centre[0], y - centre[1]);
+                        let len = vx.hypot(vy).max(1e-9);
+                        let tip = [centre[0] + vx / len * r, centre[1] + vy / len * r];
+                        let elbow = [elbow_x, y];
+                        let end = [elbow_x + side * (text_w + 2.0), y];
+                        (text, [[tip, elbow], [elbow, end]])
                     };
-                    let (vx, vy) = (elbow_x - centre[0], y - centre[1]);
-                    let len = vx.hypot(vy).max(1e-9);
-                    let tip = [centre[0] + vx / len * r, centre[1] + vy / len * r];
-                    let elbow = [elbow_x, y];
-                    let end = [elbow_x + side * (text_w + 2.0), y];
-                    (text, [[tip, elbow], [elbow, end]])
-                };
-                let crosses_placed = |y: f64| {
-                    let (text, lines) = own_ink(y);
-                    prior_lines.iter().any(|l| segment_crosses_rect(l, &text))
-                        || prior_texts
-                            .iter()
-                            .any(|t| lines.iter().any(|l| segment_crosses_rect(l, t)))
-                };
-                let free = |y: f64| {
-                    let b = text_box(y);
-                    y >= top
+                    let crosses_placed = |y: f64| {
+                        let (text, lines) = own_ink(y);
+                        prior_lines.iter().any(|l| segment_crosses_rect(l, &text))
+                            || prior_texts
+                                .iter()
+                                .any(|t| lines.iter().any(|l| segment_crosses_rect(l, t)))
+                    };
+                    let free = |y: f64| {
+                        let b = text_box(y);
+                        y >= top
                         && y <= bottom
                         && !leader_rows
                             .iter()
@@ -3910,29 +3946,36 @@ pub(crate) fn place_dimensions_routed(
                         && !prior_texts.iter().any(|t| t.intersects(&b, 0.0))
                         && leg_is_clear(y)
                         && !crosses_placed(y)
-                };
-                // Nearest free row to the nominal one: up first, then down.
-                let mut ey = nominal;
-                let mut found = free(nominal);
-                for k in 1..=200 {
-                    if found {
-                        break;
-                    }
-                    for cand in [
-                        nominal - k as f64 * 0.5 * row,
-                        nominal + k as f64 * 0.5 * row,
-                    ] {
-                        if free(cand) {
-                            ey = cand;
-                            found = true;
+                    };
+                    // Nearest free row to the nominal one: up first, then down.
+                    let mut ey = nominal;
+                    let mut found = free(nominal);
+                    for k in 1..=200 {
+                        if found {
                             break;
                         }
+                        for cand in [
+                            nominal - k as f64 * 0.5 * row,
+                            nominal + k as f64 * 0.5 * row,
+                        ] {
+                            if free(cand) {
+                                ey = cand;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if found {
+                        placed = Some((side, elbow_x, ey));
+                        break;
                     }
                 }
-                if found {
-                    placed = Some((side, elbow_x, ey));
+                if placed.is_some() {
                     break;
                 }
+            }
+            if placed.is_none() {
+                centre = head_centre;
             }
             let (side, elbow_x, ey) = match placed {
                 Some(p) => p,
@@ -3952,7 +3995,7 @@ pub(crate) fn place_dimensions_routed(
                         .first()
                         .copied()
                         .unwrap_or((preferred, bbox[2] + STANDOFF));
-                    let mut ey = (centre[1] - rise(elbow_x)).max(top);
+                    let mut ey = (centre[1] - rise(centre, elbow_x)).max(top);
                     while leader_rows
                         .iter()
                         .any(|&(s, y)| s == side && (y - ey).abs() < row)
@@ -5140,6 +5183,109 @@ mod tests {
         );
     }
 
+    /// A tag that cannot stay on its hole does not take the place a later
+    /// tag has on its own: A1's text is crowded on and round its hole except
+    /// to the east, where A2's hole is. A1 goes elsewhere and A2 stays on its
+    /// hole. Part 115: 'A5, A6' went out onto 'A7, A8''s place, and A7, A8
+    /// found no place left.
+    ///
+    /// Mutation: drop the later tags' places from `place_hole_tags`' free
+    /// test -> A1 sits on A2's place and A2 leaves its hole -> RED.
+    #[test]
+    fn a_tag_leaving_its_hole_keeps_off_a_later_tags_place() {
+        let mut view = simple_view("TOP", ProjectionType::Top, [100.0, 100.0]);
+        view.scale = 0.5;
+        // A1's bore at sheet (100, 197); A2's at (105.8, 197), where A1's
+        // east place on its hole would be.
+        let sites = [tag_site("A1", [0.0, 0.0]), tag_site("A2", [11.6, 0.0])];
+        let text = |x0: f64, y0: f64, x1: f64, y1: f64| Rect2 { x0, y0, x1, y1 };
+        let obstacles = vec![
+            text(97.0, 196.0, 100.5, 198.0), // on A1's bore and west of it
+            text(98.0, 191.0, 102.0, 193.5), // north
+            text(98.0, 200.5, 102.0, 203.0), // south
+        ];
+        let frame = Rect2 {
+            x0: 10.0,
+            y0: 10.0,
+            x1: 410.0,
+            y1: 287.0,
+        };
+        let placed = place_hole_tags(&view, 0, &sites, 297.0, frame, obstacles.clone(), &[]);
+        assert_eq!(placed.len(), 2);
+        let (a2, a2_item) = &placed[1];
+        assert!(
+            (a2.text_anchor[0] - 105.8).abs() < 1e-9
+                && (a2.text_anchor[1] - 197.0).abs() < 1e-9
+                && a2.leader.is_none(),
+            "A2 left its hole: {a2:?}"
+        );
+        let (a1, a1_item) = &placed[0];
+        assert!(
+            !a1_item.bbox.intersects(&a2_item.bbox, 0.2),
+            "A1 {:?} on A2 {:?}",
+            a1_item.bbox,
+            a2_item.bbox
+        );
+        if let Some(l) = a1.leader {
+            assert!(
+                !segment_crosses_rect(&l, &a2_item.bbox),
+                "A1's leader through A2"
+            );
+        }
+        for o in &obstacles {
+            assert!(!a1_item.bbox.intersects(o, 0.2), "A1 on text {o:?}");
+        }
+    }
+
+    /// A counted radius ("2× R2") whose head fillet has no clear route ends
+    /// its leader on another member instead of being drawn through the ink
+    /// in the way: here the head's corner is boxed in by text (a hole tag's
+    /// reserved place), the other fillet is free. Part 115's '11× R3' was
+    /// drawn from its head across the view and through 'A9, A10'.
+    ///
+    /// Mutation: try only the head's point (drop the members from `tips`)
+    /// -> the leader falls back through the text -> RED.
+    #[test]
+    fn a_counted_radius_ends_its_leader_on_a_free_member() {
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        let mut radius = pos_dim("2× R2", [-9.0, -9.0], [-9.0, -7.0]);
+        radius.kind = "radius".to_string();
+        radius.members = vec!["r-a".to_string(), "r-b".to_string()];
+        radius.member_points = vec![[-9.0, -9.0], [9.0, 9.0]];
+        view.dimensions = vec![radius];
+        // The head's corner at sheet (91, 156), boxed in.
+        let boxed = Rect2 {
+            x0: 87.0,
+            y0: 152.0,
+            x1: 95.0,
+            y1: 160.0,
+        };
+        let placed = place_dimensions_routed(
+            &view,
+            297.0,
+            0,
+            &std::collections::HashSet::new(),
+            Some([10.0, 10.0, 400.0, 287.0]),
+            &[boxed],
+            &[],
+            &crate::drawing::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+        );
+        let leader = placed.first().expect("the radius is placed");
+        assert!(
+            !placed_line_segments(leader)
+                .iter()
+                .any(|l| segment_crosses_rect(l, &boxed)),
+            "the leader runs through the text: {:?}",
+            leader.ext
+        );
+        let tip = leader.arrows[0].tip;
+        assert!(
+            (tip[0] - 109.0).abs() < 1e-6 && (tip[1] - 138.0).abs() < 1e-6,
+            "the arrow is on the free fillet at (109, 138): {tip:?}"
+        );
+    }
+
     /// A section letter "A" is placed clear of every dimension's LINE, not
     /// only of their numbers: it is placed after them, and on NIST CTC 03 the
     /// line of '211.46' ran through it.
@@ -5383,6 +5529,7 @@ mod tests {
             tolerance: None,
             key: None,
             members: Vec::new(),
+            member_points: Vec::new(),
         }
     }
 

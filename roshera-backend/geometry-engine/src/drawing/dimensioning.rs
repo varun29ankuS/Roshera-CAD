@@ -100,6 +100,13 @@ pub struct Dimension2d {
     /// `#[serde(default)]` keeps older serialized drawings parsing.
     #[serde(default)]
     pub members: Vec<String>,
+    /// Where each member of a counted POINT callout -- a radius or a blend,
+    /// "11× R3" -- touches its feature in this view (each one's `a`), the
+    /// head's first: its leader may end on any of them, and the layout takes
+    /// the first with a clear route. Empty for every other dimension.
+    /// `#[serde(default)]` keeps older serialized drawings parsing.
+    #[serde(default)]
+    pub member_points: Vec<[f64; 2]>,
 }
 
 impl Dimension2d {
@@ -287,6 +294,7 @@ pub(crate) fn project_records(
             tolerance: None,
             key,
             members: Vec::new(),
+            member_points: Vec::new(),
         });
     }
     out
@@ -521,11 +529,19 @@ pub(crate) fn count_equal_features(drawing: &mut super::types::Drawing) {
             let key = (d.kind.clone(), (d.value * 100.0).round() as i64);
             match head.get(&key) {
                 Some(&i) => {
+                    let point = d.kind == "radius" || is_blend_callout(&d.kind);
                     if kept[i].members.is_empty() {
                         let own = dimension_identity(&kept[i]);
                         kept[i].members.push(own);
+                        if point {
+                            let a = kept[i].a;
+                            kept[i].member_points.push(a);
+                        }
                     }
                     kept[i].members.push(dimension_identity(&d));
+                    if point {
+                        kept[i].member_points.push(d.a);
+                    }
                 }
                 None => {
                     head.insert(key, kept.len());
@@ -2060,11 +2076,14 @@ pub fn standard_drawing_auto(
 /// sheet only when it is no worse in any count of [`SheetScore`] and better
 /// by those counts or, on equal counts, by preference ([`takes_over`]): the
 /// result is never worse than the ladder's. When the best sheet then still
-/// has layout errors, the next sheet up is drawn too, and taken only with
-/// fewer of them ([`escape_candidate`]).
+/// has layout errors or is short of paper, the next sheet up is drawn too
+/// ([`escape_candidate`]); when it is still mostly empty paper, the same
+/// sheet at a larger scale ([`SheetShape::fuller`]) -- each taken only by
+/// [`takes_over`].
 ///
-/// So the search draws two sheets more than the ladder did, at most -- the
-/// second only for a sheet with errors. A view's
+/// So the search draws three sheets more than the ladder did, at most -- the
+/// second only for a sheet with errors or short of paper, the third only for
+/// one left mostly empty. A view's
 /// line work, dimensions and pictorial depend on the part and direction
 /// only, so every sheet after the first places copies of the first one's
 /// views ([`build_sheet`]).
@@ -2247,8 +2266,9 @@ pub fn standard_drawing_auto_with_projection(
 /// The search after the size ladder: which sheets to `build` and which to
 /// keep. First the most preferred pair -- the smallest sheet, at the largest
 /// scale the views fit it ([`SheetShape::candidate`]); then, when the best
-/// sheet so far still has layout errors, more room for them
-/// ([`escape_candidate`]). A built sheet replaces the best only by
+/// sheet so far still has layout errors or is short of paper, more room
+/// ([`escape_candidate`]); then, when it is still mostly empty paper, the
+/// same sheet at a larger scale ([`SheetShape::fuller`]). A built sheet replaces the best only by
 /// [`takes_over`], never worse than the ladder's sheet in any count.
 /// `ladder` is `(sheet, score, preference, sheet size, scale)`.
 fn search_sheets<D, E>(
@@ -2292,6 +2312,12 @@ fn search_sheets<D, E>(
     }
     if let Some(c) = escape_candidate(shape, &best.3, best.4, &best.1, built) {
         try_one(c, built, &mut best)?;
+    }
+    // Still mostly empty paper: the same sheet at a larger scale.
+    if best.2 .0 == EMPTY_TIER {
+        if let Some(c) = shape.fuller(&best.3, best.4, built) {
+            try_one(c, built, &mut best)?;
+        }
     }
     Ok(best.0)
 }
@@ -2753,6 +2779,34 @@ impl SheetShape {
             scale: k,
             pictorial: k,
             preference: self.estimated(&s, k, k),
+        })
+    }
+
+    /// More of `sheet` filled than at `scale`: the SAME sheet at the largest
+    /// ISO scale above `scale` that the views fit, the pictorial at the
+    /// views' scale -- none of the `built` triples. For a sheet left mostly
+    /// empty: "smallest sheet wins" (Varun 11-21) moves a part to more paper
+    /// only for room, and the size ladder's redraw for room keeps the scale,
+    /// so part 115 was left on A1 at 1:2 filling 3 % of it. `None` when no
+    /// larger scale fits.
+    fn fuller(
+        &self,
+        sheet: &super::types::SheetSize,
+        scale: f64,
+        built: &[(super::types::SheetSize, f64, f64)],
+    ) -> Option<SheetCandidate> {
+        let k = ISO_SCALES.iter().copied().find(|&k| {
+            k > scale + 1e-12
+                && self.fits(sheet, k, k)
+                && !built.iter().any(|(bs, bk, bp)| {
+                    bs == sheet && (bk - k).abs() < 1e-9 && (bp - k).abs() < 1e-9
+                })
+        })?;
+        Some(SheetCandidate {
+            sheet: *sheet,
+            scale: k,
+            pictorial: k,
+            preference: self.estimated(sheet, k, k),
         })
     }
 
@@ -6117,6 +6171,61 @@ mod tests {
         );
     }
 
+    /// A best sheet left mostly empty -- clean, but its views filling under
+    /// a tenth of it -- is drawn again on the SAME sheet at the largest
+    /// scale the views fit, not on a larger one: part 115's ladder climbed to
+    /// A1 at 1:2 for room (3 % filled) and the preferred pair, A2 at 1:1, was
+    /// short of paper; A1 at 1:1 was never drawn. Scores scripted: every
+    /// sheet but the fuller one short, the fuller one clean and filled.
+    ///
+    /// Mutation: skip the `fuller` try in `search_sheets` -> the empty A1
+    /// at 1:2 is kept -> RED.
+    #[test]
+    fn a_mostly_empty_sheet_is_drawn_larger_on_the_same_paper() {
+        use super::super::types::SheetSize;
+        let shape = rib_shape(false);
+        let score = |unplaced, utilization| SheetScore {
+            errors: 0,
+            unplaced,
+            table: 0,
+            utilization,
+        };
+        let ladder_pref = shape.preference(&SheetSize::A1, 0.5, false, 0.03);
+        assert_eq!(
+            ladder_pref.0, EMPTY_TIER,
+            "fixture: the ladder's sheet is empty"
+        );
+        let fuller = shape
+            .fuller(&SheetSize::A1, 0.5, &[(SheetSize::A1, 0.5, 0.5)])
+            .expect("a larger scale fits A1");
+        assert_eq!(fuller.sheet, SheetSize::A1);
+        assert!(fuller.scale > 0.5, "{fuller:?}");
+        let mut built = vec![(SheetSize::A1, 0.5, 0.5)];
+        let mut tried: Vec<(SheetSize, f64)> = Vec::new();
+        let got = search_sheets(
+            &shape,
+            (
+                (SheetSize::A1, 0.5),
+                score(0, 0.03),
+                ladder_pref,
+                SheetSize::A1,
+                0.5,
+            ),
+            &mut built,
+            |c| {
+                tried.push((c.sheet, c.scale));
+                let s = if c.sheet == fuller.sheet && (c.scale - fuller.scale).abs() < 1e-9 {
+                    score(0, 0.2)
+                } else {
+                    score(8, 0.2)
+                };
+                Ok::<_, ()>(((c.sheet, c.scale), s))
+            },
+        )
+        .expect("search");
+        assert_eq!(got, (SheetSize::A1, fuller.scale), "tried {tried:?}");
+    }
+
     /// The search builds the most preferred pair FIRST and escapes to more
     /// room only from the best sheet after it: escaping from the ladder's
     /// sheet in its place drew NIST CTC 03 (A1 at 1:5, 11 errors) on A0 at
@@ -6484,6 +6593,7 @@ mod tests {
             tolerance: None,
             key: None,
             members: Vec::new(),
+            member_points: Vec::new(),
         };
         let mut d = Drawing::new("t", SheetSize::A3);
         let mut top = super::super::projection::project_solid_view(

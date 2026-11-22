@@ -222,6 +222,14 @@ fn equal_arcs_are_one_counted_callout_and_none_is_omitted() {
     assert_eq!(radii.len(), 1, "one callout for the two notches: {radii:?}");
     assert_eq!(radii[0].label, "2\u{00D7} R8");
     assert_eq!(radii[0].members.len(), 2, "it names both notches");
+    // And where each notch is in the view: its leader may end on either.
+    let pts = &radii[0].member_points;
+    assert_eq!(pts.len(), 2, "both notches' points: {pts:?}");
+    assert_eq!(pts[0], radii[0].a, "the head's point first");
+    assert!(
+        (pts[0][0] - pts[1][0]).hypot(pts[0][1] - pts[1][1]) > 1.0,
+        "two notches, two places: {pts:?}"
+    );
 
     let c = cert(&m, &d);
     let missing: Vec<_> = c.omissions.iter().filter(|o| o.kind == "radius").collect();

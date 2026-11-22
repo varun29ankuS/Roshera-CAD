@@ -776,6 +776,7 @@ pub fn hole_row_ink(drawing: &Drawing, site: &super::hole_table::HoleSite) -> St
             .or_else(|| site.tolerance.clone()),
         key: dim.and_then(|d| d.key.clone()),
         members: Vec::new(),
+        member_points: Vec::new(),
     };
     let edit = row
         .key

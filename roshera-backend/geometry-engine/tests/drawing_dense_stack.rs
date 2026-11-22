@@ -97,6 +97,7 @@ fn height(id: &str, kind: &str, label: &str, x: f64, y0: f64, y1: f64) -> Dimens
         tolerance: None,
         key: None,
         members: Vec::new(),
+        member_points: Vec::new(),
     }
 }
 

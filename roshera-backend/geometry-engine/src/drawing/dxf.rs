@@ -1928,6 +1928,7 @@ mod tests {
                     tolerance: None,
                     key: None,
                     members: Vec::new(),
+                    member_points: Vec::new(),
                 },
                 Dimension2d {
                     id: "h".to_string(),
@@ -1945,6 +1946,7 @@ mod tests {
                     tolerance: None,
                     key: None,
                     members: Vec::new(),
+                    member_points: Vec::new(),
                 },
             ],
             centerlines: Vec::new(),
