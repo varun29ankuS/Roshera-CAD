@@ -15,7 +15,12 @@ Claude / curl ──HTTP POST──► api-server ──WS push──► CADView
 ```
 
 A single WebSocket lives at `/ws/viewport-bridge`. The frontend
-(`ViewportBridge` component, mounted in `App.tsx`) connects on load. Each
+(`ViewportBridge`, `roshera-app/src/lib/viewport-bridge.tsx`, mounted in
+`App.tsx`) connects on load.
+
+Last verified: 2026-11-22. The viewport world is Z-up (`main.tsx` sets
+`Object3D.DEFAULT_UP`), so a camera `up` of `[0, 0, 1]` keeps the part upright;
+the `[0, 1, 0]` examples below predate that change. Each
 REST endpoint under `/api/viewport/*` generates a request id, pushes a
 JSON command over the socket, awaits the matching reply, and surfaces the
 result as JSON (snapshot endpoints additionally write a PNG to disk).

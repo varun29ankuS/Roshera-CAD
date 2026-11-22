@@ -2,6 +2,10 @@
 
 2026-11-17, at commit `cc0e6fb2`. Two questions:
 
+> **HISTORICAL (2026-11-22).** Closed since: gap 1 (mates through MCP) and gap 6 (revolve chapter
+> "Edit sketch") in a2dcbbff; gap 10 by the feedback slice (2b5ec5b7). Gaps 2–5, 7–9 were not
+> re-checked and are carried in `PARKING_LOT.md`.
+
 1. **Parity.** For everything an agent can build through MCP/REST, what can a person do with it afterwards in the app?
 2. **Feedback.** What can an agent know about what the person is pointing at, and how fast?
 

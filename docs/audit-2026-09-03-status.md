@@ -1,5 +1,9 @@
 # Audit 2026-09-03 — status and remaining work
 
+> **HISTORICAL (2026-11-22).** A 09-27 handoff. Its remaining task list and decisions are
+> carried in `PARKING_LOT.md` (task numbers refer to the git-ignored plan
+> `docs/superpowers/plans/2026-09-03-audit-fixes.md`).
+
 Handoff written 2026-09-27. `main` is pushed and clean after the Task 72 commit (`36d7719a`) and this doc.
 The campaign runs at 4–6 tasks a day; each task is committed and pushed as soon as its review
 approves it.

@@ -48,6 +48,8 @@ integration). Nothing here is graded by an LLM.
 | 15 | Certified drawing comprehension (semantic sheet readback) | toleranced-Ø / FCF / datum answered from provenance | HATCH ink refuses `render_only`; an unprovenanced question refuses `unprovenanced` |
 | 16 | Wall-mounted shelf bracket (FDM PLA) — founder task spec 2026-07-23 §B | sound at every step · watertight+manifold · fits 220×160×60 · 2×M6 @ 60 mm frozen · single-piece · mass (PLA) = ranking | sound ⟹ watertight; stress/deflection/orientation/wall/overhang DECLARED `unscored`, never fake-scored |
 | 17 | Vibration-aware NEMA 17 motor mount (FDM PETG) — founder task spec 2026-07-23 Part 2 | sound at every step · fits 90×70×60 · 4×M3 @ 31 mm sq + Ø22 boss + 2×M5 · single-piece · mass (PETG) = ranking | f₁≥120 Hz modal + stress/deflection/wall/overhang/orientation/thermal DECLARED `unscored`, never fake-scored |
+| 18 | Multi-body honesty — union of two disjoint cubes; a second through-bore in a plate | volume and face count against closed-form oracles | a sound verdict over a half-reported compound, or over an open shell, is a lie the scenario catches |
+| 19 | Drawing export truth — the SVG/DXF bytes a machinist receives | bores drawn as true circles · closed silhouettes · usable SECTION A-A · no overlapping labels | the oracle parses the raw artifact text (`test/oracle-19.mjs` proves it offline) |
 
 ### The honesty through-line
 
@@ -108,14 +110,24 @@ roshera-eval/
     geom.mjs               deterministic profile generators + shoelace oracle
     builders.mjs           shared build recipes (extrude, drill, fillet-all, flange)
   scenarios/
-    01-gear.mjs ... 17-nema17-motor-mount.mjs
-    index.mjs              the ordered corpus
+    01-gear.mjs ... 19-drawing-export-truth.mjs   the scripted corpus
+    20-aerofoil-section.mjs ... 22-mounting-plate.mjs   agent scenarios (not in index)
+    index.mjs              the ordered corpus (01–19)
+    agent_oracle.mjs (lib/) shared scoring for the agent scenarios
   test/
-    oracle-10.mjs ... oracle-17.mjs   dry validation of each honesty oracle
+    oracle-10.mjs ... oracle-22.mjs   dry validation of each honesty oracle (no 18)
+    harness-blocked.mjs
+  drawing-bench/           STEP -> drawing benchmark (bench.py, score.py,
+                           regress.py, floors.json, split.json) and its design docs
+  cadgenbench-oracle/      FreeCAD/OCCT oracle scripts for CADGenBench import checks
+  diagnosis/, mcp/, speed/, ui/   dated audit and design notes (see docs/README.md)
 ```
 
-`npm run test:oracle` runs every dry-validation harness (10–17) with no
-backend; `npm run eval` runs the live corpus.
+`npm run test:oracle` runs every dry-validation harness (10–17, 19–22, and
+`harness-blocked.mjs`) with no backend; `npm run eval` runs the live corpus.
+
+Last verified: 2026-11-22 (corpus table and layout against `scenarios/index.mjs`
+and `package.json`).
 
 ### Honesty by omission (scenarios 16–17)
 

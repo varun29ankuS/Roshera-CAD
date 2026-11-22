@@ -2,6 +2,12 @@
 
 Date: 2026-11-17. Status: design, nothing built. Companion to `MCP_AUDIT.md` (the evidence for every claim about today's state).
 
+> **Status 2026-11-22:** Stage 0 landed in a2dcbbff (`roshera-mcp/test/registry_schema_parity.mjs`,
+> run by `npm run test:gates`). Stage 1 landed in d7f8dba2 + e49cfe10: the 12 assembly tools are
+> defined once in `api-server/src/agent_tools/assembly.json`, served at `GET /api/agent/tools`, and
+> registered generically by `roshera-mcp/src/served.ts`; `tools/assembly.ts` is gone. Stages 2–8
+> are not built and are parked (`PARKING_LOT.md`).
+
 ## Decision
 
 The backend owns each tool: its name, schema, description, examples, gates, effects and the code that runs it. The in-app agent calls that code in-process. MCP is a generic adapter that lists what the backend serves and forwards calls. No tool is written twice, so the two cannot disagree.

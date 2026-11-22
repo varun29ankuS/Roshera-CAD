@@ -1,73 +1,57 @@
-# React + TypeScript + Vite
+# roshera-app
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The browser client for Roshera: React 19 + TypeScript + Vite, with a
+Three.js viewport (`@react-three/fiber`). It is a thin display layer. The
+kernel in `roshera-backend/` computes and certifies all geometry; the app
+renders the meshes the server sends and calls the same REST + WebSocket
+surface an agent uses.
 
-Currently, two official plugins are available:
+Last verified: 2026-11-22 (against `package.json` and `vite.config.ts`).
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Run
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev        # Vite dev server on http://localhost:5173
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+The dev server proxies to the api-server on `localhost:8081`:
+`/api` (REST), `/acp` (Agent Client Protocol, SSE streamed unbuffered) and
+`/ws` (WebSocket). Start the backend first (see the root `README.md`). The
+server's default CORS origins are `localhost:5173` and `127.0.0.1:5173`
+(`api-server/src/main.rs`), so use that port.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+| Script | What it does |
+|---|---|
+| `npm run dev` | Vite dev server |
+| `npm run build` | `tsc -b && vite build` (type-check, then bundle to `dist/`) |
+| `npm run lint` | ESLint |
+| `npm run preview` | Serve the built `dist/` |
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+Type-check on its own with `npx tsc -p tsconfig.app.json --noEmit`. A bare
+`npx tsc --noEmit` checks no files, because the root `tsconfig.json` only
+holds project references.
+
+Unit tests are `node:test` files in `test/` that import the TypeScript
+sources directly; run them with `node --test` on a Node version that strips
+TypeScript types. There is no `npm test` script.
+
+## Layout
+
 ```
+src/
+  App.tsx            top-level layout, workspaces, sign-in
+  components/
+    viewport/        Three.js scene, camera, lighting (Z-up world)
+    panels/          Blackboard (agent conversation), model tree, timeline,
+                     drawings workspace, DFM panel, sketch, assembly
+    layout/, ui/     chrome and shared controls
+  lib/               API clients, ACP bridge, WebSocket bridge,
+                     viewport debug bridge (viewport-bridge.tsx)
+  stores/            zustand stores
+docs/screenshots/    images used by the root README
+```
+
+`Dockerfile` and `nginx.conf` build the production image: nginx serves the
+built SPA and proxies `/api` and `/ws` to the backend (see
+`docs/DEPLOYMENT.md`).

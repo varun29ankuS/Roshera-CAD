@@ -1,6 +1,19 @@
 # Roshera CAD Primitives Module - Technical Guide
 
-This document provides a comprehensive guide to every file in the primitives module, explaining their purpose, implementation details, and practical applications.
+An overview of the main files in the primitives module and what each is for.
+
+> Last verified: 2026-11-22. The section file names and the "How to Use
+> This Module" examples were checked against the source. Other snippets
+> (struct fields, per-file usage examples such as `VertexStore::new()`) are
+> simplified sketches, not the current definitions -- read the source before
+> relying on one. Removed on 2026-11-22: sections for `plane.rs` and
+> `primitive_system.rs` (neither file exists) and a duplicated AI section.
+> Files in this directory not described here: `blending_surfaces.rs`,
+> `cone_primitive.rs`, `torus_primitive.rs`, `datum.rs`, `development.rs`,
+> `feature_recognition.rs`, `geometry_summary.rs`, `mass_properties.rs`,
+> `p_curve.rs`, `persistent_id.rs`, `provenance.rs` (holds
+> `ValidityCertificate`), `qsic_curve.rs`, `snapshot.rs`,
+> `tolerance_propagation.rs`, `tool_schema_generator.rs`.
 
 ## Table of Contents
 1. [Architecture Overview](#architecture-overview)
@@ -39,10 +52,11 @@ Solid (3D volume)
 **Data Structures**:
 ```rust
 pub struct VertexStore {
-    positions: Vec<[f64; 3]>,      // X,Y,Z coordinates
-    hashes: Vec<u64>,               // Precomputed hashes
-    spatial_hash: HashMap<SpatialHashKey, Vec<u32>>,  // Spatial lookup
-    tolerance: f64,                 // Deduplication tolerance
+    x_coords: Vec<f64>,   // coordinates packed per axis (SIMD-friendly)
+    y_coords: Vec<f64>,
+    z_coords: Vec<f64>,
+    u_params: Vec<f64>,   // NaN when not on a surface
+    // ... v params, spatial hash, tolerance, stats (see vertex.rs)
 }
 ```
 
@@ -341,14 +355,6 @@ pub struct PrimitiveSchema {
 - Error examples
 - Context-aware suggestions
 
-### 19. primitive_system.rs - AI Entry Point
-**Purpose**: High-level interface for AI agents to interact with the CAD system.
-
-**Key Methods**:
-- `get_ai_catalog()`: Returns all available primitives
-- `execute_natural_language()`: Processes commands
-- `get_examples_for_primitive()`: Training data
-
 ## Primitive Implementations
 
 ### 12. box_primitive.rs - Rectangular Boxes
@@ -408,83 +414,6 @@ pub struct PrimitiveSchema {
 - Columns and pillars
 - Rotational parts
 
-### 15. plane.rs - Bounded Planes
-**Purpose**: Creates bounded plane representations.
-
-**Implementation**: Represented as thin boxes for practical use.
-
-**Applications**:
-- Cutting planes
-- Reference planes
-- Work planes for sketching
-- Split plane operations
-
-## AI Integration
-
-### 16. ai_primitive_registry.rs - Natural Language Interface
-**Purpose**: Central hub for AI-CAD interaction with natural language processing.
-
-**Key Features**:
-- Command parsing with fuzzy matching
-- Parameter extraction with unit conversion
-- Confidence scoring
-- Error recovery with suggestions
-- Self-documenting API
-
-**Example Commands**:
-```
-"create a box 10 by 5 by 3"
-"make a sphere with radius 25mm"
-"build a cylinder 50 high with 10 radius"
-```
-
-**Architecture**:
-```rust
-pub struct PrimitiveRegistry {
-    primitives: HashMap<String, AIPrimitiveInfo>,
-    nlp_rules: NLPRules,
-    usage_stats: HashMap<String, UsageStats>,
-}
-```
-
-### 17. natural_language_schemas.rs - AI Metadata
-**Purpose**: Comprehensive metadata for AI understanding of CAD primitives.
-
-**Contents**:
-- Parameter descriptions with units
-- Common value ranges
-- Usage examples
-- Manufacturing context
-- Visual descriptions
-
-**Schema Structure**:
-```rust
-pub struct PrimitiveSchema {
-    pub natural_description: String,
-    pub parameters: Vec<ParameterInfo>,
-    pub examples: Vec<CommandExample>,
-    pub common_uses: Vec<String>,
-    pub visual_description: String,
-}
-```
-
-### 18. primitive_examples.rs - AI Training Data
-**Purpose**: Provides example commands and responses for AI training.
-
-**Features**:
-- Multiple phrasings for same command
-- Parameter variations
-- Error examples
-- Context-aware suggestions
-
-### 19. primitive_system.rs - AI Entry Point
-**Purpose**: High-level interface for AI agents to interact with the CAD system.
-
-**Key Methods**:
-- `get_ai_catalog()`: Returns all available primitives
-- `execute_natural_language()`: Processes commands
-- `get_examples_for_primitive()`: Training data
-
 ## Utilities and Support
 
 ### 20. validation.rs - Model Validation
@@ -524,7 +453,7 @@ pub struct PrimitiveSchema {
 - Model comparison
 - Pathfinding for operations
 
-### 22. tests.rs & primitive_tests/
+### 22. primitive_tests/
 **Purpose**: Test suites for the module.
 
 **Test Categories**:
@@ -536,7 +465,7 @@ pub struct PrimitiveSchema {
 
 ### Basic Primitive Creation
 ```rust
-use roshera_cad::primitives::{BRepModel, TopologyBuilder};
+use geometry_engine::primitives::topology_builder::{BRepModel, TopologyBuilder};
 
 // Create a model and builder
 let mut model = BRepModel::new();
@@ -554,21 +483,21 @@ let sphere_id = builder.create_sphere_3d(
 
 ### Using the AI Interface
 ```rust
-use roshera_cad::primitives::PrimitiveSystem;
+use geometry_engine::primitives::ai_primitive_registry::PrimitiveRegistry;
 
-// Execute natural language command
-let response = PrimitiveSystem::execute_natural_language(
+// Execute natural language command (ai_primitive_registry.rs)
+let response = PrimitiveRegistry::execute_natural_language(
     "create a box 10 by 5 by 3",
     &mut model
 )?;
 
 // Get primitive catalog for AI discovery
-let catalog = PrimitiveSystem::get_ai_catalog();
+let catalog = PrimitiveRegistry::get_full_catalog();
 ```
 
 ### Parametric Updates
 ```rust
-use roshera_cad::primitives::{BoxPrimitive, BoxParameters};
+use geometry_engine::primitives::box_primitive::{BoxPrimitive, BoxParameters};
 
 // Update box dimensions
 let new_params = BoxParameters::new(15.0, 8.0, 4.0)?;
@@ -577,12 +506,12 @@ BoxPrimitive::update_parameters(box_id, new_params, &mut model)?;
 
 ### Validation
 ```rust
-use roshera_cad::primitives::{validate_model, ValidationLevel};
+use geometry_engine::primitives::validation::{validate_model_enhanced, ValidationLevel};
 
-// Validate the entire model
-let report = validate_model(&model, ValidationLevel::Standard)?;
-if !report.is_valid() {
-    println!("Validation issues: {:?}", report.issues);
+// Validate the entire model (runs ParallelValidator::validate_model).
+let report = validate_model_enhanced(&model, tolerance, ValidationLevel::Standard);
+if !report.is_valid {
+    println!("Validation errors: {:?}", report.errors);
 }
 ```
 
@@ -602,4 +531,4 @@ if !report.is_valid() {
 5. **Parallel Support**: Multi-threaded operations where applicable
 6. **Memory Optimization**: Compact data structures
 
-This primitives module implements a B-Rep CAD kernel with AI integration and web deployment capabilities.
+This primitives module holds the B-Rep topology, geometry and primitive constructors of the kernel.

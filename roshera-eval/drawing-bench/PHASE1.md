@@ -1,5 +1,9 @@
 # Drawing-quality track, PHASE 1: measure, don't guess
 
+> **HISTORICAL (2026-11-22).** Phase-1 inventory, superseded by `BENCHMARK.md`. Its "cannot
+> produce" list is out of date: DETAIL views (16c7f519) and ISO 286 fits (`geometry-engine/src/gdt/iso286.rs`)
+> now exist. The reference-set inventory in §1 is still the description of `reference/`.
+
 Status legend: **[V]** verified by reading code / looking at the file; **[I]** inferred, not run (no builds allowed this phase).
 
 ## 1. Reference-set inventory

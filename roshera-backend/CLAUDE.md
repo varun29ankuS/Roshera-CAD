@@ -1,7 +1,8 @@
 # Roshera CAD Backend — Development Guide
 
-> **Last verified:** 2026-04-30. Every claim in this file has been checked
-> against the working tree and the live `cargo check --workspace` output.
+> **Last verified:** 2026-11-22 (descriptive sections, against the working
+> tree; no cargo run). "Build status" was last measured 2026-04-30.
+> Hard rules and gate rules are unchanged.
 > If you change something, re-verify and update the relevant section. No
 > aspirational claims, no historical victory laps, no module-completion
 > percentages.
@@ -71,9 +72,11 @@ pre-existing red tests. Lines are removed as tests are fixed; they are
 (RATCHET_VIOLATION) for any allowlist entry that now passes, forcing the
 entry to be removed.
 
-The 30 pre-existing reds are documented in `.superpowers/sdd/`:
-`burndown-diag-cf.md`, `burndown-diag-boolean.md`,
-`burndown-diag-drawing-tess.md`.
+The 30 reds of the 2026-07-07 burndown were all fixed; their diagnoses
+(`burndown-diag-cf.md`, `-boolean.md`, `-drawing-tess.md`) sit in the
+git-ignored `.superpowers/sdd/`. Diagnoses for entries in the file today live
+in `geometry-engine/docs/` (see the `KNOWN_REDS.md` header); as of 2026-11-22
+it lists two loft tests, diagnosed in `burndown-diag-loft-family.md`.
 
 ---
 
@@ -161,7 +164,7 @@ how review failed fourteen times.
 
 ## Workspace layout (verified against `roshera-backend/Cargo.toml`)
 
-Seven crates, resolver = "2":
+Ten crates, resolver = "2":
 
 | Crate              | Responsibility                                           |
 |--------------------|----------------------------------------------------------|
@@ -170,8 +173,11 @@ Seven crates, resolver = "2":
 | `session-manager`  | Multi-user RBAC, session lifecycle                       |
 | `timeline-engine`  | Event-sourced design history, branches, replay           |
 | `api-server`       | Axum HTTP/WebSocket/SSE server                           |
-| `ai-integration`   | Claude provider; provider-manager dispatch               |
-| `export-engine`    | STL, OBJ, STEP, IGES, ROS                                |
+| `ai-integration`   | Claude + OpenAI-compatible providers; provider dispatch  |
+| `export-engine`    | STL, OBJ, STEP (AP242 export + import), ROS              |
+| `ros-format`       | Native `.ros` serialization                              |
+| `verdict-harness`  | Multi-agent verdict/consensus harness                    |
+| `assembly-engine`  | Instances, mates, SE(3) solve, interference              |
 
 Workspace dependencies that matter: `axum 0.8.4` (with `ws`),
 `tower-http 0.6` (cors/fs/trace), `dashmap 6.1`, `parking_lot 0.12`,
@@ -230,8 +236,10 @@ frontend does not own a geometry kernel.
 
 ## AI integration
 
-**Policy: API-only.** The only production LLM provider is `ClaudeProvider`
-(`ai-integration/src/providers/claude.rs`). When `ANTHROPIC_API_KEY` is
+**Policy: API-only.** Production LLM providers are `ClaudeProvider`
+(`ai-integration/src/providers/claude.rs`) and the hosted-API
+`universal_endpoint.rs` (OpenAI, Anthropic, Google, HuggingFace, custom
+HTTP APIs). When `ANTHROPIC_API_KEY` is
 absent, every entry point on `ClaudeProvider` returns
 `ProviderError::ProviderUnavailable` — there is no offline fallback, no
 keyword parser, no synthetic mock. The api-server gates dispatch on
@@ -251,7 +259,7 @@ or any other local-inference crate. Do not add them.
 
 ---
 
-## Module reality check (verified 2026-04-30)
+## Module reality check (verified 2026-11-22)
 
 `geometry-engine/src/math/`: includes `vector3.rs`, `vector2.rs`,
 `matrix4.rs`, `quaternion.rs`, `bspline.rs`, `nurbs.rs`,
@@ -269,14 +277,21 @@ of unused B-Spline/NURBS surface math; production uses
 were removed (1363 LoC + 2 benches deleted); rebuild path documented in
 memory entry "T-Splines Deleted (#20)".
 
-`geometry-engine/src/sketch2d/` (15 files): `constraints.rs`,
-`constraint_solver.rs`, `sketch.rs`, `sketch_plane.rs`,
-`sketch_topology.rs`, `sketch_validation.rs`, plus 2D primitives.
+`geometry-engine/src/sketch2d/` (25 files): `constraints.rs`,
+`constraint_solver.rs`, `sketch_solver.rs`, `sketch.rs`, `sketch_plane.rs`,
+`sketch_topology.rs`, `sketch_validation.rs`, `sketch_certificate.rs`,
+`profile_contacts.rs`, `dr_plan.rs`, `sketch_ops.rs`, plus 2D primitives.
 
 `geometry-engine/src/operations/`: `boolean.rs`, `intersect.rs`,
-`extrude.rs`, `revolve.rs`, `sweep.rs`, `loft.rs`, `fillet.rs`,
-`chamfer.rs`, `transform.rs`, `recorder.rs`. Every entry point records
-to `OperationRecorder` on success.
+`extrude.rs`, `revolve.rs`, `sweep.rs`, `loft.rs`, `nurbs_loft.rs`,
+`fillet.rs`, `chamfer.rs`, `offset.rs`, `pattern.rs`, `draft.rs`,
+`section.rs`, `transform.rs`, `recorder.rs` and blend/corner helpers (~40
+files). Every entry point records to `OperationRecorder` on success.
+
+Other `geometry-engine/src/` modules: `drawing/` (sheets, views, sections,
+DETAIL views, certificates), `dfm/` (analyzers + CNC/turning/sheet-metal/
+casting/FDM/molding packs), `gdt/`, `assembly/`, `perception/`, `queries/`,
+`readable/`, `labels/`, `lens/`, `harness/`, `tessellation/`, `render/`.
 
 `api-server/src/protocol/`: REST, WebSocket, and SSE handlers. The old
 `protocol/timeline_handlers.rs` and `protocol/geometry_handlers.rs` files
@@ -286,16 +301,16 @@ inside `handle_websocket_connection` (`protocol/message_handlers.rs`).
 The earlier "~30 orphaned handlers" note is obsolete; the only true WS
 orphan today is `send_collaborators_update` (`message_handlers.rs`).
 
-`ai-integration/src/providers/`: `claude.rs`, `mock.rs`,
+`ai-integration/src/providers/`: `allowlist.rs`, `claude.rs`, `mock.rs`,
 `native_factory.rs`, `universal_endpoint.rs`. No `coqui_tts.rs`, no
 `whisper.rs`, no `llama.rs`. There is `ai-integration/config/vision.toml`;
 there is no `config/ai_providers.yaml`.
 
 ---
 
-## Build status (verified 2026-04-30)
+## Build status (measured 2026-04-30; not re-measured since)
 
-`cargo check --workspace` succeeds in ~45 s on a warm cache. There is
+`cargo check --workspace` succeeded in ~45 s on a warm cache. There is
 **one** future-incompat note from a transitive dep (`sqlx-postgres v0.8.0`)
 and ~234 dead-code warnings in `api-server`, both queued for cleanup.
 There are zero compilation errors.
@@ -387,19 +402,22 @@ Benchmark sources live in `geometry-engine/benches/` and
 
 ## Documentation
 
-Real, up-to-date references in this repo:
+The index of every Markdown doc in the repo, with its purpose, is
+`docs/README.md`. Backend references:
 
 - `roshera-backend/api-server/src/protocol/README.md` — protocol surface
 - `roshera-backend/timeline-engine/README.md`
 - `roshera-backend/api-server/src/VIEWPORT_BRIDGE.md` — viewport bridge
-- `roshera-backend/geometry-engine/PERFORMANCE_METRICS.md`
+- `roshera-backend/geometry-engine/PERFORMANCE_METRICS.md` — 2026-05-13
+  tessellation timings; its math rows disagree with the README's
 - `roshera-backend/geometry-engine/src/primitives/PRIMITIVES_MODULE_GUIDE.md`
 - `roshera-backend/geometry-engine/src/primitives/primitive_tests/EVIL_EDGE_CASES.md`
 
-Repo root: `README.md`, `BENCHMARKS.md`, `KERNEL_AUDIT_2026-04-19.md`,
-`KERNEL_IMPROVEMENT_PLAN.md`. Anything else at the repo root that
-pre-dates April 2026 should be assumed deleted; if it re-appears,
-treat it as stale and verify before citing.
+Measured performance lives in the root `README.md` (Performance section)
+and `geometry-engine/benches/`. `BENCHMARKS.md`, `KERNEL_AUDIT_2026-04-19.md`
+and `KERNEL_IMPROVEMENT_PLAN.md` are not in the repo. Anything else at the
+repo root that pre-dates April 2026 should be assumed deleted; if it
+re-appears, treat it as stale and verify before citing.
 
 ---
 

@@ -1,5 +1,10 @@
 # Agent surface — designed, measured, not yet built
 
+> **HISTORICAL (2026-11-22).** Its open design items (run-folding, ChoiceCard, the ACP fields,
+> lineage hover-to-seek) are carried in `PARKING_LOT.md`; §6's piston sliver (pinned RED
+> `tests/cross_bore_mesh_wings.rs`) is in `docs/workplan-2026-11-22-status.md`. §5's measured
+> facts live only here. Deletion candidate once §5 is no longer needed.
+
 Written 2026-08-22, at the end of a long session on the Blackboard, the
 lineage view and the kernel. Everything **implemented** that day is in the
 commit messages, which are the record; this file holds only the work that was

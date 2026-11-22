@@ -1,5 +1,9 @@
 # Evil Edge Cases in CAD Topology
 
+> Superseded 2026-11-22 by `src/primitives/primitive_tests/EVIL_EDGE_CASES.md`,
+> which covers the same six tests and now carries this file's "Real scenario"
+> lines. Deletion candidate.
+
 The "happy path" — well-formed, manifold, watertight geometry from a
 single thread of execution — is the easy 5%. The other 95% is what
 actually trips kernels: degenerate output from booleans, concurrent

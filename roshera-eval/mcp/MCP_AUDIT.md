@@ -2,6 +2,13 @@
 
 Date: 2026-11-17. Scope: every tool `roshera-mcp` registers (115 kernel tools + `find_tool` / `describe_tool` / `invoke`), read against the `api-server` route each one calls.
 
+> **HISTORICAL (2026-11-22).** A dated snapshot; its "Status" column is out of date. Fixed since:
+> 1.1 and 1.3 (a2dcbbff); 1.2 (persistent ids as 32 hex digits), 1.4, 1.5, 1.6, 1.7, 1.8 and typed
+> error bodies on the history/undo/redo/scrub/lens/GD&T routes (d7f8dba2). Still open as of
+> d7f8dba2: 1.10 registry drift (ratchet at 23 differences), non-atomic composites (`drill_pattern`,
+> `boolean_many`, `sketch_points`, `timeline_branch`, `drawing_set_title`), and the remaining
+> bare-status handlers. Open items are carried in `PARKING_LOT.md`.
+
 Out of scope, by instruction: `perception.ts`, `registry.ts`, `gates.ts`, `test/scale_s2.mjs`, backend `agent_registry.rs` / `main.rs` were read but not edited (another worktree has unmerged changes to them).
 
 ## How this was checked

@@ -73,8 +73,10 @@ ClientMessage::AICommand {
 ## File Organization
 
 - `protocol.rs` - Defines ClientMessage/ServerMessage enums and all command types
-- `handlers.rs` - Handles incoming ClientMessage and sends ServerMessage responses
+- `message_handlers.rs` - Handles incoming ClientMessage and sends ServerMessage responses (one match inside `handle_websocket_connection`)
 - `mod.rs` - Module exports
+
+Last verified: 2026-11-22 (file list and the `ClientMessage` variants shown above).
 
 ## For AI Assistants and Developers
 

@@ -2,6 +2,11 @@
 
 Build-free design. **[V]** = verified by reading the cited code; **[I]** = inferred / needs a run or a decision. Paths are relative to `roshera-backend/` unless noted (`app/` = `roshera-app/src/`, `mcp/` = `roshera-mcp/src/`).
 
+> **Status 2026-11-22 (partly checked):** pieces of slices 1–2 exist — `gdt/iso286.rs`, dimension
+> suppress in `api-server/src/drawing_mgr.rs`, dimensions edited on the sheet (4e31204b),
+> `drawing/dimension_edit.rs`. No smart-dimension add (slice 3) was found. The plan of record's
+> P2 "minimal pinned human sheet edits" is the next use of this design.
+
 Varun's requirement: "there is no way to edit the drawing"; "add subtract dimensions / tolerances, we need to go deep". Standing constraints: the kernel cannot lie (a dimension value is MEASURED, never typed), history is event-sourced, entities are bound by persistent id (PID), refusals are typed.
 
 ## 0. What exists today (so the new parts are scoped honestly)

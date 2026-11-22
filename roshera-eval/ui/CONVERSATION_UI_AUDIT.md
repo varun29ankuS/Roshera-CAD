@@ -1,5 +1,9 @@
 # Conversation UI audit: the Blackboard (2026-11-18)
 
+> **HISTORICAL (2026-11-22).** Its top-ranked fixes shipped as the design's first slice (6987cac3,
+> every agent turn ends with the kernel's verdict); card-first replies 7d7b2ff5; the user's
+> selection travels with the message a4d5258a. Next slices are in `CONVERSATION_UI_DESIGN.md` §10.
+
 Scope: the agent conversation panel in `roshera-app/`. That is `components/panels/Blackboard.tsx`
 (the panel and composer), `BlackboardSection.tsx` (checkpoint sections), `BlackboardLine.tsx`
 (which shape a line gets), `BlackboardMessageParts.tsx` (tool row, failed turn, long prose),

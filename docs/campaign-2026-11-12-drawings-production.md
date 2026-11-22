@@ -1,5 +1,8 @@
 # Drawings to production — campaign (2026-11-12)
 
+> **Still cited (2026-11-22).** `roshera-drawing-dfm-plan.pdf` refers to this campaign's items
+> by ID (P1/P1b, P2, P4, P7, P8); status against them lives in `workplan-2026-11-22-status.md`.
+
 Varun, 11-12: "fix the gaps and build what the research showed us ... finetune
 this to a large extent so that this can go in production."
 

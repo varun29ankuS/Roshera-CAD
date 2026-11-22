@@ -35,7 +35,7 @@
 
 Roshera is an **agent runtime for geometry**. The product is the kernel and the bridge it exposes: a native Rust B-Rep engine whose primitives, topology, and operations carry enough semantic structure for an LLM to query, reason about, and drive directly. Humans orchestrate; agents execute. The React/Three.js frontend that ships in this repo is one client of that runtime — it talks to the kernel over REST + WebSocket the same way an external agent would.
 
-The differentiator is the readable surface: geometry is not just triangles, it is a queryable model with named features, intent, and history. And every operation an agent runs returns the kernel's **full validity certificate** — a nine-conjunct AND over brep-validity, watertightness, manifoldness, orientation, self-intersection, construction consistency, feature consistency, and two mesh-quality dimensions — computed synchronously under the model write lock and failing closed. The geometry carries its own proof instead of a render that merely looks right.
+The differentiator is the readable surface: geometry is not just triangles, it is a queryable model with named features, intent, and history. And every operation an agent runs returns the kernel's **full validity certificate** — a ten-conjunct AND over brep-validity, watertightness, manifoldness, orientation, outward-facing shells, self-intersection, construction consistency, feature consistency, and two mesh-quality dimensions (`ValidityCertificate::is_sound`, `geometry-engine/src/primitives/provenance.rs`) — computed synchronously under the model write lock and failing closed. The geometry carries its own proof instead of a render that merely looks right.
 
 A second, render-based reconcile views each solid from fourteen viewpoints and cross-checks what it sees against what the kernel claims. That layer is **advisory**: it runs off the write lock and does not gate a mutation. The distinction matters, so it is stated here rather than blurred — see [The Certificate](https://varun29ankus.github.io/Roshera-CAD/certificate.html) for the anatomy, and [Status](#status) for what's actually usable today.
 
@@ -88,7 +88,7 @@ roshera-backend/       Rust workspace (10 crates)
 roshera-agent-policy.md  The rules every agent works under, delivered to agents as AGENTS.md
 roshera-app/           React + Three.js + TypeScript browser client
 roshera-mcp/           MCP server exposing the kernel to agents (incl. the six-gate constraint layer)
-roshera-eval/          Certificate-scored agent evaluation scenarios (18)
+roshera-eval/          Certificate-scored evaluation: 19 scripted scenarios + 3 agent scenarios, drawing bench
 roshera-rl/            Certificate-scored episode loop over the MCP surface (JSONL trajectories;
                        task corpus and model policies not yet built — see below)
 ```
@@ -135,7 +135,7 @@ What is live-verified against a running backend: 8 concurrent episodes, each in 
 
 ## Status
 
-What follows is honest about what's tested versus what's implemented but rough. Measured perf numbers are in [Performance](#performance). The kernel carries a red-test ratchet (`geometry-engine/KNOWN_REDS.md`) whose tolerated-failure allowlist is currently empty — no known-failing test is carried as accepted.
+What follows is honest about what's tested versus what's implemented but rough. Measured perf numbers are in [Performance](#performance). The kernel carries a red-test ratchet (`geometry-engine/KNOWN_REDS.md`); its allowlist holds two loft tests added 2026-11-18, each with a diagnosis in `geometry-engine/docs/burndown-diag-loft-family.md`.
 
 | Layer | Component | Status |
 |-------|-----------|--------|
@@ -153,19 +153,20 @@ What follows is honest about what's tested versus what's implemented but rough. 
 | | Revolve (full/partial) | Works; piecewise-analytic bands (arc → exact Torus/Sphere) on the typed strict path, 360° profiles without inner loops |
 | | Sweep (single path) | Implemented; multi-guide not done |
 | | Loft (ruled + NURBS-skinned) | Ruled loft implemented. `nurbs_loft` skins a single G2-continuous (degree-3) NURBS lateral through closed section rings on the proven watertight cylinder topology — the kernel's first freeform NURBS face |
-| **Certificates** | Soundness (per-operation) | Nine-conjunct AND, computed synchronously under the write lock on every mutating-op response, memoized per solid, failing closed |
+| **Certificates** | Soundness (per-operation) | Ten-conjunct AND, computed synchronously under the write lock on every mutating-op response, memoized per solid, failing closed |
 | | Fidelity (requested vs measured) | Reported beside the certificate — never folded into `sound` — for the ops with a measurable request: cylinder, box, revolve, loft. Signed deviation per named quantity; unmeasurable quantities stated absent with a reason, never as 0 |
 | | Sketch — DOF, conflict witnesses | Minimal conflicting constraint sets via QuickXplain; honest `minimal: false` rather than a fabricated core |
 | | Rebuild (timeline mould) | Per-feature verdicts; global soundness re-measured from the resulting B-Rep |
 | **Sketch 2D** | Constraint solver (Newton-Raphson) + DR-plan | Works; per-entity constrainment exposed as queryable kernel facts. Parametric sketch (`psketch_*`) drives the same solver over the agent surface |
-| **Drawings** | Certified 2D sheets | Multi-view layout, SECTION A-A, hole tables, GD&T feature-control frames resolved against disclosed datum reference frames, and `drawing_export_sheet` to PDF/DXF/SVG — all derived from the live B-Rep |
+| **Drawings** | Certified 2D sheets | Multi-view layout, SECTION A-A, DETAIL views, ISO 286 fits, hole tables, GD&T feature-control frames resolved against disclosed datum reference frames, and `drawing_export_sheet` to PDF/DXF/SVG — all derived from the live B-Rep |
+| **DFM** | Manufacturability packs | Read-only, exact-or-refuse rule packs: CNC 3-axis, CNC turning, sheet metal, casting (8be09cc1), FDM, molding (`geometry-engine/src/dfm/packs/`); every verdict names faces, measured value and limit, and an undecidable check reports Inconclusive, never pass |
 | **Perception** | Spatial-relationship queries | Ordered ray crossings with exact hit points, SDF X-ray occupancy slices (`occupancy_view`, non-deceivable), view-coverage honesty (`part_coverage` — which faces the standard views leave unseen), section cutaways — an agent asks instead of parsing meshes |
 | **Identity** | Persistent IDs + labels | `FacePid` carries durable face identity across re-extrude and timeline replay (fillet/chamfer/pattern lineage not yet minted); labels pin names to faces/edges/planes and resolve-or-refuse (never a wrong entity) |
 | **Durability** | Event-log persistence, replay, quarantine | Works; boot is a full replay (boot-time snapshots not used). Verified live by kill + resurrect. `GET /api/evidence-pack` bundles recorded history + certificates (absent → null with reason, never fabricated) + notebook + provenance-labeled mass properties |
 | **Agent surface** | MCP minimal surface + meta-tool funnel | Works; 31 default tools (18 core verbs + the 10-tool `psketch_*` sketching family + `find_tool`/`describe_tool`/`invoke`), the ~90-tool long tail reachable via `invoke` at fixed cost with identical schema validation. Six typed dispatch gates at the one choke point every call path crosses (see [The constraint layer](#the-constraint-layer)). `blackboard_add_entry` (agent→human notebook) is in the default surface |
 | **Assembly** | Instances, mates, SE(3) solve, interference | Gauss-Newton SE(3) solver with an analytic Jacobian, DOF/mobility analysis, interactive drag, and a dozen-plus mate/joint kinds (Cam/Path/Symmetric are typed but not numerically enforced). Certified interference: static overlap (EPA-backed, enclosure-aware) plus continuous nonlinear time-of-impact swept clearance via Parry — `min_clearance = raw_min_clearance − ε`, a conservative lower bound, with a typed refusal when a pair's distance is unsupported |
 | **Export** | STL, OBJ, encrypted .ros | Works |
-| | STEP (AP242) | Export and import implemented (tiered writer + parser); primitive and blended-flange round-trips assert topology, validity, and soundness are preserved. On third-party files, single parts import and draw; assembly placement (`NEXT_ASSEMBLY_USAGE_OCCURRENCE` transforms) is not read yet, so a multi-part assembly arrives as its parts at their own origins |
+| | STEP (AP242) | Export and import implemented (tiered writer + parser); primitive and blended-flange round-trips assert topology, validity, and soundness are preserved. On third-party files, single parts import and draw; assembly placement (`NEXT_ASSEMBLY_USAGE_OCCURRENCE` transforms) is read since a9478f97 (`export-engine/src/formats/step/assembly_placement.rs`) |
 | **AI** | Claude + OpenAI providers | Works. The agent surface also connects through OpenRouter, xAI, Mistral, GLM, Kimi, DeepSeek and Sarvam (API keys only — no local models) |
 | | Vision pipeline | Implemented |
 | | Natural language command parsing | Works for common commands |
@@ -181,11 +182,11 @@ places a check is deliberately narrower than its name — see
 
 ## Performance
 
-Numbers below are labeled with the date, machine, and build profile they were taken on — the profile matters: the workspace's default bench profile builds with full LTO (`lto = true`, `codegen-units = 1`), and disabling LTO measures ~3–4× slower on these benches. The certificate table below is the default full-LTO profile; the older math/primitive tables were taken under the previous `LTO=off` methodology and are marked for re-measurement. These are internal regression figures, not comparisons against any third-party kernel. Reproduce with the commands at the end. Full detail in [BENCHMARKS.md](BENCHMARKS.md).
+Numbers below are labeled with the date, machine, and build profile they were taken on — the profile matters: the workspace's default bench profile builds with full LTO (`lto = true`, `codegen-units = 1`), and disabling LTO measures ~3–4× slower on these benches. The certificate table below is the default full-LTO profile; the older math/primitive tables were taken under the previous `LTO=off` methodology and are marked for re-measurement. These are internal regression figures, not comparisons against any third-party kernel. Reproduce with the commands at the end. Bench sources live in `roshera-backend/geometry-engine/benches/`.
 
 ### Certificate cost (`certificate_cost`)
 
-The nine-conjunct soundness certificate, computed synchronously under the write lock. **Cold** is the price paid once per mutating op on an empty cache; **memoized** is the cache read on any unmutated re-read. Measured **2026-07-21 on a quiet machine** (i7-1355U).
+The soundness certificate (nine conjuncts when measured; `shells_outward` was added later by d7d513d4), computed synchronously under the write lock. **Cold** is the price paid once per mutating op on an empty cache; **memoized** is the cache read on any unmutated re-read. Measured **2026-07-21 on a quiet machine** (i7-1355U).
 
 | Solid | Cold (per mutation) | Memoized re-read |
 |-------|---------------------|------------------|
@@ -276,6 +277,9 @@ it too needs `DATABASE_URL` pointing at a reachable PostgreSQL. The
 `docker-compose.yml` beside it is currently stale — it publishes ports
 3000/9090, which the server does not listen on, and defines no database —
 so build and run the image directly rather than relying on `docker compose up`.
+For a single-tenant partner stack (Postgres + backend + frontend), use
+`docker-compose.partner.yml` at the repo root and the runbook in
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ### Prerequisites
 

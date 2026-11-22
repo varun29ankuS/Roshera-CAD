@@ -4,6 +4,10 @@ These tests go beyond the happy path. Each one stresses a specific
 weakness in typical B-Rep implementations: a known place where naive
 code crashes, corrupts the model, or silently produces garbage.
 
+All six tests live in `topology_tests.rs` in this directory. This file
+absorbed `geometry-engine/EVIL_EDGE_CASES.md` (same six tests) on
+2026-11-22; the "Real scenario" lines come from it.
+
 ## Categories
 
 ### 1. Degenerate geometry
@@ -16,6 +20,7 @@ Mathematically valid inputs that are geometrically degenerate.
 - Breaks normal-vector computation (0/0), boolean classification,
   tessellation, and area-weighted properties.
 - Roshera: creates successfully, validation flags it as degenerate.
+- Real scenario: sliver faces from a boolean on near-coplanar inputs.
 
 #### `test_zero_length_edge`
 
@@ -23,6 +28,8 @@ Mathematically valid inputs that are geometrically degenerate.
 - Breaks edge traversal, loop orientation, parametric evaluation
   (t=0 and t=1 are the same point).
 - Roshera: creation succeeds; length returns 0.
+- Real scenario: an intermediate state during an operation that has not
+  fully resolved.
 
 ### 2. Pathological topology
 
@@ -35,6 +42,8 @@ Topologically valid but problematic configurations.
   operations, winding-number calculations.
 - Roshera: creation succeeds; the self-intersection validator is the
   next layer up (intentionally not on the constructor).
+- Real scenario: sketch entities crossing each other before the user
+  cleans them up.
 
 #### `test_non_manifold_vertex`
 
@@ -54,6 +63,7 @@ Tests that modify existing topology, not just create.
 - Incomplete cleanup leaves dangling edge references, invalid face
   boundaries, and inconsistent topology.
 - Roshera: referential integrity through the cascade is enforced.
+- Real scenario: a user deletes a corner vertex of a complex model.
 
 #### `test_edge_modification_topology_consistency`
 
@@ -62,6 +72,7 @@ Tests that modify existing topology, not just create.
   boundaries, corrupt traversal order, or open gaps in topology.
 - Roshera: consistency is maintained; cached length/parameter data is
   invalidated.
+- Real scenario: tweaking a curve during design iteration.
 
 ## Why these tests matter
 

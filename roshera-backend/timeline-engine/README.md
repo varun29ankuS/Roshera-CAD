@@ -28,11 +28,20 @@ it consumes operations and emits topology.
 
 ## Status
 
-In active use by the api-server. The delete-from-timeline path has a
-known bug when an operation recorded events before failing partway
-through (tracked in `MEMORY.md`); everything else is operational. The
-storage layer writes locally; cross-process persistence is not yet
-wired.
+Last verified: 2026-11-22.
+
+In active use by the api-server. Durable persistence is wired outside this
+crate: the api-server's `durability.rs` appends every recorded event to the
+Postgres `timeline_events` table through an `EventSink` and replays the log
+on boot (quarantining any document whose log it cannot replay faithfully).
+This crate's own `storage/` module (append-only log, snapshots, index) writes
+locally. Besides the modules below, the crate holds replay (`replay.rs`),
+the recorder bridge, moulds, lineage, chapters, the feature graph,
+dimension drive and the rebuild/event certificates (see `src/lib.rs`).
+
+A delete-from-timeline defect (an operation that recorded events before
+failing partway) was noted here earlier; its tracking lived outside the repo
+and it was not re-checked on 2026-11-22.
 
 ## Usage
 

@@ -1,6 +1,15 @@
 # Drawing quality critique: STEP -> production drawing
 
 Date: 2026-11-17. Analysis only: nothing was built, run or edited.
+
+> **HISTORICAL (2026-11-22).** Superseded as a plan by `BENCHMARK.md` and
+> `docs/roshera-drawing-dfm-plan.pdf`. Its headline gap is closed: `select_dimensions` and its silent
+> caps no longer exist (`geometry-engine/src/drawing/dimensioning.rs`), completeness has its own
+> module (`drawing/completeness.rs`), body text follows the ISO 3098 2.5 mm rule
+> (`drawing/layout.rs:35`; tolerance and table text not re-checked), and DETAIL views landed
+> (16c7f519, `drawing/detail_view.rs`). Natural-frame orientation exists (`drawing/natural_frame.rs`).
+> How far §6 items 3, 4, 6, 8, 9 got was not re-checked; they are carried in
+> `docs/workplan-2026-11-22-status.md`.
 Markers: **[V]** read in the code or seen in a file; **[S]** seen on a rendered sheet; **[I]** inferred, needs a run.
 
 ## 0. Verdict

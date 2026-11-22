@@ -19,7 +19,9 @@ client with zero integration work.
 
 **Modeling**
 - Composite one-call creators: `create_box`, `create_cylinder`,
-  `create_plate_with_holes` (explicit coordinates, placement echoed back).
+  `create_sphere` (explicit coordinates, placement echoed back).
+- Solver-backed sketching: the `psketch_*` family (begin, add_entity,
+  constrain, solve, certify, dof, op, extrude, revolve, plane_from_face).
 - Sketch primitives for everything else: `create_sketch`,
   `sketch_add_shape`, `sketch_points` (batch — a 96-point gear outline is
   one call), `sketch_extrude`, `plane_from_face` (stack features on faces).
@@ -42,12 +44,18 @@ tool on every conversation does not scale — and the worst-case MCP client
 each turn. So the **default exposed surface is minimal-complete**, and the long
 tail stays reachable at fixed cost through a three-tool funnel.
 
-- **`ROSHERA_MCP_SURFACE=minimal`** *(default)* — the 15 core modeling/perception
-  verbs plus the 3 meta-tools = **18 tools, ~4.1k tokens**. Everything else lives
-  in the internal table, reachable via the funnel.
-- **`ROSHERA_MCP_SURFACE=full`** — restores the full **90-tool** direct exposure
-  (**~19.4k tokens**); the meta-tools are omitted since the whole surface is
-  present. This is the transition escape hatch, not the recommended default.
+- **`ROSHERA_MCP_SURFACE=minimal`** *(default)* — `CORE_SURFACE` (18 core
+  modeling/perception/composition verbs plus the 10-tool `psketch_*` family)
+  and the 3 meta-tools = **31 tools** (`src/surface.ts`, verified 2026-11-22).
+  Everything else lives in the internal table, reachable via the funnel. The
+  token bill is measured by `tools/mcp_budget_gate.py`; the ~4.1k figure for
+  the earlier 18-tool surface is no longer current.
+- **`ROSHERA_MCP_SURFACE=full`** — exposes every tool in the table directly
+  (about 115 kernel tools at the 2026-11-17 audit, `roshera-eval/mcp/MCP_AUDIT.md`,
+  plus the tools the backend serves from `api-server/src/agent_tools/*.json`,
+  registered by `src/served.ts`); the meta-tools are omitted since the whole
+  surface is present. This is the transition escape hatch, not the recommended
+  default.
 
 **The funnel (fixed ~500-token cost, reaches the whole long tail):**
 - `find_tool(intent)` — deterministic ranked search over the registry.
@@ -91,6 +99,8 @@ fmt gate. Two graders run:
   and skips loudly otherwise. The fallback gate above holds the line regardless.
 
 ## Known kernel issues surfaced through this API
+
+Recorded 2026-07-20; not re-checked on 2026-11-22 (each may be fixed).
 
 - `#24` — extruded circles tessellate as ~64 planar strips, not one
   analytic cylinder face (`get_face` on a bore reports `plane`).

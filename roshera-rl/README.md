@@ -285,7 +285,8 @@ and false claim. The same rule holds for `claims`.
 
 ## Tests
 
-`npm test` runs all eight suites; each also runs standalone:
+`npm test` runs all fourteen suites listed in `package.json` (verified
+2026-11-22); each also runs standalone:
 
 ```
 node test/trajectory.test.mjs
@@ -295,7 +296,13 @@ node test/task.test.mjs
 node test/policy.test.mjs
 node test/episode.test.mjs
 node test/runner.test.mjs
+node test/part_isolation.test.mjs
 node test/wiring.test.mjs
+node test/provenance.test.mjs
+node test/ingest_rows.test.mjs
+node test/ingest_store.test.mjs
+node test/ingest_wiring.test.mjs
+node test/drawing_score.test.mjs
 ```
 
 `npm run test:isolation` runs the isolation proof alone.
@@ -312,6 +319,24 @@ produces it, cited line by line. That discipline exists because this package's
 first version was written against an imagined wire contract, every test
 injected a fake session, and the suite certified the mock — four criticals
 survived seven reviews that way.
+
+## Also in this package
+
+- **Ingestion** (`bin/ingest.mjs`, `lib/ingest/`, `npm run ingest`): reads
+  trajectory JSONL already on disk into Postgres and re-checks each ingested
+  file's digest (`--verify`). JSONL stays the source of truth; `run-batch.mjs`
+  calls `runIngest` after a batch. `lib/provenance.mjs` records what produced
+  a trajectory, stating absence with a reason.
+- **Agent eval** (`agent-eval/`): a separate harness, not the `runEpisode`
+  loop. Headless Claude Code on the logged-in subscription (`ANTHROPIC_*`
+  scrubbed) builds each task's part through the Roshera MCP tools, one episode
+  at a time with its own document and part model; the harness checks the
+  result through REST (`run.mjs`, `tasks.mjs`) and classifies failures
+  (`classify.mjs`). `drawing.mjs` is the drawing mode: the agent improves a
+  drawing-bench sheet and the kernel scores it before and after (spec
+  `docs/research/2026-11-20-agent-eyes-on-drawings-design.md`, slice 4).
+  The root README's "no language model has ever driven an episode" is about
+  `runEpisode`; agent-eval runs are a different harness.
 
 ## What this does not prove
 

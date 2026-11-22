@@ -1,5 +1,9 @@
 # Kernel trust backlog — 2026-11-06
 
+> **HISTORICAL, still cited (2026-11-22).** `roshera-drawing-dfm-plan.pdf` cites this file for
+> SK-H1..M2, so keep it. Its open items are carried in `PARKING_LOT.md` (and STEP-3 / STEP-IMP-1
+> in `workplan-2026-11-22-status.md`); new work is not added here.
+
 The complete list of work found in the 2026-11-05/06 sessions: STEP import, the
 booleans that build cones/tori, tessellation, the SDF deep look, and the
 sketch2d audit. Cadence (Varun): **two items a day**, in the order below. Every

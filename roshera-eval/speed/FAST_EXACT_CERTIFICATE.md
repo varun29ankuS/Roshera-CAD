@@ -1,6 +1,13 @@
 # Fast, exact certificate: architecture and ranked plan
 
 Date: 2026-11-17. Analysis and design only. Nothing was built, run, or edited; every timing below is
+
+> **Status 2026-11-22:** ranked items 1–4 landed on 2026-11-17 — 98a88172 (quality pass projects
+> once, per face in parallel), cc0e6fb2 (one mesh per certificate), 9258c2e3 (manifold analysis by
+> sorting), c68aafc4 (import edge rebuild in parallel, applied in order). Items 5–10 (part-relative
+> element size, a deflection gate, self-intersection on the certificate mesh, `CertMesh`, per-face
+> cache, analytic distances) have no landing commit; item 6 is tracked in
+> `docs/workplan-2026-11-22-status.md`, the rest in `PARKING_LOT.md`.
 either the measurement supplied with the task or an estimate derived from it, and is labelled.
 
 Labels used throughout:

@@ -46,5 +46,9 @@ every result and the gallery picks them up on next refresh.
 `.github/workflows/ci.yml` runs the same set of demos on every push.
 The demos assert non-zero triangle counts and bbox invariants, so a
 regression in primitives, booleans, sweep, loft, features, transforms,
-or pattern/draft fails CI loudly. See `plans/steady-sauteeing-nova.md`
-Phase 3 for the full design.
+or pattern/draft fails CI loudly (the "Run kernel demo regression suite" step in `.github/workflows/ci.yml`).
+
+Other examples here: `certified_exploration.rs` (seeded rocket-engine
+sweep ranked by the certificate), `tess_quick.rs` (per-primitive
+tessellation timings), `quick_demo.rs`, `stress_test_demo.rs`,
+`run_nurbs_bench.rs`, `test_primitives.rs`.

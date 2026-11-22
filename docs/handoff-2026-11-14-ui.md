@@ -1,5 +1,8 @@
 # Handoff 2026-11-14 — UI to the mockups (overnight)
 
+> **HISTORICAL (2026-11-22).** The branch it names was merged; "selection travels with the
+> message" landed in a4d5258a. The other "Not done" items are carried in `PARKING_LOT.md`.
+
 Branch `wip/step-import`. **Nothing pushed.**
 
 ## First: the server is DOWN

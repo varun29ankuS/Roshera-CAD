@@ -2,6 +2,13 @@
 
 Last measured: May 13, 2026
 
+> Status 2026-11-22 (not re-measured): the math tables below disagree with
+> the root `README.md` Performance section (e.g. Matrix4 multiply "<1 ns"
+> here vs 5.14 ns there; Vector3 cross ~1.2 ns vs 884 ps). Which run is
+> right is unverified; the README's certificate-cost table (2026-07-21,
+> full-LTO bench profile) is the newer measurement. "43/43 passing" under
+> Quality refers to a May test run and says nothing about today's suite.
+
 These numbers are **internal regression targets** obtained on our own bench
 machine. Math/quaternion/B-spline figures come from `cargo bench`; the
 tessellation table is from `cargo run --release -p geometry-engine

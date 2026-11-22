@@ -3,12 +3,13 @@
 This is the runbook for standing up a **single-tenant partner instance**: one
 container stack per design partner, no shared database, no tenancy code. Every
 value below has been verified against the source; env vars cite `file:line`.
+Last verified: 2026-11-22 (section 5 only; other sections not re-checked).
 
 The stack is three services (`docker-compose.partner.yml`):
 
 | Service    | Image                                          | Role                                             |
 |------------|------------------------------------------------|--------------------------------------------------|
-| `postgres` | `postgres:16-alpine`                           | Auth/session persistence (users, sessions).      |
+| `postgres` | `postgres:16-alpine`                           | Auth, API keys, the timeline event log, notebooks.|
 | `backend`  | `ghcr.io/varun29ankus/roshera-cad`             | `api-server` — REST + WebSocket, geometry kernel.|
 | `frontend` | `ghcr.io/varun29ankus/roshera-cad-frontend`    | nginx: serves the SPA, proxies `/api` and `/ws`. |
 
@@ -134,23 +135,25 @@ operation (create/extrude/revolve/boolean/fillet/chamfer/transform, assembly
 - The **timeline history** — event ids, sequence numbers, and kinds are
   byte-identical after a restart (`GET /api/timeline/history/{branch}`).
 - User accounts and login sessions (unchanged — Postgres `users`/`sessions`).
+- **Solid names and colours** (re-checked 2026-11-22). Names ride the
+  `set_name` replay arm; colours and editable revolve meridians are re-derived
+  from their `set_color` / `revolve_meridian` events by `restore_side_channels`
+  (`api-server/src/durability.rs`, boot step 9).
+- **API keys, logout and token rotation** — the README's Auth row ("API keys
+  persist across restart ... revoked stays revoked") and audit Task 72
+  (36d7719a, "Logout and rotation survive a restart"); stored in the Postgres
+  `api_keys` / `revoked_tokens` tables (`session-manager/src/database.rs`).
+- **Blackboard notebooks** — Postgres `blackboard_notebooks`, written by
+  `api-server/src/blackboard.rs` and read back on boot in `durability.rs`.
 
-**Does NOT survive yet (honest residual — spec `2026-07-19-durability-design.md`
-slices 3–4):**
-- **Solid names and colours.** These are written to `Solid::name` /
-  `AppState.solid_colors` *outside* any recorded event (spec §2.3), so a
-  replayed solid boots with a default name and no colour. **Slice 3** closes
-  this by emitting rename/colour events with replay arms.
-- **Public UUID identity.** The uuid↔solid mapping is not persisted this slice
-  (spec §2.7 classes it derivable-on-replay), so a restored solid gets a *new*
-  uuid. Addressing works (list the parts to get current uuids); a uuid held by
-  an agent across a restart does not. Stable uuids are **Slice 3**.
-- **Labels / GD&T annotations.** Recorded as `label.*`/`gdt.*` events but
-  honestly skipped on replay (`NonGeometryStale`); re-materialising them is
-  **Slice 3**.
-- **Issued API keys / session tokens.** Held in memory (`session-manager`
-  `AuthManager`); a restart invalidates them. Persisting them is **Slice 4**.
-- **Blackboard notes.** In-memory only.
+**Not re-verified on 2026-11-22 (treat as open until checked):**
+- **Public UUID identity.** Boot step 8 rebuilds the uuid↔solid registry so
+  every restored solid is addressable by uuid; whether a restored solid keeps
+  the uuid it had before the restart was not re-checked. Document-stable,
+  replay-reproducible solid ids were audit Task 79 (open as of 2026-09-27).
+- **Labels / GD&T annotations.** Recorded as `label.*`/`gdt.*` events. This
+  file said replay skipped them (`NonGeometryStale`) and that Slice 3 was to
+  re-materialise them; whether it does was not re-checked.
 
 **Honesty gate.** If the log contains an event this kernel cannot faithfully
 replay (an unknown kind, a `sweep_profile`/`loft_profiles` — spec §2.2, or a
