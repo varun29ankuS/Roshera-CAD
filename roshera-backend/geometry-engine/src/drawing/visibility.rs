@@ -1553,19 +1553,37 @@ thread_local! {
 /// Scopes nest: the outer cache is restored on drop.
 pub(crate) struct VisibilityCacheScope<'m> {
     previous: Option<VisibilityCache>,
+    /// This scope opened the cache (and so closes it).
+    owns: bool,
     _model: std::marker::PhantomData<&'m BRepModel>,
 }
 
 impl<'m> VisibilityCacheScope<'m> {
-    /// Open a cache scope over `model`.
+    /// Open a cache scope over `model`. Inside a scope already open over the
+    /// SAME model this one keeps that scope's cache (it is the same snapshot:
+    /// the outer scope holds the model for its whole life) and closing it
+    /// leaves the cache to the outer scope; over another model it opens a
+    /// fresh one. Opened fresh every time, a check nested in a drawing build
+    /// or a certificate threw the cache away and built it all again.
     pub(crate) fn enter(model: &'m BRepModel) -> Self {
+        let here = model as *const BRepModel as usize;
+        let joined =
+            VISIBILITY_CACHE.with(|c| c.borrow().as_ref().is_some_and(|cache| cache.model == here));
+        if joined {
+            return Self {
+                previous: None,
+                owns: false,
+                _model: std::marker::PhantomData,
+            };
+        }
         let fresh = VisibilityCache {
-            model: model as *const BRepModel as usize,
+            model: here,
             entries: std::collections::HashMap::new(),
         };
         let previous = VISIBILITY_CACHE.with(|c| c.borrow_mut().replace(fresh));
         Self {
             previous,
+            owns: true,
             _model: std::marker::PhantomData,
         }
     }
@@ -1573,6 +1591,9 @@ impl<'m> VisibilityCacheScope<'m> {
 
 impl Drop for VisibilityCacheScope<'_> {
     fn drop(&mut self) {
+        if !self.owns {
+            return;
+        }
         let previous = self.previous.take();
         VISIBILITY_CACHE.with(|c| *c.borrow_mut() = previous);
     }

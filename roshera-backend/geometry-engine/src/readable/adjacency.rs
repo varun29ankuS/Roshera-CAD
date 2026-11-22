@@ -644,19 +644,38 @@ struct AagCache {
 /// outer cache is restored on drop.
 pub struct AdjacencyCacheScope<'m> {
     previous: Option<AagCache>,
+    /// This scope opened the cache (and so closes it); `false` when it
+    /// joined an open scope over the same model.
+    owns: bool,
     _model: std::marker::PhantomData<&'m BRepModel>,
 }
 
 impl<'m> AdjacencyCacheScope<'m> {
-    /// Open a cache scope over `model`.
+    /// Open a cache scope over `model`. Inside a scope already open over the
+    /// SAME model this one keeps that scope's cache (it is the same snapshot:
+    /// the outer scope holds the model for its whole life) and closing it
+    /// leaves the cache to the outer scope; over another model it opens a
+    /// fresh one. Opened fresh every time, a check nested in a drawing build
+    /// or a certificate threw the cache away and built it all again.
     pub fn enter(model: &'m BRepModel) -> Self {
+        let here = model as *const BRepModel as usize;
+        let joined =
+            AAG_CACHE.with(|c| c.borrow().as_ref().is_some_and(|cache| cache.model == here));
+        if joined {
+            return Self {
+                previous: None,
+                owns: false,
+                _model: std::marker::PhantomData,
+            };
+        }
         let fresh = AagCache {
-            model: model as *const BRepModel as usize,
+            model: here,
             graphs: BTreeMap::new(),
         };
         let previous = AAG_CACHE.with(|c| c.borrow_mut().replace(fresh));
         Self {
             previous,
+            owns: true,
             _model: std::marker::PhantomData,
         }
     }
@@ -664,6 +683,9 @@ impl<'m> AdjacencyCacheScope<'m> {
 
 impl Drop for AdjacencyCacheScope<'_> {
     fn drop(&mut self) {
+        if !self.owns {
+            return;
+        }
         let previous = self.previous.take();
         AAG_CACHE.with(|c| *c.borrow_mut() = previous);
     }
@@ -818,6 +840,41 @@ mod cache_tests {
             1,
             "one drawing must build the solid's adjacency graph once"
         );
+    }
+
+    /// A scope opened inside another over the SAME model keeps the outer
+    /// one's graphs (the certificate holds one for the whole sheet, and the
+    /// completeness check inside it opens its own): opened fresh, every
+    /// nested scope threw the graph away and built it again.
+    ///
+    /// Mutation: always open a fresh cache in `enter` -> two builds -> RED.
+    #[test]
+    fn a_nested_scope_over_the_same_model_keeps_the_graph() {
+        let (model, sid) = box_model();
+        let _outer = AdjacencyCacheScope::enter(&model);
+        let before = builds();
+        attributed_adjacency_graph(&model, sid);
+        {
+            let _inner = AdjacencyCacheScope::enter(&model);
+            attributed_adjacency_graph(&model, sid);
+        }
+        attributed_adjacency_graph(&model, sid);
+        assert_eq!(builds() - before, 1, "one build across both scopes");
+    }
+
+    /// Certifying a sheet builds the solid's graph once: the certificate
+    /// reads one model throughout -- drafting dimensions, bores, the
+    /// section, completeness -- and part 109's took 333 s rebuilding it.
+    ///
+    /// Mutation: drop the certificate's scope -> several builds -> RED.
+    #[test]
+    fn a_certificate_classifies_each_edge_once() {
+        let (model, sid) = box_model();
+        let sheet =
+            crate::drawing::standard_drawing_auto(&model, sid, uuid::Uuid::nil()).expect("sheet");
+        let before = builds();
+        crate::drawing::certify_drawing(&model, &sheet);
+        assert_eq!(builds() - before, 1, "one certificate, one graph");
     }
 
     #[test]

@@ -1100,7 +1100,27 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
 
 /// [`certify_drawing`] against a model already in the sheet's frame.
 fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCertificate {
+    // One model snapshot for the whole certificate: its solid's adjacency
+    // graph, hidden lines and plane cuts are each made once and shared by
+    // every check -- drafting dimensions, bores, the section, completeness.
+    // Without the scopes each check rebuilt them (part 109: 333 s).
+    let _adjacency = crate::readable::adjacency::AdjacencyCacheScope::enter(model);
+    let _visibility = super::visibility::VisibilityCacheScope::enter(model);
+    let _sections = super::section_view::SectionCacheScope::enter(model);
+    // Each stage timed under the profile: part 109's certificate took 333 s.
+    let prof = super::dimensioning::draw_profile_enabled();
+    let mut t_stage = std::time::Instant::now();
+    let mut stage = |what: &str| {
+        if prof {
+            eprintln!(
+                "[draw-profile]   certificate {what}: {:.1} ms",
+                t_stage.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        t_stage = std::time::Instant::now();
+    };
     let quality = verify_drawing(drawing);
+    stage("verify_drawing");
 
     // Resolve the drawn solid from the first Part view.
     let solid_id = drawing.views.first().map(|v| match v.source {
@@ -1139,6 +1159,7 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
         _ => HashMap::new(),
     };
 
+    stage("drafting_dimensions + members");
     let mut facts: Vec<SheetFact> = Vec::new();
 
     // ── Per-view facts ────────────────────────────────────────────────────────
@@ -1215,6 +1236,7 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
         }
     }
 
+    stage("per-view dimensions");
     // ── Hole-table rows ───────────────────────────────────────────────────────
     for hole in &drawing.hole_sites {
         let live = hole_live_check(hole, &live_dims);
@@ -1237,6 +1259,7 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
         });
     }
 
+    stage("hole-table rows");
     // ── Round-part bolt circles ───────────────────────────────────────────────
     // The callout replaces the hole-table rows of its holes on the sheet, so
     // it carries their claims — size and depth — plus the ones a row never
@@ -1269,6 +1292,7 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
         }
     }
 
+    stage("bolt circles");
     // ── Hole stacks and patterns ──────────────────────────────────────────────
     // Every stack is a claim whether a table row or a pattern callout inks it:
     // its counterbore depth, countersink angle, THRU-ness and position are on
@@ -1336,6 +1360,7 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
         }
     }
 
+    stage("hole stacks and patterns");
     // ── FCF blocks ────────────────────────────────────────────────────────────
     for fcf in &drawing.fcf_blocks {
         let live = fcf_live_check(model, fcf);
@@ -1371,6 +1396,7 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
     }
 
     // ── Section plane + cut-through (Slice 3) ─────────────────────────────────
+    stage("FCF blocks and datum symbols");
     let mut section_cuts: Option<SectionCutThrough> = None;
     if let Some(sec) = &drawing.section {
         let ct = solid_id.map(|s| section_cut_through(model, s, sec, &drawing.hole_sites));
@@ -1474,7 +1500,9 @@ fn certify_drawing_in_frame(model: &BRepModel, drawing: &Drawing) -> SheetReadba
     facts.extend(gdt_live_side_facts(solid_id, model, drawing));
     // Every model dimension no view states: thinned by the automatic
     // selection, not drawn by the layout, or suppressed by a named person.
+    stage("section");
     let omissions = super::completeness::dimension_omissions(model, drawing);
+    stage("dimension_omissions");
     for o in &omissions {
         let (verdict, label, detail) = match &o.waiver {
             Some(w) => (

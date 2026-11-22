@@ -57,19 +57,37 @@ struct SectionCache {
 /// Holds the section cache open for one drawing build over `model`.
 pub(crate) struct SectionCacheScope<'m> {
     previous: Option<SectionCache>,
+    /// This scope opened the cache (and so closes it).
+    owns: bool,
     _model: std::marker::PhantomData<&'m BRepModel>,
 }
 
 impl<'m> SectionCacheScope<'m> {
-    /// Open a cache scope over `model`.
+    /// Open a cache scope over `model`. Inside a scope already open over the
+    /// SAME model this one keeps that scope's cache (it is the same snapshot:
+    /// the outer scope holds the model for its whole life) and closing it
+    /// leaves the cache to the outer scope; over another model it opens a
+    /// fresh one. Opened fresh every time, a check nested in a drawing build
+    /// or a certificate threw the cache away and built it all again.
     pub(crate) fn enter(model: &'m BRepModel) -> Self {
+        let here = model as *const BRepModel as usize;
+        let joined =
+            SECTION_CACHE.with(|c| c.borrow().as_ref().is_some_and(|cache| cache.model == here));
+        if joined {
+            return Self {
+                previous: None,
+                owns: false,
+                _model: std::marker::PhantomData,
+            };
+        }
         let fresh = SectionCache {
-            model: model as *const BRepModel as usize,
+            model: here,
             entries: HashMap::new(),
         };
         let previous = SECTION_CACHE.with(|c| c.borrow_mut().replace(fresh));
         Self {
             previous,
+            owns: true,
             _model: std::marker::PhantomData,
         }
     }
@@ -77,6 +95,9 @@ impl<'m> SectionCacheScope<'m> {
 
 impl Drop for SectionCacheScope<'_> {
     fn drop(&mut self) {
+        if !self.owns {
+            return;
+        }
         let previous = self.previous.take();
         SECTION_CACHE.with(|c| *c.borrow_mut() = previous);
     }
