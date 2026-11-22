@@ -2105,6 +2105,8 @@ pub fn standard_drawing_auto_with_projection(
     // redrawing all four views (a gear-class sheet went from 4.5 s to 30 s
     // without this); the part's adjacency graph is built once for all.
     let _visibility = super::visibility::VisibilityCacheScope::enter(model);
+    // The section's plane cut likewise (part 109: 15 s a cut, twice a sheet).
+    let _sections = super::section_view::SectionCacheScope::enter(model);
     let _adjacency = crate::readable::adjacency::AdjacencyCacheScope::enter(model);
     let prof = draw_profile_enabled();
     let report = |d: &super::types::Drawing, s: &SheetScore, t: std::time::Instant| {

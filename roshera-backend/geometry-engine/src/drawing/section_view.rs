@@ -28,6 +28,109 @@ use super::types::{
     Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, ViewExtent, ViewSource,
 };
 
+// The caps of one plane cut depend on the part and the plane only, never on
+// the paper or the scale; a sheet search draws its section on several sheets,
+// twice each (measured at unit scale, then placed), and on part 109 one cut is
+// 15 s. While a [`SectionCacheScope`] is held, a cut is made once and reused --
+// for the model the scope was opened on only, the same discipline as the
+// hidden-line cache (`super::visibility::VisibilityCacheScope`).
+thread_local! {
+    static SECTION_CACHE: std::cell::RefCell<Option<SectionCache>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Plane cuts made on this thread (a cache hit makes none).
+    static SECTION_CUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One plane cut: the solid and the plane's exact bits.
+type SectionKey = (SolidId, [u64; 3], [u64; 3]);
+
+struct SectionCache {
+    /// Address of the model the scope was opened on.
+    model: usize,
+    entries: HashMap<SectionKey, Option<Vec<SectionCap>>>,
+}
+
+/// Holds the section cache open for one drawing build over `model`.
+pub(crate) struct SectionCacheScope<'m> {
+    previous: Option<SectionCache>,
+    _model: std::marker::PhantomData<&'m BRepModel>,
+}
+
+impl<'m> SectionCacheScope<'m> {
+    /// Open a cache scope over `model`.
+    pub(crate) fn enter(model: &'m BRepModel) -> Self {
+        let fresh = SectionCache {
+            model: model as *const BRepModel as usize,
+            entries: HashMap::new(),
+        };
+        let previous = SECTION_CACHE.with(|c| c.borrow_mut().replace(fresh));
+        Self {
+            previous,
+            _model: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for SectionCacheScope<'_> {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        SECTION_CACHE.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
+/// The caps of `solid_id` cut by the plane, from the open scope's cache
+/// when it holds them (`None`: the cut failed).
+fn cut_caps(
+    model: &BRepModel,
+    solid_id: SolidId,
+    plane_origin: Point3,
+    plane_normal: Vector3,
+) -> Option<Vec<SectionCap>> {
+    let key: SectionKey = (
+        solid_id,
+        [
+            plane_origin.x.to_bits(),
+            plane_origin.y.to_bits(),
+            plane_origin.z.to_bits(),
+        ],
+        [
+            plane_normal.x.to_bits(),
+            plane_normal.y.to_bits(),
+            plane_normal.z.to_bits(),
+        ],
+    );
+    let here = model as *const BRepModel as usize;
+    let hit = SECTION_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|cache| cache.model == here)
+            .and_then(|cache| cache.entries.get(&key).cloned())
+    });
+    if let Some(caps) = hit {
+        return caps;
+    }
+    #[cfg(test)]
+    SECTION_CUTS.with(|c| c.set(c.get() + 1));
+    let caps = section_solid_by_plane(
+        model,
+        solid_id,
+        plane_origin,
+        plane_normal,
+        Tolerance::default(),
+    )
+    .ok();
+    SECTION_CACHE.with(|c| {
+        if let Some(cache) = c.borrow_mut().as_mut().filter(|cache| cache.model == here) {
+            cache.entries.insert(key, caps.clone());
+        }
+    });
+    caps
+}
+
 /// Hatch pitch ON PAPER, millimetres, measured square to the hatch lines.
 ///
 /// ISO 128-50 hatching is a paper convention: the same 45° lines at the same
@@ -85,14 +188,7 @@ pub fn section_view(
         }
         t_stage = std::time::Instant::now();
     };
-    let caps = section_solid_by_plane(
-        model,
-        solid_id,
-        plane_origin,
-        plane_normal,
-        Tolerance::default(),
-    )
-    .ok()?;
+    let caps = cut_caps(model, solid_id, plane_origin, plane_normal)?;
     stage("section_solid_by_plane");
     if caps.is_empty() {
         return None;
@@ -624,6 +720,56 @@ mod back_of_plane_outline_tests {
             GeometryId::Solid(s) => s,
             o => panic!("{o:?}"),
         }
+    }
+
+    /// Within one drawing build the same plane cut is made once: the sheet
+    /// search draws SECTION A-A on several sheets, twice each, and part
+    /// 109's cut takes 15 s. Outside a scope every call cuts again, and a
+    /// cut for another model is never served.
+    ///
+    /// Mutation: skip the cache lookup in `cut_caps` -> two cuts -> RED.
+    #[test]
+    fn a_plane_cut_is_made_once_per_drawing_build() {
+        let mut m = BRepModel::new();
+        let sid = box_sid(&mut m);
+        let (o, n) = (Point3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0));
+        let draw = |m: &BRepModel, scale: f64| {
+            section_view(
+                m,
+                sid,
+                uuid::Uuid::nil(),
+                o,
+                n,
+                "SECTION A-A",
+                [0.0, 0.0],
+                scale,
+            )
+        };
+        SECTION_CUTS.with(|c| c.set(0));
+        {
+            let _scope = SectionCacheScope::enter(&m);
+            let unit = draw(&m, 1.0).expect("a section");
+            let placed = draw(&m, 0.5).expect("a section");
+            assert_eq!(unit.polylines.len(), placed.polylines.len());
+            assert_eq!(SECTION_CUTS.with(|c| c.get()), 1, "one cut in a scope");
+            // Another model is never served the cached cut.
+            let mut other = BRepModel::new();
+            let other_sid = box_sid(&mut other);
+            assert_eq!(other_sid, sid, "fixture: the same solid id in both");
+            let _ = section_view(
+                &other,
+                other_sid,
+                uuid::Uuid::nil(),
+                o,
+                n,
+                "S",
+                [0.0, 0.0],
+                1.0,
+            );
+            assert_eq!(SECTION_CUTS.with(|c| c.get()), 2, "another model cuts");
+        }
+        let _ = draw(&m, 1.0);
+        assert_eq!(SECTION_CUTS.with(|c| c.get()), 3, "no scope: cut again");
     }
 
     /// **The keep-side sign, pinned directly.** The rendered flange fixture
