@@ -101,6 +101,10 @@ struct OcclusionGrid {
     /// regression root-cause). Scoped to this grid's lifetime, i.e. one view
     /// of one `&BRepModel` snapshot.
     poly_cache: LoopUvCache,
+    /// The face that hid the last occluded probe, tried first next time
+    /// (`u32::MAX`: none yet). Shared by the threads classifying a view; a
+    /// stale hint only changes which face is tried first.
+    last_occluder: std::sync::atomic::AtomicU32,
 }
 
 impl OcclusionGrid {
@@ -176,6 +180,7 @@ impl OcclusionGrid {
                 all_faces,
                 near_depth,
                 poly_cache: LoopUvCache::new(),
+                last_occluder: std::sync::atomic::AtomicU32::new(u32::MAX),
             };
         }
 
@@ -222,6 +227,7 @@ impl OcclusionGrid {
             all_faces,
             near_depth,
             poly_cache: LoopUvCache::new(),
+            last_occluder: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 
@@ -254,7 +260,29 @@ impl OcclusionGrid {
     fn occluded(&self, model: &BRepModel, m: Point3, u: f64, v: f64) -> bool {
         let origin = m - self.w * self.back;
         let m_depth = m.x * self.w.x + m.y * self.w.y + m.z * self.w.z;
-        for &fid in self.candidates(u, v) {
+        let prof = HLR_PROFILE.with(|p| p.borrow().is_some());
+        if prof {
+            HLR_PROFILE.with(|p| {
+                if let Some(s) = p.borrow_mut().as_mut() {
+                    s.queries += 1;
+                    s.candidates += self.candidates(u, v).len() as u64;
+                }
+            });
+        }
+        // Coherence: the face that hid the previous probe (the neighbouring
+        // sample along the same edge, usually) is tried first. The answer is
+        // "does ANY candidate hide `m`", so the order only changes how soon a
+        // hidden probe stops -- never the answer.
+        let last = self
+            .last_occluder
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let first = Some(last).filter(|f| *f != u32::MAX && self.candidates(u, v).contains(f));
+        for fid in first.into_iter().chain(
+            self.candidates(u, v)
+                .iter()
+                .copied()
+                .filter(|f| Some(*f) != first),
+        ) {
             // Depth cull: face entirely behind `m` (its nearest point is still
             // deeper) cannot occlude `m`.
             if self.near_depth[fid as usize] > m_depth + self.eps {
@@ -262,8 +290,28 @@ impl OcclusionGrid {
             }
             #[cfg(test)]
             RAY_FACE_TEST_COUNTER.with(|c| c.set(c.get() + 1));
-            if let Some(t) = ray_hit_face_t(model, fid, origin, self.w, &self.poly_cache) {
+            let t0 = prof.then(std::time::Instant::now);
+            let hit = ray_hit_face_t(model, fid, origin, self.w, &self.poly_cache);
+            if let Some(t0) = t0 {
+                let ns = t0.elapsed().as_nanos() as u64;
+                let kind = model
+                    .faces
+                    .get(fid)
+                    .and_then(|f| model.surfaces.get(f.surface_id))
+                    .map(|s| format!("{:?}", s.surface_type()))
+                    .unwrap_or_else(|| "?".to_string());
+                HLR_PROFILE.with(|p| {
+                    if let Some(s) = p.borrow_mut().as_mut() {
+                        let e = s.by_kind.entry(kind).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 += ns;
+                    }
+                });
+            }
+            if let Some(t) = hit {
                 if t < self.back - self.eps {
+                    self.last_occluder
+                        .store(fid, std::sync::atomic::Ordering::Relaxed);
                     return true;
                 }
             }
@@ -424,6 +472,33 @@ pub struct ViewEdges {
     pub visible_sources: Vec<super::types::PolylineSource>,
     /// Per-polyline lineage parallel to [`Self::hidden`].
     pub hidden_sources: Vec<super::types::PolylineSource>,
+}
+
+impl ViewEdges {
+    fn empty() -> Self {
+        ViewEdges {
+            visible: Vec::new(),
+            hidden: Vec::new(),
+            circles: Vec::new(),
+            hidden_circles: Vec::new(),
+            ellipses: Vec::new(),
+            hidden_ellipses: Vec::new(),
+            visible_sources: Vec::new(),
+            hidden_sources: Vec::new(),
+        }
+    }
+
+    /// Append `other`'s lines after this one's, keeping each list's order.
+    fn append(&mut self, other: ViewEdges) {
+        self.visible.extend(other.visible);
+        self.hidden.extend(other.hidden);
+        self.circles.extend(other.circles);
+        self.hidden_circles.extend(other.hidden_circles);
+        self.ellipses.extend(other.ellipses);
+        self.hidden_ellipses.extend(other.hidden_ellipses);
+        self.visible_sources.extend(other.visible_sources);
+        self.hidden_sources.extend(other.hidden_sources);
+    }
 }
 
 /// `(center3d, unit normal, radius)` if `curve` lies on a circle (a full
@@ -1599,6 +1674,252 @@ impl Drop for VisibilityCacheScope<'_> {
     }
 }
 
+/// An edge sampled for one view: its 3D points, their projections, and for
+/// each segment the probe point ON the curve halfway along it (not the chord
+/// midpoint: a curved edge's chord midpoint sits inside the curve, and for
+/// the outer rim of a face that is inside the solid's side wall -- an edge in
+/// plain sight read as hidden, a flange's top rim vanished from the sheet).
+/// Straight edges take two samples, curves `samples_per_curve`. `None` when
+/// the curve cannot be evaluated.
+fn sample_edge_for_view(
+    curve: &dyn crate::primitives::curve::Curve,
+    edge: &crate::primitives::edge::Edge,
+    vm: &Matrix4,
+    samples_per_curve: usize,
+    is_linear: bool,
+) -> Option<(Vec<Point3>, Vec<[f64; 2]>, Vec<Point3>)> {
+    let n = if is_linear {
+        2
+    } else {
+        samples_per_curve.max(2)
+    };
+    let t0 = edge.param_range.start;
+    let t1 = edge.param_range.end;
+    let mut p3: Vec<Point3> = Vec::with_capacity(n);
+    let mut p2: Vec<[f64; 2]> = Vec::with_capacity(n);
+    for i in 0..n {
+        let frac = i as f64 / (n - 1) as f64;
+        let p = curve.point_at(t0 + (t1 - t0) * frac).ok()?;
+        let v = vm.transform_point(&p);
+        p3.push(p);
+        p2.push([v.x, v.y]);
+    }
+    if p2.len() < 2 {
+        return None;
+    }
+    let on_curve: Vec<Point3> = (0..p3.len().saturating_sub(1))
+        .map(|i| {
+            let frac = (i as f64 + 0.5) / (n - 1) as f64;
+            curve.point_at(t0 + (t1 - t0) * frac).unwrap_or_else(|_| {
+                Point3::new(
+                    0.5 * (p3[i].x + p3[i + 1].x),
+                    0.5 * (p3[i].y + p3[i + 1].y),
+                    0.5 * (p3[i].z + p3[i + 1].z),
+                )
+            })
+        })
+        .collect();
+    Some((p3, p2, on_curve))
+}
+
+/// The synthesized curved-surface silhouettes of `face_ids` (cylinder and
+/// cone generators, sphere great circles, torus folds in the views that have
+/// a closed form), classified through `ctx` into `out` / `circle_groups`.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_silhouettes(
+    model: &BRepModel,
+    face_ids: &[FaceId],
+    vm: &Matrix4,
+    w: Vector3,
+    samples_per_curve: usize,
+    ctx: &ViewOcclusionCtx,
+    out: &mut ViewEdges,
+    circle_groups: &mut std::collections::HashMap<(i64, i64, i64, i64), CircleGroup>,
+) {
+    // A sphere's great circle joins the shared rim groups, so spheres go in
+    // order on this thread. Every other face only appends its own lines: those
+    // are classified on all cores and appended in face order, so `out` is what
+    // one thread would have written.
+    let is_sphere = |fid: &FaceId| {
+        model
+            .faces
+            .get(*fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))
+            .is_some_and(|s| {
+                s.as_any()
+                    .downcast_ref::<crate::primitives::surface::Sphere>()
+                    .is_some()
+            })
+    };
+    for face_id in face_ids.iter().filter(|f| is_sphere(f)) {
+        synthesize_face_silhouette(
+            model,
+            face_id,
+            vm,
+            w,
+            samples_per_curve,
+            ctx,
+            out,
+            circle_groups,
+        );
+    }
+    let others: Vec<FaceId> = face_ids.iter().copied().filter(|f| !is_sphere(f)).collect();
+    let parts: Vec<(ViewEdges, u64, Option<HlrStats>)> = {
+        use rayon::prelude::*;
+        others
+            .par_iter()
+            .map(|face_id| {
+                tracked(|| {
+                    let mut local = ViewEdges::empty();
+                    let mut no_rims = std::collections::HashMap::new();
+                    synthesize_face_silhouette(
+                        model,
+                        face_id,
+                        vm,
+                        w,
+                        samples_per_curve,
+                        ctx,
+                        &mut local,
+                        &mut no_rims,
+                    );
+                    local
+                })
+            })
+            .collect()
+    };
+    for (local, tests, stats) in parts {
+        absorb(tests, stats);
+        out.append(local);
+    }
+}
+
+/// The synthesized silhouette of one face (see [`synthesize_silhouettes`]).
+#[allow(clippy::too_many_arguments)]
+fn synthesize_face_silhouette(
+    model: &BRepModel,
+    face_id: &FaceId,
+    vm: &Matrix4,
+    w: Vector3,
+    samples_per_curve: usize,
+    ctx: &ViewOcclusionCtx,
+    out: &mut ViewEdges,
+    circle_groups: &mut std::collections::HashMap<(i64, i64, i64, i64), CircleGroup>,
+) {
+    let Some(face) = model.faces.get(*face_id) else {
+        return;
+    };
+    let Some(surface) = model.surfaces.get(face.surface_id) else {
+        return;
+    };
+
+    if let Some(sph) = surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Sphere>()
+    {
+        synth_sphere_silhouette(
+            model,
+            *face_id,
+            face,
+            sph,
+            vm,
+            w,
+            samples_per_curve,
+            ctx,
+            circle_groups,
+        );
+        return;
+    }
+
+    if let Some(torus) = surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Torus>()
+    {
+        synth_torus_silhouette(
+            model,
+            *face_id,
+            face,
+            torus,
+            surface,
+            vm,
+            w,
+            samples_per_curve,
+            ctx,
+            out,
+        );
+        return;
+    }
+
+    // Cylinder / Cone share the same ruled-surface derivation: the
+    // silhouette condition `n(u)·w = 0` reduces to `A cos u + B sin u =
+    // C` with `A = w·x_dir`, `B = w·y_dir`, and `C = tan(half_angle) *
+    // (w·axis)` (zero for a cylinder, which is the `half_angle = 0`
+    // special case) — solved in closed form below.
+    let (origin, axis, ref_dir, half_angle) = if let Some(cyl) =
+        surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Cylinder>()
+    {
+        (cyl.origin, cyl.axis, cyl.ref_dir, None)
+    } else if let Some(cone) = surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Cone>()
+    {
+        (cone.apex, cone.axis, cone.ref_dir, Some(cone.half_angle))
+    } else {
+        return;
+    };
+
+    let x_dir = ref_dir;
+    let y_dir = axis.cross(&x_dir);
+    let wx = w.dot(&x_dir);
+    let wy = w.dot(&y_dir);
+    let wz = w.dot(&axis);
+    let r = (wx * wx + wy * wy).sqrt();
+    const DEGENERATE: f64 = 1e-9;
+    if r < DEGENERATE {
+        // View direction is (near-)parallel to the axis: looking straight
+        // down a cylinder/cone shows only its end rim(s), no generator
+        // line turns edge-on.
+        return;
+    }
+    let c = half_angle.map(|ha| ha.tan() * wz).unwrap_or(0.0);
+    if c.abs() > r + DEGENERATE {
+        // No real solution: this cone's flare never turns edge-on from
+        // this view direction.
+        return;
+    }
+    let phi = wy.atan2(wx);
+    let delta = (c / r).clamp(-1.0, 1.0).acos();
+    let mut candidates = vec![phi + delta, phi - delta];
+    if (candidates[0] - candidates[1]).rem_euclid(std::f64::consts::TAU) < 1e-9 {
+        candidates.truncate(1);
+    }
+
+    let Some((v_lo, v_hi)) = face_axis_span(model, face, origin, axis) else {
+        return;
+    };
+    if !(v_hi > v_lo) {
+        return;
+    }
+
+    for raw_u in candidates {
+        let u = raw_u.rem_euclid(std::f64::consts::TAU);
+        emit_line_silhouette(
+            model,
+            *face_id,
+            face,
+            surface,
+            vm,
+            u,
+            v_lo,
+            v_hi,
+            samples_per_curve,
+            ctx,
+            out,
+        );
+    }
+}
+
 /// What one hidden-line computation depends on: the part, the direction it
 /// is seen from, and how it is sampled and classified -- never the paper or
 /// where the view sits on it. The direction is keyed by its full `Debug` text
@@ -1610,6 +1931,79 @@ pub(crate) struct VisibilityKey {
     samples_per_curve: usize,
     occlude: bool,
     use_accel: bool,
+}
+
+/// Where one hidden-line view spends its time, gathered only under
+/// `ROSHERA_DRAW_PROFILE` (`None` otherwise, so the probe path pays one
+/// thread-local read).
+#[derive(Default)]
+struct HlrStats {
+    /// Occlusion queries (one per classified segment).
+    queries: u64,
+    /// Candidate faces the grid handed those queries, before the depth cull.
+    candidates: u64,
+    /// Per surface kind: exact ray-face tests run and nanoseconds spent.
+    by_kind: std::collections::BTreeMap<String, (u64, u64)>,
+}
+
+impl HlrStats {
+    fn merge(&mut self, other: HlrStats) {
+        self.queries += other.queries;
+        self.candidates += other.candidates;
+        for (kind, (n, ns)) in other.by_kind {
+            let e = self.by_kind.entry(kind).or_insert((0, 0));
+            e.0 += n;
+            e.1 += ns;
+        }
+    }
+}
+
+/// Run `f` -- possibly on a rayon worker -- and hand back, with its result,
+/// the ray-face tests and profile it ran up on that thread, leaving the
+/// thread's own counters as they were. [`absorb`] adds them to the calling
+/// thread's, so a view's totals are the same however its work was split.
+fn tracked<T>(f: impl FnOnce() -> T) -> (T, u64, Option<HlrStats>) {
+    #[cfg(test)]
+    let tests_before = RAY_FACE_TEST_COUNTER.with(|c| c.get());
+    let outer = HLR_PROFILE.with(|p| {
+        let mut p = p.borrow_mut();
+        let on = p.is_some() || PROFILING.load(std::sync::atomic::Ordering::Relaxed);
+        on.then(|| p.replace(HlrStats::default()))
+    });
+    let value = f();
+    let stats = outer
+        .and_then(|outer| HLR_PROFILE.with(|p| std::mem::replace(&mut *p.borrow_mut(), outer)));
+    #[cfg(test)]
+    let tests = RAY_FACE_TEST_COUNTER.with(|c| {
+        let n = c.get() - tests_before;
+        c.set(tests_before);
+        n
+    });
+    #[cfg(not(test))]
+    let tests = 0;
+    (value, tests, stats)
+}
+
+/// Add what a [`tracked`] call ran up to this thread's counters.
+fn absorb(_tests: u64, stats: Option<HlrStats>) {
+    #[cfg(test)]
+    RAY_FACE_TEST_COUNTER.with(|c| c.set(c.get() + _tests));
+    if let Some(s) = stats {
+        HLR_PROFILE.with(|p| {
+            if let Some(total) = p.borrow_mut().as_mut() {
+                total.merge(s);
+            }
+        });
+    }
+}
+
+/// Whether a profiled view is being drawn, so a rayon worker (whose own
+/// thread-local profile is empty) knows to gather stats for [`tracked`].
+static PROFILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    static HLR_PROFILE: std::cell::RefCell<Option<HlrStats>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 thread_local! {
@@ -1661,11 +2055,19 @@ pub(crate) fn project_solid_edges_visibility_mode(
     // Replaces the per-segment whole-solid `raycast_solid` with a projected-AABB
     // grid + depth cull; identical classification (see `OcclusionGrid`), far less
     // work. Only built when the caller actually wants occlusion.
+    let prof = super::dimensioning::draw_profile_enabled();
+    if prof {
+        HLR_PROFILE.with(|p| *p.borrow_mut() = Some(HlrStats::default()));
+        PROFILING.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let t_grid = std::time::Instant::now();
     let accel = if occlude && use_accel {
         Some(OcclusionGrid::build(model, solid_id, &vm, w, back, eps))
     } else {
         None
     };
+    let grid_ms = t_grid.elapsed().as_secs_f64() * 1e3;
+    let t_walk = std::time::Instant::now();
     let occ_ctx = ViewOcclusionCtx {
         model,
         solid_id,
@@ -1741,6 +2143,60 @@ pub(crate) fn project_solid_edges_visibility_mode(
     // Seams inside a faceted surface: drawn only where they are the outline.
     let seams = facet_seams(model, &edge_faces);
 
+    // Classify every drawn edge on all cores first: each edge's visibility
+    // runs are a pure function of its samples and the (read-only) occlusion
+    // context, so the walk below reads them back in its own order and the
+    // sheet is the one a single thread draws.
+    let mut work: Vec<EdgeId> = Vec::new();
+    let mut queued: HashSet<EdgeId> = HashSet::new();
+    for sh in &shell_ids {
+        let Some(shell) = model.shells.get(*sh) else {
+            continue;
+        };
+        for face_id in &shell.faces {
+            let Some(face) = model.faces.get(*face_id) else {
+                continue;
+            };
+            let loops = std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied());
+            for loop_id in loops {
+                let Some(topo_loop) = model.loops.get(loop_id) else {
+                    continue;
+                };
+                for edge_id in &topo_loop.edges {
+                    if queued.insert(*edge_id)
+                        && !is_parameterization_seam(model, *edge_id, &edge_faces)
+                        && !seams
+                            .get(edge_id)
+                            .is_some_and(|n| !facet_seam_is_silhouette(n, w))
+                    {
+                        work.push(*edge_id);
+                    }
+                }
+            }
+        }
+    }
+    let results: Vec<(EdgeId, Vec<(bool, Vec<[f64; 2]>)>, u64, Option<HlrStats>)> = {
+        use rayon::prelude::*;
+        work.par_iter()
+            .filter_map(|&edge_id| {
+                let edge = model.edges.get(edge_id)?;
+                let curve = model.curves.get(edge.curve_id)?;
+                let is_linear = curve.is_linear(crate::math::Tolerance::default());
+                let (_, p2, on_curve) =
+                    sample_edge_for_view(curve, edge, &vm, samples_per_curve, is_linear)?;
+                let (runs, tests, stats) =
+                    tracked(|| split_by_visibility_at(&p2, &on_curve, &occ_ctx));
+                Some((edge_id, runs, tests, stats))
+            })
+            .collect()
+    };
+    let mut classified: std::collections::HashMap<EdgeId, Vec<(bool, Vec<[f64; 2]>)>> =
+        std::collections::HashMap::with_capacity(results.len());
+    for (edge_id, runs, tests, stats) in results {
+        absorb(tests, stats);
+        classified.insert(edge_id, runs);
+    }
+
     for sh in shell_ids {
         let shell = match model.shells.get(sh) {
             Some(s) => s,
@@ -1784,58 +2240,15 @@ pub(crate) fn project_solid_edges_visibility_mode(
                     {
                         continue;
                     }
-                    let n = if is_linear {
-                        2
-                    } else {
-                        samples_per_curve.max(2)
-                    };
-                    let t0 = edge.param_range.start;
-                    let t1 = edge.param_range.end;
-
-                    // Sample 3D + 2D in lockstep.
-                    let mut p3: Vec<Point3> = Vec::with_capacity(n);
-                    let mut p2: Vec<[f64; 2]> = Vec::with_capacity(n);
-                    let mut ok = true;
-                    for i in 0..n {
-                        let frac = i as f64 / (n - 1) as f64;
-                        let t = t0 + (t1 - t0) * frac;
-                        match curve.point_at(t) {
-                            Ok(p) => {
-                                let v = vm.transform_point(&p);
-                                p3.push(p);
-                                p2.push([v.x, v.y]);
-                            }
-                            Err(_) => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    if !ok || p2.len() < 2 {
+                    let Some((p3, p2, on_curve)) =
+                        sample_edge_for_view(curve, edge, &vm, samples_per_curve, is_linear)
+                    else {
                         continue;
-                    }
-
-                    // Classify each segment at the point ON the curve halfway
-                    // along it, not at its chord midpoint: a curved edge's chord
-                    // midpoint sits inside the curve, and for the outer rim of a
-                    // face that is inside the solid's side wall -- the line of
-                    // sight to it then crosses that wall, and an edge in plain
-                    // sight was classified hidden (a flange's top rim, seen
-                    // from the front, vanished from the sheet). For a straight
-                    // edge the two points are the same.
-                    let on_curve: Vec<Point3> = (0..p3.len().saturating_sub(1))
-                        .map(|i| {
-                            let frac = (i as f64 + 0.5) / (n - 1) as f64;
-                            curve.point_at(t0 + (t1 - t0) * frac).unwrap_or_else(|_| {
-                                Point3::new(
-                                    0.5 * (p3[i].x + p3[i + 1].x),
-                                    0.5 * (p3[i].y + p3[i + 1].y),
-                                    0.5 * (p3[i].z + p3[i + 1].z),
-                                )
-                            })
-                        })
-                        .collect();
-                    let runs = split_by_visibility_at(&p2, &on_curve, &occ_ctx);
+                    };
+                    let runs = match classified.remove(edge_id) {
+                        Some(runs) => runs,
+                        None => split_by_visibility_at(&p2, &on_curve, &occ_ctx),
+                    };
 
                     // Analytic circle: a circular arc-edge whose circle plane
                     // faces the camera (normal ∥ view dir) projects, under the
@@ -1976,127 +2389,44 @@ pub(crate) fn project_solid_edges_visibility_mode(
         }
     }
 
+    let walk_ms = t_walk.elapsed().as_secs_f64() * 1e3;
+    let t_sil = std::time::Instant::now();
     // Synthesized curved-surface silhouettes — see the module-level comment
     // above `is_parameterization_seam` for the design. Runs over every face
     // of the solid (collected into `all_face_ids` above, before `shell_ids`
     // was moved into the edge walk); a face whose surface is not Cylinder,
     // Cone or Sphere is skipped immediately.
-    for face_id in &all_face_ids {
-        let Some(face) = model.faces.get(*face_id) else {
-            continue;
-        };
-        let Some(surface) = model.surfaces.get(face.surface_id) else {
-            continue;
-        };
+    synthesize_silhouettes(
+        model,
+        &all_face_ids,
+        &vm,
+        w,
+        samples_per_curve,
+        &occ_ctx,
+        &mut out,
+        &mut circle_groups,
+    );
 
-        if let Some(sph) = surface
-            .as_any()
-            .downcast_ref::<crate::primitives::surface::Sphere>()
-        {
-            synth_sphere_silhouette(
-                model,
-                *face_id,
-                face,
-                sph,
-                &vm,
-                w,
-                samples_per_curve,
-                &occ_ctx,
-                &mut circle_groups,
+    if prof {
+        let sil_ms = t_sil.elapsed().as_secs_f64() * 1e3;
+        PROFILING.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(s) = HLR_PROFILE.with(|p| p.borrow_mut().take()) {
+            eprintln!(
+                "[draw-profile]     hlr {projection:?}: grid {grid_ms:.0} ms, edges {walk_ms:.0} ms, \
+                 silhouettes {sil_ms:.0} ms; {} queries, {} candidates, {} edges",
+                s.queries,
+                s.candidates,
+                visited.len()
             );
-            continue;
-        }
-
-        if let Some(torus) = surface
-            .as_any()
-            .downcast_ref::<crate::primitives::surface::Torus>()
-        {
-            synth_torus_silhouette(
-                model,
-                *face_id,
-                face,
-                torus,
-                surface,
-                &vm,
-                w,
-                samples_per_curve,
-                &occ_ctx,
-                &mut out,
-            );
-            continue;
-        }
-
-        // Cylinder / Cone share the same ruled-surface derivation: the
-        // silhouette condition `n(u)·w = 0` reduces to `A cos u + B sin u =
-        // C` with `A = w·x_dir`, `B = w·y_dir`, and `C = tan(half_angle) *
-        // (w·axis)` (zero for a cylinder, which is the `half_angle = 0`
-        // special case) — solved in closed form below.
-        let (origin, axis, ref_dir, half_angle) = if let Some(cyl) =
-            surface
-                .as_any()
-                .downcast_ref::<crate::primitives::surface::Cylinder>()
-        {
-            (cyl.origin, cyl.axis, cyl.ref_dir, None)
-        } else if let Some(cone) = surface
-            .as_any()
-            .downcast_ref::<crate::primitives::surface::Cone>()
-        {
-            (cone.apex, cone.axis, cone.ref_dir, Some(cone.half_angle))
-        } else {
-            continue;
-        };
-
-        let x_dir = ref_dir;
-        let y_dir = axis.cross(&x_dir);
-        let wx = w.dot(&x_dir);
-        let wy = w.dot(&y_dir);
-        let wz = w.dot(&axis);
-        let r = (wx * wx + wy * wy).sqrt();
-        const DEGENERATE: f64 = 1e-9;
-        if r < DEGENERATE {
-            // View direction is (near-)parallel to the axis: looking straight
-            // down a cylinder/cone shows only its end rim(s), no generator
-            // line turns edge-on.
-            continue;
-        }
-        let c = half_angle.map(|ha| ha.tan() * wz).unwrap_or(0.0);
-        if c.abs() > r + DEGENERATE {
-            // No real solution: this cone's flare never turns edge-on from
-            // this view direction.
-            continue;
-        }
-        let phi = wy.atan2(wx);
-        let delta = (c / r).clamp(-1.0, 1.0).acos();
-        let mut candidates = vec![phi + delta, phi - delta];
-        if (candidates[0] - candidates[1]).rem_euclid(std::f64::consts::TAU) < 1e-9 {
-            candidates.truncate(1);
-        }
-
-        let Some((v_lo, v_hi)) = face_axis_span(model, face, origin, axis) else {
-            continue;
-        };
-        if !(v_hi > v_lo) {
-            continue;
-        }
-
-        for raw_u in candidates {
-            let u = raw_u.rem_euclid(std::f64::consts::TAU);
-            emit_line_silhouette(
-                model,
-                *face_id,
-                face,
-                surface,
-                &vm,
-                u,
-                v_lo,
-                v_hi,
-                samples_per_curve,
-                &occ_ctx,
-                &mut out,
-            );
+            for (kind, (n, ns)) in &s.by_kind {
+                eprintln!(
+                    "[draw-profile]       ray-face {kind}: {n} tests, {:.0} ms, {:.1} us/test",
+                    *ns as f64 / 1e6,
+                    *ns as f64 / 1e3 / (*n).max(1) as f64
+                );
+            }
         }
     }
-
     // Flush the accumulated rims: a whole, uniformly-visible (or -hidden) rim
     // draws as ONE true circle; a genuinely mixed rim falls back to its arcs.
     for g in circle_groups.into_values() {
@@ -2528,11 +2858,15 @@ mod tests {
                 });
                 v
             };
-            assert_eq!(
-                canon(&accel.visible),
-                canon(&brute.visible),
-                "{label}: visible polylines identical ({proj:?})"
-            );
+            let (av, bv) = (canon(&accel.visible), canon(&brute.visible));
+            if av != bv {
+                let ends = |p: &Vec<[f64; 2]>| (p.first().copied(), p.last().copied(), p.len());
+                let only_a: Vec<_> = av.iter().filter(|p| !bv.contains(p)).map(ends).collect();
+                let only_b: Vec<_> = bv.iter().filter(|p| !av.contains(p)).map(ends).collect();
+                panic!(
+                    "{label}: visible polylines differ ({proj:?})\n accel only: {only_a:?}\n brute only: {only_b:?}"
+                );
+            }
             assert_eq!(
                 canon(&accel.hidden),
                 canon(&brute.hidden),

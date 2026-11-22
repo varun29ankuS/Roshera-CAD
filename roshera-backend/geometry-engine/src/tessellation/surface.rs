@@ -11156,6 +11156,124 @@ pub(crate) struct CachedLoopUv {
     /// uncached path accepts, and the two would silently disagree.
     period_u: Option<f64>,
     period_v: Option<f64>,
+    /// The polygon's segments bucketed by `v` band, so a membership query
+    /// reads only the segments level with it ([`LoopBands`]).
+    bands: LoopBands,
+}
+
+/// A loop polygon's bounding box and its segments bucketed into horizontal
+/// `v` bands: a point's winding number is decided by the segments that
+/// straddle its `v` alone (Sunday's crossing rule), so a query reads one band
+/// instead of every vertex. Built once per cached loop.
+struct LoopBands {
+    u_min: f64,
+    u_max: f64,
+    v_min: f64,
+    v_max: f64,
+    /// Band height; `bands[k]` lists the segments (start index `i`, the
+    /// segment `polygon[i] -> polygon[(i + 1) % n]`) whose `v` range meets
+    /// band `k` widened by `near`.
+    band_h: f64,
+    bands: Vec<Vec<u32>>,
+    /// Distance under which a query counts as ON the boundary, where the
+    /// crossing rule and the angle-sum winding may disagree; such a query is
+    /// answered by the angle-sum test the uncached path uses.
+    near: f64,
+}
+
+impl LoopBands {
+    fn build(polygon: &[(f64, f64)]) -> Self {
+        let (mut u_min, mut u_max, mut v_min, mut v_max) = (
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for &(u, v) in polygon {
+            u_min = u_min.min(u);
+            u_max = u_max.max(u);
+            v_min = v_min.min(v);
+            v_max = v_max.max(v);
+        }
+        let n = polygon.len();
+        let span = (u_max - u_min).abs().max((v_max - v_min).abs());
+        let near = 1e-9 * span.max(1.0);
+        let count = ((n as f64).sqrt().ceil() as usize).clamp(1, 256);
+        let band_h = ((v_max - v_min) / count as f64).max(f64::MIN_POSITIVE);
+        let mut bands: Vec<Vec<u32>> = vec![Vec::new(); count];
+        if n >= 2 && v_min.is_finite() && v_max.is_finite() {
+            for i in 0..n {
+                let a = polygon[i];
+                let b = polygon[(i + 1) % n];
+                let lo = a.1.min(b.1) - near;
+                let hi = a.1.max(b.1) + near;
+                let k0 = (((lo - v_min) / band_h).floor().max(0.0) as usize).min(count - 1);
+                let k1 = (((hi - v_min) / band_h).floor().max(0.0) as usize).min(count - 1);
+                for band in bands.iter_mut().take(k1 + 1).skip(k0) {
+                    band.push(i as u32);
+                }
+            }
+        }
+        LoopBands {
+            u_min,
+            u_max,
+            v_min,
+            v_max,
+            band_h,
+            bands,
+            near,
+        }
+    }
+
+    /// Is `(u, v)` (already lifted into the polygon's cover) enclosed by the
+    /// polygon? Identical to `calculate_winding_number(..).abs() > 0.5`: away
+    /// from the boundary both give the polygon's integer winding number;
+    /// within `near` of a segment the angle-sum test itself decides.
+    fn encloses(&self, u: f64, v: f64, polygon: &[(f64, f64)]) -> bool {
+        let n = polygon.len();
+        if n < 3 || self.bands.is_empty() {
+            return calculate_winding_number(&(u, v), polygon).abs() > 0.5;
+        }
+        if u < self.u_min - self.near
+            || u > self.u_max + self.near
+            || v < self.v_min - self.near
+            || v > self.v_max + self.near
+        {
+            return false;
+        }
+        let k =
+            (((v - self.v_min) / self.band_h).floor().max(0.0) as usize).min(self.bands.len() - 1);
+        let mut winding: i64 = 0;
+        for &i in &self.bands[k] {
+            let a = polygon[i as usize];
+            let b = polygon[(i as usize + 1) % n];
+            if point_segment_distance_uv((u, v), a, b) <= self.near {
+                return calculate_winding_number(&(u, v), polygon).abs() > 0.5;
+            }
+            let left = (b.0 - a.0) * (v - a.1) - (u - a.0) * (b.1 - a.1);
+            if a.1 <= v {
+                if b.1 > v && left > 0.0 {
+                    winding += 1;
+                }
+            } else if b.1 <= v && left < 0.0 {
+                winding -= 1;
+            }
+        }
+        winding != 0
+    }
+}
+
+/// Euclidean distance from `p` to the segment `a..b` in parameter space.
+fn point_segment_distance_uv(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (qx, qy) = (a.0 + t * dx, a.1 + t * dy);
+    ((p.0 - qx).powi(2) + (p.1 - qy).powi(2)).sqrt()
 }
 
 impl LoopUvCache {
@@ -11201,7 +11319,9 @@ impl LoopUvCache {
         } else {
             None
         };
+        let bands = LoopBands::build(&polygon);
         let built = Arc::new(CachedLoopUv {
+            bands,
             polygon,
             is_outer,
             degenerate,
@@ -11225,7 +11345,19 @@ fn classify_cached(u: f64, v: f64, cached: &CachedLoopUv) -> bool {
             return false;
         }
     }
-    winding_membership_periodic(u, v, &cached.polygon, cached.period_u, cached.period_v)
+    // The same universal-cover lifts `winding_membership_periodic` tries,
+    // each answered by the banded test instead of a full angle sum.
+    let b = &cached.bands;
+    if cached.polygon.len() < 3 {
+        return false;
+    }
+    let u_lifts = periodic_lifts(u, b.u_min, b.u_max, cached.period_u);
+    let v_lifts = periodic_lifts(v, b.v_min, b.v_max, cached.period_v);
+    u_lifts.iter().any(|&lu| {
+        v_lifts
+            .iter()
+            .any(|&lv| b.encloses(lu, lv, &cached.polygon))
+    })
 }
 
 /// [`is_point_inside_face`], but consulting `cache` for each loop's UV
@@ -14363,6 +14495,83 @@ mod annulus_strip_tests {
         assert!(
             (covered - annulus).abs() <= 1e-6 * annulus,
             "the strip covers {covered:.4} mm^2 of the narrow annulus's {annulus:.4}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod banded_membership_tests {
+    use super::*;
+
+    /// A concave comb-shaped loop, sampled densely the way a trimmed face's
+    /// UV polygon is: many vertices, horizontal and vertical runs, notches.
+    fn comb() -> Vec<(f64, f64)> {
+        let mut outline = vec![(0.0, 0.0), (10.0, 0.0), (10.0, 6.0)];
+        for k in (0..5).rev() {
+            let x = 2.0 * k as f64;
+            outline.extend([(x + 2.0, 6.0), (x + 1.5, 3.0), (x + 1.0, 6.0)]);
+        }
+        outline.push((0.0, 6.0));
+        // Densify every side to 20 samples, as `project_loop_uv_unwrapped` does.
+        let mut dense = Vec::new();
+        for i in 0..outline.len() {
+            let a = outline[i];
+            let b = outline[(i + 1) % outline.len()];
+            for s in 0..20 {
+                let t = s as f64 / 20.0;
+                dense.push((a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)));
+            }
+        }
+        dense
+    }
+
+    /// The banded crossing test answers exactly as the angle-sum winding
+    /// test it replaces: on a grid through the comb, beyond it, and at every
+    /// vertex and segment midpoint (ON the boundary, where the two rules
+    /// could part and the banded test must hand back to the angle sum).
+    #[test]
+    fn a_banded_loop_test_agrees_with_the_angle_sum_everywhere() {
+        let poly = comb();
+        let bands = LoopBands::build(&poly);
+        let mut probes: Vec<(f64, f64)> = Vec::new();
+        for i in -10..=110 {
+            for j in -10..=70 {
+                probes.push((i as f64 * 0.1 + 0.0137, j as f64 * 0.1 + 0.0071));
+            }
+        }
+        for i in 0..poly.len() {
+            let a = poly[i];
+            let b = poly[(i + 1) % poly.len()];
+            probes.push(a);
+            probes.push((0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1)));
+        }
+        let mut inside = 0;
+        for &(u, v) in &probes {
+            let want = calculate_winding_number(&(u, v), &poly).abs() > 0.5;
+            assert_eq!(
+                bands.encloses(u, v, &poly),
+                want,
+                "({u}, {v}): banded test disagrees with the angle sum"
+            );
+            inside += usize::from(want);
+        }
+        assert!(
+            inside > 1000,
+            "the grid must probe the inside too ({inside})"
+        );
+    }
+
+    /// A query reads one band, not the whole polygon.
+    #[test]
+    fn a_banded_loop_reads_only_the_segments_level_with_the_query() {
+        let poly = comb();
+        let bands = LoopBands::build(&poly);
+        let read: usize = bands.bands.iter().map(Vec::len).sum();
+        let mean = read as f64 / bands.bands.len() as f64;
+        assert!(
+            mean * 4.0 < poly.len() as f64,
+            "a query reads {mean:.0} of {} segments on average",
+            poly.len()
         );
     }
 }
