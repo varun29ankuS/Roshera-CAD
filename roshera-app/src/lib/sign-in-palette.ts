@@ -20,10 +20,8 @@ export interface SignInScenePalette {
   silhouette: string
   skyLight: string
   groundLight: string
-  /** The wake particles, slow (pale) to fast (deep). */
-  wakePale: string
-  wakeDeep: string
-  /** The wake's overall opacity. */
+  /** The wake's overall opacity. Its particles are coloured by speed with
+   *  the turbo colormap, as a CFD plot is, in both themes. */
   wakeAlpha: number
 }
 
@@ -42,8 +40,6 @@ export function signInScenePalette(theme: SignInTheme): SignInScenePalette {
       silhouette: '#dfe5ec',
       skyLight: '#ffffff',
       groundLight: '#262b31',
-      wakePale: '#b4c6ea',
-      wakeDeep: '#6a8fe0',
       // On graphite the same particle count reads twice as heavy as on paper.
       wakeAlpha: 0.5,
     }
@@ -59,8 +55,6 @@ export function signInScenePalette(theme: SignInTheme): SignInScenePalette {
     silhouette: '#12161a',
     skyLight: '#ffffff',
     groundLight: '#d8d4cc',
-    wakePale: '#80a3f2',
-    wakeDeep: '#174dd9',
     wakeAlpha: 1,
   }
 }
