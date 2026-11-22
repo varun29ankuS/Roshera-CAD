@@ -362,13 +362,34 @@ console.log("(1) TIER 1: pack chunks match the vault doc; certification boundary
   // §3.0 honesty table.
   const PACK_CERT = {
     fdm: { arg: "fdm", rules: ["fdm.overhang", "fdm.min_wall", "fdm.min_bore", "fdm.trapped_volume"], presence: "certified" },
-    injection_molding: { arg: "injection_molding", rules: ["mold.draft"], presence: "certified" },
-    cnc_3_axis: { arg: null, rules: [], presence: "schema_slot_no_rules" },
-    sheet_metal: { arg: null, rules: [], presence: "schema_slot_no_rules" },
+    injection_molding: { arg: "injection_molding", rules: ["mold.draft", "mold.side_action", "mold.trapped_core", "mold.sharp_internal_corner"], presence: "certified" },
+    cnc_3_axis: {
+      arg: "cnc_3_axis",
+      rules: [
+        "cnc.internal_corner_radius", "cnc.corner_reach", "cnc.hole_depth_ratio", "cnc.min_hole_diameter",
+        "cnc.standard_drill_size", "cnc.blind_hole_floor", "cnc.hole_access", "cnc.min_wall",
+      ],
+      presence: "certified",
+    },
+    sheet_metal: {
+      arg: "sheet_metal",
+      rules: [
+        "sheet.uniform_thickness", "sheet.bend_radius", "sheet.hole_to_edge", "sheet.hole_to_bend",
+        "sheet.flange_length", "sheet.developable",
+      ],
+      presence: "certified",
+    },
     sla: { arg: null, rules: [], presence: "none" },
     sls: { arg: null, rules: [], presence: "none" },
     cnc_5_axis: { arg: null, rules: [], presence: "none" },
-    casting: { arg: null, rules: [], presence: "none" },
+    casting: {
+      arg: "casting",
+      rules: [
+        "cast.draft", "cast.min_wall", "cast.max_wall", "cast.internal_fillet", "cast.cored_hole",
+        "cast.side_core", "cast.trapped_core",
+      ],
+      presence: "certified",
+    },
   };
 
   // Independent oracle: re-extract the chunks from the vault doc itself when

@@ -531,6 +531,203 @@ fn mark_ambiguous_pair(
 /// pair (non-opposing normals, coincident planes, or a proven non-
 /// overlap).
 #[allow(clippy::too_many_arguments)]
+/// Every edge of `face` (outer + inner loops) as five points sampled at
+/// `t ∈ {0, ¼, ½, ¾, 1}`, projected onto the plane `(o, n)` — or `None`
+/// when a loop is missing or an edge is not a `Line`/`Arc`/`Circle`. Five
+/// points pin a line segment or a circular arc in the plane exactly (three
+/// already determine the circle, the rest its extent and direction).
+fn projected_edge_samples(
+    face: &Face,
+    n: Vector3,
+    o: Point3,
+    loop_store: &LoopStore,
+    edge_store: &EdgeStore,
+    curve_store: &CurveStore,
+) -> Option<(usize, Vec<[Point3; 5]>)> {
+    let mut loops = vec![face.outer_loop];
+    loops.extend_from_slice(&face.inner_loops);
+    let mut out = Vec::new();
+    for lid in &loops {
+        let lp = loop_store.get(*lid)?;
+        for &eid in &lp.edges {
+            let edge = edge_store.get(eid)?;
+            let curve = curve_store.get(edge.curve_id)?;
+            let any = curve.as_any();
+            if any.downcast_ref::<Line>().is_none()
+                && any.downcast_ref::<Arc>().is_none()
+                && any
+                    .downcast_ref::<crate::primitives::curve::Circle>()
+                    .is_none()
+            {
+                return None;
+            }
+            let mut pts = [Point3::new(0.0, 0.0, 0.0); 5];
+            for (k, slot) in pts.iter_mut().enumerate() {
+                let p = edge.evaluate(k as f64 / 4.0, curve_store).ok()?;
+                *slot = p - n * (p - o).dot(&n);
+            }
+            out.push(pts);
+        }
+    }
+    Some((loops.len(), out))
+}
+
+/// The two faces' trimmed boundaries project onto the same curves (see
+/// `try_plane_pair`'s congruent arm). Each edge must match exactly one
+/// edge of the other face, in either direction, every sample within a
+/// round-off tolerance scaled by the part size.
+fn congruent_projected_loops(
+    face_i: &Face,
+    face_j: &Face,
+    n: Vector3,
+    o: Point3,
+    loop_store: &LoopStore,
+    edge_store: &EdgeStore,
+    curve_store: &CurveStore,
+) -> bool {
+    let (Some((li, ei)), Some((lj, ej))) = (
+        projected_edge_samples(face_i, n, o, loop_store, edge_store, curve_store),
+        projected_edge_samples(face_j, n, o, loop_store, edge_store, curve_store),
+    ) else {
+        return false;
+    };
+    if li != lj || ei.len() != ej.len() || ei.is_empty() {
+        return false;
+    }
+    let scale = ei.iter().flat_map(|s| s.iter()).fold(1.0f64, |m, p| {
+        m.max(p.x.abs()).max(p.y.abs()).max(p.z.abs())
+    });
+    let tol = 1e-9 * scale;
+    let same = |a: &[Point3; 5], b: &[Point3; 5]| {
+        let fwd = a
+            .iter()
+            .zip(b.iter())
+            .all(|(p, q)| (*p - *q).magnitude() <= tol);
+        fwd || a
+            .iter()
+            .zip(b.iter().rev())
+            .all(|(p, q)| (*p - *q).magnitude() <= tol)
+    };
+    let mut used = vec![false; ej.len()];
+    for a in &ei {
+        let Some(k) = (0..ej.len()).find(|&k| !used[k] && same(a, &ej[k])) else {
+            return false;
+        };
+        used[k] = true;
+    }
+    true
+}
+
+/// The convex hull (counter-clockwise, collinear points dropped) of a
+/// planar face's boundary vertices in the basis `(u, v)`, or `None` when
+/// the face has an inner loop, a non-`Line` edge, or a vertex strictly
+/// inside the hull (a non-convex outline: its region is not its hull).
+fn convex_outline(
+    face: &Face,
+    u: Vector3,
+    v: Vector3,
+    loop_store: &LoopStore,
+    edge_store: &EdgeStore,
+    curve_store: &CurveStore,
+) -> Option<Vec<(f64, f64)>> {
+    if !face.inner_loops.is_empty() {
+        return None;
+    }
+    let lp = loop_store.get(face.outer_loop)?;
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    for &eid in &lp.edges {
+        let edge = edge_store.get(eid)?;
+        let line = curve_store
+            .get(edge.curve_id)?
+            .as_any()
+            .downcast_ref::<Line>()?;
+        for p in [line.start, line.end] {
+            pts.push((p.dot(&u), p.dot(&v)));
+        }
+    }
+    let scale = pts
+        .iter()
+        .fold(1.0f64, |m, p| m.max(p.0.abs()).max(p.1.abs()));
+    let eps = 1e-9 * scale;
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    pts.dedup_by(|a, b| (a.0 - b.0).abs() <= eps && (a.1 - b.1).abs() <= eps);
+    if pts.len() < 3 {
+        return None;
+    }
+    let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
+    };
+    // Andrew's monotone chain; drop collinear points.
+    let mut hull: Vec<(f64, f64)> = Vec::new();
+    for pass in 0..2 {
+        let start = hull.len();
+        let iter: Box<dyn Iterator<Item = &(f64, f64)>> = if pass == 0 {
+            Box::new(pts.iter())
+        } else {
+            Box::new(pts.iter().rev())
+        };
+        for &p in iter {
+            while hull.len() >= start + 2
+                && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= eps * scale
+            {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    if hull.len() < 3 {
+        return None;
+    }
+    // Convexity of the FACE: no vertex strictly inside the hull.
+    for &p in &pts {
+        let inside =
+            (0..hull.len()).all(|k| cross(hull[k], hull[(k + 1) % hull.len()], p) > eps * scale);
+        if inside {
+            return None;
+        }
+    }
+    Some(hull)
+}
+
+/// Exact interior-overlap of two convex planar faces projected along `n`
+/// (`Some(true)` overlap of positive area, `Some(false)` proven disjoint or
+/// touching only), or `None` when either face is not a convex polygon.
+fn convex_overlap(
+    face_i: &Face,
+    face_j: &Face,
+    n: Vector3,
+    loop_store: &LoopStore,
+    edge_store: &EdgeStore,
+    curve_store: &CurveStore,
+) -> Option<bool> {
+    let (u, v) = canonical_in_plane_basis(n);
+    let a = convex_outline(face_i, u, v, loop_store, edge_store, curve_store)?;
+    let b = convex_outline(face_j, u, v, loop_store, edge_store, curve_store)?;
+    for poly in [&a, &b] {
+        for k in 0..poly.len() {
+            let (p, q) = (poly[k], poly[(k + 1) % poly.len()]);
+            let axis = (-(q.1 - p.1), q.0 - p.0);
+            let proj = |s: &[(f64, f64)]| {
+                s.iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| {
+                        let d = x.0 * axis.0 + x.1 * axis.1;
+                        (lo.min(d), hi.max(d))
+                    })
+            };
+            let (alo, ahi) = proj(&a);
+            let (blo, bhi) = proj(&b);
+            let len = (axis.0 * axis.0 + axis.1 * axis.1).sqrt();
+            // Overlap along a unit axis, compared with the rectangle arm's
+            // own OVERLAP_EPS.
+            if (ahi.min(bhi) - alo.max(blo)) / len.max(1e-300) <= OVERLAP_EPS {
+                return Some(false);
+            }
+        }
+    }
+    Some(true)
+}
+
 fn try_plane_pair(
     face_i: FaceId,
     n_i: Vector3,
@@ -549,10 +746,17 @@ fn try_plane_pair(
         return Ok(()); // not opposing -- proven non-candidate, no ambiguity
     }
     let separation = (o_j - o_i).dot(&n_i);
-    if separation.abs() <= SEPARATION_EPS {
-        return Ok(()); // coincident planes -- not a wall
+    // MATERIAL SIDE (DFM audit 2026-11-22). With OUTWARD normals the
+    // material lies BEHIND each face, so a wall has face j behind face i:
+    // `(o_j − o_i)·n_i < 0` (a box: top n=+Z at z=10, bottom at z=−10 →
+    // −20). A POSITIVE separation is two faces looking at each other ACROSS
+    // A VOID — a slot's or window's two walls — which is a gap, never a
+    // wall. Taking `|separation|` (the S3 code) paired every such gap as a
+    // wall: a 0.5 mm slot read as a fabricated 0.5 mm thin wall.
+    if separation >= -SEPARATION_EPS {
+        return Ok(()); // a gap across void, or coincident planes -- not a wall
     }
-    let thickness_value = separation.abs();
+    let thickness_value = -separation;
 
     let face_i_ref = face_store
         .get(face_i)
@@ -606,6 +810,72 @@ fn try_plane_pair(
             // -- proven absent, not a refusal.
             return Ok(());
         }
+    }
+
+    // CONGRUENT faces (DFM audit 2026-11-22): when the two faces' trimmed
+    // boundaries project onto the same curves — every loop, outer and
+    // inner, edge for edge — the two trimmed regions are IDENTICAL, so they
+    // overlap in their whole (non-empty) area: the pair is proven exactly.
+    // This is every extrusion's top/bottom and every sheet's two skins
+    // with holes in them, which the rectangle arm refused.
+    if congruent_projected_loops(
+        face_i_ref,
+        face_j_ref,
+        n_i,
+        o_i,
+        loop_store,
+        edge_store,
+        curve_store,
+    ) {
+        pairs.push(FacePair {
+            face_a: face_i.min(face_j),
+            face_b: face_i.max(face_j),
+            thickness: DfmValue::new(
+                thickness_value,
+                Derivation::Analytic {
+                    surface_type: SurfaceKind::Plane,
+                    method: "parallel plane pair: separation along shared outward normal, \
+                             congruent trimmed loops (identical projected boundary)"
+                        .to_string(),
+                },
+            ),
+        });
+        return Ok(());
+    }
+
+    // CONVEX straight-edged faces (DFM audit 2026-11-22): when both faces
+    // are convex polygons (every boundary edge a Line, no inner loop, no
+    // vertex strictly inside the hull of the others), their projected
+    // interiors overlap iff no separating axis exists among the two hulls'
+    // edge normals (separating-axis theorem) — exact, and a strict
+    // generalisation of the rectangle arm, which refused rectangles whose
+    // boolean-rebuilt loops it could not classify.
+    match convex_overlap(
+        face_i_ref,
+        face_j_ref,
+        n_i,
+        loop_store,
+        edge_store,
+        curve_store,
+    ) {
+        Some(true) => {
+            pairs.push(FacePair {
+                face_a: face_i.min(face_j),
+                face_b: face_i.max(face_j),
+                thickness: DfmValue::new(
+                    thickness_value,
+                    Derivation::Analytic {
+                        surface_type: SurfaceKind::Plane,
+                        method: "parallel plane pair: separation along shared outward normal, \
+                                 exact convex-polygon overlap (separating-axis test)"
+                            .to_string(),
+                    },
+                ),
+            });
+            return Ok(());
+        }
+        Some(false) => return Ok(()), // proven disjoint
+        None => {}
     }
 
     // Fallback: necessary-only bound (module docs' conservative-refusal
@@ -704,6 +974,21 @@ pub(super) fn axial_extent(
             let v = (arc.center - axis_point).dot(&axis_dir);
             v_min = v_min.min(v);
             v_max = v_max.max(v);
+        } else if let Some(circle) = curve
+            .as_any()
+            .downcast_ref::<crate::primitives::curve::Circle>()
+        {
+            // DFM audit 2026-11-22: a full-circle rim is a `Circle`, not an
+            // `Arc`; it was refused as an "unsupported boundary curve", so
+            // every bore whose rim the boolean closed as a Circle read
+            // unverifiable. Same rim test as the Arc arm.
+            let alignment = circle.normal().dot(&axis_dir);
+            if (alignment.abs() - 1.0).abs() > RIM_PERPENDICULAR_TOL {
+                return None;
+            }
+            let v = (circle.center() - axis_point).dot(&axis_dir);
+            v_min = v_min.min(v);
+            v_max = v_max.max(v);
         } else {
             return None; // unsupported boundary curve kind
         }
@@ -748,6 +1033,19 @@ fn try_cylinder_pair(
     }
     if sign_i * sign_j > 0.0 {
         return Ok(()); // same radial sense -- not a bore/shaft pair
+    }
+    // MATERIAL SIDE (DFM audit 2026-11-22): the annulus between the two
+    // cylinders holds material only when the CONCAVE (Backward, bore-like)
+    // face is the INNER one: a bore of r 3 in a boss of r 5. A convex face
+    // INSIDE a concave one — a boss standing in a pocket, a pin in a
+    // counterbore — has VOID between them: a gap, never a wall.
+    let (r_concave, r_convex) = if sign_i < 0.0 {
+        (radius_i, radius_j)
+    } else {
+        (radius_j, radius_i)
+    };
+    if r_concave >= r_convex {
+        return Ok(()); // void annulus -- proven non-wall
     }
     if (radius_i - radius_j).abs() <= RADIUS_DISTINCT_EPS {
         return Ok(()); // degenerate (same radius)
@@ -1137,11 +1435,18 @@ pub fn pair_thickness(
                 // returns the constant matching its own concrete type --
                 // verified by reading each impl in primitives/surface.rs,
                 // same invariant `orientation.rs` relies on).
-                #[allow(clippy::expect_used)]
-                let plane = surface
-                    .as_any()
-                    .downcast_ref::<Plane>()
-                    .expect("surface_type() == Plane guarantees Plane downcast");
+                let Some(plane) = surface.as_any().downcast_ref::<Plane>() else {
+                    unverifiable.entry(face_id).or_insert_with(|| {
+                        UnverifiableReason::UnsupportedSurface {
+                            surface_type: SurfaceKind::Plane,
+                            analyzer: format!(
+                                "pair_thickness ({} is not a plain plane)",
+                                surface.type_name()
+                            ),
+                        }
+                    });
+                    continue;
+                };
                 let normal = plane.normal * face.orientation.sign();
                 classified.push((
                     face_id,
@@ -1152,11 +1457,23 @@ pub fn pair_thickness(
                 ));
             }
             SurfaceType::Cylinder => {
-                #[allow(clippy::expect_used)]
-                let cyl = surface
-                    .as_any()
-                    .downcast_ref::<Cylinder>()
-                    .expect("surface_type() == Cylinder guarantees Cylinder downcast");
+                // DFM audit 2026-11-22: `surface_type() == Cylinder` does
+                // NOT guarantee a `Cylinder` — `CylindricalFillet` reports
+                // `SurfaceType::Cylinder` too, and the old `.expect` here
+                // PANICKED on every filleted part. Anything that is not a
+                // plain `Cylinder` is refused by name.
+                let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() else {
+                    unverifiable.entry(face_id).or_insert_with(|| {
+                        UnverifiableReason::UnsupportedSurface {
+                            surface_type: SurfaceKind::Cylinder,
+                            analyzer: format!(
+                                "pair_thickness ({} is not a plain cylinder)",
+                                surface.type_name()
+                            ),
+                        }
+                    });
+                    continue;
+                };
                 classified.push((
                     face_id,
                     Classified::Cylinder {
@@ -1860,20 +2177,23 @@ mod tests {
     // ----- Conservative-refusal boundary: ambiguous (non-rectangular)
     // candidate pair -----
 
-    /// A TRIANGULAR planar face (3 straight edges, not a rectangle)
-    /// candidate-paired against a rectangle whose necessary bounding box
-    /// DOES overlap it: this analyzer cannot compute the exact overlap of
-    /// a triangle against a rectangle in v1, so it must refuse BOTH faces
-    /// rather than guess — the precise "conservative-refusal line" the
-    /// module docs describe, exercised directly.
+    /// A NON-CONVEX (L-shaped) planar face candidate-paired against a
+    /// rectangle whose necessary bounding box DOES overlap it: neither the
+    /// rectangle, congruent nor convex arm decides it, so it must refuse
+    /// BOTH faces rather than guess — the "conservative-refusal line" the
+    /// module docs describe, exercised directly. (Until the DFM audit this
+    /// fixture was a TRIANGLE whose outward normals faced each other across
+    /// void — a gap the material-side check now proves is no wall, and a
+    /// convex outline the separating-axis arm now decides exactly; see
+    /// `convex_triangle_against_rectangle_pairs_exactly`.)
     #[test]
     fn ambiguous_non_rectangular_candidate_pair_is_unverifiable_not_guessed() {
         let mut s = Stores::new();
 
-        // Rectangle at z = 0, outward normal -Z, footprint x in [0,2], y
-        // in [0,2].
+        // Rectangle at z = 0, outward normal +Z (material below it),
+        // footprint x in [0,2], y in [0,2].
         let rect = s.add_rectangle_face(
-            Vector3::new(0.0, 0.0, -1.0),
+            Vector3::new(0.0, 0.0, 1.0),
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(2.0, 0.0, 0.0),
@@ -1881,20 +2201,23 @@ mod tests {
             Point3::new(0.0, 2.0, 0.0),
         );
 
-        // Triangle at z = -1, outward normal +Z (opposing), footprint
-        // squarely inside the rectangle's necessary bounding box.
+        // L-shape at z = -1, outward normal -Z (material above it, between
+        // the two faces), footprint inside the rectangle's bounding box.
         let plane =
-            Plane::from_point_normal(Point3::new(0.0, 0.0, -1.0), Vector3::new(0.0, 0.0, 1.0))
+            Plane::from_point_normal(Point3::new(0.0, 0.0, -1.0), Vector3::new(0.0, 0.0, -1.0))
                 .unwrap_or_else(|e| panic!("valid plane fixture: {e}"));
         let surface_id = s.surfaces.add(Box::new(plane));
         let tri_verts = [
             Point3::new(0.5, 0.5, -1.0),
             Point3::new(1.5, 0.5, -1.0),
+            Point3::new(1.5, 1.0, -1.0),
+            Point3::new(1.0, 1.0, -1.0),
             Point3::new(1.0, 1.5, -1.0),
+            Point3::new(0.5, 1.5, -1.0),
         ];
         let mut loop_ = Loop::new(0, LoopType::Outer);
-        for i in 0..3 {
-            let (start, end) = (tri_verts[i], tri_verts[(i + 1) % 3]);
+        for i in 0..6 {
+            let (start, end) = (tri_verts[i], tri_verts[(i + 1) % 6]);
             let curve_id = s.curves.add(Box::new(Line::new(start, end)));
             let edge = Edge::new(
                 0,
@@ -1923,7 +2246,7 @@ mod tests {
 
         assert!(
             outcome.pairs.is_empty(),
-            "a triangle-vs-rectangle overlap must never be fabricated into an exact pair: {:?}",
+            "an L-vs-rectangle overlap must never be fabricated into an exact pair: {:?}",
             outcome.pairs
         );
         assert_eq!(
@@ -1941,6 +2264,81 @@ mod tests {
                 region.reason,
                 UnverifiableReason::UnsupportedTopology { .. }
             ));
+        }
+    }
+
+    /// DFM audit: a convex triangle against a rectangle, material between
+    /// them (rectangle n = +Z at z = 0, triangle n = −Z at z = −1), is a
+    /// PROVEN pair of thickness exactly 1 via the separating-axis arm —
+    /// and the same triangle facing the rectangle ACROSS VOID (n = +Z) is
+    /// proven no wall at all.
+    #[test]
+    fn convex_triangle_against_rectangle_pairs_exactly() {
+        for (tri_normal_z, expect_pair) in [(-1.0, true), (1.0, false)] {
+            let mut s = Stores::new();
+            let rect = s.add_rectangle_face(
+                Vector3::new(0.0, 0.0, 1.0),
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(2.0, 0.0, 0.0),
+                Point3::new(2.0, 2.0, 0.0),
+                Point3::new(0.0, 2.0, 0.0),
+            );
+            let plane = Plane::from_point_normal(
+                Point3::new(0.0, 0.0, -1.0),
+                Vector3::new(0.0, 0.0, tri_normal_z),
+            )
+            .unwrap_or_else(|e| panic!("valid plane fixture: {e}"));
+            let surface_id = s.surfaces.add(Box::new(plane));
+            let v = [
+                Point3::new(0.5, 0.5, -1.0),
+                Point3::new(1.5, 0.5, -1.0),
+                Point3::new(1.0, 1.5, -1.0),
+            ];
+            let mut loop_ = Loop::new(0, LoopType::Outer);
+            for i in 0..3 {
+                let curve_id = s.curves.add(Box::new(Line::new(v[i], v[(i + 1) % 3])));
+                let edge_id = s.edges.add(Edge::new(
+                    0,
+                    0,
+                    1,
+                    curve_id,
+                    EdgeOrientation::Forward,
+                    ParameterRange::unit(),
+                ));
+                loop_.add_edge(edge_id, true);
+            }
+            let outer_loop = s.loops.add(loop_);
+            let tri = s.faces.add(Face::new(
+                0,
+                surface_id,
+                outer_loop,
+                FaceOrientation::Forward,
+            ));
+            let outcome = pair_thickness(
+                &[rect, tri],
+                &s.faces,
+                &s.loops,
+                &s.edges,
+                &s.curves,
+                &s.surfaces,
+            )
+            .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+            assert!(
+                outcome.unverifiable.is_empty(),
+                "{:?}",
+                outcome.unverifiable
+            );
+            if expect_pair {
+                assert_eq!(outcome.pairs.len(), 1);
+                assert!((outcome.pairs[0].thickness.value - 1.0).abs() < 1e-12);
+            } else {
+                assert!(
+                    outcome.pairs.is_empty(),
+                    "a gap is not a wall: {:?}",
+                    outcome.pairs
+                );
+            }
         }
     }
 

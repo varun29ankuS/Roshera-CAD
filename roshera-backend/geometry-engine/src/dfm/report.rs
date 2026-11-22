@@ -58,12 +58,17 @@ pub enum RulePackId {
     /// Injection molding (spec §3.2 molding pack v1: draft, undercut,
     /// trapped_core).
     InjectionMolding,
-    /// CNC 3-axis — schema-compatible id, rules deferred (spec §7 roadmap:
-    /// needs polyhedral-cone tool-access-reachability machinery).
+    /// CNC milling on a 3-axis machine over a declared set of setup
+    /// directions (`packs::cnc`).
+    #[serde(rename = "cnc_3_axis")]
     Cnc3Axis,
-    /// Sheet metal — schema-compatible id, rules deferred (spec §7
-    /// roadmap: needs developable-surface detection + bend tables).
+    /// Sheet metal: bent from uniform-thickness flat stock
+    /// (`packs::sheet`).
     SheetMetal,
+    /// CNC turning (lathe) about one spindle axis (`packs::turning`).
+    CncTurning,
+    /// Casting into a two-part permanent mould / die (`packs::casting`).
+    Casting,
 }
 
 /// The nine B-Rep surface families a DFM analyzer may encounter, named for
@@ -502,7 +507,15 @@ pub enum DfmSummary {
 /// from this value rather than accepting it as an independent argument,
 /// which removes the pack/params-mismatch failure mode at the type level
 /// instead of policing it at runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// The four process packs added after FDM/molding (`cnc_3_axis`,
+/// `cnc_turning`, `sheet_metal`, `casting`) carry their thresholds in a
+/// params struct whose every field has a serde default, so `{"pack":
+/// "cnc_3_axis"}` alone is a complete request — and the report echoes
+/// the defaults that were actually applied, never an implicit constant.
+/// Every default is documented on its field with where it comes from;
+/// the rule's [`RuleProvenance`] says the same on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "pack", rename_all = "snake_case")]
 pub enum PackParams {
     /// FDM pack v1 params (spec §3.2 defaults: 0.4 mm nozzle, +Z build).
@@ -515,6 +528,280 @@ pub enum PackParams {
         pull_direction: [f64; 3],
         min_draft_deg: f64,
     },
+    /// CNC milling (3-axis) params.
+    #[serde(rename = "cnc_3_axis")]
+    Cnc3Axis(CncMillingParams),
+    /// CNC turning params.
+    CncTurning(CncTurningParams),
+    /// Sheet-metal params.
+    SheetMetal(SheetMetalParams),
+    /// Casting params.
+    Casting(CastingParams),
+}
+
+/// Standard twist-drill series a drilled diameter is checked against by
+/// `cnc.standard_drill_size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrillSeries {
+    /// Metric jobber drills in 0.1 mm steps (the commercial metric set).
+    Metric,
+    /// Fractional-inch drills in 1/64 in steps.
+    InchFractional,
+    /// Either series.
+    MetricOrInch,
+}
+
+impl DrillSeries {
+    fn tag(self) -> u8 {
+        match self {
+            DrillSeries::Metric => 0,
+            DrillSeries::InchFractional => 1,
+            DrillSeries::MetricOrInch => 2,
+        }
+    }
+}
+
+fn default_setup_directions() -> Vec<[f64; 3]> {
+    vec![[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]
+}
+fn default_pull() -> [f64; 3] {
+    [0.0, 0.0, 1.0]
+}
+fn d_min_tool_diameter() -> f64 {
+    3.0
+}
+fn d_max_corner_reach_ratio() -> f64 {
+    4.0
+}
+fn d_max_drill_depth_ratio() -> f64 {
+    10.0
+}
+fn d_min_drill_diameter() -> f64 {
+    1.0
+}
+fn d_standard_drill_max_diameter() -> f64 {
+    13.0
+}
+fn d_drill_series() -> DrillSeries {
+    DrillSeries::Metric
+}
+fn d_drill_size_tolerance() -> f64 {
+    0.001
+}
+fn d_drill_point_angles() -> Vec<f64> {
+    vec![118.0, 135.0, 140.0]
+}
+fn d_drill_point_tolerance() -> f64 {
+    0.5
+}
+fn d_hole_axis_tolerance_deg() -> f64 {
+    1e-6
+}
+fn d_cnc_min_wall() -> f64 {
+    0.8
+}
+fn d_max_bore_depth_ratio() -> f64 {
+    4.0
+}
+fn d_one() -> f64 {
+    1.0
+}
+fn d_hole_edge_factor() -> f64 {
+    2.0
+}
+fn d_hole_bend_factor() -> f64 {
+    2.5
+}
+fn d_min_flange_factor() -> f64 {
+    4.0
+}
+fn d_thickness_tolerance() -> f64 {
+    0.001
+}
+fn d_cast_max_wall() -> f64 {
+    6.0
+}
+fn d_cored_hole() -> f64 {
+    2.5
+}
+
+/// CNC milling pack params. Defaults are shop practice (see each field);
+/// `setup_directions` is the machining PLAN, not a property of the part —
+/// an agent sets it to the setups it intends (each a unit vector pointing
+/// from the part toward the spindle).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CncMillingParams {
+    /// Setup (approach) directions; default `[+Z, −Z]` (top op, then flip).
+    #[serde(default = "default_setup_directions")]
+    pub setup_directions: Vec<[f64; 3]>,
+    /// Smallest end mill the shop will use, mm (default 3.0). An inside
+    /// corner a cutter's SIDE forms is at best this tool's radius.
+    #[serde(default = "d_min_tool_diameter")]
+    pub min_tool_diameter: f64,
+    /// Max tool reach, length of cut ÷ tool diameter (default 4.0: standard
+    /// end mills cut ~3–4× their diameter).
+    #[serde(default = "d_max_corner_reach_ratio")]
+    pub max_corner_reach_ratio: f64,
+    /// Max drilled depth ÷ diameter (default 10: twist-drill limit; deeper
+    /// is gun drilling).
+    #[serde(default = "d_max_drill_depth_ratio")]
+    pub max_drill_depth_ratio: f64,
+    /// Smallest drill, mm (default 1.0).
+    #[serde(default = "d_min_drill_diameter")]
+    pub min_drill_diameter: f64,
+    /// Drills larger than this are assumed milled/bored, not drilled, and
+    /// are outside `cnc.standard_drill_size`'s scope (default 13.0 mm, the
+    /// top of the common 0.1 mm-step metric jobber set).
+    #[serde(default = "d_standard_drill_max_diameter")]
+    pub standard_drill_max_diameter: f64,
+    /// Drill series (default metric 0.1 mm steps).
+    #[serde(default = "d_drill_series")]
+    pub drill_series: DrillSeries,
+    /// How far a diameter may sit from a series size, mm (default 0.001).
+    #[serde(default = "d_drill_size_tolerance")]
+    pub drill_size_tolerance: f64,
+    /// Standard drill-point included angles, degrees (default 118/135/140).
+    #[serde(default = "d_drill_point_angles")]
+    pub drill_point_angles_deg: Vec<f64>,
+    /// Tolerance on a drill-point angle, degrees (default 0.5).
+    #[serde(default = "d_drill_point_tolerance")]
+    pub drill_point_tolerance_deg: f64,
+    /// Accept flat-bottomed blind holes (default false: they need a
+    /// flat-bottom drill or an end mill after drilling).
+    #[serde(default)]
+    pub allow_flat_bottom_holes: bool,
+    /// Hole-axis vs setup-direction misalignment tolerance, degrees
+    /// (default 1e-6: numerical only — an angled hole is a real finding).
+    #[serde(default = "d_hole_axis_tolerance_deg")]
+    pub hole_axis_tolerance_deg: f64,
+    /// Thinnest machinable wall, mm (default 0.8, the common CNC guide
+    /// figure for metals; ~1.5 for plastics).
+    #[serde(default = "d_cnc_min_wall")]
+    pub min_wall: f64,
+}
+
+impl Default for CncMillingParams {
+    fn default() -> Self {
+        Self {
+            setup_directions: default_setup_directions(),
+            min_tool_diameter: d_min_tool_diameter(),
+            max_corner_reach_ratio: d_max_corner_reach_ratio(),
+            max_drill_depth_ratio: d_max_drill_depth_ratio(),
+            min_drill_diameter: d_min_drill_diameter(),
+            standard_drill_max_diameter: d_standard_drill_max_diameter(),
+            drill_series: d_drill_series(),
+            drill_size_tolerance: d_drill_size_tolerance(),
+            drill_point_angles_deg: d_drill_point_angles(),
+            drill_point_tolerance_deg: d_drill_point_tolerance(),
+            allow_flat_bottom_holes: false,
+            hole_axis_tolerance_deg: d_hole_axis_tolerance_deg(),
+            min_wall: d_cnc_min_wall(),
+        }
+    }
+}
+
+/// CNC turning pack params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CncTurningParams {
+    /// Spindle axis as `(point, direction)`. `None` (default) infers it
+    /// from the part: the unique axis line shared by every convex (OD)
+    /// cylinder; no unique axis is a typed refusal, never a guess.
+    #[serde(default)]
+    pub spindle_axis: Option<([f64; 3], [f64; 3])>,
+    /// Max internal bore depth ÷ diameter (default 4.0: steel boring-bar
+    /// overhang ~4× bar diameter).
+    #[serde(default = "d_max_bore_depth_ratio")]
+    pub max_bore_depth_ratio: f64,
+    /// Thinnest turnable wall, mm (default 0.8).
+    #[serde(default = "d_cnc_min_wall")]
+    pub min_wall: f64,
+}
+
+impl Default for CncTurningParams {
+    fn default() -> Self {
+        Self {
+            spindle_axis: None,
+            max_bore_depth_ratio: d_max_bore_depth_ratio(),
+            min_wall: d_cnc_min_wall(),
+        }
+    }
+}
+
+/// Sheet-metal pack params. Every distance factor multiplies the sheet
+/// thickness `t`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SheetMetalParams {
+    /// Gauge, mm. `None` (default) infers it: the thinnest proven wall
+    /// pair; no proven pair is a typed refusal for every rule needing `t`.
+    #[serde(default)]
+    pub thickness: Option<f64>,
+    /// Equality tolerance on thickness, mm (default 0.001).
+    #[serde(default = "d_thickness_tolerance")]
+    pub thickness_tolerance: f64,
+    /// Min inside bend radius ÷ t (default 1.0; soft alloys 0.5, hard 1.5).
+    #[serde(default = "d_one")]
+    pub min_bend_radius_factor: f64,
+    /// Min hole-rim-to-free-edge distance ÷ t (default 2.0).
+    #[serde(default = "d_hole_edge_factor")]
+    pub hole_edge_factor: f64,
+    /// Min hole-rim-to-bend distance ÷ t, plus the inside bend radius
+    /// (default 2.5 t + R).
+    #[serde(default = "d_hole_bend_factor")]
+    pub hole_bend_factor: f64,
+    /// Min flange length ÷ t (default 4.0).
+    #[serde(default = "d_min_flange_factor")]
+    pub min_flange_factor: f64,
+}
+
+impl Default for SheetMetalParams {
+    fn default() -> Self {
+        Self {
+            thickness: None,
+            thickness_tolerance: d_thickness_tolerance(),
+            min_bend_radius_factor: d_one(),
+            hole_edge_factor: d_hole_edge_factor(),
+            hole_bend_factor: d_hole_bend_factor(),
+            min_flange_factor: d_min_flange_factor(),
+        }
+    }
+}
+
+/// Casting (two-part die / permanent mould) pack params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CastingParams {
+    /// Die opening direction (default +Z).
+    #[serde(default = "default_pull")]
+    pub pull_direction: [f64; 3],
+    /// Minimum draft, degrees (default 1.0).
+    #[serde(default = "d_one")]
+    pub min_draft_deg: f64,
+    /// Thinnest wall that fills, mm (default 1.0, die-cast aluminium).
+    #[serde(default = "d_one")]
+    pub min_wall: f64,
+    /// Thickest wall before hot spots / shrink porosity, mm (default 6.0).
+    #[serde(default = "d_cast_max_wall")]
+    pub max_wall: f64,
+    /// Smallest internal fillet radius, mm (default 1.0; sources diverge
+    /// 0.5–1.5).
+    #[serde(default = "d_one")]
+    pub min_fillet_radius: f64,
+    /// Smallest cored (cast-in) hole diameter, mm (default 2.5).
+    #[serde(default = "d_cored_hole")]
+    pub min_cored_hole_diameter: f64,
+}
+
+impl Default for CastingParams {
+    fn default() -> Self {
+        Self {
+            pull_direction: default_pull(),
+            min_draft_deg: d_one(),
+            min_wall: d_one(),
+            max_wall: d_cast_max_wall(),
+            min_fillet_radius: d_one(),
+            min_cored_hole_diameter: d_cored_hole(),
+        }
+    }
 }
 
 impl PackParams {
@@ -525,6 +812,10 @@ impl PackParams {
         match self {
             PackParams::Fdm { .. } => RulePackId::Fdm,
             PackParams::InjectionMolding { .. } => RulePackId::InjectionMolding,
+            PackParams::Cnc3Axis(_) => RulePackId::Cnc3Axis,
+            PackParams::CncTurning(_) => RulePackId::CncTurning,
+            PackParams::SheetMetal(_) => RulePackId::SheetMetal,
+            PackParams::Casting(_) => RulePackId::Casting,
         }
     }
 
@@ -581,6 +872,13 @@ impl PackParams {
             }
             hash
         }
+        fn fold_len(hash: u64, len: usize) -> u64 {
+            let mut hash = hash;
+            for byte in (len as u64).to_le_bytes() {
+                hash = fold_byte(hash, byte);
+            }
+            hash
+        }
 
         let mut hash = FNV_OFFSET_BASIS;
         match self {
@@ -604,6 +902,86 @@ impl PackParams {
                 }
                 hash = fold_f64(hash, *min_draft_deg);
             }
+            // Later packs: discriminants 2..=5, then every field in
+            // declaration order; a Vec folds its length (u64 LE) first and
+            // an Option a 0/1 presence byte first, so no two distinct
+            // parameter sets share a byte stream.
+            PackParams::Cnc3Axis(p) => {
+                hash = fold_byte(hash, 2u8);
+                hash = fold_len(hash, p.setup_directions.len());
+                for d in &p.setup_directions {
+                    for c in d {
+                        hash = fold_f64(hash, *c);
+                    }
+                }
+                for v in [
+                    p.min_tool_diameter,
+                    p.max_corner_reach_ratio,
+                    p.max_drill_depth_ratio,
+                    p.min_drill_diameter,
+                    p.standard_drill_max_diameter,
+                ] {
+                    hash = fold_f64(hash, v);
+                }
+                hash = fold_byte(hash, p.drill_series.tag());
+                hash = fold_f64(hash, p.drill_size_tolerance);
+                hash = fold_len(hash, p.drill_point_angles_deg.len());
+                for a in &p.drill_point_angles_deg {
+                    hash = fold_f64(hash, *a);
+                }
+                hash = fold_f64(hash, p.drill_point_tolerance_deg);
+                hash = fold_byte(hash, u8::from(p.allow_flat_bottom_holes));
+                hash = fold_f64(hash, p.hole_axis_tolerance_deg);
+                hash = fold_f64(hash, p.min_wall);
+            }
+            PackParams::CncTurning(p) => {
+                hash = fold_byte(hash, 3u8);
+                match &p.spindle_axis {
+                    None => hash = fold_byte(hash, 0u8),
+                    Some((o, k)) => {
+                        hash = fold_byte(hash, 1u8);
+                        for c in o.iter().chain(k.iter()) {
+                            hash = fold_f64(hash, *c);
+                        }
+                    }
+                }
+                hash = fold_f64(hash, p.max_bore_depth_ratio);
+                hash = fold_f64(hash, p.min_wall);
+            }
+            PackParams::SheetMetal(p) => {
+                hash = fold_byte(hash, 4u8);
+                match p.thickness {
+                    None => hash = fold_byte(hash, 0u8),
+                    Some(t) => {
+                        hash = fold_byte(hash, 1u8);
+                        hash = fold_f64(hash, t);
+                    }
+                }
+                for v in [
+                    p.thickness_tolerance,
+                    p.min_bend_radius_factor,
+                    p.hole_edge_factor,
+                    p.hole_bend_factor,
+                    p.min_flange_factor,
+                ] {
+                    hash = fold_f64(hash, v);
+                }
+            }
+            PackParams::Casting(p) => {
+                hash = fold_byte(hash, 5u8);
+                for c in p.pull_direction {
+                    hash = fold_f64(hash, c);
+                }
+                for v in [
+                    p.min_draft_deg,
+                    p.min_wall,
+                    p.max_wall,
+                    p.min_fillet_radius,
+                    p.min_cored_hole_diameter,
+                ] {
+                    hash = fold_f64(hash, v);
+                }
+            }
         }
         hash
     }
@@ -622,6 +1000,10 @@ pub enum DfmError {
     /// outcome.
     #[error("face {face} does not exist in the solid DFM analysis was requested against")]
     DanglingFaceRef { face: FaceRef },
+    /// A pack parameter cannot be used as given (a zero direction vector,
+    /// a non-finite threshold) — malformed input, never a refusal.
+    #[error("DFM pack parameters are malformed: {detail}")]
+    InvalidParams { detail: String },
     /// A solid reference does not resolve against the model DFM analysis
     /// was requested against — malformed input, never a legitimate
     /// analyzer outcome. Introduced by [`crate::dfm::analyzers::bore`]

@@ -48,10 +48,24 @@ pub fn draft_provenance() -> RuleProvenance {
 pub fn rule_pack(params: PackParams) -> RulePack {
     RulePack {
         params,
-        rules: vec![Rule {
-            id: DRAFT_RULE_ID,
-            provenance: draft_provenance(),
-        }],
+        rules: vec![
+            Rule {
+                id: DRAFT_RULE_ID,
+                provenance: draft_provenance(),
+            },
+            Rule {
+                id: SIDE_ACTION_RULE_ID,
+                provenance: side_action_provenance(),
+            },
+            Rule {
+                id: TRAPPED_CORE_RULE_ID,
+                provenance: trapped_core_provenance(),
+            },
+            Rule {
+                id: SHARP_INTERNAL_CORNER_RULE_ID,
+                provenance: sharp_internal_corner_provenance(),
+            },
+        ],
     }
 }
 
@@ -393,35 +407,113 @@ pub fn evaluate_draft(
     })
 }
 
+/// `mold.side_action` — every hole's axis lies along `±pull`; any other
+/// hole is an undercut that needs a side action (slide / lifter).
+pub const SIDE_ACTION_RULE_ID: &str = "mold.side_action";
+/// `mold.trapped_core` — no fully enclosed cavity (its core can never be
+/// withdrawn).
+pub const TRAPPED_CORE_RULE_ID: &str = "mold.trapped_core";
+/// `mold.sharp_internal_corner` — no sharp (radius-0) concave edge: a
+/// sharp inside corner concentrates stress and moulded-in strain.
+pub const SHARP_INTERNAL_CORNER_RULE_ID: &str = "mold.sharp_internal_corner";
+
+pub fn side_action_provenance() -> RuleProvenance {
+    RuleProvenance::ShopPractice {
+        note: "a core pin is withdrawn along the mould-opening axis (geometric fact); any other \
+               hole axis needs a side action — molding practice"
+            .to_string(),
+    }
+}
+pub fn trapped_core_provenance() -> RuleProvenance {
+    RuleProvenance::ShopPractice {
+        note: "a fully enclosed cavity's core can never be withdrawn (geometric fact)".to_string(),
+    }
+}
+pub fn sharp_internal_corner_provenance() -> RuleProvenance {
+    RuleProvenance::ShopPractice {
+        note: "sharp inside corners concentrate stress and impede flow; design guides ask for an \
+               inside radius (commonly >= 0.5x wall) — molding practice; this rule flags only \
+               radius 0"
+            .to_string(),
+    }
+}
+
 /// The molding pack's `evaluate()` arm (spec §3.2 params: `pull_direction`,
-/// `min_draft_deg`; default 1°).
+/// `min_draft_deg`; default 1°). Since the DFM audit (2026-11-22) it runs
+/// FOUR rules, `mold.draft` first so indexed reads stay valid:
+/// `mold.draft`, `mold.side_action`, `mold.trapped_core`,
+/// `mold.sharp_internal_corner`.
 pub fn evaluate(
+    model: &crate::primitives::topology_builder::BRepModel,
+    solid_id: crate::primitives::solid::SolidId,
     faces: &[FaceId],
     pull_direction: [f64; 3],
     min_draft_deg: f64,
-    face_store: &FaceStore,
-    loop_store: &LoopStore,
-    edge_store: &EdgeStore,
-    curve_store: &CurveStore,
-    surface_store: &SurfaceStore,
 ) -> Result<DfmReport, DfmError> {
+    use crate::dfm::analyzers::features::concave_features;
+    use crate::dfm::analyzers::holes::hole_census;
+    use crate::dfm::packs::common::{analytic, relabel, unit_direction, RuleFold, Sense};
+
     let dir = Vector3::new(pull_direction[0], pull_direction[1], pull_direction[2]);
     let draft = evaluate_draft(
         faces,
         dir,
         min_draft_deg,
-        face_store,
-        loop_store,
-        edge_store,
-        curve_store,
-        surface_store,
+        &model.faces,
+        &model.loops,
+        &model.edges,
+        &model.curves,
+        &model.surfaces,
     )?;
+    let pull = unit_direction(pull_direction, "pull direction")?;
+    let features = concave_features(model, solid_id)?;
+    let census = hole_census(model, solid_id, &features);
+    let side_action = relabel(
+        crate::dfm::packs::cnc::evaluate_hole_access(
+            &census,
+            &[pull, [-pull[0], -pull[1], -pull[2]]],
+            1e-6,
+        ),
+        SIDE_ACTION_RULE_ID,
+        side_action_provenance(),
+    );
+    let trapped = relabel(
+        crate::dfm::packs::fdm::evaluate_trapped_volume(model, solid_id)?,
+        TRAPPED_CORE_RULE_ID,
+        trapped_core_provenance(),
+    );
+    let mut sharp = RuleFold::new(
+        SHARP_INTERNAL_CORNER_RULE_ID,
+        sharp_internal_corner_provenance(),
+        Sense::AtMost,
+        0.0,
+        "mold.sharp_internal_corner limit: no radius-0 inside corner",
+    );
+    let mut witnesses = Vec::new();
+    for e in &features.sharp_edges {
+        witnesses.extend(e.faces);
+    }
+    witnesses.sort_unstable();
+    witnesses.dedup();
+    sharp.observe(
+        witnesses,
+        features.sharp_edges.len() as f64,
+        analytic("count of sharp concave edges (adjacency graph convexity)"),
+    );
+    for u in &features.undetermined {
+        sharp.refuse(
+            u.faces.to_vec(),
+            UnverifiableReason::UnsupportedTopology {
+                detail: format!("edge {}: convexity could not be derived", u.edge),
+            },
+        );
+    }
     Ok(DfmReport::new(
         PackParams::InjectionMolding {
             pull_direction,
             min_draft_deg,
         },
-        vec![draft],
+        vec![draft, side_action, trapped, sharp.finish()],
     ))
 }
 

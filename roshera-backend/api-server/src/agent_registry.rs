@@ -1801,16 +1801,21 @@ fn raw_tools() -> Vec<ToolSpec> {
             Analysis,
             Experimental,
             Curated,
-            "Run a DFM (design-for-manufacturability) rule pack against a part off the analytic B-Rep. The 'fdm' pack checks fdm.min_wall (wall >= 2x nozzle diameter), fdm.overhang (no face > 45 deg from vertical), fdm.min_bore (bore diameter >= 2x nozzle diameter) and fdm.trapped_volume (enclosed cavity traps unremovable support); 'injection_molding' checks mold.draft. FDM limits are shop practice, not a governing standard -- each verdict carries its provenance. Returns the kernel's own DfmReport verbatim -- never a fabricated pass; a rule that could not be checked reports 'unverifiable', never 'pass'.",
+            "Run a DFM (design-for-manufacturability) rule pack against a part off the analytic B-Rep: can this be made by the process, and what will hurt? Packs: 'fdm' (overhang, min_wall, min_bore, trapped_volume); 'injection_molding' (draft, side_action, trapped_core, sharp_internal_corner); 'cnc_3_axis' (internal_corner_radius vs the smallest tool, corner_reach L/D, hole_depth_ratio, min_hole_diameter, standard_drill_size, blind_hole_floor, hole_access vs your setup_directions, min_wall); 'cnc_turning' (axisymmetry about the spindle, bore_depth_ratio, min_wall); 'sheet_metal' (uniform_thickness, bend_radius, hole_to_edge, hole_to_bend, flange_length, developable); 'casting' (draft, min_wall, max_wall, internal_fillet, cored_hole, side_core, trapped_core). Every threshold is a parameter with a cited default (shop practice, never dressed up as a standard); every violation names its faces with measured vs limit, plus an 'animations' list that explains each violation in the viewport. Returns the kernel's own DfmReport verbatim -- never a fabricated pass; a rule that could not be checked reports 'unverifiable', never 'pass'.",
             json!({
                 "type": "object",
                 "properties": {
                     "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
-                    "pack": {"type": "string", "enum": ["fdm", "injection_molding"], "description": "which rule pack to evaluate"},
+                    "pack": {"type": "string", "enum": ["fdm", "injection_molding", "cnc_3_axis", "cnc_turning", "sheet_metal", "casting"], "description": "which rule pack to evaluate"},
                     "nozzle_diameter": {"type": "number", "description": "fdm pack only; mm, default 0.4"},
                     "build_direction": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "fdm pack only; unit build-up direction, default [0,0,1]"},
-                    "pull_direction": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "injection_molding pack only; unit mold-pull direction, default [0,0,1]"},
-                    "min_draft_deg": {"type": "number", "description": "injection_molding pack only; minimum draft angle in degrees, default 1.0"}
+                    "pull_direction": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "injection_molding / casting; unit mold-pull direction, default [0,0,1]"},
+                    "min_draft_deg": {"type": "number", "description": "injection_molding / casting; minimum draft angle in degrees, default 1.0"},
+                    "setup_directions": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "description": "cnc_3_axis; the setup plan, unit vectors from the part toward the spindle, default [[0,0,1],[0,0,-1]]"},
+                    "min_tool_diameter": {"type": "number", "description": "cnc_3_axis; smallest end mill, mm, default 3.0"},
+                    "spindle_axis": {"type": "array", "description": "cnc_turning; [[point],[direction]]; default inferred from the part's OD cylinders (refused if no unique axis)"},
+                    "thickness": {"type": "number", "description": "sheet_metal; gauge in mm; default inferred from the proven wall pairs (refused when it cannot be proven)"},
+                    "params": {"type": "object", "description": "any other pack threshold by its field name (e.g. max_drill_depth_ratio, min_wall, max_wall, hole_edge_factor); omitted fields take their cited defaults"}
                 },
                 "required": ["part_id", "pack"]
             }),

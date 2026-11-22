@@ -665,11 +665,20 @@ pub fn face_orientation_field(
             // every `Surface` impl's `surface_type()` returns the constant
             // matching its own concrete type (verified by reading each
             // impl in primitives/surface.rs).
-            #[allow(clippy::expect_used)]
-            let plane = surface
-                .as_any()
-                .downcast_ref::<Plane>()
-                .expect("surface_type() == Plane guarantees Plane downcast");
+            // DFM audit 2026-11-22: `surface_type() == Plane` does not guarantee
+            // a `Plane` (`CylindricalFillet` reports `Cylinder`); the old
+            // `.expect` panicked on filleted parts. Refuse by name instead.
+            let Some(plane) = surface.as_any().downcast_ref::<Plane>() else {
+                return Ok(OrientationOutcome::Unverifiable {
+                    reason: UnverifiableReason::UnsupportedSurface {
+                        surface_type: SurfaceKind::Plane,
+                        analyzer: format!(
+                            "face_orientation_field ({} is not a plain plane)",
+                            surface.type_name()
+                        ),
+                    },
+                });
+            };
             let dot = (sign * plane.normal.dot(&dir)).clamp(-1.0, 1.0);
             let angle = dot.acos().to_degrees();
             Ok(OrientationOutcome::Range {
@@ -683,11 +692,20 @@ pub fn face_orientation_field(
         }
 
         SurfaceType::Cylinder => {
-            #[allow(clippy::expect_used)]
-            let cyl = surface
-                .as_any()
-                .downcast_ref::<Cylinder>()
-                .expect("surface_type() == Cylinder guarantees Cylinder downcast");
+            // DFM audit 2026-11-22: `surface_type() == Cylinder` does not guarantee
+            // a `Cylinder` (`CylindricalFillet` reports `Cylinder`); the old
+            // `.expect` panicked on filleted parts. Refuse by name instead.
+            let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() else {
+                return Ok(OrientationOutcome::Unverifiable {
+                    reason: UnverifiableReason::UnsupportedSurface {
+                        surface_type: SurfaceKind::Cylinder,
+                        analyzer: format!(
+                            "face_orientation_field ({} is not a plain cyl)",
+                            surface.type_name()
+                        ),
+                    },
+                });
+            };
             match angular_intervals_for_face(
                 face,
                 loop_store,
@@ -727,11 +745,20 @@ pub fn face_orientation_field(
         }
 
         SurfaceType::Cone => {
-            #[allow(clippy::expect_used)]
-            let cone = surface
-                .as_any()
-                .downcast_ref::<Cone>()
-                .expect("surface_type() == Cone guarantees Cone downcast");
+            // DFM audit 2026-11-22: `surface_type() == Cone` does not guarantee
+            // a `Cone` (`CylindricalFillet` reports `Cylinder`); the old
+            // `.expect` panicked on filleted parts. Refuse by name instead.
+            let Some(cone) = surface.as_any().downcast_ref::<Cone>() else {
+                return Ok(OrientationOutcome::Unverifiable {
+                    reason: UnverifiableReason::UnsupportedSurface {
+                        surface_type: SurfaceKind::Cone,
+                        analyzer: format!(
+                            "face_orientation_field ({} is not a plain cone)",
+                            surface.type_name()
+                        ),
+                    },
+                });
+            };
             match angular_intervals_for_face(
                 face,
                 loop_store,

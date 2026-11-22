@@ -5471,6 +5471,119 @@ async fn dfm_check_refuses_a_never_verified_solid() {
     );
 }
 
+/// Disconnection gate for the process packs: every new pack is reachable
+/// through the PRODUCTION route with nothing but its tag (`{"pack":
+/// "cnc_3_axis"}` — every threshold takes its cited default), the report
+/// carries each pack's rule ids, and the response carries the additive
+/// `animations` list built from the same verdicts.
+#[tokio::test]
+async fn dfm_check_runs_every_process_pack_on_a_verified_solid() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
+    let verify_req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (verify_status, verify_body) = dispatch(&state, verify_req).await;
+    assert_eq!(verify_status, StatusCode::OK, "body = {verify_body}");
+
+    for (pack, first_rule) in [
+        ("cnc_3_axis", "cnc.internal_corner_radius"),
+        ("cnc_turning", "turn.axisymmetry"),
+        ("sheet_metal", "sheet.uniform_thickness"),
+        ("casting", "cast.draft"),
+        ("injection_molding", "mold.draft"),
+    ] {
+        let body = if pack == "injection_molding" {
+            json!({ "pack": pack, "pull_direction": [0.0, 0.0, 1.0], "min_draft_deg": 1.0 })
+        } else {
+            json!({ "pack": pack })
+        };
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/agent/parts/{solid_id}/dfm"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("static request must build");
+        let (status, body) = dispatch(&state, request).await;
+        assert_eq!(status, StatusCode::OK, "{pack}: body = {body}");
+        assert_eq!(body["pack"].as_str(), Some(pack), "{pack}: body = {body}");
+        assert_eq!(
+            body["verdicts"][0]["rule"].as_str(),
+            Some(first_rule),
+            "{pack}: body = {body}"
+        );
+        assert!(body["animations"].is_array(), "{pack}: body = {body}");
+    }
+
+    // A cube's walls are vertical: casting draft is violated, and that
+    // violation arrives with its explanation.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/agent/parts/{solid_id}/dfm"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "pack": "casting" }).to_string()))
+        .expect("static request must build");
+    let (_, body) = dispatch(&state, request).await;
+    let anims = body["animations"].as_array().cloned().unwrap_or_default();
+    assert!(
+        anims
+            .iter()
+            .any(|a| a["rule"] == "cast.draft" && a["kind"] == "mold_separation"),
+        "body = {body}"
+    );
+}
+
+/// A solid whose CURRENT certificate says unsound (verified, not stale) is
+/// refused pre-flight with 422 `dfm_unsound_solid`: no rule measures
+/// geometry the kernel itself rejects. Before this gate the stale check let
+/// it through and every pack ran (a cube passes most CNC rules — a "pass"
+/// on a rejected solid).
+#[tokio::test]
+async fn dfm_check_refuses_a_verified_unsound_solid() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = seed_box_with_drifted_construction(&state, 10.0).await;
+    // Verify: the full certificate is computed and cached as UNSOUND.
+    let verify_req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (verify_status, verify_body) = dispatch(&state, verify_req).await;
+    assert_eq!(verify_status, StatusCode::OK, "body = {verify_body}");
+    assert_eq!(
+        verify_body["sound"].as_bool(),
+        Some(false),
+        "fixture must verify unsound; body = {verify_body}"
+    );
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/agent/parts/{solid_id}/dfm"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "pack": "cnc_3_axis" }).to_string()))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "DFM on a verified-unsound solid must be refused; body = {body}"
+    );
+    assert_eq!(
+        body["error"].as_str(),
+        Some("dfm_unsound_solid"),
+        "body = {body}"
+    );
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unsound"),
+        "the refusal names the certificate's verdict; body = {body}"
+    );
+}
+
 /// `GET .../truth` on a never-verified solid reads back `status: "stale"`
 /// and `sound: false` — never a silently-recomputed passing verdict. This is
 /// the core P1 change: the OLD path (`BRepModel::ground_truth`) would have

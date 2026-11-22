@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Check, CircleHelp, Play, X } from 'lucide-react'
+import { Check, CircleHelp, Clapperboard, Play, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
 import { useDfmStore } from '@/stores/dfm-store'
@@ -12,6 +12,7 @@ import {
   type DfmPackParams,
   type DfmState,
 } from '@/lib/dfm'
+import { animationFor } from '@/lib/dfm-animation'
 
 const DIRECTIONS: { label: string; v: [number, number, number] }[] = [
   { label: '+Z (up)', v: [0, 0, 1] },
@@ -20,6 +21,13 @@ const DIRECTIONS: { label: string; v: [number, number, number] }[] = [
   { label: '−X', v: [-1, 0, 0] },
   { label: '+Y', v: [0, 1, 0] },
   { label: '−Y', v: [0, -1, 0] },
+]
+
+/** CNC setup plans offered (unit vectors from the part toward the spindle). */
+const SETUP_PLANS: { label: string; dirs: [number, number, number][] }[] = [
+  { label: 'Top + flip (±Z)', dirs: [[0, 0, 1], [0, 0, -1]] },
+  { label: 'Top only (+Z)', dirs: [[0, 0, 1]] },
+  { label: 'All six sides', dirs: [[0, 0, 1], [0, 0, -1], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0]] },
 ]
 
 const STATE_STYLE: Record<DfmState, { mark: string; text: string; wash: string }> = {
@@ -56,6 +64,8 @@ export function DfmPanel() {
   const focusRule = useDfmStore((s) => s.focusRule)
   const setResult = useDfmStore((s) => s.setResult)
   const focus = useDfmStore((s) => s.focus)
+  const playingRule = useDfmStore((s) => s.playingRule)
+  const play = useDfmStore((s) => s.play)
 
   const parts = useMemo(
     () => [...objects.values()].filter((o) => typeof solidOf(o) === 'number' && o.visible !== false),
@@ -66,7 +76,10 @@ export function DfmPanel() {
   const partId = chosenId && objects.has(chosenId) ? chosenId : (firstSelected ?? parts[0])?.id ?? null
   const part = partId ? objects.get(partId) : undefined
 
-  const [pack, setPack] = useState<DfmPackParams['pack']>('fdm')
+  const [pack, setPack] = useState<DfmPackParams['pack']>('cnc_3_axis')
+  const [toolDia, setToolDia] = useState('3')
+  const [planIndex, setPlanIndex] = useState(0)
+  const [gauge, setGauge] = useState('')
   const [nozzle, setNozzle] = useState('0.4')
   const [draft, setDraft] = useState('1')
   const [dirIndex, setDirIndex] = useState(0)
@@ -74,12 +87,33 @@ export function DfmPanel() {
 
   const params = (): DfmPackParams | null => {
     const v = DIRECTIONS[dirIndex].v
-    if (pack === 'fdm') {
-      const n = Number(nozzle)
-      return Number.isFinite(n) && n > 0 ? { pack, nozzle_diameter: n, build_direction: v } : null
+    const positive = (x: string) => {
+      const n = Number(x)
+      return Number.isFinite(n) && n > 0 ? n : null
     }
-    const d = Number(draft)
-    return Number.isFinite(d) && d >= 0 ? { pack, pull_direction: v, min_draft_deg: d } : null
+    switch (pack) {
+      case 'fdm': {
+        const n = positive(nozzle)
+        return n === null ? null : { pack, nozzle_diameter: n, build_direction: v }
+      }
+      case 'injection_molding':
+      case 'casting': {
+        const d = Number(draft)
+        return Number.isFinite(d) && d >= 0 ? { pack, pull_direction: v, min_draft_deg: d } : null
+      }
+      case 'cnc_3_axis': {
+        const t = positive(toolDia)
+        return t === null ? null : { pack, setup_directions: SETUP_PLANS[planIndex].dirs, min_tool_diameter: t }
+      }
+      case 'cnc_turning':
+        // The spindle axis is inferred by the kernel (or refused by name).
+        return { pack }
+      case 'sheet_metal': {
+        if (gauge.trim() === '') return { pack }
+        const g = positive(gauge)
+        return g === null ? null : { pack, thickness: g }
+      }
+    }
   }
 
   const run = async (verifyFirst: boolean) => {
@@ -147,7 +181,7 @@ export function DfmPanel() {
             ))}
           </select>
         </label>
-        {pack === 'fdm' ? (
+        {pack === 'fdm' && (
           <label className="flex items-center gap-2">
             <span className="w-16 text-muted-foreground">Nozzle Ø</span>
             <input
@@ -158,7 +192,8 @@ export function DfmPanel() {
             />
             <span className="text-muted-foreground">mm</span>
           </label>
-        ) : (
+        )}
+        {(pack === 'injection_molding' || pack === 'casting') && (
           <label className="flex items-center gap-2">
             <span className="w-16 text-muted-foreground">Min draft</span>
             <input
@@ -170,20 +205,63 @@ export function DfmPanel() {
             <span className="text-muted-foreground">°</span>
           </label>
         )}
-        <label className="flex items-center gap-2">
-          <span className="w-16 text-muted-foreground">{pack === 'fdm' ? 'Build' : 'Pull'}</span>
-          <select
-            className="cad-focus h-7 w-24 rounded border border-border/70 bg-background/70 px-1.5"
-            value={dirIndex}
-            onChange={(e) => setDirIndex(Number(e.target.value))}
-          >
-            {DIRECTIONS.map((d, i) => (
-              <option key={d.label} value={i}>
-                {d.label}
-              </option>
-            ))}
-          </select>
-        </label>
+        {pack === 'cnc_3_axis' && (
+          <>
+            <label className="flex items-center gap-2">
+              <span className="w-16 text-muted-foreground">Setups</span>
+              <select
+                className="cad-focus h-7 min-w-0 flex-1 rounded border border-border/70 bg-background/70 px-1.5"
+                value={planIndex}
+                onChange={(e) => setPlanIndex(Number(e.target.value))}
+              >
+                {SETUP_PLANS.map((p, i) => (
+                  <option key={p.label} value={i}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-2">
+              <span className="w-16 text-muted-foreground">Min tool Ø</span>
+              <input
+                className="cad-focus h-7 w-16 rounded border border-border/70 bg-background/70 px-1.5 font-mono"
+                value={toolDia}
+                onChange={(e) => setToolDia(e.target.value)}
+                inputMode="decimal"
+              />
+              <span className="text-muted-foreground">mm</span>
+            </label>
+          </>
+        )}
+        {pack === 'sheet_metal' && (
+          <label className="flex items-center gap-2">
+            <span className="w-16 text-muted-foreground">Gauge</span>
+            <input
+              className="cad-focus h-7 w-16 rounded border border-border/70 bg-background/70 px-1.5 font-mono"
+              value={gauge}
+              placeholder="auto"
+              onChange={(e) => setGauge(e.target.value)}
+              inputMode="decimal"
+            />
+            <span className="text-muted-foreground">mm</span>
+          </label>
+        )}
+        {(pack === 'fdm' || pack === 'injection_molding' || pack === 'casting') && (
+          <label className="flex items-center gap-2">
+            <span className="w-16 text-muted-foreground">{pack === 'fdm' ? 'Build' : 'Pull'}</span>
+            <select
+              className="cad-focus h-7 w-24 rounded border border-border/70 bg-background/70 px-1.5"
+              value={dirIndex}
+              onChange={(e) => setDirIndex(Number(e.target.value))}
+            >
+              {DIRECTIONS.map((d, i) => (
+                <option key={d.label} value={i}>
+                  {d.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         <button
           type="button"
           disabled={!canRun}
@@ -259,6 +337,18 @@ export function DfmPanel() {
                 )}
                 {on && <span className="pl-5 text-[11px] text-muted-foreground">Rule: {r.source}</span>}
               </button>
+              {r.state === 'fix' && animationFor(shown?.animations, r.rule) && (
+                <button
+                  type="button"
+                  onClick={() => play(playingRule === r.rule ? null : r.rule)}
+                  aria-pressed={playingRule === r.rule}
+                  className="cad-focus mb-1 ml-7 flex h-6 items-center gap-1.5 rounded border border-border/70 px-2 text-[11px] hover:bg-accent/60"
+                  title="Play the kernel's explanation of this finding on the part"
+                >
+                  <Clapperboard size={11} aria-hidden />
+                  {playingRule === r.rule ? 'Stop' : 'Show why'}
+                </button>
+              )}
             </li>
           )
         })}

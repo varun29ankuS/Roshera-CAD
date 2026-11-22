@@ -52,8 +52,13 @@
 //! (`&model.faces`, `&model.loops`, …) instead of accepted as separate
 //! parameters.
 
+pub mod casting;
+pub mod cnc;
+pub(crate) mod common;
 pub mod fdm;
 pub mod molding;
+pub mod sheet;
+pub mod turning;
 
 use crate::dfm::provenance::RuleProvenance;
 use crate::dfm::report::{DfmError, DfmReport, PackParams, RulePackId};
@@ -130,16 +135,15 @@ pub fn evaluate(
         PackParams::InjectionMolding {
             pull_direction,
             min_draft_deg,
-        } => molding::evaluate(
-            faces,
-            pull_direction,
-            min_draft_deg,
-            &model.faces,
-            &model.loops,
-            &model.edges,
-            &model.curves,
-            &model.surfaces,
-        ),
+        } => molding::evaluate(model, solid_id, faces, pull_direction, min_draft_deg),
+        // The process packs added after FDM/molding enumerate the solid's
+        // own faces (`faces` is ignored: their rules are solid-scoped —
+        // holes, corners and walls are read off the whole solid's
+        // adjacency graph, never a caller-chosen subset).
+        PackParams::Cnc3Axis(p) => cnc::evaluate(model, solid_id, &p),
+        PackParams::CncTurning(p) => turning::evaluate(model, solid_id, &p),
+        PackParams::SheetMetal(p) => sheet::evaluate(model, solid_id, &p),
+        PackParams::Casting(p) => casting::evaluate(model, solid_id, &p),
     }
 }
 

@@ -213,6 +213,19 @@ fn solid_axial_extent(
                     v_min = v_min.min(v);
                     v_max = v_max.max(v);
                     touched = true;
+                } else if let Some(circle) = curve
+                    .as_any()
+                    .downcast_ref::<crate::primitives::curve::Circle>()
+                {
+                    // A full-circle rim (DFM audit: was refused as unsupported).
+                    let alignment = circle.normal().dot(&axis_dir);
+                    if (alignment.abs() - 1.0).abs() > RIM_PERPENDICULAR_TOL {
+                        return None;
+                    }
+                    let v = (circle.center() - axis_point).dot(&axis_dir);
+                    v_min = v_min.min(v);
+                    v_max = v_max.max(v);
+                    touched = true;
                 } else {
                     return None; // unsupported boundary curve kind
                 }
@@ -246,6 +259,7 @@ pub fn bore_metrics(model: &BRepModel, solid_id: SolidId) -> Result<BoreMetricsO
         .into_iter()
         .collect();
     candidate_faces.sort_unstable(); // deterministic order, not HashSet iteration order
+    let stacks = crate::drawing::hole_features::recognize_hole_stacks(model, solid_id);
 
     let mut bores = Vec::new();
     let mut unverifiable = Vec::new();
@@ -284,23 +298,37 @@ pub fn bore_metrics(model: &BRepModel, solid_id: SolidId) -> Result<BoreMetricsO
         };
         let depth_value = wall_max - wall_min;
 
-        let Some((solid_min, solid_max)) =
-            solid_axial_extent(model, &all_faces, cyl.origin, cyl.axis)
-        else {
-            unverifiable.push(UnverifiableBore {
-                face: face_id,
-                reason: UnverifiableReason::UnsupportedTopology {
-                    detail: format!(
-                        "bore face {face_id}: solid's own extent along the bore axis could not \
-                         be derived exactly (a non-Line, non-axis-perpendicular-rim boundary \
-                         edge exists on the solid)"
-                    ),
-                },
-            });
-            continue;
+        // THRU BY TOPOLOGY first (DFM audit 2026-11-22): a recognised hole
+        // stack knows whether its drilled wall opens onto an exit face. The
+        // extent comparison below called a counterbored THRU hole BLIND
+        // (its drilled wall is shorter than the part by the counterbore
+        // depth) — the exact defect the drawing hole recogniser was built
+        // to kill. It stays only as the fallback for unrecognised bores.
+        let stack_through = stacks
+            .iter()
+            .find(|s| s.drill_faces.contains(&face_id))
+            .map(|s| s.through);
+
+        let extent_through = if stack_through.is_some() {
+            None
+        } else {
+            let Some((solid_min, solid_max)) =
+                solid_axial_extent(model, &all_faces, cyl.origin, cyl.axis)
+            else {
+                unverifiable.push(UnverifiableBore {
+                    face: face_id,
+                    reason: UnverifiableReason::UnsupportedTopology {
+                        detail: format!(
+                            "bore face {face_id}: solid's own extent along the bore axis could                              not be derived exactly (a non-Line, non-axis-perpendicular-rim                              boundary edge exists on the solid)"
+                        ),
+                    },
+                });
+                continue;
+            };
+            let part_extent_along_axis = solid_max - solid_min;
+            Some((depth_value - part_extent_along_axis).abs() <= THRU_EQUALITY_TOL_MM)
         };
-        let part_extent_along_axis = solid_max - solid_min;
-        let is_through = (depth_value - part_extent_along_axis).abs() <= THRU_EQUALITY_TOL_MM;
+        let is_through = stack_through.or(extent_through).unwrap_or(false);
 
         let aspect_value = depth_value / diameter_value;
 

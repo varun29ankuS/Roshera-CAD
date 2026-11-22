@@ -84,6 +84,7 @@
 //! ```
 
 pub mod analyzers;
+pub mod animation;
 pub mod packs;
 pub mod provenance;
 pub mod report;
@@ -95,6 +96,29 @@ pub use analyzers::{
 pub use packs::{Rule, RulePack};
 pub use provenance::{RuleProvenance, StandardBody};
 pub use report::{
+    CastingParams, CncMillingParams, CncTurningParams, DrillSeries, SheetMetalParams,
+};
+pub use report::{
     Derivation, DfmError, DfmFact, DfmReport, DfmSummary, DfmValue, FaceRef, PackParams,
     RulePackId, RuleVerdict, SurfaceKind, UnverifiableReason, Verdict,
 };
+
+/// `analyze(model, solid, params) -> DfmReport` — the process-agnostic
+/// entry point (spec §3): runs EVERY rule of the pack `params` names
+/// against EVERY face of the solid (outer, inner and peer shells; the
+/// caller never chooses a subset) and folds them through
+/// [`DfmReport::new`]'s honesty fold. `Err` only for malformed input (a
+/// dangling solid, an unusable parameter); a rule that cannot decide is an
+/// `unverifiable` VALUE in the report, never an error.
+///
+/// Packs: `fdm`, `injection_molding`, `cnc_3_axis` ([`packs::cnc`]),
+/// `cnc_turning` ([`packs::turning`]), `sheet_metal` ([`packs::sheet`]),
+/// `casting` ([`packs::casting`]).
+pub fn analyze(
+    model: &crate::primitives::topology_builder::BRepModel,
+    solid_id: crate::primitives::solid::SolidId,
+    params: PackParams,
+) -> Result<DfmReport, DfmError> {
+    let faces = packs::common::solid_face_ids(model, solid_id)?;
+    packs::evaluate(params, model, solid_id, &faces)
+}

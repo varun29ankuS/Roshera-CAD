@@ -175,24 +175,32 @@ export function registerInspectTools(server: ToolHost) {
 
   server.tool(
     "dfm_check",
-    "DFM (design-for-manufacturability): run a rule pack against a part's REAL " +
-      "B-Rep, exact-or-refuse — never a fabricated pass. ENFORCED: refused (422) " +
-      "if the part has been mutated (or never certified) since its last full " +
-      "verification — call verify_part first; a DFM pass on unverified geometry " +
-      "would just be a guess wearing a certificate. 'fdm' pack checks " +
-      "fdm.min_wall (wall >= 2x nozzle dia), fdm.overhang (no face > 45 deg " +
-      "from vertical), fdm.min_bore (bore dia >= 2x nozzle dia) and " +
-      "fdm.trapped_volume (enclosed cavity traps unremovable support); " +
-      "'injection_molding' checks mold.draft. FDM limits are shop practice, " +
-      "not a governing standard — each verdict carries its provenance. " +
-      "Returns the kernel's DfmReport verbatim: per-rule verdicts (pass | " +
-      "violation | unverifiable, each with measured/limit values and their " +
-      "derivation) plus a pack-level summary that is Pass ONLY if every rule " +
-      "passed -- one unverifiable rule forces Inconclusive, never a silent Pass.",
+    "DFM (design-for-manufacturability): can this part be made by the process, " +
+      "and what will hurt? Runs a rule pack against the part's REAL B-Rep, " +
+      "exact-or-refuse — never a fabricated pass. ENFORCED: refused (422) if " +
+      "the part has been mutated (or never certified) since its last full " +
+      "verification, or is certified unsound — call verify_part first. Packs: " +
+      "'fdm' (overhang, min_wall, min_bore, trapped_volume); 'injection_molding' " +
+      "(draft, side_action, trapped_core, sharp_internal_corner); 'cnc_3_axis' " +
+      "(internal_corner_radius vs the smallest tool, corner_reach L/D, " +
+      "hole_depth_ratio, min_hole_diameter, standard_drill_size, " +
+      "blind_hole_floor, hole_access vs your setup_directions, min_wall); " +
+      "'cnc_turning' (axisymmetry about the spindle, bore_depth_ratio, " +
+      "min_wall); 'sheet_metal' (uniform_thickness, bend_radius, hole_to_edge, " +
+      "hole_to_bend, flange_length, developable); 'casting' (draft, min_wall, " +
+      "max_wall, internal_fillet, cored_hole, side_core, trapped_core). Every " +
+      "threshold is a parameter with a cited default (shop practice, never " +
+      "dressed up as a standard). Returns the kernel's DfmReport verbatim: " +
+      "per-rule verdicts (pass | violation | unverifiable, each with " +
+      "measured/limit values, the faces involved and the threshold's " +
+      "provenance), a summary that is Pass ONLY if every rule passed, and " +
+      "'animations' — one explanation per violation (tool approach, drill " +
+      "plunge, setup cycle, mould separation, layer build, caliper, spindle " +
+      "spin) built from the same measured values.",
     {
       part_id: z.number().int().describe(PART_ID_DOC),
       pack: z
-        .enum(["fdm", "injection_molding"])
+        .enum(["fdm", "injection_molding", "cnc_3_axis", "cnc_turning", "sheet_metal", "casting"])
         .describe("which rule pack to evaluate"),
       nozzle_diameter: z
         .number()
@@ -205,27 +213,42 @@ export function registerInspectTools(server: ToolHost) {
       pull_direction: z
         .array(z.number()).length(3)
         .optional()
-        .describe("injection_molding pack only; unit mold-pull direction, default [0,0,1]"),
+        .describe("injection_molding / casting; unit mold-pull direction, default [0,0,1]"),
       min_draft_deg: z
         .number()
         .optional()
-        .describe("injection_molding pack only; minimum draft angle in degrees, default 1.0"),
+        .describe("injection_molding / casting; minimum draft angle in degrees, default 1.0"),
+      setup_directions: z
+        .array(z.array(z.number()).length(3))
+        .optional()
+        .describe(
+          "cnc_3_axis; the setup plan — unit vectors from the part toward the spindle, " +
+            "default [[0,0,1],[0,0,-1]] (top op, flip). Add [1,0,0] etc. for side ops.",
+        ),
+      min_tool_diameter: z
+        .number()
+        .optional()
+        .describe("cnc_3_axis; smallest end mill in mm, default 3.0"),
+      spindle_axis: z
+        .array(z.array(z.number()).length(3))
+        .length(2)
+        .optional()
+        .describe("cnc_turning; [[point],[direction]]; default inferred from the OD (refused if not unique)"),
+      thickness: z
+        .number()
+        .optional()
+        .describe("sheet_metal; gauge in mm; default inferred from proven wall pairs (refused when unprovable)"),
+      params: z
+        .record(z.unknown())
+        .optional()
+        .describe(
+          "any other pack threshold by its kernel field name (e.g. max_drill_depth_ratio, " +
+            "min_wall, max_wall, hole_edge_factor, allow_flat_bottom_holes); omitted = cited default",
+        ),
     },
-    async ({ part_id, pack, nozzle_diameter, build_direction, pull_direction, min_draft_deg }) => {
+    async (args) => {
       try {
-        const body =
-          pack === "fdm"
-            ? {
-                pack,
-                nozzle_diameter: nozzle_diameter ?? 0.4,
-                build_direction: build_direction ?? [0, 0, 1],
-              }
-            : {
-                pack,
-                pull_direction: pull_direction ?? [0, 0, 1],
-                min_draft_deg: min_draft_deg ?? 1.0,
-              };
-        return ok(await api("POST", `/api/agent/parts/${part_id}/dfm`, body));
+        return ok(await api("POST", `/api/agent/parts/${args.part_id}/dfm`, dfmBody(args)));
       } catch (e) {
         return fail(e);
       }
@@ -430,4 +453,53 @@ export function registerInspectTools(server: ToolHost) {
       }
     },
   );
+}
+
+/** dfm_check's arguments → the kernel's `PackParams` body (tagged by
+ *  `pack`). The two original packs keep their explicit defaults; the
+ *  process packs send only what the caller set — every omitted threshold
+ *  takes the kernel's cited default, echoed back on the report. */
+export function dfmBody(args: {
+  pack: string;
+  nozzle_diameter?: number;
+  build_direction?: number[];
+  pull_direction?: number[];
+  min_draft_deg?: number;
+  setup_directions?: number[][];
+  min_tool_diameter?: number;
+  spindle_axis?: number[][];
+  thickness?: number;
+  params?: Record<string, unknown>;
+}): Record<string, unknown> {
+  const { pack } = args;
+  if (pack === "fdm") {
+    return {
+      pack,
+      nozzle_diameter: args.nozzle_diameter ?? 0.4,
+      build_direction: args.build_direction ?? [0, 0, 1],
+    };
+  }
+  if (pack === "injection_molding") {
+    return {
+      pack,
+      pull_direction: args.pull_direction ?? [0, 0, 1],
+      min_draft_deg: args.min_draft_deg ?? 1.0,
+    };
+  }
+  const body: Record<string, unknown> = { ...(args.params ?? {}), pack };
+  const set = (k: string, v: unknown) => {
+    if (v !== undefined) body[k] = v;
+  };
+  if (pack === "cnc_3_axis") {
+    set("setup_directions", args.setup_directions);
+    set("min_tool_diameter", args.min_tool_diameter);
+  } else if (pack === "cnc_turning") {
+    set("spindle_axis", args.spindle_axis);
+  } else if (pack === "sheet_metal") {
+    set("thickness", args.thickness);
+  } else if (pack === "casting") {
+    set("pull_direction", args.pull_direction);
+    set("min_draft_deg", args.min_draft_deg);
+  }
+  return body;
 }

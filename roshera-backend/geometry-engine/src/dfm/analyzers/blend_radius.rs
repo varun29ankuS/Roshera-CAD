@@ -185,6 +185,11 @@ pub struct BlendRadiusOutcome {
     pub blends: Vec<BlendRecord>,
     pub sharp_corners: Vec<SharpCorner>,
     pub unverifiable: Vec<UnverifiableBlend>,
+    /// Edges the dihedral classifier could not classify at all (DFM audit
+    /// 2026-11-22: these were silently skipped, so an unclassifiable
+    /// concave corner vanished from every corner rule). Each may hide a
+    /// sharp inside corner; a consuming rule must refuse on it.
+    pub unclassified_edges: Vec<EdgeId>,
 }
 
 /// Whether ANY boundary edge (outer loop + every inner loop) of `face_id`
@@ -294,7 +299,38 @@ pub fn blend_radius(model: &BRepModel, solid_id: SolidId) -> Result<BlendRadiusO
         match surface.surface_type() {
             SurfaceType::Cylinder => {
                 let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() else {
-                    continue; // unreachable: surface_type() == Cylinder guarantees the downcast
+                    // DFM audit 2026-11-22: NOT unreachable — a
+                    // `CylindricalFillet` (the kernel's own fillet output)
+                    // reports `SurfaceType::Cylinder`, and every real fillet
+                    // was silently skipped here. A straight-spine one is an
+                    // exact cylinder; anything else refuses by name.
+                    match crate::dfm::analyzers::features::fillet_cylinder(model, face_id) {
+                        Some(fc) if fc.cavity => blends.push(BlendRecord {
+                            face: face_id,
+                            radius: DfmValue::new(
+                                fc.radius,
+                                Derivation::Analytic {
+                                    surface_type: SurfaceKind::Cylinder,
+                                    method: "constant-radius fillet on a straight spine \
+                                             (CylindricalFillet radius), concave by its \
+                                             outward normal"
+                                        .to_string(),
+                                },
+                            ),
+                        }),
+                        Some(_) => {} // convex fillet: not an internal corner
+                        None => unverifiable.push(UnverifiableBlend {
+                            face: face_id,
+                            reason: UnverifiableReason::UnsupportedSurface {
+                                surface_type: SurfaceKind::Cylinder,
+                                analyzer: format!(
+                                    "blend_radius ({} on a curved spine)",
+                                    surface.type_name()
+                                ),
+                            },
+                        }),
+                    }
+                    continue;
                 };
                 if face.orientation != FaceOrientation::Backward {
                     continue; // convex/external -- not a candidate at all (module docs' headline)
@@ -410,8 +446,13 @@ pub fn blend_radius(model: &BRepModel, solid_id: SolidId) -> Result<BlendRadiusO
     }
 
     let mut sharp_corners = Vec::new();
+    let mut unclassified_edges = Vec::new();
     for edge_id in edge_ids {
-        if let Ok(classification) = classify_edge(model, edge_id) {
+        let Ok(classification) = classify_edge(model, edge_id) else {
+            unclassified_edges.push(edge_id);
+            continue;
+        };
+        {
             if classification.dihedral_class() == Some(DihedralClass::Concave) {
                 sharp_corners.push(SharpCorner {
                     edge: edge_id,
@@ -444,6 +485,7 @@ pub fn blend_radius(model: &BRepModel, solid_id: SolidId) -> Result<BlendRadiusO
         blends,
         sharp_corners,
         unverifiable,
+        unclassified_edges,
     })
 }
 

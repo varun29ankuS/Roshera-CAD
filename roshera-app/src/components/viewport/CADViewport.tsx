@@ -24,6 +24,7 @@ import { PartLabels } from './PartLabels'
 import { PartDimensions } from './PartDimensions'
 import { GdtAnnotations } from './GdtAnnotations'
 import { DfmFaceTints } from './DfmFaceTints'
+import { DfmAnimationCaption, DfmAnimationPlayer } from './DfmAnimationPlayer'
 import { LensFaceTints } from './LensFaceTints'
 import { LensStoryCard } from './LensStoryCard'
 import { SketchOverlay } from './SketchOverlay'
@@ -222,6 +223,7 @@ export function CADViewport() {
         <PartDimensions />
         <GdtAnnotations />
         <DfmFaceTints />
+        <DfmAnimationPlayer />
         <LensFaceTints />
         <FeatureHighlight />
         <AgentFacesHighlight />
@@ -236,6 +238,7 @@ export function CADViewport() {
       <MatePickHintBanner />
       <SectionViewPanel />
       <LensStoryCard />
+      <DfmAnimationCaption />
       <ViewportContextMenu />
       <ExtrudeHoverTooltip />
       <LabelHoverTooltip />

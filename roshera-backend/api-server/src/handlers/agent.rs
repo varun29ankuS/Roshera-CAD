@@ -2625,7 +2625,11 @@ pub async fn part_features(
 /// (kernel `dfm/` subsystem: `geometry_engine::dfm::packs::evaluate`).
 ///
 /// Body is a [`geometry_engine::dfm::PackParams`] verbatim — tagged by
-/// `pack` (`"fdm"` or `"injection_molding"`), the SAME type
+/// `pack` (`"fdm"`, `"injection_molding"`, `"cnc_3_axis"`, `"cnc_turning"`,
+/// `"sheet_metal"`, `"casting"`; the process packs default every omitted
+/// threshold), evaluated by [`geometry_engine::dfm::analyze`]; the response
+/// adds `animations` ([`geometry_engine::dfm::animation::animate_report`]),
+/// one explanation per violation. The SAME type
 /// [`geometry_engine::dfm::DfmReport::params`] echoes back. No DTO
 /// translation layer, matching this module's own stated convention (see
 /// module docs): the agent supplies and receives the kernel's own report
@@ -2652,14 +2656,13 @@ pub async fn part_dfm_check(
     Path(id): Path<u32>,
     Json(params): Json<geometry_engine::dfm::PackParams>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    use geometry_engine::dfm::packs::evaluate as dfm_evaluate;
+    use geometry_engine::dfm::analyze as dfm_analyze;
 
     let model = model_handle.read().await;
     let solid_id = id as SolidId;
-    let solid = match model.solids.get(solid_id) {
-        Some(s) => s,
-        None => return ApiError::solid_not_found(id).into(),
-    };
+    if model.solids.get(solid_id).is_none() {
+        return ApiError::solid_not_found(id).into();
+    }
 
     // P1 ENFORCEMENT — refuse pre-flight, before any rule runs, when the
     // solid has been mutated (or never certified) since its last full
@@ -2683,22 +2686,49 @@ pub async fn part_dfm_check(
         );
     }
 
-    let mut faces = Vec::new();
-    for shell_id in solid.all_shells() {
-        if let Some(shell) = model.shells.get(shell_id) {
-            faces.extend(shell.faces.iter().copied());
+    // A verified-UNSOUND solid is refused too (DFM audit 2026-11-22): the
+    // stale gate above let a solid whose CURRENT certificate says unsound
+    // through, so every rule measured geometry the kernel itself rejects.
+    if let Some(reading) = model.soundness_reading(solid_id) {
+        if !reading.is_sound() && !reading.is_stale() {
+            let err = geometry_engine::dfm::DfmError::UnsoundSolid {
+                detail: format!(
+                    "solid {solid_id} is certified {} — DFM measures sound geometry only",
+                    reading.status_label()
+                ),
+            };
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "dfm_unsound_solid",
+                    "reason": err.to_string(),
+                    "remedy": "repair the solid, then verify_part",
+                })),
+            );
         }
     }
 
-    match dfm_evaluate(params, &model, solid_id, &faces) {
+    match dfm_analyze(&model, solid_id, params) {
         Ok(report) => {
             // `DfmReport` is Serde-derived over f64/String/enum fields only —
             // serialization to `serde_json::Value` cannot fail here; the
             // `unwrap_or_else` fallback mirrors `measure`'s own convention
             // above rather than an `.expect()` on a branch that cannot miss.
-            let body = serde_json::to_value(&report).unwrap_or_else(
+            let mut body = serde_json::to_value(&report).unwrap_or_else(
                 |e| serde_json::json!({ "error": "serialization_failed", "reason": e.to_string() }),
             );
+            // One explanation per violation, built from the SAME verdicts
+            // (`geometry_engine::dfm::animation`): the viewport plays them,
+            // an agent can read them. Additive field — the report's own
+            // fields are untouched.
+            let animations =
+                geometry_engine::dfm::animation::animate_report(&model, solid_id, &report);
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "animations".to_string(),
+                    serde_json::to_value(&animations).unwrap_or(serde_json::Value::Null),
+                );
+            }
             (StatusCode::OK, Json(body))
         }
         Err(e) => (

@@ -48,7 +48,15 @@ interface PackMeta {
   kernel_certified_rules: string[];
   kernel_presence: KernelPresence;
   section: string;
+  /** Set when the vault chunk `text` predates the kernel pack: says which
+   *  of the two an agent must believe. */
+  text_status?: string;
 }
+
+const TEXT_PREDATES_PACK =
+  "text predates the kernel pack (2026-11-22): where it says this process has no rules or cannot " +
+  "be run through dfm_check, that is out of date — kernel_certified_rules and dfm_check_pack_arg are " +
+  "authoritative; the vendor numbers in the text remain uncertified practice [P]";
 
 const CERT_TEXT: Record<KernelPresence, string> = {
   certified:
@@ -68,16 +76,62 @@ const PACK_META: Record<string, PackMeta> = {
   },
   injection_molding: {
     dfm_check_pack_arg: "injection_molding",
-    kernel_certified_rules: ["mold.draft"],
+    kernel_certified_rules: ["mold.draft", "mold.side_action", "mold.trapped_core", "mold.sharp_internal_corner"],
     kernel_presence: "certified",
     section: "§3.2",
   },
   sla: { dfm_check_pack_arg: null, kernel_certified_rules: [], kernel_presence: "none", section: "§3.3" },
   sls: { dfm_check_pack_arg: null, kernel_certified_rules: [], kernel_presence: "none", section: "§3.4" },
-  cnc_3_axis: { dfm_check_pack_arg: null, kernel_certified_rules: [], kernel_presence: "schema_slot_no_rules", section: "§3.5" },
+  // The kernel's process packs (dfm/packs/{cnc,sheet,casting}.rs, 2026-11-22).
+  // The guidance chunk text is the vault doc's, verbatim (test pins it
+  // byte-identical); where that text predates these packs, the
+  // kernel_certified_rules list and `certification` here are authoritative.
+  cnc_3_axis: {
+    dfm_check_pack_arg: "cnc_3_axis",
+    kernel_certified_rules: [
+      "cnc.internal_corner_radius",
+      "cnc.corner_reach",
+      "cnc.hole_depth_ratio",
+      "cnc.min_hole_diameter",
+      "cnc.standard_drill_size",
+      "cnc.blind_hole_floor",
+      "cnc.hole_access",
+      "cnc.min_wall",
+    ],
+    kernel_presence: "certified",
+    section: "§3.5",
+    text_status: TEXT_PREDATES_PACK,
+  },
   cnc_5_axis: { dfm_check_pack_arg: null, kernel_certified_rules: [], kernel_presence: "none", section: "§3.6" },
-  sheet_metal: { dfm_check_pack_arg: null, kernel_certified_rules: [], kernel_presence: "schema_slot_no_rules", section: "§3.7" },
-  casting: { dfm_check_pack_arg: null, kernel_certified_rules: [], kernel_presence: "none", section: "§3.8" },
+  sheet_metal: {
+    dfm_check_pack_arg: "sheet_metal",
+    kernel_certified_rules: [
+      "sheet.uniform_thickness",
+      "sheet.bend_radius",
+      "sheet.hole_to_edge",
+      "sheet.hole_to_bend",
+      "sheet.flange_length",
+      "sheet.developable",
+    ],
+    kernel_presence: "certified",
+    section: "§3.7",
+    text_status: TEXT_PREDATES_PACK,
+  },
+  casting: {
+    dfm_check_pack_arg: "casting",
+    kernel_certified_rules: [
+      "cast.draft",
+      "cast.min_wall",
+      "cast.max_wall",
+      "cast.internal_fillet",
+      "cast.cored_hole",
+      "cast.side_core",
+      "cast.trapped_core",
+    ],
+    kernel_presence: "certified",
+    section: "§3.8",
+    text_status: TEXT_PREDATES_PACK,
+  },
 };
 
 // ─── Tier-2 playbook metadata: the canonical tool path, in order (doc §4).
@@ -289,6 +343,7 @@ export function registerKbTools(server: ToolHost): void {
           kernel_presence: meta.kernel_presence,
           certified: meta.kernel_presence === "certified",
           certification: CERT_TEXT[meta.kernel_presence],
+          ...(meta.text_status ? { text_status: meta.text_status } : {}),
           source: `${KB_DOC} ${meta.section}; in-chunk provenance tags ([P] vendor/published, kernel rule ids) apply per line`,
           token_estimate: tokensOf(text),
         });

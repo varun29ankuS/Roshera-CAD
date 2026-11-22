@@ -60,6 +60,8 @@
 
 pub mod blend_radius;
 pub mod bore;
+pub mod features;
+pub mod holes;
 pub mod internal_voids;
 pub mod orientation;
 pub mod thickness;

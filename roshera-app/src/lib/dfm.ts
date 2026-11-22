@@ -9,6 +9,8 @@
  * check that did not run is not a check that passed.
  */
 
+import type { DfmAnimation } from './dfm-animation'
+
 const API_HOST: string =
   (import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL ?? ''
 
@@ -28,24 +30,39 @@ export interface DfmRuleVerdict {
   provenance: { kind: string; note?: string; [k: string]: unknown }
 }
 
+type V3 = [number, number, number]
+
+/** A pack's request body. The process packs take every threshold as an
+ *  optional field: what the caller leaves out takes the kernel's cited
+ *  default, and the report echoes the values actually used. */
 export type DfmPackParams =
-  | { pack: 'fdm'; nozzle_diameter: number; build_direction: [number, number, number] }
-  | { pack: 'injection_molding'; pull_direction: [number, number, number]; min_draft_deg: number }
+  | { pack: 'fdm'; nozzle_diameter: number; build_direction: V3 }
+  | { pack: 'injection_molding'; pull_direction: V3; min_draft_deg: number }
+  | { pack: 'cnc_3_axis'; setup_directions?: V3[]; min_tool_diameter?: number; [k: string]: unknown }
+  | { pack: 'cnc_turning'; spindle_axis?: [V3, V3] | null; [k: string]: unknown }
+  | { pack: 'sheet_metal'; thickness?: number | null; [k: string]: unknown }
+  | { pack: 'casting'; pull_direction?: V3; min_draft_deg?: number; [k: string]: unknown }
 
 export interface DfmReport {
   pack: string
   params: DfmPackParams
   verdicts: DfmRuleVerdict[]
   summary: { kind: 'pass' } | { kind: 'violations'; count: number } | { kind: 'inconclusive'; unverifiable: number }
+  /** One explanation per violation, built by the kernel from the same
+   *  measured values (see `dfm-animation.ts`). */
+  animations?: DfmAnimation[]
 }
 
 export type DfmState = 'fix' | 'unknown' | 'pass'
 
-/** The processes whose rules exist in the kernel. CNC and sheet metal are
- *  named there but have no rules yet, so they are not offered. */
+/** The processes whose rules exist in the kernel. */
 export const DFM_PROCESSES = [
-  { pack: 'fdm', label: '3D printing (FDM)' },
+  { pack: 'cnc_3_axis', label: 'CNC milling (3-axis)' },
+  { pack: 'cnc_turning', label: 'CNC turning' },
+  { pack: 'sheet_metal', label: 'Sheet metal' },
+  { pack: 'casting', label: 'Die casting' },
   { pack: 'injection_molding', label: 'Injection moulding' },
+  { pack: 'fdm', label: '3D printing (FDM)' },
 ] as const
 
 /** How each rule reads: its name, its unit, and whether the limit is a
@@ -58,6 +75,32 @@ const RULES: Record<string, { title: string; unit: string; cmp: '≤' | '≥' }>
   'mold.draft': { title: 'Draft', unit: '°', cmp: '≥' },
   'mold.undercut': { title: 'Undercut', unit: '', cmp: '≤' },
   'mold.trapped_core': { title: 'Trapped core', unit: '', cmp: '≤' },
+  'mold.side_action': { title: 'Hole needs a side action', unit: '°', cmp: '≤' },
+  'mold.sharp_internal_corner': { title: 'Sharp inside corners', unit: '', cmp: '≤' },
+  'cnc.internal_corner_radius': { title: 'Inside corner radius', unit: ' mm', cmp: '≥' },
+  'cnc.corner_reach': { title: 'Corner tool reach (L/D)', unit: '', cmp: '≤' },
+  'cnc.hole_depth_ratio': { title: 'Hole depth (L/D)', unit: '', cmp: '≤' },
+  'cnc.min_hole_diameter': { title: 'Smallest hole', unit: ' mm', cmp: '≥' },
+  'cnc.standard_drill_size': { title: 'Standard drill size', unit: ' mm off', cmp: '≤' },
+  'cnc.blind_hole_floor': { title: 'Blind hole floor', unit: '° off', cmp: '≤' },
+  'cnc.hole_access': { title: 'Hole reachable from a setup', unit: '°', cmp: '≤' },
+  'cnc.min_wall': { title: 'Wall thickness', unit: ' mm', cmp: '≥' },
+  'turn.axisymmetry': { title: 'Turnable faces', unit: ' off-axis', cmp: '≤' },
+  'turn.bore_depth_ratio': { title: 'Bore depth (L/D)', unit: '', cmp: '≤' },
+  'turn.min_wall': { title: 'Wall thickness', unit: ' mm', cmp: '≥' },
+  'sheet.uniform_thickness': { title: 'Uniform thickness', unit: ' mm', cmp: '≥' },
+  'sheet.bend_radius': { title: 'Bend radius', unit: ' mm', cmp: '≥' },
+  'sheet.hole_to_edge': { title: 'Hole to edge', unit: ' mm', cmp: '≥' },
+  'sheet.hole_to_bend': { title: 'Hole to bend', unit: ' mm', cmp: '≥' },
+  'sheet.flange_length': { title: 'Flange length', unit: ' mm', cmp: '≥' },
+  'sheet.developable': { title: 'Unfoldable faces', unit: ' doubly curved', cmp: '≤' },
+  'cast.draft': { title: 'Draft', unit: '°', cmp: '≥' },
+  'cast.min_wall': { title: 'Thinnest wall', unit: ' mm', cmp: '≥' },
+  'cast.max_wall': { title: 'Thickest wall', unit: ' mm', cmp: '≤' },
+  'cast.internal_fillet': { title: 'Inside fillets', unit: ' mm', cmp: '≥' },
+  'cast.cored_hole': { title: 'Cored hole size', unit: ' mm', cmp: '≥' },
+  'cast.side_core': { title: 'Hole needs a side core', unit: '°', cmp: '≤' },
+  'cast.trapped_core': { title: 'Trapped core', unit: '', cmp: '≤' },
 }
 
 function ruleInfo(rule: string) {
@@ -112,7 +155,10 @@ export function dfmRows(report: DfmReport): DfmRow[] {
     }
     return {
       rule: rv.rule, title: info.title, state: 'pass',
-      measured: info.unit ? `${num(v.margin.value)}${info.unit} to spare` : '',
+      // The kernel's vacuous-pass sentinel (1e300): no feature of the kind
+      // on this part — nothing to judge, not a huge margin.
+      measured:
+        v.margin.value >= 1e299 ? 'none on this part' : info.unit ? `${num(v.margin.value)}${info.unit} to spare` : '',
       limit: '', why: '', faces: [], source,
     }
   })
