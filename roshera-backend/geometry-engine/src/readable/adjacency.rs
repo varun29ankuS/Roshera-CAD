@@ -723,6 +723,9 @@ fn build_attributed_adjacency_graph(
 ) -> AttributedAdjacencyGraph {
     #[cfg(test)]
     AAG_BUILDS.with(|n| n.set(n.get() + 1));
+    // Classifying an edge probes points either side of it for membership in
+    // its faces: each face's trim loops are projected once for the build.
+    let _membership = crate::tessellation::surface::MembershipCacheScope::enter(model);
     let mut graph = AttributedAdjacencyGraph {
         solid: solid_id,
         nodes: Vec::new(),
@@ -749,6 +752,9 @@ fn build_attributed_adjacency_graph(
     let mut cavities: BTreeMap<u32, Option<bool>> = BTreeMap::new();
     let mut loops: BTreeMap<u32, usize> = BTreeMap::new();
     let mut incidence: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    // Timed under the drawing profile: part 109's graph took minutes.
+    let prof = crate::drawing::dimensioning::draw_profile_enabled();
+    let t_faces = std::time::Instant::now();
     for &f in &faces {
         let Some((geom, sign)) = face_geometry(model, f) else {
             continue;
@@ -769,6 +775,9 @@ fn build_attributed_adjacency_graph(
         attrs.insert(f, (geom, sign, range));
     }
 
+    let faces_ms = t_faces.elapsed().as_secs_f64() * 1e3;
+    // (count, ms) per derivation: analytic, dihedral, structural.
+    let mut by_derivation = [(0usize, 0.0f64); 3];
     let mut node_arcs: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
     for (&e, sides) in &incidence {
         match sides.len() {
@@ -776,7 +785,15 @@ fn build_attributed_adjacency_graph(
             1 => graph.boundary_edges.push(e),
             2 => {
                 let (fa, fb) = (sides[0].min(sides[1]), sides[0].max(sides[1]));
+                let t_arc = std::time::Instant::now();
                 let (convexity, derivation) = label_arc(model, e, fa, fb, &attrs);
+                let slot = match derivation {
+                    ConvexityDerivation::Analytic => 0,
+                    ConvexityDerivation::Dihedral => 1,
+                    ConvexityDerivation::Structural => 2,
+                };
+                by_derivation[slot].0 += 1;
+                by_derivation[slot].1 += t_arc.elapsed().as_secs_f64() * 1e3;
                 let same = fa == fb
                     || match (attrs.get(&fa), attrs.get(&fb)) {
                         (Some(a), Some(b)) => same_surface(&a.0, &b.0),
@@ -799,6 +816,18 @@ fn build_attributed_adjacency_graph(
         }
     }
 
+    if prof {
+        eprintln!(
+            "[draw-profile]   adjacency graph of {} faces: attributes {faces_ms:.1} ms; edges analytic {} in {:.1} ms, dihedral {} in {:.1} ms, structural {} in {:.1} ms",
+            faces.len(),
+            by_derivation[0].0,
+            by_derivation[0].1,
+            by_derivation[1].0,
+            by_derivation[1].1,
+            by_derivation[2].0,
+            by_derivation[2].1
+        );
+    }
     for (f, (geom, _, range)) in attrs {
         graph.nodes.push(AagNode {
             face: f,
@@ -875,6 +904,27 @@ mod cache_tests {
         let before = builds();
         crate::drawing::certify_drawing(&model, &sheet);
         assert_eq!(builds() - before, 1, "one certificate, one graph");
+    }
+
+    /// Building a solid's graph projects each face's trim loops into (u, v)
+    /// about once, not once per membership probe: the convexity of a
+    /// plane-to-plane edge is decided by probing points either side of it,
+    /// and each probe re-projected the face's whole boundary -- part 109's
+    /// 1725 such edges took 27 s.
+    ///
+    /// Mutation: open no membership scope in the graph build -> a projection
+    /// per probe -> RED.
+    #[test]
+    fn a_graph_projects_each_face_loop_about_once() {
+        let (model, sid) = box_model();
+        crate::tessellation::surface::LOOP_UV_PROJECTIONS.with(|c| c.set(0));
+        let graph = attributed_adjacency_graph(&model, sid);
+        assert_eq!(graph.arcs.len(), 12, "fixture: a box's twelve edges");
+        let projections = crate::tessellation::surface::LOOP_UV_PROJECTIONS.with(|c| c.get());
+        assert!(
+            projections <= 2 * 6,
+            "{projections} projections for 6 face loops"
+        );
     }
 
     #[test]

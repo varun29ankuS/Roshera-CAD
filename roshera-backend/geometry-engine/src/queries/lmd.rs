@@ -117,7 +117,7 @@ pub fn footpoint_in_face(model: &BRepModel, face_id: FaceId, p: &Point3) -> bool
     let Ok((u, v)) = surface.closest_point(p, model.tolerance()) else {
         return false;
     };
-    crate::tessellation::surface::point_inside_face_uv(u, v, face, model)
+    crate::tessellation::surface::point_inside_face_uv_scoped(u, v, face, model)
 }
 
 /// LMDs between two **faces**: the analytic surface LMDs, kept only when both

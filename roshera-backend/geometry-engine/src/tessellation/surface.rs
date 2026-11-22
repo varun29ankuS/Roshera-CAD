@@ -11058,6 +11058,76 @@ impl<'a> FaceMembership<'a> {
 /// `LoopId` is unique and stable only for the `&BRepModel` snapshot a cache
 /// was built against — never share one `LoopUvCache` instance across two
 /// different model states (a mutating operation can retarget a loop slot).
+// A loop cache for membership tests made while a [`MembershipCacheScope`]
+// is open over one model: each face loop is projected into (u, v) once for
+// the scope instead of once per query. `footpoint_in_face` reads it; the
+// solid's adjacency graph opens it while it classifies edges (part 109:
+// 1725 edges probed either side, 27 s re-projecting faces' boundaries).
+thread_local! {
+    static MEMBERSHIP_CACHE: std::cell::RefCell<Option<(usize, Arc<LoopUvCache>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Holds a loop cache open for membership tests on one model.
+pub(crate) struct MembershipCacheScope<'m> {
+    previous: Option<(usize, Arc<LoopUvCache>)>,
+    /// This scope opened the cache (and so closes it); `false` when it
+    /// joined one already open over the same model.
+    owns: bool,
+    _model: std::marker::PhantomData<&'m BRepModel>,
+}
+
+impl<'m> MembershipCacheScope<'m> {
+    /// Open a membership cache over `model`, or join the one already open
+    /// over the same model (the same snapshot, held by the outer scope).
+    pub(crate) fn enter(model: &'m BRepModel) -> Self {
+        let here = model as *const BRepModel as usize;
+        let joined =
+            MEMBERSHIP_CACHE.with(|c| c.borrow().as_ref().is_some_and(|(m, _)| *m == here));
+        if joined {
+            return Self {
+                previous: None,
+                owns: false,
+                _model: std::marker::PhantomData,
+            };
+        }
+        let fresh = (here, Arc::new(LoopUvCache::new()));
+        let previous = MEMBERSHIP_CACHE.with(|c| c.borrow_mut().replace(fresh));
+        Self {
+            previous,
+            owns: true,
+            _model: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for MembershipCacheScope<'_> {
+    fn drop(&mut self) {
+        if !self.owns {
+            return;
+        }
+        let previous = self.previous.take();
+        MEMBERSHIP_CACHE.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
+/// [`point_inside_face_uv`], through the open [`MembershipCacheScope`] over
+/// `model` when there is one -- the same winding test, each loop projected
+/// once for the scope.
+pub(crate) fn point_inside_face_uv_scoped(u: f64, v: f64, face: &Face, model: &BRepModel) -> bool {
+    let here = model as *const BRepModel as usize;
+    let cache = MEMBERSHIP_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(m, _)| *m == here)
+            .map(|(_, cache)| Arc::clone(cache))
+    });
+    match cache {
+        Some(cache) => point_inside_face_uv_cached(u, v, face, model, &cache),
+        None => point_inside_face_uv(u, v, face, model),
+    }
+}
+
 pub(crate) struct LoopUvCache {
     entries: DashMap<crate::primitives::r#loop::LoopId, Arc<CachedLoopUv>>,
 }
