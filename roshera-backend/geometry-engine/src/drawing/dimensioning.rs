@@ -1326,7 +1326,7 @@ pub fn standard_drawing_hlr_with_projection(
     // right, iso]`; zipping against the three specs drops the unused iso slot.
     for ((proj, name), pos) in specs.into_iter().zip(placement.positions) {
         drawing.add_view(build_hlr_view(
-            model, solid_id, source, proj, name, pos, scale, min_span, None,
+            model, solid_id, source, proj, name, pos, scale, min_span, None, None,
         )?);
     }
     dedup_dimensions_global(&mut drawing);
@@ -1455,8 +1455,9 @@ fn build_hlr_view(
     scale: f64,
     min_span: f64,
     dimensions: Option<Vec<Dimension2d>>,
+    extent: Option<super::types::ViewExtent>,
 ) -> Result<super::types::ProjectedView, super::projection::ProjectionError> {
-    let mut view = hlr_view_geometry(model, solid_id, source, proj, name, pos, scale)?;
+    let mut view = hlr_view_geometry(model, solid_id, source, proj, name, pos, scale, extent)?;
     // Dimensions are in VIEW space, so a caller that already found them for
     // this view (the sheet plan, at unit scale) hands them over instead of
     // finding them again; an undimensioned view (the pictorial) passes none.
@@ -1489,7 +1490,7 @@ pub fn added_view(
         super::types::ViewSource::Part { solid_id, .. } => solid_id,
     };
     let name: String = name.into();
-    let mut view = hlr_view_geometry(model, solid_id, source, proj, &name, pos, scale)?;
+    let mut view = hlr_view_geometry(model, solid_id, source, proj, &name, pos, scale, None)?;
     if matches!(proj, ProjectionType::Isometric) {
         view.shaded_raster = shaded_iso_raster(model, solid_id, view.extent, scale);
     }
@@ -1499,6 +1500,7 @@ pub fn added_view(
 
 /// The line work of one HLR view (everything [`build_hlr_view`] draws except
 /// the dimensions).
+#[allow(clippy::too_many_arguments)]
 fn hlr_view_geometry(
     model: &BRepModel,
     solid_id: SolidId,
@@ -1507,11 +1509,23 @@ fn hlr_view_geometry(
     name: &str,
     pos: [f64; 2],
     scale: f64,
+    extent: Option<super::types::ViewExtent>,
 ) -> Result<super::types::ProjectedView, super::projection::ProjectionError> {
-    use super::projection::{project_solid_view, DEFAULT_CURVE_SAMPLES};
+    use super::projection::{project_solid_view, project_solid_view_shell, DEFAULT_CURVE_SAMPLES};
     use super::visibility::project_solid_edges_visibility_occ;
 
-    let mut view = project_solid_view(model, source, proj, name, pos, scale)?;
+    // The plain projection's line work is replaced below by the hidden-line
+    // result; only its extent (of every edge, visible or not) is kept. A
+    // caller that already projected this view (the sheet plan, at unit
+    // scale -- the extent is in view space) hands the extent over instead.
+    let mut view = match extent {
+        Some(extent) => {
+            let mut view = project_solid_view_shell(source, proj, name, pos, scale);
+            view.extent = extent;
+            view
+        }
+        None => project_solid_view(model, source, proj, name, pos, scale)?,
+    };
     let edges =
         project_solid_edges_visibility_occ(model, solid_id, proj, DEFAULT_CURVE_SAMPLES, true)?;
     if matches!(proj, ProjectionType::Isometric) {
@@ -3499,6 +3513,7 @@ fn build_sheet(
                     .flatten()
                     .unwrap_or_default(),
             ),
+            plan.extents.get(i).copied(),
         )?;
         if prof {
             eprintln!(
@@ -3675,6 +3690,7 @@ fn attach_pictorial_iso(
         s,
         min_span,
         Some(Vec::new()),
+        None,
     ) else {
         return;
     };
@@ -7022,6 +7038,7 @@ mod tests {
             "ISO",
             [0.0, 0.0],
             1.0,
+            None,
         )
         .expect("iso");
         assert_eq!(iso.polylines.len(), 9, "visible edges of a box in iso");
@@ -7703,6 +7720,63 @@ pub(crate) mod dimension_find_counter {
         pub(super) static FINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// Extractions of the drafting dimension table on this thread.
         pub(crate) static TABLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Plain (no hidden-line) projections of a solid's edges on this thread.
+        pub(crate) static PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A sheet projects each view's edges once, in the plan (to size the
+    /// paper); the drawn views keep that extent and draw their line work by
+    /// hidden-line removal alone. (Pass 2 used to project every edge of every
+    /// view again, only to replace the result: ~0.7 s a view on part 109.)
+    #[test]
+    fn a_sheet_projects_each_view_once() {
+        use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+        let mut model = BRepModel::new();
+        let solid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(60.0, 40.0, 20.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            other => panic!("a box is a solid: {other:?}"),
+        };
+        PROJECTIONS.with(|c| c.set(0));
+        let plan = plan_sheet(
+            &model,
+            solid,
+            uuid::Uuid::nil(),
+            super::super::types::ProjectionAngle::default(),
+        )
+        .expect("plan");
+        assert_eq!(
+            PROJECTIONS.with(|c| c.get()),
+            4,
+            "the plan projects the four views"
+        );
+        let mut built = Vec::new();
+        let sheet = build_sheet(
+            &model,
+            solid,
+            uuid::Uuid::nil(),
+            super::super::types::ProjectionAngle::default(),
+            &plan,
+            SheetChoice::Auto(super::super::types::SheetOrientation::Landscape),
+            &mut built,
+        )
+        .expect("sheet");
+        assert_eq!(
+            PROJECTIONS.with(|c| c.get()),
+            4,
+            "drawing the views projects none again"
+        );
+        for (view, extent) in sheet.views.iter().zip(&plan.extents) {
+            let e = &view.extent;
+            assert_eq!(
+                (e.min_x, e.min_y, e.max_x, e.max_y),
+                (extent.min_x, extent.min_y, extent.max_x, extent.max_y),
+                "{} keeps the plan's extent",
+                view.name
+            );
+        }
     }
 
     /// A sheet search extracts the part's dimension table ONCE: the plan

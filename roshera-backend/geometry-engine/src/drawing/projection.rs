@@ -208,6 +208,8 @@ pub fn project_solid_edges(
     projection: ProjectionType,
     samples_per_curve: usize,
 ) -> Result<Vec<Polyline2d>, ProjectionError> {
+    #[cfg(test)]
+    super::dimensioning::dimension_find_counter::PROJECTIONS.with(|c| c.set(c.get() + 1));
     let solid = model
         .solids
         .get(solid_id)
@@ -325,15 +327,32 @@ pub fn project_solid_view(
             extent.include(*p);
         }
     }
-    let mut view = ProjectedView {
+    let mut view = project_solid_view_shell(source, projection, name, position_mm, scale);
+    view.polylines = polylines;
+    view.extent = extent;
+    view.canonicalize();
+    Ok(view)
+}
+
+/// A view with no line work: its identity, placement and scale, everything
+/// else empty -- what [`project_solid_view`] fills, and what the sheet's
+/// hidden-line views fill instead when the plan already holds the extent.
+pub(crate) fn project_solid_view_shell(
+    source: super::types::ViewSource,
+    projection: ProjectionType,
+    name: impl Into<String>,
+    position_mm: [f64; 2],
+    scale: f64,
+) -> ProjectedView {
+    ProjectedView {
         id: ProjectedViewId::new(),
         name: name.into(),
         projection,
         source,
         position_mm,
         scale,
-        polylines,
-        extent,
+        polylines: Vec::new(),
+        extent: ViewExtent::empty(),
         dimensions: Vec::new(),
         centerlines: Vec::new(),
         hidden_polylines: Vec::new(),
@@ -348,9 +367,7 @@ pub fn project_solid_view(
         // (`dimensioning::build_hlr_view`) populates this. Empty → readback
         // refuses on these polylines rather than guessing.
         polyline_sources: Vec::new(),
-    };
-    view.canonicalize();
-    Ok(view)
+    }
 }
 
 /// Convenience accessor used by some callers (project a single 3D
