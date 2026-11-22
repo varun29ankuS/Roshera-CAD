@@ -280,11 +280,10 @@ export function SignInHero() {
           uPale: { value: new THREE.Color(pal.wakePale) },
           uDeep: { value: new THREE.Color(pal.wakeDeep) },
           uAlpha: { value: pal.wakeAlpha },
-          uNozzle: { value: new THREE.Vector3(NOZZLE.y, NOZZLE.z, NOZZLE.exitRadius) },
         },
         vertexShader: `
           attribute vec4 seed;
-          uniform float uTime; uniform float uScale; uniform vec3 uNozzle;
+          uniform float uTime; uniform float uScale;
           varying float vAlpha; varying float vCore;
           float h(float n) { return fract(sin(n * 91.345) * 47453.53); }
           void main() {
@@ -297,16 +296,15 @@ export function SignInHero() {
             p.y += grow * 0.3 * (0.6 * sin(p.x * 0.33 + ph + uTime * 0.45) + 0.3 * sin(p.x * 0.91 + ph * 1.7 - uTime * 0.7) + 0.1 * sin(p.x * 2.3 + ph * 3.1));
             p.z += grow * 0.4 * (0.6 * sin(p.x * 0.27 + ph * 1.3 - uTime * 0.35) + 0.3 * sin(p.x * 0.83 + ph * 2.3 + uTime * 0.6));
             float j1 = h(seed.y * 311.0 + 1.0) - 0.5, j2 = h(seed.y * 173.0 + 2.0) - 0.5;
-            // Each stream widens as real flow does, x metres downstream: a
-            // jet linearly (half-width R + 0.09 x, about a 5 degree half
-            // angle), a wake as sqrt(x); a tip vortex's core grows below.
-            float x = s * (kind == 1.0 ? 36.0 : 30.0);
-            vec2 jetOff = vec2(position.y - uNozzle.x, position.z - side * uNozzle.y);
-            float jetB = uNozzle.z + 0.09 * x;
+            // The wing and tail wake widens downstream as sqrt(x), x metres
+            // from the trailing edge; the exhaust jets stay a narrow, dense
+            // core (Varun 11-22: the central darkening from the exhausts
+            // reads better than a jet spread to its real 5 degrees); a tip
+            // vortex's core grows below.
+            float x = s * 30.0;
             float wakeD = 0.04 + 0.11 * sqrt(x);
             if (kind == 1.0) {
-              vec2 grown = jetOff * (jetB / uNozzle.z) + vec2(j1, j2) * 0.5 * (jetB - uNozzle.z);
-              p.y += grown.x - jetOff.x; p.z += grown.y - jetOff.y;
+              p.y += j1 * (0.04 + 0.3 * s); p.z += j2 * (0.04 + 0.4 * s);
             } else if (kind == 2.0) {
               p.y += j1 * 0.04; p.z += j2 * 0.04;
             } else {
