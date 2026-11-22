@@ -1456,6 +1456,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         .into_iter()
         .map(|it| it.bbox)
         .collect();
+    let tag_places = hole_tag_reservations(drawing, &tabled_sites, h);
     let mut all_placed: Vec<PlacedDimension> = Vec::new();
     for (idx, view) in drawing.views.iter().enumerate() {
         let (fml, fmr, fmt, fmb) = frame_margins(&drawing.sheet_size);
@@ -1481,6 +1482,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
             })
             .map(|it| it.bbox)
             .chain(note_rects.iter().copied())
+            .chain(tag_places.iter().copied())
             .chain(
                 // Other views' centre lines are ink too, and they overshoot
                 // the outline: a section's hole axes stuck out past its
@@ -2543,6 +2545,73 @@ const HOLE_TAG_LEADER_RINGS: usize = 5;
 /// and share one tag.
 const HOLE_TAG_SAME_AXIS_MM: f64 = 1e-3;
 
+/// The hole tags of the axial view, one per axis: `(centre in view mm, text,
+/// largest diameter)`. Holes on one axis there (two bores in line, at
+/// different depths: one row each in the table) share one centre, and so one
+/// tag, "A1, A2" -- two tags on one point can only be printed over each
+/// other (part 115: five such pairs).
+fn hole_tag_groups(sites: &[HoleSite]) -> Vec<([f64; 2], String, f64)> {
+    let mut groups: Vec<([f64; 2], String, f64)> = Vec::new();
+    for site in sites {
+        let Some(centre) = site.axial_centre else {
+            continue;
+        };
+        match groups.iter_mut().find(|(c, _, _)| {
+            (c[0] - centre[0]).abs() < HOLE_TAG_SAME_AXIS_MM
+                && (c[1] - centre[1]).abs() < HOLE_TAG_SAME_AXIS_MM
+        }) {
+            Some((_, text, dia)) => {
+                text.push_str(", ");
+                text.push_str(&site.tag);
+                *dia = dia.max(site.diameter_mm);
+            }
+            None => groups.push((centre, site.tag.clone(), site.diameter_mm)),
+        }
+    }
+    groups
+}
+
+/// A hole's centre on the sheet (SVG y-down), from its axial-view centre.
+fn hole_tag_centre(axial_view: &ProjectedView, centre: [f64; 2], sheet_h: f64) -> [f64; 2] {
+    [
+        axial_view.position_mm[0] + centre[0] * axial_view.scale,
+        (sheet_h - axial_view.position_mm[1]) - centre[1] * axial_view.scale,
+    ]
+}
+
+/// Half the width and height of a hole tag's text box.
+fn hole_tag_half_extent(tag: &str) -> [f64; 2] {
+    [
+        tag.chars().count() as f64 * GLYPH_ADVANCE_EM * HOLE_TAG_FONT_MM * 0.5,
+        HOLE_TAG_FONT_MM * 0.5,
+    ]
+}
+
+/// Each tag's first place -- on its hole, centred -- reserved before the
+/// dimensions are routed, so their leaders go round it: a tag is tied to its
+/// hole, a callout's leader can take another row. Placed after the leaders,
+/// the tags of part 115 found every place on and round their holes crossed by
+/// radius leaders ('5× R4.1' through 'A9, A10') and were printed on the
+/// lines.
+fn hole_tag_reservations(drawing: &Drawing, sites: &[HoleSite], sheet_h: f64) -> Vec<Rect2> {
+    let Some(view) = drawing.axial_view_idx.and_then(|i| drawing.views.get(i)) else {
+        return Vec::new();
+    };
+    hole_tag_groups(sites)
+        .into_iter()
+        .map(|(centre, tag, _)| {
+            let [cx, cy] = hole_tag_centre(view, centre, sheet_h);
+            let [hw, hh] = hole_tag_half_extent(&tag);
+            Rect2 {
+                x0: cx - hw,
+                y0: cy - hh,
+                x1: cx + hw,
+                y1: cy + hh,
+            }
+        })
+        .collect()
+}
+
 /// Place each tabled hole's tag ("A1") in the axial view, clear of the
 /// `obstacles` (every text on the sheet and the hole table), of the other
 /// tags, and of every callout's line.
@@ -2565,36 +2634,14 @@ pub(crate) fn place_hole_tags(
     mut obstacles: Vec<Rect2>,
     callout_lines: &[[[f64; 2]; 2]],
 ) -> Vec<(PlacedHoleTag, SheetItem)> {
-    // Holes on one axis in the axial view (two bores in line, at different
-    // depths: one row each in the table) share one centre there, and so one
-    // tag, "A1, A2" -- two tags on one point can only be printed over each
-    // other (part 115: five such pairs).
-    let mut groups: Vec<([f64; 2], String, f64)> = Vec::new();
-    for site in sites {
-        let Some(centre) = site.axial_centre else {
-            continue;
-        };
-        match groups.iter_mut().find(|(c, _, _)| {
-            (c[0] - centre[0]).abs() < HOLE_TAG_SAME_AXIS_MM
-                && (c[1] - centre[1]).abs() < HOLE_TAG_SAME_AXIS_MM
-        }) {
-            Some((_, text, dia)) => {
-                text.push_str(", ");
-                text.push_str(&site.tag);
-                *dia = dia.max(site.diameter_mm);
-            }
-            None => groups.push((centre, site.tag.clone(), site.diameter_mm)),
-        }
-    }
+    let groups = hole_tag_groups(sites);
     let mut out = Vec::new();
     // The leaders of the tags placed so far: a later tag must not sit on one
     // (part 107 at 1:5: A4 was put on A1's leader).
     let mut tag_leaders: Vec<[[f64; 2]; 2]> = Vec::new();
     for (centre, tag, diameter_mm) in groups {
-        let sx = axial_view.position_mm[0] + centre[0] * axial_view.scale;
-        let sy = (sheet_h - axial_view.position_mm[1]) - centre[1] * axial_view.scale;
-        let half_w = tag.chars().count() as f64 * GLYPH_ADVANCE_EM * HOLE_TAG_FONT_MM * 0.5;
-        let half_h = HOLE_TAG_FONT_MM * 0.5;
+        let [sx, sy] = hole_tag_centre(axial_view, centre, sheet_h);
+        let [half_w, half_h] = hole_tag_half_extent(&tag);
         let rect_at = |cx: f64, cy: f64| Rect2 {
             x0: cx - half_w,
             y0: cy - half_h,
@@ -2662,6 +2709,44 @@ pub(crate) fn place_hole_tags(
             }
         }
         // No place is free: on the hole, and the sheet reports the overlap.
+        if chosen.is_none() && super::dimensioning::draw_profile_enabled() {
+            let blocked_by_lines = on_hole.iter().filter(|&&[cx, cy]| {
+                callout_lines
+                    .iter()
+                    .any(|l| segment_crosses_rect(l, &rect_at(cx, cy)))
+            });
+            // What rejects each place, on the hole and on the rings: off the
+            // frame, on text, on a tag's leader, on a callout's line.
+            let r_hole = 0.5 * diameter_mm * axial_view.scale;
+            let mut places: Vec<[f64; 2]> = on_hole.to_vec();
+            for ring in 1..=HOLE_TAG_LEADER_RINGS {
+                let reach = r_hole + ring as f64 * HOLE_TAG_LEADER_STEP_MM;
+                for k in 0..8 {
+                    let a = k as f64 * std::f64::consts::FRAC_PI_4;
+                    let (ux, uy) = (a.cos(), a.sin());
+                    let along = (half_w * ux.abs()).max(half_h * uy.abs());
+                    places.push([sx + ux * (reach + along), sy + uy * (reach + along)]);
+                }
+            }
+            let mut why = [0usize; 4];
+            for &[cx, cy] in &places {
+                let r = rect_at(cx, cy);
+                why[0] += usize::from(!inside(&r));
+                why[1] += usize::from(obstacles.iter().any(|o| r.intersects(o, 0.2)));
+                why[2] += usize::from(tag_leaders.iter().any(|l| segment_crosses_rect(l, &r)));
+                why[3] += usize::from(callout_lines.iter().any(|l| segment_crosses_rect(l, &r)));
+            }
+            eprintln!(
+                "[draw-profile]   hole tag '{tag}' has no free place within {HOLE_TAG_LEADER_RINGS} rings ({} of {} places on the hole crossed by callout lines; of {} places: {} off the frame, {} on text, {} on a tag leader, {} on a callout line)",
+                blocked_by_lines.count(),
+                on_hole.len(),
+                places.len(),
+                why[0],
+                why[1],
+                why[2],
+                why[3]
+            );
+        }
         let (anchor, leader) = chosen.unwrap_or(([sx, sy], None));
         let bbox = rect_at(anchor[0], anchor[1]);
         obstacles.push(bbox);
@@ -3855,6 +3940,14 @@ pub(crate) fn place_dimensions_routed(
                     // No clear row for any shoulder: the preferred one, at the
                     // nominal row kept clear of the other leaders at least.
                     // The layout check then reports the collision.
+                    if super::dimensioning::draw_profile_enabled() {
+                        eprintln!(
+                            "[draw-profile]   leader '{}' in {} has no clear row on {} shoulders",
+                            d.label,
+                            view.name,
+                            shoulders.len()
+                        );
+                    }
                     let (side, elbow_x) = shoulders
                         .first()
                         .copied()
@@ -4961,6 +5054,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A hole tag keeps its place on its hole, and a radius leader that
+    /// would run through it is routed round it: the tag is tied to the hole,
+    /// the leader can take another row. Part 115's tags found every place on
+    /// and round their holes crossed by radius leaders and were printed on
+    /// the lines ('5× R4.1' through 'A9, A10').
+    ///
+    /// Self-locating: a fillet at the view's bottom-left corner, its
+    /// shoulder to the right of the view, so its leg runs across the view;
+    /// the hole is put at the middle of the leg as routed with no hole
+    /// there, so it is crossed unless the leader moves.
+    ///
+    /// Mutation: drop `tag_places` from the routing obstacles in
+    /// `compute_layout` -> the leader keeps its line and the tag leaves the
+    /// hole -> RED.
+    #[test]
+    fn a_leader_is_routed_round_a_hole_tags_place() {
+        let h = SheetSize::A3.height();
+        let sheet = |sites: Vec<HoleSite>| {
+            let mut view = simple_view("TOP", ProjectionType::Top, [200.0, 150.0]);
+            let mut radius = pos_dim("4× R2", [-9.0, -9.0], [-9.0, -7.0]);
+            radius.kind = "radius".to_string();
+            view.dimensions = vec![radius];
+            let mut d = Drawing::new("tag-place", SheetSize::A3);
+            d.add_view(view);
+            d.axial_view_idx = Some(0);
+            d.hole_sites = sites;
+            d
+        };
+        let bare = compute_layout(&sheet(Vec::new()));
+        let leader = bare
+            .dimensions
+            .iter()
+            .find(|p| p.label == "4× R2")
+            .expect("the radius is placed");
+        // The leg: the leader's longest line that is not its horizontal
+        // shoulder.
+        let longest = placed_line_segments(leader)
+            .into_iter()
+            .filter(|s| (s[1][1] - s[0][1]).abs() > 1e-6)
+            .max_by(|a, b| {
+                let len = |s: &[[f64; 2]; 2]| (s[1][0] - s[0][0]).hypot(s[1][1] - s[0][1]);
+                len(a)
+                    .partial_cmp(&len(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("the leader has a leg");
+        let mid = [
+            0.5 * (longest[0][0] + longest[1][0]),
+            0.5 * (longest[0][1] + longest[1][1]),
+        ];
+        // Sheet (y down) to the view's coordinates (scale 1).
+        let centre = [mid[0] - 200.0, (h - 150.0) - mid[1]];
+        assert!(
+            centre[0].abs() < 10.0 && centre[1].abs() < 10.0,
+            "fixture: the leg crosses the view, the hole is in it: {centre:?}"
+        );
+        let layout = compute_layout(&sheet(vec![tag_site("A1", centre)]));
+        let tag = layout.hole_tags.first().expect("the tag is placed");
+        assert!(
+            (tag.text_anchor[0] - mid[0]).abs() < 1e-9
+                && (tag.text_anchor[1] - mid[1]).abs() < 1e-9
+                && tag.leader.is_none(),
+            "the tag left its hole at {mid:?}: {:?}",
+            tag
+        );
+        let leader = layout
+            .dimensions
+            .iter()
+            .find(|p| p.label == "4× R2")
+            .expect("the radius is still placed");
+        let tag_box = layout
+            .items
+            .iter()
+            .find(|it| it.kind == SheetItemKind::HoleTag)
+            .expect("tag item")
+            .bbox;
+        assert!(
+            !placed_line_segments(leader)
+                .iter()
+                .any(|l| segment_crosses_rect(l, &tag_box)),
+            "the leader runs through the tag {tag_box:?}"
+        );
     }
 
     /// A section letter "A" is placed clear of every dimension's LINE, not

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// environment variable (any non-empty value). When set, [`standard_drawing_auto`]
 /// prints milliseconds spent in each phase to stderr — the instrumentation the
 /// HLR perf work (#22) is measured against. Zero cost when unset (one env read).
-fn draw_profile_enabled() -> bool {
+pub(crate) fn draw_profile_enabled() -> bool {
     std::env::var_os("ROSHERA_DRAW_PROFILE").is_some_and(|v| !v.is_empty())
 }
 
