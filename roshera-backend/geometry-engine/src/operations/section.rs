@@ -30,8 +30,8 @@
 //!    parametric surfaces (NURBS, B-Spline, Ruled, Offset,
 //!    SurfaceOfRevolution) carry arbitrary parameter-space trim loops,
 //!    so each candidate sample is point-in-face-tested via
-//!    [`point_inside_face_uv`] (winding number on the loop's UV
-//!    projection). Face entry/exit points are located by 30-step
+//!    [`point_inside_face_uv_cached`] (winding number on the loop's UV
+//!    projection, each loop projected once per face). Face entry/exit points are located by 30-step
 //!    bisection on the segment between consecutive samples — linear
 //!    bbox-edge interpolation isn't applicable because trim curves in
 //!    UV are in general curved.
@@ -68,8 +68,8 @@ use crate::primitives::surface::{Plane, SurfaceType};
 use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::adaptive::compute_plane_axes;
 use crate::tessellation::surface::{
-    face_uv_domain_is_rectangular, get_face_parameter_bounds, point_inside_face_uv,
-    triangulate_planar_polygon,
+    face_uv_domain_is_rectangular, get_face_parameter_bounds, point_inside_face_uv_cached,
+    triangulate_planar_polygon, LoopUvCache,
 };
 
 /// Result of intersecting a single solid with a plane. One cap per
@@ -1098,8 +1098,16 @@ fn trim_curve_to_face(
             || (v - v_min).abs() <= bnd_v
             || (v_max - v).abs() <= bnd_v
     };
+    // Each loop's (u, v) polygon is projected once for this trim, not per
+    // query: the uncached test re-projects every boundary edge -- a
+    // closest-point solve per sample -- for every curve sample and bisection
+    // step, and held part 109's sheet in one NURBS face for over twelve
+    // minutes. Same winding test, same answer (`point_inside_face_uv_cached`).
+    let loop_cache = LoopUvCache::new();
     let member = |u: f64, v: f64| -> bool {
-        in_bbox(u, v) && (on_domain_boundary(u, v) || point_inside_face_uv(u, v, face, model))
+        in_bbox(u, v)
+            && (on_domain_boundary(u, v)
+                || point_inside_face_uv_cached(u, v, face, model, &loop_cache))
     };
     let inside_face = |p: &ParametricIntersectionPoint| -> bool { member(p.u, p.v) };
 
@@ -2042,6 +2050,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Trimming a section curve to a curved face projects each of the
+    /// face's loops into (u, v) ONCE, not once per curve sample and
+    /// bisection step: that per-query rebuild -- a closest-point solve per
+    /// edge sample -- held part 109's sheet in one NURBS face for over twelve
+    /// minutes. Same answer, measured on the solid-of-revolution meridian.
+    ///
+    /// Mutation: trim with the uncached `point_inside_face_uv` -> hundreds
+    /// of projections -> RED.
+    #[test]
+    fn a_section_projects_each_loop_once_per_face() {
+        let mut model = BRepModel::new();
+        let s = revolve_smooth_solid(&mut model, NOZZLE_INNER, RevolveOptions::default())
+            .expect("solid vase build");
+        let loops: usize = model
+            .get_solid(s)
+            .and_then(|solid| model.shells.get(solid.outer_shell))
+            .map(|shell| {
+                shell
+                    .faces
+                    .iter()
+                    .filter_map(|f| model.faces.get(*f))
+                    .map(|f| 1 + f.inner_loops.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        crate::tessellation::surface::LOOP_UV_PROJECTIONS.with(|c| c.set(0));
+        let caps = section_solid_by_plane(
+            &model,
+            s,
+            Point3::new(0.0, 0.0, 40.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Tolerance::default(),
+        )
+        .expect("axial section");
+        assert!(!caps.is_empty(), "the meridian cut has a profile");
+        let projections = crate::tessellation::surface::LOOP_UV_PROJECTIONS.with(|c| c.get());
+        assert!(
+            projections <= 2 * loops,
+            "{projections} loop projections for {loops} loops"
+        );
     }
 
     fn sid(g: GeometryId) -> SolidId {

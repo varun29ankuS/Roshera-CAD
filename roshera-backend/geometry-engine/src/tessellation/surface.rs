@@ -10535,6 +10535,16 @@ fn update_bounds_from_loop(
     }
 }
 
+// How many times a loop's UV polygon was projected on this thread: a closest-
+// point solve per sample on a curved face, so a membership test that rebuilds
+// it per query is the cost to watch (a section through part 109's NURBS face
+// ran past twelve minutes).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LOOP_UV_PROJECTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Public re-export of the winding-number face-membership test.
 ///
 /// Required by `operations::section` for NURBS / Ruled / Offset /
@@ -11264,6 +11274,8 @@ pub(crate) fn project_loop_uv_unwrapped(
     intervals: usize,
     inclusive: bool,
 ) -> Vec<(f64, f64)> {
+    #[cfg(test)]
+    LOOP_UV_PROJECTIONS.with(|c| c.set(c.get() + 1));
     let u_period = surface.period_u();
     let v_period = surface.period_v();
     let upper = if inclusive { intervals + 1 } else { intervals };
