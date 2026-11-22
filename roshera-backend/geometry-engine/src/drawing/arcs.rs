@@ -171,6 +171,8 @@ fn walls_of(model: &BRepModel, g: &AttributedAdjacencyGraph) -> Vec<CylinderWall
         let mut seen_edges: HashSet<u32> = HashSet::new();
         let mut side_edges = 0usize;
         let mut all_tangent = true;
+        // Each side edge and how it meets its neighbour, for the profile.
+        let mut sides: Vec<(u32, u32, EdgeConvexity, Option<f64>)> = Vec::new();
         for &f in &faces {
             for (arc, other) in g.neighbours(f) {
                 if !seen_edges.insert(arc.edge) {
@@ -194,6 +196,15 @@ fn walls_of(model: &BRepModel, g: &AttributedAdjacencyGraph) -> Vec<CylinderWall
                 if leaves && rim_circle(model, arc.edge, origin, axis).is_none() {
                     side_edges += 1;
                     all_tangent &= arc.convexity == EdgeConvexity::Tangent;
+                    if super::dimensioning::draw_profile_enabled() {
+                        let angle = crate::operations::edge_classification::classify_face_pair(
+                            model, arc.edge, f, other,
+                        )
+                        .ok()
+                        .and_then(|c| c.dihedral_angle)
+                        .map(f64::to_degrees);
+                        sides.push((arc.edge, other, arc.convexity, angle));
+                    }
                 }
             }
         }
@@ -217,6 +228,12 @@ fn walls_of(model: &BRepModel, g: &AttributedAdjacencyGraph) -> Vec<CylinderWall
             (tau, 0.0)
         };
         let mid_radial = add(scale(x, mid.cos()), scale(y, mid.sin()));
+        if coverage < tau && super::dimensioning::draw_profile_enabled() {
+            eprintln!(
+                "[draw-profile]   arc faces {faces:?} R{radius:.3} covers {:.1} deg, side edges {sides:?}",
+                coverage.to_degrees()
+            );
+        }
         walls.push(CylinderWall {
             faces,
             origin,

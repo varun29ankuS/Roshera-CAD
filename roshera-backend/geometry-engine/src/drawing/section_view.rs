@@ -72,6 +72,19 @@ pub fn section_view(
     pos: [f64; 2],
     scale: f64,
 ) -> Option<ProjectedView> {
+    // Each stage timed under the profile: part 109's sheet spent over twelve
+    // minutes in here with no line printed.
+    let prof = super::dimensioning::draw_profile_enabled();
+    let mut t_stage = std::time::Instant::now();
+    let mut stage = |what: &str| {
+        if prof {
+            eprintln!(
+                "[draw-profile]     section {what}: {:.1} ms",
+                t_stage.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        t_stage = std::time::Instant::now();
+    };
     let caps = section_solid_by_plane(
         model,
         solid_id,
@@ -80,6 +93,7 @@ pub fn section_view(
         Tolerance::default(),
     )
     .ok()?;
+    stage("section_solid_by_plane");
     if caps.is_empty() {
         return None;
     }
@@ -125,6 +139,7 @@ pub fn section_view(
     for cap in &caps {
         push_cap(cap, &to2d, &mut tris2d, &mut edge_count, &q);
     }
+    stage("caps to 2d");
     if tris2d.is_empty() {
         return None;
     }
@@ -172,7 +187,9 @@ pub fn section_view(
         u,
         v,
     ));
+    stage("back_of_plane_outline");
     let centerlines = section_centerlines(model, solid_id, plane_origin, n, u, v);
+    stage("section_centerlines");
 
     // The view's DECLARED extent additionally folds in the back-of-plane
     // OUTLINE just added, so nothing the caller places on the sheet is
@@ -235,6 +252,7 @@ pub fn section_view(
         }
         c += spacing;
     }
+    stage(&format!("hatch ({} triangles)", tris2d.len()));
 
     Some(ProjectedView {
         id: ProjectedViewId::new(),

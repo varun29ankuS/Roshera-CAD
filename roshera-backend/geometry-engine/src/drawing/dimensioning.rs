@@ -3324,7 +3324,20 @@ fn build_sheet(
             t_p2.elapsed().as_secs_f64() * 1e3
         );
     }
+    // Each step of the tail, timed under the profile: part 109 spent over
+    // twelve minutes somewhere after its views with no line printed.
+    let mut t_step = std::time::Instant::now();
+    let mut step = |name: &str| {
+        if prof {
+            eprintln!(
+                "[draw-profile]   tail {name}: {:.1} ms",
+                t_step.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        t_step = std::time::Instant::now();
+    };
     dedup_dimensions_global(&mut drawing);
+    step("dedup_dimensions_global");
 
     // ── Hole table population ──────────────────────────────────────────────────
     // Extract all dimension records for the solid and derive the hole table.
@@ -3333,14 +3346,21 @@ fn build_sheet(
     // part's own OD / boss faces out of the table.
     let t_tail = std::time::Instant::now();
     let dims = super::arcs::drafting_dimensions(model, solid_id);
+    step("drafting_dimensions");
     let bore_faces = super::arcs::closed_bore_faces(model, solid_id);
+    step("closed_bore_faces");
     drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
+    step("detect_round_part");
     drawing.hole_features =
         super::hole_features::detect_hole_features(model, solid_id, drawing.round_part.as_ref());
+    step("detect_hole_features");
     attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
+    step("attach_hole_table_from_dims");
     // A freeform outline (an aerofoil) is stated by its ordinate table.
     super::profile_table::attach_profile_table(model, solid_id, &mut drawing);
+    step("attach_profile_table");
     super::round_part::add_pitch_circles(&mut drawing);
+    step("add_pitch_circles");
 
     // ── Section view (Task 9) ─────────────────────────────────────────────────
     // When the part has internal features (bore sites populated above), add
@@ -3350,6 +3370,7 @@ fn build_sheet(
         SheetChoice::Auto | SheetChoice::Exact(..) => None,
     };
     attach_section_view(model, solid_id, &mut drawing, &dims, exact_scale, cap);
+    step("attach_section_view");
 
     // ── GD&T sidecar bridge (Task 6 fix wave) ────────────────────────────────
     // Iterate the model's DRF (datum designations) and GDT sidecar
@@ -3357,6 +3378,7 @@ fn build_sheet(
     // fcf_blocks.  Dangling PIDs (face consumed by a later operation) are not
     // placed; the sheet certificate reports them as typed `dangling` facts.
     attach_gdt_annotations(model, solid_id, &mut drawing);
+    step("attach_gdt_annotations");
 
     // ── Tolerance binding (campaign #55 Slice 4) ──────────────────────────────
     // Join GD&T sidecar dimensional tolerances to the diameter callouts + hole
@@ -3367,7 +3389,9 @@ fn build_sheet(
 
     // Equal features are stated once with their count ("4× R5"): after the
     // table and the tolerances, so a tabled or toleranced size heads no count.
+    step("attach_tolerances");
     count_equal_features(&mut drawing);
+    step("count_equal_features");
 
     // ── Pictorial isometric coexistence (A4 ReplaceIso) ───────────────────────
     // On A4, SECTION A-A replaced the ISO cell entirely — but the sheet must
