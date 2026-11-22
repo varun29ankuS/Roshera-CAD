@@ -713,12 +713,37 @@ fn check_redundant_dimensions(drawing: &Drawing, issues: &mut Vec<DrawingIssue>)
 /// the two read as one thick line, and which feature each number belongs to
 /// cannot be told. Read from the DRAWN lines: two near-equal intervals drawn
 /// on opposite sides of the view (staggered) are clear. One
-/// `RedundantDimension` per pair.
+/// `RedundantDimension` per pair ([`find_dimensions_on_each_others_lines`]).
 fn check_extension_lines_apart(
     layout: &super::layout::SheetLayout,
     issues: &mut Vec<DrawingIssue>,
 ) {
+    for (i, j) in find_dimensions_on_each_others_lines(layout) {
+        let (a, b) = (&layout.dimensions[i], &layout.dimensions[j]);
+        issues.push(error(
+            DrawingIssueKind::RedundantDimension,
+            format!(
+                "'{}' and '{}' print on each other's lines: their extension lines \
+                 run less than {} mm apart",
+                a.label,
+                b.label,
+                super::layout::EXT_LINES_APART_MM
+            ),
+            None,
+        ));
+    }
+}
+
+/// Every pair `(i, j)`, `i < j`, of `layout.dimensions` printed on each
+/// other's lines ([`check_extension_lines_apart`]): each extension line of
+/// one beside one of the other's, and not both the same lines. The one
+/// measurement behind that check and the sheet's DETAIL views
+/// ([`super::detail_view`]), so the trigger and the report cannot disagree.
+pub(crate) fn find_dimensions_on_each_others_lines(
+    layout: &super::layout::SheetLayout,
+) -> Vec<(usize, usize)> {
     let dims = &layout.dimensions;
+    let mut out = Vec::new();
     for i in 0..dims.len() {
         for j in (i + 1)..dims.len() {
             let (a, b) = (&dims[i], &dims[j]);
@@ -766,20 +791,11 @@ fn check_extension_lines_apart(
                     && (apart(&a.ext[0], &b.ext[i]) || apart(&a.ext[1], &b.ext[j]))
             });
             if beside {
-                issues.push(error(
-                    DrawingIssueKind::RedundantDimension,
-                    format!(
-                        "'{}' and '{}' print on each other's lines: their extension lines \
-                         run less than {} mm apart",
-                        a.label,
-                        b.label,
-                        super::layout::EXT_LINES_APART_MM
-                    ),
-                    None,
-                ));
+                out.push((i, j));
             }
         }
     }
+    out
 }
 
 /// Two dimensions in one view state the same interval when both its ends

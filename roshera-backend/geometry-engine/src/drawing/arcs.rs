@@ -292,9 +292,22 @@ fn apply_arc_conventions(
         open.iter()
             .position(|w| entities.iter().all(|e| w.faces.contains(e)))
     };
+    // A face of an arc tangent to its neighbours at both ends.
+    let tangent_arc = |f: &u32| open.iter().any(|w| w.tangent_ends && w.faces.contains(f));
     let mut stated: HashSet<usize> = HashSet::new();
     let mut out = Vec::with_capacity(records.len());
     for mut d in records {
+        // A location or length every face of which is a tangent arc is not
+        // owed, though the faces lie on SEVERAL walls: a bend's inner and
+        // outer surfaces share one axis, and the kernel merges their records
+        // into one naming both (`dedupe_coincident`). Matched to one wall
+        // only, NIST CTC 03's bends kept three axis locations 0.3 mm apart.
+        if matches!(d.kind.as_str(), "length" | "position")
+            && !d.entities.is_empty()
+            && d.entities.iter().all(tangent_arc)
+        {
+            continue;
+        }
         let Some(wi) = wall_of(&d.entities) else {
             out.push(d);
             continue;
@@ -329,4 +342,71 @@ fn apply_arc_conventions(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A quarter-turn wall about the Z axis, tangent to its neighbours at
+    /// both side edges -- one surface of a bend.
+    fn bend_wall(face: u32, radius: f64) -> CylinderWall {
+        CylinderWall {
+            faces: vec![face],
+            origin: [0.0, 0.0, 0.0],
+            axis: [0.0, 0.0, 1.0],
+            radius,
+            coverage: std::f64::consts::FRAC_PI_2,
+            mid_radial: [1.0, 0.0, 0.0],
+            stations: [0.0, 10.0],
+            tangent_ends: true,
+        }
+    }
+
+    fn record(kind: &str, entities: Vec<u32>) -> DimensionRecord {
+        DimensionRecord {
+            id: format!("{kind}-{entities:?}"),
+            kind: kind.to_string(),
+            value: 35.82,
+            unit: "mm".to_string(),
+            label: "X 35.82".to_string(),
+            entities,
+            anchor: [17.9, 0.0, 5.0],
+            direction: [1.0, 0.0, 0.0],
+            axis: Some([0.0, 0.0, 1.0]),
+            pid: None,
+            datum: None,
+        }
+    }
+
+    /// A bend's inner and outer surfaces share one axis, so the kernel
+    /// merges their location records into one naming both faces
+    /// (`dedupe_coincident`). Both surfaces are tangent to the flats beside
+    /// them, so the bend is located by those flats and its axis is not
+    /// dimensioned -- as for one tangent round. Kept, NIST CTC 03's bends
+    /// put three locations 0.3 mm apart on the sheet ('35.82' was faces 123
+    /// and 127, R1.09 and R4.2 of one bend).
+    ///
+    /// Mutation: drop a location only when ONE wall holds all its faces ->
+    /// the two-face record is kept -> RED.
+    #[test]
+    fn a_bends_merged_location_is_not_owed() {
+        let model = BRepModel::new();
+        let walls = [bend_wall(123, 1.09), bend_wall(127, 4.2)];
+        let out = apply_arc_conventions(
+            &model,
+            vec![
+                record("position", vec![123, 127]),
+                record("length", vec![123, 127]),
+                // One face in a bend, one not: not the bend's location.
+                record("position", vec![123, 900]),
+            ],
+            &walls,
+        );
+        let kept: Vec<(&str, &[u32])> = out
+            .iter()
+            .map(|d| (d.kind.as_str(), d.entities.as_slice()))
+            .collect();
+        assert_eq!(kept, vec![("position", &[123u32, 900][..])], "{kept:?}");
+    }
 }
