@@ -141,8 +141,18 @@ impl OcclusionGrid {
             f64::NEG_INFINITY,
             f64::NEG_INFINITY,
         );
-        for &fid in &all_faces {
-            if let Some(fb) = face_bounds(model, fid, vm) {
+        // Each face's bounds sample its edges and surface: independent per
+        // face, so found on all cores, then folded in face order (the grid
+        // is the one a single thread builds).
+        let bounds: Vec<(FaceId, Option<FaceBounds>)> = {
+            use rayon::prelude::*;
+            all_faces
+                .par_iter()
+                .map(|&fid| (fid, face_bounds(model, fid, vm)))
+                .collect()
+        };
+        for (fid, fb) in bounds {
+            if let Some(fb) = fb {
                 let bb = fb.aabb2;
                 gmin_u = gmin_u.min(bb[0]);
                 gmin_v = gmin_v.min(bb[1]);
