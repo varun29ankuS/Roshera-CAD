@@ -278,6 +278,7 @@ export function SignInHero() {
           uTime: { value: 0 },
           uScale: { value: window.innerHeight },
           uAlpha: { value: pal.wakeAlpha },
+          uGamma: { value: pal.wakeGamma },
           uNozzle: { value: new THREE.Vector3(NOZZLE.y, NOZZLE.z, NOZZLE.exitRadius) },
         },
         vertexShader: `
@@ -343,7 +344,7 @@ export function SignInHero() {
             gl_Position = projectionMatrix * mv;
           }`,
         fragmentShader: `
-          uniform float uAlpha;
+          uniform float uAlpha; uniform float uGamma;
           varying float vAlpha; varying float vSpeed;
           // Turbo, the rainbow colormap CFD plots use (A. Mikhailov, Google,
           // 2019; polynomial fit): blue (slow) -> cyan -> green -> yellow ->
@@ -360,7 +361,7 @@ export function SignInHero() {
           void main() {
             vec2 q = gl_PointCoord - 0.5; float d = dot(q, q);
             if (d > 0.25) discard;
-            gl_FragColor = vec4(turbo(vSpeed), uAlpha * vAlpha * (1.0 - d * 3.0));
+            gl_FragColor = vec4(pow(turbo(vSpeed), vec3(uGamma)), uAlpha * vAlpha * (1.0 - d * 3.0));
           }`,
       }),
     )

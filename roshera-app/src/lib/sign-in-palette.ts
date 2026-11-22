@@ -23,6 +23,9 @@ export interface SignInScenePalette {
   /** The wake's overall opacity. Its particles are coloured by speed with
    *  the turbo colormap, as a CFD plot is, in both themes. */
   wakeAlpha: number
+  /** Gamma on the colormap: above 1 darkens its light middle (cyan,
+   *  yellow), which washes out on paper (Varun 11-22). */
+  wakeGamma: number
 }
 
 export type SignInTheme = 'light' | 'dark'
@@ -42,6 +45,7 @@ export function signInScenePalette(theme: SignInTheme): SignInScenePalette {
       groundLight: '#262b31',
       // On graphite the same particle count reads twice as heavy as on paper.
       wakeAlpha: 0.5,
+      wakeGamma: 1,
     }
   }
   return {
@@ -56,5 +60,6 @@ export function signInScenePalette(theme: SignInTheme): SignInScenePalette {
     skyLight: '#ffffff',
     groundLight: '#d8d4cc',
     wakeAlpha: 1,
+    wakeGamma: 1.6,
   }
 }
