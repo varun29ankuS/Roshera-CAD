@@ -163,18 +163,60 @@ pub(crate) fn convention_records(
     model: &BRepModel,
     solid_id: SolidId,
 ) -> Vec<crate::readable::DimensionRecord> {
+    let drafting = super::arcs::drafting_dimensions(model, solid_id);
+    let round = super::round_part::detect_round_part(model, solid_id, &drafting);
+    let holes = super::hole_features::detect_hole_features(model, solid_id, round.as_ref());
+    convention_from(model, drafting, round.as_ref(), holes.as_ref())
+}
+
+/// What one sheet search reads about the part, found ONCE: the drafting
+/// dimension table, the round-part and hole-feature callouts, the closed
+/// bores, and the table in its drawing conventions. Each of these is seconds
+/// on a large part (part 109: ~2 s for the table alone), and a sheet search
+/// used to find them for every view and again in every sheet's tail.
+pub(crate) struct PartFeatures {
+    pub(crate) drafting: Vec<crate::readable::DimensionRecord>,
+    pub(crate) round: Option<super::round_part::RoundPartCallouts>,
+    pub(crate) holes: Option<super::hole_features::HoleFeatures>,
+    pub(crate) bore_faces: std::collections::HashSet<u32>,
+    /// [`convention_records`] of the part.
+    pub(crate) convention: Vec<crate::readable::DimensionRecord>,
+}
+
+impl PartFeatures {
+    pub(crate) fn find(model: &BRepModel, solid_id: SolidId) -> Self {
+        let drafting = super::arcs::drafting_dimensions(model, solid_id);
+        let round = super::round_part::detect_round_part(model, solid_id, &drafting);
+        let holes = super::hole_features::detect_hole_features(model, solid_id, round.as_ref());
+        let bore_faces = super::arcs::closed_bore_faces(model, solid_id);
+        let convention = convention_from(model, drafting.clone(), round.as_ref(), holes.as_ref());
+        Self {
+            drafting,
+            round,
+            holes,
+            bore_faces,
+            convention,
+        }
+    }
+}
+
+/// [`convention_records`] from features already found.
+fn convention_from(
+    model: &BRepModel,
+    mut records: Vec<crate::readable::DimensionRecord>,
+    round: Option<&super::round_part::RoundPartCallouts>,
+    holes: Option<&super::hole_features::HoleFeatures>,
+) -> Vec<crate::readable::DimensionRecord> {
     // A round part is dimensioned the way a drawing states it (Ø outside,
     // bolt circle as one callout), not by the plate convention.
-    let mut records = super::arcs::drafting_dimensions(model, solid_id);
-    let round = super::round_part::detect_round_part(model, solid_id, &records);
-    if let Some(rp) = &round {
+    if let Some(rp) = round {
         records = super::round_part::apply_round_conventions(records, rp);
     }
     // A drilled hole is stated as its coaxial stack (counterbore,
     // countersink, THRU / blind), and a pattern of identical stacks as one
     // callout located by its first member and pitch.
-    if let Some(hf) = super::hole_features::detect_hole_features(model, solid_id, round.as_ref()) {
-        records = super::hole_features::apply_hole_conventions(records, &hf, model.document_unit());
+    if let Some(hf) = holes {
+        records = super::hole_features::apply_hole_conventions(records, hf, model.document_unit());
     }
     // A chamfer's cone is stated by its chamfer callout ("0.50 × 45°"), not
     // also as a 45° angle and a diameter of the cone.
@@ -386,9 +428,25 @@ pub fn visible_dimensions(
     projection: ProjectionType,
     min_span: f64,
 ) -> Vec<Dimension2d> {
+    visible_dimensions_from(
+        model,
+        convention_records(model, solid_id),
+        projection,
+        min_span,
+    )
+}
+
+/// [`visible_dimensions`] from the part's convention table already found
+/// ([`PartFeatures::convention`]), so a sheet's views share one extraction.
+pub(crate) fn visible_dimensions_from(
+    model: &BRepModel,
+    records: Vec<crate::readable::DimensionRecord>,
+    projection: ProjectionType,
+    min_span: f64,
+) -> Vec<Dimension2d> {
     #[cfg(test)]
     dimension_find_counter::FINDS.with(|c| c.set(c.get() + 1));
-    candidate_dimensions(model, solid_id, projection, min_span)
+    candidates_from_records(model, records, projection, min_span)
 }
 
 /// Every callout that READS in this view: what the view owes. The sheet
@@ -3137,6 +3195,8 @@ struct SheetPlan {
     /// undimensioned view. The sheet's views take these rather than finding
     /// them a second time.
     dimensions: Vec<Option<Vec<Dimension2d>>>,
+    /// The part's features, found once for the whole search.
+    features: PartFeatures,
 }
 
 /// Order matches `layout_four_view`'s returned positions: [Front, Top, Right,
@@ -3204,6 +3264,9 @@ fn plan_sheet(
             );
         }
     };
+    let t = std::time::Instant::now();
+    let features = PartFeatures::find(model, solid_id);
+    lap("part features", t);
     for (proj, name, dimensioned) in AUTO_VIEWS {
         let t = std::time::Instant::now();
         let mut v =
@@ -3214,7 +3277,8 @@ fn plan_sheet(
             // The dimensions each view will carry (no HLR: placement needs
             // only how many stack, not what is visible).
             let t = std::time::Instant::now();
-            v.dimensions = visible_dimensions(model, solid_id, proj, min_span);
+            v.dimensions =
+                visible_dimensions_from(model, features.convention.clone(), proj, min_span);
             lap(&format!("visible_dimensions {name}"), t);
             found.push(Some(v.dimensions.clone()));
             band_probe.add_view(v);
@@ -3226,26 +3290,20 @@ fn plan_sheet(
     // Equal features take one callout on the sheet, so they take one here.
     count_equal_features(&mut band_probe);
     let (vgap, hgap, left_bands) = {
-        let t = std::time::Instant::now();
-        let dims = super::arcs::drafting_dimensions(model, solid_id);
-        lap("extract_dimensions", t);
-        let t = std::time::Instant::now();
-        let round = super::round_part::detect_round_part(model, solid_id, &dims);
-        lap("detect_round_part", t);
-        let t = std::time::Instant::now();
-        let holes = super::hole_features::detect_hole_features(model, solid_id, round.as_ref());
-        lap("detect_hole_features", t);
-        let mut called_out = round.map(|r| r.callout_faces()).unwrap_or_default();
-        if let Some(h) = &holes {
+        let mut called_out = features
+            .round
+            .as_ref()
+            .map(|r| r.callout_faces())
+            .unwrap_or_default();
+        if let Some(h) = &features.holes {
             called_out.extend(h.callout_faces());
         }
-        let t = std::time::Instant::now();
-        let tabled: std::collections::HashSet<u32> =
-            super::arcs::closed_bore_faces(model, solid_id)
-                .into_iter()
-                .filter(|f| !called_out.contains(f))
-                .collect();
-        lap("bore_face_ids", t);
+        let tabled: std::collections::HashSet<u32> = features
+            .bore_faces
+            .iter()
+            .copied()
+            .filter(|f| !called_out.contains(f))
+            .collect();
         let (vgap, hgap) = dimension_band_gaps(&band_probe.views, &tabled, angle);
         // How deep each orthographic view's left-hand lanes run (FRONT,
         // TOP, RIGHT), paper mm.
@@ -3276,6 +3334,7 @@ fn plan_sheet(
         left_bands,
         max_dim,
         dimensions: found,
+        features,
     })
 }
 
@@ -3489,16 +3548,13 @@ fn build_sheet(
     // material-side qualifier (bore = concave cylindrical face) keeps the
     // part's own OD / boss faces out of the table.
     let t_tail = std::time::Instant::now();
-    let dims = super::arcs::drafting_dimensions(model, solid_id);
-    step("drafting_dimensions");
-    let bore_faces = super::arcs::closed_bore_faces(model, solid_id);
-    step("closed_bore_faces");
-    drawing.round_part = super::round_part::detect_round_part(model, solid_id, &dims);
-    step("detect_round_part");
-    drawing.hole_features =
-        super::hole_features::detect_hole_features(model, solid_id, drawing.round_part.as_ref());
-    step("detect_hole_features");
-    attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
+    // The part's features, found once by the plan for every sheet of the
+    // search.
+    let dims = &plan.features.drafting;
+    let bore_faces = &plan.features.bore_faces;
+    drawing.round_part = plan.features.round.clone();
+    drawing.hole_features = plan.features.holes.clone();
+    attach_hole_table_from_dims(dims, bore_faces, &mut drawing);
     step("attach_hole_table_from_dims");
     // A freeform outline (an aerofoil) is stated by its ordinate table.
     super::profile_table::attach_profile_table(model, solid_id, &mut drawing);
@@ -3513,7 +3569,7 @@ fn build_sheet(
         SheetChoice::Capped(_, cap) => Some(cap),
         SheetChoice::Auto(_) | SheetChoice::Exact(..) => None,
     };
-    attach_section_view(model, solid_id, &mut drawing, &dims, exact_scale, cap);
+    attach_section_view(model, solid_id, &mut drawing, dims, exact_scale, cap);
     step("attach_section_view");
 
     // ── GD&T sidecar bridge (Task 6 fix wave) ────────────────────────────────
@@ -7639,12 +7695,57 @@ mod raster_tessellation_tests {
 }
 
 #[cfg(test)]
-mod dimension_find_counter {
+pub(crate) mod dimension_find_counter {
     use super::*;
 
     thread_local! {
         /// Calls of [`visible_dimensions`] on this thread.
         pub(super) static FINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Extractions of the drafting dimension table on this thread.
+        pub(crate) static TABLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A sheet search extracts the part's dimension table ONCE: the plan
+    /// finds the part's features and every view, and every sheet's tail,
+    /// reads them. (It used to extract it for each of the three views, again
+    /// for the plan's lanes and again in each sheet's tail: about 2 s each on
+    /// part 109.)
+    #[test]
+    fn a_sheet_search_extracts_the_dimension_table_once() {
+        use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+        let mut model = BRepModel::new();
+        let solid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(60.0, 40.0, 20.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            other => panic!("a box is a solid: {other:?}"),
+        };
+        TABLES.with(|c| c.set(0));
+        let plan = plan_sheet(
+            &model,
+            solid,
+            uuid::Uuid::nil(),
+            super::super::types::ProjectionAngle::default(),
+        )
+        .expect("plan");
+        let mut built = Vec::new();
+        for orientation in [
+            super::super::types::SheetOrientation::Landscape,
+            super::super::types::SheetOrientation::Portrait,
+        ] {
+            build_sheet(
+                &model,
+                solid,
+                uuid::Uuid::nil(),
+                super::super::types::ProjectionAngle::default(),
+                &plan,
+                SheetChoice::Auto(orientation),
+                &mut built,
+            )
+            .expect("sheet");
+        }
+        assert_eq!(TABLES.with(|c| c.get()), 1, "one extraction for the search");
     }
 
     /// A sheet finds each dimensioned view's dimensions once: the plan finds

@@ -268,6 +268,8 @@ pub(crate) fn closed_bore_faces(model: &BRepModel, solid_id: SolidId) -> HashSet
 /// angle by its drawing convention ([`super::cone_angles`]). The sheet is
 /// built from it and the certificate re-measures against it.
 pub(crate) fn drafting_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<DimensionRecord> {
+    #[cfg(test)]
+    super::dimensioning::dimension_find_counter::TABLES.with(|c| c.set(c.get() + 1));
     let records = extract_dimensions(model, solid_id);
     let walls = cylinder_walls(model, solid_id);
     let records = apply_arc_conventions(model, records, &walls);
