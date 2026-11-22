@@ -74,7 +74,7 @@ There are 23 entries across 17 of 115 tools. Every one is a `param` difference. 
 | `timeline_checkpoint` | `skip_verification` | |
 | `blackboard_add_entry`, `blackboard_edit_entry`, `blackboard_list`, `blackboard_clear` | | `part_id`, `scope` |
 
-This matches the audit's 17 tools (`MCP_AUDIT.md`, "Drift between the two copies") field for field. The audit counted tools and this test counts entries: 9 + 2 + 2 + 1 + 1 + 8 = 23. The audit compared names and required-ness only. This test also compares types on 356 shared parameters and finds none that differ.
+This matches the audit's 17 tools (`docs/archive/MCP_AUDIT.md`, "Drift between the two copies") field for field. The audit counted tools and this test counts entries: 9 + 2 + 2 + 1 + 1 + 8 = 23. The audit compared names and required-ness only. This test also compares types on 356 shared parameters and finds none that differ.
 
 ## Proof (commands run from `roshera-mcp/`)
 

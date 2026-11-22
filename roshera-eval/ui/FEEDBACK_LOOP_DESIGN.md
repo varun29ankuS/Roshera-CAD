@@ -1,6 +1,6 @@
 # The human ↔ agent feedback loop: design
 
-2026-11-17. Companion to `PARITY_AND_FEEDBACK_AUDIT.md`. Builds on the 11-13 timeline decisions (plan = a movie; picking both ways; three views of one history).
+2026-11-17. Companion to `docs/archive/PARITY_AND_FEEDBACK_AUDIT.md`. Builds on the 11-13 timeline decisions (plan = a movie; picking both ways; three views of one history).
 
 > **Status 2026-11-22:** §a slice 1 landed (2b5ec5b7); §a message attachment landed (a4d5258a).
 > §b pick mode, §c accept/reject at step k and §d parity rule: not re-checked; parked (`PARKING_LOT.md`).

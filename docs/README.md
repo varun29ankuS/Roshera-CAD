@@ -42,7 +42,6 @@ edit only by its own rules.
 | `roshera-backend/geometry-engine/docs/burndown-diag-loft-family.md` | current | Diagnoses behind the KNOWN_REDS loft entries (KNOWN_REDS links its headings) |
 | `roshera-backend/geometry-engine/src/primitives/PRIMITIVES_MODULE_GUIDE.md` | current | Tour of the primitives module's main files |
 | `roshera-backend/geometry-engine/src/primitives/primitive_tests/EVIL_EDGE_CASES.md` | current | The six degenerate-topology tests in `topology_tests.rs` and why each matters |
-| `roshera-backend/geometry-engine/EVIL_EDGE_CASES.md` | historical | Older copy of the same six cases; merged into the one above |
 | `roshera-backend/geometry-engine/PERFORMANCE_METRICS.md` | current (unverified numbers) | 2026-05-13 tessellation timings; math rows disagree with the README |
 | `roshera-backend/geometry-engine/examples/README.md` | current | Kernel demo examples, the demo gallery refresh, their CI role |
 | `roshera-backend/timeline-engine/README.md` | current | Event-sourced timeline crate: modules, usage, how to add an operation |
@@ -67,17 +66,14 @@ edit only by its own rules.
 | `roshera-eval/README.md` | current | AGENT-EVAL-α: scenarios, score dimensions, oracles, how to run |
 | `roshera-eval/drawing-bench/BENCHMARK.md` | current | Drawing benchmark method, baselines, the craft score and the layout model |
 | `roshera-eval/drawing-bench/EDITING_DESIGN.md` | current | Drawing-editing design (dimensions, tolerances, GD&T on the sheet); basis for the plan's P2 |
-| `roshera-eval/drawing-bench/DRAWING_QUALITY_CRITIQUE.md` | historical | 11-17 critique; its main gaps closed, plan superseded by BENCHMARK.md and the workplan |
-| `roshera-eval/drawing-bench/PHASE1.md` | historical | Phase-1 inventory; §1 still describes `reference/` |
 | `roshera-eval/mcp/SINGLE_REGISTRY_DESIGN.md` | current | One tool registry owned by the backend; stages 0–1 built, 2–8 parked |
 | `roshera-eval/mcp/PARITY_TEST.md` | current | The registry schema-parity ratchet test (stage 0) |
-| `roshera-eval/mcp/MCP_AUDIT.md` | historical | 11-17 MCP surface audit; most rows fixed in d7f8dba2, the rest parked |
+| `docs/archive/MCP_AUDIT.md` | historical | 11-17 MCP surface audit; most rows fixed in d7f8dba2, the rest parked |
 | `roshera-eval/speed/FAST_EXACT_CERTIFICATE.md` | current | Certificate speed analysis; items 1–4 landed, 5–10 open |
-| `roshera-eval/diagnosis/DIAGNOSIS_217_211_249.md` | historical | CADGenBench import diagnosis; open fixes carried to the status doc |
+| `docs/archive/DIAGNOSIS_217_211_249.md` | historical | CADGenBench import diagnosis; open fixes carried to the status doc |
 | `roshera-eval/ui/CONVERSATION_UI_DESIGN.md` | current (parked) | Blackboard conversation design; first slice landed |
 | `roshera-eval/ui/FEEDBACK_LOOP_DESIGN.md` | current (parked) | Human ↔ agent feedback loop; live user context built |
-| `roshera-eval/ui/CONVERSATION_UI_AUDIT.md` | historical | 11-18 Blackboard audit behind the design |
-| `roshera-eval/ui/PARITY_AND_FEEDBACK_AUDIT.md` | historical | 11-17 parity audit; open gaps carried to PARKING_LOT |
+| `docs/archive/PARITY_AND_FEEDBACK_AUDIT.md` | historical | 11-17 parity audit; open gaps carried to PARKING_LOT |
 
 ## Research and direction (`docs/research/`)
 
@@ -94,9 +90,7 @@ edit only by its own rules.
 
 | Doc | Status | Purpose |
 |---|---|---|
-| `2026-08-22-agent-surface-open-work.md` | historical | Blackboard/lineage designs from 08-22 and measured facts (§5) |
-| `audit-2026-09-03-status.md` | historical | 09-27 audit handoff; remaining tasks carried to PARKING_LOT |
-| `handoff-2026-11-14-ui.md` | historical | 11-14 overnight UI handoff |
+| `archive/2026-08-22-agent-surface-open-work.md` | historical | Blackboard/lineage designs from 08-22 and measured facts (§5) |
 
 ## Not Markdown, also in `docs/`
 
@@ -104,3 +98,5 @@ edit only by its own rules.
 `architecture.html`, `site.css`, `viewer.js`, `logo.png`: the technical
 sheets (The Claim, The Certificate, Casebook, Envelope) whose published copies
 the README links.
+
+`docs/archive/` holds superseded audits and diagnoses kept as evidence (cited by code comments and designs). Deleted 2026-11-22 after their live content moved: the duplicate geometry-engine `EVIL_EDGE_CASES.md`, drawing-bench `PHASE1.md` (its reference inventory is now in `BENCHMARK.md`) and `DRAWING_QUALITY_CRITIQUE.md`, `CONVERSATION_UI_AUDIT.md`, `docs/audit-2026-09-03-status.md`, `docs/handoff-2026-11-14-ui.md` (all in git history).

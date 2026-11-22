@@ -70,13 +70,13 @@ repairs). Item 6 is in the status doc.
 **MCP / single registry** (`roshera-eval/mcp/`):
 - Single-registry stages 2–8 (gates behind dispatch, read tools, mutating
   core, drawing/GD&T, search/resources/progress, in-process app agent)
-- MCP_AUDIT open rows: 1.10 registry drift (ratchet at 23 differences),
+- MCP_AUDIT open rows (`docs/archive/MCP_AUDIT.md`): 1.10 registry drift (ratchet at 23 differences),
   non-atomic composites (`drill_pattern`, `boolean_many`, `sketch_points`,
   `timeline_branch`, `drawing_set_title`), remaining bare-status handlers,
   naming the recorded timeline step
 
 **App / human-agent parity** (`roshera-eval/ui/`,
-`docs/handoff-2026-11-14-ui.md`, `docs/2026-08-22-agent-surface-open-work.md`;
+the 11-14 UI handoff (deleted), `docs/archive/2026-08-22-agent-surface-open-work.md`;
 unverified):
 - Parity gaps 2–5, 7–9: agent assembly edits not broadcast; assembly
   instances and mates barely editable; no history view in the Assembly
@@ -94,7 +94,7 @@ unverified):
 - Chat box focus leaking keys to viewport shortcuts; MCP and app disagreeing
   on the active document; 70–120 s agent turns
 
-**History / security** (`docs/audit-2026-09-03-status.md`; task numbers
+**History / security** (the 09-03 audit status doc, deleted 2026-11-22; task numbers
 refer to its git-ignored plan; unverified):
 - History: 79 replay-stable solid ids (blocks 100b, a branch switch that
   rebuilds), 110 lanes that bypass the durable applied head, 74 truncate /

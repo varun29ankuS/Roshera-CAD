@@ -51,7 +51,7 @@ tail stays reachable at fixed cost through a three-tool funnel.
   token bill is measured by `tools/mcp_budget_gate.py`; the ~4.1k figure for
   the earlier 18-tool surface is no longer current.
 - **`ROSHERA_MCP_SURFACE=full`** — exposes every tool in the table directly
-  (about 115 kernel tools at the 2026-11-17 audit, `roshera-eval/mcp/MCP_AUDIT.md`,
+  (about 115 kernel tools at the 2026-11-17 audit, `docs/archive/MCP_AUDIT.md`,
   plus the tools the backend serves from `api-server/src/agent_tools/*.json`,
   registered by `src/served.ts`); the meta-tools are omitted since the whole
   surface is present. This is the transition escape hatch, not the recommended

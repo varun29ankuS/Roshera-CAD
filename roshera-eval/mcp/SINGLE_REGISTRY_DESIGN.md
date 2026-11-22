@@ -1,6 +1,6 @@
 # One tool registry, owned by the backend
 
-Date: 2026-11-17. Status: design, nothing built. Companion to `MCP_AUDIT.md` (the evidence for every claim about today's state).
+Date: 2026-11-17. Status: design, nothing built. Companion to `docs/archive/MCP_AUDIT.md` (the evidence for every claim about today's state).
 
 > **Status 2026-11-22:** Stage 0 landed in a2dcbbff (`roshera-mcp/test/registry_schema_parity.mjs`,
 > run by `npm run test:gates`). Stage 1 landed in d7f8dba2 + e49cfe10: the 12 assembly tools are

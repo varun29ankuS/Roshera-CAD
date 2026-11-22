@@ -1,0 +1,122 @@
+diff --git a/roshera-backend/geometry-engine/src/tessellation/mod.rs b/roshera-backend/geometry-engine/src/tessellation/mod.rs
+index e3ffc58b..f35c1926 100644
+--- a/roshera-backend/geometry-engine/src/tessellation/mod.rs
++++ b/roshera-backend/geometry-engine/src/tessellation/mod.rs
+@@ -308,6 +308,12 @@ pub fn tessellate_solids(
+     }
+ }
+ 
++/// Fraction of a part's size below which [`effective_params`] will not cap a
++/// mesh edge's length. Half a percent: 0.65 mm on a 130 mm part, 5 mm on a
++/// metre -- far below any feature a drawing or a certificate reads, while
++/// the chord (curvature) and angle limits still shape every curved face.
++pub(crate) const REL_EDGE_FLOOR: f64 = 5.0e-3;
++
+ /// The parameters [`tessellate_solid`] actually meshes `solid` with.
+ ///
+ /// Size-relative chord FLOOR. An absolute chord (the 0.001 mm default) is a
+@@ -320,21 +326,30 @@ pub fn tessellate_solids(
+ /// over-tessellation is clamped. ~5e-4 * diagonal is about a 6 deg facet on the
+ /// part's gross radius -- smooth for display AND watertight for export. Two
+ /// requests with equal effective parameters mesh to the same mesh.
++///
++/// The edge-length cap is floored the same way, at [`REL_EDGE_FLOOR`] of the
++/// part's size. An absolute cap (the 0.1 mm default) cuts a long, thin face
++/// into pieces of that length whatever its curvature: every fillet of a
++/// 130 mm turned part became hundreds of 0.1 mm strips, 1.17 million
++/// triangles for 779 faces. The cap can only get coarser; a curved face is
++/// still held to the chord and angle limits.
+ pub(crate) fn effective_params(
+     solid: &Solid,
+     model: &BRepModel,
+     params: &TessellationParams,
+ ) -> TessellationParams {
+     const REL_FLOOR: f64 = 5.0e-4;
+-    let floor = solid_extent(solid, model) * REL_FLOOR;
++    let extent = solid_extent(solid, model);
++    let floor = extent * REL_FLOOR;
++    let edge_floor = extent * REL_EDGE_FLOOR;
++    let mut effective = params.clone();
+     if params.chord_tolerance > 0.0 && params.chord_tolerance < floor {
+-        TessellationParams {
+-            chord_tolerance: floor,
+-            ..params.clone()
+-        }
+-    } else {
+-        params.clone()
++        effective.chord_tolerance = floor;
++    }
++    if params.max_edge_length > 0.0 && params.max_edge_length < edge_floor {
++        effective.max_edge_length = edge_floor;
+     }
++    effective
+ }
+ 
+ /// `params` as comparable bits: equal keys, equal meshes.
+@@ -1364,3 +1379,66 @@ mod certificate_mesh_reuse_tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
++mod size_relative_edge_tests {
++    use super::*;
++    use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
++
++    fn block(model: &mut BRepModel, size: f64) -> crate::primitives::solid::SolidId {
++        match TopologyBuilder::new(model)
++            .create_box_3d(size, size / 2.0, size / 4.0)
++            .expect("box")
++        {
++            GeometryId::Solid(s) => s,
++            other => panic!("a box is a solid: {other:?}"),
++        }
++    }
++
++    /// The edge-length cap scales with the part, as the chord floor does: an
++    /// absolute 0.1 mm cap cut every long, thin fillet of a 130 mm turned
++    /// part (CADGenBench 109) into 0.1 mm pieces -- 1.17 million triangles
++    /// for 779 faces and 21 s of certificate meshing. A small part keeps the
++    /// requested cap; a large part's cap is a fixed fraction of its size; and
++    /// a cap already coarser than that is left alone.
++    #[test]
++    fn the_edge_length_cap_scales_with_the_part() {
++        let mut model = BRepModel::new();
++        let small = block(&mut model, 10.0);
++        let large = block(&mut model, 200.0);
++        let fine = TessellationParams::default();
++        let get = |id| model.solids.get(id).expect("solid");
++
++        let small_p = effective_params(get(small), &model, &fine);
++        assert_eq!(small_p.max_edge_length, fine.max_edge_length, "a 10 mm part keeps 0.1 mm");
++
++        let large_p = effective_params(get(large), &model, &fine);
++        let extent = solid_extent(get(large), &model);
++        assert!(
++            (large_p.max_edge_length - extent * REL_EDGE_FLOOR).abs() < 1e-12,
++            "a {extent:.0} mm part's cap is {} mm",
++            large_p.max_edge_length
++        );
++        assert!(large_p.max_edge_length > 1.0, "well above 0.1 mm");
++
++        let coarse = TessellationParams {
++            max_edge_length: 50.0,
++            ..fine.clone()
++        };
++        assert_eq!(
++            effective_params(get(large), &model, &coarse).max_edge_length,
++            50.0,
++            "a coarser cap is untouched"
++        );
++        let none = TessellationParams {
++            max_edge_length: 0.0,
++            ..fine
++        };
++        assert_eq!(
++            effective_params(get(large), &model, &none).max_edge_length,
++            0.0,
++            "no cap stays no cap"
++        );
++    }
++}

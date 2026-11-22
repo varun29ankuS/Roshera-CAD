@@ -5,7 +5,7 @@ weakness in typical B-Rep implementations: a known place where naive
 code crashes, corrupts the model, or silently produces garbage.
 
 All six tests live in `topology_tests.rs` in this directory. This file
-absorbed `geometry-engine/EVIL_EDGE_CASES.md` (same six tests) on
+absorbed the former `geometry-engine/EVIL_EDGE_CASES.md` (same six tests; deleted 2026-11-22) on
 2026-11-22; the "Real scenario" lines come from it.
 
 ## Categories

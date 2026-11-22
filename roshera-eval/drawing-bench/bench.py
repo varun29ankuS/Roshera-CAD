@@ -47,7 +47,7 @@ def env(name, default):
 STEPS = env("ROSHERA_BENCH_STEPS",
             r"C:\Users\Varun Sharma\Downloads\standard-manufacturing-co_smc-harness-v1-2-fable-5-2-max_20261113-034752")
 # The reference drawings and NIST models are third-party data kept beside this
-# script, untracked (`.gitignore`; re-fetch per PHASE1.md).
+# script, untracked (`.gitignore`; re-fetch per BENCHMARK.md, "Reference sets").
 REFERENCE = env("ROSHERA_BENCH_REFERENCE", os.path.join(HERE, "reference"))
 NIST = env("ROSHERA_BENCH_NIST", os.path.join(HERE, "reference-nist"))
 EXE = env("ROSHERA_BENCH_EXE",

@@ -3,7 +3,7 @@
 > **Status 2026-11-22:** §10's first slice landed (6987cac3); §4 selection attachment landed
 > (a4d5258a). §2, §3, §6, §7 not re-checked; UI work beyond pilot needs is parked (`PARKING_LOT.md`).
 
-This design follows from `CONVERSATION_UI_AUDIT.md`. It keeps the founder's rules: the
+This design follows from the 11-18 Blackboard audit (deleted 2026-11-22 once its fixes shipped; in git history). It keeps the founder's rules: the
 viewport is the work (a transparent, closable overlay with no blur); panel headers hug;
 text never drops below 11 px; numbers live in the status bar; cards, not paragraphs; tick or
 cross, not prose; and an engineer-first look (a SolidWorks/Fusion feature-tree register,

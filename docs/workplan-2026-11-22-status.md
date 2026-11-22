@@ -31,6 +31,29 @@ practice with vendor-guide URLs (`docs/dfm-plan-2026-11-22.md`). A
 *Machinery's Handbook* citation enters only after checking the edition
 and table.
 
+## P0 import speed: the size-relative edge cap is parked on a mirror defect
+
+Part 109's import certificate meshes 1.17 M triangles because the
+tessellation edge-length cap is an absolute 0.1 mm: every long, thin
+fillet is cut into 0.1 mm strips. Flooring the cap at 0.5 % of the part's
+size (`docs/patches/2026-11-22-size-relative-edge-cap.patch`, with its
+test) cuts that to 277 k triangles and the certificate mesh from ~22 s to
+~9 s, and passes all 4634 geometry-engine lib tests. The full red-gate
+finds ONE new red: `tests/mirror_orientation.rs`
+`a_bore_rim_fillet_commutes_with_a_mirror` -- the fillet of the mirrored
+bore rim is refused, geometrically open (394 boundary edges).
+
+Root cause (found, not yet fixed): on the mirrored part the bore wall's
+top rim (a closed `Arc`, edge 50, used reversed) samples half a turn away
+from the seam vertex it closes on: the seam line meets the top at native
+u = 4.712, the arc's own t = 0 / t = 1 point projects to u = 7.854. The
+wall's outline therefore doubles back along the rim and the curved CDT
+refuses it (`OutlineOverlapsItself`). The 0.1 mm cap hid it: both rims
+hit the 100-segment ceiling and the two traversals welded into a harmless
+slit. Fix the closed-arc start under mirror (`Arc::transformed_arc`,
+orientation-reversing branch, and/or the edge range flip in
+`operations::transform`), then land the patch.
+
 ## Calendar
 
 Weeks 4–6 (CNC pack) are mostly done → pull live pilot parts forward
@@ -44,10 +67,10 @@ parts. Everything else from those docs is in `PARKING_LOT.md`.
 | Item | Source | Why it is in scope |
 |---|---|---|
 | The certificate has no deflection (distance) gate | `roshera-eval/speed/FAST_EXACT_CERTIFICATE.md` §1.4, ranked item 6 (11-17); no landing commit, and no "deflection" in `geometry-engine/src/harness/` or `tessellation/` | A mesh that strays from the surface can certify sound: a false pass |
-| Revolution `closest_point` assumes the profile lies in one meridian plane and returns a wrong answer as success | `roshera-eval/diagnosis/DIAGNOSIS_217_211_249.md` 249-B; no landing commit found | Imported revolved faces feed sections and drawing dimensions |
+| Revolution `closest_point` assumes the profile lies in one meridian plane and returns a wrong answer as success | `docs/archive/DIAGNOSIS_217_211_249.md` 249-B; no landing commit found | Imported revolved faces feed sections and drawing dimensions |
 | STEP-import soundness on real parts: CADGenBench fixes 3, 4, 6–9 open; robot arm 70 of 572 unsound; GrabCAD vice 11 of 13 unsound | same diagnosis; `docs/backlog-2026-11-06-kernel-trust.md` STEP-3, STEP-IMP-1 | A pilot STEP part that will not certify cannot get a drawing; take one only when a pilot part shows it |
-| Drafting gaps from the 11-17 critique: view choice (drop views that add nothing), sections that carry internal dimensions, complete hole callouts (blind depth, cbore/csink on blind holes, threads as authored notes), general notes and TYP | `roshera-eval/drawing-bench/DRAWING_QUALITY_CRITIQUE.md` §6 items 3, 4, 8, 9; `BENCHMARK.md` "Not done" | Each can leave a pilot sheet incomplete; status not re-checked |
-| Cross-bore breakout meshes with off-surface slivers (`max_normal_deviation_deg` 83.6) and the certificate reads the part unsound | `docs/2026-08-22-agent-surface-open-work.md` §6; pinned RED `geometry-engine/tests/cross_bore_mesh_wings.rs:262` (`#[ignore]`, not listed in `KNOWN_REDS.md`) | A pilot part with cross-drilled holes would not certify; take it when a pilot part shows it |
+| Drafting gaps from the 11-17 critique: view choice (drop views that add nothing), sections that carry internal dimensions, complete hole callouts (blind depth, cbore/csink on blind holes, threads as authored notes), general notes and TYP | `the 11-17 drawing critique (deleted 2026-11-22; open items listed here)` §6 items 3, 4, 8, 9; `BENCHMARK.md` "Not done" | Each can leave a pilot sheet incomplete; status not re-checked |
+| Cross-bore breakout meshes with off-surface slivers (`max_normal_deviation_deg` 83.6) and the certificate reads the part unsound | `docs/archive/2026-08-22-agent-surface-open-work.md` §6; pinned RED `geometry-engine/tests/cross_bore_mesh_wings.rs:262` (`#[ignore]`, not listed in `KNOWN_REDS.md`) | A pilot part with cross-drilled holes would not certify; take it when a pilot part shows it |
 | ISO 4762 counterbore table missing (agent refused to size counterbores) | `docs/campaign-2026-11-12-drawings-production.md`, "Gaps carried" | Already the plan's P1 standards-library task |
 
 ## Order now

@@ -22,6 +22,33 @@ What the FreeCAD column shows and does not show:
 
 The CADGenBench references print "this drawing deliberately departs from drafting standards". They are an inventory of WHAT a dense drawing states (sections with depth dimensions, details, counts), not a style target. Several are sheet-metal parts drawn as their flat pattern (107, 114, 130 in part): their ordinate dimensions are unfolded lengths that a sheet of the formed solid cannot state. Reference recall therefore measures coverage of content, not drafting quality.
 
+## Reference sets (inventory, from PHASE1 2026-11-18)
+
+### CADGenBench (HuggingAI4Engineering/cadgenbench-data) [V]
+- 84 task folders. **46 + 3 have `input.png` (+ `input2.png` in 3 cases) + `description.yaml`; 32 have `input.step`, `input.mesh.npz`, `renders/`, `edit_description.txt`.**
+- `1xx` = **generation-from-drawing** tasks (ids 101-143, 145-150; 144 is not in the benchmark). Task text: "Reproduce the geometry as accurately as possible from the drawing."
+- `2xx` = **editing tasks** (starting solid + instruction). **They have NO drawing.** 32 of our 81 local STEP files (201-250) therefore cannot be scored against a reference drawing. **Scoreable set = 49 parts: 101-143, 145-150.**
+- Format: single raster **PNG, 3072x2118 px, ~0.75-0.85 MB**, A2 landscape sheet. No PDF/SVG/vector source, so reference dimensions must be extracted by looking (vision/human), not parsed. A few ids have a second image (`input2.png`).
+- Downloaded to `roshera-eval/drawing-bench/reference/<id>/{input.png,description.yaml}` (about 40 MB total at 49 ids; full folder listing in `reference/_listing.json`). Data only, nothing executed.
+- Our STEP files: `...\Downloads\standard-manufacturing-co_smc-harness-v1-2-fable-5-2-max_20261113-034752\<id>\output.step`. Note these are another team's *reconstructions from the drawing*, so "our drawing vs reference drawing" compares a re-modelled part, not the benchmark's ground-truth part. Dimension values that the reconstruction got wrong will show up as "wrong" on our sheet through no fault of the drawing pipeline. Mitigation: score only against dimensions the reconstruction's own geometry has (see 3, check C0), or use the benchmark's certified-sound subset.
+
+### What the reference sheets look like (looked at 101, 105, 110, 120, 125) [V]
+Common template: A2 landscape, ISO-style zone border (1-12 / A-H), an **empty** title block (MATERIAL/ORIGINATED/CHECKED/RELEASED/WEIGHT/TITLE/PROJECT all blank, Hugging Face + Mecado logos), and the printed disclaimer **"THIS DRAWING DELIBERATELY DEPARTS FROM DRAFTING STANDARDS ... NOT INTENDED FOR HUMAN USE"**. So:
+- Title block content is **not** a scoring target (it is blank). Only "has a title block" is.
+- No tolerances (no +/-), no GD&T FCFs, no surface finish on the samples seen. Datum symbols appear only occasionally (101 has A and B datum boxes). Projection is not stated. Views are **not** aligned in the strict projection layout (101: views scattered, front view in the middle, top bottom-left); do NOT score view placement against it.
+- Content that does recur:
+  - 3-6 orthographic views + 1 shaded **ISO** (101: 1 ISO; 105: 2 ISO; 125: 2 ISO).
+  - **Section views** A-A / C-C / D-D with hatch (101, 105, 110, 120, 125) and **detail views** with circle + scale (105 detail C x4; 110 details A/B/C and section D-D; 120 sections A-A/B-B/C-C).
+  - Dimension kinds: linear, diameter (Ø), radius (R, "R10 TYP", "5x R15 TYP", "R2.00 TYP"), **angle** (150.5 deg, 112.5 deg, 85.06 deg, pattern angles), chamfer ("CH 2.50 X 45 deg TYP", "8X 1.5 x 45 deg"), arc length/pitch, hole **callouts** ("4X 12 THRU", "28 THRU", "CBORE Ø35 - 5 DEEP", "CSINK Ø12 X 90 deg", "6 X M12x1.75-6H - 15 DEEP", "3xØ35", "3xØ15.5").
+  - Notes ("R1 All Around", "Break Edge", "pocket depth remains same for every pocket", "ALL POCKET DEPTH IS 2.00MM").
+  - Dimensions are dense: 120 is a 300 mm enclosure with ~60 dimensions in a single view.
+- Precision is mixed: some sheets state two decimals (105, 125), others integers or comma decimals (110: "60,4", "46,2"). The scorer parses both.
+
+### NIST MBE PMI test models (second reference set) [V]
+- Downloaded to `reference-nist/`: 11 PMI-annotated PDFs (CTC-01..05, FTC-06..11, each one page of a 3D-annotated view, **not** a 2D drawing sheet) and the model zip (57 MB, **not extracted except** the 11 `*.stp` in `reference-nist/step/`).
+- STEP files are labelled "geometry only" (AP203, no PMI). The PMI (position, flatness, perpendicularity, profile, +/- tolerances, datums A/B/C) lives only in the PDFs (e.g. CTC-01: Ø25 +/-0.15, Ø35 0/-0.2, Ø20 +0.05/-0.10, 60 deg +/-0.5, position 0.75 A B C, flatness 0.2, perpendicularity 1.5 A, profile 0.5 A / 1.25 A B C).
+- Use: ground truth for **tolerance + GD&T + datum** scoring, which CADGenBench cannot test. Roshera cannot import this PMI (see gap G5), so the test is "import geometry, apply the PMI through our GD&T/datum API (gdt sidecar), generate the sheet, score that the FCFs/tolerances/datums are present, attached to the right feature, and readable".
+
 ## Method
 
 * Parts: the 49 CADGenBench reconstructions (ids 101-150 except 144; `output.step` from the SMC harness run of 2026-11-13) and the 11 NIST CTC/FTC AP203 models.
