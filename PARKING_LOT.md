@@ -113,3 +113,10 @@ refer to its git-ignored plan; unverified):
 
 **Pilot app** (`docs/campaign-2026-11-12-drawings-production.md`): the
 Tauri desktop app for Windows and macOS, built last.
+
+## Found 2026-11-23 (not yet fixed)
+- Section: an offset plane parallel to the axis (y = 5) through the
+  smooth-revolved nozzle (`NOZZLE_INNER`, radii 10-19 mm) returns NO caps
+  (`section_solid_by_plane` Ok(empty)); the meridian cut through the axis
+  works. Seen while writing the section loop-projection tests; cause not
+  investigated.

@@ -147,6 +147,10 @@ pub fn section_solid_by_plane(
     shells.extend_from_slice(&solid.peer_shells);
 
     let mut fragments: Vec<Polyline3D> = Vec::new();
+    let prof = std::env::var_os("ROSHERA_DRAW_PROFILE").is_some_and(|v| !v.is_empty());
+    // Per surface kind: faces, faces that gave fragments, milliseconds.
+    let mut by_kind: std::collections::BTreeMap<String, (usize, usize, f64)> =
+        std::collections::BTreeMap::new();
     for shell_id in shells {
         let shell = match model.shells.get(shell_id) {
             Some(s) => s,
@@ -154,7 +158,20 @@ pub fn section_solid_by_plane(
         };
         for face_id in &shell.faces {
             let before = fragments.len();
+            let t_face = std::time::Instant::now();
             collect_face_fragments(model, *face_id, plane_origin, normal, &mut fragments);
+            if prof {
+                let kind = model
+                    .faces
+                    .get(*face_id)
+                    .and_then(|f| model.surfaces.get(f.surface_id))
+                    .map(|s| format!("{:?}", s.surface_type()))
+                    .unwrap_or_default();
+                let e = by_kind.entry(kind).or_insert((0, 0, 0.0));
+                e.0 += 1;
+                e.1 += usize::from(fragments.len() > before);
+                e.2 += t_face.elapsed().as_secs_f64() * 1e3;
+            }
             if std::env::var("ROSHERA_SEC_TRACE").is_ok() {
                 let kind = model
                     .faces
@@ -185,6 +202,11 @@ pub fn section_solid_by_plane(
         }
     }
 
+    if prof {
+        for (kind, (faces, hit, ms)) in &by_kind {
+            eprintln!("[draw-profile]       section faces {kind}: {faces} ({hit} cut), {ms:.0} ms");
+        }
+    }
     if fragments.is_empty() {
         return Ok(Vec::new());
     }
@@ -598,6 +620,7 @@ fn collect_face_fragments(
         ..Default::default()
     };
 
+    let t_intersect = std::time::Instant::now();
     let curves = match intersect_surface_plane(surface, plane_origin, plane_normal, &config) {
         Ok(c) => c,
         Err(e) => {
@@ -663,20 +686,93 @@ fn collect_face_fragments(
         );
     }
 
-    for curve in &curves {
-        if tier2_parametric {
-            trim_curve_to_face(curve, face, model, u_min, u_max, v_min, v_max, out);
-        } else if analytic_trimmed {
-            trim_curve_to_trimmed_analytic_face(
-                curve,
-                face,
-                model,
-                plane_origin,
-                plane_normal,
-                out,
-            );
-        } else {
-            trim_curve_to_uv_bbox(curve, u_min, u_max, v_min, v_max, out);
+    let intersect_ms = t_intersect.elapsed().as_secs_f64() * 1e3;
+    let t_trim = std::time::Instant::now();
+    let samples: usize = curves.iter().map(|c| c.points.len()).sum();
+    let trim = if tier2_parametric {
+        FaceTrim::Winding
+    } else if analytic_trimmed {
+        FaceTrim::EvenOdd
+    } else {
+        FaceTrim::UvBox
+    };
+    trim_face_curves(
+        &curves,
+        face,
+        model,
+        (u_min, u_max, v_min, v_max),
+        (plane_origin, plane_normal),
+        trim,
+        out,
+    );
+    let trim_ms = t_trim.elapsed().as_secs_f64() * 1e3;
+    if intersect_ms + trim_ms > 200.0 && std::env::var_os("ROSHERA_DRAW_PROFILE").is_some() {
+        eprintln!(
+            "[draw-profile]         section face {face_id} {surface_kind:?}: intersect {intersect_ms:.0} ms ({} curves, {samples} samples), trim {trim_ms:.0} ms (tier2 {tier2_parametric}, trimmed {analytic_trimmed})",
+            curves.len()
+        );
+    }
+}
+
+/// How a face's section curves are clipped to the face.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FaceTrim {
+    /// Tier-2 parametric faces: the winding test on the trim loops.
+    Winding,
+    /// Boolean-trimmed analytic faces: the quotient-space even-odd test.
+    EvenOdd,
+    /// Analytic faces whose UV domain is its box.
+    UvBox,
+}
+
+/// Clip every curve the plane cuts one face in to that face. The face's trim
+/// loops are projected into UV once here and shared by every curve (part
+/// 109's NURBS faces are cut in fifteen curves; projecting the loops per
+/// curve rebuilt them fifteen times, ~2 s a face).
+fn trim_face_curves(
+    curves: &[ParametricIntersectionCurve],
+    face: &crate::primitives::face::Face,
+    model: &BRepModel,
+    (u_min, u_max, v_min, v_max): (f64, f64, f64, f64),
+    (plane_origin, plane_normal): (Point3, Vector3),
+    trim: FaceTrim,
+    out: &mut Vec<Polyline3D>,
+) {
+    match trim {
+        FaceTrim::Winding => {
+            let loop_cache = LoopUvCache::new();
+            for curve in curves {
+                trim_curve_to_face(
+                    curve,
+                    face,
+                    model,
+                    u_min,
+                    u_max,
+                    v_min,
+                    v_max,
+                    &loop_cache,
+                    out,
+                );
+            }
+        }
+        FaceTrim::EvenOdd => {
+            let polygons = face_loop_polygons_uv(face, model);
+            for curve in curves {
+                trim_curve_to_trimmed_analytic_face(
+                    curve,
+                    face,
+                    model,
+                    plane_origin,
+                    plane_normal,
+                    &polygons,
+                    out,
+                );
+            }
+        }
+        FaceTrim::UvBox => {
+            for curve in curves {
+                trim_curve_to_uv_bbox(curve, u_min, u_max, v_min, v_max, out);
+            }
         }
     }
 }
@@ -802,16 +898,36 @@ fn face_membership_evenodd_quotient(
         Some(s) => s,
         None => return false,
     };
-    let period_u = surface.period_u();
-    let period_v = surface.period_v();
+    let polygons = face_loop_polygons_uv(face, model);
+    evenodd_quotient_in(u, v, &polygons, surface.period_u(), surface.period_v())
+}
 
-    let mut loop_ids = vec![face.outer_loop];
-    loop_ids.extend_from_slice(&face.inner_loops);
+/// Every trim loop of `face` (outer, then inner) as its UV polygon -- the
+/// polygons [`face_membership_evenodd_quotient`] tests against. They depend
+/// on the face alone, so a caller testing many points builds them once
+/// (each is a projection of the loop's edge samples onto the surface).
+fn face_loop_polygons_uv(
+    face: &crate::primitives::face::Face,
+    model: &BRepModel,
+) -> Vec<Vec<(f64, f64)>> {
+    std::iter::once(face.outer_loop)
+        .chain(face.inner_loops.iter().copied())
+        .map(|lid| crate::tessellation::surface::loop_polygon_uv(lid, face, model))
+        .collect()
+}
 
+/// [`face_membership_evenodd_quotient`] against loop polygons already built
+/// by [`face_loop_polygons_uv`].
+fn evenodd_quotient_in(
+    u: f64,
+    v: f64,
+    polygons: &[Vec<(f64, f64)>],
+    period_u: Option<f64>,
+    period_v: Option<f64>,
+) -> bool {
     let mut crossings = 0usize;
     let mut any_polygon = false;
-    for lid in loop_ids {
-        let poly = crate::tessellation::surface::loop_polygon_uv(lid, face, model);
+    for poly in polygons {
         let n = poly.len();
         if n < 3 {
             continue;
@@ -961,10 +1077,19 @@ fn trim_curve_to_trimmed_analytic_face(
     model: &BRepModel,
     cut_origin: Point3,
     cut_normal: Vector3,
+    polygons: &[Vec<(f64, f64)>],
     out: &mut Vec<Polyline3D>,
 ) {
     let candidates = face_edge_plane_crossings(face, model, cut_origin, cut_normal);
-    let member = |u: f64, v: f64| -> bool { face_membership_evenodd_quotient(u, v, face, model) };
+    // The face's trim loops in UV (`polygons`, built once per face by the
+    // caller): every sample and every bisection step tests against them.
+    let (period_u, period_v) = model
+        .surfaces
+        .get(face.surface_id)
+        .map(|s| (s.period_u(), s.period_v()))
+        .unwrap_or((None, None));
+    let member =
+        |u: f64, v: f64| -> bool { evenodd_quotient_in(u, v, polygons, period_u, period_v) };
     let inside = |p: &ParametricIntersectionPoint| -> bool { member(p.u, p.v) };
 
     let snap = |p: Point3, radius: f64| -> Point3 {
@@ -1071,6 +1196,7 @@ fn trim_curve_to_face(
     u_max: f64,
     v_min: f64,
     v_max: f64,
+    loop_cache: &LoopUvCache,
     out: &mut Vec<Polyline3D>,
 ) {
     // Boundary tolerance for the parameter-domain rectangle. Relative to the
@@ -1098,16 +1224,17 @@ fn trim_curve_to_face(
             || (v - v_min).abs() <= bnd_v
             || (v_max - v).abs() <= bnd_v
     };
-    // Each loop's (u, v) polygon is projected once for this trim, not per
-    // query: the uncached test re-projects every boundary edge -- a
-    // closest-point solve per sample -- for every curve sample and bisection
-    // step, and held part 109's sheet in one NURBS face for over twelve
-    // minutes. Same winding test, same answer (`point_inside_face_uv_cached`).
-    let loop_cache = LoopUvCache::new();
+    // Each loop's (u, v) polygon is projected once per FACE (`loop_cache`,
+    // built by the caller and shared by every curve the plane cuts the face
+    // in), not per query: the uncached test re-projects every boundary edge
+    // -- a closest-point solve per sample -- for every curve sample and
+    // bisection step, and held part 109's sheet in one NURBS face for over
+    // twelve minutes; a cache per CURVE still rebuilt the loops for each of
+    // its fifteen curves. Same winding test, same answer.
     let member = |u: f64, v: f64| -> bool {
         in_bbox(u, v)
             && (on_domain_boundary(u, v)
-                || point_inside_face_uv_cached(u, v, face, model, &loop_cache))
+                || point_inside_face_uv_cached(u, v, face, model, loop_cache))
     };
     let inside_face = |p: &ParametricIntersectionPoint| -> bool { member(p.u, p.v) };
 
@@ -2087,6 +2214,231 @@ mod tests {
         )
         .expect("axial section");
         assert!(!caps.is_empty(), "the meridian cut has a profile");
+        let projections = crate::tessellation::surface::LOOP_UV_PROJECTIONS.with(|c| c.get());
+        // Once per loop: a face the plane cuts in several curves (two
+        // meridians here; fifteen on part 109's NURBS faces) still projects
+        // its loops once, not once per curve.
+        assert!(
+            projections <= loops,
+            "{projections} loop projections for {loops} loops"
+        );
+    }
+
+    /// Every face whose `trim` matches, with the curves `plane` cuts it in.
+    fn cut_faces(
+        model: &BRepModel,
+        s: SolidId,
+        origin: Point3,
+        normal: Vector3,
+        trim: FaceTrim,
+    ) -> Vec<(FaceId, Vec<ParametricIntersectionCurve>)> {
+        let Some(shell) = model
+            .get_solid(s)
+            .and_then(|solid| model.shells.get(solid.outer_shell))
+        else {
+            return Vec::new();
+        };
+        shell
+            .faces
+            .iter()
+            .filter_map(|&fid| {
+                let face = model.faces.get(fid)?;
+                let surface = model.surfaces.get(face.surface_id)?;
+                if surface.as_any().downcast_ref::<Plane>().is_some() {
+                    return None;
+                }
+                let tier2 = matches!(
+                    surface.surface_type(),
+                    SurfaceType::BSpline
+                        | SurfaceType::NURBS
+                        | SurfaceType::Ruled
+                        | SurfaceType::Offset
+                        | SurfaceType::SurfaceOfRevolution
+                );
+                let kind = if tier2 {
+                    FaceTrim::Winding
+                } else if !face_uv_domain_is_rectangular(face, model) {
+                    FaceTrim::EvenOdd
+                } else {
+                    FaceTrim::UvBox
+                };
+                if kind != trim {
+                    return None;
+                }
+                let curves = intersect_surface_plane(
+                    surface,
+                    origin,
+                    normal,
+                    &SurfacePlaneIntersectionConfig::default(),
+                )
+                .ok()?;
+                (!curves.is_empty()).then_some((fid, curves))
+            })
+            .collect()
+    }
+
+    /// Clip a face's curves -- here each curve three times over, as a face
+    /// cut in several curves -- and count its trim-loop projections.
+    fn projections_for_three_copies(
+        model: &BRepModel,
+        fid: FaceId,
+        curves: &[ParametricIntersectionCurve],
+        origin: Point3,
+        normal: Vector3,
+        trim: FaceTrim,
+    ) -> (usize, usize) {
+        let face = model.faces.get(fid).expect("face");
+        let loops = 1 + face.inner_loops.len();
+        let many: Vec<ParametricIntersectionCurve> =
+            curves.iter().chain(curves).chain(curves).cloned().collect();
+        let (u0, u1, v0, v1) = get_face_parameter_bounds(face, model);
+        let mut out = Vec::new();
+        crate::tessellation::surface::LOOP_UV_PROJECTIONS.with(|c| c.set(0));
+        trim_face_curves(
+            &many,
+            face,
+            model,
+            (u0, u1, v0, v1),
+            (origin, normal),
+            trim,
+            &mut out,
+        );
+        let projections = crate::tessellation::surface::LOOP_UV_PROJECTIONS.with(|c| c.get());
+        (projections, loops)
+    }
+
+    /// A face the plane cuts in several curves projects its trim loops once,
+    /// for the winding trim (revolved NURBS-class faces) and the even-odd trim
+    /// (boolean-trimmed bore walls) alike.
+    #[test]
+    fn a_face_cut_in_several_curves_projects_its_loops_once() {
+        let mut model = BRepModel::new();
+        let nozzle = revolve_smooth_solid(&mut model, NOZZLE_INNER, RevolveOptions::default())
+            .expect("solid vase build");
+        let (origin, normal) = (Point3::new(0.0, 0.0, 40.0), Vector3::Y);
+        let winding = cut_faces(&model, nozzle, origin, normal, FaceTrim::Winding);
+        assert!(
+            !winding.is_empty(),
+            "the meridian cut crosses a revolved face"
+        );
+        for (fid, curves) in &winding {
+            let (projections, loops) = projections_for_three_copies(
+                &model,
+                *fid,
+                curves,
+                origin,
+                normal,
+                FaceTrim::Winding,
+            );
+            assert!(
+                projections <= loops,
+                "winding face {fid}: {projections} projections for {loops} loops"
+            );
+        }
+
+        let mut model = BRepModel::new();
+        let block = sid(TopologyBuilder::new(&mut model)
+            .create_box_3d(60.0, 40.0, 40.0)
+            .expect("block"));
+        let bore_z = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, -40.0), Vector3::Z, 8.0, 80.0)
+            .expect("bore z"));
+        let after_z = boolean_operation(
+            &mut model,
+            block,
+            bore_z,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("block - bore z");
+        let bore_x = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(Point3::new(-40.0, 0.0, 0.0), Vector3::X, 8.0, 80.0)
+            .expect("bore x"));
+        let block = boolean_operation(
+            &mut model,
+            after_z,
+            bore_x,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("cross-drilled block");
+        let (origin, normal) = (Point3::new(0.0, 5.0, 0.0), Vector3::Y);
+        let evenodd = cut_faces(&model, block, origin, normal, FaceTrim::EvenOdd);
+        assert!(
+            !evenodd.is_empty(),
+            "the offset cut crosses a trimmed bore wall"
+        );
+        for (fid, curves) in &evenodd {
+            let (projections, loops) = projections_for_three_copies(
+                &model,
+                *fid,
+                curves,
+                origin,
+                normal,
+                FaceTrim::EvenOdd,
+            );
+            assert!(
+                projections <= loops,
+                "even-odd face {fid}: {projections} projections for {loops} loops"
+            );
+        }
+    }
+
+    /// A boolean-trimmed analytic face (a cross-drilled bore wall, trimmed by
+    /// the other bore) is trimmed by the even-odd test on its UV loops. Those
+    /// loops are the face's, not the sample's: they are built once per face,
+    /// not once per sample and bisection step (part 109's one such cone took
+    /// 5.4 s for 98 samples, rebuilding its loops every time).
+    #[test]
+    fn a_trimmed_analytic_face_projects_its_loops_once() {
+        let mut model = BRepModel::new();
+        let block = sid(TopologyBuilder::new(&mut model)
+            .create_box_3d(60.0, 40.0, 40.0)
+            .expect("block"));
+        let bore_z = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, -40.0), Vector3::Z, 8.0, 80.0)
+            .expect("bore z"));
+        let after_z = boolean_operation(
+            &mut model,
+            block,
+            bore_z,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("block - bore z");
+        let bore_x = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(Point3::new(-40.0, 0.0, 0.0), Vector3::X, 8.0, 80.0)
+            .expect("bore x"));
+        let s = boolean_operation(
+            &mut model,
+            after_z,
+            bore_x,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("cross-drilled block");
+        let loops: usize = model
+            .get_solid(s)
+            .and_then(|solid| model.shells.get(solid.outer_shell))
+            .map(|shell| {
+                shell
+                    .faces
+                    .iter()
+                    .filter_map(|f| model.faces.get(*f))
+                    .map(|f| 1 + f.inner_loops.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        crate::tessellation::surface::LOOP_UV_PROJECTIONS.with(|c| c.set(0));
+        let caps = section_solid_by_plane(
+            &model,
+            s,
+            Point3::new(0.0, 5.0, 0.0),
+            Vector3::Y,
+            Tolerance::default(),
+        )
+        .expect("offset section through the crossing");
+        assert_eq!(caps.len(), 4, "the four corner pieces");
         let projections = crate::tessellation::surface::LOOP_UV_PROJECTIONS.with(|c| c.get());
         assert!(
             projections <= 2 * loops,
