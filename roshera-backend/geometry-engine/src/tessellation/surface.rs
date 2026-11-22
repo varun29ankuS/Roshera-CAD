@@ -377,6 +377,8 @@ pub fn tessellate_face(
             if std::env::var_os("ROSHERA_TESS_TRACE").is_some() {
                 eprintln!("[tess] torus face {} meshed by the {path} path", face.id);
             }
+            #[cfg(test)]
+            TORUS_PATHS.with(|log| log.borrow_mut().push((face.id, path)));
         }
         // A `GeneralNurbsSurface` reports `type_name() == "NurbsSurface"`. A
         // CLOSED-in-U skin lateral (the `nurbs_loft` wall: a seamed ring surface)
@@ -5480,7 +5482,7 @@ fn tessellate_torus_quad_patch(
     let Some(lp) = model.loops.get(face.outer_loop) else {
         return false;
     };
-    if lp.edges.len() != 4 {
+    if lp.edges.len() < 4 {
         return false;
     }
     let Ok(axis) = torus.axis.normalize() else {
@@ -5496,8 +5498,8 @@ fn tessellate_torus_quad_patch(
     let tau = std::f64::consts::TAU;
     let pi = std::f64::consts::PI;
 
-    // Each side's samples in loop order.
-    let sides: Vec<Vec<Point3>> = lp
+    // Each edge's samples in loop order.
+    let edges: Vec<Vec<Point3>> = lp
         .edges
         .iter()
         .enumerate()
@@ -5510,15 +5512,16 @@ fn tessellate_torus_quad_patch(
             }
         })
         .collect();
-    if sides.iter().any(|s| s.len() < 2) {
+    if edges.iter().any(|s| s.len() < 2) {
         return false;
     }
-    // Consecutive sides meet.
-    for k in 0..4 {
-        let (Some(&end), Some(&start)) = (sides[k].last(), sides[(k + 1) % 4].first()) else {
+    // Consecutive edges meet.
+    for k in 0..edges.len() {
+        let (Some(&end), Some(&next)) = (edges[k].last(), edges[(k + 1) % edges.len()].first())
+        else {
             return false;
         };
-        if (end - start).magnitude() > tol {
+        if (end - next).magnitude() > tol {
             return false;
         }
     }
@@ -5528,7 +5531,7 @@ fn tessellate_torus_quad_patch(
         let a = w.dot(&axis);
         (a, w - axis * a)
     };
-    let Ok(e1) = frame(sides[0][0]).1.normalize() else {
+    let Ok(e1) = frame(edges[0][0]).1.normalize() else {
         return false;
     };
     let e2 = axis.cross(&e1);
@@ -5561,6 +5564,75 @@ fn tessellate_torus_quad_patch(
             on_torus(p) && d.abs() * frame(p).1.magnitude() <= tol
         })
     };
+    // A side may be split into several edges at vertices (a STEP writer
+    // splits a ring at its neighbours' corners): consecutive edges on one
+    // ring circle, or on one tube circle, are one side, their samples joined
+    // at the shared vertex.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Ring,
+        Tube,
+    }
+    let kind_of = |s: &[Point3]| {
+        if round_the_ring(s) {
+            Some(Kind::Ring)
+        } else if across_the_tube(s) {
+            Some(Kind::Tube)
+        } else {
+            None
+        }
+    };
+    let mut kinds: Vec<Kind> = Vec::with_capacity(edges.len());
+    for e in &edges {
+        match kind_of(e) {
+            Some(k) => kinds.push(k),
+            None => return false,
+        }
+    }
+    // Start at an edge whose predecessor is of the other kind, so no side
+    // wraps round the loop's start.
+    let n_edges = edges.len();
+    let Some(start) = (0..n_edges).find(|&i| kinds[(i + n_edges - 1) % n_edges] != kinds[i]) else {
+        return false;
+    };
+    let mut sides: Vec<Vec<Point3>> = Vec::new();
+    let mut last_kind: Option<Kind> = None;
+    for step in 0..n_edges {
+        let i = (start + step) % n_edges;
+        let joined = match sides.last_mut() {
+            Some(side) if last_kind == Some(kinds[i]) => {
+                let whole: Vec<Point3> = side
+                    .iter()
+                    .chain(edges[i].iter().skip(1))
+                    .copied()
+                    .collect();
+                // Still ONE circle (not two rings at different heights).
+                if kind_of(&whole) != Some(kinds[i]) {
+                    return false;
+                }
+                *side = whole;
+                true
+            }
+            _ => false,
+        };
+        if !joined {
+            sides.push(edges[i].clone());
+            last_kind = Some(kinds[i]);
+        }
+    }
+    if sides.len() != 4 {
+        return false;
+    }
+    // Consecutive sides meet.
+    for k in 0..4 {
+        let (Some(&end), Some(&begin)) = (sides[k].last(), sides[(k + 1) % 4].first()) else {
+            return false;
+        };
+        if (end - begin).magnitude() > tol {
+            return false;
+        }
+    }
+
     // Rotate so side 0 runs round the ring.
     let first = if round_the_ring(&sides[0]) && across_the_tube(&sides[1]) {
         0
@@ -5573,8 +5645,47 @@ fn tessellate_torus_quad_patch(
     if !(round_the_ring(side(2)) && across_the_tube(side(3)) && across_the_tube(side(1))) {
         return false;
     }
+    let osign = face.orientation.sign();
+    let outward = |p: Point3| -> Vector3 {
+        let (_, rad) = frame(p);
+        let core = center + rad.normalize().unwrap_or(torus.ref_dir) * big_r;
+        (p - core).normalize().unwrap_or(axis) * osign
+    };
+    let point = |u: f64, v: f64| {
+        let e = e1 * u.cos() + e2 * u.sin();
+        center + e * (big_r + small_r * v.cos()) + axis * (small_r * v.sin())
+    };
     let (nu, nv) = (side(0).len(), side(1).len());
     if side(2).len() != nu || side(3).len() != nv {
+        // One pair of opposite sides unequal: rows run between the EQUAL
+        // pair (the rails), the unequal sides are the first and last rows.
+        if side(3).len() == nv {
+            // Rails across the tube: rows round the ring.
+            return rows_between_rails(
+                mesh,
+                side(0),
+                side(2),
+                side(3),
+                side(1),
+                &|p: Point3| ring_angle(p),
+                &|p: Point3| tube_angle(p),
+                &|along: f64, at: f64| point(along, at),
+                &outward,
+            );
+        } else if side(2).len() == nu {
+            // Rails round the ring: rows across the tube.
+            return rows_between_rails(
+                mesh,
+                side(1),
+                side(3),
+                side(0),
+                side(2),
+                &|p: Point3| tube_angle(p),
+                &|p: Point3| ring_angle(p),
+                &|along: f64, at: f64| point(at, along),
+                &outward,
+            );
+        }
         return false;
     }
 
@@ -5596,16 +5707,6 @@ fn tessellate_torus_quad_patch(
             0.5 * (a + b)
         })
         .collect();
-    let osign = face.orientation.sign();
-    let outward = |p: Point3| -> Vector3 {
-        let (_, rad) = frame(p);
-        let core = center + rad.normalize().unwrap_or(torus.ref_dir) * big_r;
-        (p - core).normalize().unwrap_or(axis) * osign
-    };
-    let point = |u: f64, v: f64| {
-        let e = e1 * u.cos() + e2 * u.sin();
-        center + e * (big_r + small_r * v.cos()) + axis * (small_r * v.sin())
-    };
     let mut ids = vec![vec![0u32; nv]; nu];
     for i in 0..nu {
         for j in 0..nv {
@@ -5644,6 +5745,136 @@ fn tessellate_torus_quad_patch(
             } else {
                 mesh.add_triangle(a, c, b);
                 mesh.add_triangle(a, d, c);
+            }
+        }
+    }
+    true
+}
+
+/// Mesh a four-sided patch whose sides `first_row` and `last_row` (opposite
+/// each other) may carry different sample counts, between two RAILS of equal
+/// count: `rail_a` runs from `last_row`'s start to `first_row`'s start
+/// (loop order: first_row, rail_b, last_row, rail_a), `rail_b` from
+/// `first_row`'s end to `last_row`'s start. Row `j` runs from `rail_a`'s
+/// matching sample to `rail_b`'s, at the rails' common "across" parameter
+/// (`across(p)`), with interior points on the surface at evenly spaced
+/// "along" parameters (`along(p)` reads one off a point; `point(along,
+/// across)` evaluates the surface). The first and last rows are the shared
+/// edge samples verbatim, as are both rails, so the patch welds to its
+/// neighbours bit for bit. Consecutive rows are joined by a strip that steps
+/// along whichever row is behind; each strip is wound by one vote against
+/// `outward`. Returns `false` (the caller falls back) if a rail is shorter
+/// than two samples.
+#[allow(clippy::too_many_arguments)]
+fn rows_between_rails(
+    mesh: &mut TriangleMesh,
+    first_row: &[Point3],
+    last_row_loop_order: &[Point3],
+    rail_a_loop_order: &[Point3],
+    rail_b: &[Point3],
+    along: &dyn Fn(Point3) -> f64,
+    across: &dyn Fn(Point3) -> f64,
+    point: &dyn Fn(f64, f64) -> Point3,
+    outward: &dyn Fn(Point3) -> Vector3,
+) -> bool {
+    let k = rail_b.len();
+    if k < 2 || rail_a_loop_order.len() != k || first_row.len() < 2 || last_row_loop_order.len() < 2
+    {
+        return false;
+    }
+    let pi = std::f64::consts::PI;
+    let tau = std::f64::consts::TAU;
+    let unwrap_from = |base: f64, x: f64| base + (x - base + pi).rem_euclid(tau) - pi;
+    // Row j's endpoints: rail_a read from the first row's end of it.
+    let rail_a: Vec<Point3> = rail_a_loop_order.iter().rev().copied().collect();
+    let last_row: Vec<Point3> = last_row_loop_order.iter().rev().copied().collect();
+    let (n0, n1) = (first_row.len(), last_row.len());
+    let mut rows: Vec<Vec<(Point3, u32, f64)>> = Vec::with_capacity(k);
+    for j in 0..k {
+        let pts: Vec<Point3> = if j == 0 {
+            first_row.to_vec()
+        } else if j == k - 1 {
+            last_row.clone()
+        } else {
+            let (a, b) = (rail_a[j], rail_b[j]);
+            let s0 = along(a);
+            let s1 = unwrap_from(s0, along(b));
+            let c0 = across(a);
+            let c = 0.5 * (c0 + unwrap_from(c0, across(b)));
+            let frac = j as f64 / (k - 1) as f64;
+            let m = ((n0 as f64 + (n1 as f64 - n0 as f64) * frac).round() as usize).max(2);
+            (0..m)
+                .map(|i| {
+                    if i == 0 {
+                        a
+                    } else if i == m - 1 {
+                        b
+                    } else {
+                        point(s0 + (s1 - s0) * i as f64 / (m - 1) as f64, c)
+                    }
+                })
+                .collect()
+        };
+        // Each vertex's position along its row, 0 at rail_a, 1 at rail_b.
+        let s0 = along(pts[0]);
+        let mut ss: Vec<f64> = pts.iter().map(|&p| unwrap_from(s0, along(p))).collect();
+        let span = ss[ss.len() - 1] - ss[0];
+        if span.abs() < 1e-15 {
+            return false;
+        }
+        for s in &mut ss {
+            *s = (*s - s0) / span;
+        }
+        rows.push(
+            pts.iter()
+                .zip(ss)
+                .map(|(&p, s)| {
+                    let id = mesh.add_vertex(MeshVertex {
+                        position: p,
+                        normal: outward(p),
+                        uv: None,
+                    });
+                    (p, id, s)
+                })
+                .collect(),
+        );
+    }
+    for w in rows.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        let (mut i, mut j) = (0usize, 0usize);
+        let mut tris: Vec<[(Point3, u32); 3]> = Vec::with_capacity(a.len() + b.len());
+        while i + 1 < a.len() || j + 1 < b.len() {
+            let advance_a = if i + 1 >= a.len() {
+                false
+            } else if j + 1 >= b.len() {
+                true
+            } else {
+                a[i + 1].2 <= b[j + 1].2
+            };
+            if advance_a {
+                tris.push([(a[i].0, a[i].1), (a[i + 1].0, a[i + 1].1), (b[j].0, b[j].1)]);
+                i += 1;
+            } else {
+                tris.push([(a[i].0, a[i].1), (b[j + 1].0, b[j + 1].1), (b[j].0, b[j].1)]);
+                j += 1;
+            }
+        }
+        let mut vote = 0.0;
+        for tri in &tris {
+            let centroid = Point3::new(
+                (tri[0].0.x + tri[1].0.x + tri[2].0.x) / 3.0,
+                (tri[0].0.y + tri[1].0.y + tri[2].0.y) / 3.0,
+                (tri[0].0.z + tri[1].0.z + tri[2].0.z) / 3.0,
+            );
+            vote += (tri[1].0 - tri[0].0)
+                .cross(&(tri[2].0 - tri[0].0))
+                .dot(&outward(centroid));
+        }
+        for tri in &tris {
+            if vote < 0.0 {
+                mesh.add_triangle(tri[0].1, tri[2].1, tri[1].1);
+            } else {
+                mesh.add_triangle(tri[0].1, tri[1].1, tri[2].1);
             }
         }
     }
@@ -14573,5 +14804,277 @@ mod banded_membership_tests {
             "a query reads {mean:.0} of {} segments on average",
             poly.len()
         );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test instrument: which mesher each torus face meshed on this thread
+    /// took, in order.
+    static TORUS_PATHS: std::cell::RefCell<Vec<(u32, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+mod torus_patch_tests {
+    use super::*;
+    use crate::math::Vector3;
+    use crate::primitives::curve::{Arc, Curve, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    use crate::primitives::face::{Face, FaceOrientation};
+    use crate::primitives::r#loop::{Loop, LoopType};
+    use crate::primitives::surface::Torus;
+
+    const BIG: f64 = 10.0;
+    const SMALL: f64 = 3.0;
+
+    /// A fillet-quarter torus patch as a STEP writer emits one: ring angle
+    /// 0..90 deg, tube angle 0..90 deg, four arcs -- round the ring at radius
+    /// 13 (z = 0), across the tube, round the ring at radius 10 (z = 3), back
+    /// across the tube. The two ring sides differ in length, so at a fine
+    /// chord they carry different sample counts.
+    fn quarter_fillet_patch(split_outer_ring: bool) -> (BRepModel, u32) {
+        let mut m = BRepModel::new();
+        let a = m.vertices.add(13.0, 0.0, 0.0);
+        let b = m.vertices.add(0.0, 13.0, 0.0);
+        let c = m.vertices.add(0.0, 10.0, 3.0);
+        let d = m.vertices.add(10.0, 0.0, 3.0);
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let mut arc_edge = |m: &mut BRepModel,
+                            sweep: f64,
+                            centre: Point3,
+                            normal: Vector3,
+                            x_axis: Vector3,
+                            r: f64,
+                            from: u32,
+                            to: u32,
+                            want: (Point3, Point3)| {
+            let arc = Arc::with_x_axis(centre, normal, x_axis, r, 0.0, sweep).expect("arc");
+            let (s, e) = (arc.point_at(0.0).expect("s"), arc.point_at(1.0).expect("e"));
+            assert!(
+                (s - want.0).magnitude() < 1e-9 && (e - want.1).magnitude() < 1e-9,
+                "arc runs {s:?} -> {e:?}, wanted {want:?}"
+            );
+            let cid = m.curves.add(Box::new(arc));
+            m.edges.add(Edge::new(
+                0,
+                from,
+                to,
+                cid,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            ))
+        };
+        let p = Point3::new;
+        // A -> B round the ring at radius 13 -- whole, or split at 45 deg into
+        // two edges (as a STEP writer splits a ring at a neighbour's corner).
+        let outer: Vec<u32> = if split_outer_ring {
+            let h = 13.0 * std::f64::consts::FRAC_1_SQRT_2;
+            let mid = m.vertices.add(h, h, 0.0);
+            let first = arc_edge(
+                &mut m,
+                quarter / 2.0,
+                p(0.0, 0.0, 0.0),
+                Vector3::Z,
+                Vector3::X,
+                13.0,
+                a,
+                mid,
+                (p(13.0, 0.0, 0.0), p(h, h, 0.0)),
+            );
+            let second = arc_edge(
+                &mut m,
+                quarter / 2.0,
+                p(0.0, 0.0, 0.0),
+                Vector3::Z,
+                Vector3::new(1.0, 1.0, 0.0),
+                13.0,
+                mid,
+                b,
+                (p(h, h, 0.0), p(0.0, 13.0, 0.0)),
+            );
+            vec![first, second]
+        } else {
+            vec![arc_edge(
+                &mut m,
+                quarter,
+                p(0.0, 0.0, 0.0),
+                Vector3::Z,
+                Vector3::X,
+                13.0,
+                a,
+                b,
+                (p(13.0, 0.0, 0.0), p(0.0, 13.0, 0.0)),
+            )]
+        };
+        // B -> C across the tube, in the plane x = 0.
+        let e1 = arc_edge(
+            &mut m,
+            quarter,
+            p(0.0, 10.0, 0.0),
+            Vector3::X,
+            Vector3::Y,
+            SMALL,
+            b,
+            c,
+            (p(0.0, 13.0, 0.0), p(0.0, 10.0, 3.0)),
+        );
+        // D -> C round the ring at radius 10 (used reversed: C -> D).
+        let e2 = arc_edge(
+            &mut m,
+            quarter,
+            p(0.0, 0.0, 3.0),
+            Vector3::Z,
+            Vector3::X,
+            10.0,
+            d,
+            c,
+            (p(10.0, 0.0, 3.0), p(0.0, 10.0, 3.0)),
+        );
+        // A -> D across the tube, in the plane y = 0 (used reversed: D -> A).
+        let e3 = arc_edge(
+            &mut m,
+            quarter,
+            p(10.0, 0.0, 0.0),
+            -Vector3::Y,
+            Vector3::X,
+            SMALL,
+            a,
+            d,
+            (p(13.0, 0.0, 0.0), p(10.0, 0.0, 3.0)),
+        );
+        let mut lp = Loop::new(0, LoopType::Outer);
+        for e in outer {
+            lp.add_edge(e, true);
+        }
+        lp.add_edge(e1, true);
+        lp.add_edge(e2, false);
+        lp.add_edge(e3, false);
+        let lid = m.loops.add(lp);
+        let torus = Torus::new(Point3::ZERO, Vector3::Z, BIG, SMALL).expect("torus");
+        let sid = m.surfaces.add(Box::new(torus));
+        let fid = m
+            .faces
+            .add(Face::new(0, sid, lid, FaceOrientation::Forward));
+        (m, fid)
+    }
+
+    /// Fine enough that the two ring sides take different sample counts.
+    fn params() -> TessellationParams {
+        TessellationParams {
+            max_segments: 1000,
+            ..TessellationParams::default()
+        }
+    }
+
+    /// The patch is meshed as a structured patch -- rows between its two tube
+    /// sides, each ring side verbatim at its own count -- not handed to the
+    /// general triangulator. And the mesh is a sound patch: every point on
+    /// the torus, every shared edge sample a mesh vertex, its boundary exactly
+    /// the four sides, every interior edge shared by two triangles wound
+    /// oppositely, every triangle facing out of the tube.
+    #[test]
+    fn a_torus_patch_with_unequal_ring_sides_is_meshed_in_rows() {
+        assert_patch_meshed_in_rows(false);
+    }
+
+    /// The same patch with its outer ring side split into two edges at a
+    /// vertex: the two edges are one side, and the patch still meshes in rows.
+    #[test]
+    fn a_torus_patch_with_a_split_side_is_still_one_patch_of_rows() {
+        assert_patch_meshed_in_rows(true);
+    }
+
+    fn assert_patch_meshed_in_rows(split: bool) {
+        let (m, fid) = quarter_fillet_patch(split);
+        let face = m.faces.get(fid).expect("face");
+        let params = params();
+        let cache = super::super::edge_cache::EdgeSampleCache::new(&params);
+        let lp = m.loops.get(face.outer_loop).expect("loop");
+        let counts: Vec<usize> = lp
+            .edges
+            .iter()
+            .map(|&e| cache.get_or_compute(e, &m).len())
+            .collect();
+        // Sample counts per SIDE: the split outer ring's two edges add up
+        // (their shared vertex counted once).
+        let side_counts: Vec<usize> = if split {
+            vec![counts[0] + counts[1] - 1, counts[2], counts[3], counts[4]]
+        } else {
+            counts.clone()
+        };
+        assert_ne!(
+            side_counts[0], side_counts[2],
+            "ring sides must differ: {side_counts:?}"
+        );
+        assert_eq!(
+            side_counts[1], side_counts[3],
+            "tube sides equal: {side_counts:?}"
+        );
+
+        TORUS_PATHS.with(|log| log.borrow_mut().clear());
+        let mut mesh = TriangleMesh::new();
+        tessellate_face(face, &m, &params, &cache, &mut mesh);
+        let path = TORUS_PATHS.with(|log| log.borrow().last().map(|(_, p)| *p));
+        assert_eq!(path, Some("quad patch"), "the patch took {path:?}");
+
+        // On the torus.
+        for v in &mesh.vertices {
+            let q = v.position;
+            let rho = (q.x * q.x + q.y * q.y).sqrt();
+            let off = ((rho - BIG).powi(2) + q.z * q.z).sqrt() - SMALL;
+            assert!(off.abs() < 1e-9, "vertex {q:?} is {off} off the torus");
+        }
+        // Every shared edge sample is a mesh vertex, bit for bit.
+        for &e in &lp.edges {
+            for s in cache.get_or_compute(e, &m).iter() {
+                assert!(
+                    mesh.vertices.iter().any(|v| v.position == *s),
+                    "edge sample {s:?} is not a mesh vertex"
+                );
+            }
+        }
+        // Edge use by position (the patch's vertices are not welded).
+        let key = |q: &Point3| {
+            (
+                (q.x * 1e9).round() as i64,
+                (q.y * 1e9).round() as i64,
+                (q.z * 1e9).round() as i64,
+            )
+        };
+        let mut directed: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), usize> =
+            std::collections::HashMap::new();
+        for tri in &mesh.triangles {
+            let ps: Vec<Point3> = tri
+                .iter()
+                .map(|&i| mesh.vertices[i as usize].position)
+                .collect();
+            let n = (ps[1] - ps[0]).cross(&(ps[2] - ps[0]));
+            let centroid = Point3::new(
+                (ps[0].x + ps[1].x + ps[2].x) / 3.0,
+                (ps[0].y + ps[1].y + ps[2].y) / 3.0,
+                (ps[0].z + ps[1].z + ps[2].z) / 3.0,
+            );
+            let rho = (centroid.x * centroid.x + centroid.y * centroid.y).sqrt();
+            let core = Point3::new(centroid.x * BIG / rho, centroid.y * BIG / rho, 0.0);
+            assert!(
+                n.dot(&(centroid - core)) > 0.0,
+                "a triangle faces into the tube at {centroid:?}"
+            );
+            for k in 0..3 {
+                *directed
+                    .entry((key(&ps[k]), key(&ps[(k + 1) % 3])))
+                    .or_insert(0) += 1;
+            }
+        }
+        let mut boundary = 0usize;
+        for (&(a, b), &n) in &directed {
+            assert_eq!(n, 1, "a directed edge is used twice");
+            if !directed.contains_key(&(b, a)) {
+                boundary += 1;
+            }
+        }
+        let sides: usize = side_counts.iter().map(|c| c - 1).sum();
+        assert_eq!(boundary, sides, "the boundary is exactly the four sides");
     }
 }
