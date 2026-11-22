@@ -386,6 +386,8 @@ pub fn visible_dimensions(
     projection: ProjectionType,
     min_span: f64,
 ) -> Vec<Dimension2d> {
+    #[cfg(test)]
+    dimension_find_counter::FINDS.with(|c| c.set(c.get() + 1));
     candidate_dimensions(model, solid_id, projection, min_span)
 }
 
@@ -1266,7 +1268,7 @@ pub fn standard_drawing_hlr_with_projection(
     // right, iso]`; zipping against the three specs drops the unused iso slot.
     for ((proj, name), pos) in specs.into_iter().zip(placement.positions) {
         drawing.add_view(build_hlr_view(
-            model, solid_id, source, proj, name, pos, scale, min_span,
+            model, solid_id, source, proj, name, pos, scale, min_span, None,
         )?);
     }
     dedup_dimensions_global(&mut drawing);
@@ -1394,9 +1396,14 @@ fn build_hlr_view(
     pos: [f64; 2],
     scale: f64,
     min_span: f64,
+    dimensions: Option<Vec<Dimension2d>>,
 ) -> Result<super::types::ProjectedView, super::projection::ProjectionError> {
     let mut view = hlr_view_geometry(model, solid_id, source, proj, name, pos, scale)?;
-    view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
+    // Dimensions are in VIEW space, so a caller that already found them for
+    // this view (the sheet plan, at unit scale) hands them over instead of
+    // finding them again; an undimensioned view (the pictorial) passes none.
+    view.dimensions =
+        dimensions.unwrap_or_else(|| visible_dimensions(model, solid_id, proj, min_span));
     Ok(view)
 }
 
@@ -3125,6 +3132,11 @@ struct SheetPlan {
     left_bands: Vec<f64>,
     /// The part's largest orthographic size, mm.
     max_dim: f64,
+    /// Each of [`AUTO_VIEWS`]' dimensions as `visible_dimensions` found them
+    /// (view space, before the sheet-wide de-duplication); `None` for an
+    /// undimensioned view. The sheet's views take these rather than finding
+    /// them a second time.
+    dimensions: Vec<Option<Vec<Dimension2d>>>,
 }
 
 /// Order matches `layout_four_view`'s returned positions: [Front, Top, Right,
@@ -3182,6 +3194,7 @@ fn plan_sheet(
     let prof = draw_profile_enabled();
     let t_p1 = std::time::Instant::now();
     let mut extents = Vec::with_capacity(4);
+    let mut found: Vec<Option<Vec<Dimension2d>>> = Vec::with_capacity(4);
     let mut band_probe = Drawing::new("band probe", super::types::SheetSize::A4);
     let lap = |label: &str, t: std::time::Instant| {
         if prof {
@@ -3203,7 +3216,10 @@ fn plan_sheet(
             let t = std::time::Instant::now();
             v.dimensions = visible_dimensions(model, solid_id, proj, min_span);
             lap(&format!("visible_dimensions {name}"), t);
+            found.push(Some(v.dimensions.clone()));
             band_probe.add_view(v);
+        } else {
+            found.push(None);
         }
     }
     dedup_dimensions_global(&mut band_probe);
@@ -3259,6 +3275,7 @@ fn plan_sheet(
         hgap,
         left_bands,
         max_dim,
+        dimensions: found,
     })
 }
 
@@ -3416,6 +3433,13 @@ fn build_sheet(
             positions[i],
             view_scale,
             min_span,
+            Some(
+                plan.dimensions
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_default(),
+            ),
         )?;
         if prof {
             eprintln!(
@@ -3594,6 +3618,7 @@ fn attach_pictorial_iso(
         pos,
         s,
         min_span,
+        Some(Vec::new()),
     ) else {
         return;
     };
@@ -7609,6 +7634,66 @@ mod raster_tessellation_tests {
         assert!(
             body.contains("tessellation: raster_tessellation(iso_extent, px_w, px_h)"),
             "the pictorial render must mesh at its own pixel size"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dimension_find_counter {
+    use super::*;
+
+    thread_local! {
+        /// Calls of [`visible_dimensions`] on this thread.
+        pub(super) static FINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A sheet finds each dimensioned view's dimensions once: the plan finds
+    /// them to size the sheet and the drawn views reuse them; the pictorial
+    /// finds none. (Pass 2 used to find all four views' again, the
+    /// pictorial's only to throw them away: about 12 s of part 109's sheet.)
+    #[test]
+    fn a_sheet_finds_each_views_dimensions_once() {
+        use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+        let mut model = BRepModel::new();
+        let solid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(60.0, 40.0, 20.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            other => panic!("a box is a solid: {other:?}"),
+        };
+        FINDS.with(|c| c.set(0));
+        let plan = plan_sheet(
+            &model,
+            solid,
+            uuid::Uuid::nil(),
+            super::super::types::ProjectionAngle::default(),
+        )
+        .expect("plan");
+        assert_eq!(
+            FINDS.with(|c| c.get()),
+            3,
+            "the plan finds the three views'"
+        );
+        let mut built = Vec::new();
+        let sheet = build_sheet(
+            &model,
+            solid,
+            uuid::Uuid::nil(),
+            super::super::types::ProjectionAngle::default(),
+            &plan,
+            SheetChoice::Auto(super::super::types::SheetOrientation::Landscape),
+            &mut built,
+        )
+        .expect("sheet");
+        assert!(
+            sheet.views.iter().any(|v| !v.dimensions.is_empty()),
+            "the drawn views carry the plan's dimensions"
+        );
+        assert_eq!(
+            FINDS.with(|c| c.get()),
+            3,
+            "drawing the views finds none again"
         );
     }
 }
