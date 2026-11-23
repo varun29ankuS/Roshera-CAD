@@ -4790,8 +4790,12 @@ pub(crate) fn place_dimensions_routed(
 /// from the knee to the value (paper mm).
 const ORDINATE_JOG_MM: f64 = 3.0;
 /// Air between two ordinate values along the band, beyond one text height
-/// (paper mm).
-const ORDINATE_VALUE_GAP_MM: f64 = 1.0;
+/// (paper mm): a word space (ISO 3098-1: 0.6 x the capital height, the
+/// space map's TEXT-CLEAR) and a little more, so neighbouring values never
+/// read as one phrase. At 1.0 mm every pair in CADGenBench 118's band of 20
+/// was under a word space.
+const ORDINATE_VALUE_GAP_MM: f64 =
+    super::spaces::TEXT_WORD_SPACE_OF_H * CAP_HEIGHT_OF_EM * DIM_TEXT_FONT_MM + 0.3;
 
 /// One value of an ordinate band: the feature's coordinate along the band
 /// (sheet mm), its text and its id.
@@ -6014,9 +6018,19 @@ mod tests {
                 ord[i].label
             );
             for (j, c) in boxes.iter().enumerate().skip(i + 1) {
+                // A word space apart at least (ISO 3098-1: 0.6 x the capital
+                // height), or two values read as one (the space map's
+                // TEXT-CLEAR; CADGenBench 118's band failed it 19 times).
+                let word = crate::drawing::spaces::TEXT_WORD_SPACE_OF_H
+                    * CAP_HEIGHT_OF_EM
+                    * DIM_TEXT_FONT_MM;
+                let apart = (c.x0 - b.x1)
+                    .max(b.x0 - c.x1)
+                    .max(c.y0 - b.y1)
+                    .max(b.y0 - c.y1);
                 assert!(
-                    !b.intersects(c, 0.0),
-                    "'{}' and '{}' overlap",
+                    apart >= word,
+                    "'{}' and '{}' are {apart:.2} mm apart, under a word space ({word:.2})",
                     ord[i].label,
                     ord[j].label
                 );
@@ -6069,19 +6083,19 @@ mod tests {
         let gr = view_geometry_rect(&view, 297.0).expect("view rect");
         // The frame closes the left lanes past the second, and an
         // obstacle takes the room above the short span's top end.
-        let frame = [gr.x0 - 26.0, 0.0, 420.0, 297.0];
+        let frame = [gr.x0 - 28.0, 0.0, 420.0, 297.0];
         let above = Rect2 {
-            x0: gr.x0 - 26.0,
+            x0: gr.x0 - 28.0,
             y0: gr.y0,
             x1: gr.x0,
             y1: gr.y1 - 0.6,
         };
-        // Another view closes the right-hand lanes (past the band's values).
+        // Another view closes the right-hand lanes down to the band's foot.
         let right = Rect2 {
-            x0: gr.x1 + 8.0,
+            x0: gr.x1 + 9.2,
             y0: 0.0,
             x1: 420.0,
-            y1: 297.0,
+            y1: gr.y1 + 14.0,
         };
         let placed = place_dimensions_routed(
             &view,
