@@ -751,6 +751,18 @@ pub(crate) fn find_dimensions_on_each_others_lines(
             if a.owner_view != b.owner_view || a.arc.is_some() || b.arc.is_some() {
                 continue;
             }
+            // Two ordinate values have one line each: their lines from the
+            // part, beside each other closer than the lines-apart limit at
+            // two different features, read as one line. (Their `ext[1]` is a
+            // point or a jog, so the two-line test below never fires for
+            // them, and a ladder drawn 1:5 -- features 1.3 mm apart, 0.26 mm
+            // on paper -- would certify clean.)
+            if a.ordinate || b.ordinate {
+                if a.ordinate && b.ordinate && ordinate_lines_beside(&a.ext[0], &b.ext[0]) {
+                    out.push((i, j));
+                }
+                continue;
+            }
             let close = |ea: &[[f64; 2]; 2], eb: &[[f64; 2]; 2]| {
                 let vertical = |e: &[[f64; 2]; 2]| (e[0][0] - e[1][0]).abs() < 1e-9;
                 let horizontal = |e: &[[f64; 2]; 2]| (e[0][1] - e[1][1]).abs() < 1e-9;
@@ -797,6 +809,72 @@ pub(crate) fn find_dimensions_on_each_others_lines(
         }
     }
     out
+}
+
+/// Two ordinate values' lines from the part (`ext[0]` of each) run parallel
+/// along one direction, beside each other closer than
+/// [`super::layout::EXT_LINES_APART_MM`] over more than a millimetre, and
+/// not on one coordinate (one feature's line is drawn once).
+fn ordinate_lines_beside(ea: &[[f64; 2]; 2], eb: &[[f64; 2]; 2]) -> bool {
+    let vertical = |e: &[[f64; 2]; 2]| (e[0][0] - e[1][0]).abs() < 1e-9;
+    let horizontal = |e: &[[f64; 2]; 2]| (e[0][1] - e[1][1]).abs() < 1e-9;
+    let (along, across) = if vertical(ea) && vertical(eb) {
+        (1, 0)
+    } else if horizontal(ea) && horizontal(eb) {
+        (0, 1)
+    } else {
+        return false;
+    };
+    let gap = (ea[0][across] - eb[0][across]).abs();
+    let overlap = ea[0][along]
+        .max(ea[1][along])
+        .min(eb[0][along].max(eb[1][along]))
+        - ea[0][along]
+            .min(ea[1][along])
+            .max(eb[0][along].min(eb[1][along]));
+    gap > super::layout::CHAIN_EPS && gap < super::layout::EXT_LINES_APART_MM && overlap > 1.0
+}
+
+#[cfg(test)]
+mod ordinate_lines_tests {
+    use super::*;
+    use crate::drawing::layout::{Rect2, SheetLayout};
+
+    fn layout_of(dx: f64) -> SheetLayout {
+        let a = crate::drawing::svg::ordinate_ink_tests::jogged_ordinate();
+        let mut b = a.clone();
+        b.dim_id = "d2".to_string();
+        b.label = "12.8".to_string();
+        b.ext[0][0][0] += dx;
+        b.ext[0][1][0] += dx;
+        SheetLayout {
+            sheet: Rect2 {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 420.0,
+                y1: 297.0,
+            },
+            items: Vec::new(),
+            dimensions: vec![a, b],
+            hole_tags: Vec::new(),
+            gdt_leaders: Vec::new(),
+        }
+    }
+
+    /// Two ordinate values whose lines leave the part 0.3 mm apart print on
+    /// each other's lines (a ladder drawn too small); 1 mm apart they do not.
+    ///
+    /// Mutation: drop the ordinate arm of
+    /// `find_dimensions_on_each_others_lines` -> the 0.3 mm pair is not
+    /// reported -> RED.
+    #[test]
+    fn ordinate_lines_closer_than_the_limit_are_reported() {
+        assert_eq!(
+            find_dimensions_on_each_others_lines(&layout_of(0.3)),
+            vec![(0, 1)]
+        );
+        assert!(find_dimensions_on_each_others_lines(&layout_of(1.0)).is_empty());
+    }
 }
 
 /// Two dimensions in one view state the same interval when both its ends
@@ -2014,6 +2092,7 @@ mod harness_invariant_tests {
             stack: None,
             boxed: false,
             ext_breaks: Default::default(),
+            ordinate: false,
             arc: None,
         }
     }
@@ -2056,6 +2135,7 @@ mod harness_invariant_tests {
             stack: None,
             boxed: false,
             ext_breaks: Default::default(),
+            ordinate: false,
             arc: None,
         }
     }

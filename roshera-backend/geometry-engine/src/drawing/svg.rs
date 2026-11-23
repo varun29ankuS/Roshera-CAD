@@ -615,7 +615,17 @@ fn render_dimensions(out: &mut String, layout: &SheetLayout) {
             let [p0, p1] = pd.line;
             (p0[0] - p1[0]).abs() < 1e-9 && (p0[1] - p1[1]).abs() < 1e-9
         };
-        if !is_degenerate || pd.arc.is_some() {
+        // An ordinate value inks its extension line (straight, or jogged at
+        // the band's knee) and nothing else: no dimension line, no arrows.
+        if pd.ordinate {
+            for i in 0..pd.ext.len() {
+                for seg in crate::drawing::layout::extension_line_pieces(pd, i) {
+                    if (seg[0][0] - seg[1][0]).hypot(seg[0][1] - seg[1][1]) > 1e-9 {
+                        dim_line(out, seg[0][0], seg[0][1], seg[1][0], seg[1][1]);
+                    }
+                }
+            }
+        } else if !is_degenerate || pd.arc.is_some() {
             // Each extension line as its pieces: a line broken round another
             // dimension's number is inked in two (the same pieces the
             // quality check tests).
@@ -1728,5 +1738,72 @@ fn hidden_if_shown<'a, T>(view: &ProjectedView, set: &'a [T]) -> &'a [T] {
         set
     } else {
         &[]
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod ordinate_ink_tests {
+    use super::*;
+    use crate::drawing::layout::{ArrowSpec, PlacedDimension, Rect2, SheetLayout};
+
+    /// A jogged ordinate value: straight from the part (y 100) to the knee
+    /// (y 108), slanted to its foot (x 14, y 110), the value beyond.
+    pub(crate) fn jogged_ordinate() -> PlacedDimension {
+        let foot = [14.0, 110.0];
+        let arrow = ArrowSpec {
+            tip: foot,
+            dir: [1.0, 0.0],
+        };
+        PlacedDimension {
+            line: [foot, foot],
+            ext: [[[10.0, 100.0], [10.0, 108.0]], [[10.0, 108.0], foot]],
+            arrows: [arrow, arrow],
+            text_anchor: [15.25, 113.0],
+            text_rot_deg: -90.0,
+            label: "12.5".to_string(),
+            dim_id: "d1".to_string(),
+            owner_view: 0,
+            stack: None,
+            boxed: false,
+            ext_breaks: Default::default(),
+            arc: None,
+            ordinate: true,
+        }
+    }
+
+    /// The SVG inks an ordinate value's extension line -- both pieces of a
+    /// jogged one -- and its number, and no arrowhead and no dimension line.
+    /// (Its `line` is degenerate, which for every other callout means "text
+    /// only": without the flag the extension line was not drawn at all.)
+    ///
+    /// Mutation: drop the `ordinate` arm of `render_dimensions` -> no line
+    /// is inked -> RED.
+    #[test]
+    fn an_ordinate_value_inks_its_jogged_line_and_no_arrows() {
+        let layout = SheetLayout {
+            sheet: Rect2 {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 420.0,
+                y1: 297.0,
+            },
+            items: Vec::new(),
+            dimensions: vec![jogged_ordinate()],
+            hole_tags: Vec::new(),
+            gdt_leaders: Vec::new(),
+        };
+        let mut out = String::new();
+        render_dimensions(&mut out, &layout);
+        assert_eq!(out.matches("class=\"dim-line\"").count(), 2, "{out}");
+        assert!(
+            out.contains("x1=\"10.000\" y1=\"100.000\" x2=\"10.000\" y2=\"108.000\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("x1=\"10.000\" y1=\"108.000\" x2=\"14.000\" y2=\"110.000\""),
+            "{out}"
+        );
+        assert_eq!(out.matches("dim-arrow").count(), 0, "no arrowheads: {out}");
+        assert!(out.contains(">12.5<"), "the value is written: {out}");
     }
 }

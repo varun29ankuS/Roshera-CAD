@@ -378,7 +378,7 @@ pub(crate) fn attach_detail_views(drawing: &mut super::types::Drawing) {
     }
     let dim_key = |i: usize| -> Option<(usize, String)> {
         let pd = layout.dimensions.get(i)?;
-        let id = pd.dim_id.strip_suffix("-note").unwrap_or(&pd.dim_id);
+        let id = super::layout::base_dim_id(&pd.dim_id);
         Some((pd.owner_view, id.to_string()))
     };
     // Clusters per view: the dimensions joined by being on each other's lines.

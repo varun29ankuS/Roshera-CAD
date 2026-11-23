@@ -417,6 +417,34 @@ pub struct PlacedDimension {
     /// parsing.
     #[serde(default)]
     pub arc: Option<DimArc>,
+    /// An ORDINATE value (ISO 129-1): a location in a long ladder from one
+    /// datum, written at the end of its extension line in the view's
+    /// ordinate band -- no dimension line, no arrowheads. `ext[0]` runs from
+    /// the part to the band's knee, `ext[1]` from the knee to the value (a
+    /// point when the value was not moved off its feature, a slant -- the
+    /// jog -- when it was); `line` is degenerate at the value's foot and the
+    /// `arrows` are not inked. The datum's `0` is one more ordinate value,
+    /// its id [`ORIGIN_SUFFIX`]-suffixed. `#[serde(default)]` keeps stored
+    /// layouts parsing.
+    #[serde(default)]
+    pub ordinate: bool,
+}
+
+/// The id suffix of an ordinate band's `0` at its datum
+/// ([`PlacedDimension::ordinate`]): `"{first member's id}-origin"`.
+pub(crate) const ORIGIN_SUFFIX: &str = "-origin";
+/// The id suffix of a leader callout's second text line.
+pub(crate) const NOTE_SUFFIX: &str = "-note";
+
+/// The id of the view dimension a placed callout belongs to: a leader's
+/// second text line (`-note`) and an ordinate band's datum `0` (`-origin`)
+/// belong to the dimension their id is formed from. Every reader that
+/// matches placed callouts to a view's dimensions goes through this one
+/// function.
+pub(crate) fn base_dim_id(id: &str) -> &str {
+    id.strip_suffix(NOTE_SUFFIX)
+        .or_else(|| id.strip_suffix(ORIGIN_SUFFIX))
+        .unwrap_or(id)
 }
 
 /// The arc of an angular dimension, in sheet space.
@@ -3521,6 +3549,7 @@ fn angular_dimension(
         stack: None,
         boxed: false,
         ext_breaks: Default::default(),
+        ordinate: false,
         arc: Some(DimArc {
             centre: a,
             radius: r,
@@ -3691,6 +3720,12 @@ pub(crate) fn place_dimensions_routed(
         /// span ([`clear_text_centre`]); the span's middle until the stack
         /// is known.
         tc: f64,
+        /// A location from a datum (kind `position`): a member an ordinate
+        /// ladder can take ([`super::ordinate::find_ladder`]).
+        position: bool,
+        /// Put in a band or lane by a layout verb: kept where it was put,
+        /// never taken into an ordinate ladder.
+        pinned: bool,
     }
     let mut horiz: Vec<Lin> = Vec::new();
     let mut vert: Vec<Lin> = Vec::new();
@@ -4115,6 +4150,7 @@ pub(crate) fn place_dimensions_routed(
                 stack: None,
                 boxed: false,
                 ext_breaks: Default::default(),
+                ordinate: false,
                 arc: None,
             });
             if let Some(note) = note {
@@ -4140,11 +4176,12 @@ pub(crate) fn place_dimensions_routed(
                     text_anchor: at,
                     text_rot_deg: 0.0,
                     label: note,
-                    dim_id: format!("{}-note", d.id),
+                    dim_id: format!("{}{NOTE_SUFFIX}", d.id),
                     owner_view: owner,
                     stack: None,
                     boxed: false,
                     ext_breaks: Default::default(),
+                    ordinate: false,
                     arc: None,
                 });
             }
@@ -4179,6 +4216,7 @@ pub(crate) fn place_dimensions_routed(
                 stack: None,
                 boxed: false,
                 ext_breaks: Default::default(),
+                ordinate: false,
                 arc: None,
             });
             continue;
@@ -4193,6 +4231,8 @@ pub(crate) fn place_dimensions_routed(
                 dim_id: d.id.clone(),
                 text_w: drawn_width(d),
                 tc: 0.5 * (a[0] + b[0]),
+                position: d.kind == "position",
+                pinned: pins.contains_key(&d.id),
             });
         } else {
             vert.push(Lin {
@@ -4203,6 +4243,8 @@ pub(crate) fn place_dimensions_routed(
                 dim_id: d.id.clone(),
                 text_w: drawn_width(d),
                 tc: 0.5 * (a[1] + b[1]),
+                position: d.kind == "position",
+                pinned: pins.contains_key(&d.id),
             });
         }
     }
@@ -4277,6 +4319,11 @@ pub(crate) fn place_dimensions_routed(
     // is the part's edge on that side.
     let mut stack_texts: Vec<Rect2> = Vec::new();
     let mut stack_lines: Vec<Rect2> = Vec::new();
+    // The lines of this view's ordinate bands: no stacked number is put on
+    // one, in any pass (a band's values near its datum spread past the part's
+    // corner, and a strict pass that failed elsewhere left CADGenBench 109's
+    // "11.04" on three of them).
+    let mut band_segments: Vec<[[f64; 2]; 2]> = Vec::new();
     // The lines of the callouts this view has placed already -- its leaders
     // (legs and shoulders) -- with the earlier views': a number in a lane
     // must not sit on one. Only earlier views' lines were read, and the leg
@@ -4287,12 +4334,112 @@ pub(crate) fn place_dimensions_routed(
         .flat_map(placed_line_segments)
         .chain(ink_lines.iter().copied())
         .collect();
-    for (stack, horizontal) in [(&horiz, true), (&vert, false)] {
-        let sides: [(f64, f64); 2] = if horizontal {
+    let sides_of = |horizontal: bool| -> [(f64, f64); 2] {
+        if horizontal {
             [(1.0, bbox[3]), (-1.0, bbox[1])]
         } else {
             [(-1.0, bbox[0]), (1.0, bbox[2])]
+        }
+    };
+    // ORDINATE bands first, both directions: a band lies nearest the part,
+    // and both stacks are laid in lanes beyond it and round it. Laid after
+    // the other direction's stack, a band found that stack's numbers on its
+    // lines and was refused, and its ladder of ten or more was stacked and
+    // left unplaced (CADGenBench 109 at 1:2: 17 locations).
+    let mut bands: Vec<(std::collections::HashSet<String>, Option<(usize, f64)>)> = Vec::new();
+    for (stack, horizontal) in [(&horiz, true), (&vert, false)] {
+        let sides = sides_of(horizontal);
+        let mut band: Option<(usize, f64)> = None; // A long ladder of locations from one datum is drawn as ORDINATE
+                                                   // values in one band nearest the part ([`place_ordinate_band`]); the
+                                                   // rest of the stack is laid in lanes beyond it.
+        let ordinate_ids: std::collections::HashSet<String> = {
+            let cands: Vec<usize> = stack
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.position && !d.pinned)
+                .map(|(i, _)| i)
+                .collect();
+            let spans: Vec<(f64, f64)> =
+                cands.iter().map(|&i| (stack[i].lo, stack[i].hi)).collect();
+            match super::ordinate::find_ladder(
+                &spans,
+                super::ordinate::ORDINATE_MIN_LADDER,
+                CHAIN_EPS,
+            ) {
+                Some((datum, members)) => {
+                    let members: Vec<&Lin> = members.iter().map(|&k| &stack[cands[k]]).collect();
+                    let values: Vec<OrdinateValue> = std::iter::once(OrdinateValue {
+                        feature: datum,
+                        label: "0".to_string(),
+                        dim_id: format!("{}{ORIGIN_SUFFIX}", members[0].dim_id),
+                        text_w: GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM,
+                    })
+                    .chain(members.iter().map(|d| OrdinateValue {
+                        feature: if (d.lo - datum).abs() <= CHAIN_EPS {
+                            d.hi
+                        } else {
+                            d.lo
+                        },
+                        label: d.label.clone(),
+                        dim_id: d.dim_id.clone(),
+                        text_w: d.text_w,
+                    }))
+                    .collect();
+                    // A value's text: inside the frame, off other views,
+                    // titles and text, and off every leader leg. The band's
+                    // lines: off other views and text.
+                    // The other direction's band, laid first, counts too.
+                    let placed_text = |r: &Rect2| stack_texts.iter().any(|t| t.intersects(r, 0.0));
+                    let text_blocked = |r: &Rect2| {
+                        !clear(r)
+                            || placed_text(r)
+                            || stack_lines.iter().any(|l| l.intersects(r, 0.0))
+                            || lane_text_blockers
+                                .iter()
+                                .any(|l| segment_crosses_rect(l, r))
+                    };
+                    let region_blocked = |r: &Rect2| !clear(r) || placed_text(r);
+                    match place_ordinate_band(
+                        &values,
+                        horizontal,
+                        &sides,
+                        owner,
+                        &text_blocked,
+                        &region_blocked,
+                    ) {
+                        Some((si, depth, placed)) => {
+                            band = Some((si, depth));
+                            // The band's numbers and lines are what the
+                            // stack placed after it keeps clear of, as of
+                            // its own.
+                            for pd in &placed {
+                                stack_texts.push(placed_text_box(pd));
+                                for s in placed_line_segments(pd) {
+                                    band_segments.push(s);
+                                    stack_lines.push(Rect2 {
+                                        x0: s[0][0].min(s[1][0]) - LINE_HALF,
+                                        y0: s[0][1].min(s[1][1]) - LINE_HALF,
+                                        x1: s[0][0].max(s[1][0]) + LINE_HALF,
+                                        y1: s[0][1].max(s[1][1]) + LINE_HALF,
+                                    });
+                                }
+                            }
+                            result.extend(placed);
+                            members.iter().map(|d| d.dim_id.clone()).collect()
+                        }
+                        // No room for the band on either side: the ladder
+                        // stays stacked, and what finds no lane is reported
+                        // unplaced as before.
+                        None => std::collections::HashSet::new(),
+                    }
+                }
+                None => std::collections::HashSet::new(),
+            }
         };
+        bands.push((ordinate_ids, band));
+    }
+    for (bi, (stack, horizontal)) in [(&horiz, true), (&vert, false)].into_iter().enumerate() {
+        let sides = sides_of(horizontal);
         let mut lanes: [Vec<Vec<(f64, f64)>>; 2] = [Vec::new(), Vec::new()];
         // Where each side's dimensions stand (sheet mm along the stack): a
         // dimension whose two extension lines would run beside one's, a hair
@@ -4301,7 +4448,26 @@ pub(crate) fn place_dimensions_routed(
         // datum, their lines 0.16 mm apart at 1:2, read as one). One line
         // shared exactly (a common datum) is one line, drawn once.
         let mut ends: [Vec<(f64, f64)>; 2] = [Vec::new(), Vec::new()];
+        let (ordinate_ids, band) = &bands[bi];
+        // The band's lanes are taken: the stack's nearest lane on that side
+        // starts past its deepest value.
+        if let Some((si, depth)) = *band {
+            for lane in 0..MAX_LANES {
+                let nearest_ink =
+                    STANDOFF + lane as f64 * STACK - TGAP - DIM_TEXT_FONT_MM - OUTSIDE_TEXT_AIR;
+                if nearest_ink > depth + GAP {
+                    break;
+                }
+                while lanes[si].len() <= lane {
+                    lanes[si].push(Vec::new());
+                }
+                lanes[si][lane].push((f64::NEG_INFINITY, f64::INFINITY));
+            }
+        }
         for d in stack.iter() {
+            if ordinate_ids.contains(&d.dim_id) {
+                continue;
+            }
             let text_w = d.text_w;
             // A label wider than its span goes OUTSIDE, past one extension
             // line, with the arrows outside pointing in (ISO 129-1 §6.3) --
@@ -4501,6 +4667,9 @@ pub(crate) fn place_dimensions_routed(
                                 leg_in_the_way = true;
                                 continue;
                             }
+                            if band_segments.iter().any(|l| segment_crosses_rect(l, &text)) {
+                                continue;
+                            }
                             // The dimension line runs out under a label taken
                             // outside the span.
                             let (l0, l1) = (d.lo.min(a0 + air), d.hi.max(a1 - air));
@@ -4588,6 +4757,7 @@ pub(crate) fn place_dimensions_routed(
                 stack: None,
                 boxed: false,
                 ext_breaks: Default::default(),
+                ordinate: false,
                 arc: None,
             });
         }
@@ -4596,7 +4766,7 @@ pub(crate) fn place_dimensions_routed(
     // Authored presentation: the stacked tolerance / basic box of the label
     // as placed, then the recorded drag.
     for pd in &mut result {
-        let id = pd.dim_id.strip_suffix("-note").unwrap_or(&pd.dim_id);
+        let id = base_dim_id(&pd.dim_id);
         let Some((ink, shift)) = inks.get(id) else {
             continue;
         };
@@ -4614,6 +4784,115 @@ pub(crate) fn place_dimensions_routed(
     break_extension_lines_round_numbers(&mut result);
 
     result
+}
+
+/// How far across the band a moved ordinate value's extension line slants
+/// from the knee to the value (paper mm).
+const ORDINATE_JOG_MM: f64 = 3.0;
+/// Air between two ordinate values along the band, beyond one text height
+/// (paper mm).
+const ORDINATE_VALUE_GAP_MM: f64 = 1.0;
+
+/// One value of an ordinate band: the feature's coordinate along the band
+/// (sheet mm), its text and its id.
+struct OrdinateValue {
+    feature: f64,
+    label: String,
+    dim_id: String,
+    text_w: f64,
+}
+
+/// Lay one ordinate band (ISO 129-1) for `values` -- the datum's `0` first,
+/// then the locations -- on the first of `sides` (`(out, edge)`, as the
+/// stack's) where every value's text is clear (`text_blocked` false) and
+/// its lines' region is clear (`region_blocked` false). Each value is
+/// written at the end of its extension line, read along it: turned -90 deg
+/// on a horizontal ladder (lines vertical), level on a vertical one; values
+/// closer than a text height plus [`ORDINATE_VALUE_GAP_MM`] are spread in
+/// order ([`super::ordinate::spread`]) and their lines jogged from the
+/// band's knee. Returns the side taken, the band's depth from the part's
+/// edge (paper mm) and the placed values; `None` when neither side has room.
+fn place_ordinate_band(
+    values: &[OrdinateValue],
+    horizontal: bool,
+    sides: &[(f64, f64); 2],
+    owner: usize,
+    text_blocked: &dyn Fn(&Rect2) -> bool,
+    region_blocked: &dyn Fn(&Rect2) -> bool,
+) -> Option<(usize, f64, Vec<PlacedDimension>)> {
+    let font = DIM_TEXT_FONT_MM;
+    let features: Vec<f64> = values.iter().map(|v| v.feature).collect();
+    let text_at = super::ordinate::spread(&features, font + ORDINATE_VALUE_GAP_MM);
+    let max_w = values.iter().map(|v| v.text_w).fold(0.0_f64, f64::max);
+    let depth = STANDOFF + ORDINATE_JOG_MM + TGAP + max_w;
+    // A point at `along` the ladder and `across` it.
+    let at = |along: f64, across: f64| -> [f64; 2] {
+        if horizontal {
+            [along, across]
+        } else {
+            [across, along]
+        }
+    };
+    let (lo, hi) = features
+        .iter()
+        .chain(&text_at)
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| {
+            (a.min(x), b.max(x))
+        });
+    'side: for (si, &(out, edge)) in sides.iter().enumerate() {
+        let from = edge + out * GAP;
+        let knee = edge + out * STANDOFF;
+        let foot = knee + out * ORDINATE_JOG_MM;
+        let text_start = foot + out * TGAP;
+        let [p, q] = [at(lo, from), at(hi, foot)];
+        let region = Rect2 {
+            x0: p[0].min(q[0]),
+            y0: p[1].min(q[1]),
+            x1: p[0].max(q[0]),
+            y1: p[1].max(q[1]),
+        };
+        if region_blocked(&region) {
+            continue;
+        }
+        let mut placed = Vec::with_capacity(values.len());
+        for (v, &t) in values.iter().zip(&text_at) {
+            let [straight, slant] = super::ordinate::extension_line(v.feature, t, from, knee, foot);
+            let seg = |s: [[f64; 2]; 2]| [at(s[0][0], s[0][1]), at(s[1][0], s[1][1])];
+            let foot_pt = at(t, foot);
+            let arrow = ArrowSpec {
+                tip: foot_pt,
+                dir: [1.0, 0.0],
+            };
+            // The value centred on its line's end, read along the line.
+            let middle = text_start + out * 0.5 * v.text_w;
+            let (text_anchor, text_rot_deg) = if horizontal {
+                ([t + 0.5 * font, middle], -90.0)
+            } else {
+                ([middle, t + 0.5 * font], 0.0)
+            };
+            let pd = PlacedDimension {
+                line: [foot_pt, foot_pt],
+                ext: [seg(straight), seg(slant)],
+                arrows: [arrow, arrow],
+                text_anchor,
+                text_rot_deg,
+                label: v.label.clone(),
+                dim_id: v.dim_id.clone(),
+                owner_view: owner,
+                stack: None,
+                boxed: false,
+                ext_breaks: Default::default(),
+                arc: None,
+                ordinate: true,
+            };
+            if text_blocked(&placed_text_box(&pd)) {
+                continue 'side;
+            }
+            placed.push(pd);
+        }
+        return Some((si, depth, placed));
+    }
+    None
 }
 
 /// Air left between a broken extension line and the number it is broken
@@ -4866,8 +5145,13 @@ pub(crate) fn dimension_band_depths(
     let Some(gr) = view_geometry_rect(view, 0.0) else {
         return (0.0, 0.0);
     };
+    // An ordinate value is neither a stacked dimension nor a leader: its
+    // band is measured on its own below (an unjogged value's `ext[1]` is a
+    // point, the shape of a leader; a jogged one's is not, and is turned
+    // -90 deg on a horizontal ladder, the rotation of a LEFT band).
     let stacked = |pd: &PlacedDimension| {
-        pd.arc.is_none()
+        !pd.ordinate
+            && pd.arc.is_none()
             && ((pd.ext[1][0][0] - pd.ext[1][1][0]).abs() > 1e-9
                 || (pd.ext[1][0][1] - pd.ext[1][1][1]).abs() > 1e-9)
     };
@@ -4879,13 +5163,26 @@ pub(crate) fn dimension_band_depths(
     let leaders: std::collections::HashSet<String> =
         place_dimensions(view, 0.0, 0, tabled_face_ids)
             .iter()
-            .filter(|pd| !stacked(pd))
+            .filter(|pd| !stacked(pd) && !pd.ordinate)
             .map(|pd| pd.dim_id.clone())
             .collect();
     let mut stacks_only = view.clone();
     stacks_only.dimensions.retain(|d| !leaders.contains(&d.id));
     let (mut below, mut left) = (0.0_f64, 0.0_f64);
     for pd in place_dimensions(&stacks_only, 0.0, 0, tabled_face_ids) {
+        if pd.ordinate {
+            // The band reaches as far as its deepest value: below the part
+            // for a horizontal ladder (vertical lines), left of it for a
+            // vertical one. A band on the other side adds nothing here.
+            let tb = placed_text_box(&pd);
+            let vertical_lines = (pd.ext[0][0][0] - pd.ext[0][1][0]).abs() < 1e-9;
+            if vertical_lines {
+                below = below.max(tb.y1 - gr.y1);
+            } else {
+                left = left.max(gr.x0 - tb.x0);
+            }
+            continue;
+        }
         if !stacked(&pd) {
             // A leader or a point callout.
             continue;
@@ -4912,6 +5209,27 @@ pub(crate) fn shift_placed_dimension(pd: &mut PlacedDimension, by: [f64; 2]) {
         (seg[0][0] - seg[1][0]).abs() < 1e-9 && (seg[0][1] - seg[1][1]).abs() < 1e-9
     };
     let [dx, dy] = by;
+    if pd.ordinate {
+        // An ordinate value: the number moves and its extension line is
+        // jogged to it -- the line stays on its feature up to the knee
+        // (`ext[0]`), the slant (`ext[1]`) runs from the knee to the moved
+        // foot. Moved wholesale, like a point callout, the line left the
+        // feature it locates.
+        pd.ext[1][0] = pd.ext[0][1];
+        pd.ext[1][1][0] += dx;
+        pd.ext[1][1][1] += dy;
+        for p in pd.line.iter_mut() {
+            p[0] += dx;
+            p[1] += dy;
+        }
+        for a in &mut pd.arrows {
+            a.tip[0] += dx;
+            a.tip[1] += dy;
+        }
+        pd.text_anchor[0] += dx;
+        pd.text_anchor[1] += dy;
+        return;
+    }
     if pd.arc.is_some() {
         // An angular dimension: its arc and extension lines stay on the
         // feature; the number moves.
@@ -5391,6 +5709,7 @@ mod tests {
             stack: None,
             boxed: false,
             ext_breaks: [Vec::new(), Vec::new()],
+            ordinate: false,
             arc: None,
         };
         let letters = place_cutting_plane_labels(&d, &cpl, 297.0, &[], std::slice::from_ref(&pd));
@@ -5630,6 +5949,205 @@ mod tests {
         let placed = place_dimensions(&view, 297.0, 0, &std::collections::HashSet::new());
         let labels: Vec<&str> = placed.iter().map(|p| p.label.as_str()).collect();
         assert_eq!(labels, ["8", "14"], "both offsets are drawn");
+    }
+
+    /// `n` horizontal locations from the left datum edge of a 20 mm view
+    /// (view x = -10, sheet x = 90), `pitch` mm apart: labels "2", "4", ...
+    fn ladder_view(n: usize, pitch: f64) -> ProjectedView {
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        view.dimensions = (1..=n)
+            .map(|k| {
+                let x = -10.0 + pitch * k as f64;
+                pos_dim(&format!("{}", 2 * k), [-10.0, -9.0], [x, -9.0])
+            })
+            .collect();
+        view
+    }
+
+    /// Ten or more locations from one datum are drawn as ORDINATE values
+    /// (ISO 129-1; Varun 11-22: "10 or more locations from one datum in a
+    /// view"): one band below the part, a `0` at the datum, every value at
+    /// the end of its own extension line, no dimension lines, no arrows.
+    /// Values closer than one is tall are spread apart and their lines
+    /// jogged; no two overlap and no line runs through a value. As a stack
+    /// the same ladder needs one lane per location (CADGenBench 109 and 118
+    /// left locations unplaced on every sheet the search tried).
+    ///
+    /// Mutation: skip the ordinate band (leave the ladder stacked) -> no
+    /// value is `ordinate` -> RED.
+    #[test]
+    fn a_ladder_of_ten_locations_is_drawn_as_ordinate() {
+        let view = ladder_view(10, 2.0);
+        let placed = place_dimensions(&view, 297.0, 0, &std::collections::HashSet::new());
+        let ord: Vec<&PlacedDimension> = placed.iter().filter(|p| p.ordinate).collect();
+        assert_eq!(ord.len(), 11, "ten values and the datum's 0: {placed:#?}");
+        assert_eq!(placed.len(), 11, "nothing else is drawn for the ladder");
+        let zero = ord
+            .iter()
+            .find(|p| p.dim_id.ends_with(ORIGIN_SUFFIX))
+            .expect("the datum's 0");
+        assert_eq!(zero.label, "0");
+        assert!(
+            (zero.ext[0][0][0] - 90.0).abs() < 1e-9,
+            "the 0 stands on the datum"
+        );
+        for k in 1..=10 {
+            let label = format!("{}", 2 * k);
+            let p = ord
+                .iter()
+                .find(|p| p.label == label)
+                .unwrap_or_else(|| panic!("{label} is drawn as an ordinate value"));
+            // Sheet x of the feature: 100 + (-10 + 2k).
+            let feature_x = 90.0 + 2.0 * k as f64;
+            assert!(
+                (p.ext[0][0][0] - feature_x).abs() < 1e-9,
+                "{label}'s line starts on its feature: {:?}",
+                p.ext
+            );
+        }
+        let gr = view_geometry_rect(&view, 297.0).expect("view rect");
+        let boxes: Vec<Rect2> = ord.iter().map(|p| placed_text_box(p)).collect();
+        for (i, b) in boxes.iter().enumerate() {
+            assert!(
+                b.y0 > gr.y1,
+                "{} is in the band below the part",
+                ord[i].label
+            );
+            for (j, c) in boxes.iter().enumerate().skip(i + 1) {
+                assert!(
+                    !b.intersects(c, 0.0),
+                    "'{}' and '{}' overlap",
+                    ord[i].label,
+                    ord[j].label
+                );
+            }
+        }
+        for p in &ord {
+            for seg in placed_line_segments(p) {
+                for (q, b) in ord.iter().zip(&boxes) {
+                    assert!(
+                        q.dim_id == p.dim_id || !segment_crosses_rect(&seg, b),
+                        "'{}''s line runs through '{}'",
+                        p.label,
+                        q.label
+                    );
+                }
+            }
+        }
+        assert!(
+            ord.iter()
+                .any(|p| (p.ext[1][0][0] - p.ext[1][1][0]).abs() > 1e-6),
+            "values 2 mm apart are spread, their lines jogged"
+        );
+    }
+
+    /// No stacked number is put on an ordinate band's line, in any pass. A
+    /// ladder crowded at its datum spreads its values past the part's corner,
+    /// and the band's jogged lines run under the corner where the vertical
+    /// stack takes a short dimension's number outside its span; with the
+    /// lanes there closed by the frame, the strict pass finds no place and
+    /// the fallback used to print the number on the band's lines
+    /// (CADGenBench 109 at 1:2: "11.04" under '0', '1.5' and '3.03').
+    ///
+    /// Mutation: drop the `band_segments` check in the stack search -> a band
+    /// line runs through the vertical number -> RED.
+    #[test]
+    fn no_stacked_number_is_put_on_an_ordinate_line() {
+        let mut view = simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]);
+        // Ten locations crowded 0.4 mm apart at the left datum (x = -10).
+        view.dimensions = (1..=10)
+            .map(|k| {
+                let x = -10.0 + 0.4 * k as f64;
+                pos_dim(&format!("{:.1}", 0.4 * k as f64), [-10.0, -9.0], [x, -9.0])
+            })
+            .collect();
+        // A short vertical dimension at the bottom-left corner, its number
+        // wider than its span: it goes outside, past one end.
+        let mut short = len_dim("11.04", [-9.0, -10.0], [-9.0, -9.5]);
+        short.id = "short".to_string();
+        view.dimensions.push(short);
+        let gr = view_geometry_rect(&view, 297.0).expect("view rect");
+        // The frame closes the left lanes past the second, and an
+        // obstacle takes the room above the short span's top end.
+        let frame = [gr.x0 - 26.0, 0.0, 420.0, 297.0];
+        let above = Rect2 {
+            x0: gr.x0 - 26.0,
+            y0: gr.y0,
+            x1: gr.x0,
+            y1: gr.y1 - 0.6,
+        };
+        // Another view closes the right-hand lanes (past the band's values).
+        let right = Rect2 {
+            x0: gr.x1 + 8.0,
+            y0: 0.0,
+            x1: 420.0,
+            y1: 297.0,
+        };
+        let placed = place_dimensions_routed(
+            &view,
+            297.0,
+            0,
+            &std::collections::HashSet::new(),
+            Some(frame),
+            &[above, right],
+            &[],
+            &super::super::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+        );
+        assert!(
+            placed.iter().any(|p| p.ordinate),
+            "fixture: the ladder is a band"
+        );
+        let band_lines: Vec<[[f64; 2]; 2]> = placed
+            .iter()
+            .filter(|p| p.ordinate)
+            .flat_map(placed_line_segments)
+            .collect();
+        for p in placed.iter().filter(|p| !p.ordinate) {
+            let b = placed_text_box(p);
+            assert!(
+                !band_lines.iter().any(|l| segment_crosses_rect(l, &b)),
+                "'{}' is printed on an ordinate line",
+                p.label
+            );
+        }
+    }
+
+    /// Fewer than ten locations from one datum stay a stacked baseline.
+    #[test]
+    fn nine_locations_stay_stacked() {
+        let view = ladder_view(9, 2.0);
+        let placed = place_dimensions(&view, 297.0, 0, &std::collections::HashSet::new());
+        assert!(placed.iter().all(|p| !p.ordinate), "{placed:#?}");
+    }
+
+    /// The stack's band depth counts an ordinate band: the standoff, the jog
+    /// and the widest value below the part -- what the sheet plan sizes the
+    /// gap under FRONT by.
+    ///
+    /// Mutation: drop the ordinate arm of `dimension_band_depths` (an
+    /// unjogged value is then taken for a leader, a jogged one sided by its
+    /// rotation as a LEFT band) -> the depth below is short -> RED.
+    #[test]
+    fn an_ordinate_band_is_as_deep_as_its_widest_value() {
+        let view = ladder_view(10, 2.0);
+        let placed = place_dimensions(&view, 0.0, 0, &std::collections::HashSet::new());
+        let gr = view_geometry_rect(&view, 0.0).expect("view rect");
+        let deepest = placed
+            .iter()
+            .filter(|p| p.ordinate)
+            .map(|p| placed_text_box(p).y1 - gr.y1)
+            .fold(0.0_f64, f64::max);
+        assert!(deepest > STANDOFF, "fixture: the band lies below the part");
+        let (below, left) = dimension_band_depths(&view, &std::collections::HashSet::new());
+        assert!(
+            below >= deepest - 1e-9,
+            "band depth below {below} must reach the deepest value {deepest}"
+        );
+        assert!(
+            left < 1e-9,
+            "a horizontal ladder takes no left band: {left}"
+        );
     }
 
     /// Positions from one datum edge stack as an ISO 129-1 BASELINE: every

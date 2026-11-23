@@ -79,6 +79,7 @@ fn hdim(id: &str, label: &str, x0: f64, x1: f64, d: f64, geo: &Rect2) -> PlacedD
         stack: None,
         boxed: false,
         ext_breaks: Default::default(),
+        ordinate: false,
         arc: None,
     }
 }
@@ -107,6 +108,7 @@ fn leader(id: &str, label: &str, tip: [f64; 2], elbow: [f64; 2], w: f64) -> Plac
         stack: None,
         boxed: false,
         ext_breaks: Default::default(),
+        ordinate: false,
         arc: None,
     }
 }

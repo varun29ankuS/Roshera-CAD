@@ -2308,7 +2308,7 @@ pub fn standard_drawing_auto_with_options(
                     .dimensions
                     .iter()
                     .map(|pd| {
-                        let id = pd.dim_id.strip_suffix("-note").unwrap_or(&pd.dim_id);
+                        let id = super::layout::base_dim_id(&pd.dim_id);
                         (pd.owner_view, id.to_string())
                     })
                     .collect();
@@ -3149,12 +3149,7 @@ fn sheet_shortfall_and_utilization(
     let placed: std::collections::HashSet<(usize, &str)> = layout
         .dimensions
         .iter()
-        .map(|pd| {
-            (
-                pd.owner_view,
-                pd.dim_id.strip_suffix("-note").unwrap_or(&pd.dim_id),
-            )
-        })
+        .map(|pd| (pd.owner_view, super::layout::base_dim_id(&pd.dim_id)))
         .collect();
     let unplaced = drawing
         .views

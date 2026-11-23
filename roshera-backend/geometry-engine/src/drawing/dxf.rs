@@ -1223,7 +1223,18 @@ fn dimension_ink(pd: &PlacedDimension, sheet_h: f64) -> Vec<Entity> {
     let mut out = Vec::new();
     let [l0, l1] = pd.line;
     let has_line = (l0[0] - l1[0]).abs() > 1e-9 || (l0[1] - l1[1]).abs() > 1e-9;
-    if has_line || pd.arc.is_some() {
+    if pd.ordinate {
+        // An ordinate value: its extension line (jogged or not), no
+        // dimension line, no arrowheads -- what the SVG inks.
+        for i in 0..pd.ext.len() {
+            for seg in extension_line_pieces(pd, i) {
+                let (a, b) = (up(seg[0]), up(seg[1]));
+                if (a[0] - b[0]).hypot(a[1] - b[1]) > 1e-9 {
+                    out.push(line_entity(LAYER_DIMENSIONS, a, b));
+                }
+            }
+        }
+    } else if has_line || pd.arc.is_some() {
         for i in 0..pd.ext.len() {
             for seg in extension_line_pieces(pd, i) {
                 let (a, b) = (up(seg[0]), up(seg[1]));
@@ -2179,5 +2190,35 @@ mod tests {
             v[0].bulge < 0.0
                 && (v[0].bulge + (std::f64::consts::FRAC_PI_2 / 4.0).tan()).abs() < 1e-9
         );
+    }
+}
+
+#[cfg(test)]
+mod ordinate_ink_tests {
+    use super::*;
+
+    /// The DXF inks an ordinate value as the SVG does: the two pieces of its
+    /// jogged extension line and its TEXT, no arrowhead SOLID or outline,
+    /// no dimension line.
+    ///
+    /// Mutation: drop the `ordinate` arm of `dimension_ink` -> the line is
+    /// not inked -> RED.
+    #[test]
+    fn an_ordinate_value_is_its_jogged_line_and_its_text() {
+        let pd = crate::drawing::svg::ordinate_ink_tests::jogged_ordinate();
+        let ents = dimension_ink(&pd, 297.0);
+        let lines = ents
+            .iter()
+            .filter(|e| matches!(e.specific, EntityType::Line(_)))
+            .count();
+        let solids = ents
+            .iter()
+            .filter(|e| matches!(e.specific, EntityType::Solid(_) | EntityType::LwPolyline(_)))
+            .count();
+        let texts = ents
+            .iter()
+            .filter(|e| matches!(e.specific, EntityType::Text(_)))
+            .count();
+        assert_eq!((lines, solids, texts), (2, 0, 1), "{ents:#?}");
     }
 }

@@ -173,7 +173,7 @@ pub fn dimension_omissions(model: &BRepModel, drawing: &Drawing) -> Vec<Dimensio
     let mut inked_ids: Vec<HashSet<&str>> = vec![HashSet::new(); drawing.views.len()];
     for pd in &layout.dimensions {
         if let Some(set) = inked_ids.get_mut(pd.owner_view) {
-            set.insert(pd.dim_id.strip_suffix("-note").unwrap_or(&pd.dim_id));
+            set.insert(super::layout::base_dim_id(&pd.dim_id));
         }
     }
     let inked: Vec<Vec<&Dimension2d>> = drawing

@@ -8,6 +8,55 @@
 //! is tall ([`spread`]), and the extension line that reaches it, jogged when
 //! the value had to move ([`extension_line`]).
 
+/// Fewest locations from one datum, in one view and one direction, that are
+/// drawn as an ordinate ladder rather than as a stack of dimensions (Varun
+/// 2026-11-22: "10 or more locations from one datum in a view"; about 20 of
+/// the 44 bench parts). Fewer stay stacked baseline dimensions.
+pub(crate) const ORDINATE_MIN_LADDER: usize = 10;
+
+/// The ladder among `spans` (each a location's `(lo, hi)` along one
+/// direction): the datum coordinate the most of them share as one end
+/// (within `eps`) with their other ends all on ONE side of it, and those
+/// spans' indices, when at least `min` do. A baseline ladder runs one way
+/// from its datum; a span on the other side ends ON the datum's coordinate
+/// at its feature and is measured from somewhere else (CADGenBench 124's
+/// TOP: "1.5" from -30 to -28.5, beside nine locations from -28.5), so it
+/// is not a member. A span whose two ends both lie on the datum locates
+/// nothing. Ties go to the lower datum coordinate, so the answer does not
+/// depend on the order of `spans`.
+pub(crate) fn find_ladder(spans: &[(f64, f64)], min: usize, eps: f64) -> Option<(f64, Vec<usize>)> {
+    let on = |x: f64, d: f64| (x - d).abs() <= eps;
+    let members_of = |d: f64| -> Vec<usize> {
+        let (mut above, mut below) = (Vec::new(), Vec::new());
+        for (i, &(lo, hi)) in spans.iter().enumerate() {
+            if on(lo, d) && !on(hi, d) {
+                above.push(i);
+            } else if on(hi, d) && !on(lo, d) {
+                below.push(i);
+            }
+        }
+        if below.len() > above.len() {
+            below
+        } else {
+            above
+        }
+    };
+    let mut best: Option<(f64, Vec<usize>)> = None;
+    for &(lo, hi) in spans {
+        for d in [lo, hi] {
+            let m = members_of(d);
+            let better = match &best {
+                None => true,
+                Some((bd, bm)) => m.len() > bm.len() || (m.len() == bm.len() && d < *bd - eps),
+            };
+            if better {
+                best = Some((d, m));
+            }
+        }
+    }
+    best.filter(|(_, m)| m.len() >= min)
+}
+
 /// Where each value is written along the band, in the input order: as near
 /// its feature as it can be, no two closer than `pitch` (a value's height
 /// across the band plus a gap), the order of the features kept.
@@ -77,6 +126,49 @@ pub(crate) fn extension_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ladder is the datum the most locations share, whichever end of
+    /// their spans it is; fewer than the minimum is no ladder.
+    ///
+    /// Mutation: count members by `lo` only -> the datum at the high end
+    /// (the second block) is missed -> RED.
+    #[test]
+    fn the_ladder_is_the_most_shared_datum_end() {
+        // Ten locations measured from x = 0, and three from x = 100 written
+        // with the datum as their HIGH end.
+        let mut spans: Vec<(f64, f64)> = (1..=10).map(|k| (0.0, 5.0 * k as f64)).collect();
+        spans.extend([(70.0, 100.0), (80.0, 100.0), (90.0, 100.0)]);
+        let (datum, members) = find_ladder(&spans, 10, 1e-6).expect("a ladder of ten");
+        assert_eq!(datum, 0.0);
+        assert_eq!(members, (0..10).collect::<Vec<_>>());
+        assert!(
+            find_ladder(&spans[..9], 10, 1e-6).is_none(),
+            "nine is no ladder"
+        );
+        // From the high end: ten spans ending on x = 100.
+        let high: Vec<(f64, f64)> = (1..=10).map(|k| (100.0 - 5.0 * k as f64, 100.0)).collect();
+        let (datum, members) = find_ladder(&high, 10, 1e-6).expect("a ladder from the high end");
+        assert_eq!(datum, 100.0);
+        assert_eq!(members.len(), 10);
+    }
+
+    /// A location measured from elsewhere TO the datum's coordinate is not a
+    /// member: nine locations from -28.5 and "1.5" from -30 to -28.5
+    /// (CADGenBench 124's TOP) are no ladder of ten.
+    ///
+    /// Mutation: count both sides of the datum together -> ten members, a
+    /// band is drawn, and the dense-stack integration test of 124's TOP
+    /// places one dimension too many -> RED.
+    #[test]
+    fn a_span_ending_on_the_datum_from_the_other_side_is_not_a_member() {
+        let mut spans: Vec<(f64, f64)> = (1..=9).map(|k| (-28.5, -28.5 + 5.0 * k as f64)).collect();
+        spans.push((-30.0, -28.5));
+        assert!(find_ladder(&spans, 10, 1e-6).is_none(), "nine, not ten");
+        spans.push((-28.5, 30.0));
+        let (datum, members) = find_ladder(&spans, 10, 1e-6).expect("ten on one side");
+        assert_eq!(datum, -28.5);
+        assert!(!members.contains(&9), "the span from -30 is not a member");
+    }
 
     /// Features a pitch or more apart are written at their features.
     #[test]

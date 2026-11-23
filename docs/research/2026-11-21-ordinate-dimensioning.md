@@ -7,10 +7,32 @@ more paper than any sheet's gap, so the sheet search climbs sheets that cannot
 help (118 ended on A1 at 1:2 with 1.2 % of the paper used) and the locations
 are still not drawn.
 
+## Status (2026-11-23): built
+
+Wired in `layout::place_dimensions_routed` (`place_ordinate_band`), with
+`drawing/ordinate.rs` (`find_ladder`, `spread`, `extension_line`). As built,
+differences from the design below:
+
+- Trigger is **10** locations (Varun 11-22), not 6: `ORDINATE_MIN_LADDER`.
+- Members share the datum END and lie on ONE side of it (a location measured
+  from elsewhere TO the datum's coordinate is not a member: 124's TOP "1.5").
+- Both directions' bands are laid FIRST, nearest the part; both stacks then
+  take lanes beyond and round them. No stacked number is put on a band line
+  in any pass; a stacked extension line may still cross a band number (they
+  share the ladder's features) and is broken round it.
+- `verify::find_dimensions_on_each_others_lines` has an ordinate arm: two
+  values whose lines leave the part < 0.5 mm apart are an error (a ladder
+  drawn too small does not certify clean).
+- Placed ids are matched to view dimensions through `layout::base_dim_id`
+  (`-note`, `-origin`).
+- Part 109 (11-23): A1 1:5 with 15 errors -> A0 1:1, every dimension placed,
+  1 error (the older "5.5"/"6" pair); certificate sound + complete, 110
+  consistent.
+
 ## What is drawn (ISO 129-1 ordinate dimensioning)
 
 For one view, one direction (along x or along y), when at least
-`ORDINATE_MIN_LADDER` (6) locations share one datum end:
+`ORDINATE_MIN_LADDER` (10; was 6 in this design) locations share one datum end:
 
 - one band, on one side of the view (the stack's usual side, else the other);
 - the datum's extension line carries `0`;
