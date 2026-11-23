@@ -11725,6 +11725,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/agent/parts/{id}/dfm",
             post(handlers::agent::part_dfm_check),
         )
+        // Simulation — a linear static study (sim-engine): set-up checks,
+        // mesh and solve through the engines, a verdict with its evidence.
+        .route(
+            "/api/agent/parts/{id}/sim/static",
+            post(handlers::agent::part_sim_static),
+        )
         .route(
             "/api/agent/parts/{id}/perception",
             get(handlers::agent::part_perception),

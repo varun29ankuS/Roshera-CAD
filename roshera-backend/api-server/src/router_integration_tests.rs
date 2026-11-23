@@ -14514,3 +14514,89 @@ async fn a_layout_verb_is_gated_recorded_reported_shown_and_undone() {
         "undo restores the exact prior layout"
     );
 }
+
+// =====================================================================
+// POST /api/agent/parts/{id}/sim/static — a linear static study
+// =====================================================================
+
+/// A static study on a never-verified solid is refused before anything
+/// runs, as `/dfm` is: a safety factor on unverified geometry would launder
+/// a guess.
+#[tokio::test]
+async fn sim_static_refuses_a_never_verified_solid() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/agent/parts/{solid_id}/sim/static"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "supports": [],
+                "loads": [],
+                "material": { "name": "steel", "youngs_modulus_mpa": 210000.0, "poisson_ratio": 0.3 },
+                "goal": { "min_safety_factor": 2.0 }
+            })
+            .to_string(),
+        ))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body = {body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some("sim_stale_solid"),
+        "body = {body}"
+    );
+}
+
+/// The route reaches the kernel's set-up check: a verified box resting on a
+/// roller (its bottom face held along its normal only) is refused with the
+/// motions left free, in words -- before any mesher or solver runs, so this
+/// holds on a machine without them.
+#[tokio::test]
+async fn sim_static_names_the_free_motions_of_a_part_on_a_roller() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
+    let verify = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (vs, vb) = dispatch(&state, verify).await;
+    assert_eq!(vs, StatusCode::OK, "verify: {vb}");
+    let (bottom, top) = {
+        let model = state.model.read().await;
+        (
+            find_plane_face_near(&model, solid_id, Vector3::new(0.0, 0.0, -1.0))
+                .expect("bottom face"),
+            find_plane_face_near(&model, solid_id, Vector3::new(0.0, 0.0, 1.0)).expect("top face"),
+        )
+    };
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/agent/parts/{solid_id}/sim/static"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "supports": [{ "kind": "slider", "faces": [bottom] }],
+                "loads": [{ "faces": [top], "force_n": [0.0, 0.0, -100.0] }],
+                "material": { "name": "steel", "youngs_modulus_mpa": 210000.0, "poisson_ratio": 0.3 },
+                "goal": { "min_safety_factor": 2.0 }
+            })
+            .to_string(),
+        ))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body = {body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some("sim_part_can_move"),
+        "body = {body}"
+    );
+    let free: Vec<&str> = body["free_motions"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert_eq!(free.len(), 3, "two slides and a turn: {body}");
+    assert!(free.iter().any(|m| m.starts_with("can turn")), "{body}");
+}

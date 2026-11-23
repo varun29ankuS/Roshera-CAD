@@ -93,6 +93,7 @@ const SYNONYM_GROUPS: string[][] = [
   ["perpendicular", "parallel", "constrain", "constraint", "coincident", "tangent"],
   ["dof", "freedom", "degrees", "underconstrained", "locked", "free"],
   ["machinable", "machined", "manufacturable", "cnc", "dfm", "manufacturability", "mill", "print", "printability"],
+  ["strength", "strong", "stress", "fea", "simulate", "simulation", "deflection", "stiffness", "stiff", "safety"],
   // Engineering-shop vocabulary the table simply lacked (each word maps to the
   // canonical term a tool name/purpose actually uses):
   ["watertight", "sealed", "leak", "airtight"],

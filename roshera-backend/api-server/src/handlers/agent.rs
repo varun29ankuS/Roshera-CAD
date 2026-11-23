@@ -3728,6 +3728,151 @@ pub async fn measure(
     }
 }
 
+/// `POST /api/agent/parts/{id}/sim/static` — run a linear static study on a
+/// solid (`sim_engine::run::run_static`): check the set-up, mesh and solve it
+/// twice through the engines, and answer with a verdict only the evidence
+/// supports. Body: a [`sim_engine::study::Study`] verbatim; response: the
+/// kernel's own [`sim_engine::run::StaticReport`] (no DTO layer, as `/dfm`).
+///
+/// Like `/dfm`, a solid that is stale (mutated since its last verification)
+/// or certified unsound is refused before anything runs: a safety factor
+/// measured on geometry the kernel rejects would launder a guess.
+///
+/// 404 — solid not found. 422 — refused: `sim_stale_solid`,
+/// `sim_unsound_solid`, `sim_part_can_move` (the free motions in words, in
+/// `free_motions`), or `sim_refused` (an unknown face, no support, an
+/// unphysical material, a support this solver cannot model, a mesh or solve
+/// failure — the reason verbatim). 503 — `sim_engine_missing`: the mesher or
+/// the solver is not installed (the variable to set is named).
+///
+/// The study runs on a blocking thread under a READ lock on the model: the
+/// part cannot change under the solver, and the async runtime is not held.
+pub async fn part_sim_static(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Json(study): Json<sim_engine::study::Study>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let solid_id = id as SolidId;
+    {
+        let model = model_handle.read().await;
+        if model.solids.get(solid_id).is_none() {
+            return ApiError::solid_not_found(id).into();
+        }
+        if let Some(reading) = model.soundness_reading(solid_id) {
+            if reading.is_stale() {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "sim_stale_solid",
+                        "reason": format!("solid {solid_id} has changed since it was last verified; verify it first"),
+                        "remedy": "verify_part",
+                    })),
+                );
+            }
+            if !reading.is_sound() {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "sim_unsound_solid",
+                        "reason": format!(
+                            "solid {solid_id} is certified {} — a study measures sound geometry only",
+                            reading.status_label()
+                        ),
+                        "remedy": "repair the solid, then verify_part",
+                    })),
+                );
+            }
+        } else {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "sim_stale_solid",
+                    "reason": format!("solid {solid_id} has never been verified; verify it first"),
+                    "remedy": "verify_part",
+                })),
+            );
+        }
+    }
+
+    let handle = model_handle.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let workdir = std::env::temp_dir()
+            .join("roshera-sim")
+            .join(uuid::Uuid::new_v4().to_string());
+        let model = handle.blocking_read();
+        // The set-up checks need no engine: a part that can move is refused
+        // even on a machine without the engines.
+        let engines = sim_engine::engines::Engines::discover();
+        let result = match engines {
+            Ok(engines) => {
+                sim_engine::run::run_static(&model, solid_id, &study, &engines, &workdir)
+                    .map_err(SimFailure::Study)
+            }
+            Err(e) => {
+                // Run the set-up checks with no engine behind them; they stop
+                // before any engine is needed when the set-up is wrong.
+                let none = sim_engine::engines::Engines {
+                    mesher: sim_engine::engines::EngineInfo {
+                        name: "none".to_string(),
+                        program: std::path::PathBuf::new(),
+                        version: String::new(),
+                        interim: true,
+                    },
+                    solver: sim_engine::engines::EngineInfo {
+                        name: "none".to_string(),
+                        program: std::path::PathBuf::new(),
+                        version: String::new(),
+                        interim: false,
+                    },
+                };
+                match sim_engine::run::run_static(&model, solid_id, &study, &none, &workdir) {
+                    Err(sim_engine::run::StudyError::Mesh(_)) | Ok(_) => Err(SimFailure::Engine(e)),
+                    Err(other) => Err(SimFailure::Study(other)),
+                }
+            }
+        };
+        let _ = std::fs::remove_dir_all(&workdir);
+        result
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(report)) => {
+            let body = serde_json::to_value(&report).unwrap_or_else(
+                |e| serde_json::json!({ "error": "serialization_failed", "reason": e.to_string() }),
+            );
+            (StatusCode::OK, Json(body))
+        }
+        Ok(Err(SimFailure::Engine(e))) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "sim_engine_missing", "reason": e.to_string() })),
+        ),
+        Ok(Err(SimFailure::Study(sim_engine::run::StudyError::CanMove(free)))) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "sim_part_can_move",
+                "reason": sim_engine::run::StudyError::CanMove(free.clone()).to_string(),
+                "free_motions": free.iter().map(|m| m.describe()).collect::<Vec<_>>(),
+            })),
+        ),
+        Ok(Err(SimFailure::Study(e))) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "sim_refused", "reason": e.to_string() })),
+        ),
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "sim_crashed", "reason": join.to_string() })),
+        ),
+    }
+}
+
+/// Why `part_sim_static` did not produce a report.
+enum SimFailure {
+    Engine(sim_engine::engines::EngineError),
+    Study(sim_engine::run::StudyError),
+}
+
 #[cfg(test)]
 mod watertight_verdict_source_gate {
     //! A closure verdict in this file must come from the kernel's `closed`

@@ -256,6 +256,80 @@ export function registerInspectTools(server: ToolHost) {
   );
 
   server.tool(
+    "sim_static",
+    "STRENGTH / STIFFNESS: will the part hold its loads? A linear static " +
+      "study (FEA) run end to end by the kernel: it checks the set-up first " +
+      "(refused with 'sim_part_can_move' and the free motions in words when " +
+      "the supports leave the part free to slide or turn), meshes the part's " +
+      "exact geometry twice (coarse + fine quadratic tets; mesher Gmsh, " +
+      "interim), solves both (CalculiX), and answers with a verdict only the " +
+      "evidence supports: holds / fails against min_safety_factor, or " +
+      "undecided WITH THE REASON (supports do not carry the load; peak stress " +
+      "did not converge -- a sharp corner; no yield strength with a source). " +
+      "Never guesses a safety factor. ENFORCED like dfm_check: refused if the " +
+      "part is stale or unsound -- call verify_part first. Faces are live face " +
+      "ids (select_face / get_face); the report records their persistent ids. " +
+      "Supports: 'fixed' or 'bolt_clamp' (faces held in all directions); 'pin' " +
+      "and 'slider' are checked for motion but not yet solved. Loads: a total " +
+      "force in N on faces, spread 'even' or 'bearing' (a pin pressing on the " +
+      "half of a hole facing the pull). Units: mm, N, MPa.",
+    {
+      part_id: z.number().int().describe(PART_ID_DOC),
+      supports: z
+        .array(
+          z.object({
+            kind: z.enum(["fixed", "bolt_clamp", "pin", "slider"]),
+            faces: z.array(z.number().int()).min(1),
+          }),
+        )
+        .min(1)
+        .describe("how the part is held: each a kind and the faces it holds"),
+      loads: z
+        .array(
+          z.object({
+            faces: z.array(z.number().int()).min(1),
+            force_n: z.array(z.number()).length(3).describe("total force, N, model axes"),
+            spread: z.enum(["even", "bearing"]).optional(),
+          }),
+        )
+        .min(1)
+        .describe("forces on faces"),
+      material: z
+        .object({
+          name: z.string(),
+          youngs_modulus_mpa: z.number(),
+          poisson_ratio: z.number(),
+          yield_strength_mpa: z.number().optional(),
+          source: z
+            .string()
+            .optional()
+            .describe("where the yield value comes from; without it no safety factor is given"),
+        })
+        .describe("linear elastic, isotropic"),
+      min_safety_factor: z.number().describe("the goal: yield / peak stress must reach this"),
+      mesh_size_mm: z
+        .number()
+        .optional()
+        .describe("coarse mesh's largest element; default a twentieth of the part; the fine mesh uses 0.6 of it"),
+    },
+    async (args) => {
+      try {
+        return ok(
+          await api("POST", `/api/agent/parts/${args.part_id}/sim/static`, {
+            supports: args.supports,
+            loads: args.loads,
+            material: args.material,
+            goal: { min_safety_factor: args.min_safety_factor },
+            mesh: { size_mm: args.mesh_size_mm },
+          }),
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
     "select_face",
     "Address a face by DESCRIPTION — resolves it or REFUSES (never picks among " +
       "equal matches). Returns face_id + persistent_id, or ambiguous / not_found.",

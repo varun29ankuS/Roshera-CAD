@@ -301,6 +301,7 @@ dependencies = [
  "serde_json",
  "session-manager",
  "shared-types",
+ "sim-engine",
  "sysinfo 0.30.13",
  "thiserror 2.0.19",
  "time",

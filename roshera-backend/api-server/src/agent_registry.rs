@@ -1821,6 +1821,25 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "sim_static",
+            Analysis,
+            Experimental,
+            Curated,
+            "Strength and stiffness: will the part hold its loads? A linear static study (FEA) run end to end by the kernel: the set-up is checked first (refused with the free motions in words when the supports leave the part free to slide or turn), the part's exact geometry is meshed twice (quadratic tets; mesher Gmsh, interim) and solved (CalculiX), and the verdict is holds / fails against min_safety_factor, or undecided with its reason (supports do not carry the load; peak stress did not converge; no yield strength with a source). Refused if the part is stale or unsound: call verify_part first. Faces are live face ids. Units mm, N, MPa.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
+                    "supports": {"type": "array", "description": "how the part is held: each {kind: fixed | bolt_clamp | pin | slider, faces: [face ids]}; pin and slider are checked for motion but not yet solved"},
+                    "loads": {"type": "array", "description": "forces on faces: each {faces: [face ids], force_n: [x,y,z] total N, spread: even | bearing}"},
+                    "material": {"type": "object", "description": "{name, youngs_modulus_mpa, poisson_ratio, yield_strength_mpa?, source?}; without a yield strength and its source no safety factor is given"},
+                    "min_safety_factor": {"type": "number", "description": "the goal: yield / peak stress must reach this"},
+                    "mesh_size_mm": {"type": "number", "description": "coarse mesh's largest element; default a twentieth of the part; the fine mesh uses 0.6 of it"}
+                },
+                "required": ["part_id", "supports", "loads", "material", "min_safety_factor"]
+            }),
+        ),
+        t(
             "kb_lookup",
             Analysis,
             Experimental,
@@ -2434,7 +2453,9 @@ mod tests {
         // drawing_move_dimension, drawing_align, drawing_move_view,
         // drawing_reattach_leader, drawing_remove_view, drawing_remove_dimension
         // (POST /api/drawings/{id}/layout).
-        assert_eq!(tools.len(), 120, "expected 120 tools, got {}", tools.len());
+        // 120 -> 121 (2026-11-23): sim_static -- a linear static study
+        // (POST /api/agent/parts/{id}/sim/static).
+        assert_eq!(tools.len(), 121, "expected 121 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2451,7 +2472,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 132, "120 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 133, "121 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");

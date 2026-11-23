@@ -260,6 +260,7 @@ const READ_ONLY = new Set<string>([
   "part_distance",
   "part_features",
   "dfm_check",
+  "sim_static",
   "kb_lookup",
   "ground_truth",
   "measure_faces",
