@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-const { setupOf, forceOf, setupGaps, studyOf, simRunOf, verdictView, stressColor, fieldBuffers, deformScale, fieldRange } =
+const { wireSegments, setupOf, forceOf, setupGaps, studyOf, simRunOf, verdictView, stressColor, fieldBuffers, deformScale, fieldRange } =
   await import('../src/lib/sim.ts')
 
 const material = { name: 'Al 6061-T6', youngs_modulus_mpa: '68900', poisson_ratio: '0.33', yield_strength_mpa: '276', source: 'customer datasheet' }
@@ -116,4 +116,8 @@ test("an agent's study is shown as it was run, and runs again unchanged", () => 
   assert.deepEqual(forceOf(setup.loads[0]), [200, 0, 30], 'the force vector the agent gave, not an axis')
   assert.equal(setup.material.yield_strength_mpa, '', 'no yield given stays no yield')
   assert.deepEqual(studyOf(setup), agent, 'the same study goes back to the kernel')
+})
+test('the mesh wireframe draws each element edge once, end to end', () => {
+  const w = wireSegments({ positions: [[0, 0, 0], [1, 0, 0], [0, 2, 0]], edges: [[0, 1], [1, 2]] })
+  assert.deepEqual([...w], [0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 2, 0])
 })

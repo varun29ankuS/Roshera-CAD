@@ -36,4 +36,17 @@ assert.match(out.field.shown, /Simulate tab/);
 // A refusal body (no field) passes through untouched.
 const refusal = { error: "sim_part_can_move", free_motions: ["can slide along x"] };
 assert.deepEqual(simForAgent(refusal), refusal);
-console.log("ok - sim_static gives the agent the report with the field summarised");
+// A session (sim_session): its nested report and its mesh wireframe are
+// summarised too.
+const session = simForAgent({
+  stage: "result",
+  revision: "r-2",
+  wire: { positions: [[0, 0, 0], [1, 0, 0]], edges: [[0, 1]] },
+  report,
+});
+assert.equal(session.revision, "r-2");
+assert.equal(session.wire.edges, 1);
+assert.equal("positions" in session.wire, false, "the wireframe stays with the viewport");
+assert.equal(session.report.field.vertices, 3);
+assert.equal("von_mises" in session.report.field, false);
+console.log("ok - sim tools give the agent the study with its arrays summarised");

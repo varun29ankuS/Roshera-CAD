@@ -27,6 +27,7 @@
  * line describing the tool call, never a fabricated card.
  */
 
+import { joinAgentText, needsNewSegment } from './agent-segments'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
@@ -336,7 +337,10 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
   // dropped connection.
   useAcpSessionStore.getState().incrementTurns()
 
-  const lineId = board.addLine('', 'agent')
+  // The line the agent is writing now. A NEW one starts whenever another
+  // line lands after it mid-turn (an Intent, a kernel line), so the board
+  // reads in the order things happened -- see lib/agent-segments.ts.
+  let lineId = board.addLine('', 'agent')
   board.setStreamingLine(lineId)
   let accumulated = ''
   let sawContent = false
@@ -370,7 +374,17 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
         const chunk = content.type === 'text' ? (content as { text: string }).text : ''
         if (!chunk) return
         sawContent = true
-        accumulated += chunk
+        const b = useBlackboardStore.getState()
+        if (needsNewSegment(b.lines.map((l) => l.id), lineId)) {
+          // Close the segment where it stands (persisted), or drop it if the
+          // agent had not written anything on it yet.
+          if (accumulated.trim() === '') b.deleteLine(lineId)
+          else b.editLine(lineId, accumulated)
+          lineId = b.addLine('', 'agent')
+          b.setStreamingLine(lineId)
+          accumulated = ''
+        }
+        accumulated = joinAgentText(accumulated, chunk)
         useBlackboardStore.getState().setLineText(lineId, accumulated)
         return
       }

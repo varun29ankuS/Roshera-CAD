@@ -4,7 +4,7 @@ import { useThree } from '@react-three/fiber'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useSimStore } from '@/stores/sim-store'
-import { deformScale, fieldBuffers, forceOf } from '@/lib/sim'
+import { deformScale, fieldBuffers, forceOf, wireSegments } from '@/lib/sim'
 import { facePositions } from '@/lib/face-positions'
 import { TintMesh } from './face-tint'
 
@@ -12,6 +12,8 @@ import { TintMesh } from './face-tint'
 export const SUPPORT_COLOR = '#2F6FD6'
 /** Loaded faces and their force arrows. */
 export const LOAD_COLOR = '#E07A1F'
+/** The mesh's element edges at the mesh stage. */
+export const MESH_COLOR = '#1E3A5F'
 
 /**
  * The Simulate workspace on the part. Before a run: the held faces tinted
@@ -29,6 +31,8 @@ export function SimView() {
   const shown = useSimStore((s) => s.shown)
   const deformed = useSimStore((s) => s.deformed)
   const focus = useSimStore((s) => s.focus)
+  const stage = useSimStore((s) => s.stage)
+  const wire = useSimStore((s) => s.wire)
   const meshRefs = useSceneStore((s) => s.meshRefs)
   const objects = useSceneStore((s) => s.objects)
   const invalidate = useThree((s) => s.invalidate)
@@ -103,7 +107,25 @@ export function SimView() {
   }, [showResult, report, shown, deformed])
   useEffect(() => () => result?.dispose(), [result])
 
+  // The mesh stage: the proving mesh's element edges over the part.
+  const wireGeometry = useMemo(() => {
+    if (!active || stage !== 'mesh' || !wire) return null
+    const g = new THREE.BufferGeometry()
+    g.setAttribute('position', new THREE.BufferAttribute(wireSegments(wire), 3))
+    return g
+  }, [active, stage, wire])
+  useEffect(() => () => wireGeometry?.dispose(), [wireGeometry])
+
   if (!active) return null
+  if (wireGeometry && world) {
+    return (
+      <group matrixAutoUpdate={false} matrix={world}>
+        <lineSegments geometry={wireGeometry} renderOrder={3}>
+          <lineBasicMaterial color={MESH_COLOR} transparent opacity={0.75} depthTest />
+        </lineSegments>
+      </group>
+    )
+  }
   if (result && world) {
     return (
       <group matrixAutoUpdate={false} matrix={world}>

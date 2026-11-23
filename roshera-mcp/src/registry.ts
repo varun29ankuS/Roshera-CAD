@@ -244,7 +244,10 @@ const EXPERIMENTAL = new Set<string>([
   "drawing_remove_dimension",
   "iso286_limits",
   "dfm_check",
+  "sim_mesh",
+  "sim_setup",
   "sim_static",
+  "sim_session",
   "kb_lookup",
 ]);
 
@@ -379,7 +382,10 @@ const BENCH_OF: Record<string, Bench> = {
   // A linear static study (POST /api/agent/parts/{id}/sim/static): set-up
   // checks, mesh, solve, a verdict with its evidence. Reads the part, writes
   // nothing.
+  sim_mesh: "analysis",
+  sim_setup: "analysis",
   sim_static: "analysis",
+  sim_session: "analysis",
   kb_lookup: "analysis",
   ground_truth: "analysis",
   measure_faces: "analysis",

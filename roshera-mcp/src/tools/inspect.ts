@@ -255,58 +255,59 @@ export function registerInspectTools(server: ToolHost) {
     },
   );
 
+  // ── A strength study, walked through WITH the person ──────────────────
+  // mesh -> (ask) -> set-up -> (ask) -> run. Each stage shows on the part in
+  // the person's Simulate tab; each names the revision it builds on, and the
+  // kernel refuses a stage that does not build on the current one -- a run is
+  // always of the set-up the person last saw.
+  const STUDY_FLOW =
+    "A strength study is walked through WITH the person, one stage at a time: " +
+    "(0) guide_attention({action:'workspace', mode:'simulate'}) so they watch it; " +
+    "(1) sim_mesh -- the mesh appears on the part; ask_choice whether it is right " +
+    "(e.g. 'Looks right' / 'Finer' / 'Coarser'), re-mesh until they approve; " +
+    "(2) sim_setup with the mesh stage's revision -- supports (blue) and loads " +
+    "(orange arrows) appear on the part; ask_choice whether they are right, " +
+    "including anything you assumed; (3) sim_static with the set-up's revision. " +
+    "Never skip an ask. Units mm, N, MPa.";
+  const supportsSchema = z
+    .array(
+      z.object({
+        kind: z.enum(["fixed", "bolt_clamp", "pin", "slider"]),
+        faces: z.array(z.number().int()).min(1),
+      }),
+    )
+    .min(1)
+    .describe("how the part is held: each a kind and the live face ids it holds; pin and slider are checked for motion but not yet solved");
+  const loadsSchema = z
+    .array(
+      z.object({
+        faces: z.array(z.number().int()).min(1),
+        force_n: z.array(z.number()).length(3).describe("total force, N, model axes"),
+        spread: z.enum(["even", "bearing"]).optional(),
+      }),
+    )
+    .min(1)
+    .describe("forces on faces; spread 'bearing' = a pin pressing on the half of a hole facing the pull");
+  const materialSchema = z
+    .object({
+      name: z.string(),
+      youngs_modulus_mpa: z.number(),
+      poisson_ratio: z.number(),
+      yield_strength_mpa: z.number().optional(),
+      source: z.string().optional().describe("where the yield comes from; without it no safety factor is given"),
+    })
+    .describe("linear elastic, isotropic -- ask the person; never invent a value or a source");
+
   server.tool(
-    "sim_static",
-    "STRENGTH / STIFFNESS: will the part hold its loads? A linear static " +
-      "study (FEA) run end to end by the kernel: it checks the set-up first " +
-      "(refused with 'sim_part_can_move' and the free motions in words when " +
-      "the supports leave the part free to slide or turn), meshes the part's " +
-      "exact geometry twice (coarse + fine quadratic tets; mesher Gmsh, " +
-      "interim), solves both (CalculiX), and answers with a verdict only the " +
-      "evidence supports: holds / fails against min_safety_factor, or " +
-      "undecided WITH THE REASON (supports do not carry the load; peak stress " +
-      "did not converge -- a sharp corner; no yield strength with a source). " +
-      "Never guesses a safety factor. ENFORCED like dfm_check: refused if the " +
-      "part is stale or unsound -- call verify_part first. Faces are live face " +
-      "ids (select_face / get_face); the report records their persistent ids. " +
-      "Supports: 'fixed' or 'bolt_clamp' (faces held in all directions); 'pin' " +
-      "and 'slider' are checked for motion but not yet solved. Loads: a total " +
-      "force in N on faces, spread 'even' or 'bearing' (a pin pressing on the " +
-      "half of a hole facing the pull). Units: mm, N, MPa.",
+    "sim_mesh",
+    "STRENGTH STUDY, STAGE 1 -- MESH: make the study's two meshes (coarse, and the " +
+      "fine one the stress is read from; mesher Gmsh, interim) WITHOUT solving, and " +
+      "show the fine one on the part in the person's Simulate tab. Starts a new " +
+      "study in this document. Returns the node/element counts, the mesh size, how " +
+      "far the mesh is from the true surface, and the REVISION sim_setup must name. " +
+      "Refused if the part is stale or unsound (verify_part first). " + STUDY_FLOW,
     {
       part_id: z.number().int().describe(PART_ID_DOC),
-      supports: z
-        .array(
-          z.object({
-            kind: z.enum(["fixed", "bolt_clamp", "pin", "slider"]),
-            faces: z.array(z.number().int()).min(1),
-          }),
-        )
-        .min(1)
-        .describe("how the part is held: each a kind and the faces it holds"),
-      loads: z
-        .array(
-          z.object({
-            faces: z.array(z.number().int()).min(1),
-            force_n: z.array(z.number()).length(3).describe("total force, N, model axes"),
-            spread: z.enum(["even", "bearing"]).optional(),
-          }),
-        )
-        .min(1)
-        .describe("forces on faces"),
-      material: z
-        .object({
-          name: z.string(),
-          youngs_modulus_mpa: z.number(),
-          poisson_ratio: z.number(),
-          yield_strength_mpa: z.number().optional(),
-          source: z
-            .string()
-            .optional()
-            .describe("where the yield value comes from; without it no safety factor is given"),
-        })
-        .describe("linear elastic, isotropic"),
-      min_safety_factor: z.number().describe("the goal: yield / peak stress must reach this"),
       mesh_size_mm: z
         .number()
         .optional()
@@ -314,20 +315,98 @@ export function registerInspectTools(server: ToolHost) {
     },
     async (args) => {
       try {
-        const report = await api("POST", `/api/agent/parts/${args.part_id}/sim/static`, {
-          supports: args.supports,
-          loads: args.loads,
-          material: args.material,
-          goal: { min_safety_factor: args.min_safety_factor },
-          mesh: { size_mm: args.mesh_size_mm },
-        });
-        return ok(simForAgent(report));
+        return ok(
+          simForAgent(
+            await api("POST", `/api/agent/parts/${args.part_id}/sim/static/mesh`, { size_mm: args.mesh_size_mm }),
+          ),
+        );
       } catch (e) {
         return fail(e);
       }
     },
   );
 
+  server.tool(
+    "sim_setup",
+    "STRENGTH STUDY, STAGE 2 -- SET-UP: how the part is held, what loads it, what it " +
+      "is made of and the safety factor it must reach. Checked by the kernel exactly " +
+      "as the run will check it (refused with 'sim_part_can_move' and the free " +
+      "motions in words when the supports leave it free), then drawn on the part " +
+      "(supports blue, loads as orange arrows). Must name the MESH stage's revision; " +
+      "the mesh size is the one approved there. Returns the REVISION sim_static must " +
+      "name. 409 sim_stale_revision: the study moved on -- read sim_session. " + STUDY_FLOW,
+    {
+      part_id: z.number().int().describe(PART_ID_DOC),
+      revision: z.string().describe("the revision sim_mesh returned (the mesh the person approved)"),
+      supports: supportsSchema,
+      loads: loadsSchema,
+      material: materialSchema,
+      min_safety_factor: z.number().describe("the goal: yield / peak stress must reach this"),
+    },
+    async (args) => {
+      try {
+        return ok(
+          simForAgent(
+            await api("POST", `/api/agent/parts/${args.part_id}/sim/static/setup`, {
+              revision: args.revision,
+              study: {
+                supports: args.supports,
+                loads: args.loads,
+                material: args.material,
+                goal: { min_safety_factor: args.min_safety_factor },
+                mesh: {},
+              },
+            }),
+          ),
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "sim_static",
+    "STRENGTH STUDY, STAGE 3 -- RUN: solve EXACTLY the set-up the person approved " +
+      "(named by sim_setup's revision) on the mesh they approved, twice (coarse + " +
+      "fine, CalculiX), and answer with a verdict only the evidence supports: holds / " +
+      "fails against the safety factor, or undecided WITH THE REASON (supports do not " +
+      "carry the load; peak stress did not converge -- a sharp corner; no yield with a " +
+      "source). Never guesses a safety factor. Adds the check 'solved on the mesh you " +
+      "approved'. The result is coloured on the part in the Simulate tab. 409 " +
+      "sim_stale_revision: the set-up changed since -- read sim_session, show the " +
+      "person, ask again. " + STUDY_FLOW,
+    {
+      part_id: z.number().int().describe(PART_ID_DOC),
+      revision: z.string().describe("the revision sim_setup returned (the set-up the person approved)"),
+    },
+    async (args) => {
+      try {
+        return ok(
+          simForAgent(await api("POST", `/api/agent/parts/${args.part_id}/sim/static`, { revision: args.revision })),
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "sim_session",
+    "READ this document's current strength study: its stage (mesh / setup / " +
+      "result), part, revision, the mesh, the set-up (supports, loads, material, " +
+      "goal) and the result -- whoever drove it, the person or an agent. Use it to " +
+      "pick a study up where it was left (e.g. 'run it again with a fillet'), never " +
+      "re-ask the person for what is recorded here. stale: the part changed since.",
+    {},
+    async () => {
+      try {
+        return ok(simForAgent(await api("GET", `/api/agent/sim/session`)));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
   server.tool(
     "select_face",
     "Address a face by DESCRIPTION — resolves it or REFUSES (never picks among " +
@@ -577,24 +656,29 @@ export function dfmBody(args: {
   return body;
 }
 
-/** A static-study report as the agent reads it: everything but the result
- *  field's per-vertex arrays (megabytes on a real part; the viewport draws
- *  them), which become a summary -- how much of the part they cover and
- *  the stress range -- with where the person sees them. */
-export function simForAgent(report: unknown): unknown {
-  if (!report || typeof report !== "object") return report;
-  const r = report as Record<string, unknown>;
+/** A study answer as the agent reads it: everything but the per-vertex
+ *  arrays meant for the viewport (megabytes on a real part -- one study
+ *  swamped the agent's context), each summarised with where the person sees
+ *  it. Handles a report, a session (whose report is nested) and a mesh stage
+ *  (whose wireframe is). */
+export function simForAgent(body: unknown): unknown {
+  if (!body || typeof body !== "object") return body;
+  const r = { ...(body as Record<string, unknown>) };
+  const count = (o: Record<string, unknown>, k: string) => (Array.isArray(o[k]) ? (o[k] as unknown[]).length : 0);
   const field = r.field as Record<string, unknown> | undefined;
-  if (!field || typeof field !== "object") return report;
-  const count = (k: string) => (Array.isArray(field[k]) ? (field[k] as unknown[]).length : 0);
-  return {
-    ...r,
-    field: {
-      vertices: count("positions"),
-      triangles: count("triangles"),
+  if (field && typeof field === "object") {
+    r.field = {
+      vertices: count(field, "positions"),
+      triangles: count(field, "triangles"),
       min_von_mises: field.min_von_mises,
       max_von_mises: field.max_von_mises,
-      shown: "coloured on the part in the person's Simulate tab (open it with the workspace tool, mode 'simulate')",
-    },
-  };
+      shown: "coloured on the part in the person's Simulate tab (open it with guide_attention, mode 'simulate')",
+    };
+  }
+  const wire = r.wire as Record<string, unknown> | undefined;
+  if (wire && typeof wire === "object") {
+    r.wire = { edges: count(wire, "edges"), shown: "drawn on the part in the person's Simulate tab" };
+  }
+  if (r.report && typeof r.report === "object") r.report = simForAgent(r.report);
+  return r;
 }

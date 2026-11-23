@@ -25,6 +25,7 @@ pub mod engines;
 pub mod field;
 pub mod loads;
 pub mod mesh;
+pub mod preview;
 pub mod rigid;
 pub mod run;
 pub mod study;

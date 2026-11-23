@@ -10,10 +10,9 @@ import {
   SUPPORT_KINDS,
   deformScale,
   engineLabel,
-  fetchLatest,
+  fetchSession,
   fieldRange,
   runStatic,
-  setupOf,
   setupGaps,
   stressColor,
   studyOf,
@@ -112,31 +111,28 @@ export function SimPanel() {
     [picks, partId],
   )
 
-  // A study run elsewhere -- by an agent through `sim_static` -- is shown
-  // here as it lands: its part, its set-up and its result on the part. A
-  // study on a part that has changed since is not shown (its numbers belong
-  // to a shape that no longer exists).
-  const { loadRun, markSeen } = sim
+  // The document's study, whoever drives it -- an agent walking the person
+  // through mesh -> set-up -> run, or the person here -- is shown at its
+  // stage as it moves: its part, and what the stage shows on it. A study
+  // on a part that has changed since is not shown (it describes a shape
+  // that no longer exists).
+  const { loadSession, markSeen } = sim
   useEffect(() => {
     let stop = false
     const tick = async () => {
-      for (const p of parts) {
-        const sid = solidOf(p)
-        if (typeof sid !== 'number') continue
-        const rec = await fetchLatest(sid).catch(() => null)
-        if (stop) return
-        if (!rec || rec.stale || useSimStore.getState().seenRuns.has(rec.run_id)) continue
-        loadRun(rec.run_id, p.id, setupOf(rec.study), rec.report)
-      }
+      const session = await fetchSession().catch(() => null)
+      if (stop || !session || session.stale) return
+      if (useSimStore.getState().revision === session.revision) return
+      const part = parts.find((p) => solidOf(p) === session.solid)
+      if (part) loadSession(part.id, session)
     }
     void tick()
-    const timer = setInterval(() => void tick(), 3000)
+    const timer = setInterval(() => void tick(), 2000)
     return () => {
       stop = true
       clearInterval(timer)
     }
-  }, [parts, loadRun])
-
+  }, [parts, loadSession])
   const [supportKind, setSupportKind] = useState<SupportKind>('fixed')
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' })
 
@@ -171,8 +167,8 @@ export function SimPanel() {
         sim.setReport(out.report)
         setPhase({ kind: 'idle' })
         // This run is already on screen with the set-up as entered.
-        const rec = await fetchLatest(solidId).catch(() => null)
-        if (rec) markSeen(rec.run_id)
+        const session = await fetchSession().catch(() => null)
+        if (session) markSeen(session.revision)
       } else if (out.kind === 'can_move') {
         setPhase({ kind: 'can_move', motions: out.motions })
       } else {
@@ -196,9 +192,10 @@ export function SimPanel() {
         <div className="text-[11px] text-muted-foreground">Will the part hold its loads?</div>
       </div>
 
+      {sim.stage === 'mesh' || sim.stage === 'setup' ? <StageBanner /> : null}
       {report ? (
         <Results onEdit={() => sim.setReport(null)} />
-      ) : (
+      ) : sim.stage === 'mesh' ? null : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <Step n={1} title="Part" done={!!part}>
             <select
@@ -520,6 +517,41 @@ function Results({ onEdit }: { onEdit: () => void }) {
           Change the set-up
         </button>
       </div>
+    </div>
+  )
+}
+
+/** Where a staged study stands, while the agent asks the person about it:
+ *  what is on the part now, and that the question is in the Blackboard. */
+function StageBanner() {
+  const stage = useSimStore((s) => s.stage)
+  const mesh = useSimStore((s) => s.mesh)
+  if (stage !== 'mesh' && stage !== 'setup') return null
+  return (
+    <div className="flex flex-col gap-1.5 border-b border-border/70 bg-sky-500/10 px-3 py-2.5">
+      <span className="text-[11px] font-semibold uppercase tracking-wide text-sky-800 dark:text-sky-200">
+        {stage === 'mesh' ? 'Step 1 of 3 · The mesh' : 'Step 2 of 3 · Supports and loads'}
+      </span>
+      {stage === 'mesh' && mesh && (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5">
+          <dt className="text-muted-foreground">Proving mesh</dt>
+          <dd className="text-right font-mono">
+            {mesh.fine.nodes.toLocaleString()} nodes · {mesh.fine.elements.toLocaleString()} elements
+          </dd>
+          <dt className="text-muted-foreground">Element size</dt>
+          <dd className="text-right font-mono">{mesh.fine.size_mm.toFixed(2)} mm</dd>
+          <dt className="text-muted-foreground">Checking mesh</dt>
+          <dd className="text-right font-mono">{mesh.coarse.nodes.toLocaleString()} nodes</dd>
+          <dt className="text-muted-foreground">Off the true surface</dt>
+          <dd className="text-right font-mono">{mesh.fine.boundary_deviation_mm.toPrecision(2)} mm</dd>
+        </dl>
+      )}
+      <span className="text-[11px]">
+        {stage === 'mesh'
+          ? 'The mesh the stress will be read from is drawn on the part. '
+          : 'Held faces are blue; each load is an orange arrow. '}
+        The agent asks you in the Blackboard whether it is right before going on.
+      </span>
     </div>
   )
 }

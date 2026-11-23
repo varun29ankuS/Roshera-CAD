@@ -3728,206 +3728,445 @@ pub async fn measure(
     }
 }
 
-/// `POST /api/agent/parts/{id}/sim/static` — run a linear static study on a
-/// solid (`sim_engine::run::run_static`): check the set-up, mesh and solve it
-/// twice through the engines, and answer with a verdict only the evidence
-/// supports. Body: a [`sim_engine::study::Study`] verbatim; response: the
-/// kernel's own [`sim_engine::run::StaticReport`] (no DTO layer, as `/dfm`).
-///
-/// Like `/dfm`, a solid that is stale (mutated since its last verification)
-/// or certified unsound is refused before anything runs: a safety factor
-/// measured on geometry the kernel rejects would launder a guess.
-///
-/// 404 — solid not found. 422 — refused: `sim_stale_solid`,
-/// `sim_unsound_solid`, `sim_part_can_move` (the free motions in words, in
-/// `free_motions`), or `sim_refused` (an unknown face, no support, an
-/// unphysical material, a support this solver cannot model, a mesh or solve
-/// failure — the reason verbatim). 503 — `sim_engine_missing`: the mesher or
-/// the solver is not installed (the variable to set is named).
-///
-/// The study runs on a blocking thread under a READ lock on the model: the
-/// part cannot change under the solver, and the async runtime is not held.
-pub async fn part_sim_static(
-    State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
-    Path(id): Path<u32>,
-    Json(study): Json<sim_engine::study::Study>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let solid_id = id as SolidId;
-    {
-        let model = model_handle.read().await;
-        if model.solids.get(solid_id).is_none() {
-            return ApiError::solid_not_found(id).into();
-        }
-        if let Some(reading) = model.soundness_reading(solid_id) {
-            if reading.is_stale() {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({
-                        "error": "sim_stale_solid",
-                        "reason": format!("solid {solid_id} has changed since it was last verified; verify it first"),
-                        "remedy": "verify_part",
-                    })),
-                );
-            }
-            if !reading.is_sound() {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({
-                        "error": "sim_unsound_solid",
-                        "reason": format!(
-                            "solid {solid_id} is certified {} — a study measures sound geometry only",
-                            reading.status_label()
-                        ),
-                        "remedy": "repair the solid, then verify_part",
-                    })),
-                );
-            }
-        } else {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "error": "sim_stale_solid",
-                    "reason": format!("solid {solid_id} has never been verified; verify it first"),
-                    "remedy": "verify_part",
-                })),
-            );
-        }
-    }
+// ── Simulation: a static study, one stage at a time ─────────────────────
+//
+// A study is walked through in the person's sight, each stage shown in the
+// Simulate tab and approved before the next (Varun 2026-11-23: "it should
+// show meshing... ask if any changes are needed... then show load, ask...
+// every step has to be executed properly"):
+//
+//   1. MESH   `POST .../sim/static/mesh`  -- both meshes made, the proving
+//             mesh drawn on the part; nothing solved.
+//   2. SETUP  `POST .../sim/static/setup` -- supports, loads, material and
+//             goal, checked (can the part move?) and drawn on the part.
+//   3. RUN    `POST .../sim/static` with the set-up's `revision` -- solves
+//             EXACTLY what was shown: the set-up stored at that revision, on
+//             the mesh approved at stage 1.
+//
+// Each stage names the revision it builds on, and a stage that does not
+// build on the CURRENT one is refused (409 `sim_stale_revision`): a run can
+// never be of a set-up the person did not see. The session is kept per
+// document (keyed by the same resolution that picks the request's model),
+// so a part id from another document can never answer for this one.
 
-    let handle = model_handle.clone();
-    let asked = study.clone();
+/// The stages of a study.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimStage {
+    Mesh,
+    Setup,
+    Result,
+}
+
+/// A document's current study.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SimSession {
+    /// Changes at every stage; the next stage must name it.
+    pub revision: String,
+    pub solid: u32,
+    pub stage: SimStage,
+    /// The coarse mesh size the person approved (`None`: the automatic size).
+    pub mesh_size_mm: Option<f64>,
+    pub mesh: Option<sim_engine::preview::MeshPreview>,
+    pub wire: Option<sim_engine::preview::MeshWire>,
+    pub study: Option<sim_engine::study::Study>,
+    pub report: Option<sim_engine::run::StaticReport>,
+}
+
+/// The document a request is about, as a session key.
+fn sim_document_key(key: &crate::part_mgr::ModelKey) -> String {
+    serde_json::to_string(key).unwrap_or_else(|_| format!("{key:?}"))
+}
+
+fn new_revision() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn sim_json(status: StatusCode, body: serde_json::Value) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(body))
+}
+
+/// Refuse a study on a missing, stale or unsound solid (as `/dfm` does): a
+/// number measured on geometry the kernel rejects would launder a guess.
+async fn sim_gate(
+    model_handle: &std::sync::Arc<
+        tokio::sync::RwLock<geometry_engine::primitives::topology_builder::BRepModel>,
+    >,
+    id: u32,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let solid_id = id as SolidId;
+    let model = model_handle.read().await;
+    if model.solids.get(solid_id).is_none() {
+        return Some(ApiError::solid_not_found(id).into());
+    }
+    match model.soundness_reading(solid_id) {
+        Some(reading) if reading.is_stale() => Some(sim_json(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({
+                "error": "sim_stale_solid",
+                "reason": format!("solid {solid_id} has changed since it was last verified; verify it first"),
+                "remedy": "verify_part",
+            }),
+        )),
+        Some(reading) if !reading.is_sound() => Some(sim_json(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({
+                "error": "sim_unsound_solid",
+                "reason": format!(
+                    "solid {solid_id} is certified {} — a study measures sound geometry only",
+                    reading.status_label()
+                ),
+                "remedy": "repair the solid, then verify_part",
+            }),
+        )),
+        Some(_) => None,
+        None => Some(sim_json(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({
+                "error": "sim_stale_solid",
+                "reason": format!("solid {solid_id} has never been verified; verify it first"),
+                "remedy": "verify_part",
+            }),
+        )),
+    }
+}
+
+/// The 409 for a stage that does not build on the document's current one.
+fn sim_stale_revision(
+    current: Option<&SimSession>,
+    asked: &str,
+    needs: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    sim_json(
+        StatusCode::CONFLICT,
+        serde_json::json!({
+            "error": "sim_stale_revision",
+            "reason": format!(
+                "this step must build on the study's current {needs} stage; revision {asked} is not it — read the session (sim_session) and show the person what changed"
+            ),
+            "current_revision": current.map(|s| s.revision.clone()),
+            "current_stage": current.map(|s| s.stage),
+            "current_solid": current.map(|s| s.solid),
+        }),
+    )
+}
+
+/// A study failure as a response.
+fn sim_failure(f: SimFailure) -> (StatusCode, Json<serde_json::Value>) {
+    match f {
+        SimFailure::Engine(e) => sim_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": "sim_engine_missing", "reason": e.to_string() }),
+        ),
+        SimFailure::Study(sim_engine::run::StudyError::CanMove(free)) => sim_json(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({
+                "error": "sim_part_can_move",
+                "reason": sim_engine::run::StudyError::CanMove(free.clone()).to_string(),
+                "free_motions": free.iter().map(|m| m.describe()).collect::<Vec<_>>(),
+            }),
+        ),
+        SimFailure::Study(e) => sim_json(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({ "error": "sim_refused", "reason": e.to_string() }),
+        ),
+        SimFailure::Crashed(why) => sim_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": "sim_crashed", "reason": why }),
+        ),
+    }
+}
+
+/// Run `work` on a blocking thread under a READ lock on the model, with a
+/// per-run engine directory removed afterwards. The part cannot change under
+/// the engines, and the async runtime is not held.
+async fn sim_blocking<T: Send + 'static>(
+    model_handle: std::sync::Arc<
+        tokio::sync::RwLock<geometry_engine::primitives::topology_builder::BRepModel>,
+    >,
+    work: impl FnOnce(
+            &geometry_engine::primitives::topology_builder::BRepModel,
+            &sim_engine::engines::Engines,
+            &std::path::Path,
+        ) -> Result<T, sim_engine::run::StudyError>
+        + Send
+        + 'static,
+) -> Result<T, SimFailure> {
     let outcome = tokio::task::spawn_blocking(move || {
+        let engines = sim_engine::engines::Engines::discover().map_err(SimFailure::Engine)?;
         let workdir = std::env::temp_dir()
             .join("roshera-sim")
             .join(uuid::Uuid::new_v4().to_string());
-        let model = handle.blocking_read();
-        // The set-up checks need no engine: a part that can move is refused
-        // even on a machine without the engines.
-        let engines = sim_engine::engines::Engines::discover();
-        let result = match engines {
-            Ok(engines) => {
-                sim_engine::run::run_static(&model, solid_id, &study, &engines, &workdir)
-                    .map_err(SimFailure::Study)
-            }
-            Err(e) => {
-                // Run the set-up checks with no engine behind them; they stop
-                // before any engine is needed when the set-up is wrong.
-                let none = sim_engine::engines::Engines {
-                    mesher: sim_engine::engines::EngineInfo {
-                        name: "none".to_string(),
-                        program: std::path::PathBuf::new(),
-                        version: String::new(),
-                        interim: true,
-                    },
-                    solver: sim_engine::engines::EngineInfo {
-                        name: "none".to_string(),
-                        program: std::path::PathBuf::new(),
-                        version: String::new(),
-                        interim: false,
-                    },
-                };
-                match sim_engine::run::run_static(&model, solid_id, &study, &none, &workdir) {
-                    Err(sim_engine::run::StudyError::Mesh(_)) | Ok(_) => Err(SimFailure::Engine(e)),
-                    Err(other) => Err(SimFailure::Study(other)),
-                }
-            }
-        };
+        let model = model_handle.blocking_read();
+        let result = work(&model, &engines, &workdir).map_err(SimFailure::Study);
         let _ = std::fs::remove_dir_all(&workdir);
         result
     })
     .await;
-
     match outcome {
-        Ok(Ok(report)) => {
-            let body = serde_json::to_value(&report).unwrap_or_else(
-                |e| serde_json::json!({ "error": "serialization_failed", "reason": e.to_string() }),
-            );
-            state.sim_studies.insert(
-                id,
-                std::sync::Arc::new(SimRecord {
-                    run_id: uuid::Uuid::new_v4().to_string(),
-                    study: asked,
-                    report,
-                }),
-            );
-            (StatusCode::OK, Json(body))
-        }
-        Ok(Err(SimFailure::Engine(e))) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "sim_engine_missing", "reason": e.to_string() })),
-        ),
-        Ok(Err(SimFailure::Study(sim_engine::run::StudyError::CanMove(free)))) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "sim_part_can_move",
-                "reason": sim_engine::run::StudyError::CanMove(free.clone()).to_string(),
-                "free_motions": free.iter().map(|m| m.describe()).collect::<Vec<_>>(),
-            })),
-        ),
-        Ok(Err(SimFailure::Study(e))) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({ "error": "sim_refused", "reason": e.to_string() })),
-        ),
-        Err(join) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "sim_crashed", "reason": join.to_string() })),
-        ),
+        Ok(r) => r,
+        Err(join) => Err(SimFailure::Crashed(join.to_string())),
     }
 }
 
-/// A solid's latest static study: what was asked and what the kernel
-/// answered, with an id the app uses to tell a new run from the one it
-/// already shows.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SimRecord {
-    pub run_id: String,
-    pub study: sim_engine::study::Study,
-    pub report: sim_engine::run::StaticReport,
+/// Body of `POST .../sim/static/mesh`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SimMeshRequest {
+    /// The coarse mesh's largest element, mm; absent: the automatic size.
+    #[serde(default)]
+    pub size_mm: Option<f64>,
 }
 
-/// `GET /api/agent/parts/{id}/sim/static/latest` -- the solid's latest
-/// static study, whoever ran it (the app's Run button or an agent's
-/// `sim_static`), so the Simulate tab can show an agent's study on the part.
-/// `stale: true` when the solid has changed since: the report then describes
-/// geometry that no longer exists, and the app says so instead of colouring
-/// the new shape with old numbers.
-///
-/// 404 `no_study` -- nothing has been run on this solid since the server
-/// started.
-pub async fn part_sim_static_latest(
+/// `POST /api/agent/parts/{id}/sim/static/mesh` — STAGE 1: make the study's
+/// two meshes (coarse, and the fine one the stress is read from) without
+/// solving, and show the fine one on the part. Starts a new study session
+/// for the document. 200: `{revision, stage, solid, mesh_size_mm, mesh,
+/// wire}`. Refused as `/sim/static` is (404, 422 stale/unsound, 503 engines).
+pub async fn part_sim_mesh(
     State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
+    crate::part_mgr::ActiveModelKeyed(model_handle, key): crate::part_mgr::ActiveModelKeyed,
     Path(id): Path<u32>,
+    Json(req): Json<SimMeshRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(record) = state.sim_studies.get(&id).map(|r| r.value().clone()) else {
-        return (
+    if let Some(refused) = sim_gate(&model_handle, id).await {
+        return refused;
+    }
+    let size = req.size_mm;
+    let made = sim_blocking(model_handle.clone(), move |model, engines, dir| {
+        sim_engine::preview::mesh_preview(model, id as SolidId, size, engines, dir)
+    })
+    .await;
+    match made {
+        Ok((mesh, wire)) => {
+            let session = SimSession {
+                revision: new_revision(),
+                solid: id,
+                stage: SimStage::Mesh,
+                mesh_size_mm: size,
+                mesh: Some(mesh),
+                wire: Some(wire),
+                study: None,
+                report: None,
+            };
+            let body = serde_json::to_value(&session).unwrap_or_default();
+            state
+                .sim_sessions
+                .insert(sim_document_key(&key), std::sync::Arc::new(session));
+            sim_json(StatusCode::OK, body)
+        }
+        Err(f) => sim_failure(f),
+    }
+}
+
+/// Body of `POST .../sim/static/setup`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SimSetupRequest {
+    /// The mesh stage's revision: the set-up is for the mesh the person saw.
+    pub revision: String,
+    pub study: sim_engine::study::Study,
+}
+
+/// `POST /api/agent/parts/{id}/sim/static/setup` — STAGE 2: the supports,
+/// loads, material and goal, checked by the same `check_setup` the run uses
+/// (so a set-up accepted here is never refused by the run for a reason not
+/// shown) and drawn on the part. Must name the current MESH stage's revision
+/// on this solid (409 `sim_stale_revision` otherwise); the mesh size is the
+/// one approved there. 200: the session at stage `setup`, with `checks`.
+/// 422 `sim_part_can_move` (free motions in words) / `sim_refused`.
+pub async fn part_sim_setup(
+    State(state): State<AppState>,
+    crate::part_mgr::ActiveModelKeyed(model_handle, key): crate::part_mgr::ActiveModelKeyed,
+    Path(id): Path<u32>,
+    Json(req): Json<SimSetupRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let doc = sim_document_key(&key);
+    let current = state.sim_sessions.get(&doc).map(|s| s.value().clone());
+    let Some(meshed) = current
+        .as_ref()
+        .filter(|s| s.revision == req.revision && s.solid == id && s.stage == SimStage::Mesh)
+        .cloned()
+    else {
+        return sim_stale_revision(current.as_deref(), &req.revision, "mesh");
+    };
+    if let Some(refused) = sim_gate(&model_handle, id).await {
+        return refused;
+    }
+    let mut study = req.study;
+    study.mesh.size_mm = meshed.mesh_size_mm;
+    let checked = {
+        let model = model_handle.read().await;
+        sim_engine::run::check_setup(&model, id as SolidId, &study)
+    };
+    if let Err(e) = checked {
+        return sim_failure(SimFailure::Study(e));
+    }
+    let session = SimSession {
+        revision: new_revision(),
+        stage: SimStage::Setup,
+        study: Some(study),
+        report: None,
+        ..(*meshed).clone()
+    };
+    let mut body = serde_json::to_value(&session).unwrap_or_default();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "checks".to_string(),
+            serde_json::json!([
+                { "name": "faces", "passed": true, "detail": "every named face is on this part" },
+                { "name": "material", "passed": true, "detail": "the material is physical" },
+                { "name": "held", "passed": true, "detail": "the supports hold all six motions" },
+            ]),
+        );
+    }
+    state.sim_sessions.insert(doc, std::sync::Arc::new(session));
+    sim_json(StatusCode::OK, body)
+}
+
+/// Body of `POST .../sim/static`: the approved set-up (by revision), or a
+/// study entered whole by the person in the app's own panel.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SimRunRequest {
+    Approved { revision: String },
+    Direct(sim_engine::study::Study),
+}
+
+/// `POST /api/agent/parts/{id}/sim/static` — STAGE 3: run the study and
+/// answer with a verdict only the evidence supports (the kernel's
+/// `StaticReport`, no DTO layer). With `{revision}`: runs EXACTLY the set-up
+/// stored at that revision (409 `sim_stale_revision` unless it is the
+/// document's current SETUP stage on this solid), and adds the check "solved
+/// on the mesh you approved". With a whole `Study` (the person's own panel):
+/// runs it as given. Either way the result becomes the document's session.
+///
+/// 404 — solid not found. 422 — `sim_stale_solid`, `sim_unsound_solid`,
+/// `sim_part_can_move` (free motions in words), `sim_refused`. 503 —
+/// `sim_engine_missing`.
+pub async fn part_sim_static(
+    State(state): State<AppState>,
+    crate::part_mgr::ActiveModelKeyed(model_handle, key): crate::part_mgr::ActiveModelKeyed,
+    Path(id): Path<u32>,
+    Json(req): Json<SimRunRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let doc = sim_document_key(&key);
+    let (study, approved) = match req {
+        SimRunRequest::Approved { revision } => {
+            let current = state.sim_sessions.get(&doc).map(|s| s.value().clone());
+            match current
+                .as_ref()
+                .filter(|s| s.revision == revision && s.solid == id && s.stage == SimStage::Setup)
+                .and_then(|s| s.study.clone().map(|st| (st, s.clone())))
+            {
+                Some((study, session)) => (study, Some(session)),
+                None => return sim_stale_revision(current.as_deref(), &revision, "setup"),
+            }
+        }
+        SimRunRequest::Direct(study) => (study, None),
+    };
+    if let Some(refused) = sim_gate(&model_handle, id).await {
+        return refused;
+    }
+    // The set-up checks need no engine: a part that can move is refused as
+    // such even on a machine without the mesher or solver.
+    let checked = {
+        let model = model_handle.read().await;
+        sim_engine::run::check_setup(&model, id as SolidId, &study)
+    };
+    if let Err(e) = checked {
+        return sim_failure(SimFailure::Study(e));
+    }
+    let asked = study.clone();
+    let ran = sim_blocking(model_handle.clone(), move |model, engines, dir| {
+        sim_engine::run::run_static(model, id as SolidId, &study, engines, dir)
+    })
+    .await;
+    match ran {
+        Ok(mut report) => {
+            if let Some(mesh) = approved.as_ref().and_then(|s| s.mesh.as_ref()) {
+                let same = mesh.coarse.nodes == report.coarse.mesh.nodes
+                    && mesh.fine.nodes == report.fine.mesh.nodes
+                    && mesh.fine.elements == report.fine.mesh.elements;
+                report.checks.push(sim_engine::run::Check {
+                    name: "solved on the mesh you approved".to_string(),
+                    passed: same,
+                    detail: format!(
+                        "approved {} + {} nodes, solved {} + {} nodes",
+                        mesh.coarse.nodes,
+                        mesh.fine.nodes,
+                        report.coarse.mesh.nodes,
+                        report.fine.mesh.nodes
+                    ),
+                });
+            }
+            let body = serde_json::to_value(&report).unwrap_or_else(
+                |e| serde_json::json!({ "error": "serialization_failed", "reason": e.to_string() }),
+            );
+            let session = match approved {
+                Some(s) => SimSession {
+                    revision: new_revision(),
+                    stage: SimStage::Result,
+                    report: Some(report),
+                    ..(*s).clone()
+                },
+                None => SimSession {
+                    revision: new_revision(),
+                    solid: id,
+                    stage: SimStage::Result,
+                    mesh_size_mm: asked.mesh.size_mm,
+                    mesh: None,
+                    wire: None,
+                    study: Some(asked),
+                    report: Some(report),
+                },
+            };
+            state.sim_sessions.insert(doc, std::sync::Arc::new(session));
+            sim_json(StatusCode::OK, body)
+        }
+        Err(f) => sim_failure(f),
+    }
+}
+
+/// `GET /api/agent/sim/session` — the document's current study: its stage,
+/// its part, and what that stage shows (the mesh, the set-up, the result),
+/// whoever is driving it. The Simulate tab follows it; an agent reads it to
+/// pick up a study where it was left. `stale: true` when the part has
+/// changed since: the session then describes geometry that no longer exists.
+/// 404 `no_study`.
+pub async fn sim_session(
+    State(state): State<AppState>,
+    crate::part_mgr::ActiveModelKeyed(model_handle, key): crate::part_mgr::ActiveModelKeyed,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(session) = state
+        .sim_sessions
+        .get(&sim_document_key(&key))
+        .map(|s| s.value().clone())
+    else {
+        return sim_json(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "error": "no_study",
-                "reason": format!("no static study has been run on solid {id}"),
-            })),
+                "reason": "no study has been started in this document",
+            }),
         );
     };
     let stale = {
         let model = model_handle.read().await;
         model
-            .soundness_reading(id as SolidId)
+            .soundness_reading(session.solid as SolidId)
             .map_or(true, |r| r.is_stale())
     };
-    let mut body = serde_json::to_value(&*record).unwrap_or_else(
-        |e| serde_json::json!({ "error": "serialization_failed", "reason": e.to_string() }),
-    );
+    let mut body = serde_json::to_value(&*session).unwrap_or_default();
     if let Some(obj) = body.as_object_mut() {
         obj.insert("stale".to_string(), serde_json::Value::Bool(stale));
     }
-    (StatusCode::OK, Json(body))
+    sim_json(StatusCode::OK, body)
 }
 
-/// Why `part_sim_static` did not produce a report.
+/// Why a study stage did not produce its result.
 enum SimFailure {
     Engine(sim_engine::engines::EngineError),
     Study(sim_engine::run::StudyError),
+    Crashed(String),
 }
 
 #[cfg(test)]

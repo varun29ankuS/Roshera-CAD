@@ -235,4 +235,22 @@ fn a_cantilever_deflects_as_the_beam_formula_says() {
         (volume - 100.0 * 10.0 * 10.0).abs() < 1.0,
         "the skin encloses {volume} mm^3, the beam is 10000"
     );
+    // The mesh stage shows the mesh the run solves: same size rule, same
+    // mesher call, so the same counts on both meshes.
+    let (preview, wire) = sim_engine::preview::mesh_preview(
+        &m,
+        s,
+        study.mesh.size_mm,
+        &engines,
+        &std::env::temp_dir().join("roshera-sim-cantilever-preview"),
+    )
+    .expect("the mesh stage runs");
+    assert_eq!(preview.coarse.nodes, report.coarse.mesh.nodes);
+    assert_eq!(preview.fine.nodes, report.fine.mesh.nodes);
+    assert_eq!(preview.fine.elements, report.fine.mesh.elements);
+    assert!(!wire.edges.is_empty());
+    assert!(wire
+        .edges
+        .iter()
+        .all(|e| (e[0] as usize) < wire.positions.len() && (e[1] as usize) < wire.positions.len()));
 }

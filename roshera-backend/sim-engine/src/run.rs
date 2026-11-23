@@ -24,7 +24,7 @@ use crate::rigid::{free_motions, FreeMotion, HeldPoint, Holds};
 use crate::study::{Study, SupportKind, FINE_RATIO};
 
 /// Time each engine run may take.
-const ENGINE_LIMIT: Duration = Duration::from_secs(600);
+pub(crate) const ENGINE_LIMIT: Duration = Duration::from_secs(600);
 /// Reactions must balance the applied load to this share.
 const BALANCE_TOL: f64 = 0.01;
 /// The two meshes' largest displacements must agree to this share.
@@ -98,21 +98,21 @@ pub enum StudyError {
     CanMove(Vec<FreeMotion>),
     #[error("{0:?} supports are not available in this solver yet; use fixed or bolt clamp")]
     UnsupportedSupport(SupportKind),
+    #[error("the mesh size must be above 0 mm, not {0}")]
+    MeshSize(f64),
     #[error(transparent)]
     Mesh(#[from] MeshError),
     #[error(transparent)]
     Solve(#[from] SolveError),
 }
 
-/// Run `study` on `solid`, its engine files in `workdir`.
-pub fn run_static(
-    model: &BRepModel,
-    solid: SolidId,
-    study: &Study,
-    engines: &Engines,
-    workdir: &Path,
-) -> Result<StaticReport, StudyError> {
-    // ── The set-up, before anything runs ──────────────────────────────────
+/// The set-up checks a study must pass before anything is meshed: a
+/// support and a load, a physical material, every named face on this part,
+/// nothing left free to move, and only supports this solver can model. The
+/// study run and the set-up stage both call this, so a set-up accepted on
+/// screen can never be refused by the run for a reason the screen did not
+/// show.
+pub fn check_setup(model: &BRepModel, solid: SolidId, study: &Study) -> Result<(), StudyError> {
     if study.supports.is_empty() {
         return Err(StudyError::NoSupport);
     }
@@ -198,21 +198,60 @@ pub fn run_static(
     {
         return Err(StudyError::UnsupportedSupport(s.kind));
     }
+    Ok(())
+}
+
+/// The coarse mesh's largest element: the size asked, or a twentieth of the
+/// part's largest extent. The mesh stage and the run both use this, so the
+/// mesh a person approves is the mesh that is solved.
+pub fn coarse_mesh_size(
+    model: &BRepModel,
+    solid: SolidId,
+    asked: Option<f64>,
+) -> Result<f64, StudyError> {
+    if let Some(size) = asked {
+        if !(size > 0.0) {
+            return Err(StudyError::MeshSize(size));
+        }
+        return Ok(size);
+    }
+    let surface = tessellate_solid(
+        model
+            .solids
+            .get(solid)
+            .ok_or(StudyError::UnknownSolid(solid))?,
+        model,
+        &TessellationParams::default(),
+    );
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for v in &surface.vertices {
+        let p = [v.position.x, v.position.y, v.position.z];
+        for i in 0..3 {
+            lo[i] = lo[i].min(p[i]);
+            hi[i] = hi[i].max(p[i]);
+        }
+    }
+    let extent = (0..3).map(|i| hi[i] - lo[i]).fold(0.0_f64, f64::max);
+    if !(extent > 0.0) {
+        return Err(StudyError::UnknownSolid(solid));
+    }
+    Ok(extent / 20.0)
+}
+
+/// Run `study` on `solid`, its engine files in `workdir`.
+pub fn run_static(
+    model: &BRepModel,
+    solid: SolidId,
+    study: &Study,
+    engines: &Engines,
+    workdir: &Path,
+) -> Result<StaticReport, StudyError> {
+    check_setup(model, solid, study)?;
+    let m = &study.material;
 
     // ── Mesh and solve, coarse then fine ──────────────────────────────────
-    let extent = {
-        let mut lo = [f64::INFINITY; 3];
-        let mut hi = [f64::NEG_INFINITY; 3];
-        for v in &surface.vertices {
-            let p = [v.position.x, v.position.y, v.position.z];
-            for i in 0..3 {
-                lo[i] = lo[i].min(p[i]);
-                hi[i] = hi[i].max(p[i]);
-            }
-        }
-        (0..3).map(|i| hi[i] - lo[i]).fold(0.0_f64, f64::max)
-    };
-    let coarse_size = study.mesh.size_mm.unwrap_or(extent / 20.0);
+    let coarse_size = coarse_mesh_size(model, solid, study.mesh.size_mm)?;
     let held_faces: BTreeSet<FaceId> = study
         .supports
         .iter()
@@ -367,8 +406,11 @@ pub fn run_static(
             },
         }
     };
-    let face_pids = named
+    let face_pids = study
+        .supports
         .iter()
+        .flat_map(|s| s.faces.iter())
+        .chain(study.loads.iter().flat_map(|l| l.faces.iter()))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|&f| {

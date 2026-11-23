@@ -207,7 +207,7 @@ pub(crate) async fn make_test_state_with_database(
         consumed_uuids: Arc::new(DashMap::new()),
         solid_colors: Arc::new(DashMap::new()),
         solid_profiles: Arc::new(DashMap::new()),
-        sim_studies: Arc::new(DashMap::new()),
+        sim_sessions: Arc::new(DashMap::new()),
         lens: crate::lens_routes::LensStore::default(),
         ai_processor,
         session_aware_ai,
@@ -14602,77 +14602,180 @@ async fn sim_static_names_the_free_motions_of_a_part_on_a_roller() {
     assert!(free.iter().any(|m| m.starts_with("can turn")), "{body}");
 }
 
-/// The latest study on a part is served to the app whoever ran it, so the
-/// Simulate tab can show an agent's study: none yet -> 404 `no_study`; a
-/// recorded one -> its run id, set-up and report, and `stale: false` while
-/// the part is unchanged since it was verified.
+/// A study is walked through stage by stage, each building on the document's
+/// current one: no study yet -> 404; a set-up naming any revision but the
+/// current MESH stage's is refused (409) -- it would be for a mesh the person
+/// did not see; a set-up leaving the part free is refused with its motions
+/// and leaves the session as it was; a good set-up is accepted on the mesh
+/// size approved; and a run naming a stale revision is refused, so a run is
+/// always of the set-up last shown. (No engines are reached: the mesh stage is
+/// seeded, and every refusal comes before the solver.)
 #[tokio::test]
-async fn sim_static_latest_serves_the_recorded_study() {
+async fn a_study_is_staged_and_each_stage_builds_on_the_current_one() {
     let state = make_test_state().await;
     let (_uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
-    let get = |sid: SolidId| {
+    let send = |method: Method, uri: String, body: Value| {
         Request::builder()
-            .method(Method::GET)
-            .uri(format!("/api/agent/parts/{sid}/sim/static/latest"))
-            .body(Body::empty())
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(if body.is_null() {
+                Body::empty()
+            } else {
+                Body::from(body.to_string())
+            })
             .expect("request must build")
     };
-    let (status, body) = dispatch(&state, get(solid_id)).await;
+    let session = || {
+        send(
+            Method::GET,
+            "/api/agent/sim/session".to_string(),
+            Value::Null,
+        )
+    };
+
+    let (status, body) = dispatch(&state, session()).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"].as_str(), Some("no_study"), "{body}");
 
-    let verify = Request::builder()
-        .method(Method::GET)
-        .uri(format!("/api/agent/parts/{solid_id}/perception"))
-        .body(Body::empty())
-        .expect("request must build");
-    let (vs, vb) = dispatch(&state, verify).await;
+    let (vs, vb) = dispatch(
+        &state,
+        send(
+            Method::GET,
+            format!("/api/agent/parts/{solid_id}/perception"),
+            Value::Null,
+        ),
+    )
+    .await;
     assert_eq!(vs, StatusCode::OK, "verify: {vb}");
+    let (bottom, top) = {
+        let model = state.model.read().await;
+        (
+            find_plane_face_near(&model, solid_id, Vector3::new(0.0, 0.0, -1.0))
+                .expect("bottom face"),
+            find_plane_face_near(&model, solid_id, Vector3::new(0.0, 0.0, 1.0)).expect("top face"),
+        )
+    };
 
-    let run = json!({
-        "mesh": { "size_mm": 1.0, "nodes": 10, "elements": 1, "boundary_deviation_mm": 0.0, "mesher_seconds": 0.1 },
-        "max_displacement_mm": 0.1, "peak_von_mises_mpa": 5.0, "peak_at": [0.0, 0.0, 0.0],
-        "reaction_total_n": [0.0, 0.0, 1.0], "load_on_held_n": [0.0, 0.0, 0.0], "solver_seconds": 0.1
-    });
-    let engine = json!({ "name": "Gmsh", "program": "gmsh", "version": "4", "interim": true });
-    let report: sim_engine::run::StaticReport = serde_json::from_value(json!({
-        "verdict": { "verdict": "undecided", "reason": "no yield strength with a source" },
-        "checks": [], "coarse": run, "fine": run,
-        "engines": { "mesher": engine, "solver": engine },
-        "face_pids": [], "assumptions": [], "field": {
-            "positions": [], "displacement": [], "von_mises": [], "triangles": [], "faces": [],
-            "min_von_mises": 0.0, "max_von_mises": 0.0
-        }
-    }))
-    .expect("a report must deserialize");
-    let study: sim_engine::study::Study = serde_json::from_value(json!({
-        "supports": [{ "kind": "fixed", "faces": [1] }],
-        "loads": [{ "faces": [2], "force_n": [0.0, 0.0, -1.0] }],
-        "material": { "name": "steel", "youngs_modulus_mpa": 210000.0, "poisson_ratio": 0.3 },
-        "goal": { "min_safety_factor": 2.0 }
-    }))
-    .expect("a study must deserialize");
-    state.sim_studies.insert(
-        solid_id,
-        std::sync::Arc::new(crate::handlers::agent::SimRecord {
-            run_id: "run-1".to_string(),
-            study,
-            report,
+    // Seed the MESH stage as the mesh route leaves it (the route itself needs
+    // the engines), under this request's document.
+    let doc = {
+        let active = state.active_document.read().await.clone();
+        serde_json::to_string(&crate::part_mgr::ModelKey::Legacy {
+            document_id: active,
+        })
+        .expect("key serializes")
+    };
+    let stats = sim_engine::mesh::MeshStats {
+        size_mm: 2.0,
+        nodes: 100,
+        elements: 40,
+        boundary_deviation_mm: 0.0,
+        mesher_seconds: 0.1,
+    };
+    state.sim_sessions.insert(
+        doc,
+        std::sync::Arc::new(crate::handlers::agent::SimSession {
+            revision: "mesh-1".to_string(),
+            solid: solid_id,
+            stage: crate::handlers::agent::SimStage::Mesh,
+            mesh_size_mm: Some(2.0),
+            mesh: Some(sim_engine::preview::MeshPreview {
+                coarse: stats.clone(),
+                fine: stats,
+            }),
+            wire: Some(sim_engine::preview::MeshWire::default()),
+            study: None,
+            report: None,
         }),
     );
-
-    let (status, body) = dispatch(&state, get(solid_id)).await;
+    let (status, body) = dispatch(&state, session()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["run_id"].as_str(), Some("run-1"), "{body}");
-    assert_eq!(body["stale"].as_bool(), Some(false), "{body}");
+    assert_eq!(body["stage"].as_str(), Some("mesh"), "{body}");
+
+    let study = |kind: &str| {
+        json!({
+            "supports": [{ "kind": kind, "faces": [bottom] }],
+            "loads": [{ "faces": [top], "force_n": [0.0, 0.0, -100.0] }],
+            "material": { "name": "steel", "youngs_modulus_mpa": 210000.0, "poisson_ratio": 0.3 },
+            "goal": { "min_safety_factor": 2.0 }
+        })
+    };
+    let setup_uri = format!("/api/agent/parts/{solid_id}/sim/static/setup");
+
+    // A set-up for a mesh the person did not see.
+    let (status, body) = dispatch(
+        &state,
+        send(
+            Method::POST,
+            setup_uri.clone(),
+            json!({ "revision": "some-other", "study": study("fixed") }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"].as_str(), Some("sim_stale_revision"), "{body}");
+    assert_eq!(body["current_revision"].as_str(), Some("mesh-1"), "{body}");
+
+    // A set-up that leaves the part free: refused with its motions, session kept.
+    let (status, body) = dispatch(
+        &state,
+        send(
+            Method::POST,
+            setup_uri.clone(),
+            json!({ "revision": "mesh-1", "study": study("slider") }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"].as_str(), Some("sim_part_can_move"), "{body}");
+    let (_, body) = dispatch(&state, session()).await;
     assert_eq!(
-        body["study"]["supports"][0]["kind"].as_str(),
-        Some("fixed"),
+        body["revision"].as_str(),
+        Some("mesh-1"),
+        "a refused set-up changes nothing: {body}"
+    );
+
+    // A good set-up: accepted, on the mesh size approved at the mesh stage.
+    let (status, body) = dispatch(
+        &state,
+        send(
+            Method::POST,
+            setup_uri,
+            json!({ "revision": "mesh-1", "study": study("fixed") }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stage"].as_str(), Some("setup"), "{body}");
+    let setup_revision = body["revision"]
+        .as_str()
+        .expect("a new revision")
+        .to_string();
+    assert_ne!(setup_revision, "mesh-1");
+    assert_eq!(
+        body["study"]["mesh"]["size_mm"].as_f64(),
+        Some(2.0),
         "{body}"
     );
     assert_eq!(
-        body["report"]["verdict"]["verdict"].as_str(),
-        Some("undecided"),
+        body["mesh"]["fine"]["nodes"].as_u64(),
+        Some(100),
+        "the approved mesh is kept: {body}"
+    );
+
+    // A run naming the mesh revision, not the set-up just shown: refused.
+    let run_uri = format!("/api/agent/parts/{solid_id}/sim/static");
+    let (status, body) = dispatch(
+        &state,
+        send(Method::POST, run_uri, json!({ "revision": "mesh-1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["current_revision"].as_str(),
+        Some(setup_revision.as_str()),
         "{body}"
     );
+    assert_eq!(body["current_stage"].as_str(), Some("setup"), "{body}");
 }

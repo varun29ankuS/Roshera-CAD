@@ -142,8 +142,10 @@ const table = buildTable();
   // (kernel, "drawing"; POST /api/drawings/{id}/layout).
   // 135 -> 136 (2026-11-23): sim_static (kernel, "analysis") -- a linear
   // static study: set-up checks, mesh, solve, verdict.
-  if (table.size === 136) pass("table holds 136 tools (131 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 136`);
+  // 136 -> 139 (2026-11-23): sim_mesh, sim_setup, sim_session -- the study
+  // walked through with the person, stage by stage.
+  if (table.size === 139) pass("table holds 139 tools (134 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 139`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -180,8 +182,9 @@ const table = buildTable();
   // 125 -> 126 (2026-11-20): drawing_look.
   // 126 -> 132 (2026-11-20): the six layout verbs (agent hands).
   // 132 -> 133 (2026-11-23): sim_static.
-  if (full.length === 133) pass("full surface exposes exactly 133 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 133`);
+  // 133 -> 136 (2026-11-23): sim_mesh, sim_setup, sim_session.
+  if (full.length === 136) pass("full surface exposes exactly 136 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 136`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");

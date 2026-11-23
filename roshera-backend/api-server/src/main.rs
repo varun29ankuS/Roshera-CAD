@@ -204,10 +204,10 @@ pub struct AppState {
     /// timeline replay (the construction sidecar is set outside the recorded op,
     /// so a replay drops it) and `GET /parts/{id}/profile` can always recover it.
     pub solid_profiles: Arc<DashMap<u32, Vec<[f64; 2]>>>,
-    /// Each solid's latest static study -- the set-up and the kernel's report
-    /// -- whoever ran it (the app, an agent), so the Simulate tab shows an
-    /// agent's study on the part (`GET /api/agent/parts/{id}/sim/static/latest`).
-    pub sim_studies: Arc<DashMap<u32, Arc<handlers::agent::SimRecord>>>,
+    /// Each document's current study (mesh -> set-up -> result), keyed by the
+    /// document a request resolves to, whoever drives it (an agent, the app):
+    /// the Simulate tab follows it (`GET /api/agent/sim/session`).
+    pub sim_sessions: Arc<DashMap<String, Arc<handlers::agent::SimSession>>>,
     /// Kernel Lens: what the importer decided, by face persistent id
     /// (served by `lens_routes`).
     pub lens: lens_routes::LensStore,
@@ -10547,7 +10547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         consumed_uuids: Arc::new(DashMap::new()),
         solid_colors: Arc::new(DashMap::new()),
         solid_profiles: Arc::new(DashMap::new()),
-        sim_studies: Arc::new(DashMap::new()),
+        sim_sessions: Arc::new(DashMap::new()),
         lens: lens_routes::LensStore::default(),
         ai_processor,
         session_aware_ai,
@@ -11737,9 +11737,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(handlers::agent::part_sim_static),
         )
         .route(
-            "/api/agent/parts/{id}/sim/static/latest",
-            get(handlers::agent::part_sim_static_latest),
+            "/api/agent/parts/{id}/sim/static/mesh",
+            post(handlers::agent::part_sim_mesh),
         )
+        .route(
+            "/api/agent/parts/{id}/sim/static/setup",
+            post(handlers::agent::part_sim_setup),
+        )
+        .route("/api/agent/sim/session", get(handlers::agent::sim_session))
         .route(
             "/api/agent/parts/{id}/perception",
             get(handlers::agent::part_perception),

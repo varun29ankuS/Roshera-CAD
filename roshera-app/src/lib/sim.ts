@@ -246,21 +246,54 @@ export function setupOf(study: Study): Setup {
   }
 }
 
-/** A part's latest study, whoever ran it. `stale`: the part changed since. */
-export interface SimRecord {
-  run_id: string
-  study: Study
-  report: StaticReport
+/** The mesh a study will be solved on (the mesh stage). */
+export interface MeshPreview {
+  coarse: MeshStats
+  /** The proving mesh: the stress is read off this one. */
+  fine: MeshStats
+}
+
+/** The proving mesh's surface as element edges, for a wireframe. */
+export interface MeshWire {
+  positions: Vec3[]
+  edges: [number, number][]
+}
+
+export type SimStage = 'mesh' | 'setup' | 'result'
+
+/** A document's current study, whoever drives it (`GET /api/agent/sim/session`). */
+export interface SimSession {
+  revision: string
+  solid: number
+  stage: SimStage
+  mesh_size_mm: number | null
+  mesh: MeshPreview | null
+  wire: MeshWire | null
+  study: Study | null
+  report: StaticReport | null
+  /** The part changed since: the session describes a shape that is gone. */
   stale: boolean
 }
 
-/** The latest study on a part, or null when none has been run. */
-export async function fetchLatest(solidId: number): Promise<SimRecord | null> {
-  const r = await fetch(`${API_HOST}/api/agent/parts/${solidId}/sim/static/latest`)
+/** The document's current study, or null when none has been started. */
+export async function fetchSession(): Promise<SimSession | null> {
+  const r = await fetch(`${API_HOST}/api/agent/sim/session`)
   if (!r.ok) return null
-  return (await r.json()) as SimRecord
+  return (await r.json()) as SimSession
 }
 
+/** Vertex buffer for the mesh wireframe: one segment per element edge. */
+export function wireSegments(wire: MeshWire): Float32Array {
+  const out = new Float32Array(wire.edges.length * 6)
+  wire.edges.forEach(([a, b], i) => {
+    const pa = wire.positions[a]
+    const pb = wire.positions[b]
+    if (!pa || !pb) return
+    out.set(pa, i * 6)
+    out.set(pb, i * 6 + 3)
+  })
+  return out
+}
 // ─── Running it ─────────────────────────────────────────────────────────
 
 export type SimRun =

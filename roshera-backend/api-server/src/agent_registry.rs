@@ -1821,22 +1821,63 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
-            "sim_static",
+            "sim_mesh",
             Analysis,
             Experimental,
             Curated,
-            "Strength and stiffness: will the part hold its loads? A linear static study (FEA) run end to end by the kernel: the set-up is checked first (refused with the free motions in words when the supports leave the part free to slide or turn), the part's exact geometry is meshed twice (quadratic tets; mesher Gmsh, interim) and solved (CalculiX), and the verdict is holds / fails against min_safety_factor, or undecided with its reason (supports do not carry the load; peak stress did not converge; no yield strength with a source). Refused if the part is stale or unsound: call verify_part first. Faces are live face ids. Units mm, N, MPa.",
+            "Strength study, stage 1 of 3, MESH: make the study's two meshes (coarse, and the fine one the stress is read from; mesher Gmsh, interim) without solving, and show the fine one on the part in the person's Simulate tab. Starts a new study in this document; returns the counts, the size, the distance to the true surface and the revision sim_setup must name. Open the Simulate tab first (guide_attention, mode simulate) and ask the person whether the mesh is right before stage 2. Refused if the part is stale or unsound.",
             json!({
                 "type": "object",
                 "properties": {
                     "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
-                    "supports": {"type": "array", "description": "how the part is held: each {kind: fixed | bolt_clamp | pin | slider, faces: [face ids]}; pin and slider are checked for motion but not yet solved"},
-                    "loads": {"type": "array", "description": "forces on faces: each {faces: [face ids], force_n: [x,y,z] total N, spread: even | bearing}"},
-                    "material": {"type": "object", "description": "{name, youngs_modulus_mpa, poisson_ratio, yield_strength_mpa?, source?}; without a yield strength and its source no safety factor is given"},
-                    "min_safety_factor": {"type": "number", "description": "the goal: yield / peak stress must reach this"},
                     "mesh_size_mm": {"type": "number", "description": "coarse mesh's largest element; default a twentieth of the part; the fine mesh uses 0.6 of it"}
                 },
-                "required": ["part_id", "supports", "loads", "material", "min_safety_factor"]
+                "required": ["part_id"]
+            }),
+        ),
+        t(
+            "sim_setup",
+            Analysis,
+            Experimental,
+            Curated,
+            "Strength study, stage 2 of 3, SET-UP: supports, loads, material and the safety factor, checked exactly as the run will check them (refused with the free motions in words when the part can still move) and drawn on the part (supports blue, loads as orange arrows). Must name the mesh stage's revision; returns the revision sim_static must name. Ask the person whether the set-up is right before stage 3. Units mm, N, MPa; never invent a material value or source.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
+                    "revision": {"type": "string", "description": "the revision sim_mesh returned"},
+                    "supports": {"type": "array", "description": "how the part is held: each {kind: fixed | bolt_clamp | pin | slider, faces: [face ids]}"},
+                    "loads": {"type": "array", "description": "forces on faces: each {faces: [face ids], force_n: [x,y,z] total N, spread: even | bearing}"},
+                    "material": {"type": "object", "description": "{name, youngs_modulus_mpa, poisson_ratio, yield_strength_mpa?, source?}"},
+                    "min_safety_factor": {"type": "number", "description": "the goal: yield / peak stress must reach this"}
+                },
+                "required": ["part_id", "revision", "supports", "loads", "material", "min_safety_factor"]
+            }),
+        ),
+        t(
+            "sim_static",
+            Analysis,
+            Experimental,
+            Curated,
+            "Strength study, stage 3 of 3, RUN: solve exactly the set-up the person approved (named by sim_setup's revision) on the mesh they approved, twice (coarse + fine, CalculiX), and answer with a verdict only the evidence supports: holds / fails against the safety factor, or undecided with the reason (supports do not carry the load; peak stress did not converge; no yield with a source). Adds the check 'solved on the mesh you approved'. Refused (409) when the study has moved on since that revision.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
+                    "revision": {"type": "string", "description": "the revision sim_setup returned"}
+                },
+                "required": ["part_id", "revision"]
+            }),
+        ),
+        t(
+            "sim_session",
+            Analysis,
+            Experimental,
+            Curated,
+            "Read this document's current strength study: stage (mesh / setup / result), part, revision, the mesh, the set-up and the result, whoever drove it. Pick a study up where it was left instead of asking the person again for what is recorded; stale: the part changed since.",
+            json!({
+                "type": "object",
+                "properties": {}
             }),
         ),
         t(
@@ -2455,7 +2496,9 @@ mod tests {
         // (POST /api/drawings/{id}/layout).
         // 120 -> 121 (2026-11-23): sim_static -- a linear static study
         // (POST /api/agent/parts/{id}/sim/static).
-        assert_eq!(tools.len(), 121, "expected 121 tools, got {}", tools.len());
+        // 121 -> 124 (2026-11-23): sim_mesh, sim_setup, sim_session -- the study
+        // walked through with the person, stage by stage.
+        assert_eq!(tools.len(), 124, "expected 124 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2472,7 +2515,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 133, "121 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 136, "124 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");
