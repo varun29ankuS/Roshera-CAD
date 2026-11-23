@@ -5545,6 +5545,7 @@ dependencies = [
 name = "sim-engine"
 version = "0.1.0"
 dependencies = [
+ "export-engine",
  "geometry-engine",
  "serde",
  "serde_json",

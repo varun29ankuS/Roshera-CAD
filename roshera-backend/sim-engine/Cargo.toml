@@ -6,6 +6,7 @@ description = "Roshera simulation: study set-up checks, meshing and solving thro
 
 [dependencies]
 geometry-engine = { path = "../geometry-engine" }
+export-engine = { path = "../export-engine" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

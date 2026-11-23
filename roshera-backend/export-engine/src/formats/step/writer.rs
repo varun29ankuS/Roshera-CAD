@@ -1814,8 +1814,15 @@ pub async fn export_brep_to_step(model: &BRepModel, path: &Path) -> Result<(), E
     let file = std::fs::File::create(path).map_err(|_| ExportError::FileWriteError {
         path: path.to_string_lossy().to_string(),
     })?;
+    write_brep_step(model, file)
+}
 
-    let mut writer = StepWriter::new(file);
+/// The STEP exchange structure of `model` written to `out`: what
+/// [`export_brep_to_step`] writes to its file, for a caller that is not
+/// async or does not want a file (the simulation crate hands it to a
+/// mesher).
+pub fn write_brep_step<W: Write>(model: &BRepModel, out: W) -> Result<(), ExportError> {
+    let mut writer = StepWriter::new(out);
 
     // Write header
     let header = StepHeader::default();
