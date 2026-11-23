@@ -55,13 +55,6 @@ import { refreshSceneFromServer } from '@/lib/ws-bridge'
 import { syncNotebook } from '@/lib/blackboard-api'
 import { establishAcpSession, getAcpSessionId, resetAcpClient } from '@/lib/acp-blackboard'
 import { enterDocument } from '@/lib/document-scope'
-import {
-  markStartDocumentUsed,
-  planStartDocument,
-  readStartDocument,
-  writeStartDocument,
-} from '@/lib/start-document'
-import { useSceneStore } from '@/stores/scene-store'
 
 export interface DocumentSwitchResult {
   success: boolean
@@ -93,20 +86,6 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : 'backend unreachable'
 }
 
-/** This browser's storage, or a store that remembers nothing when it is
- *  blocked (private window, policy): every load then starts a new blank. */
-function startStorage(): Pick<Storage, 'getItem' | 'setItem'> {
-  try {
-    return window.localStorage
-  } catch {
-    return { getItem: () => null, setItem: () => undefined }
-  }
-}
-
-/** The start-in-a-fresh-document step runs at most once per page load
- *  (lib/start-document.ts decides which document that is). */
-let startedFresh = false
-
 export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
   documents: [],
   switchingId: null,
@@ -116,33 +95,12 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
     try {
       const docs = await listDocuments()
       set({ documents: docs })
-      // A load starts in a fresh document (Varun 2026-11-18): the blank this
-      // browser made last time if nothing was built in it, else a new one.
-      // Never by reopening the last document -- opening one replays and
-      // re-certifies its whole history. Once per load, so a later refresh
-      // never yanks the user out of a document they chose.
-      if (!startedFresh) {
-        startedFresh = true
-        const storage = startStorage()
-        const plan = planStartDocument(docs, readStartDocument(storage))
-        if (plan.kind === 'open') {
-          void get().switchTo(plan.id)
-          return
-        }
-        if (plan.kind === 'create') {
-          void createDocument('Untitled')
-            .then((doc) => {
-              writeStartDocument(storage, { id: doc.id, used: false })
-              // In the list before the switch marks it active: otherwise the
-              // list holds no active document until it is re-fetched, and
-              // anything that asks it which document is open hears "none".
-              set((s) => ({ documents: s.documents.some((d) => d.id === doc.id) ? s.documents : [...s.documents, doc] }))
-              return get().switchTo(doc.id)
-            })
-            .catch(() => undefined)
-          return
-        }
-      }
+      // A load continues in the document the server has open -- the one you
+      // were in, kept across restarts -- as CAD tools do (Varun 2026-11-23:
+      // "this should behave like how industry standards work"). It replaced
+      // "a load starts in a fresh blank" (2026-11-18), which moved the shared
+      // live model -- and every connected agent -- to a new blank on each
+      // page load. A new document is made only when asked for.
       const active = docs.find((d) => d.active)
       // The history caches belong to whatever the server has open -- also
       // when something other than this tab strip (an agent over MCP) moved it.
@@ -240,11 +198,3 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
     }
   },
 }))
-
-// Building anything in the blank this browser started in makes it a real
-// document: the next load starts a new blank instead of reopening it.
-useSceneStore.subscribe((scene) => {
-  if (scene.objectOrder.length === 0) return
-  const active = useDocumentStore.getState().documents.find((d) => d.active)
-  markStartDocumentUsed(startStorage(), active?.id ?? null)
-})
