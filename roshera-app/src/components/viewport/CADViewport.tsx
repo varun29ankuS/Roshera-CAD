@@ -24,6 +24,7 @@ import { PartLabels } from './PartLabels'
 import { PartDimensions } from './PartDimensions'
 import { GdtAnnotations } from './GdtAnnotations'
 import { DfmFaceTints } from './DfmFaceTints'
+import { SimView } from './SimView'
 import { DfmAnimationCaption, DfmAnimationPlayer } from './DfmAnimationPlayer'
 import { LensFaceTints } from './LensFaceTints'
 import { LensStoryCard } from './LensStoryCard'
@@ -224,6 +225,7 @@ export function CADViewport() {
         <GdtAnnotations />
         <DfmFaceTints />
         <DfmAnimationPlayer />
+        <SimView />
         <LensFaceTints />
         <FeatureHighlight />
         <AgentFacesHighlight />

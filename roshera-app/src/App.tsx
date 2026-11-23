@@ -10,6 +10,7 @@ import { PropertiesPanel } from '@/components/panels/PropertiesPanel'
 import { Blackboard } from '@/components/panels/Blackboard'
 import { ModelTree } from '@/components/panels/ModelTree'
 import { DfmPanel } from '@/components/panels/DfmPanel'
+import { SimPanel } from '@/components/panels/SimPanel'
 import { ExtrudePanel } from '@/components/panels/ExtrudePanel'
 import { ViewBar } from '@/components/viewport/ViewBar'
 import { OverlaySlotsContext, type SlotName, type Slots } from '@/components/viewport/overlay-slots-context'
@@ -63,6 +64,10 @@ export function App() {
   // Drawing and Assembly bring their own workspace; the Part workspace stays
   // mounted underneath, parked (see below).
   const sheetWorkspace = docMode === 'drawing' || docMode === 'assembly'
+  // DFM and Simulate are checks ON the part: its model and history stay, the
+  // modelling tools go, and the check's panel takes the left column.
+  const checkWorkspace = docMode === 'dfm' || docMode === 'simulate'
+  const leftInset = docMode === 'simulate' ? 'left-[21rem]' : docMode === 'dfm' ? 'left-[19rem]' : 'left-[15.5rem]'
   // Drawing and Assembly mount on first visit and then STAY mounted, parked
   // when another tab is open: Assembly rebuilt its whole 3D view from every
   // part's mesh on each entry (a 15.9 s freeze, measured 2026-11-18).
@@ -238,7 +243,7 @@ export function App() {
           <OverlaySlotsContext.Provider value={slots}>
             {/* DFM keeps the model and its history but not the modelling
                 tools: it is a check on the part, run on its own. */}
-            {docMode !== 'dfm' && <ToolBar />}
+            {!checkWorkspace && <ToolBar />}
 
             {/* The tree lives INSIDE the viewport, over the model — not beside
                 it. I had docked it as a column for symmetry with the right
@@ -263,12 +268,12 @@ export function App() {
               <div
                 className={cn(
                   'pointer-events-none absolute bottom-2 left-2 top-2 z-20 flex flex-col gap-2 transition-[width] duration-200',
-                  docMode === 'dfm' ? 'w-72' : browserOpen ? 'w-56' : 'w-10',
+                  docMode === 'simulate' ? 'w-80' : docMode === 'dfm' ? 'w-72' : browserOpen ? 'w-56' : 'w-10',
                 )}
               >
-                {docMode === 'dfm' ? (
+                {checkWorkspace ? (
                   <div className="pointer-events-auto flex min-h-0 flex-1 flex-col overflow-hidden rounded border border-border bg-card/95">
-                    <DfmPanel />
+                    {docMode === 'simulate' ? <SimPanel /> : <DfmPanel />}
                   </div>
                 ) : (
                   <>
@@ -300,7 +305,7 @@ export function App() {
                 ref={attachTopSlot}
                 className={cn(
                   'pointer-events-none absolute right-[21rem] top-12 z-30 flex flex-col items-center gap-2',
-                  docMode === 'dfm' ? 'left-[19rem]' : 'left-[15.5rem]',
+                  leftInset,
                 )}
               >
                 <ExtrudePanel />
@@ -355,7 +360,7 @@ export function App() {
               <div
                 className={cn(
                   'pointer-events-none absolute bottom-2 right-[21rem] z-20 flex flex-col items-center gap-1.5',
-                  docMode === 'dfm' ? 'left-[19rem]' : 'left-[15.5rem]',
+                  leftInset,
                 )}
               >
                 {/* BOTTOM SLOT, just above the history: coordinate readouts

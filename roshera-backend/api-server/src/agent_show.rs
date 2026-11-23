@@ -153,6 +153,7 @@ pub enum Workspace {
     Assembly,
     Drawing,
     Dfm,
+    Simulate,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]

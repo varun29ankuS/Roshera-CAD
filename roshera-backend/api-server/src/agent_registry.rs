@@ -548,7 +548,7 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["workspace", "view", "feature", "faces", "step"], "description": "what to show"},
-                    "mode": {"type": "string", "enum": ["part", "assembly", "drawing", "dfm"], "description": "workspace: which one"},
+                    "mode": {"type": "string", "enum": ["part", "assembly", "drawing", "dfm", "simulate"], "description": "workspace: which one"},
                     "view": {"type": "string", "enum": ["iso", "front", "back", "top", "bottom", "left", "right", "fit"], "description": "camera: which side, or fit"},
                     "name": {"type": "string", "description": "feature: its name in the history (e.g. Bore)"},
                     "anchor": {"type": "integer", "description": "feature: its anchor step (instead of a name)"},

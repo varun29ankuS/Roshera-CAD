@@ -38,7 +38,7 @@ export interface CameraView {
 /** The body of `POST /api/agent/user-context`. */
 export interface UserContextReport {
   sharing: boolean
-  workspace?: 'part' | 'assembly' | 'drawing' | 'dfm'
+  workspace?: 'part' | 'assembly' | 'drawing' | 'dfm' | 'simulate'
   tool?: string
   pick_filter?: EntityKind
   hover?: EntityRef
@@ -87,7 +87,7 @@ export interface ContextInput {
   camera: CameraView | null
 }
 
-const WORKSPACES = ['part', 'assembly', 'drawing', 'dfm'] as const
+const WORKSPACES = ['part', 'assembly', 'drawing', 'dfm', 'simulate'] as const
 
 function round(v: number, places: number): number {
   const k = 10 ** places

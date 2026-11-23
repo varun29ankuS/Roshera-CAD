@@ -241,7 +241,7 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('AgentShow'),
     payload: z.discriminatedUnion('action', [
-      z.object({ action: z.literal('workspace'), mode: z.enum(['part', 'assembly', 'drawing', 'dfm']), caption: z.string().nullish() }),
+      z.object({ action: z.literal('workspace'), mode: z.enum(['part', 'assembly', 'drawing', 'dfm', 'simulate']), caption: z.string().nullish() }),
       z.object({ action: z.literal('view'), view: z.enum(['iso', 'front', 'back', 'top', 'bottom', 'left', 'right', 'fit']), caption: z.string().nullish() }),
       z.object({ action: z.literal('feature'), name: z.string().nullish(), anchor: z.number().nullish(), caption: z.string().nullish() }),
       z.object({ action: z.literal('faces'), solid_id: z.number(), face_ids: z.array(z.number()), caption: z.string().nullish() }),

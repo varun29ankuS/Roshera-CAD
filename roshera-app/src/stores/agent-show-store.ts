@@ -90,7 +90,7 @@ export const useAgentShowStore = create<AgentShowState>((set, get) => ({
     const scene = useSceneStore.getState()
     const toPart = () => {
       const mode = useDocModeStore.getState().mode
-      if (mode !== 'part' && mode !== 'dfm') useDocModeStore.getState().setMode('part')
+      if (mode !== 'part' && mode !== 'dfm' && mode !== 'simulate') useDocModeStore.getState().setMode('part')
     }
     switch (a.action) {
       case 'workspace':

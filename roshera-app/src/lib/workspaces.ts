@@ -5,8 +5,8 @@
  * once, and an unknown name is refused rather than half-handled.
  *
  * A workspace exists here only once it does something real. DFM runs the
- * kernel's rule packs; Simulate joins when the kernel has a mesher and a
- * solver behind it.
+ * kernel's rule packs; Simulate runs a static study through the kernel's
+ * mesher and solver (sim-engine; interim engines named in every result).
  */
 
 export const WORKSPACES = [
@@ -14,6 +14,7 @@ export const WORKSPACES = [
   { id: 'assembly', label: 'Assembly' },
   { id: 'drawing', label: 'Drawing' },
   { id: 'dfm', label: 'DFM' },
+  { id: 'simulate', label: 'Simulate' },
 ] as const
 
 export type WorkspaceId = (typeof WORKSPACES)[number]['id']

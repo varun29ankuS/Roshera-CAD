@@ -9,7 +9,7 @@ import { chapterTitle, type Chapter } from './chapters-api.ts'
 import type { SheetRect } from './sheet-look.ts'
 import type { SheetMove, SheetScore } from './sheet-hands.ts'
 
-export type Workspace = 'part' | 'assembly' | 'drawing' | 'dfm'
+export type Workspace = 'part' | 'assembly' | 'drawing' | 'dfm' | 'simulate'
 export type NamedView = 'iso' | 'front' | 'back' | 'top' | 'bottom' | 'left' | 'right' | 'fit'
 
 export type ShowAction =
@@ -71,7 +71,7 @@ export function findFeature(chapters: Chapter[], q: { name?: string | null; anch
   return all.find((c) => norm(chapterTitle(c)) === want || (c.name !== null && norm(c.name) === want)) ?? null
 }
 
-const WORKSPACE_NAMES: Record<Workspace, string> = { part: 'Part', assembly: 'Assembly', drawing: 'Drawing', dfm: 'DFM' }
+const WORKSPACE_NAMES: Record<Workspace, string> = { part: 'Part', assembly: 'Assembly', drawing: 'Drawing', dfm: 'DFM', simulate: 'Simulate' }
 
 /** What the bar says: the agent's own caption, else what is being shown. */
 export function showCaption(a: ShowAction): string {

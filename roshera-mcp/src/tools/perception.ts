@@ -445,7 +445,7 @@ export function registerPerceptionTools(server: ToolHost) {
       action: z
         .enum(["workspace", "view", "feature", "faces", "step"])
         .describe("what to show"),
-      mode: z.enum(["part", "assembly", "drawing", "dfm"]).optional().describe("workspace: which one"),
+      mode: z.enum(["part", "assembly", "drawing", "dfm", "simulate"]).optional().describe("workspace: which one"),
       view: z
         .enum(["iso", "front", "back", "top", "bottom", "left", "right", "fit"])
         .optional()
