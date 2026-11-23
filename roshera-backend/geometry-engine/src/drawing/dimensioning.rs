@@ -487,7 +487,7 @@ pub(crate) fn candidates_from_records(
             if d.kind == "angle" {
                 return shows_cone_angle(d, &projection);
             }
-            d.projected_span() >= min_span && shows_true_length(d)
+            d.projected_span() >= min_span && shows_true_length_in_plane(d)
         })
         .collect();
     // Drawing convention: a linear dimension shows just its value — strip the
@@ -647,8 +647,10 @@ const PATTERN_TOL: f64 = 1e-3;
 /// table are instances of one pattern when each sits at the same radius
 /// from the axis and the same station along it, and measures along the same
 /// direction relative to its own radial and tangential directions (up to
-/// sign); three or more such instances, at least one stated on the sheet,
-/// are stated by that one, which names them all
+/// sign); three or more such instances make a row, and rows of one value,
+/// radius and direction at other stations along the axis are one pattern.
+/// A pattern with at least one instance stated on the sheet is stated by
+/// that one, which names them all
 /// ([`Dimension2d::members`]) and leaves the other views. The certificate
 /// re-measures every member. A pattern instance with a bound tolerance keeps
 /// its own statement, and so does its pattern (nothing is counted); a part
@@ -721,7 +723,31 @@ pub(crate) fn count_pattern_lengths(
             patterns.push(group);
         }
     }
+    // Rows of one pattern along the axis -- equal value, radius and direction
+    // in their own frame, at other stations -- are one pattern: in a view
+    // square to the axis the rows' on-axis instances cover one interval, and
+    // the sheet states that interval once (`dedup_dimensions_global`), so a
+    // row counted alone has no statement of its own and its oblique copies
+    // would be named by nothing (CADGenBench 109: five rows of pockets, four
+    // of them owed).
+    let row_key = |p: &[&crate::readable::DimensionRecord]| p.first().and_then(|r| signature(r));
+    let mut rows: Vec<Vec<&crate::readable::DimensionRecord>> = Vec::new();
     for pattern in patterns {
+        let Some(key) = row_key(&pattern) else {
+            continue;
+        };
+        let same_row_family = |other: &Vec<&crate::readable::DimensionRecord>| {
+            other
+                .first()
+                .is_some_and(|o| (o.value - pattern[0].value).abs() <= 0.005)
+                && row_key(other).is_some_and(|k| same_instance(&(key.0, k.1, key.2), &k))
+        };
+        match rows.iter_mut().find(|o| same_row_family(o)) {
+            Some(family) => family.extend(pattern),
+            None => rows.push(pattern),
+        }
+    }
+    for pattern in rows {
         let ids: Vec<String> = pattern.iter().map(|r| record_identity(r)).collect();
         // Where the sheet states instances: (view, index), in view order.
         let stated: Vec<(usize, usize)> = drawing
@@ -829,6 +855,42 @@ pub(crate) fn shows_true_length(d: &Dimension2d) -> bool {
     (along - d.value.abs()).abs() <= TRUE_LENGTH_TOL_MM.max(1e-6 * d.value.abs())
 }
 
+/// Does this view draw a length, a location or an extent true only as an
+/// ALIGNED dimension (ISO 129-1): its measured direction lies in the view's
+/// plane -- the line from `a` to `b` is `value` long -- but on neither of the
+/// view's axes, so the horizontal or vertical line [`shows_true_length`]
+/// asks for is shorter than its number. The layout draws it with its line
+/// parallel to `b - a` (`layout::is_aligned_placement`). CADGenBench 103's
+/// "12.49" at 45 degrees and NIST CTC 04's "20"s at about 22 degrees read
+/// true only so.
+pub(crate) fn draws_aligned(d: &Dimension2d) -> bool {
+    if !matches!(d.kind.as_str(), "length" | "position" | "extent") || shows_true_length(d) {
+        return false;
+    }
+    let span = (d.a[0] - d.b[0]).hypot(d.a[1] - d.b[1]);
+    (span - d.value.abs()).abs() <= TRUE_LENGTH_TOL_MM.max(1e-6 * d.value.abs())
+}
+
+/// Do two aligned dimensions of one view state the same number over the same
+/// span -- both drawn aligned ([`draws_aligned`]), equal values to the
+/// hundredth, the same two ends (either way round) within half a view
+/// millimetre? One statement is the other's (CADGenBench 103: two records of
+/// one 45-degree "12.49" printed twice over the same extension lines).
+pub(crate) fn same_aligned_span(x: &Dimension2d, y: &Dimension2d) -> bool {
+    let near = |p: [f64; 2], q: [f64; 2]| (p[0] - q[0]).hypot(p[1] - q[1]) < 0.5;
+    draws_aligned(x)
+        && draws_aligned(y)
+        && (x.value - y.value).abs() <= 0.01
+        && ((near(x.a, y.a) && near(x.b, y.b)) || (near(x.a, y.b) && near(x.b, y.a)))
+}
+
+/// Is this length drawn at its true length in this view, along an axis or
+/// aligned ([`shows_true_length`], [`draws_aligned`])? The one rule the
+/// candidates and the certificate's owed lengths share.
+pub(crate) fn shows_true_length_in_plane(d: &Dimension2d) -> bool {
+    shows_true_length(d) || draws_aligned(d)
+}
+
 /// `|cos|` between a cone's axis and the view direction above which the cone
 /// is seen end-on (within about 8 degrees of its axis).
 const END_ON_COS: f64 = 0.99;
@@ -907,6 +969,12 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
             // arc to its centre, and two equal arcs in line with each other
             // are two features, not one dimension stated twice.
             if d.kind == "angle" || d.kind == "radius" {
+                continue;
+            }
+            // An aligned span runs along neither axis: it has no H or V
+            // interval to share with another dimension (one aligned
+            // statement per feature is kept by the cross-view pass).
+            if draws_aligned(d) {
                 continue;
             }
             let dx = (d.a[0] - d.b[0]).abs();
@@ -1000,6 +1068,21 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
                     } else {
                         keep[lins[j].idx] = false;
                     }
+                }
+            }
+        }
+        // Aligned spans (not in `lins`): one statement per number over one
+        // span, the first kept.
+        let aligned: Vec<usize> = (0..view.dimensions.len())
+            .filter(|&k| draws_aligned(&view.dimensions[k]))
+            .collect();
+        for (n, &i) in aligned.iter().enumerate() {
+            if !keep[i] {
+                continue;
+            }
+            for &j in &aligned[n + 1..] {
+                if keep[j] && same_aligned_span(&view.dimensions[i], &view.dimensions[j]) {
+                    keep[j] = false;
                 }
             }
         }
@@ -8059,8 +8142,12 @@ pub(crate) mod true_length_tests {
     /// would draw its 6 three millimetres long. It is offered in no principal
     /// view (RIGHT: 5.2 long; TOP: drawn along its horizontal, 3 long).
     ///
+    /// TOP, square to the pair's direction, offers it as an ALIGNED
+    /// dimension.
+    ///
     /// Mutation: drop the true-length rule from `candidates_from_records` ->
-    /// FRONT offers the 6 drawn 3.0 long -> RED.
+    /// FRONT offers the 6 drawn 3.0 long -> RED. Drop `draws_aligned` from
+    /// it -> TOP offers nothing -> RED.
     #[test]
     fn a_view_offers_a_length_only_at_its_true_length() {
         let model = BRepModel::new();
@@ -8070,10 +8157,12 @@ pub(crate) mod true_length_tests {
         assert!(front.is_empty(), "FRONT offers {front:?}");
         let right = candidates_from_records(&model, oblique(), ProjectionType::Right, 0.5);
         assert!(right.is_empty(), "RIGHT offers {right:?}");
-        // In TOP the wall pair lies in the plane, but the layout draws a
-        // linear dimension along the view's horizontal or vertical: 3 long.
+        // In TOP the wall pair lies in the plane: drawn along the view's
+        // horizontal it would be 3 long, so TOP offers it ALIGNED (ISO
+        // 129-1), its line 6 long along its own direction.
         let top = candidates_from_records(&model, oblique(), ProjectionType::Top, 0.5);
-        assert!(top.is_empty(), "TOP offers {top:?}");
+        assert_eq!(top.len(), 1, "TOP offers it aligned: {top:?}");
+        assert!(draws_aligned(&top[0]) && !shows_true_length(&top[0]));
         // An along-X length reads true in FRONT, as before.
         let square = candidates_from_records(
             &model,
@@ -8082,6 +8171,47 @@ pub(crate) mod true_length_tests {
             0.5,
         );
         assert_eq!(square.len(), 1);
+    }
+
+    /// Two records of one aligned span (CADGenBench 103: two "12.49" at 45
+    /// degrees over the same extension lines) are stated once in a view;
+    /// the same number over another span is a second statement.
+    ///
+    /// Mutation: skip aligned spans in the same-view dedup -> both "12.49"
+    /// stay -> RED.
+    #[test]
+    fn one_aligned_span_is_stated_once() {
+        let model = BRepModel::new();
+        let c = 45f64.to_radians();
+        let dir = [c.cos(), c.sin(), 0.0];
+        let mut twin = record("w2", "length", 12.49, dir);
+        twin.entities = vec![3, 4];
+        let mut elsewhere = record("w3", "length", 12.49, dir);
+        elsewhere.entities = vec![5, 6];
+        elsewhere.anchor = [30.0, 0.0, 5.0];
+        let records = vec![record("w1", "length", 12.49, dir), twin, elsewhere];
+        let mut v = super::super::projection::project_solid_view_shell(
+            super::super::types::ViewSource::Part {
+                part_id: uuid::Uuid::nil(),
+                solid_id: 0,
+            },
+            ProjectionType::Top,
+            "TOP".to_string(),
+            [100.0, 100.0],
+            1.0,
+        );
+        v.dimensions = candidates_from_records(&model, records, ProjectionType::Top, 0.5);
+        assert_eq!(v.dimensions.len(), 3, "fixture: all three drawn aligned");
+        let mut d = super::super::types::Drawing::new("twins", super::super::types::SheetSize::A3);
+        d.add_view(v);
+        dedup_dimensions_global(&mut d);
+        let mut ids: Vec<&str> = d.views[0]
+            .dimensions
+            .iter()
+            .map(|x| x.id.as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["w1", "w3"]);
     }
 }
 
@@ -8184,6 +8314,61 @@ mod pattern_length_tests {
         for r in &records {
             assert!(named.contains(&record_identity(r)), "{} is a member", r.id);
         }
+    }
+
+    /// The pattern repeated in rows along the axis (CADGenBench 109: twelve
+    /// pockets at each of five stations). In FRONT and RIGHT the rows' on-axis
+    /// widths cover one interval, so the sheet's dedup keeps one of them, and
+    /// only one row had an instance stated: the other rows' oblique copies
+    /// were named by nothing and owed (32 on 109). Every row is named by the
+    /// one statement.
+    ///
+    /// Mutation: group by station again -> the second row is named by
+    /// nothing -> RED.
+    #[test]
+    fn a_polar_pattern_in_rows_along_the_axis_is_stated_once() {
+        let records: Vec<DimensionRecord> = (0..24)
+            .map(|i| {
+                let mut r = slot(i, 30.0 * (i % 12) as f64);
+                r.id = format!("s{i}");
+                if i >= 12 {
+                    r.anchor[2] = 13.0;
+                }
+                r
+            })
+            .collect();
+        let mut d = sheet_of(&records);
+        // As the sheet does: one statement per interval in each view.
+        dedup_dimensions_global(&mut d);
+        count_pattern_lengths(&records, Some(&round_about_z()), &mut d);
+        let named: std::collections::HashSet<String> = d
+            .views
+            .iter()
+            .flat_map(|v| &v.dimensions)
+            .filter(|x| x.kind == "length")
+            .flat_map(|x| {
+                if x.members.is_empty() {
+                    vec![dimension_identity(x)]
+                } else {
+                    x.members.clone()
+                }
+            })
+            .collect();
+        for r in &records {
+            assert!(
+                named.contains(&record_identity(r)),
+                "{} (z = {}) is stated",
+                r.id,
+                r.anchor[2]
+            );
+        }
+        let statements = d
+            .views
+            .iter()
+            .flat_map(|v| &v.dimensions)
+            .filter(|x| x.kind == "length")
+            .count();
+        assert_eq!(statements, 1, "stated once");
     }
 
     /// Twelve equal widths that are NOT one pattern -- at different radii --

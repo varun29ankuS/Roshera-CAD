@@ -147,11 +147,20 @@ fn same_statement(c: &Dimension2d, inked: &[&Dimension2d]) -> bool {
     if c.kind == "radius" {
         return false;
     }
+    // An aligned span is stated only by an aligned dimension over the same
+    // two ends (the same-view dedup keeps one of them), never by a level or
+    // upright one that happens to share its dominant interval.
+    if super::dimensioning::draws_aligned(c) {
+        return inked
+            .iter()
+            .any(|d| super::dimensioning::same_aligned_span(c, d));
+    }
     let Some((oc, lo, hi)) = interval(c) else {
         return false;
     };
     inked.iter().any(|d| {
         (d.value - c.value).abs() <= 0.01
+            && !super::dimensioning::draws_aligned(d)
             && interval(d)
                 .is_some_and(|(od, l, h)| od == oc && (l - lo).abs() < 0.5 && (h - hi).abs() < 0.5)
     })
@@ -361,19 +370,22 @@ pub fn dimension_omissions(model: &BRepModel, drawing: &Drawing) -> Vec<Dimensio
 
 /// The lengths, locations and extents of `records` that read in some
 /// principal view (their line at least [`MIN_SPAN`] long) but at true length
-/// in none ([`super::dimensioning::shows_true_length`]): each with its
+/// in none -- neither along a view's axis nor ALIGNED in its plane
+/// ([`super::dimensioning::shows_true_length_in_plane`]): each with its
 /// identity, once. No principal view offers them, so the sheet can only owe
-/// them -- an aligned dimension or an auxiliary view would state them.
+/// them -- an auxiliary view would state them.
 ///
-/// One oblique reading is enough: the layout draws a linear dimension along
-/// a view's horizontal or vertical, so only a direction on a world axis is
-/// ever drawn true, and such a direction is true in every view it reads in
-/// (edge-on in the third, where it does not read).
+/// Every principal view is read before a length is owed: a direction in one
+/// view's plane is oblique in the other two and drawn aligned in that one
+/// (a slot 60 degrees round is foreshortened in FRONT and RIGHT and true in
+/// TOP). A length a view draws true is that view's candidate, and owed
+/// through the per-view accounting when the layout finds it no room.
 pub(crate) fn true_length_in_no_view(
     model: &BRepModel,
     records: &[crate::readable::DimensionRecord],
 ) -> Vec<(String, Dimension2d)> {
     let mut oblique: Vec<(String, Dimension2d)> = Vec::new();
+    let mut drawn_true: HashSet<String> = HashSet::new();
     for (projection, _) in PRINCIPAL {
         for d in super::dimensioning::project_records(model, records.to_vec(), projection) {
             if !matches!(d.kind.as_str(), "length" | "position" | "extent")
@@ -381,20 +393,24 @@ pub(crate) fn true_length_in_no_view(
             {
                 continue;
             }
-            if super::dimensioning::shows_true_length(&d) {
+            if super::dimensioning::shows_true_length_in_plane(&d) {
+                drawn_true.insert(identity(&d));
                 continue;
             }
             let id = identity(&d);
             if !oblique.iter().any(|(o, _)| *o == id) {
-                if super::dimensioning::draw_profile_enabled() {
-                    let along = (d.a[0] - d.b[0]).abs().max((d.a[1] - d.b[1]).abs());
-                    eprintln!(
-                        "[draw-profile]   owed, not true length in {projection:?}: {} '{}' drawn {along:.4} for {:.4}, along {:?}, faces {:?}",
-                        d.kind, d.label, d.value, d.dir3, d.entities
-                    );
-                }
                 oblique.push((id, d));
             }
+        }
+    }
+    oblique.retain(|(id, _)| !drawn_true.contains(id));
+    if super::dimensioning::draw_profile_enabled() {
+        for (_, d) in &oblique {
+            let along = (d.a[0] - d.b[0]).abs().max((d.a[1] - d.b[1]).abs());
+            eprintln!(
+                "[draw-profile]   owed, true length in no principal view: {} '{}' drawn {along:.4} for {:.4}, along {:?}, faces {:?}",
+                d.kind, d.label, d.value, d.dir3, d.entities
+            );
         }
     }
     oblique
@@ -571,13 +587,15 @@ mod true_length_owed_tests {
     use super::*;
     use crate::drawing::dimensioning::true_length_tests::record;
 
-    /// A length measured along no world axis is owed -- whether skew to all
-    /// three views or lying in TOP's plane at 60 degrees (the layout would
-    /// draw it along TOP's horizontal, 3 long, under its 6). One along a world
-    /// axis is drawn true and is not owed.
+    /// A length skew to all three principal views is owed. One lying in
+    /// TOP's plane at 60 degrees is drawn true there as an ALIGNED dimension
+    /// (it is oblique in FRONT and RIGHT): not owed here -- TOP offers it,
+    /// and the ordinary per-view accounting owes it if the layout finds no
+    /// room. One along a world axis is drawn true and is not owed.
     ///
     /// Mutation: drop the `shows_true_length` skip -> the along-X length
-    /// is owed too -> RED.
+    /// is owed too -> RED. Stop at the first oblique reading (FRONT) -> the
+    /// in-plane length is owed -> RED.
     #[test]
     fn a_length_true_in_no_principal_view_is_owed() {
         let model = BRepModel::new();
@@ -593,8 +611,38 @@ mod true_length_owed_tests {
             .map(|(_, d)| d.id)
             .collect();
         owed.sort();
-        assert_eq!(owed, ["polar", "skew"]);
+        assert_eq!(owed, ["skew"]);
     }
+    /// An aligned span is stated by the aligned dimension over its two ends
+    /// (its twin record, which the same-view dedup dropped), not by one over
+    /// another span: there it is owed.
+    ///
+    /// Mutation: drop the aligned arm of `same_statement` -> its twin no
+    /// longer states it (aligned dimensions are no interval statement) -> RED.
+    #[test]
+    fn an_aligned_span_is_stated_only_by_its_own_ends() {
+        let model = BRepModel::new();
+        let c = 45f64.to_radians();
+        let dir = [c.cos(), c.sin(), 0.0];
+        let top = |r: Vec<crate::readable::DimensionRecord>| {
+            crate::drawing::dimensioning::candidates_from_records(
+                &model,
+                r,
+                crate::drawing::types::ProjectionType::Top,
+                0.5,
+            )
+        };
+        let mut twin = record("w2", "length", 12.49, dir);
+        twin.entities = vec![3, 4];
+        let mut elsewhere = record("w3", "length", 12.49, dir);
+        elsewhere.anchor = [0.0, 30.0, 5.0];
+        let c1 = top(vec![record("w1", "length", 12.49, dir)]).remove(0);
+        let c2 = top(vec![twin]).remove(0);
+        let c3 = top(vec![elsewhere]).remove(0);
+        assert!(same_statement(&c1, &[&c2]), "its twin states it");
+        assert!(!same_statement(&c1, &[&c3]), "another span does not");
+    }
+
     /// The pass is reached in production: `dimension_omissions` owes what it
     /// finds, with its reason (the disconnection gate: a capability ships
     /// with its call site).

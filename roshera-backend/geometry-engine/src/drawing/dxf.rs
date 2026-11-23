@@ -2222,3 +2222,47 @@ mod ordinate_ink_tests {
         assert_eq!((lines, solids, texts), (2, 0, 1), "{ents:#?}");
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod aligned_ink_tests {
+    use super::*;
+    use crate::drawing::layout::aligned_tests::{placed_aligned, DEG, SHEET_H, VALUE};
+
+    /// The DXF inks an aligned dimension as the SVG does -- two extension
+    /// lines, its slanted dimension line, two arrowheads, its TEXT turned with
+    /// the line (y up: +30 degrees) -- and a CAD reader's definition of it
+    /// measures the value: feature points `value` apart, the line's own
+    /// direction.
+    #[test]
+    fn the_dxf_inks_and_defines_an_aligned_dimension() {
+        let pd = placed_aligned();
+        let ents = dimension_ink(&pd, SHEET_H);
+        let lines = ents
+            .iter()
+            .filter(|e| matches!(e.specific, EntityType::Line(_)))
+            .count();
+        let solids = ents
+            .iter()
+            .filter(|e| matches!(e.specific, EntityType::Solid(_)))
+            .count();
+        assert_eq!((lines, solids), (3, 2), "{ents:#?}");
+        let text = ents
+            .iter()
+            .find_map(|e| match &e.specific {
+                EntityType::Text(t) => Some(t.rotation),
+                _ => None,
+            })
+            .expect("the value is inked");
+        assert!((text - DEG).abs() < 1e-9, "text turned {text}");
+        let def = linear_definition(&pd, SHEET_H).expect("a linear dimension");
+        let [f0, f1] = def.feature;
+        assert!(((f1[0] - f0[0]).hypot(f1[1] - f0[1]) - VALUE).abs() < 1e-9);
+        let r = def.rotation_deg.rem_euclid(180.0);
+        assert!(
+            (r - DEG).abs() < 1e-9,
+            "definition along {}",
+            def.rotation_deg
+        );
+    }
+}

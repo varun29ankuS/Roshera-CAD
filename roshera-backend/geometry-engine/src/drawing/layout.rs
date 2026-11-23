@@ -154,7 +154,7 @@ pub(crate) fn placed_text_box(pd: &PlacedDimension) -> Rect2 {
             x1: ax + text_w * 0.5,
             y1: ay + drop,
         }
-    } else {
+    } else if (pd.text_rot_deg + 90.0).abs() < 1e-6 {
         // Vertical: rotated -90° about text_anchor. rotate(-90) maps the
         // centred text span along ±y: x ∈ [ax − font, ax], y ∈ [ay − w/2,
         // ay + w/2].
@@ -164,6 +164,32 @@ pub(crate) fn placed_text_box(pd: &PlacedDimension) -> Rect2 {
             x1: ax + drop,
             y1: ay + text_w * 0.5,
         }
+    } else {
+        // Turned to any other angle (an aligned dimension's number): the
+        // box round the four corners of the text turned as the SVG turns it,
+        // `rotate(deg)` about the anchor, y down.
+        let (s, c) = pd.text_rot_deg.to_radians().sin_cos();
+        let corners = [
+            (-0.5 * text_w, -font - rise),
+            (0.5 * text_w, -font - rise),
+            (0.5 * text_w, drop),
+            (-0.5 * text_w, drop),
+        ]
+        .map(|(x, y)| [ax + x * c - y * s, ay + x * s + y * c]);
+        corners.iter().fold(
+            Rect2 {
+                x0: f64::INFINITY,
+                y0: f64::INFINITY,
+                x1: f64::NEG_INFINITY,
+                y1: f64::NEG_INFINITY,
+            },
+            |r, p| Rect2 {
+                x0: r.x0.min(p[0]),
+                y0: r.y0.min(p[1]),
+                x1: r.x1.max(p[0]),
+                y1: r.y1.max(p[1]),
+            },
+        )
     }
 }
 
@@ -428,6 +454,17 @@ pub struct PlacedDimension {
     /// layouts parsing.
     #[serde(default)]
     pub ordinate: bool,
+}
+
+/// Is this an ALIGNED dimension (ISO 129-1): a straight dimension whose line
+/// runs along the measured direction, on neither of the sheet's axes
+/// ([`super::dimensioning::draws_aligned`])? Not an ordinate value, an
+/// angle's arc, a point callout or a leader (whose shoulder is level). The
+/// one test every reader of a placed dimension uses.
+pub(crate) fn is_aligned_placement(pd: &PlacedDimension) -> bool {
+    let [[x0, y0], [x1, y1]] = pd.line;
+    let (dx, dy) = ((x1 - x0).abs(), (y1 - y0).abs());
+    !pd.ordinate && pd.arc.is_none() && dx > 1e-6 && dy > 1e-6
 }
 
 /// The id suffix of an ordinate band's `0` at its datum
@@ -3729,6 +3766,7 @@ pub(crate) fn place_dimensions_routed(
     }
     let mut horiz: Vec<Lin> = Vec::new();
     let mut vert: Vec<Lin> = Vec::new();
+    let mut aligned: Vec<AlignedLin> = Vec::new();
     let mut result: Vec<PlacedDimension> = Vec::new();
 
     // Tabled predicate: this bore's X/Y and/or Ø live in the hole table
@@ -4218,6 +4256,19 @@ pub(crate) fn place_dimensions_routed(
                 ext_breaks: Default::default(),
                 ordinate: false,
                 arc: None,
+            });
+            continue;
+        }
+
+        // A length true only along its own direction in this view's plane:
+        // an ALIGNED dimension, placed after the stacks ([`place_aligned`]).
+        if crate::drawing::dimensioning::draws_aligned(d) {
+            aligned.push(AlignedLin {
+                a,
+                b,
+                label: d.label.clone(),
+                dim_id: d.id.clone(),
+                text_w: drawn_width(d),
             });
             continue;
         }
@@ -4763,6 +4814,66 @@ pub(crate) fn place_dimensions_routed(
         }
     }
 
+    // ALIGNED dimensions, after the stacks, bands and leaders: each takes the
+    // nearest lane along its own normal where its number is clear of every
+    // text, line and other view and outside this view's geometry (the
+    // quality check's `DimensionOnGeometry`), its lines run through no text,
+    // and it is not printed on another dimension's lines
+    // (`verify::on_each_others_lines`). None clear: not placed, and owed by
+    // the certificate.
+    if !aligned.is_empty() {
+        let centre = [0.5 * (bbox[0] + bbox[2]), 0.5 * (bbox[1] + bbox[3])];
+        let reach = (bbox[2] - bbox[0]).hypot(bbox[3] - bbox[1]) + STANDOFF;
+        let mut texts: Vec<Rect2> = result.iter().map(placed_text_box).collect();
+        let mut lines: Vec<[[f64; 2]; 2]> = result
+            .iter()
+            .flat_map(placed_line_segments)
+            .chain(ink_lines.iter().copied())
+            .collect();
+        let outside_frame = |p: [f64; 2]| {
+            frame.is_some_and(|f| p[0] < f[0] || p[1] < f[1] || p[0] > f[2] || p[1] > f[3])
+        };
+        for d in &aligned {
+            let blocked = |pd: &PlacedDimension| {
+                let r = placed_text_box(pd);
+                let text_blocked = outside_frame([r.x0, r.y0])
+                    || outside_frame([r.x1, r.y1])
+                    || r.intersects(&gr, 0.0)
+                    || obstacles.iter().any(|o| o.intersects(&r, 0.0))
+                    || texts.iter().any(|t| t.intersects(&r, 0.0))
+                    || lines.iter().any(|l| segment_crosses_rect(l, &r));
+                text_blocked
+                    || placed_line_segments(pd).iter().any(|s| {
+                        texts.iter().any(|t| segment_crosses_rect(s, t))
+                            || obstacles.iter().any(|o| segment_crosses_rect(s, o))
+                            || s.iter().any(|&p| outside_frame(p))
+                    })
+                    || result
+                        .iter()
+                        .any(|other| super::verify::on_each_others_lines(pd, other))
+            };
+            // How many lines already drawn its lines cross: the lane
+            // crossing none, else the fewest, is taken.
+            let crossings = |pd: &PlacedDimension| {
+                placed_line_segments(pd)
+                    .iter()
+                    .map(|s| {
+                        lines
+                            .iter()
+                            .filter(|l| super::spaces::segments_cross(s, l))
+                            .count()
+                    })
+                    .sum::<usize>()
+            };
+            if let Some(pd) = place_aligned(d, owner, centre, reach, Some(gr), &blocked, &crossings)
+            {
+                texts.push(placed_text_box(&pd));
+                lines.extend(placed_line_segments(&pd));
+                result.push(pd);
+            }
+        }
+    }
+
     // Authored presentation: the stacked tolerance / basic box of the label
     // as placed, then the recorded drag.
     for pd in &mut result {
@@ -4784,6 +4895,149 @@ pub(crate) fn place_dimensions_routed(
     break_extension_lines_round_numbers(&mut result);
 
     result
+}
+
+/// A length a view draws true only ALIGNED
+/// ([`super::dimensioning::draws_aligned`]), waiting for its place: the
+/// feature's two points on the sheet, its text, id and drawn text width.
+struct AlignedLin {
+    a: [f64; 2],
+    b: [f64; 2],
+    label: String,
+    dim_id: String,
+    text_w: f64,
+}
+
+/// Place one ALIGNED dimension (ISO 129-1): its dimension line parallel to
+/// the feature's direction, offset from it along the normal by a lane
+/// distance (`STANDOFF + i * STACK`, out to `reach`), the side pointing away
+/// from the view's `centre` first; extension lines square to it from `GAP`
+/// off the feature to `EXT` past the line; the number turned with the line,
+/// read from the bottom or the right (angle in [-90, 90)), `TGAP` off it on
+/// its upper side -- centred in the span when it fits between the
+/// arrowheads, else beyond the end with the line run on under it and the
+/// arrowheads outside. Of the lanes `blocked` does not refuse, the first
+/// whose lines cross no line already drawn (`crossings` 0) is taken, else
+/// the one crossing the fewest (the nearest of equals): a leader's leg
+/// crossed by an extension line reads as a tangle (CADGenBench 112's
+/// near-level "37.54" ran its extension lines through seven leaders).
+/// `None` when no lane is clear.
+///
+/// `keep_out` is a rectangle the number may not overlap (the view's
+/// geometry, `DimensionOnGeometry`): a lane whose number would be anchored
+/// strictly inside it is refused before it is built and scored -- the text
+/// box straddles its anchor, so `blocked` would refuse it anyway, and on a
+/// feature deep inside a big view (CADGenBench 109) most lanes are such.
+fn place_aligned(
+    d: &AlignedLin,
+    owner: usize,
+    centre: [f64; 2],
+    reach: f64,
+    keep_out: Option<Rect2>,
+    blocked: &dyn Fn(&PlacedDimension) -> bool,
+    crossings: &dyn Fn(&PlacedDimension) -> usize,
+) -> Option<PlacedDimension> {
+    let (mut a, mut b) = (d.a, d.b);
+    let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+    if len < 1e-9 {
+        return None;
+    }
+    let mut u = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
+    let mut theta = u[1].atan2(u[0]).to_degrees();
+    // Read from the bottom or the right: the text runs left to right, or
+    // bottom to top.
+    if !(-90.0..90.0).contains(&theta) {
+        std::mem::swap(&mut a, &mut b);
+        u = [-u[0], -u[1]];
+        theta = u[1].atan2(u[0]).to_degrees();
+    }
+    // The number's upper side (SVG y down): (0, -1) turned by theta.
+    let up = {
+        let t = theta.to_radians();
+        [t.sin(), -t.cos()]
+    };
+    let mid = [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])];
+    let outward = (mid[0] - centre[0]) * up[0] + (mid[1] - centre[1]) * up[1] >= 0.0;
+    let sides = if outward {
+        [up, [-up[0], -up[1]]]
+    } else {
+        [[-up[0], -up[1]], up]
+    };
+    let at = |p: [f64; 2], n: [f64; 2], k: f64| [p[0] + n[0] * k, p[1] + n[1] * k];
+    let fits = len >= d.text_w + 2.0 * AR_L + 1.0;
+    // The clear lane crossing the fewest lines so far, nearest first.
+    let mut best: Option<(usize, PlacedDimension)> = None;
+    for n in sides {
+        let mut k = STANDOFF;
+        while k <= reach {
+            let (l0, l1) = (at(a, n, k), at(b, n, k));
+            let ext = [
+                [at(a, n, GAP), at(l0, n, EXT)],
+                [at(b, n, GAP), at(l1, n, EXT)],
+            ];
+            let (line, arrows, text_mid) = if fits {
+                (
+                    [l0, l1],
+                    [
+                        ArrowSpec { tip: l0, dir: u },
+                        ArrowSpec {
+                            tip: l1,
+                            dir: [-u[0], -u[1]],
+                        },
+                    ],
+                    [0.5 * (l0[0] + l1[0]), 0.5 * (l1[1] + l0[1])],
+                )
+            } else {
+                // Beyond the far end: the arrowheads point in from outside,
+                // the line runs on under the number.
+                let run = AR_L + 0.5 + d.text_w;
+                (
+                    [at(l0, u, -(AR_L + 0.5)), at(l1, u, run)],
+                    [
+                        ArrowSpec {
+                            tip: l0,
+                            dir: [-u[0], -u[1]],
+                        },
+                        ArrowSpec { tip: l1, dir: u },
+                    ],
+                    at(l1, u, AR_L + 0.5 + 0.5 * d.text_w),
+                )
+            };
+            let anchor = at(text_mid, up, TGAP);
+            if keep_out.is_some_and(|r| {
+                anchor[0] > r.x0 && anchor[0] < r.x1 && anchor[1] > r.y0 && anchor[1] < r.y1
+            }) {
+                k += STACK;
+                continue;
+            }
+            let pd = PlacedDimension {
+                line,
+                ext,
+                arrows,
+                text_anchor: anchor,
+                text_rot_deg: theta,
+                label: d.label.clone(),
+                dim_id: d.dim_id.clone(),
+                owner_view: owner,
+                stack: None,
+                boxed: false,
+                ext_breaks: Default::default(),
+                arc: None,
+                ordinate: false,
+            };
+            if !blocked(&pd) {
+                let n_cross = crossings(&pd);
+                if n_cross == 0 {
+                    return Some(pd);
+                }
+                if best.as_ref().map_or(true, |(c, _)| n_cross < *c) {
+                    best = Some((n_cross, pd));
+                }
+            }
+            k += STACK;
+        }
+    }
+    best.map(|(_, pd)| pd)
 }
 
 /// How far across the band a moved ordinate value's extension line slants
@@ -5187,8 +5441,9 @@ pub(crate) fn dimension_band_depths(
             }
             continue;
         }
-        if !stacked(&pd) {
-            // A leader or a point callout.
+        if !stacked(&pd) || is_aligned_placement(&pd) {
+            // A leader or a point callout; an aligned dimension, which
+            // stands at its feature, in no band.
             continue;
         }
         if pd.text_rot_deg.abs() < 1e-6 {
@@ -5280,6 +5535,31 @@ pub(crate) fn shift_placed_dimension(pd: &mut PlacedDimension, by: [f64; 2]) {
         if len > 1e-9 {
             pd.arrows[0].dir = [vx / len, vy / len];
         }
+        return;
+    }
+    if is_aligned_placement(pd) {
+        // An aligned dimension: the drag across its own line moves the line
+        // (its extension lines' far ends and arrowheads follow), the drag
+        // along it slides the number.
+        let [[x0, y0], [x1, y1]] = pd.line;
+        let len = (x1 - x0).hypot(y1 - y0);
+        let n = [-(y1 - y0) / len, (x1 - x0) / len];
+        let k = dx * n[0] + dy * n[1];
+        let across = [k * n[0], k * n[1]];
+        for p in &mut pd.line {
+            p[0] += across[0];
+            p[1] += across[1];
+        }
+        for e in &mut pd.ext {
+            e[1][0] += across[0];
+            e[1][1] += across[1];
+        }
+        for a in &mut pd.arrows {
+            a.tip[0] += across[0];
+            a.tip[1] += across[1];
+        }
+        pd.text_anchor[0] += dx;
+        pd.text_anchor[1] += dy;
         return;
     }
     let horizontal = (pd.line[0][1] - pd.line[1][1]).abs() < 1e-9;
@@ -6860,5 +7140,409 @@ mod tests {
         let a = serde_json::to_string(&compute_layout(&dwg)).expect("ser");
         let b = serde_json::to_string(&compute_layout(&dwg)).expect("ser");
         assert_eq!(a, b, "compute_layout must be deterministic");
+    }
+}
+
+/// Aligned dimensions (ISO 129-1, `docs/research/2026-11-23-aligned-dimensions.md`).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub(crate) mod aligned_tests {
+    use super::*;
+    use crate::drawing::dimensioning::{candidates_from_records, true_length_tests::record};
+    use crate::drawing::types::{
+        Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, ViewExtent, ViewSource,
+    };
+    use crate::primitives::topology_builder::BRepModel;
+
+    /// The sheet height the fixture is laid on.
+    pub(crate) const SHEET_H: f64 = 297.0;
+    /// The measured length and its direction in TOP (degrees from +X).
+    pub(crate) const VALUE: f64 = 12.0;
+    pub(crate) const DEG: f64 = 30.0;
+
+    /// TOP of an 80 mm square plate at 1:1, with one length of [`VALUE`]
+    /// measured [`DEG`] round from X in the plate's plane: drawn true only
+    /// aligned.
+    pub(crate) fn aligned_view() -> ProjectedView {
+        let c = DEG.to_radians();
+        let model = BRepModel::new();
+        let dims = candidates_from_records(
+            &model,
+            vec![record("w", "length", VALUE, [c.cos(), c.sin(), 0.0])],
+            ProjectionType::Top,
+            0.5,
+        );
+        ProjectedView {
+            id: ProjectedViewId::new(),
+            name: "TOP".to_string(),
+            projection: ProjectionType::Top,
+            source: ViewSource::Part {
+                part_id: uuid::Uuid::nil(),
+                solid_id: 0,
+            },
+            position_mm: [150.0, 150.0],
+            scale: 1.0,
+            polylines: vec![Polyline2d::from_points(vec![
+                [-40.0, -40.0],
+                [40.0, -40.0],
+                [40.0, 40.0],
+                [-40.0, 40.0],
+                [-40.0, -40.0],
+            ])],
+            extent: ViewExtent {
+                min_x: -40.0,
+                min_y: -40.0,
+                max_x: 40.0,
+                max_y: 40.0,
+            },
+            dimensions: dims,
+            centerlines: Vec::new(),
+            hidden_polylines: Vec::new(),
+            circles: Vec::new(),
+            hidden_circles: Vec::new(),
+            ellipses: Vec::new(),
+            hidden_ellipses: Vec::new(),
+            show_hidden: true,
+            shaded_raster: None,
+            hatch_polylines: Vec::new(),
+            polyline_sources: Vec::new(),
+        }
+    }
+
+    /// The aligned dimension of [`aligned_view`] as the layout places it.
+    pub(crate) fn placed_aligned() -> PlacedDimension {
+        let view = aligned_view();
+        assert_eq!(view.dimensions.len(), 1, "fixture: TOP offers the length");
+        let placed = place_dimensions(&view, SHEET_H, 0, &std::collections::HashSet::new());
+        assert_eq!(placed.len(), 1, "placed: {placed:?}");
+        placed.into_iter().next().unwrap()
+    }
+
+    fn unit(s: [[f64; 2]; 2]) -> [f64; 2] {
+        let (dx, dy) = (s[1][0] - s[0][0], s[1][1] - s[0][1]);
+        let l = dx.hypot(dy);
+        [dx / l, dy / l]
+    }
+
+    /// The length is drawn ALIGNED: its dimension line parallel to the
+    /// measured direction (on the sheet, y down: 30 degrees up from the
+    /// right), as long as the value at 1:1; its extension lines square to it
+    /// and their feet `value` apart along it; its text turned with the line.
+    ///
+    /// Mutation: place it as a horizontal or vertical stack dimension (the
+    /// layout's old classification by the dominant axis) -> its line is 10.4
+    /// long and horizontal -> RED.
+    #[test]
+    fn an_in_plane_oblique_length_is_drawn_aligned() {
+        let pd = placed_aligned();
+        assert!(is_aligned_placement(&pd), "{pd:?}");
+        let c = DEG.to_radians();
+        let u = [c.cos(), -c.sin()];
+        let along = unit(pd.line);
+        assert!(
+            (along[0] * u[1] - along[1] * u[0]).abs() < 1e-9,
+            "the line runs along the measured direction: {along:?}"
+        );
+        let drawn = (pd.line[1][0] - pd.line[0][0]).hypot(pd.line[1][1] - pd.line[0][1]);
+        assert!((drawn - VALUE).abs() < 1e-9, "drawn {drawn} for {VALUE}");
+        for e in &pd.ext {
+            let eu = unit(*e);
+            assert!(
+                (eu[0] * u[0] + eu[1] * u[1]).abs() < 1e-9,
+                "extension line square to the line"
+            );
+        }
+        let feet = [pd.ext[0][0], pd.ext[1][0]];
+        let apart = (feet[1][0] - feet[0][0]) * u[0] + (feet[1][1] - feet[0][1]) * u[1];
+        assert!((apart.abs() - VALUE).abs() < 1e-9, "feet {apart} apart");
+        assert!(
+            (pd.text_rot_deg - (-DEG)).abs() < 1e-9,
+            "text along the line: {}",
+            pd.text_rot_deg
+        );
+        // Arrowheads on the line's ends, pointing along it.
+        for a in &pd.arrows {
+            assert!((a.dir[0] * u[1] - a.dir[1] * u[0]).abs() < 1e-9);
+        }
+    }
+
+    /// The number of an aligned dimension whose feature lies inside the
+    /// view stands outside the view's geometry (the quality check's
+    /// `DimensionOnGeometry`, ISO 129: callouts clear of the outline), its
+    /// extension lines carried out to it.
+    ///
+    /// Mutation: drop the geometry-rectangle test from the aligned
+    /// placement -> the number is put on the plate, 11 mm off the feature
+    /// -> RED.
+    #[test]
+    fn an_aligned_number_stands_clear_of_the_view() {
+        let view = aligned_view();
+        let pd = placed_aligned();
+        let geo = view_geometry_rect(&view, SHEET_H).unwrap();
+        let t = placed_text_box(&pd);
+        assert!(!t.intersects(&geo, 0.0), "text {t:?} on the view {geo:?}");
+    }
+
+    /// A line already drawn across the side the aligned dimension prefers
+    /// (here an earlier view's leader running level above the plate) is not
+    /// crossed while the other side is free: the dimension takes that side.
+    ///
+    /// Mutation: drop the no-crossing pass -> the dimension stands above the
+    /// plate with its extension lines through the line -> RED.
+    #[test]
+    fn an_aligned_dimension_does_not_cross_a_drawn_line_when_it_need_not() {
+        let view = aligned_view();
+        let leader = [[0.0, 100.0], [400.0, 100.0]];
+        let placed = place_dimensions_routed(
+            &view,
+            SHEET_H,
+            0,
+            &std::collections::HashSet::new(),
+            None,
+            &[],
+            &[leader],
+            &crate::drawing::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+        );
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert!(
+            !placed_line_segments(&placed[0])
+                .iter()
+                .any(|s| crate::drawing::spaces::segments_cross(s, &leader)),
+            "{:?}",
+            placed[0]
+        );
+    }
+
+    /// Two aligned dimensions of near-equal spans whose extension lines
+    /// would run 0.2 mm apart are not stacked on the same side: the second
+    /// takes the other side, and no pair prints on each other's lines.
+    ///
+    /// Mutation: drop the `on_each_others_lines` test from the aligned
+    /// placement -> the second takes the next lane on the same side -> the
+    /// pair is reported -> RED.
+    #[test]
+    fn near_equal_aligned_spans_are_not_printed_on_each_others_lines() {
+        let c = DEG.to_radians();
+        let mut view = aligned_view();
+        let model = BRepModel::new();
+        view.dimensions = candidates_from_records(
+            &model,
+            vec![
+                record("w", "length", VALUE, [c.cos(), c.sin(), 0.0]),
+                record("v", "length", VALUE + 0.4, [c.cos(), c.sin(), 0.0]),
+            ],
+            ProjectionType::Top,
+            0.5,
+        );
+        let placed = place_dimensions(&view, SHEET_H, 0, &std::collections::HashSet::new());
+        assert_eq!(placed.len(), 2, "both placed: {placed:?}");
+        assert!(!crate::drawing::verify::on_each_others_lines(
+            &placed[0], &placed[1]
+        ));
+    }
+
+    /// The text box of a number turned to an arbitrary angle holds every
+    /// corner of the turned text (SVG `rotate(deg)` about the anchor, y down).
+    ///
+    /// Mutation: the old box (anything not level is the -90 degree box) ->
+    /// corners outside -> RED.
+    #[test]
+    fn a_turned_number_is_boxed_where_it_is_drawn() {
+        let mut pd = placed_aligned();
+        pd.label = "123.45".to_string();
+        for deg in [-30.0_f64, -60.0, 45.0, -89.0, 10.0] {
+            pd.text_rot_deg = deg;
+            let b = placed_text_box(&pd);
+            let w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM;
+            let (s, c) = deg.to_radians().sin_cos();
+            for (x, y) in [
+                (-0.5 * w, -DIM_TEXT_FONT_MM),
+                (0.5 * w, -DIM_TEXT_FONT_MM),
+                (0.5 * w, 0.0),
+                (-0.5 * w, 0.0),
+            ] {
+                let p = [
+                    pd.text_anchor[0] + x * c - y * s,
+                    pd.text_anchor[1] + x * s + y * c,
+                ];
+                assert!(
+                    p[0] >= b.x0 - 1e-9
+                        && p[0] <= b.x1 + 1e-9
+                        && p[1] >= b.y0 - 1e-9
+                        && p[1] <= b.y1 + 1e-9,
+                    "{deg} deg: corner {p:?} outside {b:?}"
+                );
+            }
+        }
+    }
+
+    /// The sheet's SVG inks the slanted line and the number turned with it.
+    #[test]
+    fn the_svg_inks_an_aligned_dimension_turned() {
+        let mut d =
+            crate::drawing::types::Drawing::new("aligned", crate::drawing::types::SheetSize::A4);
+        d.add_view(aligned_view());
+        let layout = compute_layout(&d);
+        let pd = layout
+            .dimensions
+            .iter()
+            .find(|p| p.dim_id == "w")
+            .expect("placed on the sheet");
+        assert!(is_aligned_placement(pd));
+        let svg = crate::drawing::svg::render_drawing_svg(&d);
+        assert!(
+            svg.contains(&format!("rotate({:.1} ", -DEG)),
+            "the number is turned -30 degrees"
+        );
+        let line = format!("x1=\"{:.3}\" y1=\"{:.3}\"", pd.line[0][0], pd.line[0][1]);
+        assert!(svg.contains(&line), "the dimension line is inked: {line}");
+    }
+
+    /// Two aligned dimensions printed on each other's lines -- their
+    /// extension lines 0.3 mm apart, parallel and overlapping -- are reported
+    /// like two horizontal ones (the check the DETAIL views trigger on).
+    ///
+    /// Mutation: `close` in `find_dimensions_on_each_others_lines` compares
+    /// only horizontal or vertical lines -> not reported -> RED.
+    #[test]
+    fn aligned_dimensions_on_each_others_lines_are_reported() {
+        let a = placed_aligned();
+        let u = unit(a.line);
+        let mut b = a.clone();
+        b.dim_id = "w2".to_string();
+        for p in b
+            .line
+            .iter_mut()
+            .chain(b.ext.iter_mut().flat_map(|e| e.iter_mut()))
+        {
+            p[0] += 0.3 * u[0];
+            p[1] += 0.3 * u[1];
+        }
+        let layout = SheetLayout {
+            sheet: Rect2 {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 420.0,
+                y1: SHEET_H,
+            },
+            items: Vec::new(),
+            dimensions: vec![a, b],
+            hole_tags: Vec::new(),
+            gdt_leaders: Vec::new(),
+        };
+        assert_eq!(
+            crate::drawing::verify::find_dimensions_on_each_others_lines(&layout),
+            vec![(0, 1)]
+        );
+    }
+
+    /// No lane clear for its number: the aligned dimension is not placed
+    /// (never printed over what blocks it), so the certificate owes it.
+    /// With one lane blocked, it takes the next one out.
+    #[test]
+    fn an_aligned_dimension_with_no_room_is_not_placed() {
+        let d = AlignedLin {
+            a: [100.0, 100.0],
+            b: [110.392, 94.0],
+            label: "12".to_string(),
+            dim_id: "w".to_string(),
+            text_w: 2.0 * GLYPH_ADVANCE_EM * DIM_TEXT_FONT_MM,
+        };
+        let none = |_: &PlacedDimension| 0_usize;
+        assert!(place_aligned(
+            &d,
+            0,
+            [0.0, 0.0],
+            200.0,
+            None,
+            &|_: &PlacedDimension| true,
+            &none
+        )
+        .is_none());
+        // The first lane blocked: the second lane out is taken.
+        let first = place_aligned(
+            &d,
+            0,
+            [0.0, 0.0],
+            200.0,
+            None,
+            &|_: &PlacedDimension| false,
+            &none,
+        )
+        .unwrap();
+        let first_box = placed_text_box(&first);
+        let second = place_aligned(
+            &d,
+            0,
+            [0.0, 0.0],
+            200.0,
+            None,
+            &|pd: &PlacedDimension| placed_text_box(pd).intersects(&first_box, 0.0),
+            &none,
+        )
+        .unwrap();
+        let off = |pd: &PlacedDimension| {
+            let m = [
+                0.5 * (pd.line[0][0] + pd.line[1][0]),
+                0.5 * (pd.line[0][1] + pd.line[1][1]),
+            ];
+            (m[0] - 105.196).hypot(m[1] - 97.0)
+        };
+        assert!((off(&first) - STANDOFF).abs() < 1e-3, "{}", off(&first));
+        // Every lane crosses a drawn line, the first three of them: the
+        // nearest lane crossing the fewest (one) is taken, not the first.
+        let fewest = place_aligned(
+            &d,
+            0,
+            [0.0, 0.0],
+            200.0,
+            None,
+            &|_: &PlacedDimension| false,
+            &|pd: &PlacedDimension| {
+                if (off(pd) - STANDOFF).abs() < 1e-3 {
+                    3
+                } else {
+                    1
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            (off(&fewest) - (STANDOFF + STACK)).abs() < 1e-3,
+            "{}",
+            off(&fewest)
+        );
+        assert!(
+            (off(&second) - (STANDOFF + STACK)).abs() < 1e-3,
+            "{}",
+            off(&second)
+        );
+    }
+
+    /// A drag across an aligned dimension moves its line square to itself;
+    /// along it, the number slides. The line stays parallel and its length.
+    #[test]
+    fn a_dragged_aligned_dimension_keeps_its_direction() {
+        let pd = placed_aligned();
+        let u = unit(pd.line);
+        let n = [-u[1], u[0]];
+        let mut moved = pd.clone();
+        shift_placed_dimension(
+            &mut moved,
+            [5.0 * n[0] + 2.0 * u[0], 5.0 * n[1] + 2.0 * u[1]],
+        );
+        let mu = unit(moved.line);
+        assert!((mu[0] * u[1] - mu[1] * u[0]).abs() < 1e-9);
+        for i in 0..2 {
+            let d = [
+                moved.line[i][0] - pd.line[i][0],
+                moved.line[i][1] - pd.line[i][1],
+            ];
+            assert!((d[0] - 5.0 * n[0]).abs() < 1e-9 && (d[1] - 5.0 * n[1]).abs() < 1e-9);
+            // Extension lines keep their feet on the feature.
+            assert_eq!(moved.ext[i][0], pd.ext[i][0]);
+        }
+        assert!((moved.text_anchor[0] - pd.text_anchor[0] - 5.0 * n[0] - 2.0 * u[0]).abs() < 1e-9);
     }
 }

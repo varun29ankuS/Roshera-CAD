@@ -747,68 +747,74 @@ pub(crate) fn find_dimensions_on_each_others_lines(
     let mut out = Vec::new();
     for i in 0..dims.len() {
         for j in (i + 1)..dims.len() {
-            let (a, b) = (&dims[i], &dims[j]);
-            if a.owner_view != b.owner_view || a.arc.is_some() || b.arc.is_some() {
-                continue;
-            }
-            // Two ordinate values have one line each: their lines from the
-            // part, beside each other closer than the lines-apart limit at
-            // two different features, read as one line. (Their `ext[1]` is a
-            // point or a jog, so the two-line test below never fires for
-            // them, and a ladder drawn 1:5 -- features 1.3 mm apart, 0.26 mm
-            // on paper -- would certify clean.)
-            if a.ordinate || b.ordinate {
-                if a.ordinate && b.ordinate && ordinate_lines_beside(&a.ext[0], &b.ext[0]) {
-                    out.push((i, j));
-                }
-                continue;
-            }
-            let close = |ea: &[[f64; 2]; 2], eb: &[[f64; 2]; 2]| {
-                let vertical = |e: &[[f64; 2]; 2]| (e[0][0] - e[1][0]).abs() < 1e-9;
-                let horizontal = |e: &[[f64; 2]; 2]| (e[0][1] - e[1][1]).abs() < 1e-9;
-                let (along, across) = if vertical(ea) && vertical(eb) {
-                    (1, 0)
-                } else if horizontal(ea) && horizontal(eb) {
-                    (0, 1)
-                } else {
-                    return false;
-                };
-                let gap = (ea[0][across] - eb[0][across]).abs();
-                let (a0, a1) = (
-                    ea[0][along].min(ea[1][along]),
-                    ea[0][along].max(ea[1][along]),
-                );
-                let (b0, b1) = (
-                    eb[0][along].min(eb[1][along]),
-                    eb[0][along].max(eb[1][along]),
-                );
-                let overlap = a1.min(b1) - a0.max(b0);
-                // Beside each other, or the very same line (a shared datum
-                // line, drawn once) -- the pair is then on each other's
-                // lines only if their OTHER lines are beside each other.
-                gap < super::layout::EXT_LINES_APART_MM && overlap > 1.0
-            };
-            let apart = |ea: &[[f64; 2]; 2], eb: &[[f64; 2]; 2]| {
-                (ea[0][0] - eb[0][0]).abs().max((ea[0][1] - eb[0][1]).abs())
-                    > super::layout::CHAIN_EPS
-                    || (ea[1][0] - eb[1][0]).abs().max((ea[1][1] - eb[1][1]).abs())
-                        > super::layout::CHAIN_EPS
-            };
-            // The WHOLE dimension on the other's lines, as the interval check
-            // it replaces had it (both ends): each extension line of one
-            // beside one of the other's, and not both the same lines. One
-            // pair of close lines alone is not reported here.
-            let beside = [(0usize, 1usize), (1, 0)].iter().any(|&(i, j)| {
-                close(&a.ext[0], &b.ext[i])
-                    && close(&a.ext[1], &b.ext[j])
-                    && (apart(&a.ext[0], &b.ext[i]) || apart(&a.ext[1], &b.ext[j]))
-            });
-            if beside {
+            if on_each_others_lines(&dims[i], &dims[j]) {
                 out.push((i, j));
             }
         }
     }
     out
+}
+
+/// Do two placed dimensions print on each other's lines
+/// ([`find_dimensions_on_each_others_lines`])? The one test the check and the
+/// layout's aligned placement (`layout::place_aligned`) share.
+pub(crate) fn on_each_others_lines(
+    a: &super::layout::PlacedDimension,
+    b: &super::layout::PlacedDimension,
+) -> bool {
+    if a.owner_view != b.owner_view || a.arc.is_some() || b.arc.is_some() {
+        return false;
+    }
+    // Two ordinate values have one line each: their lines from the
+    // part, beside each other closer than the lines-apart limit at
+    // two different features, read as one line. (Their `ext[1]` is a
+    // point or a jog, so the two-line test below never fires for
+    // them, and a ladder drawn 1:5 -- features 1.3 mm apart, 0.26 mm
+    // on paper -- would certify clean.)
+    if a.ordinate || b.ordinate {
+        return a.ordinate && b.ordinate && ordinate_lines_beside(&a.ext[0], &b.ext[0]);
+    }
+    // Two PARALLEL extension lines, in any direction (an aligned
+    // dimension's run square to its slanted line): their gap is the
+    // distance between the lines, their overlap is along them.
+    let close = |ea: &[[f64; 2]; 2], eb: &[[f64; 2]; 2]| {
+        let dir = |e: &[[f64; 2]; 2]| {
+            let (dx, dy) = (e[1][0] - e[0][0], e[1][1] - e[0][1]);
+            let len = dx.hypot(dy);
+            (len > 1e-9).then(|| [dx / len, dy / len])
+        };
+        let (Some(u), Some(v)) = (dir(ea), dir(eb)) else {
+            return false;
+        };
+        if (u[0] * v[1] - u[1] * v[0]).abs() > 1e-9 {
+            return false;
+        }
+        let n = [-u[1], u[0]];
+        let gap = ((eb[0][0] - ea[0][0]) * n[0] + (eb[0][1] - ea[0][1]) * n[1]).abs();
+        let t = |p: [f64; 2]| p[0] * u[0] + p[1] * u[1];
+        let (a0, a1) = (t(ea[0]).min(t(ea[1])), t(ea[0]).max(t(ea[1])));
+        let (b0, b1) = (t(eb[0]).min(t(eb[1])), t(eb[0]).max(t(eb[1])));
+        let overlap = a1.min(b1) - a0.max(b0);
+        // Beside each other, or the very same line (a shared datum
+        // line, drawn once) -- the pair is then on each other's
+        // lines only if their OTHER lines are beside each other.
+        gap < super::layout::EXT_LINES_APART_MM && overlap > 1.0
+    };
+    let apart = |ea: &[[f64; 2]; 2], eb: &[[f64; 2]; 2]| {
+        (ea[0][0] - eb[0][0]).abs().max((ea[0][1] - eb[0][1]).abs()) > super::layout::CHAIN_EPS
+            || (ea[1][0] - eb[1][0]).abs().max((ea[1][1] - eb[1][1]).abs())
+                > super::layout::CHAIN_EPS
+    };
+    // The WHOLE dimension on the other's lines, as the interval check
+    // it replaces had it (both ends): each extension line of one
+    // beside one of the other's, and not both the same lines. One
+    // pair of close lines alone is not reported here.
+    let beside = [(0usize, 1usize), (1, 0)].iter().any(|&(i, j)| {
+        close(&a.ext[0], &b.ext[i])
+            && close(&a.ext[1], &b.ext[j])
+            && (apart(&a.ext[0], &b.ext[i]) || apart(&a.ext[1], &b.ext[j]))
+    });
+    beside
 }
 
 /// Two ordinate values' lines from the part (`ext[0]` of each) run parallel

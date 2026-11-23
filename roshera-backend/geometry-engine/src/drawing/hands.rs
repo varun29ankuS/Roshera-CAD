@@ -264,6 +264,9 @@ fn degenerate(s: &[[f64; 2]; 2]) -> bool {
 enum Shape {
     /// A dimension line between extension lines; `true` = horizontal.
     Linear(bool),
+    /// An ALIGNED dimension: its line along the feature's own direction, in
+    /// no band ([`crate::drawing::layout::is_aligned_placement`]).
+    Aligned,
     /// A leg from the feature to a shoulder carrying the text.
     Leader,
     /// An angle's arc, a point callout.
@@ -273,6 +276,8 @@ enum Shape {
 fn shape(pd: &PlacedDimension) -> Shape {
     if pd.arc.is_some() || degenerate(&pd.line) {
         Shape::Other
+    } else if crate::drawing::layout::is_aligned_placement(pd) {
+        Shape::Aligned
     } else if !degenerate(&pd.ext[0]) && !degenerate(&pd.ext[1]) {
         Shape::Linear((pd.line[0][1] - pd.line[1][1]).abs() < 1e-6)
     } else if !degenerate(&pd.ext[0]) {
@@ -690,6 +695,12 @@ pub fn move_dimension(
             return Err(refuse(
                 "not_movable",
                 format!("'{label}' is an angle or a point callout: it has no band or lane (drawing_dimension_properties move_mm moves its text)"),
+            ));
+        }
+        Shape::Aligned => {
+            return Err(refuse(
+                "aligned",
+                format!("'{label}' is an aligned dimension: it stands along its feature, in no band or lane (drawing_dimension_properties move_mm moves it)"),
             ));
         }
     }
@@ -1865,4 +1876,23 @@ pub fn judge_caption(delta: &SheetDelta, sound: Option<bool>, complete: Option<b
         "grade {:.2} -> {:.2}, below bar {} -> {}, {verdict}{complete}",
         delta.grade_before, delta.grade_after, delta.below_bar_before, delta.below_bar_after
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod aligned_shape_tests {
+    use super::*;
+
+    /// An aligned dimension is read as one: not a vertical stack dimension
+    /// (its line is neither level nor upright), so a band or lane verb is
+    /// refused for it by name rather than putting it in a band it does not
+    /// run along.
+    ///
+    /// Mutation: drop the `Shape::Aligned` arm of `shape` -> read as
+    /// `Linear(false)` -> RED.
+    #[test]
+    fn an_aligned_dimension_has_its_own_shape() {
+        let pd = crate::drawing::layout::aligned_tests::placed_aligned();
+        assert_eq!(shape(&pd), Shape::Aligned);
+    }
 }
