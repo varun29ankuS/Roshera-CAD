@@ -5542,6 +5542,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim-engine"
+version = "0.1.0"
+dependencies = [
+ "geometry-engine",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "simba"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

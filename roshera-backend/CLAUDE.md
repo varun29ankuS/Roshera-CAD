@@ -164,7 +164,7 @@ how review failed fourteen times.
 
 ## Workspace layout (verified against `roshera-backend/Cargo.toml`)
 
-Ten crates, resolver = "2":
+Eleven crates, resolver = "2":
 
 | Crate              | Responsibility                                           |
 |--------------------|----------------------------------------------------------|
@@ -178,6 +178,7 @@ Ten crates, resolver = "2":
 | `ros-format`       | Native `.ros` serialization                              |
 | `verdict-harness`  | Multi-agent verdict/consensus harness                    |
 | `assembly-engine`  | Instances, mates, SE(3) solve, interference              |
+| `sim-engine`       | Simulation: set-up checks (rigid-body, loads), meshing and solving through external engines, verdicts (in progress, 2026-11-23) |
 
 Workspace dependencies that matter: `axum 0.8.4` (with `ws`),
 `tower-http 0.6` (cors/fs/trace), `dashmap 6.1`, `parking_lot 0.12`,

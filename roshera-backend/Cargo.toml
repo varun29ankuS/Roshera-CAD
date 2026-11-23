@@ -9,7 +9,8 @@ members = [
     "export-engine",
     "ros-format",
     "verdict-harness",
-    "assembly-engine"
+    "assembly-engine",
+    "sim-engine"
 ]
 # vendor/goose is its own nested workspace (its crates inherit settings from
 # vendor/goose/Cargo.toml); api-server reaches it by path, it is never a member.

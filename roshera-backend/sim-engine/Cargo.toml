@@ -1,0 +1,14 @@
+[package]
+name = "sim-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Roshera simulation: study set-up checks, meshing and solving through engines, certified verdicts"
+
+[dependencies]
+geometry-engine = { path = "../geometry-engine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
