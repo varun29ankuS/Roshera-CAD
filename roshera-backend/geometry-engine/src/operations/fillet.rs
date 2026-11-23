@@ -3400,10 +3400,19 @@ fn cylinder_rim_fillet(
     // Cap and lateral trim circles share the cylinder's parametric
     // direction so loop orientation flags carry over from the original
     // top/bottom edges unchanged (see step 5).
-    let cap_trim_circle = Arc::circle(origin + axis * cap_h, axis, cap_r)
+    //
+    // Each circle's t = 0 is anchored to `ref_dir`, where its seam vertex
+    // (v_cap, v_lat) sits, as the cone path below anchors to `u_rad`.
+    // `Arc::circle` picks a canonical t = 0 (+X for a Z axis) that agrees
+    // with `ref_dir` only by accident: on a mirrored part (ref_dir = −X) both
+    // circles started half a turn from the vertex they close on, so every
+    // consumer that walks the edge from its vertex doubled back along it.
+    let mut cap_trim_circle = Arc::circle(origin + axis * cap_h, axis, cap_r)
         .map_err(|e| OperationError::NumericalError(format!("cap trim circle: {e}")))?;
-    let lat_trim_circle = Arc::circle(torus_center, axis, big_r)
+    cap_trim_circle.x_axis = ref_dir;
+    let mut lat_trim_circle = Arc::circle(torus_center, axis, big_r)
         .map_err(|e| OperationError::NumericalError(format!("lat trim circle: {e}")))?;
+    lat_trim_circle.x_axis = ref_dir;
 
     // The seam arc connects v_lat (radial direction at the start) to
     // v_cap (axial direction at the end) along a quarter-circle in the

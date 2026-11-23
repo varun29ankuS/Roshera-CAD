@@ -1378,6 +1378,17 @@ fn a_bore_rim_fillet_commutes_with_a_mirror() {
     let rim = top_rim(&a, aid);
     fillet_edges(&mut a, aid, rim, opts).expect("fillet the mirrored rim");
 
+    // The fillet's new trim circles start at their seam vertices. Measured
+    // before the fix: on the mirrored part (cylinder ref_dir = −X) the wall's
+    // new top rim started at the canonical +X, half a turn (one diameter,
+    // 8 mm) from the vertex it closes on; a 0.1 mm mesh cap hid the slit
+    // that left, a coarser cap meshed the wall open.
+    let off = edges_off_their_vertices(&a, aid);
+    assert!(
+        off.is_empty(),
+        "mirror-then-fillet: edges whose curve does not start and end on their vertices: {off:?}"
+    );
+
     assert!(
         a.certify_solid(aid).is_sound(),
         "mirror-then-fillet is sound"
