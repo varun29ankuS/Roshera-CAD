@@ -207,6 +207,7 @@ pub(crate) async fn make_test_state_with_database(
         consumed_uuids: Arc::new(DashMap::new()),
         solid_colors: Arc::new(DashMap::new()),
         solid_profiles: Arc::new(DashMap::new()),
+        sim_studies: Arc::new(DashMap::new()),
         lens: crate::lens_routes::LensStore::default(),
         ai_processor,
         session_aware_ai,
@@ -14599,4 +14600,79 @@ async fn sim_static_names_the_free_motions_of_a_part_on_a_roller() {
         .unwrap_or_default();
     assert_eq!(free.len(), 3, "two slides and a turn: {body}");
     assert!(free.iter().any(|m| m.starts_with("can turn")), "{body}");
+}
+
+/// The latest study on a part is served to the app whoever ran it, so the
+/// Simulate tab can show an agent's study: none yet -> 404 `no_study`; a
+/// recorded one -> its run id, set-up and report, and `stale: false` while
+/// the part is unchanged since it was verified.
+#[tokio::test]
+async fn sim_static_latest_serves_the_recorded_study() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
+    let get = |sid: SolidId| {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/agent/parts/{sid}/sim/static/latest"))
+            .body(Body::empty())
+            .expect("request must build")
+    };
+    let (status, body) = dispatch(&state, get(solid_id)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"].as_str(), Some("no_study"), "{body}");
+
+    let verify = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception"))
+        .body(Body::empty())
+        .expect("request must build");
+    let (vs, vb) = dispatch(&state, verify).await;
+    assert_eq!(vs, StatusCode::OK, "verify: {vb}");
+
+    let run = json!({
+        "mesh": { "size_mm": 1.0, "nodes": 10, "elements": 1, "boundary_deviation_mm": 0.0, "mesher_seconds": 0.1 },
+        "max_displacement_mm": 0.1, "peak_von_mises_mpa": 5.0, "peak_at": [0.0, 0.0, 0.0],
+        "reaction_total_n": [0.0, 0.0, 1.0], "load_on_held_n": [0.0, 0.0, 0.0], "solver_seconds": 0.1
+    });
+    let engine = json!({ "name": "Gmsh", "program": "gmsh", "version": "4", "interim": true });
+    let report: sim_engine::run::StaticReport = serde_json::from_value(json!({
+        "verdict": { "verdict": "undecided", "reason": "no yield strength with a source" },
+        "checks": [], "coarse": run, "fine": run,
+        "engines": { "mesher": engine, "solver": engine },
+        "face_pids": [], "assumptions": [], "field": {
+            "positions": [], "displacement": [], "von_mises": [], "triangles": [], "faces": [],
+            "min_von_mises": 0.0, "max_von_mises": 0.0
+        }
+    }))
+    .expect("a report must deserialize");
+    let study: sim_engine::study::Study = serde_json::from_value(json!({
+        "supports": [{ "kind": "fixed", "faces": [1] }],
+        "loads": [{ "faces": [2], "force_n": [0.0, 0.0, -1.0] }],
+        "material": { "name": "steel", "youngs_modulus_mpa": 210000.0, "poisson_ratio": 0.3 },
+        "goal": { "min_safety_factor": 2.0 }
+    }))
+    .expect("a study must deserialize");
+    state.sim_studies.insert(
+        solid_id,
+        std::sync::Arc::new(crate::handlers::agent::SimRecord {
+            run_id: "run-1".to_string(),
+            study,
+            report,
+        }),
+    );
+
+    let (status, body) = dispatch(&state, get(solid_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["run_id"].as_str(), Some("run-1"), "{body}");
+    assert_eq!(body["stale"].as_bool(), Some(false), "{body}");
+    assert_eq!(
+        body["study"]["supports"][0]["kind"].as_str(),
+        Some("fixed"),
+        "{body}"
+    );
+    assert_eq!(
+        body["report"]["verdict"]["verdict"].as_str(),
+        Some("undecided"),
+        "{body}"
+    );
 }

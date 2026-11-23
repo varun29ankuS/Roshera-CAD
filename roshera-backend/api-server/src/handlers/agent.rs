@@ -3748,7 +3748,7 @@ pub async fn measure(
 /// The study runs on a blocking thread under a READ lock on the model: the
 /// part cannot change under the solver, and the async runtime is not held.
 pub async fn part_sim_static(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Json(study): Json<sim_engine::study::Study>,
@@ -3796,6 +3796,7 @@ pub async fn part_sim_static(
     }
 
     let handle = model_handle.clone();
+    let asked = study.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let workdir = std::env::temp_dir()
             .join("roshera-sim")
@@ -3842,6 +3843,14 @@ pub async fn part_sim_static(
             let body = serde_json::to_value(&report).unwrap_or_else(
                 |e| serde_json::json!({ "error": "serialization_failed", "reason": e.to_string() }),
             );
+            state.sim_studies.insert(
+                id,
+                std::sync::Arc::new(SimRecord {
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    study: asked,
+                    report,
+                }),
+            );
             (StatusCode::OK, Json(body))
         }
         Ok(Err(SimFailure::Engine(e))) => (
@@ -3865,6 +3874,54 @@ pub async fn part_sim_static(
             Json(serde_json::json!({ "error": "sim_crashed", "reason": join.to_string() })),
         ),
     }
+}
+
+/// A solid's latest static study: what was asked and what the kernel
+/// answered, with an id the app uses to tell a new run from the one it
+/// already shows.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SimRecord {
+    pub run_id: String,
+    pub study: sim_engine::study::Study,
+    pub report: sim_engine::run::StaticReport,
+}
+
+/// `GET /api/agent/parts/{id}/sim/static/latest` -- the solid's latest
+/// static study, whoever ran it (the app's Run button or an agent's
+/// `sim_static`), so the Simulate tab can show an agent's study on the part.
+/// `stale: true` when the solid has changed since: the report then describes
+/// geometry that no longer exists, and the app says so instead of colouring
+/// the new shape with old numbers.
+///
+/// 404 `no_study` -- nothing has been run on this solid since the server
+/// started.
+pub async fn part_sim_static_latest(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(record) = state.sim_studies.get(&id).map(|r| r.value().clone()) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no_study",
+                "reason": format!("no static study has been run on solid {id}"),
+            })),
+        );
+    };
+    let stale = {
+        let model = model_handle.read().await;
+        model
+            .soundness_reading(id as SolidId)
+            .map_or(true, |r| r.is_stale())
+    };
+    let mut body = serde_json::to_value(&*record).unwrap_or_else(
+        |e| serde_json::json!({ "error": "serialization_failed", "reason": e.to_string() }),
+    );
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("stale".to_string(), serde_json::Value::Bool(stale));
+    }
+    (StatusCode::OK, Json(body))
 }
 
 /// Why `part_sim_static` did not produce a report.

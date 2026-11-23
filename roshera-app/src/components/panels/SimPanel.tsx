@@ -10,8 +10,10 @@ import {
   SUPPORT_KINDS,
   deformScale,
   engineLabel,
+  fetchLatest,
   fieldRange,
   runStatic,
+  setupOf,
   setupGaps,
   stressColor,
   studyOf,
@@ -110,6 +112,31 @@ export function SimPanel() {
     [picks, partId],
   )
 
+  // A study run elsewhere -- by an agent through `sim_static` -- is shown
+  // here as it lands: its part, its set-up and its result on the part. A
+  // study on a part that has changed since is not shown (its numbers belong
+  // to a shape that no longer exists).
+  const { loadRun, markSeen } = sim
+  useEffect(() => {
+    let stop = false
+    const tick = async () => {
+      for (const p of parts) {
+        const sid = solidOf(p)
+        if (typeof sid !== 'number') continue
+        const rec = await fetchLatest(sid).catch(() => null)
+        if (stop) return
+        if (!rec || rec.stale || useSimStore.getState().seenRuns.has(rec.run_id)) continue
+        loadRun(rec.run_id, p.id, setupOf(rec.study), rec.report)
+      }
+    }
+    void tick()
+    const timer = setInterval(() => void tick(), 3000)
+    return () => {
+      stop = true
+      clearInterval(timer)
+    }
+  }, [parts, loadRun])
+
   const [supportKind, setSupportKind] = useState<SupportKind>('fixed')
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' })
 
@@ -143,6 +170,9 @@ export function SimPanel() {
       if (out.kind === 'report') {
         sim.setReport(out.report)
         setPhase({ kind: 'idle' })
+        // This run is already on screen with the set-up as entered.
+        const rec = await fetchLatest(solidId).catch(() => null)
+        if (rec) markSeen(rec.run_id)
       } else if (out.kind === 'can_move') {
         setPhase({ kind: 'can_move', motions: out.motions })
       } else {
@@ -259,7 +289,12 @@ export function SimPanel() {
                   <input
                     className={cn(field, 'h-6 w-16 font-mono')}
                     value={Number.isFinite(l.newtons) ? String(l.newtons) : ''}
-                    onChange={(e) => sim.updateLoad(i, { newtons: Number(e.target.value) })}
+                    onChange={(e) => {
+                      const n = Number(e.target.value)
+                      const g = l.given
+                      const k = g && l.newtons > 0 ? n / l.newtons : 0
+                      sim.updateLoad(i, g ? { newtons: n, given: [g[0] * k, g[1] * k, g[2] * k] } : { newtons: n })
+                    }}
                     inputMode="decimal"
                     aria-label="Force (N)"
                   />
@@ -278,6 +313,11 @@ export function SimPanel() {
                     onChange={(e) => sim.updateLoad(i, { direction: e.target.value as LoadDirection })}
                     aria-label="Direction"
                   >
+                    {l.given && (
+                      <option value="given">
+                        As given ({l.given.map((c) => Math.round(c * 10) / 10).join(', ')} N)
+                      </option>
+                    )}
                     {LOAD_DIRECTIONS.filter((d) => d.id !== 'into' || l.normal).map((d) => (
                       <option key={d.id} value={d.id}>
                         {d.label}

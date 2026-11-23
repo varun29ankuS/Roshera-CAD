@@ -17,6 +17,8 @@ interface SimState {
   deformed: boolean
   /** The set-up row the person is looking at; its faces are drawn strongest. */
   focus: { kind: 'support' | 'load'; index: number } | null
+  /** Server run ids already shown or seen, so a study is loaded once. */
+  seenRuns: Set<string>
 
   setPart: (objectId: string | null) => void
   addSupport: (s: SupportEntry) => void
@@ -32,6 +34,10 @@ interface SimState {
   show: (shown: FieldShown) => void
   setDeformed: (deformed: boolean) => void
   setFocus: (focus: SimState['focus']) => void
+  /** Show a study run elsewhere (an agent): its part, set-up and report. */
+  loadRun: (runId: string, objectId: string, setup: Setup, report: StaticReport) => void
+  /** Remember a run as seen without showing it (the app's own run). */
+  markSeen: (runId: string) => void
 }
 
 const EMPTY_SETUP: Setup = {
@@ -53,6 +59,7 @@ export const useSimStore = create<SimState>((set) => ({
   shown: 'stress',
   deformed: true,
   focus: null,
+  seenRuns: new Set(),
 
   setPart: (objectId) =>
     set((s) => (s.objectId === objectId ? s : { objectId, setup: EMPTY_SETUP, report: null, focus: null })),
@@ -72,4 +79,7 @@ export const useSimStore = create<SimState>((set) => ({
   show: (shown) => set({ shown }),
   setDeformed: (deformed) => set({ deformed }),
   setFocus: (focus) => set({ focus }),
+  loadRun: (runId, objectId, setup, report) =>
+    set((s) => ({ objectId, setup, report, focus: null, seenRuns: new Set(s.seenRuns).add(runId) })),
+  markSeen: (runId) => set((s) => ({ seenRuns: new Set(s.seenRuns).add(runId) })),
 }))

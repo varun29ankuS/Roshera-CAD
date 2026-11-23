@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-const { forceOf, setupGaps, studyOf, simRunOf, verdictView, stressColor, fieldBuffers, deformScale, fieldRange } =
+const { setupOf, forceOf, setupGaps, studyOf, simRunOf, verdictView, stressColor, fieldBuffers, deformScale, fieldRange } =
   await import('../src/lib/sim.ts')
 
 const material = { name: 'Al 6061-T6', youngs_modulus_mpa: '68900', poisson_ratio: '0.33', yield_strength_mpa: '276', source: 'customer datasheet' }
@@ -101,4 +101,19 @@ test('the deformation is exaggerated to a round factor showing the largest movem
   assert.equal(deformScale(field), 20)
   assert.equal(deformScale({ ...field, displacement: field.displacement.map(() => [0, 0, 0]) }), 1)
   assert.equal(deformScale({ ...field, displacement: [[0, 0, 0], [0, 0, -50], [0, 0, 0]] }), 1)
+})
+
+test("an agent's study is shown as it was run, and runs again unchanged", () => {
+  const agent = {
+    supports: [{ kind: 'fixed', faces: [1903, 1904] }],
+    loads: [{ faces: [1916], force_n: [200, 0, 30], spread: 'even' }],
+    material: { name: 'aluminium', youngs_modulus_mpa: 68900, poisson_ratio: 0.33 },
+    goal: { min_safety_factor: 2 },
+    mesh: {},
+  }
+  const setup = setupOf(agent)
+  assert.equal(setup.loads[0].direction, 'given')
+  assert.deepEqual(forceOf(setup.loads[0]), [200, 0, 30], 'the force vector the agent gave, not an axis')
+  assert.equal(setup.material.yield_strength_mpa, '', 'no yield given stays no yield')
+  assert.deepEqual(studyOf(setup), agent, 'the same study goes back to the kernel')
 })

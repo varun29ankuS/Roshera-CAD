@@ -87,7 +87,7 @@ export interface StaticReport {
 
 /** Directions a load can be given in: along a model axis, or pushing into
  *  the loaded face (against its outward normal). */
-export type LoadDirection = '+x' | '-x' | '+y' | '-y' | '+z' | '-z' | 'into'
+export type LoadDirection = '+x' | '-x' | '+y' | '-y' | '+z' | '-z' | 'into' | 'given'
 
 export const LOAD_DIRECTIONS: { id: LoadDirection; label: string }[] = [
   { id: 'into', label: 'Into the face' },
@@ -120,6 +120,8 @@ export interface LoadEntry {
   /** The loaded faces' outward normal (area-weighted, model axes), needed
    *  for an 'into' load. */
   normal: Vec3 | null
+  /** A 'given' load's total force vector, N -- as an agent set it. */
+  given?: Vec3
 }
 
 export interface MaterialEntry {
@@ -138,7 +140,7 @@ export interface Setup {
   meshSizeMm: string
 }
 
-const AXES: Record<Exclude<LoadDirection, 'into'>, Vec3> = {
+const AXES: Record<Exclude<LoadDirection, 'into' | 'given'>, Vec3> = {
   '+x': [1, 0, 0],
   '-x': [-1, 0, 0],
   '+y': [0, 1, 0],
@@ -149,6 +151,10 @@ const AXES: Record<Exclude<LoadDirection, 'into'>, Vec3> = {
 
 /** A load's total force vector, N, or null when it has no direction. */
 export function forceOf(load: LoadEntry): Vec3 | null {
+  if (load.direction === 'given') {
+    const g = load.given
+    return g && Math.hypot(g[0], g[1], g[2]) > 0 ? [g[0], g[1], g[2]] : null
+  }
   let d: Vec3
   if (load.direction === 'into') {
     const n = load.normal
@@ -212,6 +218,47 @@ export function studyOf(setup: Setup): Study | null {
     goal: { min_safety_factor: Number(setup.minSafetyFactor) },
     mesh: size !== null ? { size_mm: size } : {},
   }
+}
+
+/** The set-up a study was run with, as the panel shows it (a study run by
+ *  an agent: its loads keep the force vectors it gave). */
+export function setupOf(study: Study): Setup {
+  const m = study.material
+  return {
+    supports: study.supports.map((s) => ({ kind: s.kind, faces: [...s.faces] })),
+    loads: study.loads.map((l) => ({
+      faces: [...l.faces],
+      direction: 'given' as const,
+      newtons: Math.hypot(l.force_n[0], l.force_n[1], l.force_n[2]),
+      spread: l.spread ?? 'even',
+      normal: null,
+      given: [l.force_n[0], l.force_n[1], l.force_n[2]] as Vec3,
+    })),
+    material: {
+      name: m.name,
+      youngs_modulus_mpa: String(m.youngs_modulus_mpa),
+      poisson_ratio: String(m.poisson_ratio),
+      yield_strength_mpa: m.yield_strength_mpa !== undefined && m.yield_strength_mpa !== null ? String(m.yield_strength_mpa) : '',
+      source: m.source ?? '',
+    },
+    minSafetyFactor: String(study.goal.min_safety_factor),
+    meshSizeMm: study.mesh?.size_mm !== undefined && study.mesh?.size_mm !== null ? String(study.mesh.size_mm) : '',
+  }
+}
+
+/** A part's latest study, whoever ran it. `stale`: the part changed since. */
+export interface SimRecord {
+  run_id: string
+  study: Study
+  report: StaticReport
+  stale: boolean
+}
+
+/** The latest study on a part, or null when none has been run. */
+export async function fetchLatest(solidId: number): Promise<SimRecord | null> {
+  const r = await fetch(`${API_HOST}/api/agent/parts/${solidId}/sim/static/latest`)
+  if (!r.ok) return null
+  return (await r.json()) as SimRecord
 }
 
 // ─── Running it ─────────────────────────────────────────────────────────

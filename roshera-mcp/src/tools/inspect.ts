@@ -314,15 +314,14 @@ export function registerInspectTools(server: ToolHost) {
     },
     async (args) => {
       try {
-        return ok(
-          await api("POST", `/api/agent/parts/${args.part_id}/sim/static`, {
-            supports: args.supports,
-            loads: args.loads,
-            material: args.material,
-            goal: { min_safety_factor: args.min_safety_factor },
-            mesh: { size_mm: args.mesh_size_mm },
-          }),
-        );
+        const report = await api("POST", `/api/agent/parts/${args.part_id}/sim/static`, {
+          supports: args.supports,
+          loads: args.loads,
+          material: args.material,
+          goal: { min_safety_factor: args.min_safety_factor },
+          mesh: { size_mm: args.mesh_size_mm },
+        });
+        return ok(simForAgent(report));
       } catch (e) {
         return fail(e);
       }
@@ -576,4 +575,26 @@ export function dfmBody(args: {
     set("min_draft_deg", args.min_draft_deg);
   }
   return body;
+}
+
+/** A static-study report as the agent reads it: everything but the result
+ *  field's per-vertex arrays (megabytes on a real part; the viewport draws
+ *  them), which become a summary -- how much of the part they cover and
+ *  the stress range -- with where the person sees them. */
+export function simForAgent(report: unknown): unknown {
+  if (!report || typeof report !== "object") return report;
+  const r = report as Record<string, unknown>;
+  const field = r.field as Record<string, unknown> | undefined;
+  if (!field || typeof field !== "object") return report;
+  const count = (k: string) => (Array.isArray(field[k]) ? (field[k] as unknown[]).length : 0);
+  return {
+    ...r,
+    field: {
+      vertices: count("positions"),
+      triangles: count("triangles"),
+      min_von_mises: field.min_von_mises,
+      max_von_mises: field.max_von_mises,
+      shown: "coloured on the part in the person's Simulate tab (open it with the workspace tool, mode 'simulate')",
+    },
+  };
 }
