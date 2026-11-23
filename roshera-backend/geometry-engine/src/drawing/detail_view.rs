@@ -428,6 +428,17 @@ pub(crate) fn attach_detail_views(drawing: &mut super::types::Drawing) {
             .cloned()
             .collect();
         if members.len() < 2 {
+            // No chain of locations: crowded LENGTHS move into a detail
+            // as they are ([`attach_length_detail`]).
+            let lengths: Vec<super::dimensioning::Dimension2d> = parent
+                .dimensions
+                .iter()
+                .filter(|d| ids.contains(&d.id) && d.kind == "length")
+                .cloned()
+                .collect();
+            if lengths.len() >= 2 {
+                attach_length_detail(drawing, vi, lengths);
+            }
             continue;
         }
         // One datum, one axis, one sense: then the difference of two
@@ -542,6 +553,130 @@ pub(crate) fn attach_detail_views(drawing: &mut super::types::Drawing) {
     }
 }
 
+/// A DETAIL view for crowded LENGTHS of view `vi`: two or more lengths along
+/// one axis whose extension lines print on each other's (their ends closer
+/// than half a millimetre on paper: CADGenBench 109's groove "6" and its
+/// floor "5.5", ends 0.25 mm apart). A length states its own feature's size,
+/// so it moves into the detail UNCHANGED -- no chain, no restatement -- and
+/// the detail is drawn at the smallest ISO scale that puts the closest two
+/// of their ends [`DETAIL_FEATURE_GAP_MM`] apart on paper. Radius callouts
+/// inside the circle move with them, as for a chain detail. Lengths on more
+/// than one axis, a circle wider than [`DETAIL_MAX_PAPER_MM`] on paper, or
+/// no free paper: nothing is moved, and the quality check still reports the
+/// pair.
+fn attach_length_detail(
+    drawing: &mut super::types::Drawing,
+    vi: usize,
+    lengths: Vec<super::dimensioning::Dimension2d>,
+) {
+    let Some(parent) = drawing.views.get(vi) else {
+        return;
+    };
+    // Why a crowded group got no detail, for `ROSHERA_DRAW_PROFILE`.
+    let refuse = |why: String| {
+        if super::dimensioning::draw_profile_enabled() {
+            let names: Vec<String> = lengths
+                .iter()
+                .map(|d| {
+                    format!(
+                        "{} [{:.2},{:.2}]-[{:.2},{:.2}]",
+                        d.label, d.a[0], d.a[1], d.b[0], d.b[1]
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[draw-profile]   no detail for lengths {names:?} in {}: {why}",
+                parent.name
+            );
+        }
+    };
+    let along = |d: &super::dimensioning::Dimension2d| [d.b[0] - d.a[0], d.b[1] - d.a[1]];
+    let first = along(&lengths[0]);
+    let axis = if first[0].abs() >= first[1].abs() {
+        0
+    } else {
+        1
+    };
+    if !lengths.iter().all(|d| along(d)[1 - axis].abs() < 1e-6) {
+        refuse("not along one axis".to_string());
+        return;
+    }
+    // The closest two distinct ends along the axis.
+    let mut ends: Vec<f64> = lengths
+        .iter()
+        .flat_map(|d| [d.a[axis], d.b[axis]])
+        .collect();
+    ends.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ends.dedup_by(|a, b| (*a - *b).abs() <= 1e-6);
+    let gap = ends
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .fold(f64::INFINITY, f64::min);
+    if !(gap > 1e-6) {
+        refuse("their ends coincide".to_string());
+        return;
+    }
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for d in &lengths {
+        for p in [d.a, d.b] {
+            for i in 0..2 {
+                lo[i] = lo[i].min(p[i]);
+                hi[i] = hi[i].max(p[i]);
+            }
+        }
+    }
+    let centre = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])];
+    let half_diag = 0.5 * (hi[0] - lo[0]).hypot(hi[1] - lo[1]);
+    let radius = (1.3 * half_diag + 2.0).max(DETAIL_MIN_RADIUS_MM);
+    let need = (DETAIL_FEATURE_GAP_MM / gap).max(2.0 * parent.scale);
+    let Some(k) = super::dimensioning::ISO_SCALES
+        .iter()
+        .rev()
+        .copied()
+        .find(|&s| s >= need - 1e-12)
+        .filter(|&s| 2.0 * radius * s <= DETAIL_MAX_PAPER_MM)
+    else {
+        refuse(format!(
+            "a circle of radius {radius:.1} mm at the scale that parts {gap:.2} mm is wider than {DETAIL_MAX_PAPER_MM} mm"
+        ));
+        return;
+    };
+    let Some(position) = free_slot(drawing, centre, radius, k) else {
+        refuse(format!(
+            "no free paper for a {:.0} mm detail at {k}:1",
+            2.0 * radius * k
+        ));
+        return;
+    };
+    let letter = next_letter(drawing);
+    let parent = &drawing.views[vi];
+    let mut detail = clipped_view(parent, centre, radius);
+    detail.id = super::types::ProjectedViewId::new();
+    detail.name = format!("DETAIL {letter}");
+    detail.scale = k;
+    detail.position_mm = position;
+    let mut moved: Vec<String> = lengths.iter().map(|d| d.id.clone()).collect();
+    detail.dimensions = lengths;
+    for d in &parent.dimensions {
+        let point_callout = d.kind == "radius" || super::dimensioning::is_blend_callout(&d.kind);
+        if point_callout && (d.a[0] - centre[0]).hypot(d.a[1] - centre[1]) <= radius {
+            detail.dimensions.push(d.clone());
+            moved.push(d.id.clone());
+        }
+    }
+    let detail_idx = drawing.views.len();
+    drawing.views[vi]
+        .dimensions
+        .retain(|d| !moved.contains(&d.id));
+    drawing.views.push(detail);
+    drawing.details.push(super::types::DetailSemantics {
+        letter,
+        parent_view_idx: vi,
+        detail_view_idx: detail_idx,
+        centre,
+        radius,
+    });
+}
 /// The next unused view letter: SECTION A-A takes "A"; I, O and Q are not
 /// used (they read as 1 and 0).
 fn next_letter(drawing: &super::types::Drawing) -> String {
@@ -702,6 +837,105 @@ mod build_tests {
             member_points: Vec::new(),
             chain_from: None,
         }
+    }
+
+    /// A length along X from `x0` to `x1` at height `y`.
+    fn length(id: &str, x0: f64, x1: f64, y: f64) -> Dimension2d {
+        Dimension2d {
+            kind: "length".to_string(),
+            value: x1 - x0,
+            label: format!("{}", x1 - x0),
+            a: [x0, y],
+            b: [x1, y],
+            datum: None,
+            ..location(id, x1, y)
+        }
+    }
+
+    /// Two LENGTHS whose ends lie a quarter of a millimetre apart (a groove
+    /// 6 wide and its 5.5 floor: CADGenBench 109's "5.5" and "6", on every
+    /// sheet the search drew) print on each other's lines at any scale a
+    /// sheet can hold. They move, unchanged, into a DETAIL view drawn large
+    /// enough to part their lines; nothing is left on each other's lines.
+    /// (A detail used to be drawn only for locations, restated as chains.)
+    ///
+    /// Mutation: drop the length arm of `attach_detail_views` -> the pair
+    /// stays on FRONT -> RED.
+    #[test]
+    fn crowded_lengths_move_into_a_detail_view() {
+        let mut v = front(1.0);
+        // Three: the stack staggers a close pair to opposite sides of the
+        // view, so a third finds both sides taken (on 109 the far side was).
+        v.dimensions = vec![
+            length("six", 10.0, 16.0, 5.0),
+            length("five", 10.25, 15.75, 6.0),
+            length("mid", 10.45, 15.55, 7.0),
+        ];
+        let mut d = Drawing::new("detail", SheetSize::A3);
+        d.add_view(v);
+        let before = crate::drawing::verify::find_dimensions_on_each_others_lines(
+            &crate::drawing::layout::compute_layout(&d),
+        );
+        assert!(
+            !before.is_empty(),
+            "fixture: the lengths print on each other's lines"
+        );
+
+        attach_detail_views(&mut d);
+
+        let after = crate::drawing::verify::find_dimensions_on_each_others_lines(
+            &crate::drawing::layout::compute_layout(&d),
+        );
+        assert!(after.is_empty(), "still on each other's lines: {after:?}");
+        assert_eq!(d.details.len(), 1, "one detail");
+        let view = &d.views[d.details[0].detail_view_idx];
+        // Its closest two ends stand at least 1.5 mm apart on paper.
+        let mut ends: Vec<f64> = view
+            .dimensions
+            .iter()
+            .flat_map(|x| [x.a[0], x.b[0]])
+            .collect();
+        ends.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let closest = ends
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            closest * view.scale >= DETAIL_FEATURE_GAP_MM - 1e-9,
+            "closest ends {closest} mm at {}:1 are under {DETAIL_FEATURE_GAP_MM} mm on paper",
+            view.scale
+        );
+        let ids: Vec<&str> = view.dimensions.iter().map(|x| x.id.as_str()).collect();
+        assert!(
+            ids.len() >= 2,
+            "the crowded lengths are stated in the detail: {ids:?}"
+        );
+        for id in &ids {
+            assert!(
+                !d.views[0].dimensions.iter().any(|x| x.id == *id),
+                "{id} is not stated again on FRONT"
+            );
+        }
+        let stated = d
+            .views
+            .iter()
+            .flat_map(|v| &v.dimensions)
+            .filter(|x| x.kind == "length")
+            .count();
+        assert_eq!(stated, 3, "every length is stated once, somewhere");
+        for x in &view.dimensions {
+            let c = d.details[0].centre;
+            let r = d.details[0].radius;
+            assert!(
+                inside_disc(x.a, c, r) && inside_disc(x.b, c, r),
+                "{} lies in the circle",
+                x.id
+            );
+        }
+    }
+
+    fn inside_disc(p: [f64; 2], c: [f64; 2], r: f64) -> bool {
+        (p[0] - c[0]).hypot(p[1] - c[1]) <= r + 1e-9
     }
 
     /// The detail view is reached in production: the automatic sheet build

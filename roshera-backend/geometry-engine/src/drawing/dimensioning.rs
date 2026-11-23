@@ -487,7 +487,7 @@ pub(crate) fn candidates_from_records(
             if d.kind == "angle" {
                 return shows_cone_angle(d, &projection);
             }
-            d.projected_span() >= min_span
+            d.projected_span() >= min_span && shows_true_length(d)
         })
         .collect();
     // Drawing convention: a linear dimension shows just its value — strip the
@@ -676,6 +676,28 @@ fn shows_cone_angle(d: &Dimension2d, projection: &ProjectionType) -> bool {
     };
     let len = dot3(axis, axis).sqrt();
     len < 1e-12 || (dot3(axis, vd) / len).abs() < END_ON_COS
+}
+
+/// Most a length's line may differ from the value it states and still be
+/// its true length in the view (view mm, unit scale): float noise only.
+const TRUE_LENGTH_TOL_MM: f64 = 1e-3;
+
+/// Does this view draw a length, a location or an extent at the value it
+/// states? Its line runs `value` long only when the direction it measures
+/// along lies in the view's plane; obliquely, the line is shorter than its
+/// number (CADGenBench 109's FRONT drew a "5.5" 2.75 long and a "6" 3.0
+/// long: walls of a 12-fold pattern 60 degrees round from the view). A
+/// reader measuring the sheet would read the wrong size, so such a view does
+/// not offer it; a view square to it does, and when none of the principal
+/// views is, the certificate owes it
+/// ([`super::completeness::OmissionReason::NotTrueLengthInAnyView`]).
+/// Every other kind is judged by its own rule.
+pub(crate) fn shows_true_length(d: &Dimension2d) -> bool {
+    if !matches!(d.kind.as_str(), "length" | "position" | "extent") {
+        return true;
+    }
+    let along = (d.a[0] - d.b[0]).abs().max((d.a[1] - d.b[1]).abs());
+    (along - d.value.abs()).abs() <= TRUE_LENGTH_TOL_MM.max(1e-6 * d.value.abs())
 }
 
 /// `|cos|` between a cone's axis and the view direction above which the cone
@@ -7865,5 +7887,60 @@ pub(crate) mod dimension_find_counter {
             3,
             "drawing the views finds none again"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub(crate) mod true_length_tests {
+    use super::*;
+    use crate::readable::DimensionRecord;
+
+    /// A length of `value` measured along `dir` (world), centred at the
+    /// origin: what a feature of a polar pattern yields at its own angle.
+    pub(crate) fn record(id: &str, kind: &str, value: f64, dir: [f64; 3]) -> DimensionRecord {
+        DimensionRecord {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            value,
+            unit: "mm".to_string(),
+            label: format!("{value}"),
+            entities: vec![1, 2],
+            anchor: [0.0, 0.0, 5.0],
+            direction: dir,
+            axis: None,
+            pid: Some(format!("pid-{id}")),
+            datum: None,
+        }
+    }
+
+    /// A slot wall pair 60 degrees round from X (a 12-fold pattern's
+    /// instance, CADGenBench 109's "5.5" and "6"): FRONT (looking along Y)
+    /// would draw its 6 three millimetres long. It is offered in no principal
+    /// view (RIGHT: 5.2 long; TOP: drawn along its horizontal, 3 long).
+    ///
+    /// Mutation: drop the true-length rule from `candidates_from_records` ->
+    /// FRONT offers the 6 drawn 3.0 long -> RED.
+    #[test]
+    fn a_view_offers_a_length_only_at_its_true_length() {
+        let model = BRepModel::new();
+        let c = 60f64.to_radians();
+        let oblique = || vec![record("w", "length", 6.0, [c.cos(), c.sin(), 0.0])];
+        let front = candidates_from_records(&model, oblique(), ProjectionType::Front, 0.5);
+        assert!(front.is_empty(), "FRONT offers {front:?}");
+        let right = candidates_from_records(&model, oblique(), ProjectionType::Right, 0.5);
+        assert!(right.is_empty(), "RIGHT offers {right:?}");
+        // In TOP the wall pair lies in the plane, but the layout draws a
+        // linear dimension along the view's horizontal or vertical: 3 long.
+        let top = candidates_from_records(&model, oblique(), ProjectionType::Top, 0.5);
+        assert!(top.is_empty(), "TOP offers {top:?}");
+        // An along-X length reads true in FRONT, as before.
+        let square = candidates_from_records(
+            &model,
+            vec![record("x", "length", 6.0, [1.0, 0.0, 0.0])],
+            ProjectionType::Front,
+            0.5,
+        );
+        assert_eq!(square.len(), 1);
     }
 }

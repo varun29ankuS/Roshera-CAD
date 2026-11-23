@@ -58,6 +58,13 @@ pub enum OmissionReason {
     /// It is on no view, and no rule above explains why (the sheet's stored
     /// record was changed, or the view that showed it was removed).
     NotOnSheet,
+    /// A length, location or extent that no principal view draws at its true
+    /// length: it is measured along no world axis, and in every view its line
+    /// (drawn along the view's horizontal or vertical) would be shorter than
+    /// the value it states. It is not drawn foreshortened (CADGenBench 109's
+    /// "5.5" spanned 2.75 mm); an aligned dimension or an auxiliary view
+    /// would state it.
+    NotTrueLengthInAnyView,
 }
 
 impl OmissionReason {
@@ -71,6 +78,9 @@ impl OmissionReason {
             OmissionReason::NotPlaced => "no room on the sheet to draw it",
             OmissionReason::Suppressed => "suppressed",
             OmissionReason::NotOnSheet => "on no view of the sheet",
+            OmissionReason::NotTrueLengthInAnyView => {
+                "no principal view draws it at true length (needs an aligned dimension or an auxiliary view)"
+            }
         }
     }
 }
@@ -271,8 +281,44 @@ pub fn dimension_omissions(model: &BRepModel, drawing: &Drawing) -> Vec<Dimensio
         }
     }
 
+    // A length no principal view draws true is a candidate of none, so the
+    // loop above never sees it: owe it here, with its reason, rather than
+    // read the sheet complete without it.
+    let mut oblique: Vec<(String, Dimension2d)> = true_length_in_no_view(model, &records)
+        .into_iter()
+        .filter(|(id, _)| !covered.contains(id))
+        .collect();
+    oblique.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut reported: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
+    for (id, c) in oblique {
+        if !reported.insert(id.clone()) {
+            continue;
+        }
+        let waiver = c
+            .key
+            .as_ref()
+            .and_then(|k| drawing.dimension_edits.get(k))
+            .and_then(|e| e.suppressed.clone());
+        out.push(DimensionOmission {
+            view: "no principal view".to_string(),
+            owner_view: None,
+            key: c.key,
+            kind: c.kind,
+            label: c.label,
+            value: c.value,
+            unit: c.unit,
+            entities: c.entities,
+            pid: c.pid,
+            reason: if waiver.is_some() {
+                OmissionReason::Suppressed
+            } else {
+                OmissionReason::NotTrueLengthInAnyView
+            },
+            waiver,
+        });
+    }
     for (id, c, name, owner) in missing {
         if covered.contains(&id) || !reported.insert(id.clone()) {
             continue;
@@ -306,6 +352,47 @@ pub fn dimension_omissions(model: &BRepModel, drawing: &Drawing) -> Vec<Dimensio
         });
     }
     out
+}
+
+/// The lengths, locations and extents of `records` that read in some
+/// principal view (their line at least [`MIN_SPAN`] long) but at true length
+/// in none ([`super::dimensioning::shows_true_length`]): each with its
+/// identity, once. No principal view offers them, so the sheet can only owe
+/// them -- an aligned dimension or an auxiliary view would state them.
+///
+/// One oblique reading is enough: the layout draws a linear dimension along
+/// a view's horizontal or vertical, so only a direction on a world axis is
+/// ever drawn true, and such a direction is true in every view it reads in
+/// (edge-on in the third, where it does not read).
+pub(crate) fn true_length_in_no_view(
+    model: &BRepModel,
+    records: &[crate::readable::DimensionRecord],
+) -> Vec<(String, Dimension2d)> {
+    let mut oblique: Vec<(String, Dimension2d)> = Vec::new();
+    for (projection, _) in PRINCIPAL {
+        for d in super::dimensioning::project_records(model, records.to_vec(), projection) {
+            if !matches!(d.kind.as_str(), "length" | "position" | "extent")
+                || d.projected_span() < MIN_SPAN
+            {
+                continue;
+            }
+            if super::dimensioning::shows_true_length(&d) {
+                continue;
+            }
+            let id = identity(&d);
+            if !oblique.iter().any(|(o, _)| *o == id) {
+                if super::dimensioning::draw_profile_enabled() {
+                    let along = (d.a[0] - d.b[0]).abs().max((d.a[1] - d.b[1]).abs());
+                    eprintln!(
+                        "[draw-profile]   owed, not true length in {projection:?}: {} '{}' drawn {along:.4} for {:.4}, along {:?}, faces {:?}",
+                        d.kind, d.label, d.value, d.dir3, d.entities
+                    );
+                }
+                oblique.push((id, d));
+            }
+        }
+    }
+    oblique
 }
 
 /// The location records (by pid) a CHAIN states
@@ -470,5 +557,50 @@ mod tests {
         );
         let without_anchor = chain_located([&b, &c].into_iter());
         assert!(without_anchor.is_empty(), "{without_anchor:?}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod true_length_owed_tests {
+    use super::*;
+    use crate::drawing::dimensioning::true_length_tests::record;
+
+    /// A length measured along no world axis is owed -- whether skew to all
+    /// three views or lying in TOP's plane at 60 degrees (the layout would
+    /// draw it along TOP's horizontal, 3 long, under its 6). One along a world
+    /// axis is drawn true and is not owed.
+    ///
+    /// Mutation: drop the `shows_true_length` skip -> the along-X length
+    /// is owed too -> RED.
+    #[test]
+    fn a_length_true_in_no_principal_view_is_owed() {
+        let model = BRepModel::new();
+        let k = 1.0 / 3f64.sqrt();
+        let c = 60f64.to_radians();
+        let records = vec![
+            record("skew", "length", 6.0, [k, k, k]),
+            record("polar", "length", 5.5, [c.cos(), c.sin(), 0.0]),
+            record("square", "length", 6.0, [1.0, 0.0, 0.0]),
+        ];
+        let mut owed: Vec<String> = true_length_in_no_view(&model, &records)
+            .into_iter()
+            .map(|(_, d)| d.id)
+            .collect();
+        owed.sort();
+        assert_eq!(owed, ["polar", "skew"]);
+    }
+    /// The pass is reached in production: `dimension_omissions` owes what it
+    /// finds, with its reason (the disconnection gate: a capability ships
+    /// with its call site).
+    #[test]
+    fn dimension_omissions_owes_lengths_true_in_no_view() {
+        let source = include_str!("completeness.rs").replace("\r\n", "\n");
+        let production = source
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("split always yields a first element");
+        assert!(production.contains("true_length_in_no_view(model, &records)"));
+        assert!(production.contains("OmissionReason::NotTrueLengthInAnyView\n"));
     }
 }
