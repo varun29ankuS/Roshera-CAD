@@ -284,9 +284,11 @@ pub fn dimension_omissions(model: &BRepModel, drawing: &Drawing) -> Vec<Dimensio
     // A length no principal view draws true is a candidate of none, so the
     // loop above never sees it: owe it here, with its reason, rather than
     // read the sheet complete without it.
+    // A pattern instance a counted callout names ("12× 6",
+    // `count_pattern_lengths`) is stated by it.
     let mut oblique: Vec<(String, Dimension2d)> = true_length_in_no_view(model, &records)
         .into_iter()
-        .filter(|(id, _)| !covered.contains(id))
+        .filter(|(id, _)| !covered.contains(id) && !inked_identities.contains(id))
         .collect();
     oblique.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -313,6 +315,9 @@ pub fn dimension_omissions(model: &BRepModel, drawing: &Drawing) -> Vec<Dimensio
             pid: c.pid,
             reason: if waiver.is_some() {
                 OmissionReason::Suppressed
+            } else if carried.contains(&id) {
+                // Named by a counted callout the layout found no room for.
+                OmissionReason::NotPlaced
             } else {
                 OmissionReason::NotTrueLengthInAnyView
             },

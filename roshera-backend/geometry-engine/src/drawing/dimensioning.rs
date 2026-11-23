@@ -631,6 +631,135 @@ pub(crate) fn count_equal_features(drawing: &mut super::types::Drawing) {
     }
 }
 
+/// Most two instances of one polar pattern may differ, in radius and axial
+/// station (mm) and in the components of their measured direction.
+const PATTERN_TOL: f64 = 1e-3;
+
+/// Lengths of one POLAR PATTERN stated once, with their count (ISO 129-1:
+/// "12× 6").
+///
+/// Equal lengths are otherwise never counted -- two equal lengths are two
+/// places on the part ([`is_counted_kind`]). The instances of a pattern
+/// round the part axis are one feature repeated: CADGenBench 109's twelve
+/// slots, of which the four on a world axis are drawn true and the eight
+/// between are drawn in no principal view
+/// ([`shows_true_length`]). Equal-valued `"length"` records of the part's
+/// table are instances of one pattern when each sits at the same radius
+/// from the axis and the same station along it, and measures along the same
+/// direction relative to its own radial and tangential directions (up to
+/// sign); three or more such instances, at least one stated on the sheet,
+/// are stated by that one, which names them all
+/// ([`Dimension2d::members`]) and leaves the other views. The certificate
+/// re-measures every member. A pattern instance with a bound tolerance keeps
+/// its own statement, and so does its pattern (nothing is counted); a part
+/// with no round axis has no polar pattern.
+pub(crate) fn count_pattern_lengths(
+    records: &[crate::readable::DimensionRecord],
+    round: Option<&super::round_part::RoundPartCallouts>,
+    drawing: &mut super::types::Drawing,
+) {
+    let Some(round) = round else {
+        return;
+    };
+    let axis = unit3_or_zero(round.axis);
+    // (radius, station, direction in the instance's radial/tangential/axial
+    // frame), or `None` for a length on the axis.
+    let signature = |r: &crate::readable::DimensionRecord| -> Option<(f64, f64, [f64; 3])> {
+        let p = [
+            r.anchor[0] - round.centre[0],
+            r.anchor[1] - round.centre[1],
+            r.anchor[2] - round.centre[2],
+        ];
+        let station = dot3(p, axis);
+        let radial = [
+            p[0] - axis[0] * station,
+            p[1] - axis[1] * station,
+            p[2] - axis[2] * station,
+        ];
+        let radius = dot3(radial, radial).sqrt();
+        if radius < PATTERN_TOL {
+            return None;
+        }
+        let u = [radial[0] / radius, radial[1] / radius, radial[2] / radius];
+        let t = [
+            axis[1] * u[2] - axis[2] * u[1],
+            axis[2] * u[0] - axis[0] * u[2],
+            axis[0] * u[1] - axis[1] * u[0],
+        ];
+        let d = unit3_or_zero(r.direction);
+        Some((radius, station, [dot3(d, u), dot3(d, t), dot3(d, axis)]))
+    };
+    let same_instance = |a: &(f64, f64, [f64; 3]), b: &(f64, f64, [f64; 3])| {
+        let dir_eq = |s: f64| (0..3).all(|i| (a.2[i] - s * b.2[i]).abs() <= PATTERN_TOL);
+        (a.0 - b.0).abs() <= PATTERN_TOL
+            && (a.1 - b.1).abs() <= PATTERN_TOL
+            && (dir_eq(1.0) || dir_eq(-1.0))
+    };
+    // Patterns: equal values, then equal signatures, three or more.
+    let mut patterns: Vec<Vec<&crate::readable::DimensionRecord>> = Vec::new();
+    let mut taken = vec![false; records.len()];
+    for i in 0..records.len() {
+        if taken[i] || records[i].kind != "length" {
+            continue;
+        }
+        let Some(si) = signature(&records[i]) else {
+            continue;
+        };
+        let mut group = vec![&records[i]];
+        taken[i] = true;
+        for j in (i + 1)..records.len() {
+            let r = &records[j];
+            if taken[j] || r.kind != "length" || (r.value - records[i].value).abs() > 0.005 {
+                continue;
+            }
+            if signature(r).is_some_and(|sj| same_instance(&si, &sj)) {
+                group.push(r);
+                taken[j] = true;
+            }
+        }
+        if group.len() >= 3 {
+            patterns.push(group);
+        }
+    }
+    for pattern in patterns {
+        let ids: Vec<String> = pattern.iter().map(|r| record_identity(r)).collect();
+        // Where the sheet states instances: (view, index), in view order.
+        let stated: Vec<(usize, usize)> = drawing
+            .views
+            .iter()
+            .enumerate()
+            .flat_map(|(vi, v)| {
+                v.dimensions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| ids.contains(&dimension_identity(d)))
+                    .map(move |(di, _)| (vi, di))
+            })
+            .collect();
+        let Some(&(hv, hd)) = stated.first() else {
+            continue;
+        };
+        if stated
+            .iter()
+            .any(|&(v, i)| drawing.views[v].dimensions[i].tolerance.is_some())
+        {
+            continue;
+        }
+        let head_id = dimension_identity(&drawing.views[hv].dimensions[hd]);
+        for &(v, i) in stated.iter().skip(1).rev() {
+            drawing.views[v].dimensions.remove(i);
+        }
+        if let Some(head) = drawing.views[hv]
+            .dimensions
+            .iter_mut()
+            .find(|d| dimension_identity(d) == head_id)
+        {
+            head.members = ids;
+            head.label = format!("{}{}", count_prefix(head.members.len()), head.label);
+        }
+    }
+}
+
 /// A blend callout -- a fillet's "R3.00" or a chamfer's "0.50 × 45°" -- is a
 /// point callout on a leader: its `a` (== `b`) is a point on the blend's
 /// profile where the arrow touches it. It brackets no interval, so it is
@@ -3320,6 +3449,11 @@ fn plan_sheet(
     dedup_dimensions_global(&mut band_probe);
     // Equal features take one callout on the sheet, so they take one here.
     count_equal_features(&mut band_probe);
+    count_pattern_lengths(
+        &features.convention,
+        features.round.as_ref(),
+        &mut band_probe,
+    );
     let (vgap, hgap, left_bands) = {
         let mut called_out = features
             .round
@@ -3623,6 +3757,12 @@ fn build_sheet(
     // table and the tolerances, so a tabled or toleranced size heads no count.
     step("attach_tolerances");
     count_equal_features(&mut drawing);
+    // A polar pattern's equal lengths are stated once, with their count.
+    count_pattern_lengths(
+        &plan.features.convention,
+        plan.features.round.as_ref(),
+        &mut drawing,
+    );
     step("count_equal_features");
 
     // ── Pictorial isometric coexistence (A4 ReplaceIso) ───────────────────────
@@ -7942,5 +8082,131 @@ pub(crate) mod true_length_tests {
             0.5,
         );
         assert_eq!(square.len(), 1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod pattern_length_tests {
+    use super::*;
+    use crate::readable::DimensionRecord;
+
+    /// A slot width of 6 at angle `deg` round the Z axis: its anchor on a
+    /// 40 mm radius at z = 5, measured across the slot (tangentially).
+    fn slot(i: usize, deg: f64) -> DimensionRecord {
+        let a = deg.to_radians();
+        DimensionRecord {
+            id: format!("s{i}"),
+            kind: "length".to_string(),
+            value: 6.0,
+            unit: "mm".to_string(),
+            label: "L 6".to_string(),
+            entities: vec![100 + 2 * i as u32, 101 + 2 * i as u32],
+            anchor: [40.0 * a.cos(), 40.0 * a.sin(), 5.0],
+            direction: [-a.sin(), a.cos(), 0.0],
+            axis: None,
+            pid: Some(format!("pid-s{i}")),
+            datum: None,
+        }
+    }
+
+    fn round_about_z() -> super::super::round_part::RoundPartCallouts {
+        super::super::round_part::RoundPartCallouts {
+            axis: [0.0, 0.0, 1.0],
+            centre: [0.0, 0.0, 0.0],
+            ref_dir: [1.0, 0.0, 0.0],
+            outer_diameter: 100.0,
+            coaxial_bore_faces: Vec::new(),
+            coaxial_faces: Vec::new(),
+            coaxial_cone_faces: Vec::new(),
+            bolt_circles: Vec::new(),
+        }
+    }
+
+    /// A sheet whose views carry the instances each one draws true (the
+    /// candidates of FRONT, TOP and RIGHT): the on-axis ones.
+    fn sheet_of(records: &[DimensionRecord]) -> super::super::types::Drawing {
+        let model = BRepModel::new();
+        let mut d =
+            super::super::types::Drawing::new("pattern", super::super::types::SheetSize::A3);
+        for p in [
+            ProjectionType::Front,
+            ProjectionType::Top,
+            ProjectionType::Right,
+        ] {
+            let mut v = super::super::projection::project_solid_view_shell(
+                super::super::types::ViewSource::Part {
+                    part_id: uuid::Uuid::nil(),
+                    solid_id: 0,
+                },
+                p,
+                format!("{p:?}"),
+                [100.0, 100.0],
+                1.0,
+            );
+            v.dimensions = candidates_from_records(&model, records.to_vec(), p, 0.5);
+            d.add_view(v);
+        }
+        d
+    }
+
+    /// Twelve slots of one width round the part axis, 30 degrees apart: the
+    /// four on a world axis are drawn true, the eight between are not
+    /// (CADGenBench 109's 12-fold pattern). Their width is stated ONCE, as
+    /// "12x 6", naming all twelve; no other view repeats it.
+    ///
+    /// Mutation: skip `count_pattern_lengths` -> four separate "6"s and
+    /// eight stated nowhere -> RED.
+    #[test]
+    fn a_polar_pattern_states_its_width_once_with_its_count() {
+        let records: Vec<DimensionRecord> = (0..12).map(|i| slot(i, 30.0 * i as f64)).collect();
+        let mut d = sheet_of(&records);
+        let drawn: usize = d.views.iter().map(|v| v.dimensions.len()).sum();
+        assert!(
+            drawn >= 2,
+            "fixture: the on-axis instances are drawn true ({drawn})"
+        );
+        count_pattern_lengths(&records, Some(&round_about_z()), &mut d);
+        let sixes: Vec<&Dimension2d> = d
+            .views
+            .iter()
+            .flat_map(|v| &v.dimensions)
+            .filter(|x| x.kind == "length")
+            .collect();
+        assert_eq!(sixes.len(), 1, "stated once: {sixes:?}");
+        assert_eq!(sixes[0].members.len(), 12, "naming all twelve");
+        assert!(
+            sixes[0].label.starts_with(&count_prefix(12)),
+            "{}",
+            sixes[0].label
+        );
+        let named: std::collections::HashSet<&String> = sixes[0].members.iter().collect();
+        for r in &records {
+            assert!(named.contains(&record_identity(r)), "{} is a member", r.id);
+        }
+    }
+
+    /// Twelve equal widths that are NOT one pattern -- at different radii --
+    /// are twelve places on the part: nothing is counted.
+    #[test]
+    fn equal_lengths_off_one_pattern_are_not_counted() {
+        let records: Vec<DimensionRecord> = (0..12)
+            .map(|i| {
+                let mut r = slot(i, 30.0 * i as f64);
+                let k = 1.0 + 0.05 * i as f64;
+                r.anchor = [r.anchor[0] * k, r.anchor[1] * k, r.anchor[2]];
+                r
+            })
+            .collect();
+        let mut d = sheet_of(&records);
+        let before: usize = d.views.iter().map(|v| v.dimensions.len()).sum();
+        count_pattern_lengths(&records, Some(&round_about_z()), &mut d);
+        let after: usize = d.views.iter().map(|v| v.dimensions.len()).sum();
+        assert_eq!(before, after);
+        assert!(d
+            .views
+            .iter()
+            .flat_map(|v| &v.dimensions)
+            .all(|x| x.members.is_empty()));
     }
 }
