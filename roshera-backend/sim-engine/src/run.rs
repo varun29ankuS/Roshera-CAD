@@ -16,7 +16,7 @@ use geometry_engine::primitives::topology_builder::BRepModel;
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 use serde::{Deserialize, Serialize};
 
-use crate::ccx::{solve_static, von_mises, DeckLoad, SolveError};
+use crate::ccx::{solve_static, von_mises, DeckHold, DeckLoad, DeckSupport, SolveError};
 use crate::engines::Engines;
 use crate::field::{surface_field, SurfaceField};
 use crate::mesh::{mesh_solid, MeshError, MeshStats};
@@ -96,8 +96,6 @@ pub enum StudyError {
     Material(String),
     #[error("the part is not held: it {}", .0.iter().map(FreeMotion::describe).collect::<Vec<_>>().join("; "))]
     CanMove(Vec<FreeMotion>),
-    #[error("{0:?} supports are not available in this solver yet; use fixed or bolt clamp")]
-    UnsupportedSupport(SupportKind),
     #[error("the mesh size must be above 0 mm, not {0}")]
     MeshSize(f64),
     #[error(transparent)]
@@ -191,13 +189,6 @@ pub fn check_setup(model: &BRepModel, solid: SolidId, study: &Study) -> Result<(
     if !free.is_empty() {
         return Err(StudyError::CanMove(free));
     }
-    if let Some(s) = study
-        .supports
-        .iter()
-        .find(|s| matches!(s.kind, SupportKind::Pin | SupportKind::Slider))
-    {
-        return Err(StudyError::UnsupportedSupport(s.kind));
-    }
     Ok(())
 }
 
@@ -252,10 +243,18 @@ pub fn run_static(
 
     // ── Mesh and solve, coarse then fine ──────────────────────────────────
     let coarse_size = coarse_mesh_size(model, solid, study.mesh.size_mm)?;
-    let held_faces: BTreeSet<FaceId> = study
+    // Fixed and bolted faces are held in every direction; a slider's face
+    // along its normal, a pin's hole wall radially (along its normal there).
+    let deck_supports: Vec<DeckSupport<'_>> = study
         .supports
         .iter()
-        .flat_map(|s| s.faces.iter().copied())
+        .map(|s| DeckSupport {
+            faces: &s.faces,
+            hold: match s.kind {
+                SupportKind::Fixed | SupportKind::BoltClamp => DeckHold::All,
+                SupportKind::Pin | SupportKind::Slider => DeckHold::AlongNormal,
+            },
+        })
         .collect();
     let applied: [f64; 3] = study.loads.iter().fold([0.0; 3], |t, l| {
         [
@@ -278,7 +277,7 @@ pub fn run_static(
             .collect();
         let sol = solve_static(
             &mesh,
-            &held_faces,
+            &deck_supports,
             &loads,
             m.youngs_modulus_mpa,
             m.poisson_ratio,
@@ -425,7 +424,7 @@ pub fn run_static(
         .collect();
     let mut assumptions = vec![
         "linear elastic, small deflections".to_string(),
-        "held faces fixed in all three directions".to_string(),
+        "fixed and bolted faces held in every direction; slider faces along their normal only; pin holes radially only (free to turn and slide on the pin)".to_string(),
         format!(
             "mesher {}{}",
             engines.mesher.name,

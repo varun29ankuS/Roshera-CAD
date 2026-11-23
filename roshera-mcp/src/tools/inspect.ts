@@ -277,7 +277,7 @@ export function registerInspectTools(server: ToolHost) {
       }),
     )
     .min(1)
-    .describe("how the part is held: each a kind and the live face ids it holds; pin and slider are checked for motion but not yet solved");
+    .describe("how the part is held: each a kind and the live face ids it holds -- fixed/bolt_clamp hold every direction, slider holds along the face normal only, pin holds a hole wall radially (free to turn and slide on the pin)");
   const loadsSchema = z
     .array(
       z.object({

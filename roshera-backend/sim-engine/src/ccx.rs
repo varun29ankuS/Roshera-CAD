@@ -23,6 +23,23 @@ use crate::mesh::VolumeMesh;
 const GMSH_TO_CCX_TET10: [usize; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 9, 8];
 
 /// A load as the solver gets it: faces, total force, spread.
+/// How a support holds the mesh nodes on its faces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeckHold {
+    /// In every direction (a fixed or bolted face).
+    All,
+    /// Along the face's normal at each node only, free across it: a slider's
+    /// plane normal; on a pin's hole wall, the radial direction.
+    AlongNormal,
+}
+
+/// A support as the deck writes it.
+#[derive(Debug, Clone, Copy)]
+pub struct DeckSupport<'a> {
+    pub faces: &'a [FaceId],
+    pub hold: DeckHold,
+}
+
 pub struct DeckLoad<'a> {
     pub faces: &'a [FaceId],
     pub force_n: [f64; 3],
@@ -63,7 +80,7 @@ pub enum SolveError {
 /// Write the deck for `mesh`, solve it in `workdir`, and read the results.
 pub fn solve_static(
     mesh: &VolumeMesh,
-    held_faces: &BTreeSet<FaceId>,
+    supports: &[DeckSupport<'_>],
     loads: &[DeckLoad<'_>],
     youngs_mpa: f64,
     poisson: f64,
@@ -71,7 +88,7 @@ pub fn solve_static(
     workdir: &Path,
     limit: Duration,
 ) -> Result<Solution, SolveError> {
-    let (deck, load_on_held) = deck(mesh, held_faces, loads, youngs_mpa, poisson)?;
+    let (deck, load_on_held) = deck(mesh, supports, loads, youngs_mpa, poisson)?;
     std::fs::write(workdir.join("job.inp"), deck).map_err(|e| SolveError::Write(e.to_string()))?;
     let took = run(
         solver,
@@ -142,20 +159,77 @@ pub(crate) fn tri6_on(mesh: &VolumeMesh, faces: &[FaceId]) -> Vec<Tri6> {
         .collect()
 }
 
+/// The nodes a support set holds fully, and the normal constraints on the
+/// rest: `n . u = 0` per node and normal, `n` the area-weighted outward
+/// normal of the support's boundary triangles at that node. A node fully
+/// held anywhere gets no constraint; a node constrained along three
+/// independent normals is fully held (a corner on three sliders).
+pub(crate) fn holds_of(
+    mesh: &VolumeMesh,
+    supports: &[DeckSupport<'_>],
+) -> (BTreeSet<u64>, BTreeMap<u64, Vec<[f64; 3]>>) {
+    let mut fixed: BTreeSet<u64> = BTreeSet::new();
+    let mut normals: BTreeMap<u64, Vec<[f64; 3]>> = BTreeMap::new();
+    for s in supports {
+        match s.hold {
+            DeckHold::All => {
+                for b in mesh.boundary.iter().filter(|b| s.faces.contains(&b.face)) {
+                    fixed.extend(b.nodes);
+                }
+            }
+            DeckHold::AlongNormal => {
+                let mut at: BTreeMap<u64, [f64; 3]> = BTreeMap::new();
+                for t in tri6_on(mesh, s.faces) {
+                    for node in t.nodes {
+                        let e = at.entry(node).or_insert([0.0; 3]);
+                        for i in 0..3 {
+                            e[i] += t.normal[i];
+                        }
+                    }
+                }
+                for (node, n) in at {
+                    let len = dot(n, n).sqrt();
+                    if len > 0.0 {
+                        normals
+                            .entry(node)
+                            .or_default()
+                            .push([n[0] / len, n[1] / len, n[2] / len]);
+                    }
+                }
+            }
+        }
+    }
+    // One constraint per distinct direction.
+    let mut constraints: BTreeMap<u64, Vec<[f64; 3]>> = BTreeMap::new();
+    for (node, ns) in normals {
+        if fixed.contains(&node) {
+            continue;
+        }
+        let mut kept: Vec<[f64; 3]> = Vec::new();
+        for n in ns {
+            if kept.iter().all(|k| dot(*k, n).abs() < 0.999) {
+                kept.push(n);
+            }
+        }
+        if kept.len() >= 3 {
+            fixed.insert(node);
+        } else {
+            constraints.insert(node, kept);
+        }
+    }
+    (fixed, constraints)
+}
+
 fn deck(
     mesh: &VolumeMesh,
-    held_faces: &BTreeSet<FaceId>,
+    supports: &[DeckSupport<'_>],
     loads: &[DeckLoad<'_>],
     youngs_mpa: f64,
     poisson: f64,
 ) -> Result<(String, [f64; 3]), SolveError> {
     use std::fmt::Write as _;
-    let held: BTreeSet<u64> = mesh
-        .boundary
-        .iter()
-        .filter(|b| held_faces.contains(&b.face))
-        .flat_map(|b| b.nodes)
-        .collect();
+    let (fixed, constraints) = holds_of(mesh, supports);
+    let held: BTreeSet<u64> = fixed.iter().chain(constraints.keys()).copied().collect();
     if held.is_empty() {
         return Err(SolveError::NothingHeld);
     }
@@ -190,16 +264,54 @@ fn deck(
             .collect();
         writeln!(s, "{}, {}", k + 1, ids.join(", ")).map_err(w)?;
     }
-    writeln!(s, "*NSET, NSET=HELD").map_err(w)?;
-    let held: Vec<String> = held.iter().map(u64::to_string).collect();
-    for chunk in held.chunks(12) {
-        writeln!(s, "{}", chunk.join(", ")).map_err(w)?;
+    let write_set = |s: &mut String,
+                     name: &str,
+                     nodes: &mut dyn Iterator<Item = u64>|
+     -> Result<(), SolveError> {
+        writeln!(s, "*NSET, NSET={name}").map_err(w)?;
+        let ids: Vec<String> = nodes.map(|n| n.to_string()).collect();
+        for chunk in ids.chunks(12) {
+            writeln!(s, "{}", chunk.join(", ")).map_err(w)?;
+        }
+        Ok(())
+    };
+    write_set(&mut s, "HELD", &mut held.iter().copied())?;
+    if !fixed.is_empty() {
+        write_set(&mut s, "FIXED", &mut fixed.iter().copied())?;
+    }
+    // n . u = 0 per node and direction; each equation's first term (the
+    // dependent DOF) is the node's largest normal component not already a
+    // dependent of another of its equations.
+    for (node, ns) in &constraints {
+        let mut taken = [false; 3];
+        for n in ns {
+            let mut order = [0usize, 1, 2];
+            order.sort_by(|&a, &b| {
+                n[b].abs()
+                    .partial_cmp(&n[a].abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let Some(&dep) = order.iter().find(|&&d| !taken[d] && n[d].abs() > 1e-6) else {
+                continue;
+            };
+            taken[dep] = true;
+            let terms: Vec<String> = std::iter::once(dep)
+                .chain(order.iter().copied().filter(|&d| d != dep))
+                .filter(|&d| n[d].abs() > 1e-12)
+                .map(|d| format!("{node}, {}, {:.12e}", d + 1, n[d]))
+                .collect();
+            writeln!(s, "*EQUATION\n{}\n{}", terms.len(), terms.join(", ")).map_err(w)?;
+        }
     }
     writeln!(
         s,
-        "*MATERIAL, NAME=M\n*ELASTIC\n{youngs_mpa:.9e}, {poisson:.9e}\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*STEP\n*STATIC\n*BOUNDARY\nHELD, 1, 3, 0.0\n*CLOAD"
+        "*MATERIAL, NAME=M\n*ELASTIC\n{youngs_mpa:.9e}, {poisson:.9e}\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*STEP\n*STATIC"
     )
     .map_err(w)?;
+    if !fixed.is_empty() {
+        writeln!(s, "*BOUNDARY\nFIXED, 1, 3, 0.0").map_err(w)?;
+    }
+    writeln!(s, "*CLOAD").map_err(w)?;
     for (node, f) in &cload.0 {
         for (dof, v) in f.iter().enumerate() {
             if *v != 0.0 {

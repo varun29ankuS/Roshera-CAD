@@ -189,6 +189,32 @@ impl ExportEngine {
         Ok(filename)
     }
 
+    /// Export the named solids of `model` to STEP -- the parts asked for,
+    /// never the whole document they live in.
+    pub async fn export_step_solids(
+        &self,
+        model: &BRepModel,
+        solids: &[geometry_engine::primitives::solid::SolidId],
+        name: &str,
+    ) -> Result<String, ExportError> {
+        fs::create_dir_all(&self.output_dir)
+            .await
+            .map_err(|_e| ExportError::FileWriteError {
+                path: self.output_dir.to_string_lossy().to_string(),
+            })?;
+        let filename = format!("{}.step", name);
+        let filepath = self.output_dir.join(&filename);
+        let file = std::fs::File::create(&filepath).map_err(|_| ExportError::FileWriteError {
+            path: filepath.to_string_lossy().to_string(),
+        })?;
+        crate::formats::step::writer::write_solids_step(
+            model,
+            solids,
+            std::io::BufWriter::new(file),
+        )?;
+        Ok(filename)
+    }
+
     /// Import B-Rep model from STEP format
     pub async fn import_step(&self, filename: &str) -> Result<BRepModel, ExportError> {
         let filepath = self.output_dir.join(filename);

@@ -23,6 +23,7 @@ pub mod fillet_robust;
 pub mod g2_blending;
 pub mod geometry_validity;
 pub mod loft;
+pub mod merge_coplanar;
 pub mod modify;
 pub mod mould;
 pub mod nurbs_loft;

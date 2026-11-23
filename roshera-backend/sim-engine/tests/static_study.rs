@@ -261,3 +261,124 @@ fn a_cantilever_deflects_as_the_beam_formula_says() {
         .iter()
         .all(|e| (e[0] as usize) < wire.positions.len() && (e[1] as usize) < wire.positions.len()));
 }
+
+/// Sliders hold only along their normal: a cube on rollers on three faces
+/// (x = min, y = min, z = min) under an even push on top is in uniaxial
+/// compression, exactly, for any mesh -- stress p everywhere, the top drops
+/// p L / E, and the free sides bulge out nu p L / E. A fixed base would
+/// stop the bulge at the bottom; the rollers must let it slide.
+///
+/// Needs Gmsh and CalculiX: run with `--ignored`.
+#[test]
+#[ignore = "needs Gmsh and CalculiX; run with --ignored"]
+fn a_cube_on_rollers_compresses_exactly() {
+    let engines = Engines::discover().expect("Gmsh and CalculiX installed");
+    let mut m = BRepModel::new();
+    let s = match TopologyBuilder::new(&mut m).create_box_3d(20.0, 20.0, 20.0) {
+        Ok(GeometryId::Solid(s)) => s,
+        other => panic!("box: {other:?}"),
+    };
+    let roller = |axis| Support {
+        kind: SupportKind::Slider,
+        faces: vec![face_at(&m, s, axis, -1.0)],
+    };
+    let (e, nu, force, side) = (68_900.0, 0.33, 100.0, 20.0);
+    let study = Study {
+        supports: vec![roller(0), roller(1), roller(2)],
+        loads: vec![Load {
+            faces: vec![face_at(&m, s, 2, 1.0)],
+            force_n: [0.0, 0.0, -force],
+            spread: Spread::Even,
+        }],
+        material: aluminium(None),
+        goal: Goal {
+            min_safety_factor: 2.0,
+        },
+        mesh: MeshControl { size_mm: Some(5.0) },
+    };
+    let dir = std::env::temp_dir().join("roshera-sim-rollers");
+    let _ = std::fs::remove_dir_all(&dir);
+    let report = run_static(&m, s, &study, &engines, &dir).expect("a study on sliders runs");
+    let p = force / (side * side);
+    let drop = p * side / e;
+    let bulge = nu * drop;
+    let corner = (drop * drop + 2.0 * bulge * bulge).sqrt();
+    let got = report.fine.max_displacement_mm;
+    assert!(
+        (got - corner).abs() / corner < 0.01,
+        "far corner moves {got:.4e} mm, exact {corner:.4e}"
+    );
+    let peak = report.fine.peak_von_mises_mpa;
+    assert!(
+        (peak - p).abs() / p < 0.01,
+        "stress {peak:.5} MPa everywhere, exact {p}"
+    );
+    let f = &report.field;
+    let max_ux = f
+        .displacement
+        .iter()
+        .map(|d| d[0] as f64)
+        .fold(f64::MIN, f64::max);
+    assert!(
+        (max_ux - bulge).abs() / bulge < 0.02,
+        "sides bulge {max_ux:.4e} mm, exact {bulge:.4e}"
+    );
+    let balance = report
+        .checks
+        .iter()
+        .find(|c| c.name == "forces balance")
+        .unwrap();
+    assert!(balance.passed, "{balance:?}");
+}
+
+/// A curved wall is meshed ON the true surface: every boundary node of a
+/// quadratic mesh of a cylinder -- corner and mid-side alike -- lies at the
+/// cylinder's radius (a mid-side node left on the chord would sit inside it,
+/// making a curved part stiffer and its stresses wrong).
+///
+/// Needs Gmsh: run with `--ignored`.
+#[test]
+#[ignore = "needs Gmsh; run with --ignored"]
+fn a_curved_wall_is_meshed_on_the_true_surface() {
+    use geometry_engine::math::{Point3, Vector3};
+    let engines = Engines::discover().expect("Gmsh installed");
+    let mut m = BRepModel::new();
+    let (r, h) = (10.0, 20.0);
+    let s = match TopologyBuilder::new(&mut m).create_cylinder_3d(
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::new(0.0, 0.0, 1.0),
+        r,
+        h,
+    ) {
+        Ok(GeometryId::Solid(s)) => s,
+        other => panic!("cylinder: {other:?}"),
+    };
+    let dir = std::env::temp_dir().join("roshera-sim-cylinder");
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mesh, _) = sim_engine::mesh::mesh_solid(
+        &m,
+        s,
+        3.0,
+        &engines.mesher,
+        &dir,
+        std::time::Duration::from_secs(120),
+    )
+    .expect("the cylinder meshes");
+    let mut on_wall = 0usize;
+    let mut worst = 0.0_f64;
+    for b in &mesh.boundary {
+        for n in b.nodes {
+            let p = mesh.nodes[&n];
+            // Wall nodes: strictly between the caps.
+            if p[2] > 1e-6 && p[2] < h - 1e-6 {
+                on_wall += 1;
+                worst = worst.max(((p[0] * p[0] + p[1] * p[1]).sqrt() - r).abs());
+            }
+        }
+    }
+    assert!(on_wall > 50, "the wall carries nodes: {on_wall}");
+    assert!(
+        worst < 1e-6,
+        "a wall node lies {worst:.3e} mm off the radius"
+    );
+}

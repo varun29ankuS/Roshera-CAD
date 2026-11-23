@@ -474,7 +474,7 @@ pub async fn export_mesh(
         }
         ExportFormat::STEP => state
             .export_engine
-            .export_step(&model, &safe_name)
+            .export_step_solids(&model, &solids_to_export, &safe_name)
             .await
             .map_err(|e| {
                 tracing::error!("STEP export failed: {:?}", e);

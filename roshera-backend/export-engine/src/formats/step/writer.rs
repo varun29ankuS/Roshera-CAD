@@ -1836,18 +1836,38 @@ pub fn write_solid_step<W: Write>(
     solid: geometry_engine::primitives::solid::SolidId,
     out: W,
 ) -> Result<(), ExportError> {
+    write_solids_step(model, &[solid], out)
+}
+
+/// The STEP exchange structure of the named solids of `model` -- a part
+/// exported is that part, not the document it lives in (the export route
+/// wrote every solid in the document whatever was selected). Refused when a
+/// named solid is not in the model.
+pub fn write_solids_step<W: Write>(
+    model: &BRepModel,
+    solids: &[geometry_engine::primitives::solid::SolidId],
+    out: W,
+) -> Result<(), ExportError> {
     let mut snapshot = BRepSnapshot::from_model(model)?;
-    let wanted = crate::formats::ros_snapshot::id_to_uuid(solid as u64);
-    snapshot.solids.retain(|(id, _)| *id == wanted);
-    let Some((_, data)) = snapshot.solids.first() else {
-        return Err(ExportError::ExportFailed {
-            reason: format!("solid {solid} is not in the model"),
-        });
-    };
-    let shells: std::collections::HashSet<uuid::Uuid> = data
-        .shells
+    let wanted: std::collections::HashSet<uuid::Uuid> = solids
         .iter()
-        .chain(data.peer_shells.iter())
+        .map(|&s| crate::formats::ros_snapshot::id_to_uuid(s as u64))
+        .collect();
+    snapshot.solids.retain(|(id, _)| wanted.contains(id));
+    if let Some(missing) = solids.iter().find(|&&s| {
+        !snapshot
+            .solids
+            .iter()
+            .any(|(id, _)| *id == crate::formats::ros_snapshot::id_to_uuid(s as u64))
+    }) {
+        return Err(ExportError::ExportFailed {
+            reason: format!("solid {missing} is not in the model"),
+        });
+    }
+    let shells: std::collections::HashSet<uuid::Uuid> = snapshot
+        .solids
+        .iter()
+        .flat_map(|(_, data)| data.shells.iter().chain(data.peer_shells.iter()))
         .copied()
         .collect();
     snapshot.shells.retain(|(id, _)| shells.contains(id));
@@ -3009,5 +3029,24 @@ mod single_solid_tests {
             write_solid_step(&model, 999, Vec::new()).is_err(),
             "an unknown solid is refused"
         );
+    }
+
+    /// A selection of parts is written as exactly those parts: two of three
+    /// boxes, twelve faces; an unknown one in the selection refuses the
+    /// export rather than writing the rest silently.
+    ///
+    /// Mutation: keep every snapshot solid -> 18 faces -> RED.
+    #[test]
+    fn a_selection_of_parts_is_written_as_exactly_those_parts() {
+        let mut model = BRepModel::new();
+        let a = add_box(&mut model, 10.0);
+        let b = add_box(&mut model, 20.0);
+        add_box(&mut model, 40.0);
+        let mut out = Vec::new();
+        write_solids_step(&model, &[a, b], &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("ADVANCED_FACE").count(), 12);
+        assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), 2);
+        assert!(write_solids_step(&model, &[a, 999], Vec::new()).is_err());
     }
 }

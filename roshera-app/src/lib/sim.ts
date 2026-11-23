@@ -103,8 +103,8 @@ export const LOAD_DIRECTIONS: { id: LoadDirection; label: string }[] = [
 export const SUPPORT_KINDS: { id: SupportKind; label: string; hint: string; solved: boolean }[] = [
   { id: 'fixed', label: 'Fixed', hint: 'Held in every direction: welded, bonded, clamped hard', solved: true },
   { id: 'bolt_clamp', label: 'Bolted', hint: 'A bolt clamps these faces (washer face, hole wall) to a rigid frame', solved: true },
-  { id: 'pin', label: 'Pin', hint: 'A pin in a hole: held across, free to turn. Checked for motion; not solved yet', solved: false },
-  { id: 'slider', label: 'Slider', hint: 'Rests on a surface: held along its normal only. Checked for motion; not solved yet', solved: false },
+  { id: 'pin', label: 'Pin', hint: 'A pin in a hole: the hole wall held radially, free to turn and slide on the pin', solved: true },
+  { id: 'slider', label: 'Slider', hint: 'Rests on a surface: held along its normal only, free to slide across it', solved: true },
 ]
 
 export interface SupportEntry {

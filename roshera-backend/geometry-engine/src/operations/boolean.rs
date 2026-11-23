@@ -753,6 +753,18 @@ pub fn boolean_operation(
         // every entity it actually removed for precisely this reason; using
         // that return value here (rather than discarding it as `let _ =`)
         // is the fix.
+        // Merge the faces the rebuild left split on one plane (two boxes
+        // joined into an L keep both bottoms, both sides): the redundant edges
+        // between them made a fillet refuse the L's inside corner and ink as
+        // seams on drawings. Absorbed faces are only detached here; the sweep
+        // below removes them with every other leftover.
+        if options.merge_coincident {
+            crate::operations::merge_coplanar::merge_coplanar_faces(
+                model,
+                result_solid,
+                &options.common.tolerance,
+            );
+        }
         let pruned = crate::operations::delete::prune_boolean_orphan_topology(model)?;
 
         // Shells are not part of the wire entity taxonomy (no `ENTITY_SHELL`,
