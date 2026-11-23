@@ -423,7 +423,7 @@ pub fn run_static(
             )
         })
         .collect();
-    let assumptions = vec![
+    let mut assumptions = vec![
         "linear elastic, small deflections".to_string(),
         "held faces fixed in all three directions".to_string(),
         format!(
@@ -436,6 +436,14 @@ pub fn run_static(
             }
         ),
     ];
+    // A safety factor on a TYPICAL yield is indicative only: say so, every
+    // time, beside the number it qualifies.
+    if m.yield_basis == Some(crate::materials::YieldBasis::Typical) {
+        assumptions.push(
+            "the yield strength is a TYPICAL value, not a specified minimum: the safety factor is indicative, not a design check"
+                .to_string(),
+        );
+    }
     Ok(StaticReport {
         verdict,
         checks,

@@ -1870,6 +1870,17 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "sim_materials",
+            Analysis,
+            Experimental,
+            Curated,
+            "The built-in material library for a strength study: each material's stiffness (E, Poisson) and yield, where each comes from, and whether the yield is a specified minimum (a standard's floor, fit for a design check) or typical (a data-sheet average, not a design minimum). Offer them to the person; pass the chosen values, the yield source and the yield basis to sim_setup.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ),
+        t(
             "sim_session",
             Analysis,
             Experimental,
@@ -2498,7 +2509,8 @@ mod tests {
         // (POST /api/agent/parts/{id}/sim/static).
         // 121 -> 124 (2026-11-23): sim_mesh, sim_setup, sim_session -- the study
         // walked through with the person, stage by stage.
-        assert_eq!(tools.len(), 124, "expected 124 tools, got {}", tools.len());
+        // 124 -> 125 (2026-11-23): sim_materials -- the cited material library.
+        assert_eq!(tools.len(), 125, "expected 125 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2515,7 +2527,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 136, "124 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 137, "125 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");

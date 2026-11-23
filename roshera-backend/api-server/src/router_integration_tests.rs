@@ -14779,3 +14779,33 @@ async fn a_study_is_staged_and_each_stage_builds_on_the_current_one() {
     );
     assert_eq!(body["current_stage"].as_str(), Some("setup"), "{body}");
 }
+
+/// The material library is served to the app and the agent from the kernel:
+/// every entry has its sources, and each yield says whether it is a
+/// specified minimum or a typical value.
+#[tokio::test]
+async fn sim_materials_serves_the_cited_library() {
+    let state = make_test_state().await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/agent/sim/materials")
+        .body(Body::empty())
+        .expect("request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let list = body["materials"].as_array().expect("a list");
+    assert!(list.len() >= 5, "{body}");
+    for m in list {
+        assert!(
+            m["yield_source"].as_str().is_some_and(|s| !s.is_empty()),
+            "{m}"
+        );
+        assert!(
+            matches!(
+                m["yield_basis"].as_str(),
+                Some("specified_minimum") | Some("typical")
+            ),
+            "{m}"
+        );
+    }
+}

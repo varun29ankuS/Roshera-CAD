@@ -295,6 +295,10 @@ export function registerInspectTools(server: ToolHost) {
       poisson_ratio: z.number(),
       yield_strength_mpa: z.number().optional(),
       source: z.string().optional().describe("where the yield comes from; without it no safety factor is given"),
+      yield_basis: z
+        .enum(["specified_minimum", "typical"])
+        .optional()
+        .describe("from sim_materials: a typical yield makes the safety factor indicative, and the result says so"),
     })
     .describe("linear elastic, isotropic -- ask the person; never invent a value or a source");
 
@@ -385,6 +389,24 @@ export function registerInspectTools(server: ToolHost) {
         return ok(
           simForAgent(await api("POST", `/api/agent/parts/${args.part_id}/sim/static`, { revision: args.revision })),
         );
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "sim_materials",
+    "The built-in MATERIAL LIBRARY for a strength study: each material's stiffness " +
+      "(E, Poisson) and yield, where each comes from, and whether the yield is a " +
+      "SPECIFIED MINIMUM (a standard's floor -- fit for a design check) or TYPICAL (a " +
+      "data-sheet average, not a design minimum). Offer these to the person with " +
+      "ask_choice; pass the chosen one's values, its yield_source as source and its " +
+      "yield_basis to sim_setup. The person's own values override.",
+    {},
+    async () => {
+      try {
+        return ok(await api("GET", `/api/agent/sim/materials`));
       } catch (e) {
         return fail(e);
       }

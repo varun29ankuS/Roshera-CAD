@@ -248,6 +248,7 @@ const EXPERIMENTAL = new Set<string>([
   "sim_setup",
   "sim_static",
   "sim_session",
+  "sim_materials",
   "kb_lookup",
 ]);
 
@@ -386,6 +387,7 @@ const BENCH_OF: Record<string, Bench> = {
   sim_setup: "analysis",
   sim_static: "analysis",
   sim_session: "analysis",
+  sim_materials: "analysis",
   kb_lookup: "analysis",
   ground_truth: "analysis",
   measure_faces: "analysis",

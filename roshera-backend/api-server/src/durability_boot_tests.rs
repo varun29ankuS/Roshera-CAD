@@ -2488,6 +2488,12 @@ impl DatabasePersistence for FailingSaves {
     }
 
     // ---- Everything else: verbatim delegation ----
+    async fn save_open_document(&self, id: &str) -> Result<(), session_manager::SessionError> {
+        self.inner.save_open_document(id).await
+    }
+    async fn load_open_document(&self) -> Result<Option<String>, session_manager::SessionError> {
+        self.inner.load_open_document().await
+    }
     async fn save_session(
         &self,
         session: &session_manager::SessionState,

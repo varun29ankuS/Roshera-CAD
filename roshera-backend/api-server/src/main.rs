@@ -10636,6 +10636,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // boots blank exactly as before; a log the kernel cannot faithfully
     // rebuild is quarantined (clean prefix served, break named on
     // `/api/durability/status`), never served as a wrong model.
+    // Reopen the document the server last had open (a restart must not move
+    // the app and every agent to a different document).
+    if let Some(id) = documents::reopen_last_document(&state).await {
+        tracing::info!(document = %id, "documents: reopening the last open document");
+    }
     match durability::boot_replay(&state).await {
         durability::DurabilityStatus::Quarantined {
             first_break_sequence,
@@ -11745,6 +11750,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(handlers::agent::part_sim_setup),
         )
         .route("/api/agent/sim/session", get(handlers::agent::sim_session))
+        .route(
+            "/api/agent/sim/materials",
+            get(handlers::agent::sim_materials),
+        )
         .route(
             "/api/agent/parts/{id}/perception",
             get(handlers::agent::part_perception),

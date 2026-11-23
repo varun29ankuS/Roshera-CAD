@@ -4162,6 +4162,13 @@ pub async fn sim_session(
     sim_json(StatusCode::OK, body)
 }
 
+/// `GET /api/agent/sim/materials` -- the built-in material library: each
+/// material's stiffness and yield, where they come from, and whether the
+/// yield is a specified minimum or a typical value (not a design minimum).
+pub async fn sim_materials() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "materials": sim_engine::materials::library() }))
+}
+
 /// Why a study stage did not produce its result.
 enum SimFailure {
     Engine(sim_engine::engines::EngineError),

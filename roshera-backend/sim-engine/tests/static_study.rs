@@ -55,6 +55,7 @@ fn aluminium(yield_mpa: Option<f64>) -> Material {
         poisson_ratio: 0.33,
         yield_strength_mpa: yield_mpa,
         source: yield_mpa.map(|_| "test value, not a cited datasheet".to_string()),
+        yield_basis: yield_mpa.map(|_| sim_engine::materials::YieldBasis::Typical),
     }
 }
 
@@ -188,6 +189,12 @@ fn a_cantilever_deflects_as_the_beam_formula_says() {
         }
     }
     assert!(report.engines.mesher.interim);
+    // A safety factor on a typical yield says so beside it.
+    assert!(
+        report.assumptions.iter().any(|a| a.contains("TYPICAL")),
+        "{:?}",
+        report.assumptions
+    );
 
     // The surface field the viewport draws: a closed skin wound
     // consistently outward -- every edge used once in each direction --

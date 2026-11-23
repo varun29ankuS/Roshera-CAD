@@ -264,6 +264,7 @@ const READ_ONLY = new Set<string>([
   "sim_setup",
   "sim_static",
   "sim_session",
+  "sim_materials",
   "kb_lookup",
   "ground_truth",
   "measure_faces",

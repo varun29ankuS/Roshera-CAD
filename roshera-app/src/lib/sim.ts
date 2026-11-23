@@ -27,6 +27,7 @@ export interface Study {
     poisson_ratio: number
     yield_strength_mpa?: number
     source?: string
+    yield_basis?: YieldBasis
   }
   goal: { min_safety_factor: number }
   mesh: { size_mm?: number }
@@ -87,7 +88,7 @@ export interface StaticReport {
 
 /** Directions a load can be given in: along a model axis, or pushing into
  *  the loaded face (against its outward normal). */
-export type LoadDirection = '+x' | '-x' | '+y' | '-y' | '+z' | '-z' | 'into' | 'given'
+export type LoadDirection = '+x' | '-x' | '+y' | '-y' | '+z' | '-z' | 'into' | 'out' | 'given'
 
 export const LOAD_DIRECTIONS: { id: LoadDirection; label: string }[] = [
   { id: 'into', label: 'Into the face' },
@@ -124,12 +125,16 @@ export interface LoadEntry {
   given?: Vec3
 }
 
+export type YieldBasis = 'specified_minimum' | 'typical'
+
 export interface MaterialEntry {
   name: string
   youngs_modulus_mpa: string
   poisson_ratio: string
   yield_strength_mpa: string
   source: string
+  /** From the library: a typical yield makes the safety factor indicative. */
+  yieldBasis: YieldBasis | null
 }
 
 export interface Setup {
@@ -140,7 +145,7 @@ export interface Setup {
   meshSizeMm: string
 }
 
-const AXES: Record<Exclude<LoadDirection, 'into' | 'given'>, Vec3> = {
+const AXES: Record<Exclude<LoadDirection, 'into' | 'out' | 'given'>, Vec3> = {
   '+x': [1, 0, 0],
   '-x': [-1, 0, 0],
   '+y': [0, 1, 0],
@@ -156,11 +161,12 @@ export function forceOf(load: LoadEntry): Vec3 | null {
     return g && Math.hypot(g[0], g[1], g[2]) > 0 ? [g[0], g[1], g[2]] : null
   }
   let d: Vec3
-  if (load.direction === 'into') {
+  if (load.direction === 'into' || load.direction === 'out') {
     const n = load.normal
     const len = n ? Math.hypot(n[0], n[1], n[2]) : 0
     if (!n || !(len > 0)) return null
-    d = [-n[0] / len, -n[1] / len, -n[2] / len]
+    const s = load.direction === 'into' ? -1 : 1
+    d = [(s * n[0]) / len, (s * n[1]) / len, (s * n[2]) / len]
   } else {
     d = AXES[load.direction]
   }
@@ -181,7 +187,8 @@ export function setupGaps(setup: Setup): string[] {
     gaps.push('Say how the part is held: pick the faces that are bolted or fixed')
   if (setup.loads.length === 0) gaps.push('Add a load: pick the faces it acts on')
   for (const l of setup.loads) {
-    if (!(l.newtons > 0)) gaps.push('Every load needs a force above 0 N')
+    if (l.faces.length === 0) gaps.push('Pick the faces each load acts on')
+    else if (!(l.newtons > 0)) gaps.push('Every load needs a force above 0 N')
     else if (forceOf(l) === null) gaps.push('A load pushing into its faces needs faces with one clear normal')
   }
   const m = setup.material
@@ -214,6 +221,7 @@ export function studyOf(setup: Setup): Study | null {
       poisson_ratio: Number(m.poisson_ratio),
       ...(y !== null ? { yield_strength_mpa: y } : {}),
       ...(m.source.trim() !== '' ? { source: m.source.trim() } : {}),
+      ...(m.yieldBasis ? { yield_basis: m.yieldBasis } : {}),
     },
     goal: { min_safety_factor: Number(setup.minSafetyFactor) },
     mesh: size !== null ? { size_mm: size } : {},
@@ -240,6 +248,7 @@ export function setupOf(study: Study): Setup {
       poisson_ratio: String(m.poisson_ratio),
       yield_strength_mpa: m.yield_strength_mpa !== undefined && m.yield_strength_mpa !== null ? String(m.yield_strength_mpa) : '',
       source: m.source ?? '',
+      yieldBasis: m.yield_basis ?? null,
     },
     minSafetyFactor: String(study.goal.min_safety_factor),
     meshSizeMm: study.mesh?.size_mm !== undefined && study.mesh?.size_mm !== null ? String(study.mesh.size_mm) : '',
@@ -445,4 +454,113 @@ export function fieldBuffers(
 export function engineLabel(e: EngineInfo): string {
   const v = e.version.trim() ? ` ${e.version.trim()}` : ''
   return `${e.name}${v}${e.interim ? ' (interim)' : ''}`
+}
+
+// ─── The study as steps ─────────────────────────────────────────────────
+
+/** The steps of a study, in order -- one bar for the person setting it up
+ *  by hand and for an agent walking them through it. */
+export type StepId = 'part' | 'mesh' | 'supports' | 'loads' | 'material' | 'run'
+
+export const STEPS: { id: StepId; label: string; does: string }[] = [
+  { id: 'part', label: 'Part', does: 'Choose the part to check.' },
+  { id: 'mesh', label: 'Mesh', does: 'Make the mesh the stress is read from, and look at it on the part.' },
+  { id: 'supports', label: 'Supports', does: 'Say how the part is held: choose a kind, then click its faces.' },
+  { id: 'loads', label: 'Loads', does: 'Add each force: click its faces, then set its size and direction.' },
+  { id: 'material', label: 'Material', does: 'What it is made of, and where the values come from.' },
+  { id: 'run', label: 'Run', does: 'Set the safety factor it must reach, then run the study.' },
+]
+
+/** The step a study session's stage is at: an agent's mesh is the mesh
+ *  step, its set-up awaiting approval is the loads step (supports, loads and
+ *  material are shown together), its result is the run step. */
+export function stepOfStage(stage: SimStage): StepId {
+  return stage === 'mesh' ? 'mesh' : stage === 'setup' ? 'loads' : 'run'
+}
+
+/** A load pointing the other way. */
+export function flipped(load: LoadEntry): Partial<LoadEntry> {
+  const opposite: Record<LoadDirection, LoadDirection> = {
+    '+x': '-x', '-x': '+x', '+y': '-y', '-y': '+y', '+z': '-z', '-z': '+z',
+    into: 'out', out: 'into', given: 'given',
+  }
+  if (load.direction === 'given' && load.given)
+    return { given: [-load.given[0], -load.given[1], -load.given[2]] }
+  return { direction: opposite[load.direction] }
+}
+
+/** A stage request's answer: the session, or why not. */
+export type StageRun =
+  | { kind: 'ok'; session: SimSession }
+  | Exclude<SimRun, { kind: 'report' }>
+
+async function postStage(path: string, body: unknown): Promise<StageRun> {
+  const r = await fetch(`${API_HOST}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const json = (await r.json().catch(() => ({}))) as Record<string, unknown>
+  if (r.ok) return { kind: 'ok', session: { ...(json as unknown as SimSession), stale: false } }
+  if (r.status === 409) {
+    return {
+      kind: 'refused',
+      reason: 'The study changed since this step was shown (another step was taken, perhaps by the agent). Look again, then go on.',
+    }
+  }
+  const out = simRunOf(r.status, json)
+  return out.kind === 'report' ? { kind: 'refused', reason: `HTTP ${r.status}` } : out
+}
+
+/** Stage 1: make the study's meshes and show them. */
+export function makeMesh(solidId: number, sizeMm: number | null): Promise<StageRun> {
+  return postStage(`/api/agent/parts/${solidId}/sim/static/mesh`, sizeMm ? { size_mm: sizeMm } : {})
+}
+
+/** Stage 2: the set-up, for the mesh shown at `revision`. */
+export function submitSetup(solidId: number, revision: string, study: Study): Promise<StageRun> {
+  return postStage(`/api/agent/parts/${solidId}/sim/static/setup`, { revision, study })
+}
+
+/** Stage 3: run the set-up shown at `revision`. */
+export async function runApproved(solidId: number, revision: string): Promise<SimRun> {
+  const r = await fetch(`${API_HOST}/api/agent/parts/${solidId}/sim/static`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ revision }),
+  })
+  const body = (await r.json().catch(() => ({}))) as Record<string, unknown>
+  if (r.status === 409)
+    return { kind: 'refused', reason: 'The set-up changed since it was shown. Look at it again, then run.' }
+  return simRunOf(r.status, body)
+}
+/** A material from the kernel's library (`GET /api/agent/sim/materials`). */
+export interface LibraryMaterial {
+  id: string
+  name: string
+  youngs_modulus_mpa: number
+  poisson_ratio: number
+  yield_strength_mpa: number
+  yield_basis: YieldBasis
+  yield_source: string
+  stiffness_source: string
+}
+
+export async function fetchMaterials(): Promise<LibraryMaterial[]> {
+  const r = await fetch(`${API_HOST}/api/agent/sim/materials`)
+  if (!r.ok) return []
+  const body = (await r.json()) as { materials?: LibraryMaterial[] }
+  return body.materials ?? []
+}
+
+/** A library material as the panel's entry: every value and its source. */
+export function entryOf(m: LibraryMaterial): MaterialEntry {
+  return {
+    name: m.name,
+    youngs_modulus_mpa: String(m.youngs_modulus_mpa),
+    poisson_ratio: String(m.poisson_ratio),
+    yield_strength_mpa: String(m.yield_strength_mpa),
+    source: m.yield_source,
+    yieldBasis: m.yield_basis,
+  }
 }

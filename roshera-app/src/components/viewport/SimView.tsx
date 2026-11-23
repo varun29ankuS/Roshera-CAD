@@ -31,7 +31,7 @@ export function SimView() {
   const shown = useSimStore((s) => s.shown)
   const deformed = useSimStore((s) => s.deformed)
   const focus = useSimStore((s) => s.focus)
-  const stage = useSimStore((s) => s.stage)
+  const step = useSimStore((s) => s.step)
   const wire = useSimStore((s) => s.wire)
   const meshRefs = useSceneStore((s) => s.meshRefs)
   const objects = useSceneStore((s) => s.objects)
@@ -46,6 +46,9 @@ export function SimView() {
   useEffect(() => {
     if (!showResult || !mesh) return
     const was = mesh.visible
+    // The part's three.js mesh belongs to the viewport scene, not to React
+    // state: hiding it while the result skin stands in is a scene change,
+    // undone on cleanup (the DFM animation player does the same).
     mesh.visible = false
     invalidate()
     return () => {
@@ -58,6 +61,8 @@ export function SimView() {
     if (!mesh) return null
     mesh.updateWorldMatrix(true, false)
     return mesh.matrixWorld.clone()
+    // `objects` changes when the part moves: the world matrix is re-read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mesh, objects])
 
   const marks = useMemo(() => {
@@ -109,11 +114,11 @@ export function SimView() {
 
   // The mesh stage: the proving mesh's element edges over the part.
   const wireGeometry = useMemo(() => {
-    if (!active || stage !== 'mesh' || !wire) return null
+    if (!active || step !== 'mesh' || !wire) return null
     const g = new THREE.BufferGeometry()
     g.setAttribute('position', new THREE.BufferAttribute(wireSegments(wire), 3))
     return g
-  }, [active, stage, wire])
+  }, [active, step, wire])
   useEffect(() => () => wireGeometry?.dispose(), [wireGeometry])
 
   if (!active) return null

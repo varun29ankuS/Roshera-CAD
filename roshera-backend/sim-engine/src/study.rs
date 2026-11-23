@@ -70,6 +70,11 @@ pub struct Material {
     /// edition, the customer's own data).
     #[serde(default)]
     pub source: Option<String>,
+    /// Whether the yield is a standard's specified minimum or a typical
+    /// data-sheet value (`materials::YieldBasis`); a typical one is named
+    /// in the result's assumptions. Absent: as the person stated it.
+    #[serde(default)]
+    pub yield_basis: Option<crate::materials::YieldBasis>,
 }
 
 /// What the part must achieve.

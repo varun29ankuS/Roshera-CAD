@@ -708,7 +708,48 @@ pub async fn activate(state: &AppState, document_id: &str) -> durability::Durabi
     //    IDENTICAL path a server boot already runs, because boot and
     //    activate share this one function.
     *state.active_document.write().await = document_id.to_string();
+    // Remembered, so a restart reopens THIS document (`reopen_last_document`)
+    // instead of the fixed default. A failure to remember is named, never
+    // fatal: the switch itself has happened.
+    if let Err(e) = state.database.save_open_document(document_id).await {
+        tracing::warn!(
+            target: "documents",
+            document = %document_id,
+            error = %e,
+            "documents: could not remember the open document for the next restart"
+        );
+    }
     durability::boot_replay(state).await
+}
+
+/// At server boot: point `active_document` at the document the server last
+/// had open, when one was remembered and is still registered -- so a
+/// restart leaves everyone (the app, every agent) in the document they
+/// were in, as CAD tools do, instead of moving them all to the fixed
+/// default. Runs BEFORE the boot replay, which serves whatever this cell
+/// holds. Returns the reopened document, if any.
+pub async fn reopen_last_document(state: &AppState) -> Option<String> {
+    let remembered = match state.database.load_open_document().await {
+        Ok(Some(id)) => id,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(target: "documents", error = %e, "documents: could not read the last open document; booting the default");
+            return None;
+        }
+    };
+    let registered = match state.database.load_documents().await {
+        Ok(docs) => docs.iter().any(|d| d.id == remembered),
+        Err(e) => {
+            tracing::warn!(target: "documents", error = %e, "documents: could not list documents; booting the default");
+            return None;
+        }
+    };
+    if !registered {
+        tracing::warn!(target: "documents", document = %remembered, "documents: the last open document is no longer registered; booting the default");
+        return None;
+    }
+    *state.active_document.write().await = remembered.clone();
+    Some(remembered)
 }
 
 /// Boot-time self-heal: ensure the default (pre-documents) document has a

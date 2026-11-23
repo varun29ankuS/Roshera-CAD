@@ -597,6 +597,13 @@ impl DatabasePersistence for GatedStore {
         self.inner.prune_token_revocations(now_ms).await
     }
 
+    async fn save_open_document(&self, id: &str) -> Result<(), SessionError> {
+        self.inner.save_open_document(id).await
+    }
+    async fn load_open_document(&self) -> Result<Option<String>, SessionError> {
+        self.inner.load_open_document().await
+    }
+
     async fn save_session(&self, session: &SessionState) -> Result<(), SessionError> {
         self.inner.save_session(session).await
     }

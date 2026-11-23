@@ -1,6 +1,8 @@
 import { create } from 'zustand'
 import {
   setupOf,
+  stepOfStage,
+  type StepId,
   type FieldShown,
   type LoadEntry,
   type MaterialEntry,
@@ -38,6 +40,10 @@ interface SimState {
   deformed: boolean
   /** The set-up row the person is looking at; its faces are drawn strongest. */
   focus: { kind: 'support' | 'load'; index: number } | null
+  /** The step on screen. */
+  step: StepId
+  /** The support or load whose faces the person is clicking now. */
+  picking: { kind: 'support' | 'load'; index: number } | null
 
   setPart: (objectId: string | null) => void
   addSupport: (s: SupportEntry) => void
@@ -57,12 +63,14 @@ interface SimState {
   loadSession: (objectId: string, session: SimSession) => void
   /** Note a revision as already on screen (the panel's own run). */
   markSeen: (revision: string) => void
+  setStep: (step: StepId) => void
+  setPicking: (picking: SimState['picking']) => void
 }
 
 const EMPTY_SETUP: Setup = {
   supports: [],
   loads: [],
-  material: { name: '', youngs_modulus_mpa: '', poisson_ratio: '', yield_strength_mpa: '', source: '' },
+  material: { name: '', youngs_modulus_mpa: '', poisson_ratio: '', yield_strength_mpa: '', source: '', yieldBasis: null },
   minSafetyFactor: '',
   meshSizeMm: '',
 }
@@ -83,12 +91,14 @@ export const useSimStore = create<SimState>((set) => ({
   shown: 'stress',
   deformed: true,
   focus: null,
+  step: 'part',
+  picking: null,
 
   setPart: (objectId) =>
     set((s) =>
       s.objectId === objectId
         ? s
-        : { objectId, setup: EMPTY_SETUP, report: null, stage: null, mesh: null, wire: null, focus: null },
+        : { objectId, setup: EMPTY_SETUP, report: null, stage: null, mesh: null, wire: null, focus: null, picking: null },
     ),
   addSupport: (sup) => set((s) => edit({ ...s.setup, supports: [...s.setup.supports, sup] })),
   updateSupport: (i, sup) =>
@@ -116,6 +126,10 @@ export const useSimStore = create<SimState>((set) => ({
       setup: session.study ? setupOf(session.study) : EMPTY_SETUP,
       report: session.stage === 'result' ? session.report : null,
       focus: null,
+      picking: null,
+      step: stepOfStage(session.stage),
     }),
   markSeen: (revision) => set({ revision }),
+  setStep: (step) => set({ step, picking: null }),
+  setPicking: (picking) => set({ picking }),
 }))

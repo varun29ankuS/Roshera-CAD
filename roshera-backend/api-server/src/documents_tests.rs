@@ -661,3 +661,43 @@ async fn rename_unknown_document_404s() {
     assert_eq!(status, StatusCode::NOT_FOUND, "body = {body}");
     assert_eq!(body["error_code"], "document_not_found");
 }
+
+/// A restart reopens the document the server last had open -- with its
+/// geometry -- instead of the fixed default, so the app and every connected
+/// agent stay where they were (Varun 2026-11-23: after each restart the
+/// server reopened the NIST-parts default, and the bracket the agent had
+/// built "came back unsound": part 2 there is another part).
+///
+/// Mutation: drop the `save_open_document` call in `activate` -> the restart
+/// boots the default, empty here -> RED.
+#[tokio::test]
+async fn a_restart_reopens_the_last_open_document() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let state = build_state(db, true).await;
+    let (status, body) =
+        dispatch(&state, post("/api/documents", json!({ "name": "Bracket" }))).await;
+    assert_eq!(status, StatusCode::OK, "create; body = {body}");
+    let id = body["id"].as_str().expect("id").to_string();
+    let (status, _) = dispatch(
+        &state,
+        post(&format!("/api/documents/{id}/open"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "open");
+    create_a_box(&state).await;
+    drop(state);
+
+    // The restart, as `main` boots: reopen, then replay.
+    let db = open_db(&path).await;
+    let restarted = build_state(db, false).await;
+    let reopened = documents::reopen_last_document(&restarted).await;
+    durability::boot_replay(&restarted).await;
+    assert_eq!(reopened.as_deref(), Some(id.as_str()));
+    assert_eq!(
+        *restarted.active_document.read().await,
+        id,
+        "the restart is in the document it left"
+    );
+    assert_eq!(solid_count(&restarted).await, 1, "with its geometry");
+}

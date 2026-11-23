@@ -411,7 +411,14 @@ pub trait DatabasePersistence: Send + Sync {
     /// here, so this method has no opinion about which document it is
     /// asked to delete.
     async fn delete_document(&self, id: &str) -> Result<(), SessionError>;
-
+    /// Remember which document the server has open, so a restart reopens it
+    /// (as CAD tools do) instead of falling back to the fixed default --
+    /// which moved everyone, and every connected agent, to a different
+    /// document after each restart.
+    async fn save_open_document(&self, id: &str) -> Result<(), SessionError>;
+    /// The document the server last had open; `None` when none was recorded
+    /// (a database from before this was kept).
+    async fn load_open_document(&self) -> Result<Option<String>, SessionError>;
     // Import blobs: the exact bytes of every file imported into a document,
     // content-addressed by their sha256 (lowercase hex). An import is recorded
     // in the timeline as a step that NAMES its blob; replaying the step
@@ -958,6 +965,20 @@ impl PostgresDatabase {
             reason: format!("Failed to create documents table: {}", e),
         })?;
 
+        // Server settings that survive a restart (the open document).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS server_settings (
+                key VARCHAR(255) PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create server_settings table: {}", e),
+        })?;
         // Import blobs: the exact bytes of each imported file, addressed by
         // sha256, scoped by document (see `save_import_blob`).
         sqlx::query(
@@ -2100,6 +2121,38 @@ impl DatabasePersistence for PostgresDatabase {
         Ok(rows.into_iter().map(row_to_document_record_pg).collect())
     }
 
+    async fn save_open_document(&self, id: &str) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO server_settings (key, value) VALUES ('open_document', $1)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save the open document: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_open_document(&self) -> Result<Option<String>, SessionError> {
+        let row = sqlx::query("SELECT value FROM server_settings WHERE key = 'open_document'")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to load the open document: {}", e),
+            })?;
+        row.map(|r| {
+            sqlx::Row::try_get::<String, _>(&r, "value").map_err(|e| {
+                SessionError::PersistenceError {
+                    reason: format!("Failed to read the open document: {}", e),
+                }
+            })
+        })
+        .transpose()
+    }
     async fn delete_document(&self, id: &str) -> Result<(), SessionError> {
         let mut tx = self
             .pool
@@ -2628,6 +2681,20 @@ impl SqliteDatabase {
             reason: format!("Failed to create documents table: {}", e),
         })?;
 
+        // Server settings that survive a restart (the open document).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS server_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create server_settings table: {}", e),
+        })?;
         // Import blobs — SQLite twin of the PostgreSQL `import_blobs` table.
         sqlx::query(
             r#"
@@ -3719,6 +3786,38 @@ impl DatabasePersistence for SqliteDatabase {
             .collect())
     }
 
+    async fn save_open_document(&self, id: &str) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO server_settings (key, value) VALUES ('open_document', ?1)
+            ON CONFLICT (key) DO UPDATE SET value = excluded.value
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save the open document: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_open_document(&self) -> Result<Option<String>, SessionError> {
+        let row = sqlx::query("SELECT value FROM server_settings WHERE key = 'open_document'")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to load the open document: {}", e),
+            })?;
+        row.map(|r| {
+            sqlx::Row::try_get::<String, _>(&r, "value").map_err(|e| {
+                SessionError::PersistenceError {
+                    reason: format!("Failed to read the open document: {}", e),
+                }
+            })
+        })
+        .transpose()
+    }
     async fn delete_document(&self, id: &str) -> Result<(), SessionError> {
         let mut tx = self
             .pool
