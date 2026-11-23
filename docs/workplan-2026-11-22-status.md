@@ -33,6 +33,14 @@ and table.
 
 ## P0 import speed: the size-relative edge cap is parked on a mirror defect
 
+**Landed 2026-11-23.** The defect was not in the mirror: the cylinder
+rim fillet (`operations/fillet.rs`, closed-edge path) built both trim
+circles with `Arc::circle`'s canonical t = 0 (+X) instead of `ref_dir`,
+where their seam vertices sit; a mirror makes `ref_dir` = −X. Fixed by
+anchoring both to `ref_dir` (as the cone path anchors to `u_rad`), pinned
+in `a_bore_rim_fillet_commutes_with_a_mirror`; the edge cap then landed
+with a clean full red-gate. The patch file below is now history.
+
 Part 109's import certificate meshes 1.17 M triangles because the
 tessellation edge-length cap is an absolute 0.1 mm: every long, thin
 fillet is cut into 0.1 mm strips. Flooring the cap at 0.5 % of the part's
