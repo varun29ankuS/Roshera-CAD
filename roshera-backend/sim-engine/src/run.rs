@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ccx::{solve_static, von_mises, DeckLoad, SolveError};
 use crate::engines::Engines;
+use crate::field::{surface_field, SurfaceField};
 use crate::mesh::{mesh_solid, MeshError, MeshStats};
 use crate::rigid::{free_motions, FreeMotion, HeldPoint, Holds};
 use crate::study::{Study, SupportKind, FINE_RATIO};
@@ -76,6 +77,8 @@ pub struct StaticReport {
     /// The persistent ids of the faces the study names (hex), for replay.
     pub face_pids: Vec<(u32, String)>,
     pub assumptions: Vec<String>,
+    /// The fine run's result on the part's surface, for the viewport.
+    pub field: SurfaceField,
 }
 
 /// Why a study was not run at all.
@@ -222,7 +225,7 @@ pub fn run_static(
             t[2] + l.force_n[2],
         ]
     });
-    let solve_at = |size: f64, label: &str| -> Result<RunResult, StudyError> {
+    let solve_at = |size: f64, label: &str| -> Result<(RunResult, SurfaceField), StudyError> {
         let dir = workdir.join(label);
         let (mesh, stats) = mesh_solid(model, solid, size, &engines.mesher, &dir, ENGINE_LIMIT)?;
         let loads: Vec<DeckLoad<'_>> = study
@@ -254,18 +257,22 @@ pub fn run_static(
             .iter()
             .map(|(n, s)| (*n, von_mises(s)))
             .fold((0, 0.0_f64), |a, b| if b.1 > a.1 { b } else { a });
-        Ok(RunResult {
-            mesh: stats,
-            max_displacement_mm,
-            peak_von_mises_mpa: peak,
-            peak_at: mesh.nodes.get(&peak_node).copied().unwrap_or([0.0; 3]),
-            reaction_total_n: sol.reaction_total,
-            load_on_held_n: sol.load_on_held,
-            solver_seconds: sol.solver_seconds,
-        })
+        let field = surface_field(&mesh, &sol);
+        Ok((
+            RunResult {
+                mesh: stats,
+                max_displacement_mm,
+                peak_von_mises_mpa: peak,
+                peak_at: mesh.nodes.get(&peak_node).copied().unwrap_or([0.0; 3]),
+                reaction_total_n: sol.reaction_total,
+                load_on_held_n: sol.load_on_held,
+                solver_seconds: sol.solver_seconds,
+            },
+            field,
+        ))
     };
-    let coarse = solve_at(coarse_size, "coarse")?;
-    let fine = solve_at(coarse_size * FINE_RATIO, "fine")?;
+    let (coarse, _) = solve_at(coarse_size, "coarse")?;
+    let (fine, field) = solve_at(coarse_size * FINE_RATIO, "fine")?;
 
     // ── Checks and verdict ────────────────────────────────────────────────
     let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-300);
@@ -395,6 +402,7 @@ pub fn run_static(
         engines: engines.clone(),
         face_pids,
         assumptions,
+        field,
     })
 }
 

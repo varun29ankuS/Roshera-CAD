@@ -142,9 +142,12 @@ fn a_cantilever_deflects_as_the_beam_formula_says() {
     let dir = std::env::temp_dir().join("roshera-sim-cantilever");
     let _ = std::fs::remove_dir_all(&dir);
     let report = run_static(&m, s, &study, &engines, &dir).expect("the study runs");
+    // The report without its field (thousands of vertices) for reading.
+    let mut brief = report.clone();
+    brief.field = Default::default();
     eprintln!(
         "{}",
-        serde_json::to_string_pretty(&report).unwrap_or_default()
+        serde_json::to_string_pretty(&brief).unwrap_or_default()
     );
     let expected = 1.0 * 100f64.powi(4) / (8.0 * 68_900.0 * (10.0 * 1000.0 / 12.0));
     let got = report.fine.max_displacement_mm;
@@ -168,4 +171,51 @@ fn a_cantilever_deflects_as_the_beam_formula_says() {
         }
     }
     assert!(report.engines.mesher.interim);
+
+    // The surface field the viewport draws: a closed skin wound
+    // consistently outward -- every edge used once in each direction --
+    // on all six faces of the beam, peaking where the report says.
+    let f = &report.field;
+    assert!(!f.triangles.is_empty());
+    assert_eq!(f.faces.len(), f.triangles.len());
+    assert_eq!(f.positions.len(), f.von_mises.len());
+    assert_eq!(f.positions.len(), f.displacement.len());
+    let mut directed = std::collections::HashMap::<(u32, u32), u32>::new();
+    for t in &f.triangles {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            *directed.entry((a, b)).or_default() += 1;
+        }
+    }
+    for (&(a, b), &n) in &directed {
+        assert_eq!(n, 1, "edge {a}->{b} used {n} times in one direction");
+        assert!(
+            directed.contains_key(&(b, a)),
+            "edge {a}->{b} has no reverse: the skin is open or wound inconsistently"
+        );
+    }
+    let mut faces = f.faces.clone();
+    faces.sort_unstable();
+    faces.dedup();
+    assert_eq!(faces.len(), 6, "every face of the beam carries the field");
+    let peak = report.fine.peak_von_mises_mpa as f32;
+    assert!(
+        (f.max_von_mises - peak).abs() <= 1e-3 * peak,
+        "surface peak {} vs report peak {peak}",
+        f.max_von_mises
+    );
+    // Outward, not merely consistent: the skin encloses positive volume.
+    let volume: f64 = f
+        .triangles
+        .iter()
+        .map(|t| {
+            let [a, b, c] = t.map(|i| f.positions[i as usize].map(f64::from));
+            (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                / 6.0
+        })
+        .sum();
+    assert!(
+        (volume - 100.0 * 10.0 * 10.0).abs() < 1.0,
+        "the skin encloses {volume} mm^3, the beam is 10000"
+    );
 }

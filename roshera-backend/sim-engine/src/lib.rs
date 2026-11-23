@@ -22,6 +22,7 @@
 
 pub mod ccx;
 pub mod engines;
+pub mod field;
 pub mod loads;
 pub mod mesh;
 pub mod rigid;
