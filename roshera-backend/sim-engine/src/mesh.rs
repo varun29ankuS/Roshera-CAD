@@ -81,8 +81,14 @@ pub fn mesh_solid(
     std::fs::create_dir_all(workdir).map_err(|e| MeshError::Export(e.to_string()))?;
     let step = workdir.join("part.step");
     let file = std::fs::File::create(&step).map_err(|e| MeshError::Export(e.to_string()))?;
-    export_engine::formats::step::writer::write_brep_step(model, std::io::BufWriter::new(file))
-        .map_err(|e| MeshError::Export(e.to_string()))?;
+    // This solid only: the mesher meshes every body in the file it is given,
+    // and a document holds every part.
+    export_engine::formats::step::writer::write_solid_step(
+        model,
+        solid,
+        std::io::BufWriter::new(file),
+    )
+    .map_err(|e| MeshError::Export(e.to_string()))?;
     let (lo, hi) = solid_bounds(model, solid).ok_or(MeshError::Empty)?;
     let pad = 1e-3 * (0..3).map(|i| hi[i] - lo[i]).fold(1.0_f64, f64::max);
     std::fs::write(workdir.join("part.geo"), geo_script(size_mm, lo, hi, pad))

@@ -1822,6 +1822,49 @@ pub async fn export_brep_to_step(model: &BRepModel, path: &Path) -> Result<(), E
 /// async or does not want a file (the simulation crate hands it to a
 /// mesher).
 pub fn write_brep_step<W: Write>(model: &BRepModel, out: W) -> Result<(), ExportError> {
+    let snapshot = BRepSnapshot::from_model(model)?;
+    write_snapshot_step(model, &snapshot, out)
+}
+
+/// The STEP exchange structure of ONE solid of `model`: its shells and
+/// faces, and only the geometry they reference (the writer's face-anchored
+/// reachability filter drops the rest). For a consumer that must not see
+/// the other parts of the document -- a mesher meshes every body it is
+/// given.
+pub fn write_solid_step<W: Write>(
+    model: &BRepModel,
+    solid: geometry_engine::primitives::solid::SolidId,
+    out: W,
+) -> Result<(), ExportError> {
+    let mut snapshot = BRepSnapshot::from_model(model)?;
+    let wanted = crate::formats::ros_snapshot::id_to_uuid(solid as u64);
+    snapshot.solids.retain(|(id, _)| *id == wanted);
+    let Some((_, data)) = snapshot.solids.first() else {
+        return Err(ExportError::ExportFailed {
+            reason: format!("solid {solid} is not in the model"),
+        });
+    };
+    let shells: std::collections::HashSet<uuid::Uuid> = data
+        .shells
+        .iter()
+        .chain(data.peer_shells.iter())
+        .copied()
+        .collect();
+    snapshot.shells.retain(|(id, _)| shells.contains(id));
+    let faces: std::collections::HashSet<uuid::Uuid> = snapshot
+        .shells
+        .iter()
+        .flat_map(|(_, s)| s.faces.iter().copied())
+        .collect();
+    snapshot.faces.retain(|(id, _)| faces.contains(id));
+    write_snapshot_step(model, &snapshot, out)
+}
+
+fn write_snapshot_step<W: Write>(
+    model: &BRepModel,
+    snapshot: &BRepSnapshot,
+    out: W,
+) -> Result<(), ExportError> {
     let mut writer = StepWriter::new(out);
 
     // Write header
@@ -1836,9 +1879,6 @@ pub fn write_brep_step<W: Write>(model: &BRepModel, out: W) -> Result<(), Export
     writer.begin_data().map_err(|e| ExportError::ExportFailed {
         reason: format!("Failed to begin STEP data section: {}", e),
     })?;
-
-    // Convert to snapshot for easier iteration.
-    let snapshot = BRepSnapshot::from_model(model)?;
 
     // Compute parameter-space curves (pcurves) + periodicity metadata for
     // every edge bounding a non-planar parametric face FROM THE LIVE MODEL —
@@ -1861,7 +1901,7 @@ pub fn write_brep_step<W: Write>(model: &BRepModel, out: W) -> Result<(), Export
         .unwrap_or_else(|| "Roshera Model".to_string());
 
     writer
-        .write_brep_model(&snapshot, context_id, &model_name, &pcurve_export)
+        .write_brep_model(snapshot, context_id, &model_name, &pcurve_export)
         .map_err(|e| ExportError::ExportFailed {
             reason: format!("Failed to write B-Rep model: {}", e),
         })?;
@@ -2906,5 +2946,68 @@ mod tests {
     fn escape_step_string_doubles_apostrophe() {
         assert_eq!(escape_step_string("O'Brien"), "O''Brien");
         assert_eq!(escape_step_string("a\\b"), "a\\\\b");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod single_solid_tests {
+    use super::*;
+    use geometry_engine::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+    fn add_box(model: &mut BRepModel, w: f64) -> u32 {
+        match TopologyBuilder::new(model).create_box_3d(w, w, w).unwrap() {
+            GeometryId::Solid(id) => id,
+            other => panic!("box built {other:?}"),
+        }
+    }
+
+    fn cartesian_points(text: &str) -> Vec<[f64; 3]> {
+        text.lines()
+            .filter_map(|l| l.split_once("CARTESIAN_POINT('',(").map(|(_, r)| r))
+            .filter_map(|r| r.split_once("))").map(|(n, _)| n))
+            .filter_map(|n| {
+                let v: Vec<f64> = n.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                (v.len() == 3).then(|| [v[0], v[1], v[2]])
+            })
+            .collect()
+    }
+
+    /// One solid of a two-solid model is written alone: its six faces and
+    /// none of the other box's -- a mesher given the whole document meshes
+    /// every part in it (an L-bracket study meshed a 7.9 MB document).
+    ///
+    /// Mutation: drop the face/shell trimming -> 12 faces -> RED.
+    #[test]
+    fn one_solid_of_two_is_written_alone() {
+        let mut model = BRepModel::new();
+        let small = add_box(&mut model, 10.0);
+        add_box(&mut model, 40.0);
+
+        let mut whole = Vec::new();
+        write_brep_step(&model, &mut whole).unwrap();
+        let whole = String::from_utf8(whole).unwrap();
+        assert_eq!(whole.matches("ADVANCED_FACE").count(), 12);
+
+        let mut one = Vec::new();
+        write_solid_step(&model, small, &mut one).unwrap();
+        let one = String::from_utf8(one).unwrap();
+        assert_eq!(
+            one.matches("ADVANCED_FACE").count(),
+            6,
+            "only the small box's faces"
+        );
+        assert_eq!(one.matches("MANIFOLD_SOLID_BREP").count(), 1);
+        // Nothing of the 40 mm box: every written point within the 10 mm box.
+        for p in cartesian_points(&one) {
+            assert!(
+                p.iter().all(|c| c.abs() <= 10.0 + 1e-9),
+                "point {p:?} is from the other box"
+            );
+        }
+        assert!(
+            write_solid_step(&model, 999, Vec::new()).is_err(),
+            "an unknown solid is refused"
+        );
     }
 }

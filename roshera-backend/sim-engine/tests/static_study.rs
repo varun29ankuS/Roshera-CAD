@@ -121,7 +121,15 @@ fn a_part_on_a_roller_is_refused_with_its_free_motions() {
 #[ignore = "needs Gmsh and CalculiX; run with --ignored"]
 fn a_cantilever_deflects_as_the_beam_formula_says() {
     let engines = Engines::discover().expect("Gmsh and CalculiX installed");
-    let (m, s) = bar();
+    let (mut m, s) = bar();
+    // A second part in the same document, as in the app, lying wholly inside
+    // the beam's bounding box: only the studied solid may reach the mesher,
+    // or this one is meshed with it (the mesher keeps every volume inside
+    // that box). Built before the faces are named, so ids are final.
+    match TopologyBuilder::new(&mut m).create_box_3d(4.0, 4.0, 4.0) {
+        Ok(GeometryId::Solid(_)) => {}
+        other => panic!("second part: {other:?}"),
+    }
     let (lo_x, top) = (face_at(&m, s, 0, -1.0), face_at(&m, s, 2, 1.0));
     let study = Study {
         supports: vec![Support {
@@ -142,6 +150,15 @@ fn a_cantilever_deflects_as_the_beam_formula_says() {
     let dir = std::env::temp_dir().join("roshera-sim-cantilever");
     let _ = std::fs::remove_dir_all(&dir);
     let report = run_static(&m, s, &study, &engines, &dir).expect("the study runs");
+    // What reached the mesher: the beam's six faces, nothing of the other part.
+    for run in ["coarse", "fine"] {
+        let step = std::fs::read_to_string(dir.join(run).join("part.step")).unwrap();
+        assert_eq!(
+            step.matches("ADVANCED_FACE").count(),
+            6,
+            "{run} mesher input"
+        );
+    }
     // The report without its field (thousands of vertices) for reading.
     let mut brief = report.clone();
     brief.field = Default::default();
