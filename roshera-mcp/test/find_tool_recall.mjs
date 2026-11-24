@@ -20,7 +20,7 @@
 //
 // Run: node test/find_tool_recall.mjs   (exit 0 = pass, non-zero = fail)
 
-import { buildTable, MINIMAL_SURFACE } from "../dist/surface.js";
+import { buildTable, MINIMAL_SURFACE } from "./.build/surface.js";
 
 let failures = 0;
 const fail = (m) => {
@@ -183,7 +183,10 @@ console.log("\n(f2) ratchet floors (encode observed reality, never aspiration)")
 // not here: a sheet verb (drawing bench, experimental) is scaled down, and its
 // name kept out of the name-token rarity, when the query carries no sheet
 // context (metatools.ts `SHEET_VERB_OUT_OF_CONTEXT`). Measured 27/33 again.
-const FLOOR_HIT1 = 27;
+// 27 -> 28 (2026-11-24): material names left the global synonyms (they are
+// study words only in a study), so "how heavy is this part in aluminium" is
+// mass_properties again. This file also read the stale dist/ until today.
+const FLOOR_HIT1 = 28;
 const FLOOR_HITANY = 33;
 if (hit1 >= FLOOR_HIT1) pass(`hit@1 ${hit1}/${CASES.length} ≥ floor ${FLOOR_HIT1}`);
 else fail(`hit@1 REGRESSED: ${hit1}/${CASES.length} < floor ${FLOOR_HIT1}`);

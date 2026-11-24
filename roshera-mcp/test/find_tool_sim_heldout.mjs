@@ -97,8 +97,10 @@ console.log("(s2) ratchet floors");
 //              face-dominated: "solve it" (sketch/assembly solvers share the
 //              verb), "apply a force on the top face" and "bolt the base face
 //              down and push..." (face tools win on "face").
+//   2026-11-24 with no context, "solve it" is answered AMBIGUOUS, listing
+//              sim_static among the meanings: hit@any 13 -> 14.
 const FLOOR_AT1 = 9;
-const FLOOR_ANY = 13;
+const FLOOR_ANY = 14;
 if (hit1 >= FLOOR_AT1) pass(`hit@1 ${hit1} >= floor ${FLOOR_AT1}`);
 else fail(`hit@1 ${hit1} < floor ${FLOOR_AT1}`);
 if (hitAny >= FLOOR_ANY) pass(`hit@any ${hitAny} >= floor ${FLOOR_ANY}`);

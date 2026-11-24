@@ -290,6 +290,15 @@ const READ_ONLY = new Set<string>([
   "drawing_read_semantics",
   "drawing_spaces",
   "drawing_look",
+  // Found by test/tool_annotations.test.mjs (2026-11-24), which checks this
+  // list against the tools' MCP read-only annotations: all four only read --
+  // drawing_dimensions and iso286_limits are GETs; psketch_certify and
+  // psketch_dof call /certify, which runs on an isolated diagnostic solver and
+  // never mutates the sketch (csketch.rs, tested there).
+  "drawing_dimensions",
+  "iso286_limits",
+  "psketch_certify",
+  "psketch_dof",
   "gdt_report",
   "export_part",
   "drawing_export_sheet",
@@ -301,7 +310,7 @@ const READ_ONLY = new Set<string>([
 ]);
 
 /** Read-only: listed above, or a served tool whose definition says so. */
-function isReadOnly(tool: string): boolean {
+export function isReadOnly(tool: string): boolean {
   return READ_ONLY.has(tool) || servedMeta(tool)?.effects === "read_only";
 }
 

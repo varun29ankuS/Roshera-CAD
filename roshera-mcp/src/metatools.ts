@@ -95,7 +95,9 @@ const SYNONYM_GROUPS: string[][] = [
   ["load", "force", "push", "pull", "press", "newton"],
   // ...and what holds it.
   ["support", "fixture", "restrain", "restraint", "held", "hold", "anchor"],
-  ["material", "alloy", "steel", "aluminium", "aluminum", "titanium", "grade"],
+  // Material names are NOT a global group: "how heavy is this part in
+  // aluminium" is a mass question. In a study they mean the material library
+  // (DOMAIN_WORDS.simulate).
   ["shell", "hollow", "wall"],
   ["move", "translate", "shift", "reposition", "transform", "nudge", "rotate", "rotation", "reorient"],
   ["collide", "collision", "interference", "clash"],
@@ -454,6 +456,34 @@ export const VERB_MEANINGS: Record<string, { words: string[]; means: Partial<Rec
   export: { words: ["export"], means: { core: "export_part", drawing: "drawing_export_sheet" } },
 };
 
+/**
+ * A word's meaning INSIDE a domain, as the words that domain's tools use for
+ * it. In a strength study "pin", "fix" and "constraint" are supports and a
+ * "load" is a force; in a sketch "fix" is a constraint; in an assembly "pin"
+ * is a mate. Applied only while that domain is the working context: the query
+ * gains the domain's own words, so the global vocabulary is untouched with no
+ * context. Keys and values are plain words (stemmed when used). Same data
+ * shape the ontology will hold.
+ */
+export const DOMAIN_WORDS: Partial<Record<Bench, Record<string, string[]>>> = {
+  simulate: {
+    pin: ["support"], pinned: ["support"], fix: ["support"], fixed: ["support"],
+    clamp: ["support"], bolt: ["support"], anchor: ["support"], hold: ["support"],
+    restrain: ["support"], constraint: ["support"], constrain: ["support"],
+    load: ["force"], push: ["force"], pull: ["force"], press: ["force"],
+    material: ["material"], alloy: ["material"], steel: ["material"], aluminium: ["material"],
+    aluminum: ["material"], titanium: ["material"],
+  },
+  sketch: {
+    fix: ["constrain"], fixed: ["constrain"], lock: ["constrain"], pin: ["constrain"],
+    constraint: ["constrain"],
+  },
+  assembly: {
+    pin: ["mate", "revolute"], hinge: ["mate", "revolute"], fix: ["mate"], fixed: ["mate"],
+    constraint: ["mate"], constrain: ["mate"],
+  },
+};
+
 /** Words that add no intent to a bare verb ("solve it again now"). */
 const FILLER = new Set(["again", "now", "once", "go", "ahead", "then", "next", "ok", "okay"].map(stem));
 
@@ -477,6 +507,22 @@ function bareVerbOf(query: string): string | null {
  */
 const W_CONTEXT = 1.25;
 
+/**
+ * Added to every matching tool of the working bench when the query uses a
+ * word that bench defines (DOMAIN_WORDS): larger than any score a query can
+ * reach (W_EXACT_NAME is 1000), so those tools form the first group -- a
+ * partition, not a tuned weight.
+ */
+const CLAIMED_OFFSET = 10_000;
+
+/** The domain words a query uses in the working context (for the answer's `context`). */
+export function claimedWords(query: string, contextBench: Bench | null): string[] {
+  if (contextBench === null) return [];
+  const words = DOMAIN_WORDS[contextBench] ?? {};
+  const stems = new Set(Object.keys(words).map(stem));
+  return [...new Set(tokenize(query).filter((t) => stems.has(t)))];
+}
+
 /** Rank the whole table against a query; deterministic total order. */
 export function rankTools(
   table: ToolTable,
@@ -485,7 +531,15 @@ export function rankTools(
   limit = 5,
   contextBench: Bench | null = null,
 ): Scored[] {
-  const queryTokens = tokenize(query);
+  const baseTokens = tokenize(query);
+  // In a domain, a word also says what the domain's tools call it.
+  const domainWords = contextBench !== null && !benchFilter ? DOMAIN_WORDS[contextBench] : undefined;
+  const domainStems = new Map<string, string[]>(
+    Object.entries(domainWords ?? {}).map(([w, adds]) => [stem(w), adds.map(stem)]),
+  );
+  const queryTokens = [...baseTokens];
+  for (const t of baseTokens) for (const add of domainStems.get(t) ?? []) if (!queryTokens.includes(add)) queryTokens.push(add);
+  const claimed = baseTokens.some((t) => domainStems.has(t));
   const queryCreates = queryTokens.some((t) => CREATE_VERB_STEMS.has(t));
   const queryMutates = queryTokens.some((t) => MUTATE_VERB_STEMS.has(t));
   const context = sheetContextTokens(table);
@@ -506,6 +560,10 @@ export function rankTools(
     if (!sheetContext && !benchFilter && isSheetVerb(entry.name)) score *= SHEET_VERB_OUT_OF_CONTEXT;
     if (contextBench !== null && !benchFilter && bench === contextBench) score *= W_CONTEXT;
     if (score <= 0) continue;
+    // A word the working domain defines claims the query for that domain:
+    // its tools rank first ("pin the hole" in a study is a support, not a
+    // drilling). Ranking within each group is unchanged.
+    if (claimed && bench === contextBench) score += CLAIMED_OFFSET;
     scored.push({
       name: entry.name,
       bench,
@@ -705,8 +763,18 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
             "Browse a whole bench by querying its name, e.g. 'analysis'.",
         });
       }
+      const read = bench ? [] : claimedWords(query, ctx.bench);
       return okMeta({
         query,
+        ...(ctx.bench !== null && !bench
+          ? {
+              context: {
+                working_in: ctx.bench,
+                from: ctx.from,
+                ...(read.length ? { domain_words: read } : {}),
+              },
+            }
+          : {}),
         // The ranking reads every word of each purpose; the RESULT carries
         // only its gist -- a search that returned five full purposes cost up
         // to 2.6k tokens, mostly a workflow repeated per tool. describe_tool

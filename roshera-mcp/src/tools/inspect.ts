@@ -397,8 +397,8 @@ export function registerInspectTools(server: ToolHost) {
       "fine, CalculiX), and answer with a verdict only the evidence supports: holds / " +
       "fails against the safety factor, or undecided WITH THE REASON (supports do not " +
       "carry the load; peak stress did not converge -- a sharp corner; no yield with a " +
-      "source). Never guesses a safety factor. Adds the check 'solved on the mesh you " +
-      "approved'. The result is coloured on the part in the Simulate tab. 409 " +
+      "source). Never guesses a safety factor. The report carries the check 'solved on " +
+      "the mesh you approved'. The result is coloured on the part in the Simulate tab. 409 " +
       "sim_stale_revision: the set-up changed since -- read sim_session, show the " +
       "person, ask again. " + STUDY_FLOW,
     {

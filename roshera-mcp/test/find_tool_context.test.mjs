@@ -140,6 +140,25 @@ await inBench("simulate", "select the top face", "select_face");
 await inBench("sketch", "undo that", "timeline_undo");
 await inBench("assembly", "make a box 10 by 20 by 30", "create_box");
 
+// (x7) frozen 2026-11-24 before the per-domain word meanings existed: one
+// word, a different meaning per domain.
+console.log("(x7) a word means what it means in the domain");
+await inBench("simulate", "pin the hole", "sim_setup"); // a pin SUPPORT
+await inBench("assembly", "pin the lever to the base", "assembly_mate"); // a revolute MATE
+await inBench("simulate", "the load is 300 N downward on the tab", "sim_setup");
+await inBench("simulate", "add a constraint on the base face", "sim_setup"); // a support
+await inBench("sketch", "add a constraint between the line and the arc", "psketch_constrain");
+await inBench("sketch", "fix this point where it is", "psketch_constrain"); // X/Y coordinate constraints
+await inBench("simulate", "what material is it made of", "sim_materials");
+{
+  // No domain: "aluminium" is not a study word, the question is the part's mass.
+  resetWorkingContext();
+  await bench("core_only");
+  const r = await find("how heavy is this part in aluminium");
+  if (first(r) === "mass_properties") pass(`no domain: "how heavy is this part in aluminium" -> mass_properties`);
+  else fail(`no domain: "how heavy is this part in aluminium" -> ${first(r)} (${(r.matches ?? []).map((m) => m.name).join(", ")})`);
+}
+
 console.log("(x6) a resolved verb costs one match");
 {
   resetWorkingContext();

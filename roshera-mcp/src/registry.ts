@@ -19,6 +19,7 @@ import { z } from "zod";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
 import { nextTurn } from "./core.js";
 import { servedMeta } from "./served_meta.js";
+import { annotationsOf } from "./effects.js";
 import {
   preDispatchGate,
   recordDispatchOutcome,
@@ -210,7 +211,9 @@ export class ToolTable implements ToolHost {
       recordDispatchOutcome(t.name, args, result, turn);
       return result;
     };
-    this.tools.set(t.name, { ...t, handler: wrapped });
+    // Every tool says what it does to its world (effects.ts); a served tool
+    // keeps the annotations its own definition declares.
+    this.tools.set(t.name, { ...t, annotations: t.annotations ?? annotationsOf(t.name), handler: wrapped });
   }
 
   get(name: string): RegisteredTool | undefined {
