@@ -183,6 +183,14 @@ pub(crate) enum GooseAcpError {
     )]
     LockdownIncomplete(Vec<String>),
     #[error(
+        "goose finds enabled plugins for the agent workspace: {0:?} -- each \
+         one's MCP servers would start with every agent session (goose >= \
+         1.60 enables a newly found plugin by default); remove them from \
+         the workspace's and goose root's `.agents/plugins`, refusing to \
+         boot with them live"
+    )]
+    PluginsEnabled(Vec<String>),
+    #[error(
         "the goose config lockdown could not be verified as applied to \
          Roshera's own root '{root}': {detail}. goose::config::Config::global() \
          is a process-lifetime OnceCell that binds to whatever GOOSE_PATH_ROOT \
@@ -610,6 +618,11 @@ pub(crate) fn initialize(
     })?;
 
     std::env::set_var("GOOSE_PATH_ROOT", &root);
+    // goose >= 1.60 reads its loaded-session bound from this setting (its
+    // own `SessionRuntime`, server-wide); the env value outranks the config
+    // file. Pinned here, before goose first reads config, to Roshera's
+    // bound -- see [`max_agent_sessions`].
+    std::env::set_var("GOOSE_MAX_ACTIVE_AGENTS", max_agent_sessions().to_string());
     // Consulted BEFORE the config file by goose's provider resolution —
     // remove so the config pin below is authoritative.
     std::env::remove_var("GOOSE_PROVIDER");
@@ -717,6 +730,15 @@ pub(crate) fn initialize(
         return Err(GooseAcpError::LockdownIncomplete(still_enabled));
     }
 
+    // goose >= 1.60 starts the MCP servers of every ENABLED PLUGIN with a
+    // session -- found under `<session cwd>/.agents/plugins` and goose's
+    // own `<root>/.agents/plugins`, and a newly found plugin is enabled by
+    // default. Sessions are pinned to the agent workspace (`session_cwd` in
+    // `acp_router_at`), so these two directories are the whole plugin
+    // surface: it must be empty, or the server refuses to boot -- a plugin
+    // is an arbitrary command, the same hazard as an extension.
+    verify_no_enabled_plugins(&agent_workspace)?;
+
     // The outcome is proven closed; now prove it is closed at the right
     // LOCATION — see verify_config_landed_at_root's doc and this module's
     // threat-model step 3 for the clobbering failure this closes.
@@ -730,6 +752,22 @@ pub(crate) fn initialize(
 
     let _ = GOOSE_ROOT.set(root.clone());
     Ok(root)
+}
+
+/// Refuse when goose would start any plugin's MCP servers for a session in
+/// `workspace` -- see the call in [`initialize`]. goose discovers plugins
+/// as the subdirectories of `<workspace>/.agents/plugins` and of its own
+/// `<root>/.agents/plugins`, and enables a newly found one by default.
+fn verify_no_enabled_plugins(workspace: &std::path::Path) -> Result<(), GooseAcpError> {
+    let plugins: Vec<String> = goose::plugins::discovery::discover_enabled_plugins(Some(workspace))
+        .into_iter()
+        .map(|plugin| format!("{} ({})", plugin.name, plugin.root.display()))
+        .collect();
+    if plugins.is_empty() {
+        Ok(())
+    } else {
+        Err(GooseAcpError::PluginsEnabled(plugins))
+    }
 }
 
 /// The `/acp` router, or `None` if [`initialize`] has not run — callers
@@ -809,8 +847,11 @@ pub(crate) fn acp_router(
     acp_provider_epoch: Arc<crate::acp_provider_epoch::AcpProviderEpoch>,
 ) -> Option<axum::Router> {
     let root = GOOSE_ROOT.get()?;
+    // Fail closed: no pinned session directory, no `/acp` surface.
+    let workspace = agent_workspace_dir().ok()?;
     Some(acp_router_at(
         root,
+        &workspace,
         auth_manager,
         ai_provider_manager,
         acp_provider_epoch,
@@ -826,16 +867,42 @@ pub(crate) fn acp_router(
 /// which would mount `/acp` on every test-built app in the binary.
 fn acp_router_at(
     root: &std::path::Path,
+    workspace: &std::path::Path,
     auth_manager: Arc<session_manager::AuthManager>,
     ai_provider_manager: Arc<crate::ai_provider_config::AiProviderManager>,
     acp_provider_epoch: Arc<crate::acp_provider_epoch::AcpProviderEpoch>,
 ) -> axum::Router {
     let server = std::sync::Arc::new(goose::acp::server_factory::AcpServer::new(
+        acp_server_config(root, workspace),
+    ));
+    let router = goose::acp::transport::create_acp_router(server);
+    acp_layers(
+        router,
+        auth_manager,
+        ai_provider_manager,
+        acp_provider_epoch,
+    )
+}
+
+/// The goose ACP server's configuration: no built-ins, Roshera's config
+/// directory, every session pinned to the agent workspace.
+fn acp_server_config(
+    root: &std::path::Path,
+    workspace: &std::path::Path,
+) -> goose::acp::server_factory::AcpServerFactoryConfig {
+    {
         goose::acp::server_factory::AcpServerFactoryConfig {
-            // No forced builtins — and BUILTIN_REGISTRY is empty anyway
-            // (no `goose-mcp` in the build).
-            builtins: Vec::new(),
-            data_dir: root.join("data"),
+            // NO builtins, stated explicitly (BUILTIN_REGISTRY is empty
+            // anyway: no `goose-mcp` in the build). goose >= 1.60's
+            // `AcpBuiltinSelection::from_requested(vec![])` means the
+            // DEVELOPER extension (shell + file editing) by default; an
+            // empty selection built field by field means none.
+            builtins: goose::acp::server::AcpBuiltinSelection {
+                defaults: Vec::new(),
+                explicit: Vec::new(),
+            },
+            // The data directory is no longer a field: goose derives it from
+            // GOOSE_PATH_ROOT, pinned in `initialize` to this same root.
             config_dir: root.join("config"),
             // Closed upstream enum (GooseCli | GooseDesktop); affects a
             // display string, not behavior. Cli is the closer fit for a
@@ -845,12 +912,25 @@ fn acp_router_at(
             // The scheduler is its own background-cron surface with its
             // own review needed; off for slice 1.
             enable_scheduler: false,
-            // Every loaded session holds one `node roshera-mcp` process;
-            // see [`max_agent_sessions`] for the bound and why.
-            max_active_sessions: Some(max_agent_sessions()),
-        },
-    ));
-    let router = goose::acp::transport::create_acp_router(server);
+            // Every session runs in the agent workspace, WHATEVER `cwd` the
+            // client sends: a client-chosen directory would decide which
+            // `.agents/plugins` goose starts (goose >= 1.60), and the agent
+            // policy (AGENTS.md) lives here. `initialize` proved this
+            // directory carries no enabled plugin.
+            session_cwd: Some(workspace.to_path_buf()),
+            // The loaded-session bound is GOOSE_MAX_ACTIVE_AGENTS, pinned in
+            // `initialize` (see [`max_agent_sessions`]).
+        }
+    }
+}
+
+/// Roshera's layers around goose's `/acp` router.
+fn acp_layers(
+    router: axum::Router,
+    auth_manager: Arc<session_manager::AuthManager>,
+    ai_provider_manager: Arc<crate::ai_provider_config::AiProviderManager>,
+    acp_provider_epoch: Arc<crate::acp_provider_epoch::AcpProviderEpoch>,
+) -> axum::Router {
     // `observe_acp_transport` (agent_activity) is layered OUTSIDE the
     // injection middleware (and still inside `acp_gate` + auth, both
     // applied at the merge site): it watches `session/prompt` /
@@ -914,18 +994,18 @@ fn acp_router_at(
         .layer(axum::middleware::from_fn(acp_sse_keepalive))
 }
 
-/// Default upper bound on agent sessions kept loaded per ACP connection.
+/// Default upper bound on agent sessions kept loaded by the agent host.
 ///
 /// Each loaded session owns one `node roshera-mcp/dist/index.js` process
-/// (tens of MB resident), and goose's own default is 100 per connection.
-/// `acp-client.ts` uses exactly ONE session per connection (a rebuild opens
-/// a new connection, not a second session), so 4 never evicts the session
-/// a tab is using, leaves headroom for a client that opens a few sessions
-/// side by side, and caps a client that loops `session/new` on one
-/// connection at 4 processes instead of 100. An evicted session is not
-/// lost: its history lives in goose's SQLite session store and it reloads,
-/// re-spawning its extension, on next use. The bound ACROSS connections is
-/// the orphan reaper's job (`acp_orphan_reaper.rs`), not this cap's.
+/// (tens of MB resident), and goose's own default is 100. Since goose 1.60
+/// the bound is SERVER-WIDE (goose's `SessionRuntime`, set through
+/// GOOSE_MAX_ACTIVE_AGENTS), and goose never releases the session being
+/// used or one mid-turn -- so 4 never evicts a tab's live session, and a
+/// client that loops `session/new` holds at most 4 processes instead of
+/// 100. An evicted session is not lost: its history lives in goose's SQLite
+/// session store and it reloads, re-spawning its extension, on next use.
+/// Before 1.60 this was a per-connection bound carried by a Roshera patch to
+/// the vendored goose; upstream now does it, so that patch is gone.
 const DEFAULT_MAX_AGENT_SESSIONS: usize = 4;
 
 /// Env override for [`DEFAULT_MAX_AGENT_SESSIONS`].
@@ -1427,7 +1507,11 @@ fn roshera_mcp_server_json(entry_path: &std::path::Path, api_key: &str) -> serde
 mod tests {
     use super::*;
     use goose::agents::extension::Envs;
-    use goose::agents::{Agent, AgentConfig, ExtensionConfig, GoosePlatform};
+    use goose::agents::extension_config::TransportConfig;
+    use goose::agents::extension_manager::ExtensionSet;
+    use goose::agents::{
+        ExtensionConfig, GoosePlatform, StateMachineServices, StateMachineServicesConfig,
+    };
     use goose::config::{GooseMode, PermissionManager};
     use goose::session::{SessionManager, SessionType};
     use std::collections::{HashMap, HashSet};
@@ -1458,6 +1542,184 @@ mod tests {
         }
     }
 
+    /// THE reason for the goose 1.60 upgrade, end to end: the in-app agent
+    /// sees a workbench switch. goose 1.45 cached a session's tool list and
+    /// refreshed it only when an extension was added or removed -- never on
+    /// the MCP server's `tools/list_changed` -- so `workbench('simulate')`
+    /// changed nothing the model was offered. Here Roshera's real MCP
+    /// server runs under goose's own client: list the tools, switch the
+    /// bench through goose, and the simulate tools must be offered.
+    #[tokio::test]
+    async fn a_workbench_switch_reaches_the_goose_agent() {
+        let _content_guard = goose_config_content_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let goose_root = claim_goose_config_cell().clone();
+
+        let sessions_dir = goose_root.join("workbench-proof-sessions");
+        let session_manager = Arc::new(SessionManager::new(sessions_dir.clone()));
+        let permission_manager = Arc::new(PermissionManager::new(sessions_dir));
+        let services = StateMachineServices::with_config(StateMachineServicesConfig::new(
+            session_manager.clone(),
+            permission_manager,
+            None,
+            true,
+            GoosePlatform::GooseCli,
+        ));
+        let session = session_manager
+            .create_session(
+                goose_root.clone(),
+                "workbench-proof".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .expect("session creation");
+
+        let mcp_entry_path =
+            resolve_mcp_entry_path().expect("roshera-mcp dist must be built for this proof");
+        let roshera = extension_config_from_injected_entry(&roshera_mcp_server_json(
+            &mcp_entry_path,
+            "test-key-not-a-real-credential",
+        ));
+        let set = ExtensionSet::new(&session.id, Some(goose_root.clone()), vec![roshera])
+            .expect("extension set");
+        let snapshot = services.resolve_tools(&set).await;
+        let started: Vec<_> = snapshot.start().await;
+        assert!(
+            started.iter().all(|r| r.success),
+            "Roshera's MCP server must start under goose: {:?}",
+            started
+                .iter()
+                .map(|r| (&r.name, &r.error))
+                .collect::<Vec<_>>()
+        );
+
+        let names = |tools: Vec<rmcp::model::Tool>| -> Vec<String> {
+            tools.into_iter().map(|t| t.name.to_string()).collect()
+        };
+        let before = names(snapshot.tools().await);
+        assert!(
+            before.iter().any(|n| n.ends_with("workbench")),
+            "the resident surface carries the workbench tool: {before:?}"
+        );
+        assert!(
+            !before.iter().any(|n| n.ends_with("sim_mesh")),
+            "sim_mesh must not be offered before the switch (else this proves nothing): {before:?}"
+        );
+
+        let workbench = before
+            .iter()
+            .find(|n| n.ends_with("workbench"))
+            .cloned()
+            .unwrap_or_default();
+        let mut args = serde_json::Map::new();
+        args.insert("mode".to_string(), serde_json::json!("simulate"));
+        // `call` hands back the result as a future: the tool runs when it is
+        // awaited.
+        let switched = snapshot
+            .call(
+                rmcp::model::CallToolRequestParams::new(workbench).with_arguments(args),
+                goose::agents::extension_manager::CallRequest::new("workbench-switch"),
+                tokio_util::sync::CancellationToken::new(),
+                &services,
+            )
+            .await
+            .expect("goose must dispatch the workbench call")
+            .result
+            .await
+            .expect("the workbench call must succeed through goose");
+        assert_ne!(
+            switched.is_error,
+            Some(true),
+            "workbench('simulate') must not be refused"
+        );
+
+        // The server sends tools/list_changed; goose's client bumps its tools
+        // version. A snapshot's catalog is built once (a turn's view), and
+        // goose takes a NEW snapshot for every model step
+        // (`ToolSnapshot::for_session`) -- so, as goose does, take a fresh
+        // one: it reuses the running server (a respawn would lose the bench)
+        // and refetches the tools. Allow the notification a moment to
+        // arrive, never longer than 10 s.
+        let mut after = Vec::new();
+        for _ in 0..50 {
+            after = names(services.resolve_tools(&set).await.tools().await);
+            if after.iter().any(|n| n.ends_with("sim_mesh")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        for tool in ["sim_mesh", "sim_setup", "sim_static"] {
+            assert!(
+                after.iter().any(|n| n.ends_with(tool)),
+                "after workbench('simulate') goose must offer {tool}; offered {} tools: {after:?}",
+                after.len()
+            );
+        }
+    }
+
+    /// The goose ACP server Roshera builds selects NO built-in (goose >=
+    /// 1.60's `AcpBuiltinSelection::from_requested(vec![])` would mean the
+    /// developer extension: shell + file editing) and pins every session to
+    /// the agent workspace whatever `cwd` a client sends (which decides the
+    /// `.agents/plugins` goose starts).
+    #[test]
+    fn acp_server_selects_no_builtins_and_pins_sessions_to_the_workspace() {
+        let root = std::path::Path::new("C:/goose-root");
+        let workspace = std::path::Path::new("C:/agent-workspace");
+        let config = acp_server_config(root, workspace);
+        assert!(
+            config.builtins.defaults.is_empty() && config.builtins.explicit.is_empty(),
+            "no built-in extension may be selected: defaults {:?}, explicit {:?}",
+            config.builtins.defaults,
+            config.builtins.explicit
+        );
+        assert_eq!(config.session_cwd.as_deref(), Some(workspace));
+        assert_eq!(config.config_dir, root.join("config"));
+        assert!(!config.enable_scheduler, "the scheduler stays off");
+    }
+
+    /// goose >= 1.60 starts the MCP servers of every enabled plugin with a
+    /// session, and a plugin directory found under the session's
+    /// `.agents/plugins` is enabled by default. A workspace carrying one
+    /// must be refused at boot; a clean one passes.
+    #[tokio::test]
+    async fn a_plugin_in_the_agent_workspace_refuses_boot() {
+        let _content_guard = goose_config_content_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        claim_goose_config_cell();
+
+        let workspace =
+            std::env::temp_dir().join(format!("roshera-plugin-workspace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).expect("temp workspace");
+        assert!(
+            verify_no_enabled_plugins(&workspace).is_ok(),
+            "a workspace with no plugins must pass"
+        );
+
+        let plugin = workspace.join(".agents").join("plugins").join("planted");
+        std::fs::create_dir_all(&plugin).expect("planted plugin dir");
+        std::fs::write(
+            plugin.join(".mcp.json"),
+            r#"{"mcpServers":{"x":{"command":"cmd","args":["/c","exit"]}}}"#,
+        )
+        .expect("planted plugin mcp config");
+        // The hazard is real: goose itself finds the planted plugin enabled.
+        assert!(
+            !goose::plugins::discovery::discover_enabled_plugins(Some(&workspace)).is_empty(),
+            "goose must discover the planted plugin (else this test proves nothing)"
+        );
+        match verify_no_enabled_plugins(&workspace) {
+            Err(GooseAcpError::PluginsEnabled(names)) => {
+                assert!(names.iter().any(|n| n.contains("planted")), "{names:?}")
+            }
+            other => panic!("a planted plugin must refuse boot, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     fn extension_config_from_injected_entry(entry: &serde_json::Value) -> ExtensionConfig {
         let name = entry["name"].as_str().unwrap_or_default().to_string();
         let cmd = entry["command"].as_str().unwrap_or_default().to_string();
@@ -1483,7 +1745,7 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default();
-        ExtensionConfig::Stdio {
+        ExtensionConfig::External(TransportConfig::Stdio {
             name,
             description: String::new(),
             cmd,
@@ -1494,7 +1756,7 @@ mod tests {
             cwd: None,
             bundled: Some(false),
             available_tools: vec![],
-        }
+        })
     }
 
     /// Claims goose's process-lifetime `Config::global()` `OnceCell` —
@@ -1775,14 +2037,21 @@ mod tests {
         // (1) Defense-in-depth: the config-enabled path stays empty.
         let enabled = goose::config::get_enabled_extensions();
 
+        // goose >= 1.60: a session's tools are its EXTENSION SET resolved by
+        // the services -- the set `session/new` builds (goose's
+        // `initial_session_extensions`: the built-ins selection, which
+        // Roshera leaves empty; the config-enabled extensions; enabled
+        // plugins, proven empty by `initialize`; then the client's
+        // `mcpServers`, which Roshera rewrites to its own server). The
+        // snapshot's `tools()` is what the model is offered each turn:
+        // platform tools AND MCP tools.
         let sessions_dir = goose_root.join("proof-sessions");
         let session_manager = Arc::new(SessionManager::new(sessions_dir.clone()));
         let permission_manager = Arc::new(PermissionManager::new(sessions_dir));
-        let agent = Agent::with_config(AgentConfig::new(
+        let services = StateMachineServices::with_config(StateMachineServicesConfig::new(
             session_manager.clone(),
             permission_manager,
             None,
-            GooseMode::default(),
             true,
             GoosePlatform::GooseCli,
         ));
@@ -1797,24 +2066,22 @@ mod tests {
             .expect("session creation");
         let session_id = session.id;
 
-        let mut activation_errors = Vec::new();
-        for extension in enabled {
-            let name = extension.name();
-            if let Err(e) = agent.add_extension(extension, &session_id).await {
-                activation_errors.push(format!("{name}: {e}"));
-            }
-        }
-        assert!(
-            activation_errors.is_empty(),
-            "config-enabled goose extensions failed to activate — reachability \
-             cannot be assessed: {activation_errors:?}"
-        );
-
-        let tools_before_injection = agent
-            .extension_manager
-            .get_prefixed_tools(&session_id, None)
+        let set_before = ExtensionSet::new(&session_id, Some(goose_root.clone()), enabled.clone())
+            .expect("the config-enabled extension set must be well formed");
+        let snapshot_before = services.resolve_tools(&set_before).await;
+        let failed: Vec<String> = snapshot_before
+            .start()
             .await
-            .expect("tool enumeration");
+            .into_iter()
+            .filter(|r| !r.success)
+            .map(|r| format!("{}: {}", r.name, r.error.unwrap_or_default()))
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "config-enabled goose extensions failed to activate — reachability \
+             cannot be assessed: {failed:?}"
+        );
+        let tools_before_injection = snapshot_before.tools().await;
         assert!(
             tools_before_injection.is_empty(),
             "goose built-in tools are reachable via the config-enabled path \
@@ -1833,19 +2100,24 @@ mod tests {
             roshera_mcp_server_json(&mcp_entry_path, "test-key-not-a-real-credential");
         let roshera_extension = extension_config_from_injected_entry(&injected_entry);
 
-        agent
-            .add_extension(roshera_extension, &session_id)
+        let mut with_roshera = enabled;
+        with_roshera.push(roshera_extension);
+        let set_after = ExtensionSet::new(&session_id, Some(goose_root.clone()), with_roshera)
+            .expect("the session's extension set must be well formed");
+        let snapshot_after = services.resolve_tools(&set_after).await;
+        let failed: Vec<String> = snapshot_after
+            .start()
             .await
-            .expect(
-                "Roshera's own MCP server must activate — it is Roshera's own \
-                 build output, not a hostile config entry",
-            );
-
-        let tools_after_injection = agent
-            .extension_manager
-            .get_prefixed_tools(&session_id, None)
-            .await
-            .expect("tool enumeration after injecting Roshera's own MCP server");
+            .into_iter()
+            .filter(|r| !r.success)
+            .map(|r| format!("{}: {}", r.name, r.error.unwrap_or_default()))
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "Roshera's own MCP server must activate — it is Roshera's own \
+             build output, not a hostile config entry: {failed:?}"
+        );
+        let tools_after_injection = snapshot_after.tools().await;
         assert!(
             !tools_after_injection.is_empty(),
             "Roshera's own MCP server exposed zero tools — the injection wiring \
@@ -2739,6 +3011,7 @@ mod tests {
             std::env::set_var(crate::acp_orphan_reaper::ACP_ORPHAN_GRACE_ENV, "1");
             let router = acp_router_at(
                 &server_root,
+                &server_root.join("agent-workspace"),
                 test_auth_manager(),
                 test_ai_provider_manager(),
                 Arc::new(crate::acp_provider_epoch::AcpProviderEpoch::new()),

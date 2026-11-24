@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::Meta;
 use agent_client_protocol::{
@@ -19,8 +18,7 @@ use tokio::sync::oneshot;
 
 mod conversions;
 
-use super::{meta_string, GooseAcpAgent, ResultExt};
-use crate::agents::Agent;
+use super::{meta_string, AcpConnection, ResultExt};
 use crate::recipe::build_recipe::{build_recipe_from_template, RecipeError};
 use crate::recipe::local_recipes::{self, get_recipe_library_dir};
 use crate::recipe::manifest::{
@@ -45,7 +43,7 @@ pub(super) fn deserialize_save_recipe_request(
     result.map_err(save_recipe_validation_error)
 }
 
-impl GooseAcpAgent {
+impl AcpConnection {
     pub(super) async fn resolve_recipe_from_meta(
         &self,
         meta: Option<&Meta>,
@@ -153,7 +151,7 @@ impl GooseAcpAgent {
             .collect();
         *self.recipe_path_cache.lock().await = recipe_file_hash_map;
 
-        let scheduled_jobs = match self.agent_manager.scheduler() {
+        let scheduled_jobs = match self.services.scheduler.clone() {
             Some(scheduler) => scheduler.list_scheduled_jobs().await,
             None => Vec::new(),
         };
@@ -313,40 +311,43 @@ impl GooseAcpAgent {
         }
     }
 
-    pub(super) async fn apply_recipe(&self, agent: &Arc<Agent>, recipe: &Recipe) {
-        agent
-            .apply_recipe_components(recipe.response.clone(), true)
-            .await;
-        if let Some(instructions) = recipe.instructions.clone() {
-            agent
-                .extend_system_prompt("recipe".to_string(), instructions)
-                .await;
-        }
-    }
-
-    pub(super) async fn apply_session_recipe(
+    /// ACP sessions created before the rendered recipe was stored hold the
+    /// template, which load and fork render once in place.
+    pub(super) async fn render_stored_recipe_template(
         &self,
-        agent: &Arc<Agent>,
-        session: &Session,
+        session: &mut Session,
     ) -> Result<(), agent_client_protocol::Error> {
-        let Some(recipe) = session.recipe.as_ref() else {
+        let Some(recipe) = &session.recipe else {
             return Ok(());
         };
-
-        if session.session_type == SessionType::Scheduled {
-            self.apply_recipe(agent, recipe).await;
+        let yaml = recipe.to_yaml().internal_err()?;
+        if session.session_type == SessionType::Scheduled
+            || !(yaml.contains("{{") || yaml.contains("{%"))
+        {
             return Ok(());
         }
-
-        let recipe_dir = get_recipe_library_dir(true);
-        if let Some(rendered) = self.render_recipe(
+        let Some(rendered) = self.render_recipe(
             recipe,
-            &recipe_dir,
+            &get_recipe_library_dir(true),
             session.user_recipe_values.clone().unwrap_or_default(),
-        )? {
-            self.apply_recipe(agent, &rendered).await;
-        }
-
+        )?
+        else {
+            return Ok(());
+        };
+        self.services
+            .session_manager
+            .update(&session.id)
+            .recipe(Some(rendered))
+            .apply()
+            .await
+            .internal_err()?;
+        session.recipe = self
+            .services
+            .session_manager
+            .get_session(&session.id, false)
+            .await
+            .internal_err()?
+            .recipe;
         Ok(())
     }
 
@@ -355,13 +356,14 @@ impl GooseAcpAgent {
         cx: &ConnectionTo<Client>,
         session_id: &str,
         recipe: Option<&(Recipe, PathBuf)>,
+        parameter_scope_id: Option<&str>,
     ) -> Result<(Option<Recipe>, Option<HashMap<String, String>>), agent_client_protocol::Error>
     {
         let Some((recipe, recipe_dir)) = recipe else {
             return Ok((None, None));
         };
         let (rendered, values) = self
-            .render_recipe_with_params(cx, session_id, recipe, recipe_dir)
+            .render_recipe_with_params(cx, session_id, recipe, recipe_dir, parameter_scope_id)
             .await?;
         Ok((Some(rendered), values))
     }
@@ -372,6 +374,7 @@ impl GooseAcpAgent {
         session_id: &str,
         recipe: &Recipe,
         recipe_dir: &Path,
+        parameter_scope_id: Option<&str>,
     ) -> Result<(Recipe, Option<HashMap<String, String>>), agent_client_protocol::Error> {
         let parameters = recipe.parameters.clone().unwrap_or_default();
 
@@ -385,7 +388,7 @@ impl GooseAcpAgent {
         }
 
         let response = self
-            .request_recipe_params(cx, session_id, parameters)
+            .request_recipe_params(cx, session_id, parameters, parameter_scope_id)
             .await?;
         if matches!(response.action, RecipeParamsAction::Cancel) {
             return Err(recipe_params_cancelled_error());
@@ -403,6 +406,7 @@ impl GooseAcpAgent {
         cx: &ConnectionTo<Client>,
         session_id: &str,
         parameters: Vec<RecipeParameter>,
+        parameter_scope_id: Option<&str>,
     ) -> Result<RecipeParamsResponse, agent_client_protocol::Error> {
         let request = RequestRecipeParams {
             session_id: session_id.to_string(),
@@ -410,6 +414,7 @@ impl GooseAcpAgent {
                 .into_iter()
                 .map(RecipeParameterDto::from)
                 .collect(),
+            parameter_scope_id: parameter_scope_id.map(str::to_string),
         };
         let (tx, rx) = oneshot::channel();
         cx.send_request(RequestRecipeParamsMessage(request))

@@ -5,7 +5,6 @@ use goose::tool_inspection::ToolInspector;
 use rmcp::model::CallToolRequestParams;
 use rmcp::object;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 fn make_request(
     id: &str,
@@ -29,9 +28,8 @@ fn write_adversary_md(dir: &std::path::Path, content: &str) {
 async fn test_adversary_disabled_without_config_file() {
     let tmp = tempfile::tempdir().unwrap();
 
-    let provider = Arc::new(Mutex::new(None));
     let inspector = AdversaryInspector::with_config_dir(
-        provider,
+        Default::default(),
         Arc::new(goose::session::SessionManager::new(
             tmp.path().to_path_buf(),
         )),
@@ -63,9 +61,8 @@ async fn test_adversary_enabled_default_tools() {
     let tmp = tempfile::tempdir().unwrap();
     write_adversary_md(tmp.path(), "BLOCK everything for testing");
 
-    let provider = Arc::new(Mutex::new(None));
     let inspector = AdversaryInspector::with_config_dir(
-        provider,
+        Default::default(),
         Arc::new(goose::session::SessionManager::new(
             tmp.path().to_path_buf(),
         )),
@@ -124,12 +121,11 @@ async fn test_adversary_custom_tool_filter() {
     let tmp = tempfile::tempdir().unwrap();
     write_adversary_md(
         tmp.path(),
-        "tools: shell, computercontroller__automation_script\n---\nBLOCK bad stuff",
+        "tools: shell, developer__shell\n---\nBLOCK bad stuff",
     );
 
-    let provider = Arc::new(Mutex::new(None));
     let inspector = AdversaryInspector::with_config_dir(
-        provider,
+        Default::default(),
         Arc::new(goose::session::SessionManager::new(
             tmp.path().to_path_buf(),
         )),
@@ -156,13 +152,13 @@ async fn test_adversary_custom_tool_filter() {
         .unwrap();
     assert_eq!(results.len(), 1);
 
-    // automation_script — reviewed
+    // developer__shell — reviewed
     let results = inspector
         .inspect(
             "test",
             &[make_request(
                 "r2",
-                "computercontroller__automation_script",
+                "developer__shell",
                 object!({"script": "echo hi", "language": "shell"}),
             )],
             &messages,

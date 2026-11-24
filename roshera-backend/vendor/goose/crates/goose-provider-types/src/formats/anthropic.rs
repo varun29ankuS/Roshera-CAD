@@ -2,8 +2,13 @@ use crate::canonical::maybe_get_canonical_model;
 use crate::canonical::ThinkingMode;
 use crate::conversation::message::{Message, MessageContentBlock};
 use crate::conversation::token_usage::{CostSource, ProviderUsage, Usage};
+use crate::documents::{
+    convert_document, document_media_type_is_supported, unsupported_document_text, DocumentFormat,
+    ASSISTANT_ROLE_REASON, UNSUPPORTED_MEDIA_TYPE_REASON,
+};
 use crate::errors::ProviderError;
 use crate::images::{convert_image, ImageFormat};
+use crate::maybe_send::MaybeSend;
 use crate::mcp_utils::extract_text_from_resource;
 use crate::model::ModelConfig;
 use crate::thinking::ThinkingEffort;
@@ -13,7 +18,7 @@ use rmcp::model::{
     ResourceContents, Role, Tool,
 };
 use rmcp::object as json_object;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
@@ -45,16 +50,36 @@ macro_rules! string_enum {
 }
 
 string_enum!(ThinkingType { Adaptive => "adaptive", Enabled => "enabled", Disabled => "disabled" });
+string_enum!(CacheTtl { FiveMinutes => "5m", OneHour => "1h" });
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+string_enum!(PrefixMismatchBehavior { DropBlock => "drop_block", Error => "error" });
+
+pub const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
+pub const INPUT_TRANSFORMATIONS_FIELD: &str = "input_transformations";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AnthropicFormatOptions {
     pub preserve_unsigned_thinking: bool,
     pub preserve_thinking_context: bool,
     pub thinking_disabled: bool,
+    pub emit_clear_thinking: bool,
+    pub current_model: Option<String>,
+    pub prompt_cache_disabled: bool,
+    pub cache_ttl: Option<CacheTtl>,
+    pub prefix_mismatch_behavior: Option<PrefixMismatchBehavior>,
+    pub strip_thinking_history: bool,
 }
 
 impl AnthropicFormatOptions {
-    fn for_model(self, model_config: &ModelConfig) -> Self {
+    /// Anthropic-compatible providers keep `Default`, which does not request block binding.
+    pub fn native() -> Self {
+        Self {
+            prefix_mismatch_behavior: Some(PrefixMismatchBehavior::DropBlock),
+            ..Self::default()
+        }
+    }
+
+    fn for_model(self, provider_name: &str, model_config: &ModelConfig) -> Self {
         let preserve_thinking_context = model_config
             .request_param::<bool>("preserve_thinking_context")
             .unwrap_or(self.preserve_thinking_context);
@@ -62,19 +87,96 @@ impl AnthropicFormatOptions {
             .request_param::<bool>("preserve_unsigned_thinking")
             .unwrap_or(self.preserve_unsigned_thinking)
             || preserve_thinking_context;
-        let thinking_disabled = model_config.reasoning == Some(false)
-            || model_config.thinking_effort() == Some(ThinkingEffort::Off);
+        let always_on = canonical_thinking_mode(provider_name, &model_config.model_name)
+            == Some(ThinkingMode::AlwaysOnAdaptive);
+        let thinking_disabled = !always_on
+            && (model_config.reasoning == Some(false)
+                || model_config.thinking_effort() == Some(ThinkingEffort::Off));
+        let emit_clear_thinking = model_config
+            .request_param::<bool>("emit_clear_thinking")
+            .unwrap_or(self.emit_clear_thinking);
+        let cache_ttl = model_config
+            .cache_ttl()
+            .and_then(|ttl| ttl.parse::<CacheTtl>().ok())
+            .or(self.cache_ttl);
+        let prefix_mismatch_behavior = match model_config
+            .request_param::<String>("prefix_mismatch_behavior")
+            .as_deref()
+        {
+            None => self.prefix_mismatch_behavior,
+            Some("off") => None,
+            Some(value) => value.parse().ok().or(self.prefix_mismatch_behavior),
+        };
 
         Self {
             preserve_unsigned_thinking,
             preserve_thinking_context,
             thinking_disabled,
+            emit_clear_thinking,
+            current_model: self
+                .current_model
+                .or_else(|| Some(model_config.model_name.clone())),
+            prompt_cache_disabled: model_config.prompt_cache_disabled(),
+            cache_ttl,
+            prefix_mismatch_behavior,
+            strip_thinking_history: self.strip_thinking_history,
+        }
+    }
+
+    /// `{"type":"ephemeral"}` selects Anthropic's default 5m TTL; the `ttl`
+    /// field is only sent for an explicit 1h opt-in, since a 1h write is
+    /// billed at 2x input instead of 1.25x.
+    fn cache_control(&self) -> Value {
+        match self.cache_ttl {
+            Some(CacheTtl::OneHour) => {
+                json!({ TYPE_FIELD: "ephemeral", "ttl": "1h" })
+            }
+            _ => json!({ TYPE_FIELD: "ephemeral" }),
         }
     }
 }
 
+pub fn is_reserved_request_param_key(key: &str) -> bool {
+    matches!(
+        key,
+        "messages" | "model" | "stream" | "max_tokens" | "system" | "tools"
+    )
+}
+
+pub fn thinking_block_is_stale(message: &Message, current_model: Option<&str>) -> bool {
+    let Some(current_model) = current_model else {
+        return false;
+    };
+    let Some(inference) = message.metadata.inference.as_ref() else {
+        return false;
+    };
+    let requested = inference.requested_model.as_str();
+    let resolved = inference.resolved_model.as_deref().unwrap_or("");
+    if requested.is_empty() && resolved.is_empty() {
+        return false;
+    }
+    current_model != requested && current_model != resolved
+}
+
 fn canonical_thinking_mode(provider_name: &str, model_name: &str) -> Option<ThinkingMode> {
-    maybe_get_canonical_model(provider_name, model_name).and_then(|model| model.thinking_mode)
+    maybe_get_canonical_model(provider_name, model_name)
+        .and_then(|model| model.thinking_mode)
+        .or_else(|| provider_thinking_mode(provider_name, model_name))
+}
+
+/// Models that always reason when the canonical entry has no thinking mode.
+/// Muse Spark rejects `thinking: disabled` and ignores `budget_tokens`.
+fn provider_thinking_mode(provider_name: &str, model_name: &str) -> Option<ThinkingMode> {
+    if provider_name == "muse_code" && model_name.starts_with("muse-spark") {
+        return Some(ThinkingMode::AlwaysOnAdaptive);
+    }
+    None
+}
+
+/// Adaptive models run adaptive thinking when `thinking` is omitted, so turning
+/// it off takes an explicit disable. Always-on models reject that disable.
+pub fn requires_explicit_thinking_disable(provider_name: &str, model_name: &str) -> bool {
+    canonical_thinking_mode(provider_name, model_name) == Some(ThinkingMode::Adaptive)
 }
 
 fn canonical_reasoning(provider_name: &str, model_config: &ModelConfig) -> Option<bool> {
@@ -177,12 +279,12 @@ fn args_to_input_value(arguments: Option<JsonObject>) -> Value {
 
 /// Convert internal Message format to Anthropic's API message specification
 pub fn format_messages(messages: &[Message]) -> Vec<Value> {
-    format_messages_with_options(messages, AnthropicFormatOptions::default())
+    format_messages_with_options(messages, &AnthropicFormatOptions::default())
 }
 
 fn format_messages_with_options(
     messages: &[Message],
-    options: AnthropicFormatOptions,
+    options: &AnthropicFormatOptions,
 ) -> Vec<Value> {
     let mut anthropic_messages = Vec::new();
 
@@ -191,6 +293,10 @@ fn format_messages_with_options(
             Role::User => USER_ROLE,
             Role::Assistant => ASSISTANT_ROLE,
         };
+
+        let thinking_is_stale = thinking_block_is_stale(message, options.current_model.as_deref());
+        let replay_thinking =
+            !options.thinking_disabled && !options.strip_thinking_history && !thinking_is_stale;
 
         let mut content = Vec::new();
         for msg_content in &message.content {
@@ -339,12 +445,12 @@ fn format_messages_with_options(
                 MessageContentBlock::ActionRequired(_action_required) => {
                     // Skip action required messages - they're for UI only
                 }
-                MessageContentBlock::SystemNotification(_) => {
+                MessageContentBlock::SystemNotification(_) | MessageContentBlock::Error(_) => {
                     // Skip
                 }
                 MessageContentBlock::Thinking(thinking) => {
                     // Anthropic rejects thinking blocks sent without a matching thinking config.
-                    if !options.thinking_disabled {
+                    if replay_thinking {
                         if !thinking.signature.is_empty() {
                             content.push(json!({
                                 TYPE_FIELD: THINKING_TYPE,
@@ -362,7 +468,7 @@ fn format_messages_with_options(
                     }
                 }
                 MessageContentBlock::RedactedThinking(redacted) => {
-                    if !options.thinking_disabled {
+                    if replay_thinking {
                         content.push(json!({
                             TYPE_FIELD: REDACTED_THINKING_TYPE,
                             DATA_FIELD: redacted.data
@@ -372,13 +478,21 @@ fn format_messages_with_options(
                 MessageContentBlock::Image(image) => {
                     content.push(convert_image(image, &ImageFormat::Anthropic));
                 }
-                MessageContentBlock::FrontendToolRequest(tool_request) => {
-                    if let Ok(tool_call) = &tool_request.tool_call {
+                MessageContentBlock::Document(document) => {
+                    if message.role != Role::User {
                         content.push(json!({
-                            TYPE_FIELD: TOOL_USE_TYPE,
-                            ID_FIELD: tool_request.id,
-                            NAME_FIELD: tool_call.name,
-                            INPUT_FIELD: args_to_input_value(tool_call.arguments.clone())
+                            TYPE_FIELD: TEXT_TYPE,
+                            TEXT_TYPE: unsupported_document_text(document, ASSISTANT_ROLE_REASON)
+                        }));
+                    } else if document_media_type_is_supported(&document.mime_type) {
+                        content.push(convert_document(document, &DocumentFormat::Anthropic));
+                    } else {
+                        content.push(json!({
+                            TYPE_FIELD: TEXT_TYPE,
+                            TEXT_TYPE: unsupported_document_text(
+                                document,
+                                UNSUPPORTED_MEDIA_TYPE_REASON,
+                            )
                         }));
                     }
                 }
@@ -404,33 +518,23 @@ fn format_messages_with_options(
         }));
     }
 
-    // The volatile turn-context must sit after every cache breakpoint, or it invalidates the
-    // message-level cached prefix (Anthropic hashes tools -> system -> messages). Move it to the
-    // tail and place cache_control on the last non-turn-context block.
-    relocate_turn_context_to_tail(&mut anthropic_messages);
+    if options.prompt_cache_disabled {
+        return anthropic_messages;
+    }
 
+    // The last two user messages extend the cached prefix each turn.
     let mut user_count = 0;
     for message in anthropic_messages.iter_mut().rev() {
         if message.get(ROLE_FIELD) != Some(&json!(USER_ROLE)) {
             continue;
         }
-        let Some(content_array) = message
+        if let Some(block) = message
             .get_mut(CONTENT_FIELD)
             .and_then(|content| content.as_array_mut())
-        else {
-            continue;
-        };
-        let Some(target) = cache_control_target_index(content_array) else {
-            continue;
-        };
-        if let Some(block) = content_array
-            .get_mut(target)
+            .and_then(|content_array| content_array.last_mut())
             .and_then(|b| b.as_object_mut())
         {
-            block.insert(
-                CACHE_CONTROL_FIELD.to_string(),
-                json!({ TYPE_FIELD: "ephemeral" }),
-            );
+            block.insert(CACHE_CONTROL_FIELD.to_string(), options.cache_control());
             user_count += 1;
             if user_count >= 2 {
                 break;
@@ -439,52 +543,6 @@ fn format_messages_with_options(
     }
 
     anthropic_messages
-}
-
-fn relocate_turn_context_to_tail(messages: &mut [Value]) {
-    let Some(last) = messages.len().checked_sub(1) else {
-        return;
-    };
-    let source = messages.iter().enumerate().rev().find_map(|(mi, m)| {
-        m.get(CONTENT_FIELD)
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.iter().position(is_turn_context_block))
-            .map(|bi| (mi, bi))
-    });
-    let Some((mi, bi)) = source else {
-        return;
-    };
-    if mi != last
-        && messages[mi]
-            .get(CONTENT_FIELD)
-            .and_then(|c| c.as_array())
-            .map_or(0, |a| a.len())
-            <= 1
-    {
-        return;
-    }
-    let block = messages[mi][CONTENT_FIELD]
-        .as_array_mut()
-        .unwrap()
-        .remove(bi);
-    messages[last][CONTENT_FIELD]
-        .as_array_mut()
-        .unwrap()
-        .push(block);
-}
-
-fn cache_control_target_index(content_array: &[Value]) -> Option<usize> {
-    content_array
-        .iter()
-        .rposition(|block| !is_turn_context_block(block))
-}
-
-fn is_turn_context_block(block: &Value) -> bool {
-    block.get(TYPE_FIELD).and_then(Value::as_str) == Some(TEXT_TYPE)
-        && block
-            .get(TEXT_TYPE)
-            .and_then(Value::as_str)
-            .is_some_and(crate::conversation::is_turn_context_text)
 }
 
 fn anthropic_flavored_input_schema(input_schema: Arc<JsonObject>) -> Arc<JsonObject> {
@@ -497,7 +555,7 @@ fn anthropic_flavored_input_schema(input_schema: Arc<JsonObject>) -> Arc<JsonObj
 }
 
 /// Convert internal Tool format to Anthropic's API tool specification
-pub fn format_tools(tools: &[Tool]) -> Vec<Value> {
+pub fn format_tools(tools: &[Tool], options: &AnthropicFormatOptions) -> Vec<Value> {
     let mut unique_tools = HashSet::new();
     let mut tool_specs = Vec::new();
 
@@ -511,24 +569,34 @@ pub fn format_tools(tools: &[Tool]) -> Vec<Value> {
         }
     }
 
+    if options.prompt_cache_disabled {
+        return tool_specs;
+    }
+
     // Add "cache_control" to the last tool spec, if any. This means that all tool definitions,
     // will be cached as a single prefix.
     if let Some(last_tool) = tool_specs.last_mut() {
-        last_tool.as_object_mut().unwrap().insert(
-            CACHE_CONTROL_FIELD.to_string(),
-            json!({ TYPE_FIELD: "ephemeral" }),
-        );
+        last_tool
+            .as_object_mut()
+            .unwrap()
+            .insert(CACHE_CONTROL_FIELD.to_string(), options.cache_control());
     }
 
     tool_specs
 }
 
 /// Convert system message to Anthropic's API system specification
-pub fn format_system(system: &str) -> Value {
+pub fn format_system(system: &str, options: &AnthropicFormatOptions) -> Value {
+    if options.prompt_cache_disabled {
+        return json!([{
+            TYPE_FIELD: TEXT_TYPE,
+            TEXT_TYPE: system
+        }]);
+    }
     json!([{
         TYPE_FIELD: TEXT_TYPE,
         TEXT_TYPE: system,
-        CACHE_CONTROL_FIELD: { TYPE_FIELD: "ephemeral" }
+        CACHE_CONTROL_FIELD: options.cache_control()
     }])
 }
 
@@ -593,12 +661,7 @@ pub fn response_to_message(response: &Value) -> Result<Message> {
 }
 
 fn usage_from_anthropic_fields(usage: &Value) -> Usage {
-    let field = |key: &str| {
-        usage
-            .get(key)
-            .and_then(|v| v.as_u64())
-            .map(|v| v.min(i32::MAX as u64) as i32)
-    };
+    let field = |key: &str| usage.get(key).and_then(|v| v.as_i64());
 
     Usage::from_cache_exclusive_input(
         Some(field("input_tokens").unwrap_or(0)),
@@ -642,6 +705,23 @@ fn merge_delta_usage(existing: &Usage, delta: &Usage, delta_data: &Value) -> Usa
     }
 }
 
+pub fn error_for_type(error_type: Option<&str>, details: String) -> ProviderError {
+    match error_type {
+        Some("authentication_error" | "permission_error") => ProviderError::Authentication(details),
+        Some("rate_limit_error") => ProviderError::RateLimitExceeded {
+            details,
+            retry_delay: None,
+        },
+        Some("billing_error") => ProviderError::CreditsExhausted {
+            details,
+            top_up_url: None,
+        },
+        Some("request_too_large") => ProviderError::ContextLengthExceeded(details),
+        Some("api_error" | "overloaded_error") => ProviderError::ServerError(details),
+        _ => ProviderError::RequestFailed(details),
+    }
+}
+
 pub fn get_usage(data: &Value) -> Result<Usage> {
     if let Some(usage) = data.get("usage") {
         Ok(usage_from_anthropic_fields(usage))
@@ -664,6 +744,36 @@ pub fn get_usage(data: &Value) -> Result<Usage> {
     }
 }
 
+/// Anthropic response fields that have no canonical `ProviderUsage` equivalent.
+const ADDITIONAL_USAGE_FIELDS: [&str; 1] = ["service_tier"];
+
+pub fn input_transformations(message_data: &Value) -> Option<Value> {
+    let transformations = message_data.get(INPUT_TRANSFORMATIONS_FIELD)?.as_array()?;
+    let dropped: Vec<(&str, &str)> = transformations
+        .iter()
+        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("thinking_dropped"))
+        .map(|t| {
+            (
+                t.get("path").and_then(Value::as_str).unwrap_or(""),
+                t.get("reason").and_then(Value::as_str).unwrap_or(""),
+            )
+        })
+        .collect();
+    if !dropped.is_empty() {
+        tracing::warn!(?dropped, "API dropped thinking blocks from the request");
+    }
+    Some(Value::Array(transformations.clone()))
+}
+
+pub fn get_additional_data(data: &Value) -> Option<Map<String, Value>> {
+    let usage = data.get("usage")?.as_object()?;
+    let additional: Map<String, Value> = ADDITIONAL_USAGE_FIELDS
+        .iter()
+        .filter_map(|field| Some(((*field).to_string(), usage.get(*field)?.clone())))
+        .collect();
+    (!additional.is_empty()).then_some(additional)
+}
+
 fn provider_usage_with_cost(
     model: String,
     usage: Usage,
@@ -681,6 +791,15 @@ pub fn thinking_effort(model_config: &ModelConfig) -> ThinkingEffort {
     model_config
         .thinking_effort()
         .unwrap_or(ThinkingEffort::High)
+}
+
+fn adaptive_effort_wire(provider_name: &str, model_config: &ModelConfig) -> String {
+    let effort = adaptive_output_effort(model_config);
+    // Meta Messages accepts low, medium, high, and xhigh. goose's max maps to xhigh.
+    if provider_name == "muse_code" && effort == ThinkingEffort::Max {
+        return "xhigh".to_string();
+    }
+    effort.to_string()
 }
 
 pub fn adaptive_output_effort(model_config: &ModelConfig) -> ThinkingEffort {
@@ -729,7 +848,7 @@ fn apply_thinking_config(
     match thinking_type_for_provider(provider_name, model_config) {
         ThinkingType::Adaptive => {
             obj.insert("thinking".to_string(), json!({"type": "adaptive"}));
-            let effort = adaptive_output_effort(model_config).to_string();
+            let effort = adaptive_effort_wire(provider_name, model_config);
             obj.insert("output_config".to_string(), json!({"effort": effort}));
         }
         ThinkingType::Enabled => {
@@ -763,10 +882,64 @@ fn apply_thinking_config(
             }
         }
 
-        if let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut()) {
-            thinking.insert("clear_thinking".to_string(), json!(false));
+        // Z.AI requires this to preserve reasoning; Anthropic rejects it.
+        if options.emit_clear_thinking {
+            if let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut()) {
+                thinking.insert("clear_thinking".to_string(), json!(false));
+            }
         }
     }
+
+    if !obj.contains_key("thinking")
+        && requires_explicit_thinking_disable(provider_name, &model_config.model_name)
+    {
+        obj.insert("thinking".to_string(), json!({"type": "disabled"}));
+    }
+
+    // Newer Claude models default to `display: "omitted"` and return empty thinking
+    // blocks. Request summaries explicitly; other models sharing this format don't
+    // accept the field.
+    if model_config.model_name.to_lowercase().contains("claude") {
+        if let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut()) {
+            if thinking.get("type").and_then(|t| t.as_str()) != Some("disabled") {
+                thinking.insert("display".to_string(), json!("summarized"));
+            }
+        }
+    }
+
+    // `block_binding` is only accepted alongside adaptive or enabled thinking.
+    if let Some(behavior) = options.prefix_mismatch_behavior {
+        if let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut()) {
+            if thinking.get("type").and_then(|t| t.as_str()) != Some("disabled") {
+                thinking.insert(
+                    "block_binding".to_string(),
+                    json!({"prefix_mismatch_behavior": behavior.to_string()}),
+                );
+            }
+        }
+    }
+}
+
+pub fn block_binding_behavior(payload: &Value) -> Option<PrefixMismatchBehavior> {
+    payload
+        .pointer("/thinking/block_binding/prefix_mismatch_behavior")
+        .and_then(Value::as_str)
+        .and_then(|behavior| behavior.parse().ok())
+}
+
+pub fn is_thinking_signature_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("thinking")
+        && (lower.contains("signature")
+            || lower.contains("cannot be modified")
+            || lower.contains("block_binding"))
+}
+
+pub fn is_unsupported_thinking_config_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("thinking")
+        && (lower.contains("is not supported for this model")
+            || lower.contains("to turn thinking off on this model"))
 }
 
 pub fn create_request(
@@ -797,10 +970,10 @@ pub fn create_request_for_model(
     tools: &[Tool],
     options: AnthropicFormatOptions,
 ) -> Result<Value> {
-    let options = options.for_model(model_config);
-    let anthropic_messages = format_messages_with_options(messages, options);
-    let tool_specs = format_tools(tools);
-    let system_spec = format_system(system);
+    let options = options.for_model(provider_name, model_config);
+    let anthropic_messages = format_messages_with_options(messages, &options);
+    let tool_specs = format_tools(tools, &options);
+    let system_spec = format_system(system, &options);
 
     if anthropic_messages.is_empty() {
         return Err(anyhow!("No valid messages to send to Anthropic API"));
@@ -852,7 +1025,7 @@ pub fn response_to_streaming_message<S>(
     mut stream: S,
 ) -> impl futures::Stream<Item = anyhow::Result<(Option<Message>, Option<ProviderUsage>)>> + 'static
 where
-    S: futures::Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
+    S: futures::Stream<Item = anyhow::Result<String>> + Unpin + MaybeSend + 'static,
 {
     use async_stream::try_stream;
     use futures::StreamExt;
@@ -881,13 +1054,28 @@ where
         signature: String,
     }
 
+    fn block_index(event_data: &Value) -> Option<i32> {
+        event_data
+            .get("index")
+            .and_then(|v| v.as_i64())
+            .map(|index| index as i32)
+    }
+
     try_stream! {
-        let mut accumulated_tool_calls: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
-        let mut current_tool_id: Option<String> = None;
+        struct StreamingToolCall {
+            id: String,
+            name: String,
+            arguments: String,
+        }
+
+        let mut accumulated_tool_calls: std::collections::HashMap<i32, StreamingToolCall> = std::collections::HashMap::new();
+        let mut held = Vec::new();
         let mut final_usage: Option<ProviderUsage> = None;
         let mut message_id: Option<String> = None;
         let mut thinking: Option<ThinkingState> = None;
         let mut stop_reason: Option<String> = None;
+        let mut message_stopped = false;
+        let mut additional_data: Option<Map<String, Value>> = None;
 
         while let Some(line_result) = stream.next().await {
             let line = line_result?;
@@ -900,23 +1088,34 @@ where
 
             let data_part = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")).unwrap_or(&line);
 
+            if data_part.trim().is_empty() {
+                continue;
+            }
+
             // Handle end of stream
             if data_part.trim() == "[DONE]" {
                 break;
             }
 
-            // Parse the JSON event
-            let event: StreamingEvent = match serde_json::from_str(data_part) {
-                Ok(event) => event,
-                Err(e) => {
-                    tracing::debug!("Failed to parse streaming event: {} - Line: {}", e, data_part);
-                    continue;
-                }
-            };
+            let event: StreamingEvent = serde_json::from_str(data_part)
+                .map_err(ProviderError::stream_decode_error)?;
 
             match event.event_type.as_str() {
+                "error" => {
+                    let error = event.data.get("error").unwrap_or(&event.data);
+                    let error_type = error.get("type").and_then(Value::as_str);
+                    let message = error.get("message").and_then(Value::as_str).unwrap_or("Anthropic stream error");
+                    let details = format!("{}: {message}", error_type.unwrap_or("unknown_error"));
+                    Err(error_for_type(error_type, details))?;
+                }
                 EVENT_MESSAGE_START => {
                     if let Some(message_data) = event.data.get("message") {
+                        additional_data = get_additional_data(message_data);
+                        if let Some(transformations) = input_transformations(message_data) {
+                            additional_data
+                                .get_or_insert_with(Map::new)
+                                .insert(INPUT_TRANSFORMATIONS_FIELD.to_string(), transformations);
+                        }
                         if let Some(id) = message_data.get("id").and_then(|v| v.as_str()) {
                             message_id = Some(id.to_string());
                         }
@@ -936,11 +1135,16 @@ where
                     if let Some(content_block) = event.data.get("content_block") {
                         match content_block.get(TYPE_FIELD).and_then(|v| v.as_str()) {
                             Some(TOOL_USE_TYPE) => {
-                                if let Some(id) = content_block.get("id").and_then(|v| v.as_str()) {
-                                    current_tool_id = Some(id.to_string());
-                                    if let Some(name) = content_block.get("name").and_then(|v| v.as_str()) {
-                                        accumulated_tool_calls.insert(id.to_string(), (name.to_string(), String::new()));
-                                    }
+                                if let (Some(index), Some(id), Some(name)) = (
+                                    block_index(&event.data),
+                                    content_block.get("id").and_then(|v| v.as_str()),
+                                    content_block.get("name").and_then(|v| v.as_str()),
+                                ) {
+                                    accumulated_tool_calls.insert(index, StreamingToolCall {
+                                        id: id.to_string(),
+                                        name: name.to_string(),
+                                        arguments: String::new(),
+                                    });
                                 }
                             }
                             Some(THINKING_TYPE) => {
@@ -962,7 +1166,7 @@ where
                                     let mut message = Message::assistant()
                                         .with_redacted_thinking(data);
                                     message.id = message_id.clone();
-                                    yield (Some(message), None);
+                                    if held.is_empty() { yield (Some(message), None); } else { held.push(message); }
                                 } else {
                                     tracing::warn!("redacted_thinking block missing '{}' field", DATA_FIELD);
                                 }
@@ -978,13 +1182,13 @@ where
                             Ok(ContentBlockDelta::TextDelta { text }) => {
                                 let mut message = Message::assistant().with_text(&text);
                                 message.id = message_id.clone();
-                                yield (Some(message), None);
+                                if held.is_empty() { yield (Some(message), None); } else { held.push(message); }
                             }
                             Ok(ContentBlockDelta::InputJsonDelta { partial_json }) => {
-                                if let Some(tool_id) = &current_tool_id {
-                                    if let Some((_name, args)) = accumulated_tool_calls.get_mut(tool_id) {
-                                        args.push_str(&partial_json);
-                                    }
+                                if let Some(call) = block_index(&event.data)
+                                    .and_then(|index| accumulated_tool_calls.get_mut(&index))
+                                {
+                                    call.arguments.push_str(&partial_json);
                                 }
                             }
                             Ok(ContentBlockDelta::ThinkingDelta { thinking: t }) => {
@@ -1006,24 +1210,26 @@ where
                 }
                 EVENT_CONTENT_BLOCK_STOP => {
                     if let Some(state) = thinking.take() {
-                        if !state.text.is_empty() {
+                        // Omitted thinking arrives as an empty string with a signature and must still be replayed.
+                        if !state.text.is_empty() || !state.signature.is_empty() {
                             let mut message = Message::assistant()
                                 .with_thinking(state.text, state.signature);
                             message.id = message_id.clone();
-                            yield (Some(message), None);
+                            if held.is_empty() { yield (Some(message), None); } else { held.push(message); }
                         }
                     }
-                    if let Some(tool_id) = current_tool_id.take() {
-                        if let Some((name, args)) = accumulated_tool_calls.remove(&tool_id) {
-                            let parsed_args = if args.is_empty() {
+                    if let Some(index) = block_index(&event.data) {
+                        if let Some(call) = accumulated_tool_calls.remove(&index) {
+                            let StreamingToolCall { id, name, arguments } = call;
+                            let parsed_args = if arguments.is_empty() {
                                 json!({})
                             } else {
-                                match crate::json::parse_tool_arguments(&args) {
+                                match crate::json::parse_tool_arguments(&arguments) {
                                     Some(parsed) => parsed,
                                     None => {
-                                        let message_text = crate::json::truncation_error_message(&args)
+                                        let message_text = crate::json::truncation_error_message(&arguments)
                                             .unwrap_or_else(|| {
-                                                format!("Could not parse tool arguments: {args}")
+                                                format!("Could not parse tool arguments: {arguments}")
                                             });
                                         let error = ErrorData::new(
                                             ErrorCode::INVALID_PARAMS,
@@ -1033,10 +1239,10 @@ where
                                         let mut message = Message::new(
                                             Role::Assistant,
                                             chrono::Utc::now().timestamp(),
-                                            vec![MessageContentBlock::tool_request(tool_id, Err(error))],
+                                            vec![MessageContentBlock::tool_request_with_provider_index(id, Err(error), None, index)],
                                         );
                                         message.id = message_id.clone();
-                                        yield (Some(message), None);
+                                        if held.is_empty() { yield (Some(message), None); } else { held.push(message); }
                                         continue;
                                     }
                                 }
@@ -1047,10 +1253,10 @@ where
                             let mut message = Message::new(
                                 rmcp::model::Role::Assistant,
                                 chrono::Utc::now().timestamp(),
-                                vec![MessageContentBlock::tool_request(tool_id, Ok(tool_call))],
+                                vec![MessageContentBlock::tool_request_with_provider_index(id, Ok(tool_call), None, index)],
                             );
                             message.id = message_id.clone();
-                            yield (Some(message), None);
+                            held.push(message);
                         }
                     }
                     continue;
@@ -1093,7 +1299,10 @@ where
                             let category = str_field("category");
                             // The refusal delta carries the request's usage;
                             // flush it so refused turns are still accounted.
-                            if let Some(usage) = final_usage.take() {
+                            if let Some(mut usage) = final_usage.take() {
+                                usage.finish_reasons = Some(vec![STOP_REASON_REFUSAL.to_string()]);
+                                usage.response_id = message_id.clone();
+                                usage.additional_data = additional_data.clone();
                                 yield (None, Some(usage));
                             }
                             Err(ProviderError::Refusal { details, category })?;
@@ -1104,12 +1313,13 @@ where
                                 "The provider ended the response with: {details}"
                             ));
                             message.id = message_id.clone();
-                            yield (Some(message), None);
+                            if held.is_empty() { yield (Some(message), None); } else { held.push(message); }
                         }
                     }
                     continue;
                 }
                 EVENT_MESSAGE_STOP => {
+                    message_stopped = true;
                     if let Some(usage_data) = event.data.get("usage") {
                         let usage = get_usage(usage_data).unwrap_or_default();
                         let model = event.data.get("model")
@@ -1129,14 +1339,22 @@ where
             }
         }
 
+        if !message_stopped {
+            Err(ProviderError::NetworkError("Anthropic stream ended without message_stop".to_string()))?;
+        }
+
+        for message in held {
+            yield (Some(message), None);
+        }
+
         // A tool_use block left open at stream end never received its
         // content_block_stop, so its args are truncated rather than complete.
         if !accumulated_tool_calls.is_empty() {
             let truncated_by_limit = stop_reason.as_deref() == Some("max_tokens");
-            let mut ids: Vec<String> = accumulated_tool_calls.keys().cloned().collect();
-            ids.sort();
-            for id in ids {
-                if let Some((_name, args)) = accumulated_tool_calls.remove(&id) {
+            let mut indices: Vec<i32> = accumulated_tool_calls.keys().copied().collect();
+            indices.sort();
+            for index in indices {
+                if let Some(StreamingToolCall { id, arguments: args, .. }) = accumulated_tool_calls.remove(&index) {
                     let guidance = if truncated_by_limit {
                         "The model's response was truncated — it hit the output token limit while generating this tool call. \
                          Try increasing max_tokens for this provider or breaking the task into smaller steps."
@@ -1153,7 +1371,7 @@ where
                     let mut message = Message::new(
                         Role::Assistant,
                         chrono::Utc::now().timestamp(),
-                        vec![MessageContentBlock::tool_request(id, Err(error))],
+                        vec![MessageContentBlock::tool_request_with_provider_index(id, Err(error), None, index)],
                     );
                     message.id = message_id.clone();
                     yield (Some(message), None);
@@ -1161,16 +1379,97 @@ where
             }
         }
 
-        if let Some(usage) = final_usage {
+        if stop_reason.as_deref() == Some("max_tokens") {
+            let mut message = Message::assistant();
+            message.id = message_id.clone();
+            message.metadata.output_token_limit_reached = true;
+            yield (Some(message), None);
+        }
+
+        if let Some(mut usage) = final_usage {
+            if let Some(reason) = stop_reason {
+                usage.finish_reasons = Some(vec![reason]);
+            }
+            if let Some(id) = message_id {
+                usage.response_id = Some(id);
+            }
+            usage.additional_data = additional_data;
             yield (None, Some(usage));
         }
     }
 }
 
 #[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    #[test]
+    fn user_document_becomes_a_base64_document_block() {
+        let messages = vec![Message::user().with_document(
+            "cGRmLWJ5dGVz",
+            "application/pdf",
+            Some("q3-report.pdf".to_string()),
+        )];
+
+        let spec = format_messages(&messages);
+
+        assert_eq!(spec.len(), 1);
+        assert_eq!(spec[0]["role"], "user");
+        let block = &spec[0]["content"][0];
+        assert_eq!(block["type"], DOCUMENT_TYPE);
+        assert_eq!(block["title"], "q3-report.pdf");
+        assert_eq!(
+            block[SOURCE_FIELD],
+            json!({
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "cGRmLWJ5dGVz",
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_document_becomes_a_text_block() {
+        let messages = vec![Message::assistant().with_document(
+            "cGRmLWJ5dGVz",
+            "application/pdf",
+            Some("q3-report.pdf".to_string()),
+        )];
+
+        let spec = format_messages(&messages);
+
+        assert_eq!(spec.len(), 1);
+        assert_eq!(spec[0]["role"], "assistant");
+        assert_eq!(spec[0]["content"][0]["type"], "text");
+        let text = spec[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("q3-report.pdf"), "{text}");
+        assert!(text.contains("user messages"), "{text}");
+        assert!(!text.contains("cGRmLWJ5dGVz"), "{text}");
+    }
+
+    #[test]
+    fn unsupported_document_media_type_becomes_an_explicit_text_block() {
+        let messages = vec![Message::user().with_document(
+            "cm93cw==",
+            "text/csv",
+            Some("rows.csv".to_string()),
+        )];
+
+        let spec = format_messages(&messages);
+
+        assert_eq!(spec[0]["content"][0]["type"], "text");
+        let text = spec[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("rows.csv"), "{text}");
+        assert!(text.contains("text/csv"), "{text}");
+        assert!(text.contains("application/pdf"), "{text}");
+        assert!(!text.contains("cm93cw=="), "{text}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::message::Message;
+    use crate::conversation::message::{Message, MessageContent};
     use crate::model::ModelConfig;
     use rmcp::object;
     use serde_json::json;
@@ -1366,10 +1665,9 @@ mod tests {
 
         let spec = format_messages_with_options(
             &messages,
-            AnthropicFormatOptions {
+            &AnthropicFormatOptions {
                 preserve_unsigned_thinking: true,
-                preserve_thinking_context: false,
-                thinking_disabled: false,
+                ..Default::default()
             },
         );
 
@@ -1379,6 +1677,80 @@ mod tests {
         assert_eq!(spec[0]["content"][0]["thinking"], "internal");
         assert!(spec[0]["content"][0].get("signature").is_none());
         assert_eq!(spec[1]["content"][0]["text"], "Hi there");
+    }
+
+    fn signed_thinking_from_model(model: &str) -> Message {
+        use crate::conversation::message::InferenceMetadata;
+        Message::assistant()
+            .with_content(MessageContent::thinking("internal", "sig-abc"))
+            .with_text("answer")
+            .with_inference(InferenceMetadata {
+                provider: "anthropic".to_string(),
+                requested_model: model.to_string(),
+                resolved_model: None,
+                provider_session_id: None,
+            })
+    }
+
+    #[test]
+    fn strip_thinking_history_removes_signed_blocks() {
+        let messages = vec![Message::assistant()
+            .with_content(MessageContent::thinking("", "sig"))
+            .with_text("answer")];
+        let opts = AnthropicFormatOptions {
+            strip_thinking_history: true,
+            ..Default::default()
+        };
+        let spec = format_messages_with_options(&messages, &opts);
+        assert_eq!(
+            spec[0]["content"],
+            json!([{"type": "text", "text": "answer"}])
+        );
+    }
+
+    #[test]
+    fn drops_signed_thinking_from_a_different_model() {
+        let messages = vec![signed_thinking_from_model("claude-opus-4-1")];
+        let opts = AnthropicFormatOptions {
+            current_model: Some("claude-sonnet-4-5".to_string()),
+            ..Default::default()
+        };
+        let spec = format_messages_with_options(&messages, &opts);
+        let types: Vec<&str> = spec[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["type"].as_str().unwrap())
+            .collect();
+        assert!(
+            !types.contains(&"thinking"),
+            "stale thinking must be dropped"
+        );
+        assert!(types.contains(&"text"), "text content must be preserved");
+    }
+
+    #[test]
+    fn keeps_signed_thinking_from_the_same_model() {
+        let messages = vec![signed_thinking_from_model("claude-sonnet-4-5")];
+        let opts = AnthropicFormatOptions {
+            current_model: Some("claude-sonnet-4-5".to_string()),
+            ..Default::default()
+        };
+        let spec = format_messages_with_options(&messages, &opts);
+        assert_eq!(spec[0]["content"][0]["type"], "thinking");
+        assert_eq!(spec[0]["content"][0]["signature"], "sig-abc");
+    }
+
+    #[test]
+    fn keeps_signed_thinking_when_provenance_unknown() {
+        let messages =
+            vec![Message::assistant().with_content(MessageContent::thinking("internal", "sig"))];
+        let opts = AnthropicFormatOptions {
+            current_model: Some("claude-sonnet-4-5".to_string()),
+            ..Default::default()
+        };
+        let spec = format_messages_with_options(&messages, &opts);
+        assert_eq!(spec[0]["content"][0]["type"], "thinking");
     }
 
     #[test]
@@ -1412,7 +1784,7 @@ mod tests {
             ),
         ];
 
-        let spec = format_tools(&tools);
+        let spec = format_tools(&tools, &AnthropicFormatOptions::default());
 
         assert_eq!(spec.len(), 2);
         assert_eq!(spec[0]["name"], "calculator");
@@ -1427,7 +1799,7 @@ mod tests {
     #[test]
     fn test_system_to_anthropic_spec() {
         let system = "You are a helpful assistant.";
-        let spec = format_system(system);
+        let spec = format_system(system, &AnthropicFormatOptions::default());
 
         assert!(spec.is_array());
         let spec_array = spec.as_array().unwrap();
@@ -1507,9 +1879,41 @@ mod tests {
         let messages = vec![Message::user().with_text("Hello")];
         let payload = create_request_with_default_options(&config, "system", &messages, &[])?;
 
-        assert_eq!(payload["thinking"]["type"], "adaptive");
+        assert_eq!(
+            payload["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
         assert_eq!(payload["output_config"]["effort"], "high");
-        assert!(payload["thinking"].get("budget_tokens").is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_adaptive_thinking_for_minimax() -> Result<()> {
+        // MiniMax-M3.1-Flash rejects thinking.type=disabled and requires
+        // adaptive thinking, so the payload must carry thinking.type=adaptive
+        // plus output_config.effort even when the effort is "off".
+        let _guard = env_lock::lock_env([
+            ("GOOSE_THINKING_EFFORT", None::<&str>),
+            ("ANTHROPIC_PRESERVE_THINKING_CONTEXT", None::<&str>),
+        ]);
+
+        let mut config = cfg_with_effort("MiniMax-M3.1-Flash", "off");
+        config.max_tokens = Some(4096);
+
+        let messages = vec![Message::user().with_text("Hello")];
+        let payload = create_request_for_model(
+            "minimax",
+            &config,
+            "MiniMax-M3.1-Flash",
+            "system",
+            &messages,
+            &[],
+            AnthropicFormatOptions::default(),
+        )?;
+
+        assert_eq!(payload["thinking"]["type"], "adaptive");
+        assert!(payload["output_config"]["effort"].is_string());
 
         Ok(())
     }
@@ -1528,6 +1932,7 @@ mod tests {
         let payload = create_request_with_default_options(&config, "system", &messages, &[])?;
 
         assert_eq!(payload["thinking"]["type"], "enabled");
+        assert_eq!(payload["thinking"]["display"], "summarized");
         let budget = payload["thinking"]["budget_tokens"].as_i64().unwrap();
         assert!(budget > 0);
         assert_eq!(payload["max_tokens"], 64000);
@@ -1577,6 +1982,33 @@ mod tests {
         assert!(payload.get("thinking").is_none());
         assert!(payload.get("output_config").is_none());
 
+        // Adaptive models treat an omitted field as adaptive, so off must be explicit.
+        let config = cfg_with_effort("claude-opus-5", "off");
+        let payload = create_request_with_default_options(&config, "system", &messages, &[])?;
+
+        assert_eq!(payload["thinking"], json!({"type": "disabled"}));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_non_claude_adaptive_omits_thinking_display() -> Result<()> {
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
+
+        let mut config = cfg("muse-spark");
+        config.reasoning = Some(true);
+        let messages = vec![Message::user().with_text("Hello")];
+        let payload = create_request(
+            "muse_code",
+            &config,
+            "system",
+            &messages,
+            &[],
+            AnthropicFormatOptions::default(),
+        )?;
+
+        assert_eq!(payload["thinking"], json!({"type": "adaptive"}));
+
         Ok(())
     }
 
@@ -1603,19 +2035,69 @@ mod tests {
             AnthropicFormatOptions {
                 preserve_unsigned_thinking: true,
                 preserve_thinking_context: true,
-                thinking_disabled: false,
+                emit_clear_thinking: true,
+                ..Default::default()
             },
         )?;
 
         assert_eq!(payload["thinking"]["type"], "enabled");
         assert!(payload["thinking"]["budget_tokens"].as_i64().unwrap() >= 1024);
         assert_eq!(payload["thinking"]["clear_thinking"], false);
+        assert!(payload["thinking"].get("display").is_none());
         assert_eq!(payload["max_tokens"], 64000);
         assert_eq!(payload["messages"][0]["content"][0]["type"], "thinking");
         assert_eq!(payload["messages"][0]["content"][0]["thinking"], "internal");
         assert!(payload["messages"][0]["content"][0]
             .get("signature")
             .is_none());
+
+        // Preserved context still wins on models that need an explicit thinking disable.
+        let mut config = cfg("claude-opus-5");
+        config.max_tokens = Some(64000);
+        let payload = create_request_with_options_provider(
+            &config,
+            "system",
+            &messages,
+            &[],
+            AnthropicFormatOptions {
+                preserve_thinking_context: true,
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(payload["thinking"]["type"], "enabled");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_enabled_thinking_without_optin_omits_clear_thinking() -> Result<()> {
+        let mut config = cfg("claude-sonnet-4-5-20250929");
+        config.max_tokens = Some(64000);
+        let messages = vec![
+            Message::assistant().with_content(MessageContentBlock::thinking("internal", "")),
+            Message::user().with_text("Continue"),
+        ];
+
+        let payload = create_request_with_options_provider(
+            &config,
+            "system",
+            &messages,
+            &[],
+            AnthropicFormatOptions {
+                preserve_unsigned_thinking: true,
+                preserve_thinking_context: true,
+                emit_clear_thinking: false,
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(payload["thinking"]["type"], "enabled");
+        assert!(
+            payload["thinking"].get("clear_thinking").is_none(),
+            "Anthropic enabled thinking must not carry clear_thinking, got {}",
+            payload["thinking"]
+        );
 
         Ok(())
     }
@@ -1630,6 +2112,7 @@ mod tests {
 
         let mut params = std::collections::HashMap::new();
         params.insert("preserve_thinking_context".to_string(), json!(true));
+        params.insert("emit_clear_thinking".to_string(), json!(true));
 
         let mut config = cfg("glm-4.7");
         config.request_params = Some(params);
@@ -1644,6 +2127,39 @@ mod tests {
         assert_eq!(payload["thinking"]["clear_thinking"], false);
         assert_eq!(payload["messages"][0]["content"][0]["type"], "thinking");
         assert_eq!(payload["messages"][0]["content"][0]["thinking"], "internal");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_adaptive_model_preserved_thinking_omits_clear_thinking() -> Result<()> {
+        let mut config = cfg_with_effort("claude-opus-4-8", "high");
+        config.max_tokens = Some(64000);
+        let messages = vec![
+            Message::assistant().with_content(MessageContentBlock::thinking("internal", "")),
+            Message::user().with_text("Continue"),
+        ];
+
+        let payload = create_request_with_options_provider(
+            &config,
+            "system",
+            &messages,
+            &[],
+            AnthropicFormatOptions {
+                preserve_unsigned_thinking: true,
+                preserve_thinking_context: true,
+                emit_clear_thinking: false,
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(payload["thinking"]["type"], "adaptive");
+        assert!(
+            payload["thinking"].get("clear_thinking").is_none(),
+            "adaptive thinking must not carry clear_thinking, got {}",
+            payload["thinking"]
+        );
+        assert_eq!(payload["output_config"]["effort"], "high");
 
         Ok(())
     }
@@ -1939,23 +2455,6 @@ mod tests {
         assert_eq!(input, &json!({}));
     }
 
-    #[test]
-    fn test_parameterless_frontend_tool_request_serializes_input_as_empty_object() {
-        // Same regression as above, but exercises the FrontendToolRequest
-        // branch which is reached for UI-originated tool calls.
-        let messages = vec![Message::assistant().with_frontend_tool_request(
-            "frontend_tool_1",
-            Ok(CallToolRequestParams::new("list_things")),
-        )];
-
-        let spec = format_messages(&messages);
-
-        let input = &spec[0]["content"][0]["input"];
-        assert!(input.is_object(), "expected object, got {input:?}");
-        assert!(!input.is_null());
-        assert_eq!(input, &json!({}));
-    }
-
     fn cfg(name: &str) -> ModelConfig {
         ModelConfig::new(name)
     }
@@ -2018,6 +2517,35 @@ mod tests {
     }
 
     #[test]
+    fn test_thinking_type_fable_5_2_is_always_on_adaptive() {
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
+
+        for model in ["claude-fable-5-2", "system.ai.claude-fable-5-2"] {
+            for effort in ["off", "low", "high"] {
+                assert_eq!(
+                    thinking_type(&cfg_with_effort(model, effort)),
+                    ThinkingType::Adaptive,
+                    "{model} {effort}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_thinking_type_opus_5_5_cannot_disable_thinking() {
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
+
+        assert_eq!(
+            thinking_type(&cfg("claude-opus-5-5")),
+            ThinkingType::Adaptive
+        );
+        assert_eq!(
+            thinking_type(&cfg_with_effort("claude-opus-5-5", "off")),
+            ThinkingType::Adaptive
+        );
+    }
+
+    #[test]
     fn test_create_request_fable_5_omits_temperature() -> Result<()> {
         let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
         let mut config = cfg("claude-fable-5");
@@ -2065,6 +2593,7 @@ mod tests {
         text: Vec<String>,
         tool_calls: Vec<String>,
         tool_errors: Vec<String>,
+        output_token_limit_message_ids: Vec<Option<String>>,
     }
 
     async fn collect_stream(events: &str) -> StreamedParts {
@@ -2072,6 +2601,9 @@ mod tests {
 
         for result in collect_stream_results(events).await {
             if let Ok((Some(msg), _usage)) = result {
+                if msg.metadata.output_token_limit_reached {
+                    parts.output_token_limit_message_ids.push(msg.id.clone());
+                }
                 for c in &msg.content {
                     match c {
                         MessageContentBlock::Thinking(t) => {
@@ -2095,6 +2627,30 @@ mod tests {
             }
         }
         parts
+    }
+
+    #[tokio::test]
+    async fn test_streaming_marks_max_tokens() {
+        let events = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_limit","role":"assistant","content":[],"model":"claude-opus-4-6","usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Partial answer"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":25}}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+        );
+
+        let parts = collect_stream(events).await;
+        assert_eq!(parts.text, vec!["Partial answer"]);
+        assert_eq!(
+            parts.output_token_limit_message_ids,
+            vec![Some("msg_limit".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -2232,6 +2788,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_streaming_reassembles_interleaved_parallel_tool_calls() {
+        let events = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_par","role":"assistant","content":[],"model":"claude-opus-4-6","usage":{"input_tokens":5,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_a","name":"search","input":{}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool_b","name":"write","input":{}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"/tmp/a.md\"}"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"rust\"}"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+        );
+
+        let requests = collect_tool_requests(events).await;
+
+        assert_eq!(requests.len(), 2);
+        let write = requests
+            .iter()
+            .find(|r| r.id == "tool_b")
+            .expect("write tool request");
+        assert_eq!(write.provider_index(), Some(1));
+        let write_call = write.tool_call.as_ref().expect("write args parsed");
+        assert_eq!(write_call.name, "write");
+        assert_eq!(
+            write_call.arguments.as_ref().unwrap()["path"],
+            json!("/tmp/a.md")
+        );
+
+        let search = requests
+            .iter()
+            .find(|r| r.id == "tool_a")
+            .expect("search tool request");
+        assert_eq!(search.provider_index(), Some(0));
+        let search_call = search.tool_call.as_ref().expect("search args parsed");
+        assert_eq!(search_call.name, "search");
+        assert_eq!(
+            search_call.arguments.as_ref().unwrap()["query"],
+            json!("rust")
+        );
+    }
+
+    async fn collect_tool_requests(events: &str) -> Vec<crate::conversation::message::ToolRequest> {
+        let mut requests = Vec::new();
+        for result in collect_stream_results(events).await {
+            if let Ok((Some(msg), _usage)) = result {
+                for content in &msg.content {
+                    if let MessageContentBlock::ToolRequest(req) = content {
+                        requests.push(req.clone());
+                    }
+                }
+            }
+        }
+        requests
+    }
+
+    #[tokio::test]
     async fn test_streaming_preserves_cache_tokens_through_delta_merge() {
         let events = concat!(
             r#"data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-opus-4-6","usage":{"input_tokens":7,"cache_creation_input_tokens":10000,"cache_read_input_tokens":5000,"output_tokens":0}}}"#,
@@ -2258,6 +2882,62 @@ mod tests {
         assert_eq!(usage.usage.output_tokens, Some(25));
         assert_eq!(usage.usage.cache_read_input_tokens, Some(5000));
         assert_eq!(usage.usage.cache_write_input_tokens, Some(10000));
+        assert_eq!(
+            usage.finish_reasons.as_deref(),
+            Some(&["end_turn".to_string()][..])
+        );
+        assert_eq!(usage.response_id.as_deref(), Some("msg_1"));
+    }
+
+    async fn streamed_usage(events: &str) -> ProviderUsage {
+        collect_stream_results(events)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok().and_then(|(_, usage)| usage))
+            .next_back()
+            .expect("stream should yield usage")
+    }
+
+    #[tokio::test]
+    async fn test_streaming_surfaces_additional_usage_data() {
+        let events = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-sonnet-4-5","usage":{"input_tokens":7,"output_tokens":0,"service_tier":"fast"}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":25}}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+        );
+
+        let additional = streamed_usage(events)
+            .await
+            .additional_data
+            .expect("additional data should be reported");
+        assert_eq!(additional["service_tier"], json!("fast"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_omits_additional_usage_data_when_absent() {
+        let events = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-sonnet-4-5","usage":{"input_tokens":7,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":25}}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+        );
+
+        assert!(streamed_usage(events).await.additional_data.is_none());
     }
 
     #[tokio::test]
@@ -2334,6 +3014,54 @@ mod tests {
         assert_eq!(merged.cache_write_input_tokens, Some(10000));
     }
 
+    #[tokio::test]
+    async fn test_streaming_permission_error_classification() {
+        let events = r#"data: {"type":"error","error":{"type":"permission_error","message":"provider failure"}}"#;
+        let results = collect_stream_results(events).await;
+        assert_eq!(results.len(), 1);
+        let error = results.into_iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ProviderError>(),
+                Some(ProviderError::Authentication(details))
+                    if details == "permission_error: provider failure"
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_billing_error_classification() {
+        let events = r#"data: {"type":"error","error":{"type":"billing_error","message":"provider failure"}}"#;
+        let results = collect_stream_results(events).await;
+        assert_eq!(results.len(), 1);
+        let error = results.into_iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ProviderError>(),
+                Some(ProviderError::CreditsExhausted { details, top_up_url: None })
+                    if details == "billing_error: provider failure"
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_request_too_large_classification() {
+        let events = r#"data: {"type":"error","error":{"type":"request_too_large","message":"provider failure"}}"#;
+        let results = collect_stream_results(events).await;
+        assert_eq!(results.len(), 1);
+        let error = results.into_iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ProviderError>(),
+                Some(ProviderError::ContextLengthExceeded(details))
+                    if details == "request_too_large: provider failure"
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
     fn expect_refusal(
         results: Vec<anyhow::Result<(Option<Message>, Option<ProviderUsage>)>>,
     ) -> (String, Option<String>) {
@@ -2367,6 +3095,8 @@ mod tests {
             .expect("a refused request should still yield its usage");
         assert_eq!(usage.usage.input_tokens, Some(10));
         assert_eq!(usage.usage.output_tokens, Some(5));
+        assert_eq!(usage.finish_reasons, Some(vec!["refusal".to_string()]));
+        assert_eq!(usage.response_id.as_deref(), Some("msg_1"));
 
         let (details, category) = expect_refusal(results);
         assert_eq!(details, "This request violates the usage policy.");
@@ -2468,6 +3198,10 @@ mod tests {
 
         let parts = collect_stream(events).await;
         assert_eq!(
+            parts.output_token_limit_message_ids,
+            vec![Some("msg_t2".to_string())]
+        );
+        assert_eq!(
             parts.tool_errors.len(),
             1,
             "expected one tool error for the dropped/truncated tool call, got: {:?}",
@@ -2479,6 +3213,41 @@ mod tests {
             "expected actionable truncation message, got: {}",
             msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_unfinished_tool_calls_keep_provider_indices() {
+        let events = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_t3","role":"assistant","content":[],"model":"claude-opus-4-6","usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_open_a","name":"search","input":{}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool_open_b","name":"write","input":{}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"ru"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/re"}}"#,
+            "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":8192}}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+        );
+
+        let requests = collect_tool_requests(events).await;
+
+        assert_eq!(requests.len(), 2);
+        let indexed: Vec<(String, Option<i32>)> = requests
+            .iter()
+            .map(|r| (r.id.clone(), r.provider_index()))
+            .collect();
+        assert_eq!(
+            indexed,
+            vec![
+                ("tool_open_a".to_string(), Some(0)),
+                ("tool_open_b".to_string(), Some(1)),
+            ]
+        );
+        assert!(requests.iter().all(|r| r.tool_call.is_err()));
     }
 
     #[tokio::test]
@@ -2504,28 +3273,11 @@ mod tests {
         assert!(parts.tool_errors.is_empty());
     }
 
-    /// Anthropic prefix caching only pays off when the bytes up to a cache
-    /// breakpoint are identical turn over turn. The per-turn turn-context block
-    /// (timestamp, turn budget, compaction state) changes on every call, so if
-    /// it ever lands inside a cached prefix every request becomes a cache write
-    /// instead of a read. These tests pin the property that keeps caching alive
-    /// so a future refactor of the formatter or the turn-context format can't
-    /// silently regress it.
-    mod cache_prefix_stability {
+    /// Placement shape only; cross-request prefix stability is covered by
+    /// `tests/prefix_invariance.rs`.
+    mod cache_breakpoint_placement {
         use super::*;
         use rmcp::model::CallToolResult;
-
-        /// A turn-context block whose shape matches what `is_turn_context_text`
-        /// recognizes, varying only the volatile fields.
-        fn turn_context(time: &str, turn_budget: &str) -> String {
-            format!(
-                "<turn-context>\n\
-                 <current-time>{time}</current-time>\n\
-                 <working-directory>/Users/me/code/goose</working-directory>\n\
-                 <turn-budget>{turn_budget}</turn-budget>\n\
-                 </turn-context>"
-            )
-        }
 
         fn sample_tools() -> Vec<Tool> {
             vec![
@@ -2548,11 +3300,21 @@ mod tests {
             ]
         }
 
-        /// A realistic multi-turn conversation. `inject_moim` prepends the
-        /// turn-context block to the latest genuine user message, so it sits as
-        /// the first text block of the final user message here.
-        fn conversation(turn_context_block: &str) -> Vec<Message> {
-            vec![
+        fn breakpoints(messages: &[Value]) -> Vec<(usize, usize)> {
+            let mut found = Vec::new();
+            for (mi, message) in messages.iter().enumerate() {
+                for (bi, block) in message["content"].as_array().unwrap().iter().enumerate() {
+                    if block.get(CACHE_CONTROL_FIELD).is_some() {
+                        found.push((mi, bi));
+                    }
+                }
+            }
+            found
+        }
+
+        #[test]
+        fn breakpoints_cover_tools_system_and_last_two_user_messages() {
+            let messages = vec![
                 Message::user().with_text("What does the main entrypoint do?"),
                 Message::assistant().with_tool_request(
                     "tool_1",
@@ -2566,200 +3328,173 @@ mod tests {
                     ])),
                 ),
                 Message::assistant().with_text("It calls `run()`."),
-                Message::user()
-                    .with_text(turn_context_block)
-                    .with_text("Now add error handling to it."),
-            ]
+                Message::user().with_text("Now add error handling to it."),
+            ];
+            let req = create_request_with_default_options(
+                &cfg("claude-sonnet-4-5"),
+                "You are a careful coding assistant.",
+                &messages,
+                &sample_tools(),
+            )
+            .unwrap();
+
+            let tools = req["tools"].as_array().unwrap();
+            assert!(tools[0].get(CACHE_CONTROL_FIELD).is_none());
+            assert!(tools[1].get(CACHE_CONTROL_FIELD).is_some());
+            assert!(req["system"][0].get(CACHE_CONTROL_FIELD).is_some());
+
+            let request_messages = req["messages"].as_array().unwrap();
+            let marked = breakpoints(request_messages);
+            assert_eq!(
+                marked,
+                vec![(2, 0), (4, 0)],
+                "message breakpoints should sit on the last block of the last two user messages"
+            );
         }
 
-        /// The (message index, block index) of the last block carrying a
-        /// `cache_control` marker, scanning in canonical order. This is the far
-        /// edge of the furthest cached prefix.
-        fn last_breakpoint(messages: &[Value]) -> Option<(usize, usize)> {
-            let mut found = None;
-            for (mi, message) in messages.iter().enumerate() {
-                for (bi, block) in message["content"].as_array().unwrap().iter().enumerate() {
-                    if block.get(CACHE_CONTROL_FIELD).is_some() {
-                        found = Some((mi, bi));
-                    }
+        #[test]
+        fn disable_prompt_cache_removes_every_breakpoint() {
+            let config = cfg("claude-sonnet-4-5").with_merged_request_params(
+                std::collections::HashMap::from([(
+                    "disable_prompt_cache".to_string(),
+                    json!(true),
+                )]),
+            );
+            let req = create_request_with_default_options(
+                &config,
+                "You are a summarizer.",
+                &[Message::user().with_text("Summarize the conversation above.")],
+                &sample_tools(),
+            )
+            .unwrap();
+
+            assert!(!req.to_string().contains(CACHE_CONTROL_FIELD));
+        }
+
+        fn cache_control_values(req: &Value) -> Vec<Value> {
+            let mut found = Vec::new();
+            let tools = req["tools"].as_array().unwrap();
+            let system = req["system"].as_array().unwrap();
+            let messages = req["messages"].as_array().unwrap();
+            for block in tools
+                .iter()
+                .chain(system.iter())
+                .chain(messages.iter().flat_map(|m| {
+                    m["content"]
+                        .as_array()
+                        .map(|c| c.iter())
+                        .unwrap_or_default()
+                }))
+            {
+                if let Some(cc) = block.get(CACHE_CONTROL_FIELD) {
+                    found.push(cc.clone());
                 }
             }
             found
         }
 
-        fn find_turn_context(messages: &[Value]) -> Option<(usize, usize)> {
-            messages.iter().enumerate().find_map(|(mi, message)| {
-                message["content"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .position(is_turn_context_block)
-                    .map(|bi| (mi, bi))
-            })
-        }
-
-        /// The exact bytes Anthropic hashes for its furthest cache breakpoint:
-        /// tools, then system, then messages truncated at the last
-        /// `cache_control` marker. Everything after that point is outside every
-        /// cached prefix and may change freely turn to turn.
-        fn cached_prefix(payload: &Value) -> String {
-            let messages = payload["messages"].as_array().unwrap();
-            let (last_mi, last_bi) = last_breakpoint(messages)
-                .expect("request must carry at least one cache_control breakpoint");
-
-            let prefix_messages: Vec<Value> = messages
-                .iter()
-                .take(last_mi + 1)
-                .enumerate()
-                .map(|(mi, message)| {
-                    let mut message = message.clone();
-                    if mi == last_mi {
-                        message["content"]
-                            .as_array_mut()
-                            .unwrap()
-                            .truncate(last_bi + 1);
-                    }
-                    message
-                })
-                .collect();
-
-            json!({
-                "tools": payload.get("tools"),
-                "system": payload.get("system"),
-                "messages": prefix_messages,
-            })
-            .to_string()
-        }
-
-        /// The production tool-loop case: `inject_moim` prepends turn-context to
-        /// the latest *genuine* user message, but the request then ends with a
-        /// later `tool_result` message. The block must be relocated *across*
-        /// messages to land after the trailing breakpoint, not merely reordered
-        /// within its own message.
-        fn tool_loop_conversation(turn_context_block: &str) -> Vec<Message> {
-            vec![
-                Message::user().with_text("What does the main entrypoint do?"),
-                Message::assistant().with_text("Let me read it."),
-                Message::user()
-                    .with_text(turn_context_block)
-                    .with_text("Now add error handling to it."),
-                Message::assistant().with_tool_request(
-                    "tool_1",
-                    Ok(CallToolRequestParams::new("read_file")
-                        .with_arguments(object!({"path": "src/main.rs"}))),
-                ),
-                Message::user().with_tool_response(
-                    "tool_1",
-                    Ok(CallToolResult::success(vec![
-                        rmcp::model::ContentBlock::text("fn main() { run(); }"),
-                    ])),
-                ),
-            ]
-        }
-
-        fn request_with(messages: &[Message]) -> Value {
-            create_request_with_default_options(
+        #[test]
+        fn default_breakpoints_omit_ttl() {
+            let req = create_request_with_default_options(
                 &cfg("claude-sonnet-4-5"),
                 "You are a careful coding assistant.",
-                messages,
+                &[Message::user().with_text("Hello")],
                 &sample_tools(),
             )
-            .unwrap()
-        }
+            .unwrap();
 
-        fn request(turn_context_block: &str) -> Value {
-            request_with(&conversation(turn_context_block))
-        }
-
-        #[test]
-        fn cached_prefix_is_invariant_to_turn_context_changes() {
-            let req_a = request(&turn_context("2026-06-25 12:00:00", "14/40 used"));
-            let req_b = request(&turn_context("2026-06-25 13:47:00", "31/40 used"));
-
-            assert_ne!(
-                req_a.to_string(),
-                req_b.to_string(),
-                "test setup is vacuous: the two requests are byte-identical, so the \
-                 turn-context never reached the request body"
-            );
-
-            assert_eq!(
-                cached_prefix(&req_a),
-                cached_prefix(&req_b),
-                "the cached prefix changed when only the volatile turn-context changed; \
-                 prefix caching will collapse into a per-turn cache write"
-            );
-
-            assert!(
-                !cached_prefix(&req_a).contains("12:00:00"),
-                "the volatile turn-context timestamp leaked into the cached prefix"
-            );
-        }
-
-        #[test]
-        fn turn_context_sits_after_every_cache_breakpoint() {
-            let req = request(&turn_context("2026-06-25 12:00:00", "14/40 used"));
-            let messages = req["messages"].as_array().unwrap();
-
-            for message in messages {
-                for block in message["content"].as_array().unwrap() {
-                    if block.get(CACHE_CONTROL_FIELD).is_some() {
-                        assert!(
-                            !is_turn_context_block(block),
-                            "a cache_control breakpoint landed on the volatile turn-context block"
-                        );
-                    }
-                }
+            let values = cache_control_values(&req);
+            assert_eq!(values.len(), 3);
+            for cc in values {
+                assert_eq!(cc, json!({ "type": "ephemeral" }));
             }
-
-            let breakpoint = last_breakpoint(messages).expect("a breakpoint should exist");
-            let turn_context = find_turn_context(messages)
-                .expect("the turn-context block should survive into the formatted request");
-            assert!(
-                turn_context > breakpoint,
-                "turn-context at {turn_context:?} is not after the last cache breakpoint at \
-                 {breakpoint:?}, so it sits inside a cached prefix"
-            );
         }
 
-        /// Guards the tool-loop path: turn-context is injected onto an earlier
-        /// genuine user message while the request ends with a `tool_result`, so
-        /// keeping it out of the cached prefix requires relocating it across
-        /// messages. A regression that only reorders within a message would
-        /// pass the tests above but fail here.
         #[test]
-        fn cached_prefix_is_invariant_in_tool_loop() {
-            let req_a = request_with(&tool_loop_conversation(&turn_context(
-                "2026-06-25 12:00:00",
-                "14/40",
-            )));
-            let req_b = request_with(&tool_loop_conversation(&turn_context(
-                "2026-06-25 13:47:00",
-                "31/40",
-            )));
+        fn one_hour_ttl_stamps_every_breakpoint() {
+            let config = cfg("claude-sonnet-4-5").with_cache_ttl("1h");
+            let req = create_request_with_default_options(
+                &config,
+                "You are a careful coding assistant.",
+                &[
+                    Message::user().with_text("Hello"),
+                    Message::assistant().with_text("Hi."),
+                    Message::user().with_text("Continue"),
+                ],
+                &sample_tools(),
+            )
+            .unwrap();
 
-            assert_ne!(
-                req_a.to_string(),
-                req_b.to_string(),
-                "test setup is vacuous: turn-context never reached the request body"
-            );
+            let values = cache_control_values(&req);
+            assert_eq!(values.len(), 4);
+            for cc in values {
+                assert_eq!(cc, json!({ "type": "ephemeral", "ttl": "1h" }));
+            }
+        }
 
-            assert_eq!(
-                cached_prefix(&req_a),
-                cached_prefix(&req_b),
-                "the cached prefix changed when only the volatile turn-context changed during a \
-                 tool loop; the block was not relocated past the trailing tool_result breakpoint"
-            );
+        #[test]
+        fn explicit_five_minute_ttl_matches_default_wire_format() {
+            let config = cfg("claude-sonnet-4-5").with_cache_ttl("5m");
+            let req = create_request_with_default_options(
+                &config,
+                "You are a careful coding assistant.",
+                &[Message::user().with_text("Hello")],
+                &sample_tools(),
+            )
+            .unwrap();
 
-            let messages = req_a["messages"].as_array().unwrap();
-            let breakpoint = last_breakpoint(messages).expect("a breakpoint should exist");
-            let turn_context = find_turn_context(messages)
-                .expect("the turn-context block should survive into the formatted request");
-            assert!(
-                turn_context > breakpoint,
-                "turn-context at {turn_context:?} was not relocated across messages to after the \
-                 last breakpoint at {breakpoint:?}"
-            );
+            for cc in cache_control_values(&req) {
+                assert_eq!(cc, json!({ "type": "ephemeral" }));
+            }
+        }
+
+        #[test]
+        fn unrecognized_ttl_value_falls_back_to_default() {
+            let config = cfg("claude-sonnet-4-5").with_cache_ttl("2h");
+            let req = create_request_with_default_options(
+                &config,
+                "You are a careful coding assistant.",
+                &[Message::user().with_text("Hello")],
+                &sample_tools(),
+            )
+            .unwrap();
+
+            for cc in cache_control_values(&req) {
+                assert_eq!(cc, json!({ "type": "ephemeral" }));
+            }
+        }
+
+        #[test]
+        fn disable_prompt_cache_wins_over_ttl() {
+            let config = cfg("claude-sonnet-4-5")
+                .with_cache_ttl("1h")
+                .with_prompt_cache_disabled();
+            let req = create_request_with_default_options(
+                &config,
+                "You are a summarizer.",
+                &[Message::user().with_text("Summarize.")],
+                &sample_tools(),
+            )
+            .unwrap();
+
+            assert!(!req.to_string().contains(CACHE_CONTROL_FIELD));
+        }
+
+        #[test]
+        fn breakpoints_land_on_the_last_content_block() {
+            let messages = vec![Message::user()
+                .with_text("Here is the context.")
+                .with_text("And the question.")];
+            let req = create_request_with_default_options(
+                &cfg("claude-sonnet-4-5"),
+                "You are a careful coding assistant.",
+                &messages,
+                &sample_tools(),
+            )
+            .unwrap();
+
+            let request_messages = req["messages"].as_array().unwrap();
+            assert_eq!(breakpoints(request_messages), vec![(0, 1)]);
         }
     }
 }

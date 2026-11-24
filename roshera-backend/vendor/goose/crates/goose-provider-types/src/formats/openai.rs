@@ -1,10 +1,16 @@
+use crate::base::ThinkingPreservationFormat;
 use crate::conversation::message::{Message, MessageContentBlock, ProviderMetadata};
 use crate::conversation::token_usage::{CostSource, ProviderUsage, Usage};
+use crate::documents::{
+    convert_document, document_media_type_is_supported, unsupported_document_text, DocumentFormat,
+    ASSISTANT_ROLE_REASON, UNSUPPORTED_MEDIA_TYPE_REASON,
+};
 use crate::errors::ProviderError;
 use crate::images::{convert_image, detect_image_path, load_image_file, ImageFormat};
 use crate::json::{parse_tool_arguments, truncation_error_message};
+use crate::maybe_send::MaybeSend;
 use crate::mcp_utils::extract_text_from_resource;
-use crate::model::ModelConfig;
+use crate::model::{is_goose_internal_request_param, ModelConfig};
 use crate::thinking::{
     split_think_blocks, ThinkFilter, ThinkingEffort, GEMINI_THOUGHT_SIGNATURE_KEY,
 };
@@ -48,13 +54,25 @@ fn describe_json_value(value: &Value) -> &'static str {
     }
 }
 
-fn is_reserved_request_param_key(key: &str) -> bool {
+fn output_token_limit_tool_error(function_name: &str, id: &str) -> ErrorData {
+    ErrorData {
+        code: ErrorCode::INVALID_PARAMS,
+        message: Cow::from(format!(
+            "Tool arguments for {function_name} (id {id}) were truncated because the model reached its output token limit"
+        )),
+        data: None,
+    }
+}
+
+pub fn is_reserved_request_param_key(key: &str) -> bool {
     matches!(key, "messages" | "model" | "stream" | "stream_options")
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenAiFormatOptions {
     pub preserve_thinking_context: bool,
+    pub supports_vision: bool,
+    pub thinking_preservation_format: Option<ThinkingPreservationFormat>,
 }
 
 fn merge_reasoning_text(prefix: &str, suffix: &str) -> String {
@@ -181,12 +199,42 @@ fn extract_content_and_signature(
     }
 }
 
+#[derive(Default, Serialize)]
+struct OpenAiMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OpenAiToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OpenAiToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: OpenAiFunctionCall,
+    #[serde(flatten)]
+    metadata: serde_json::Map<String, Value>,
+}
+
+#[derive(Serialize)]
+struct OpenAiFunctionCall {
+    name: String,
+    arguments: String,
+}
+
 pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<Value> {
     format_messages_with_options(
         messages,
         image_format,
         OpenAiFormatOptions {
             preserve_thinking_context: true,
+            ..Default::default()
         },
     )
 }
@@ -197,6 +245,7 @@ pub fn format_messages_with_options(
     options: OpenAiFormatOptions,
 ) -> Vec<Value> {
     let mut messages_spec = Vec::new();
+    let mut tool_image_messages = Vec::new();
     let mut pending_assistant_reasoning = String::new();
     // Reasoning to propagate across consecutive tool-call messages in the same turn.
     // DeepSeek/Kimi require reasoning_content on every assistant tool-call message.
@@ -229,11 +278,18 @@ pub fn format_messages_with_options(
             saw_tool_response = false;
         }
 
-        let mut converted = json!({
-            "role": message.role
-        });
+        let mut converted = OpenAiMessage {
+            role: match message.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            }
+            .to_string(),
+            ..Default::default()
+        };
 
         let mut output = Vec::new();
+        // Keep attachment provenance until split assistant calls are consolidated.
+        let mut pending_image_messages = Vec::new();
         let mut content_array = Vec::new();
         let mut has_non_text_content = false;
         let mut reasoning_text = String::new();
@@ -243,11 +299,17 @@ pub fn format_messages_with_options(
                 MessageContentBlock::Text(text) => {
                     if !text.text.is_empty() {
                         if message.role == Role::User {
-                            if let Some(image_path) = detect_image_path(&text.text) {
-                                if let Ok(image) = load_image_file(image_path.as_ref()) {
-                                    has_non_text_content = true;
-                                    content_array.push(json!({"type": "text", "text": text.text}));
-                                    content_array.push(convert_image(&image, image_format));
+                            if options.supports_vision {
+                                if let Some(image_path) = detect_image_path(&text.text) {
+                                    if let Ok(image) = load_image_file(image_path.as_ref()) {
+                                        has_non_text_content = true;
+                                        content_array
+                                            .push(json!({"type": "text", "text": text.text}));
+                                        content_array.push(convert_image(&image, image_format));
+                                    } else {
+                                        content_array
+                                            .push(json!({"type": "text", "text": text.text}));
+                                    }
                                 } else {
                                     content_array.push(json!({"type": "text", "text": text.text}));
                                 }
@@ -265,7 +327,7 @@ pub fn format_messages_with_options(
                 MessageContentBlock::RedactedThinking(_) => {
                     continue;
                 }
-                MessageContentBlock::SystemNotification(_) => {
+                MessageContentBlock::SystemNotification(_) | MessageContentBlock::Error(_) => {
                     continue;
                 }
                 MessageContentBlock::ToolRequest(request) => match &request.tool_call {
@@ -278,28 +340,18 @@ pub fn format_messages_with_options(
                             None => "{}".to_string(),
                         };
 
-                        let tool_calls = converted
-                            .as_object_mut()
-                            .unwrap()
-                            .entry("tool_calls")
-                            .or_insert(json!([]));
-
-                        let mut tool_call_json = json!({
-                            "id": request.id,
-                            "type": "function",
-                            "function": {
-                                "name": sanitized_name,
-                                "arguments": arguments_str,
-                            }
-                        });
-
-                        if let Some(metadata) = &request.metadata {
-                            for (key, value) in metadata {
-                                tool_call_json[key] = value.clone();
-                            }
-                        }
-
-                        tool_calls.as_array_mut().unwrap().push(tool_call_json);
+                        converted
+                            .tool_calls
+                            .get_or_insert_default()
+                            .push(OpenAiToolCall {
+                                id: request.id.clone(),
+                                kind: "function",
+                                function: OpenAiFunctionCall {
+                                    name: sanitized_name,
+                                    arguments: arguments_str,
+                                },
+                                metadata: request.metadata.clone().unwrap_or_default(),
+                            });
                     }
                     Err(_e) => {
                         // An unparseable tool call still needs a valid assistant
@@ -310,19 +362,18 @@ pub fn format_messages_with_options(
                         // OpenAI-compatible APIs reject. Emit a placeholder call with the
                         // same id so the history stays well-formed; the error rides on the
                         // following tool response.
-                        let tool_calls = converted
-                            .as_object_mut()
-                            .unwrap()
-                            .entry("tool_calls")
-                            .or_insert(json!([]));
-                        tool_calls.as_array_mut().unwrap().push(json!({
-                            "id": request.id,
-                            "type": "function",
-                            "function": {
-                                "name": "unparseable_tool_call",
-                                "arguments": "{}",
-                            }
-                        }));
+                        converted
+                            .tool_calls
+                            .get_or_insert_default()
+                            .push(OpenAiToolCall {
+                                id: request.id.clone(),
+                                kind: "function",
+                                function: OpenAiFunctionCall {
+                                    name: "unparseable_tool_call".to_string(),
+                                    arguments: "{}".to_string(),
+                                },
+                                metadata: serde_json::Map::new(),
+                            });
                     }
                 },
                 MessageContentBlock::ToolResponse(response) => {
@@ -330,19 +381,27 @@ pub fn format_messages_with_options(
                         Ok(result) => {
                             // Process all content, replacing images with placeholder text
                             let mut tool_content = Vec::new();
-                            let mut image_messages = Vec::new();
 
                             for content in result.content.iter() {
                                 match content {
                                     ContentBlock::Image(image) => {
-                                        // Add placeholder text in the tool response
-                                        tool_content.push(ContentBlock::text("This tool result included an image that is uploaded in the next message."));
+                                        if options.supports_vision {
+                                            // Add placeholder text in the tool response
+                                            tool_content.push(ContentBlock::text("This tool result included an image that is uploaded in the next message."));
 
-                                        // Create a separate image message
-                                        image_messages.push(json!({
-                                            "role": "user",
-                                            "content": [convert_image(&image.clone(), image_format)]
-                                        }));
+                                            // Create a separate image message
+                                            pending_image_messages.push(OpenAiMessage {
+                                                role: "user".to_string(),
+                                                content: Some(json!([convert_image(
+                                                    &image.clone(),
+                                                    image_format
+                                                )])),
+                                                ..Default::default()
+                                            });
+                                        } else {
+                                            // Add placeholder text in the tool response
+                                            tool_content.push(ContentBlock::text("This tool result included an image that was omitted as the model does not support vision."));
+                                        }
                                     }
                                     ContentBlock::Resource(resource) => {
                                         let text = extract_text_from_resource(&resource.resource);
@@ -362,22 +421,24 @@ pub fn format_messages_with_options(
                                 .collect::<Vec<String>>()
                                 .join(" "));
 
-                            // First add the tool response with all content
-                            output.push(json!({
-                                "role": "tool",
-                                "content": tool_response_content,
-                                "tool_call_id": response.id
-                            }));
-                            // Then add any image messages that need to follow
-                            output.extend(image_messages);
+                            output.push(OpenAiMessage {
+                                role: "tool".to_string(),
+                                content: Some(tool_response_content),
+                                tool_call_id: Some(response.id.clone()),
+                                ..Default::default()
+                            });
                         }
                         Err(e) => {
                             // A tool result error is shown as output so the model can interpret the error message
-                            output.push(json!({
-                                "role": "tool",
-                                "content": format!("The tool call returned the following error:\n{}", e),
-                                "tool_call_id": response.id
-                            }));
+                            output.push(OpenAiMessage {
+                                role: "tool".to_string(),
+                                content: Some(json!(format!(
+                                    "The tool call returned the following error:\n{}",
+                                    e
+                                ))),
+                                tool_call_id: Some(response.id.clone()),
+                                ..Default::default()
+                            });
                         }
                     }
                 }
@@ -385,8 +446,15 @@ pub fn format_messages_with_options(
                 MessageContentBlock::ActionRequired(_) => {}
                 MessageContentBlock::Image(image) => {
                     if message.role == Role::User {
-                        has_non_text_content = true;
-                        content_array.push(convert_image(image, image_format));
+                        if options.supports_vision {
+                            has_non_text_content = true;
+                            content_array.push(convert_image(image, image_format));
+                        } else {
+                            content_array.push(json!({
+                                "type": "text",
+                                "text": "[image omitted: model does not support vision]"
+                            }));
+                        }
                     } else {
                         content_array.push(json!({
                             "type": "text",
@@ -394,65 +462,50 @@ pub fn format_messages_with_options(
                         }));
                     }
                 }
-                MessageContentBlock::FrontendToolRequest(request) => match &request.tool_call {
-                    Ok(tool_call) => {
-                        let sanitized_name = sanitize_function_name(&tool_call.name);
-                        let arguments_str = match &tool_call.arguments {
-                            Some(args) => {
-                                serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string())
-                            }
-                            None => "{}".to_string(),
-                        };
-
-                        let tool_calls = converted
-                            .as_object_mut()
-                            .unwrap()
-                            .entry("tool_calls")
-                            .or_insert(json!([]));
-
-                        tool_calls.as_array_mut().unwrap().push(json!({
-                            "id": request.id,
-                            "type": "function",
-                            "function": {
-                                "name": sanitized_name,
-                                "arguments": arguments_str,
-                            }
+                MessageContentBlock::Document(document) => {
+                    if message.role != Role::User {
+                        content_array.push(json!({
+                            "type": "text",
+                            "text": unsupported_document_text(document, ASSISTANT_ROLE_REASON)
+                        }));
+                    } else if document_media_type_is_supported(&document.mime_type) {
+                        has_non_text_content = true;
+                        content_array.push(convert_document(document, &DocumentFormat::OpenAi));
+                    } else {
+                        content_array.push(json!({
+                            "type": "text",
+                            "text": unsupported_document_text(document, UNSUPPORTED_MEDIA_TYPE_REASON)
                         }));
                     }
-                    Err(e) => {
-                        output.push(json!({
-                            "role": "tool",
-                            "content": format!("Error: {}", e),
-                            "tool_call_id": request.id
-                        }));
-                    }
-                },
+                }
             }
         }
 
+        let image_count = pending_image_messages.len();
+        output.append(&mut pending_image_messages);
+
         if !content_array.is_empty() {
             if has_non_text_content {
-                converted["content"] = json!(content_array);
+                converted.content = Some(json!(content_array));
             } else {
                 let texts: Vec<String> = content_array
                     .iter()
                     .filter_map(|v| v["text"].as_str().map(|s| s.to_string()))
                     .collect();
-                converted["content"] = json!(texts.join("\n"));
+                converted.content = Some(json!(texts.join("\n")));
             }
         }
 
         // Some strict OpenAI-compatible providers require "content" to be present
         // (even as null) when tool_calls are provided. See #6717.
         if message.role == Role::Assistant
-            && converted.get("tool_calls").is_some()
-            && converted.get("content").is_none()
+            && converted.tool_calls.is_some()
+            && converted.content.is_none()
         {
-            converted["content"] = json!(null);
+            converted.content = Some(Value::Null);
         }
 
-        let has_message_payload =
-            converted.get("content").is_some() || converted.get("tool_calls").is_some();
+        let has_message_payload = converted.content.is_some() || converted.tool_calls.is_some();
 
         if options.preserve_thinking_context && message.role == Role::Assistant {
             if !has_message_payload && output.is_empty() && !reasoning_text.is_empty() {
@@ -466,10 +519,7 @@ pub fn format_messages_with_options(
                 pending_assistant_reasoning.clear();
             }
 
-            let has_tool_calls = converted
-                .get("tool_calls")
-                .and_then(|tc| tc.as_array())
-                .is_some_and(|a| !a.is_empty());
+            let has_tool_calls = converted.tool_calls.as_ref().is_some_and(|a| !a.is_empty());
 
             if has_tool_calls {
                 if reasoning_text.is_empty() {
@@ -489,18 +539,58 @@ pub fn format_messages_with_options(
         // Include reasoning_content only when non-empty. Kimi rejects empty
         // reasoning_content (""), so we must omit it entirely.
         if options.preserve_thinking_context && !reasoning_text.is_empty() {
-            converted["reasoning_content"] = json!(reasoning_text);
+            converted.reasoning_content = Some(reasoning_text);
         }
 
         if has_message_payload {
             output.insert(0, converted);
         }
 
-        messages_spec.extend(output);
+        let image_start = output.len() - image_count;
+        for (index, message) in output.into_iter().enumerate() {
+            messages_spec.push(
+                serde_json::to_value(message).expect("OpenAI message fields are JSON serializable"),
+            );
+            tool_image_messages.push(index >= image_start);
+        }
     }
 
-    merge_split_tool_call_messages(&mut messages_spec);
+    merge_split_tool_call_messages(&mut messages_spec, &mut tool_image_messages);
+
+    if let Some(format) = options.thinking_preservation_format {
+        inline_reasoning_content(&mut messages_spec, format);
+    }
+
     messages_spec
+}
+
+/// Rewrites `reasoning_content` into the message `content` for models that reject a
+/// separate reasoning field on replay.
+///
+/// Must run after `merge_split_tool_call_messages`, which relies on `reasoning_content`
+/// to identify messages split from the same assistant turn.
+fn inline_reasoning_content(messages: &mut [Value], format: ThinkingPreservationFormat) {
+    let wrap: fn(&str) -> String = match format {
+        ThinkingPreservationFormat::ReasoningContent => return,
+        ThinkingPreservationFormat::ContentPrepend => |text| format!("{text}\n\n"),
+        ThinkingPreservationFormat::ContentXml => |text| format!("<think>\n{text}\n</think>\n\n"),
+    };
+
+    for message in messages {
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        let Some(Value::String(reasoning)) = object.remove("reasoning_content") else {
+            continue;
+        };
+        let prefix = wrap(&reasoning);
+
+        match object.entry("content").or_insert(Value::Null) {
+            Value::String(content) => content.insert_str(0, &prefix),
+            Value::Array(blocks) => blocks.insert(0, json!({"type": "text", "text": prefix})),
+            content => *content = json!(prefix.trim_end()),
+        }
+    }
 }
 
 /// The agent splits a single assistant response with N tool_calls into N
@@ -510,7 +600,7 @@ pub fn format_messages_with_options(
 ///
 /// Only merges when `reasoning_content` is present and matches, since that is
 /// the only signal that messages were split from the same turn.
-fn merge_split_tool_call_messages(messages: &mut Vec<Value>) {
+fn merge_split_tool_call_messages(messages: &mut Vec<Value>, tool_images: &mut Vec<bool>) {
     let mut i = 0;
     while i < messages.len() {
         let is_assistant_tool_call = messages[i].get("role") == Some(&json!("assistant"))
@@ -528,6 +618,7 @@ fn merge_split_tool_call_messages(messages: &mut Vec<Value>) {
 
         let mut extra_tool_calls: Vec<Value> = Vec::new();
         let mut collected: Vec<Value> = Vec::new();
+        let mut collected_images = Vec::new();
         let mut scan = i + 1;
 
         loop {
@@ -535,10 +626,10 @@ fn merge_split_tool_call_messages(messages: &mut Vec<Value>) {
                 break;
             }
 
-            // Skip past tool result and any image-only user messages that
-            // format_messages inserts after tool results containing images.
+            // Only formatter-generated attachments belong to this tool result;
+            // an actual user image starts a new turn, even with identical reasoning.
             let mut peek = scan + 1;
-            while peek < messages.len() && is_image_only_user_message(&messages[peek]) {
+            while peek < messages.len() && tool_images[peek] {
                 peek += 1;
             }
 
@@ -564,6 +655,7 @@ fn merge_split_tool_call_messages(messages: &mut Vec<Value>) {
             }
 
             collected.extend(messages[scan..peek].iter().cloned());
+            collected_images.extend_from_slice(&tool_images[scan..peek]);
             if let Some(tc) = messages[peek]
                 .get("tool_calls")
                 .and_then(|tc| tc.as_array())
@@ -587,6 +679,7 @@ fn merge_split_tool_call_messages(messages: &mut Vec<Value>) {
 
         let insert_at = i + 1;
         messages.drain(insert_at..scan);
+        tool_images.splice(insert_at..scan, collected_images);
         let num_collected = collected.len();
         for (j, msg) in collected.into_iter().enumerate() {
             messages.insert(insert_at + j, msg);
@@ -594,20 +687,46 @@ fn merge_split_tool_call_messages(messages: &mut Vec<Value>) {
 
         i = insert_at + num_collected;
     }
+    defer_tool_images(messages, tool_images);
 }
 
-/// True if `msg` is a synthetic image-only user message (content is exclusively image_url items).
-fn is_image_only_user_message(msg: &Value) -> bool {
-    msg.get("role") == Some(&json!("user"))
-        && msg
-            .get("content")
-            .and_then(|c| c.as_array())
-            .is_some_and(|arr| {
-                !arr.is_empty()
-                    && arr
+fn defer_tool_images(messages: &mut Vec<Value>, tool_images: &[bool]) {
+    if !tool_images.iter().any(|is_tool_image| *is_tool_image) {
+        return;
+    }
+    let mut output = Vec::with_capacity(messages.len());
+    let mut pending_calls = std::collections::HashSet::new();
+    let mut pending_images = Vec::new();
+
+    for (message, is_tool_image) in messages.drain(..).zip(tool_images) {
+        if *is_tool_image && !pending_calls.is_empty() {
+            pending_images.push(message);
+            continue;
+        }
+
+        if message["role"] == "tool" {
+            if let Some(id) = message["tool_call_id"].as_str() {
+                pending_calls.remove(id);
+            }
+        } else {
+            output.append(&mut pending_images);
+            pending_calls.clear();
+            if let Some(calls) = message["tool_calls"].as_array() {
+                pending_calls.extend(
+                    calls
                         .iter()
-                        .all(|item| item.get("type") == Some(&json!("image_url")))
-            })
+                        .filter_map(|call| call["id"].as_str().map(str::to_owned)),
+                );
+            }
+        }
+
+        output.push(message);
+        if pending_calls.is_empty() {
+            output.append(&mut pending_images);
+        }
+    }
+    output.append(&mut pending_images);
+    *messages = output;
 }
 
 pub fn format_tools(tools: &[Tool]) -> anyhow::Result<Vec<Value>> {
@@ -625,6 +744,7 @@ pub fn format_tools(tools: &[Tool]) -> anyhow::Result<Vec<Value>> {
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.input_schema,
+                "strict": false,
             }
         }));
     }
@@ -632,8 +752,32 @@ pub fn format_tools(tools: &[Tool]) -> anyhow::Result<Vec<Value>> {
     Ok(result)
 }
 
+pub fn record_response_metadata(usage: &mut ProviderUsage, response: &Value) {
+    usage.response_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let finish_reasons = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|choice| choice.get("finish_reason").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !finish_reasons.is_empty() {
+        usage.finish_reasons = Some(finish_reasons);
+    }
+}
+
 /// Convert OpenAI's API response to internal Message format
 pub fn response_to_message(response: &Value) -> anyhow::Result<Message> {
+    let output_token_limit_reached = response
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        == Some("length");
+
     let Some(original) = response
         .get("choices")
         .and_then(|c| c.get(0))
@@ -714,6 +858,16 @@ pub fn response_to_message(response: &Value) -> anyhow::Result<Message> {
                     })
                     .filter(|m: &serde_json::Map<String, Value>| !m.is_empty());
 
+                if output_token_limit_reached {
+                    let error = output_token_limit_tool_error(&function_name, &id);
+                    content.push(MessageContentBlock::tool_request_with_metadata(
+                        id,
+                        Err(error),
+                        metadata.as_ref(),
+                    ));
+                    continue;
+                }
+
                 if function_name.is_empty() {
                     let error = ErrorData {
                         code: ErrorCode::INVALID_REQUEST,
@@ -778,11 +932,9 @@ pub fn response_to_message(response: &Value) -> anyhow::Result<Message> {
         }
     }
 
-    Ok(Message::new(
-        Role::Assistant,
-        chrono::Utc::now().timestamp(),
-        content,
-    ))
+    let mut message = Message::new(Role::Assistant, chrono::Utc::now().timestamp(), content);
+    message.metadata.output_token_limit_reached = output_token_limit_reached;
+    Ok(message)
 }
 
 pub fn get_usage(usage: &Value) -> Usage {
@@ -799,14 +951,12 @@ pub fn get_usage(usage: &Value) -> Usage {
     let input_tokens = usage
         .get("prompt_tokens")
         .and_then(|v| v.as_i64())
-        .or_else(|| usage.get("prompt_eval_count").and_then(|v| v.as_i64()))
-        .map(|v| v as i32);
+        .or_else(|| usage.get("prompt_eval_count").and_then(|v| v.as_i64()));
 
     let output_tokens = usage
         .get("completion_tokens")
         .and_then(|v| v.as_i64())
-        .or_else(|| usage.get("eval_count").and_then(|v| v.as_i64()))
-        .map(|v| v as i32);
+        .or_else(|| usage.get("eval_count").and_then(|v| v.as_i64()));
 
     let cache_read_input_tokens = usage
         .get("cache_read_input_tokens")
@@ -816,18 +966,21 @@ pub fn get_usage(usage: &Value) -> Usage {
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_i64())
-        })
-        .map(|v| v as i32);
+        });
 
     let cache_write_input_tokens = usage
         .get("cache_creation_input_tokens")
         .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cache_write_tokens"))
+                .and_then(|v| v.as_i64())
+        });
 
     let total_tokens = usage
         .get("total_tokens")
         .and_then(|v| v.as_i64())
-        .map(|v| v as i32)
         .or_else(|| match (input_tokens, output_tokens) {
             (Some(input), Some(output)) => Some(input.saturating_add(output)),
             _ => None,
@@ -996,7 +1149,101 @@ fn strip_data_prefix(line: &str) -> Option<&str> {
         .map(|s| s.trim())
 }
 
-fn parse_streaming_chunk(line: &str) -> Result<StreamingChunk, ProviderError> {
+/// Longest error text pulled out of a stream frame, so a pathological payload cannot be
+/// pasted wholesale into a user-facing message.
+const MAX_STREAM_ERROR_LEN: usize = 500;
+
+/// Best-effort human-readable text for an error payload that may not be a plain string.
+///
+/// FastAPI reports `HTTPException` as `{"detail": "..."}` but `RequestValidationError` as
+/// `{"detail": [{"loc": [...], "msg": "field required", ...}]}`, so a string-only read would
+/// drop the commoner validation shape entirely.
+fn stream_error_text(value: &Value) -> Option<String> {
+    fn one(value: &Value) -> Option<String> {
+        match value {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(_) => value
+                .get("msg")
+                .or_else(|| value.get("message"))
+                .and_then(|m| m.as_str().map(String::from))
+                .or_else(|| Some(value.to_string())),
+            Value::Null => None,
+            other => Some(other.to_string()),
+        }
+    }
+
+    let text = match value {
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().filter_map(one).collect();
+            if parts.is_empty() {
+                return None;
+            }
+            parts.join("; ")
+        }
+        other => one(other)?,
+    };
+    if text.is_empty() {
+        return None;
+    }
+    if text.chars().count() > MAX_STREAM_ERROR_LEN {
+        let truncated: String = text.chars().take(MAX_STREAM_ERROR_LEN).collect();
+        return Some(format!("{truncated}…"));
+    }
+    Some(text)
+}
+
+/// Decide whether a choice-less SSE frame reports an in-stream failure.
+///
+/// Returns `Some(err)` when it does, `None` when it is gateway metadata that can be skipped.
+///
+/// Requires an actual error *signal* — a `status`/`statusCode`/`code` of 400 or above, a
+/// `type` of `"error"`, or a `detail` field, which has no benign meaning in this position.
+/// Mere prose is not enough: gateways also emit informational frames, and treating
+/// `{"message": "processing"}` as a failure would kill a healthy stream, which is the very
+/// bug this skip exists to avoid. The converse matters just as much — a gateway that
+/// rate-limits with a bare `{"statusCode": 429, "message": …}` on an HTTP 200 must not be
+/// silently skipped, or a failed turn is reported as an empty successful one.
+fn classify_choiceless_frame(value: &Value) -> Option<ProviderError> {
+    let status = ["status", "statusCode", "code"].iter().find_map(|key| {
+        let raw = value.get(*key)?;
+        raw.as_i64()
+            .or_else(|| raw.as_str().and_then(|s| s.parse::<i64>().ok()))
+    });
+
+    let has_error_signal = status.is_some_and(|s| s >= 400)
+        || value.get("type").and_then(|t| t.as_str()) == Some("error")
+        || value.get("detail").is_some_and(|d| !d.is_null());
+    if !has_error_signal {
+        return None;
+    }
+
+    let details = value
+        .get("message")
+        .and_then(stream_error_text)
+        .or_else(|| value.get("detail").and_then(stream_error_text))
+        .or_else(|| value.get("error").and_then(stream_error_text))
+        // A status with no recoverable text must still be loud rather than vanish.
+        .unwrap_or_else(|| match status {
+            Some(s) => format!("Gateway returned status {s} mid-stream"),
+            None => "Unknown server error".to_string(),
+        });
+    Some(ProviderError::ServerError(details))
+}
+
+/// Parse one SSE `data:` payload.
+///
+/// Returns `Ok(None)` for a metadata-only frame — a JSON object with no `choices` key at
+/// all. Gateways interleave these with the real chunks: Portkey/Azure APIM and friends
+/// emit trace/guardrail objects such as `{"hook_results": {...}}` before the first token.
+/// They carry nothing this parser consumes, so they are skipped rather than failed on;
+/// treating them as decode errors kills the whole turn on an otherwise healthy stream.
+///
+/// A frame with `"choices": []` is NOT metadata — that is the standard usage-only chunk,
+/// so it still deserializes and flows through the empty-choices paths below.
+///
+/// A choice-less frame that reports an in-stream failure is NOT metadata either — see
+/// `classify_choiceless_frame`.
+fn parse_streaming_chunk(line: &str) -> Result<Option<StreamingChunk>, ProviderError> {
     let value: Value = serde_json::from_str(line).map_err(|e| {
         ProviderError::stream_decode_error(format!(
             "Failed to parse streaming chunk: {e}: {line:?}"
@@ -1019,18 +1266,37 @@ fn parse_streaming_chunk(line: &str) -> Result<StreamingChunk, ProviderError> {
         return Err(ProviderError::ServerError(message.to_string()));
     }
 
-    serde_json::from_value(value).map_err(|e| {
+    if value
+        .as_object()
+        .is_some_and(|o| !o.contains_key("choices"))
+    {
+        if let Some(err) = classify_choiceless_frame(&value) {
+            return Err(err);
+        }
+        return Ok(None);
+    }
+
+    serde_json::from_value(value).map(Some).map_err(|e| {
         ProviderError::stream_decode_error(format!(
             "Failed to parse streaming chunk: {e}: {line:?}"
         ))
     })
 }
 
+fn output_token_limit_marker(id: Option<String>) -> Message {
+    let mut message = Message::assistant();
+    if let Some(id) = id {
+        message = message.with_id(id);
+    }
+    message.metadata.output_token_limit_reached = true;
+    message
+}
+
 pub fn response_to_streaming_message<S>(
     mut stream: S,
 ) -> impl Stream<Item = anyhow::Result<(Option<Message>, Option<ProviderUsage>)>> + 'static
 where
-    S: Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
+    S: Stream<Item = anyhow::Result<String>> + Unpin + MaybeSend + 'static,
 {
     try_stream! {
         use futures::StreamExt;
@@ -1046,6 +1312,11 @@ where
         // reasoning_content in a later chunk would produce duplicated reasoning.
         let mut pending_inline_thinking = String::new();
         let mut last_seen_model: Option<String> = None;
+        let mut last_response_id: Option<String> = None;
+        let mut last_finish_reason: Option<String> = None;
+        let mut output_token_limit_reached = false;
+        let mut output_token_limit_metadata_emitted = false;
+        let mut usage_emitted = false;
 
         'outer: while let Some(response) = stream.next().await {
             let response_str = response?;
@@ -1059,11 +1330,16 @@ where
                 continue
             }
 
-            let chunk: StreamingChunk = parse_streaming_chunk(
+            let Some(chunk) = parse_streaming_chunk(
                 line.ok_or_else(|| anyhow!("unexpected stream format"))?
-            )?;
+            )? else {
+                continue  // metadata-only frame
+            };
             if let Some(model) = &chunk.model {
                 last_seen_model = Some(model.clone());
+            }
+            if let Some(id) = &chunk.id {
+                last_response_id = Some(id.clone());
             }
 
             if !chunk.choices.is_empty() {
@@ -1079,9 +1355,22 @@ where
                 }
             }
 
+            if let Some(reason) = chunk.choices.first().and_then(|c| c.finish_reason.clone()) {
+                last_finish_reason = Some(reason);
+            }
             let mut usage = extract_usage_with_output_tokens(&chunk, last_seen_model.as_deref());
+            if let Some(u) = usage.as_mut() {
+                if let Some(reason) = &last_finish_reason {
+                    u.finish_reasons = Some(vec![reason.clone()]);
+                }
+                if let Some(id) = &last_response_id {
+                    u.response_id = Some(id.clone());
+                }
+            }
+            output_token_limit_reached |= last_finish_reason.as_deref() == Some("length");
 
             if chunk.choices.is_empty() {
+                usage_emitted |= usage.is_some();
                 yield (None, usage)
             } else if chunk.choices[0].delta.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) {
                 let mut tool_call_data: ToolCallData = HashMap::new();
@@ -1095,7 +1384,10 @@ where
                     }
                 }
 
-                let is_complete = chunk.choices[0].finish_reason == Some("tool_calls".to_string());
+                let is_complete = matches!(
+                    chunk.choices[0].finish_reason.as_deref(),
+                    Some("tool_calls" | "length")
+                );
 
                 if !is_complete {
                     let mut done = false;
@@ -1107,16 +1399,37 @@ where
                                     break 'outer;
                                 }
 
-                                let tool_chunk: StreamingChunk = parse_streaming_chunk(line)?;
+                                // A metadata frame here must NOT fall through to the
+                                // empty-choices branch below, which ends accumulation and
+                                // would truncate this tool call's arguments.
+                                let Some(tool_chunk) = parse_streaming_chunk(line)? else {
+                                    continue
+                                };
                                 if let Some(model) = &tool_chunk.model {
                                     last_seen_model = Some(model.clone());
                                 }
+                                if let Some(id) = &tool_chunk.id {
+                                    last_response_id = Some(id.clone());
+                                }
+                                if let Some(reason) = tool_chunk.choices.first().and_then(|c| c.finish_reason.clone()) {
+                                    last_finish_reason = Some(reason);
+                                }
 
-                                if let Some(chunk_usage) = extract_usage_with_output_tokens(&tool_chunk, last_seen_model.as_deref()) {
+                                if let Some(mut chunk_usage) = extract_usage_with_output_tokens(&tool_chunk, last_seen_model.as_deref()) {
+                                    if let Some(reason) = &last_finish_reason {
+                                        chunk_usage.finish_reasons = Some(vec![reason.clone()]);
+                                    }
+                                    if let Some(id) = &last_response_id {
+                                        chunk_usage.response_id = Some(id.clone());
+                                    }
                                     usage = Some(chunk_usage);
                                 }
 
                                 if !tool_chunk.choices.is_empty() {
+                                    output_token_limit_reached |=
+                                        tool_chunk.choices[0].finish_reason.as_deref()
+                                            == Some("length");
+
                                     if let Some(details) = &tool_chunk.choices[0].delta.reasoning_details {
                                         accumulated_reasoning.extend(details.iter().cloned());
                                     }
@@ -1130,7 +1443,12 @@ where
                                     if let Some(delta_tool_calls) = &tool_chunk.choices[0].delta.tool_calls {
                                         for delta_call in delta_tool_calls {
                                             if let Some(index) = delta_call.index {
-                                                if let Some((_, _, ref mut args, ref mut extra)) = tool_call_data.get_mut(&index) {
+                                                if let Some((_, ref mut stored_name, ref mut args, ref mut extra)) = tool_call_data.get_mut(&index) {
+                                                    if let Some(new_name) = &delta_call.function.name {
+                                                        if !new_name.is_empty() {
+                                                            *stored_name = new_name.clone();
+                                                        }
+                                                    }
                                                     args.push_str(&delta_call.function.arguments);
                                                     if extra.is_none() && delta_call.extra.is_some() {
                                                         *extra = delta_call.extra.clone();
@@ -1225,18 +1543,27 @@ where
                             extra_fields.as_ref().filter(|m| !m.is_empty()).cloned()
                         };
 
-                        let content = if arguments.is_empty() {
-                            MessageContentBlock::tool_request_with_metadata(
+                        let content = if output_token_limit_reached {
+                            MessageContentBlock::tool_request_with_provider_index(
+                                id.clone(),
+                                Err(output_token_limit_tool_error(function_name, id)),
+                                metadata.as_ref(),
+                                index,
+                            )
+                        } else if arguments.is_empty() {
+                            MessageContentBlock::tool_request_with_provider_index(
                                 id.clone(),
                                 Ok(CallToolRequestParams::new(function_name.clone()).with_arguments(object(json!({})))),
                                 metadata.as_ref(),
+                                index,
                             )
                         } else {
                             match parse_tool_arguments(arguments) {
-                                Some(params) if params.is_object() => MessageContentBlock::tool_request_with_metadata(
+                                Some(params) if params.is_object() => MessageContentBlock::tool_request_with_provider_index(
                                     id.clone(),
                                     Ok(CallToolRequestParams::new(function_name.clone()).with_arguments(object(params))),
                                     metadata.as_ref(),
+                                    index,
                                 ),
                                 // Valid JSON but NOT an object (a bare array/string/number).
                                 // Surface a tool error so the model retries instead of
@@ -1251,7 +1578,7 @@ where
                                         )),
                                         data: None,
                                     };
-                                    MessageContentBlock::tool_request_with_metadata(id.clone(), Err(error), metadata.as_ref())
+                                    MessageContentBlock::tool_request_with_provider_index(id.clone(), Err(error), metadata.as_ref(), index)
                                 }
                                 None => {
                                     let message_text = truncation_error_message(arguments)
@@ -1263,7 +1590,7 @@ where
                                         message: Cow::from(message_text),
                                         data: None,
                                     };
-                                    MessageContentBlock::tool_request_with_metadata(id.clone(), Err(error), metadata.as_ref())
+                                    MessageContentBlock::tool_request_with_provider_index(id.clone(), Err(error), metadata.as_ref(), index)
                                 }
                             }
                         };
@@ -1282,7 +1609,10 @@ where
                 if let Some(id) = chunk.id {
                     msg = msg.with_id(id);
                 }
+                msg.metadata.output_token_limit_reached = output_token_limit_reached;
+                output_token_limit_metadata_emitted |= output_token_limit_reached;
 
+                usage_emitted |= usage.is_some();
                 yield (
                     Some(msg),
                     usage,
@@ -1325,18 +1655,19 @@ where
                         msg = msg.with_id(id);
                     }
 
-                    yield (
-                        Some(msg),
-                        if chunk.choices[0].finish_reason.is_some() {
-                            usage
-                        } else {
-                            None
-                        },
-                    )
+                    let final_usage = if chunk.choices[0].finish_reason.is_some() {
+                        usage
+                    } else {
+                        None
+                    };
+                    usage_emitted |= final_usage.is_some();
+                    yield (Some(msg), final_usage)
                 } else if usage.is_some() {
+                    usage_emitted = true;
                     yield (None, usage)
                 }
             } else if usage.is_some() {
+                usage_emitted = true;
                 yield (None, usage)
             }
         }
@@ -1360,14 +1691,33 @@ where
                 content.push(MessageContentBlock::thinking(trailing_thinking, ""));
             }
 
-            yield (
-                Some(Message::new(
-                    Role::Assistant,
-                    chrono::Utc::now().timestamp(),
-                    content,
-                )),
-                None,
-            )
+            let mut message = Message::new(
+                Role::Assistant,
+                chrono::Utc::now().timestamp(),
+                content,
+            );
+            if let Some(id) = last_response_id.clone() {
+                message = message.with_id(id);
+            }
+            message.metadata.output_token_limit_reached =
+                output_token_limit_reached && !output_token_limit_metadata_emitted;
+            output_token_limit_metadata_emitted |= message.metadata.output_token_limit_reached;
+
+            yield (Some(message), None)
+        }
+
+        if output_token_limit_reached && !output_token_limit_metadata_emitted {
+            yield (Some(output_token_limit_marker(last_response_id.clone())), None)
+        }
+
+        if !usage_emitted && (last_response_id.is_some() || last_finish_reason.is_some()) {
+            let mut usage = ProviderUsage::new(
+                last_seen_model.unwrap_or_else(|| "unknown".to_string()),
+                Usage::default(),
+            );
+            usage.response_id = last_response_id;
+            usage.finish_reasons = last_finish_reason.map(|reason| vec![reason]);
+            yield (None, Some(usage))
         }
     }
 }
@@ -1389,6 +1739,8 @@ pub fn create_request(
         for_streaming,
         OpenAiFormatOptions {
             preserve_thinking_context: true,
+            supports_vision: model_config.supports_vision.unwrap_or_default(),
+            ..Default::default()
         },
     )
 }
@@ -1428,14 +1780,8 @@ pub fn create_request_for_model_with_options(
     for_streaming: bool,
     format_options: OpenAiFormatOptions,
 ) -> anyhow::Result<Value, Error> {
-    if model_config.model_name.starts_with("o1-mini") {
-        return Err(anyhow!(
-            "o1-mini model is not currently supported since goose uses tool calling and o1-mini does not support it. Please use o1 or o3 models instead."
-        ));
-    }
-
     let (model_name, legacy_reasoning_effort) = extract_reasoning_effort(capability_model_name);
-    let is_reasoning_model = is_openai_responses_model(&model_name);
+    let is_reasoning_model = model_config.openai_reasoning_for_model(&model_name);
     let supports_xai_effort = supports_xai_reasoning_effort(&model_name);
     let reasoning_effort = if is_reasoning_model {
         model_config
@@ -1451,10 +1797,16 @@ pub fn create_request_for_model_with_options(
         None
     };
 
-    let system_message = json!({
-        "role": if is_reasoning_model { "developer" } else { "system" },
-        "content": system
-    });
+    let system_message = serde_json::to_value(OpenAiMessage {
+        role: if is_reasoning_model {
+            "developer"
+        } else {
+            "system"
+        }
+        .to_string(),
+        content: Some(Value::String(system.to_string())),
+        ..Default::default()
+    })?;
 
     let messages_spec = format_messages_with_options(messages, image_format, format_options);
     let mut tools_spec = format_tools(tools)?;
@@ -1475,6 +1827,10 @@ pub fn create_request_for_model_with_options(
 
     if !tools_spec.is_empty() {
         payload["tools"] = json!(tools_spec);
+        // Some OpenAI-compatible backends default to "none" when tools are sent
+        // without tool_choice, so the model never calls them. "auto" is the
+        // OpenAI default, and a request_params override below still wins.
+        payload["tool_choice"] = json!("auto");
     }
 
     if !is_reasoning_model && !supports_xai_effort {
@@ -1508,7 +1864,7 @@ pub fn create_request_for_model_with_options(
     if let Some(params) = &model_config.request_params {
         if let Some(obj) = payload.as_object_mut() {
             for (key, value) in params {
-                if key != "thinking_effort" && !is_reserved_request_param_key(key) {
+                if !is_goose_internal_request_param(key) && !is_reserved_request_param_key(key) {
                     obj.insert(key.clone(), value.clone());
                 }
             }
@@ -1551,14 +1907,15 @@ pub fn extract_reasoning_effort(model_name: &str) -> (String, Option<String>) {
 /// True when the model should use the OpenAI Responses API.
 ///
 /// The Responses API is backwards-compatible with all OpenAI reasoning
-/// models, so every `o`-series (`o1`, `o3`, `o4`, …) and `gpt-5` variant
+/// models, so every `o`-series (`o1`, `o3`, `o4`, …), `gpt-5`, and `gpt-6` variant
 /// routes here. The matcher intentionally scans the full model identifier so
 /// hosted aliases like `databricks-gpt-5.4`, `goose-o3-mini`, or
 /// `headless-goose-o3-mini` work without provider-specific normalization.
 pub fn is_openai_responses_model(model_name: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        RE.get_or_init(|| Regex::new(r"(?i)(?:^|[-/])(?:o\d+(?:$|-)|gpt-5(?:$|[-.]))").unwrap());
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[-/])(?:o\d+(?:$|-)|gpt-(?:5|6)(?:$|[-.]))").unwrap()
+    });
     re.is_match(model_name)
 }
 
@@ -1610,42 +1967,32 @@ pub fn openai_reasoning_effort_for_thinking(
     model_name: &str,
     effort: ThinkingEffort,
 ) -> Option<String> {
-    let supported = openai_reasoning_efforts_for_model(model_name);
+    let catalog = crate::canonical::maybe_get_canonical_model("openai", model_name);
+    let catalog_efforts = catalog
+        .as_ref()
+        .and_then(|model| model.reasoning_efforts.as_deref());
 
     let preferred: &[&str] = match effort {
-        ThinkingEffort::Off => &["none", "low"],
-        ThinkingEffort::Low => &["low", "medium", "high", "xhigh"],
+        ThinkingEffort::Off => &["none", "minimal", "low"],
+        ThinkingEffort::Low => &["low", "minimal", "medium", "high", "xhigh"],
         ThinkingEffort::Medium => &["medium", "high", "low", "xhigh"],
         ThinkingEffort::High => &["high", "medium", "xhigh", "low"],
-        ThinkingEffort::Max => &["xhigh", "high", "medium", "low"],
+        ThinkingEffort::Max => &["max", "xhigh", "high", "medium", "low"],
     };
 
     preferred
         .iter()
-        .find(|level| supported.contains(level))
+        .find(|level| match catalog_efforts {
+            Some(values) => values.iter().any(|value| value == **level),
+            None => openai_reasoning_efforts_for_model(model_name).contains(level),
+        })
         .map(|level| (*level).to_string())
 }
 
-pub(crate) fn openai_reasoning_efforts_for_model(model_name: &str) -> &'static [&'static str] {
-    let normalized = model_name.to_ascii_lowercase();
-
-    if normalized.contains("gpt-5") {
-        if normalized.contains("-pro") || normalized.contains("/pro") {
-            &["high"]
-        } else if normalized.contains("gpt-5.4")
-            || normalized.contains("gpt-5-4")
-            || normalized.contains("gpt-5.5")
-            || normalized.contains("gpt-5-5")
-            || normalized.contains("gpt-5.6")
-            || normalized.contains("gpt-5-6")
-        {
-            &["none", "low", "medium", "high", "xhigh"]
-        } else {
-            &["low", "medium", "high"]
-        }
-    } else {
-        &["low", "medium", "high"]
-    }
+pub(crate) fn openai_reasoning_efforts_for_model(_model_name: &str) -> &'static [&'static str] {
+    // For aliases without catalog effort options, send only widely supported
+    // levels. Catalog entries override this fallback, including `none` and `max`.
+    &["low", "medium", "high"]
 }
 
 const MAX_FUNCTION_NAME_LENGTH: usize = 128;
@@ -1663,6 +2010,73 @@ pub fn is_valid_function_name(name: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap());
     re.is_match(name)
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    fn format(messages: &[Message]) -> Vec<Value> {
+        format_messages_with_options(
+            messages,
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                supports_vision: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn user_document_becomes_a_file_content_part() {
+        let spec = format(&[Message::user().with_document(
+            "cGRmLWJ5dGVz",
+            "application/pdf",
+            Some("q3-report.pdf".to_string()),
+        )]);
+
+        assert_eq!(spec.len(), 1);
+        assert_eq!(
+            spec[0]["content"][0],
+            json!({
+                "type": "file",
+                "file": {
+                    "filename": "q3-report.pdf",
+                    "file_data": "data:application/pdf;base64,cGRmLWJ5dGVz",
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_document_becomes_a_text_part() {
+        let spec = format(&[Message::assistant().with_document(
+            "cGRmLWJ5dGVz",
+            "application/pdf",
+            Some("q3-report.pdf".to_string()),
+        )]);
+
+        assert_eq!(spec.len(), 1);
+        assert_eq!(spec[0]["role"], "assistant");
+        let text = spec[0]["content"].as_str().unwrap();
+        assert!(text.contains("q3-report.pdf"), "{text}");
+        assert!(text.contains("user messages"), "{text}");
+        assert!(!text.contains("cGRmLWJ5dGVz"), "{text}");
+    }
+
+    #[test]
+    fn unsupported_document_media_type_becomes_an_explicit_text_part() {
+        let spec = format(&[Message::user().with_document(
+            "cm93cw==",
+            "text/csv",
+            Some("rows.csv".to_string()),
+        )]);
+
+        let text = spec[0]["content"].as_str().unwrap();
+        assert!(text.contains("rows.csv"), "{text}");
+        assert!(text.contains("application/pdf"), "{text}");
+        assert!(!text.contains("cm93cw=="), "{text}");
+    }
 }
 
 #[cfg(test)]
@@ -1901,6 +2315,11 @@ mod tests {
         assert_eq!(spec.len(), 1);
         assert_eq!(spec[0]["type"], "function");
         assert_eq!(spec[0]["function"]["name"], "test_tool");
+        assert_eq!(
+            spec[0]["function"]["strict"],
+            json!(false),
+            "Some chat-completions upstreams default strict to true when the flag is absent, but MCP tool schemas are not strict-compatible; must explicitly set strict: false"
+        );
         Ok(())
     }
 
@@ -2037,9 +2456,17 @@ mod tests {
         std::fs::write(&png_path, png_data)?;
         let png_path_str = png_path.to_str().unwrap();
 
-        // Create user message with image path - should load the image
+        // Create user message with image path - should load the image when vision is supported
         let user_message = Message::user().with_text(format!("Here is an image: {}", png_path_str));
-        let spec = format_messages(&[user_message], &ImageFormat::OpenAi);
+        let spec = format_messages_with_options(
+            &[user_message],
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: true,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(spec.len(), 1);
         assert_eq!(spec[0]["role"], "user");
@@ -2058,7 +2485,15 @@ mod tests {
         // Create assistant message with same text - should NOT load the image
         let assistant_message =
             Message::assistant().with_text(format!("I saved the output to {}", png_path_str));
-        let spec = format_messages(&[assistant_message], &ImageFormat::OpenAi);
+        let spec = format_messages_with_options(
+            &[assistant_message],
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: true,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(spec.len(), 1);
         assert_eq!(spec[0]["role"], "assistant");
@@ -2075,13 +2510,307 @@ mod tests {
     }
 
     #[test]
+    fn test_format_messages_with_image_path_passthrough_when_not_vision() -> anyhow::Result<()> {
+        // Create a temporary PNG file with valid PNG magic numbers
+        let temp_dir = tempfile::tempdir()?;
+        let png_path = temp_dir.path().join("test.png");
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, // PNG magic number
+            0x0D, 0x0A, 0x1A, 0x0A, // PNG header
+            0x00, 0x00, 0x00, 0x0D, // Rest of fake PNG data
+        ];
+        std::fs::write(&png_path, png_data)?;
+        let png_path_str = png_path.to_str().unwrap();
+
+        // User message with image path: with vision NOT supported, the path must
+        // pass through as plain text (a non-vision model can forward it to a
+        // vision subagent instead of 400ing on an injected image_url block).
+        let user_message = Message::user().with_text(format!("Here is an image: {}", png_path_str));
+
+        let spec = format_messages_with_options(
+            std::slice::from_ref(&user_message),
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(spec.len(), 1);
+        assert_eq!(spec[0]["role"], "user");
+        // Single text block collapses to a plain string — the path survives verbatim.
+        let content = spec[0]["content"].as_str().unwrap();
+        assert!(content.contains(png_path_str));
+        assert!(!content.contains("image_url"));
+        assert!(!content.contains("data:image"));
+
+        // Default options (bare format_messages wrapper) must behave the same:
+        // unaffirmed vision -> passthrough.
+        let spec = format_messages(&[user_message], &ImageFormat::OpenAi);
+        let content = spec[0]["content"].as_str().unwrap();
+        assert!(content.contains(png_path_str));
+        assert!(!content.contains("image_url"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_threads_supports_vision() -> anyhow::Result<()> {
+        // Create a temporary PNG file with valid PNG magic numbers
+        let temp_dir = tempfile::tempdir()?;
+        let png_path = temp_dir.path().join("test.png");
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, // PNG magic number
+            0x0D, 0x0A, 0x1A, 0x0A, // PNG header
+            0x00, 0x00, 0x00, 0x0D, // Rest of fake PNG data
+        ];
+        std::fs::write(&png_path, png_data)?;
+        let png_path_str = png_path.to_str().unwrap();
+        let message = Message::user().with_text(format!("Here is an image: {}", png_path_str));
+
+        // Vision affirmed: path is converted to an image_url block.
+        let vision = ModelConfig::new("gpt-4o").with_vision_support(true);
+        let request = create_request(
+            &vision,
+            "system",
+            std::slice::from_ref(&message),
+            &[],
+            &ImageFormat::OpenAi,
+            false,
+        )?;
+        let messages = request["messages"].as_array().unwrap();
+        let content = messages[1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "image_url");
+
+        // Unknown (None): passthrough, no image_url.
+        let unknown = ModelConfig::new("gpt-4o");
+        let request = create_request(
+            &unknown,
+            "system",
+            std::slice::from_ref(&message),
+            &[],
+            &ImageFormat::OpenAi,
+            false,
+        )?;
+        let messages = request["messages"].as_array().unwrap();
+        let content = messages[1]["content"].as_str().unwrap();
+        assert!(content.contains(png_path_str));
+        assert!(!content.contains("image_url"));
+
+        // Explicitly non-vision: passthrough, no image_url.
+        let non_vision = ModelConfig::new("gpt-4o").with_vision_support(false);
+        let request = create_request(
+            &non_vision,
+            "system",
+            &[message],
+            &[],
+            &ImageFormat::OpenAi,
+            false,
+        )?;
+        let messages = request["messages"].as_array().unwrap();
+        let content = messages[1]["content"].as_str().unwrap();
+        assert!(!content.contains("image_url"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_messages_with_image_block_passthrough_when_not_vision() -> anyhow::Result<()> {
+        let user_message = Message::user().with_image("aW1hZ2VkYXRh", "image/png");
+
+        // Non-vision: explicit image content is replaced with a text placeholder
+        // at format time — session history is untouched, so a vision model (or a
+        // delegated vision subagent) can still see the real image later.
+        let spec = format_messages_with_options(
+            std::slice::from_ref(&user_message),
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(spec.len(), 1);
+        let content = spec[0]["content"].as_str().unwrap();
+        assert_eq!(content, "[image omitted: model does not support vision]");
+        assert!(!content.contains("image_url"));
+        assert!(!content.contains("data:image"));
+
+        // Vision: the image is converted to an image_url block (existing behavior).
+        let spec = format_messages_with_options(
+            &[user_message],
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: true,
+                ..Default::default()
+            },
+        );
+        let content = spec[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image_url");
+        assert!(content[0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_response_image_omitted_when_not_vision() -> anyhow::Result<()> {
+        let tool_response = Message::user().with_tool_response(
+            "tool1",
+            Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::image("aW1hZ2VkYXRh", "image/png"),
+            ])),
+        );
+
+        // Non-vision: the separate user image message is NOT emitted — this is
+        // what un-bricks sessions (a converted image in the next request 400s).
+        let spec = format_messages_with_options(
+            std::slice::from_ref(&tool_response),
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: false,
+                ..Default::default()
+            },
+        );
+        let serialized = serde_json::to_value(&spec).unwrap().to_string();
+        assert!(!serialized.contains("image_url"));
+        assert!(serialized.contains(
+            "This tool result included an image that was omitted as the model does not support vision."
+        ));
+
+        // Vision: the separate user image message IS emitted (existing behavior).
+        let spec = format_messages_with_options(
+            &[tool_response],
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: true,
+                ..Default::default()
+            },
+        );
+        let serialized = serde_json::to_value(&spec).unwrap().to_string();
+        assert!(serialized.contains("image_url"));
+        assert!(serialized
+            .contains("This tool result included an image that is uploaded in the next message."));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_tool_responses_with_images_are_consecutive() {
+        // #11893: a synthetic user image message between the tool results of one
+        // tool_calls batch makes strict OpenAI-compatible APIs reject the request.
+        let messages = vec![
+            Message::assistant()
+                .with_tool_request("call_a", Ok(CallToolRequestParams::new("read_image")))
+                .with_tool_request("call_b", Ok(CallToolRequestParams::new("read_image"))),
+            Message::user()
+                .with_tool_response(
+                    "call_a",
+                    Ok(CallToolResult::success(vec![ContentBlock::image(
+                        "aW1hZ2VkYXRhYQ==",
+                        "image/png",
+                    )])),
+                )
+                .with_tool_response(
+                    "call_b",
+                    Ok(CallToolResult::success(vec![ContentBlock::image(
+                        "aW1hZ2VkYXRhYg==",
+                        "image/png",
+                    )])),
+                ),
+        ];
+
+        let spec = format_messages_with_options(
+            &messages,
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: true,
+                ..Default::default()
+            },
+        );
+
+        let roles: Vec<&str> = spec.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["assistant", "tool", "tool", "user", "user"]);
+        assert_eq!(spec[1]["tool_call_id"], "call_a");
+        assert_eq!(spec[2]["tool_call_id"], "call_b");
+    }
+
+    #[test]
+    fn test_mixed_tool_responses_image_and_text_ordering() {
+        // A text-only result between two image results must not let the image
+        // messages split the batch either.
+        let messages = vec![
+            Message::assistant()
+                .with_tool_request("call_a", Ok(CallToolRequestParams::new("read_image")))
+                .with_tool_request("call_b", Ok(CallToolRequestParams::new("shell")))
+                .with_tool_request("call_c", Ok(CallToolRequestParams::new("read_image"))),
+            Message::user()
+                .with_tool_response(
+                    "call_a",
+                    Ok(CallToolResult::success(vec![ContentBlock::image(
+                        "aW1hZ2VkYXRhYQ==",
+                        "image/png",
+                    )])),
+                )
+                .with_tool_response(
+                    "call_b",
+                    Ok(CallToolResult::success(vec![ContentBlock::text(
+                        "text result",
+                    )])),
+                )
+                .with_tool_response(
+                    "call_c",
+                    Ok(CallToolResult::success(vec![ContentBlock::image(
+                        "aW1hZ2VkYXRhYw==",
+                        "image/png",
+                    )])),
+                ),
+        ];
+
+        let spec = format_messages_with_options(
+            &messages,
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: true,
+                ..Default::default()
+            },
+        );
+
+        let roles: Vec<&str> = spec.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            vec!["assistant", "tool", "tool", "tool", "user", "user"]
+        );
+        assert_eq!(spec[1]["tool_call_id"], "call_a");
+        assert_eq!(spec[2]["tool_call_id"], "call_b");
+        assert_eq!(spec[3]["tool_call_id"], "call_c");
+    }
+
+    #[test]
     fn test_format_messages_with_text_and_image_preserves_order() {
         // Text before image: order should be [text, image]
         let msg_text_first = Message::user()
             .with_text("Describe this image")
             .with_image("aW1hZ2VkYXRh", "image/png");
 
-        let spec = format_messages(&[msg_text_first], &ImageFormat::OpenAi);
+        let spec = format_messages_with_options(
+            &[msg_text_first],
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(spec.len(), 1);
         assert_eq!(spec[0]["role"], "user");
 
@@ -2098,7 +2827,15 @@ mod tests {
             .with_image("aW1hZ2VkYXRh", "image/png")
             .with_text("What do you see?");
 
-        let spec2 = format_messages(&[msg_image_first], &ImageFormat::OpenAi);
+        let spec2 = format_messages_with_options(
+            &[msg_image_first],
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: true,
+                ..Default::default()
+            },
+        );
         let content2 = spec2[0]["content"]
             .as_array()
             .expect("content should be an array");
@@ -2132,6 +2869,96 @@ mod tests {
             panic!("Expected Text content");
         }
         assert!(matches!(message.role, Role::Assistant));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_response_metadata() {
+        let response = json!({
+            "id": "chatcmpl-123",
+            "choices": [
+                {"finish_reason": "stop"},
+                {"finish_reason": "tool_calls"}
+            ]
+        });
+        let mut usage = ProviderUsage::new("test-model".to_string(), Usage::default());
+
+        record_response_metadata(&mut usage, &response);
+
+        assert_eq!(usage.response_id.as_deref(), Some("chatcmpl-123"));
+        assert_eq!(
+            usage.finish_reasons,
+            Some(vec!["stop".to_string(), "tool_calls".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_response_to_message_marks_length_finish_reason() -> anyhow::Result<()> {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Partial answer"
+                },
+                "finish_reason": "length"
+            }]
+        });
+
+        let message = response_to_message(&response)?;
+
+        assert_eq!(message.as_concat_text(), "Partial answer");
+        assert!(message.metadata.output_token_limit_reached);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_response_to_message_rejects_length_terminated_tool_calls() -> anyhow::Result<()> {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_empty",
+                            "type": "function",
+                            "function": {
+                                "name": "empty_tool",
+                                "arguments": ""
+                            }
+                        },
+                        {
+                            "id": "call_valid",
+                            "type": "function",
+                            "function": {
+                                "name": "valid_tool",
+                                "arguments": "{\"value\":true}"
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "length"
+            }]
+        });
+
+        let message = response_to_message(&response)?;
+
+        assert!(message.metadata.output_token_limit_reached);
+        assert_eq!(message.content.len(), 2);
+        for (content, expected_id) in message.content.iter().zip(["call_empty", "call_valid"]) {
+            let MessageContentBlock::ToolRequest(request) = content else {
+                panic!("expected tool request");
+            };
+            assert_eq!(request.id, expected_id);
+            let error = request
+                .tool_call
+                .as_ref()
+                .expect_err("length-terminated tool call must not be executable");
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+            assert!(error.message.contains("output token limit"));
+        }
 
         Ok(())
     }
@@ -2355,6 +3182,71 @@ mod tests {
     }
 
     #[test]
+    fn test_request_serializes_content_before_tool_calls() -> anyhow::Result<()> {
+        let messages = vec![
+            Message::user().with_text("Find the answer"),
+            Message::assistant()
+                .with_text("I'll look it up")
+                .with_tool_request("call_1", Ok(CallToolRequestParams::new("lookup"))),
+            Message::user().with_tool_response(
+                "call_1",
+                Ok(CallToolResult::success(vec![ContentBlock::text("42")])),
+            ),
+        ];
+        let request = create_request(
+            &test_model_config("model-service"),
+            "system",
+            &messages,
+            &[],
+            &ImageFormat::OpenAi,
+            true,
+        )?;
+        let wire = serde_json::to_string(&request)?;
+        let parsed: Value = serde_json::from_str(&wire)?;
+        let assistant = serde_json::to_string(&parsed["messages"][2])?;
+        assert!(assistant.find("\"content\"").unwrap() < assistant.find("\"tool_calls\"").unwrap());
+        assert_eq!(parsed["messages"].as_array().unwrap().len(), 4);
+        assert_eq!(parsed["messages"][3]["role"], "tool");
+        assert_eq!(parsed["messages"][3]["tool_call_id"], "call_1");
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_call_serialization_preserves_provider_metadata() {
+        let metadata = json!({
+            "extra_content": {"google": {"thought_signature": "signature"}},
+        });
+        let call = OpenAiToolCall {
+            id: "original".to_string(),
+            kind: "function",
+            function: OpenAiFunctionCall {
+                name: "lookup".to_string(),
+                arguments: "{}".to_string(),
+            },
+            metadata: metadata.as_object().unwrap().clone(),
+        };
+        let wire = serde_json::to_string(&call).unwrap();
+        let serialized: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(serialized["id"], "original");
+        assert_eq!(serialized["type"], "function");
+        assert_eq!(serialized["function"]["name"], "lookup");
+        assert_eq!(serialized["function"]["arguments"], "{}");
+        assert_eq!(serialized["extra_content"], metadata["extra_content"]);
+    }
+
+    #[test]
+    fn test_message_serialization_distinguishes_missing_and_null_content() {
+        let missing = serde_json::to_value(OpenAiMessage::default()).unwrap();
+        assert!(missing.get("content").is_none());
+        let null = serde_json::to_value(OpenAiMessage {
+            content: Some(Value::Null),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(null.get("content"), Some(&Value::Null));
+    }
+
+    #[test]
     fn test_format_messages_tool_request_with_none_arguments() -> anyhow::Result<()> {
         // Test that tool calls with None arguments are formatted as "{}" string
         let message = Message::assistant()
@@ -2400,58 +3292,6 @@ mod tests {
         let parsed_args: Value = serde_json::from_str(args_str)?;
         assert_eq!(parsed_args["param"], "value");
         assert_eq!(parsed_args["number"], 42);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_messages_frontend_tool_request_with_none_arguments() -> anyhow::Result<()> {
-        // Test that FrontendToolRequest with None arguments are formatted as "{}" string
-        let message = Message::assistant().with_frontend_tool_request(
-            "frontend_tool1",
-            Ok(CallToolRequestParams::new("frontend_test_tool")),
-        );
-
-        let spec = format_messages(&[message], &ImageFormat::OpenAi);
-
-        assert_eq!(spec.len(), 1);
-        assert_eq!(spec[0]["role"], "assistant");
-        assert!(spec[0]["tool_calls"].is_array());
-
-        let tool_call = &spec[0]["tool_calls"][0];
-        assert_eq!(tool_call["id"], "frontend_tool1");
-        assert_eq!(tool_call["type"], "function");
-        assert_eq!(tool_call["function"]["name"], "frontend_test_tool");
-        // This should be the string "{}", not null
-        assert_eq!(tool_call["function"]["arguments"], "{}");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_messages_frontend_tool_request_with_some_arguments() -> anyhow::Result<()> {
-        // Test that FrontendToolRequest with Some arguments are properly JSON-serialized
-        let message = Message::assistant().with_frontend_tool_request(
-            "frontend_tool1",
-            Ok(CallToolRequestParams::new("frontend_test_tool")
-                .with_arguments(object!({"action": "click", "element": "button"}))),
-        );
-
-        let spec = format_messages(&[message], &ImageFormat::OpenAi);
-
-        assert_eq!(spec.len(), 1);
-        assert_eq!(spec[0]["role"], "assistant");
-        assert!(spec[0]["tool_calls"].is_array());
-
-        let tool_call = &spec[0]["tool_calls"][0];
-        assert_eq!(tool_call["id"], "frontend_tool1");
-        assert_eq!(tool_call["type"], "function");
-        assert_eq!(tool_call["function"]["name"], "frontend_test_tool");
-        // This should be a JSON string representation
-        let args_str = tool_call["function"]["arguments"].as_str().unwrap();
-        let parsed_args: Value = serde_json::from_str(args_str)?;
-        assert_eq!(parsed_args["action"], "click");
-        assert_eq!(parsed_args["element"], "button");
 
         Ok(())
     }
@@ -2504,6 +3344,69 @@ mod tests {
         Ok(())
     }
 
+    fn tool_choice_test_tool() -> Tool {
+        Tool::new(
+            "test_tool",
+            "A test tool",
+            object!({
+                "type": "object",
+                "properties": {"input": {"type": "string"}},
+                "required": ["input"]
+            }),
+        )
+    }
+
+    #[test]
+    fn test_create_request_sets_tool_choice_auto_when_tools_present() -> anyhow::Result<()> {
+        let request = create_request(
+            &test_model_config("gpt-4o"),
+            "system",
+            &[],
+            &[tool_choice_test_tool()],
+            &ImageFormat::OpenAi,
+            false,
+        )?;
+        assert_eq!(request["tool_choice"], "auto");
+        assert_eq!(request["tools"].as_array().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_omits_tool_choice_without_tools() -> anyhow::Result<()> {
+        let request = create_request(
+            &test_model_config("gpt-4o"),
+            "system",
+            &[],
+            &[],
+            &ImageFormat::OpenAi,
+            false,
+        )?;
+        let obj = request.as_object().unwrap();
+        assert!(!obj.contains_key("tools"));
+        assert!(
+            !obj.contains_key("tool_choice"),
+            "some backends reject tool_choice on a request that has no tools"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_params_can_override_tool_choice() -> anyhow::Result<()> {
+        let model_config = test_model_config("gpt-4o").with_merged_request_params(
+            std::collections::HashMap::from([("tool_choice".to_string(), json!("required"))]),
+        );
+        let request = create_request(
+            &model_config,
+            "system",
+            &[],
+            &[tool_choice_test_tool()],
+            &ImageFormat::OpenAi,
+            false,
+        )?;
+        assert_eq!(request["tool_choice"], "required");
+        Ok(())
+    }
+
     #[test]
     fn test_create_request_omits_max_tokens_when_unset() -> anyhow::Result<()> {
         // Unknown models on OpenAI-compatible local providers (llama_swap,
@@ -2550,6 +3453,9 @@ mod tests {
             ("max_tokens".to_string(), json!(1)),
             ("temperature".to_string(), json!(2.0)),
             ("provider_custom".to_string(), json!("allowed")),
+            ("thinking_effort".to_string(), json!("high")),
+            ("disable_prompt_cache".to_string(), json!(true)),
+            ("preserve_thinking_context".to_string(), json!(true)),
         ]);
         let model_config = test_model_config("glm-4.7")
             .with_max_tokens(Some(4096))
@@ -2578,6 +3484,9 @@ mod tests {
         assert_eq!(request["max_tokens"], 1);
         assert_eq!(request["temperature"], 2.0);
         assert_eq!(request["provider_custom"], "allowed");
+        assert!(request.get("thinking_effort").is_none());
+        assert!(request.get("disable_prompt_cache").is_none());
+        assert!(request.get("preserve_thinking_context").is_none());
 
         Ok(())
     }
@@ -2638,7 +3547,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_request_gpt56_max_effort_uses_xhigh() -> anyhow::Result<()> {
+    fn test_create_request_gpt56_max_effort_uses_max() -> anyhow::Result<()> {
         let model_config = test_model_config("gpt-5.6-luna")
             .with_max_tokens(Some(1024))
             .with_thinking_effort(ThinkingEffort::Max);
@@ -2652,10 +3561,114 @@ mod tests {
         )?;
         let obj = request.as_object().unwrap();
 
-        assert_eq!(obj.get("reasoning_effort"), Some(&json!("xhigh")));
+        assert_eq!(obj.get("reasoning_effort"), Some(&json!("max")));
         assert!(obj.get("thinking_effort").is_none());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_openai_reasoning_effort_gpt6_sol_and_luna() {
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            assert_eq!(
+                openai_reasoning_effort_for_thinking(model, ThinkingEffort::Off),
+                Some("none".to_string())
+            );
+            assert_eq!(
+                openai_reasoning_effort_for_thinking(model, ThinkingEffort::Max),
+                Some("max".to_string())
+            );
+            assert_eq!(
+                crate::canonical::maybe_get_canonical_model("openai", model)
+                    .unwrap()
+                    .reasoning_efforts
+                    .unwrap(),
+                ["none", "low", "medium", "high", "xhigh", "max"]
+            );
+            assert!(
+                is_openai_responses_model(model),
+                "{model} uses /v1/responses"
+            );
+        }
+
+        assert_eq!(
+            openai_reasoning_effort_for_thinking("gpt-6-astra", ThinkingEffort::Max),
+            Some("max".to_string())
+        );
+        assert_eq!(
+            openai_reasoning_effort_for_thinking("gpt-5.6-sol", ThinkingEffort::Max),
+            Some("max".to_string())
+        );
+    }
+
+    #[test]
+    fn test_openai_reasoning_effort_gpt6_does_not_support_none() {
+        for model in [
+            "gpt-6-astra",
+            "data_workflow_tools.goose.goose-gpt-6-astra",
+            "openrouter/openai/gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6.1-sol-high",
+            "data_workflow_tools.goose.goose-gpt-6.1-sol",
+            "openrouter/openai/gpt-6.1-sol",
+            "gpt-6.1-sol@eu",
+            "openai/gpt-6.1-sol-fast",
+            "openai/gpt-6.1-sol-fast-high",
+            "gpt-6-1-sol",
+            "gpt-6-1-sol-high",
+            "goose-gpt-6-1-sol",
+            "catalog.schema.goose-gpt-6-1-sol",
+            "openrouter/openai/gpt-6-1-sol",
+            "gpt-6-1-sol@eu",
+            "openai/gpt-6-1-sol-fast-high",
+            "GOOSE-GPT-6-1-SOL",
+        ] {
+            assert_eq!(
+                openai_reasoning_effort_for_thinking(model, ThinkingEffort::Off),
+                Some("low".to_string()),
+                "{model} Off should map to low, not none"
+            );
+            assert_eq!(
+                openai_reasoning_effort_for_thinking(model, ThinkingEffort::Medium),
+                Some("medium".to_string()),
+                "{model} medium should remain medium"
+            );
+            assert!(
+                !openai_reasoning_efforts_for_model(model).contains(&"none"),
+                "{model} must not advertise none"
+            );
+        }
+
+        assert_eq!(
+            openai_reasoning_effort_for_thinking("gpt-5.6-luna", ThinkingEffort::Off),
+            Some("none".to_string())
+        );
+        assert_eq!(
+            openai_reasoning_effort_for_thinking("gpt-5.4", ThinkingEffort::Off),
+            Some("none".to_string())
+        );
+        assert_eq!(
+            openai_reasoning_effort_for_thinking("gpt-5", ThinkingEffort::Off),
+            Some("minimal".to_string())
+        );
+    }
+
+    #[test]
+    fn test_gpt6_1_sol_effort_matching_respects_model_boundaries() {
+        for model in [
+            "gpt-6.1-solstice",
+            "gpt-6-1-solstice",
+            "gpt-6.10-sol",
+            "gpt-6-10-sol",
+            "notgpt-6-1-sol",
+            "catalog.schema.notgpt-6-1-sol",
+        ] {
+            assert_eq!(
+                openai_reasoning_effort_for_thinking(model, ThinkingEffort::Off),
+                Some("low".to_string()),
+                "{model} must use the unknown-model fallback"
+            );
+        }
     }
 
     #[test]
@@ -2673,7 +3686,7 @@ mod tests {
         )?;
         let obj = request.as_object().unwrap();
 
-        assert_eq!(obj.get("reasoning_effort"), Some(&json!("high")));
+        assert_eq!(obj.get("reasoning_effort"), Some(&json!("xhigh")));
         assert!(obj.get("thinking_effort").is_none());
 
         Ok(())
@@ -2718,6 +3731,8 @@ mod tests {
         usage: Option<ProviderUsage>,
         tool_calls: Vec<String>,
         has_text_content: bool,
+        text: String,
+        output_token_limit_message_ids: Vec<Option<String>>,
     }
 
     async fn run_streaming_test(response_lines: &str) -> anyhow::Result<StreamingUsageTestResult> {
@@ -2731,6 +3746,8 @@ mod tests {
             usage: None,
             tool_calls: Vec::new(),
             has_text_content: false,
+            text: String::new(),
+            output_token_limit_message_ids: Vec::new(),
         };
 
         while let Some(Ok((message, usage))) = messages.next().await {
@@ -2739,6 +3756,9 @@ mod tests {
                 result.usage = Some(u);
             }
             if let Some(msg) = message {
+                if msg.metadata.output_token_limit_reached {
+                    result.output_token_limit_message_ids.push(msg.id.clone());
+                }
                 for content in &msg.content {
                     match content {
                         MessageContentBlock::ToolRequest(req) => {
@@ -2748,6 +3768,7 @@ mod tests {
                         }
                         MessageContentBlock::Text(text) if !text.text.is_empty() => {
                             result.has_text_content = true;
+                            result.text.push_str(&text.text);
                         }
                         _ => {}
                     }
@@ -2760,9 +3781,9 @@ mod tests {
 
     fn assert_usage_yielded_once(
         result: &StreamingUsageTestResult,
-        expected_input: i32,
-        expected_output: i32,
-        expected_total: i32,
+        expected_input: i64,
+        expected_output: i64,
+        expected_total: i64,
     ) {
         assert_eq!(
             result.usage_count, 1,
@@ -2774,6 +3795,86 @@ mod tests {
         assert_eq!(usage.usage.input_tokens, Some(expected_input));
         assert_eq!(usage.usage.output_tokens, Some(expected_output));
         assert_eq!(usage.usage.total_tokens, Some(expected_total));
+    }
+
+    async fn collect_streamed_tool_requests(
+        response_lines: &str,
+    ) -> Vec<crate::conversation::message::ToolRequest> {
+        let lines: Vec<String> = response_lines.lines().map(|s| s.to_string()).collect();
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = response_to_streaming_message(response_stream);
+        pin!(messages);
+
+        let mut requests = Vec::new();
+        while let Some(Ok((message, _usage))) = messages.next().await {
+            if let Some(msg) = message {
+                for content in &msg.content {
+                    if let MessageContentBlock::ToolRequest(req) = content {
+                        requests.push(req.clone());
+                    }
+                }
+            }
+        }
+        requests
+    }
+
+    #[tokio::test]
+    async fn test_streaming_reassembles_interleaved_parallel_tool_calls() {
+        let response_lines = concat!(
+            r#"data: {"id":"chatcmpl-par","model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"search","arguments":""}},{"index":1,"id":"call_b","type":"function","function":{"name":"write","arguments":""}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"id":"chatcmpl-par","model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"path\":"}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"id":"chatcmpl-par","model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"id":"chatcmpl-par","model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"/tmp/a.md\"}"}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"id":"chatcmpl-par","model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"rust\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "\n",
+            "data: [DONE]",
+        );
+
+        let requests = collect_streamed_tool_requests(response_lines).await;
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r.provider_index())
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
+
+        let search = requests[0].tool_call.as_ref().expect("search args parsed");
+        assert_eq!(search.name, "search");
+        assert_eq!(search.arguments.as_ref().unwrap()["query"], json!("rust"));
+
+        let write = requests[1].tool_call.as_ref().expect("write args parsed");
+        assert_eq!(write.name, "write");
+        assert_eq!(
+            write.arguments.as_ref().unwrap()["path"],
+            json!("/tmp/a.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_marks_length_on_empty_terminal_chunk() -> anyhow::Result<()> {
+        let response_lines = r#"
+data: {"id":"chatcmpl-limit","model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Partial answer"},"finish_reason":null}]}
+data: {"id":"chatcmpl-limit","model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
+data: [DONE]
+"#;
+
+        let result = run_streaming_test(response_lines).await?;
+
+        assert_eq!(result.text, "Partial answer");
+        assert_eq!(
+            result.output_token_limit_message_ids,
+            vec![Some("chatcmpl-limit".to_string())]
+        );
+        assert_usage_yielded_once(&result, 10, 5, 15);
+
+        Ok(())
     }
 
     #[test]
@@ -2900,6 +4001,26 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn test_streaming_metadata_without_usage() -> anyhow::Result<()> {
+        let response_lines = r#"
+data: {"id":"chatcmpl-no-usage","model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}
+data: {"id":"chatcmpl-no-usage","model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: [DONE]
+"#;
+
+        let result = run_streaming_test(response_lines).await?;
+
+        assert_eq!(result.usage_count, 1);
+        let usage = result.usage.unwrap();
+        assert_eq!(usage.model, "test-model");
+        assert_eq!(usage.usage, Usage::default());
+        assert_eq!(usage.finish_reasons, Some(vec!["stop".to_string()]));
+        assert_eq!(usage.response_id.as_deref(), Some("chatcmpl-no-usage"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_openrouter_streaming_usage_yielded_once() -> anyhow::Result<()> {
         let response_lines = r#"
 data: {"id":"gen-1768896871-9HgAQqS1Z72C6gApaidi","provider":"OpenInference","model":"openai/gpt-oss-120b:free","object":"chat.completion.chunk","created":1768896871,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":null,"reasoning_details":[]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
@@ -2916,6 +4037,15 @@ data: [DONE]
 
         assert!(result.has_text_content, "Expected text content in response");
         assert_usage_yielded_once(&result, 7007, 49, 7056);
+        let usage = result.usage.as_ref().unwrap();
+        assert_eq!(
+            usage.finish_reasons.as_deref(),
+            Some(&["stop".to_string()][..])
+        );
+        assert_eq!(
+            usage.response_id.as_deref(),
+            Some("gen-1768896871-9HgAQqS1Z72C6gApaidi")
+        );
 
         Ok(())
     }
@@ -2938,6 +4068,15 @@ data: [DONE]
         assert_eq!(
             result.usage.as_ref().map(|usage| usage.model.as_str()),
             Some("gpt-5.2-1106-preview")
+        );
+        let usage = result.usage.as_ref().unwrap();
+        assert_eq!(
+            usage.finish_reasons.as_deref(),
+            Some(&["tool_calls".to_string()][..])
+        );
+        assert_eq!(
+            usage.response_id.as_deref(),
+            Some("chatcmpl-Bk9Ye6Y0t9E7bC3DOMxCpW8eJkTKU")
         );
 
         Ok(())
@@ -3096,7 +4235,8 @@ data: [DONE]"#;
     async fn test_streaming_non_object_arguments_does_not_panic() -> anyhow::Result<()> {
         // Streamed tool call whose arguments are valid JSON but NOT an object.
         // Must yield an INVALID_PARAMS tool error, not panic via rmcp `object()`.
-        let response_lines = r#"data: {"model":"test-model","choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_bad","function":{"name":"test_tool","arguments":"[1, 2, 3]"},"type":"function","index":0}]},"index":0,"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110},"object":"chat.completion.chunk","id":"test-id","created":1234567890}
+        let response_lines = r#"data: {"model":"test-model","choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_bad","function":{"name":"test_tool","arguments":"[1, "},"type":"function","index":0}]},"index":0,"finish_reason":null}],"object":"chat.completion.chunk","id":"test-id","created":1234567890}
+data: {"model":"test-model","choices":[{"delta":{"tool_calls":[{"function":{"arguments":"2, 3]"},"index":0}]},"index":0,"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110},"object":"chat.completion.chunk","id":"test-id","created":1234567890}
 data: [DONE]"#;
 
         let response_stream =
@@ -3104,9 +4244,17 @@ data: [DONE]"#;
         let messages = response_to_streaming_message(response_stream);
         pin!(messages);
 
-        while let Some(Ok((message, _usage))) = messages.next().await {
+        let mut found_tool_error = false;
+        let mut usage_count = 0;
+        while let Some(result) = messages.next().await {
+            let (message, usage) = result?;
+            if usage.is_some() {
+                usage_count += 1;
+            }
             if let Some(msg) = message {
                 if let MessageContentBlock::ToolRequest(request) = &msg.content[0] {
+                    assert!(!msg.metadata.output_token_limit_reached);
+                    assert_eq!(msg.id.as_deref(), Some("test-id"));
                     match &request.tool_call {
                         Err(ErrorData {
                             code: ErrorCode::INVALID_PARAMS,
@@ -3118,14 +4266,60 @@ data: [DONE]"#;
                                 m.contains("test_tool"),
                                 "error must name the original tool so the model can retry it: {m}"
                             );
-                            return Ok(());
+                            found_tool_error = true;
                         }
                         _ => panic!("expected INVALID_PARAMS for non-object streamed args"),
                     }
                 }
             }
         }
-        panic!("expected a tool request message");
+
+        assert!(found_tool_error, "expected a tool request message");
+        assert_eq!(usage_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_length_rejects_tool_calls_regardless_of_arguments() -> anyhow::Result<()>
+    {
+        let response_lines = r#"data: {"model":"test-model","choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_empty","function":{"name":"empty_tool","arguments":""},"type":"function","index":0},{"id":"call_valid","function":{"name":"valid_tool","arguments":"{\"value\":"},"type":"function","index":1}]},"index":0,"finish_reason":null}],"object":"chat.completion.chunk","id":"test-id","created":1234567890}
+data: {"model":"test-model","choices":[{"delta":{"tool_calls":[{"function":{"arguments":""},"index":0},{"function":{"arguments":"true}"},"index":1}]},"index":0,"finish_reason":"length"}],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110},"object":"chat.completion.chunk","id":"test-id","created":1234567890}
+data: [DONE]"#;
+
+        let response_stream =
+            tokio_stream::iter(response_lines.lines().map(|line| Ok(line.to_string())));
+        let messages = response_to_streaming_message(response_stream);
+        pin!(messages);
+
+        let mut tool_error_ids = Vec::new();
+        let mut usage_count = 0;
+        while let Some(result) = messages.next().await {
+            let (message, usage) = result?;
+            if usage.is_some() {
+                usage_count += 1;
+            }
+            if let Some(msg) = message {
+                assert!(msg.metadata.output_token_limit_reached);
+                assert_eq!(msg.id.as_deref(), Some("test-id"));
+                for content in msg.content {
+                    if let MessageContentBlock::ToolRequest(request) = content {
+                        let request_id = request.id.clone();
+                        match request.tool_call {
+                            Err(error) => {
+                                assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+                                assert!(error.message.contains("output token limit"));
+                                tool_error_ids.push(request_id);
+                            }
+                            Ok(_) => panic!("length-terminated tool call must not be executable"),
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(tool_error_ids, vec!["call_empty", "call_valid"]);
+        assert_eq!(usage_count, 1);
+        Ok(())
     }
 
     #[tokio::test]
@@ -3163,6 +4357,87 @@ data: [DONE]"#;
 
         assert_eq!(text, "y");
         assert_eq!(thinking, "x");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_truncated_inline_think_preserves_output_token_limit(
+    ) -> anyhow::Result<()> {
+        let response_lines = concat!(
+            "data: {\"id\":\"chunk-1\",\"model\":\"test-model\",\"choices\":[{\"delta\":{\"content\":\"<think>unfinished reasoning\"},\"index\":0,\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"chunk-1\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n",
+            "data: [DONE]\n"
+        );
+
+        let response_stream =
+            tokio_stream::iter(response_lines.lines().map(|line| Ok(line.to_string())));
+        let mut messages = std::pin::pin!(response_to_streaming_message(response_stream));
+        let mut streamed_messages = Vec::new();
+        let mut usage_count = 0;
+
+        while let Some(result) = messages.next().await {
+            let (message, usage) = result?;
+            if usage.is_some() {
+                usage_count += 1;
+            }
+            if let Some(message) = message {
+                streamed_messages.push(message);
+            }
+        }
+
+        assert_eq!(usage_count, 1);
+        assert_eq!(
+            streamed_messages
+                .iter()
+                .filter(|message| message.metadata.output_token_limit_reached)
+                .count(),
+            1
+        );
+        let trailing_message = streamed_messages
+            .last()
+            .expect("expected trailing thinking");
+        assert!(trailing_message.metadata.output_token_limit_reached);
+        assert!(matches!(
+            trailing_message.content.as_slice(),
+            [MessageContentBlock::Thinking(thinking)]
+                if thinking.thinking == "unfinished reasoning"
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_partial_think_tag_emits_one_output_limit_marker() -> anyhow::Result<()>
+    {
+        let response_lines = concat!(
+            "data: {\"id\":\"chunk-1\",\"model\":\"test-model\",\"choices\":[{\"delta\":{\"content\":\"<thi\"},\"index\":0,\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"chunk-1\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n",
+            "data: [DONE]\n"
+        );
+
+        let response_stream =
+            tokio_stream::iter(response_lines.lines().map(|line| Ok(line.to_string())));
+        let mut messages = std::pin::pin!(response_to_streaming_message(response_stream));
+        let mut streamed_messages = Vec::new();
+        let mut usage_count = 0;
+
+        while let Some(result) = messages.next().await {
+            let (message, usage) = result?;
+            usage_count += usize::from(usage.is_some());
+            if let Some(message) = message {
+                streamed_messages.push(message);
+            }
+        }
+
+        assert_eq!(usage_count, 1);
+        let marked_messages: Vec<_> = streamed_messages
+            .iter()
+            .filter(|message| message.metadata.output_token_limit_reached)
+            .collect();
+        assert_eq!(marked_messages.len(), 1);
+        assert_eq!(marked_messages[0].id.as_deref(), Some("chunk-1"));
+        assert_eq!(marked_messages[0].as_concat_text(), "<thi");
 
         Ok(())
     }
@@ -3331,6 +4606,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: true,
+                ..Default::default()
             },
         );
 
@@ -3389,6 +4665,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: false,
+                ..Default::default()
             },
         );
 
@@ -3441,6 +4718,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: true,
+                ..Default::default()
             },
         );
 
@@ -3471,6 +4749,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: true,
+                ..Default::default()
             },
         );
 
@@ -3499,6 +4778,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: true,
+                ..Default::default()
             },
         );
 
@@ -3523,6 +4803,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: true,
+                ..Default::default()
             },
         );
 
@@ -3559,6 +4840,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: true,
+                ..Default::default()
             },
         );
 
@@ -3617,6 +4899,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: true,
+                ..Default::default()
             },
         );
 
@@ -3664,6 +4947,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: true,
+                ..Default::default()
             },
         );
 
@@ -3754,7 +5038,8 @@ data: [DONE]"#;
             json!({"role": "assistant", "tool_calls": [{"id": "tc2", "type": "function", "function": {"name": "write", "arguments": "{}"}}], "reasoning_content": "thinking..."}),
             json!({"role": "tool", "tool_call_id": "tc2", "content": "result2"}),
         ];
-        merge_split_tool_call_messages(&mut messages);
+        let mut tool_images = vec![false; messages.len()];
+        merge_split_tool_call_messages(&mut messages, &mut tool_images);
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 2);
@@ -3770,7 +5055,8 @@ data: [DONE]"#;
             json!({"role": "assistant", "tool_calls": [{"id": "tc2", "type": "function", "function": {"name": "write", "arguments": "{}"}}]}),
             json!({"role": "tool", "tool_call_id": "tc2", "content": "result2"}),
         ];
-        merge_split_tool_call_messages(&mut messages);
+        let mut tool_images = vec![false; messages.len()];
+        merge_split_tool_call_messages(&mut messages, &mut tool_images);
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 1);
@@ -3786,16 +5072,17 @@ data: [DONE]"#;
             json!({"role": "assistant", "tool_calls": [{"id": "tc2", "type": "function", "function": {"name": "click", "arguments": "{}"}}], "reasoning_content": "thinking..."}),
             json!({"role": "tool", "tool_call_id": "tc2", "content": "clicked"}),
         ];
-        merge_split_tool_call_messages(&mut messages);
+        let mut tool_images = vec![false, false, true, false, false];
+        merge_split_tool_call_messages(&mut messages, &mut tool_images);
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 2);
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[1]["tool_call_id"], "tc1");
-        assert_eq!(messages[2]["role"], "user");
-        assert_eq!(messages[3]["role"], "tool");
-        assert_eq!(messages[3]["tool_call_id"], "tc2");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "tc2");
+        assert_eq!(messages[3]["role"], "user");
     }
 
     #[test]
@@ -3807,7 +5094,8 @@ data: [DONE]"#;
             json!({"role": "assistant", "tool_calls": [{"id": "tc2", "type": "function", "function": {"name": "write", "arguments": "{}"}}], "reasoning_content": "thinking..."}),
             json!({"role": "tool", "tool_call_id": "tc2", "content": "result2"}),
         ];
-        merge_split_tool_call_messages(&mut messages);
+        let mut tool_images = vec![false; messages.len()];
+        merge_split_tool_call_messages(&mut messages, &mut tool_images);
 
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 1);
@@ -3884,6 +5172,224 @@ data: [DONE]"#;
         Ok(())
     }
 
+    // ---- metadata-only SSE frames (gateway trace/guardrail objects) -----------------------
+    //
+    // Some OpenAI-compatible gateways interleave objects that have no `choices` key at all
+    // with the real chunks. A Portkey gateway sends a `hook_results` guardrail trace as the
+    // FIRST frame whenever strict-openai-compliance is off. Failing on such a frame killed
+    // the whole turn.
+
+    /// A guardrail trace frame, in the shape a Portkey gateway emits it.
+    const METADATA_FRAME: &str = concat!(
+        r#"data: {"hook_results":{"before_request_hooks":[{"verdict":true,"#,
+        r#""id":"guardrail-1","type":"guardrail","deny":false}]}}"#
+    );
+
+    fn content_chunk(content: &str) -> String {
+        format!(
+            concat!(
+                r#"data: {{"id":"x","object":"chat.completion.chunk","created":1,"model":"m","#,
+                r#""choices":[{{"index":0,"delta":{{"content":"{}"}},"finish_reason":null}}]}}"#
+            ),
+            content
+        )
+    }
+
+    #[tokio::test]
+    async fn test_metadata_only_first_frame_does_not_abort_stream() -> anyhow::Result<()> {
+        // The reported bug: a metadata-only opening frame made the whole turn fail with
+        // "Failed to parse streaming chunk: missing field `choices`".
+        let response_lines = format!("{METADATA_FRAME}\n{}\ndata: [DONE]", content_chunk("hello"));
+        assert_eq!(run_streaming_test(&response_lines).await?.text, "hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metadata_only_frame_interleaved_mid_stream_is_skipped() -> anyhow::Result<()> {
+        let response_lines = format!(
+            "{}\n{METADATA_FRAME}\n{}\ndata: [DONE]",
+            content_chunk("hel"),
+            content_chunk("lo")
+        );
+        assert_eq!(run_streaming_test(&response_lines).await?.text, "hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metadata_only_frame_mid_tool_call_keeps_arguments_intact() -> anyhow::Result<()> {
+        // A metadata frame arriving between two tool_calls argument deltas must not end
+        // argument accumulation. Merely defaulting `choices` to an empty vec would route this
+        // frame into the inner loop's empty-choices branch (`done = true`) and silently
+        // truncate the arguments to `{"city":"Pa` — a quiet corruption instead of a loud error.
+        let response_lines = concat!(
+            r#"data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Pa"}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"hook_results":{"before_request_hooks":[{"verdict":true,"type":"guardrail","deny":false}]}}"#,
+            "\n",
+            r#"data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ris\"}"}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n",
+            "data: [DONE]"
+        );
+        let lines: Vec<String> = response_lines.lines().map(|s| s.to_string()).collect();
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let mut messages = std::pin::pin!(response_to_streaming_message(response_stream));
+
+        let mut tool_calls = Vec::new();
+        while let Some(result) = messages.next().await {
+            let (message, _usage) = result?;
+            if let Some(msg) = message {
+                for content in &msg.content {
+                    if let MessageContentBlock::ToolRequest(req) = content {
+                        if let Ok(call) = &req.tool_call {
+                            tool_calls.push(call.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(tool_calls.len(), 1, "expected exactly one tool call");
+        assert_eq!(tool_calls[0].name, "get_weather");
+        assert_eq!(
+            tool_calls[0]
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("city"))
+                .and_then(Value::as_str),
+            Some("Paris"),
+            "arguments must survive the interleaved metadata frame intact"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_empty_choices_array_is_not_treated_as_metadata() -> anyhow::Result<()> {
+        // `"choices": []` is the standard usage-only chunk, NOT a metadata frame: it must
+        // still deserialize and still surface its usage.
+        let response_lines = concat!(
+            r#"data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            "\n",
+            r#"data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#,
+            "\n",
+            "data: [DONE]"
+        );
+        let result = run_streaming_test(response_lines).await?;
+        assert_eq!(result.usage_count, 1, "the usage-only chunk must be kept");
+        let usage = result.usage.expect("usage should be reported");
+        assert_eq!(usage.usage.output_tokens, Some(3));
+        assert!(result.has_text_content);
+        Ok(())
+    }
+
+    #[test]
+    fn test_error_frames_still_surface_as_server_error() {
+        // Skipping choice-less frames must not swallow gateway error frames, which are also
+        // choice-less. Every one of these is handled ahead of the metadata skip.
+        for line in [
+            r#"{"error":{"message":"upstream exploded"}}"#,
+            r#"{"object":"error","message":"upstream exploded"}"#,
+            // No `error` key and no `object`: the shape Azure APIM rate-limits with, on an
+            // HTTP 200. Skipping this would report the failed turn as an empty success.
+            r#"{"statusCode":429,"message":"upstream exploded"}"#,
+            // Some gateways stringify the status.
+            r#"{"status":"503","message":"upstream exploded"}"#,
+            // FastAPI's HTTPException shape.
+            r#"{"detail":"upstream exploded"}"#,
+            // FastAPI's RequestValidationError shape: `detail` is a LIST, so a string-only
+            // read would drop it and silently skip the frame.
+            r#"{"detail":[{"loc":["body"],"msg":"upstream exploded","type":"value_error"}]}"#,
+            // A non-string `message` must not be dropped either.
+            r#"{"statusCode":500,"message":{"text":"upstream exploded"}}"#,
+            // `type: "error"` is a third error marker some gateways use.
+            r#"{"type":"error","message":"upstream exploded"}"#,
+        ] {
+            match parse_streaming_chunk(line) {
+                Err(ProviderError::ServerError(msg)) => assert!(
+                    msg.contains("upstream exploded"),
+                    "message preserved for {line}, got {msg:?}"
+                ),
+                other => panic!("expected ServerError for {line}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_informational_choiceless_frame_is_still_skipped() -> anyhow::Result<()> {
+        // Prose alone is not an error signal. A keepalive/progress frame carrying a message
+        // but no status must NOT abort the turn — doing so would reintroduce exactly the bug
+        // the metadata skip exists to fix.
+        let response_lines = format!(
+            "{}\n{}\ndata: [DONE]",
+            r#"data: {"message":"processing"}"#,
+            content_chunk("hello")
+        );
+        assert_eq!(run_streaming_test(&response_lines).await?.text, "hello");
+        Ok(())
+    }
+
+    #[test]
+    fn test_status_only_error_frame_still_fails_loudly() {
+        // No message text anywhere: the frame must still surface rather than vanish.
+        match parse_streaming_chunk(r#"{"statusCode":503}"#) {
+            Err(ProviderError::ServerError(msg)) => {
+                assert!(msg.contains("503"), "status should reach the caller: {msg}")
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_choiceless_frame_error_text_is_capped() {
+        let long = "x".repeat(5_000);
+        let line = format!(r#"{{"statusCode":500,"message":"{long}"}}"#);
+        match parse_streaming_chunk(&line) {
+            Err(ProviderError::ServerError(msg)) => assert!(
+                msg.chars().count() <= MAX_STREAM_ERROR_LEN + 1,
+                "error text should be truncated, got {} chars",
+                msg.chars().count()
+            ),
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_in_stream_error_frame_aborts_rather_than_ending_empty() {
+        // End-to-end counterpart: the turn must fail, not complete with no content. A silent
+        // skip here tells the user to resend — the worst possible advice into a 429.
+        let response_lines = concat!(
+            r#"data: {"statusCode":429,"message":"rate limited"}"#,
+            "\n",
+            "data: [DONE]"
+        );
+        let lines: Vec<String> = response_lines.lines().map(|s| s.to_string()).collect();
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let mut messages = std::pin::pin!(response_to_streaming_message(response_stream));
+
+        let first = messages.next().await.expect("stream should yield an item");
+        let err = first.expect_err("an in-stream error frame must not be skipped");
+        assert!(
+            err.to_string().contains("rate limited"),
+            "the gateway's message must reach the caller: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_streaming_chunk_returns_none_for_metadata_frames() {
+        // Unit-level counterpart to the streaming tests above.
+        let metadata = parse_streaming_chunk(r#"{"hook_results":{"before_request_hooks":[]}}"#)
+            .expect("metadata frame must not be an error");
+        assert!(metadata.is_none(), "metadata frame should be skipped");
+
+        let real = parse_streaming_chunk(r#"{"choices":[],"usage":{"completion_tokens":1}}"#)
+            .expect("usage-only chunk must parse");
+        assert!(
+            real.is_some(),
+            "`choices: []` is a real chunk, not metadata"
+        );
+    }
+
     #[tokio::test]
     async fn test_streaming_chunk_with_only_reasoning_content() -> anyhow::Result<()> {
         let response_lines = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"hi\"},\"finish_reason\":null}]}\ndata: [DONE]";
@@ -3934,6 +5440,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: true,
+                ..Default::default()
             },
         );
         assert_eq!(spec.len(), 1);
@@ -3968,6 +5475,7 @@ data: [DONE]"#;
             &ImageFormat::OpenAi,
             OpenAiFormatOptions {
                 preserve_thinking_context: true,
+                ..Default::default()
             },
         );
         assert_eq!(spec.len(), 1);
@@ -4175,7 +5683,7 @@ data: [DONE]"#;
     }
 
     #[test]
-    fn test_is_openai_responses_model_matches_o_and_gpt5_families() {
+    fn test_is_openai_responses_model_matches_openai_reasoning_families() {
         for model in [
             "o3",
             "o3-mini",
@@ -4188,6 +5696,8 @@ data: [DONE]"#;
             "gpt-5-2-pro",
             "databricks-gpt-5.4",
             "goose-gpt-5.4-high",
+            "gpt-6-astra",
+            "data_workflow_tools.goose.goose-gpt-6-astra",
             "headless-goose-o3-mini",
         ] {
             assert!(is_openai_responses_model(model), "{model} should match");
@@ -4417,6 +5927,171 @@ data: [DONE]"#;
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn format_with_preservation(
+        messages: &[Message],
+        format: ThinkingPreservationFormat,
+    ) -> Vec<Value> {
+        format_messages_with_options(
+            messages,
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: false,
+                thinking_preservation_format: Some(format),
+            },
+        )
+    }
+
+    #[test]
+    fn test_thinking_preservation_content_prepend() {
+        let message = Message::assistant()
+            .with_thinking("Thinking process", "")
+            .with_text("Hello");
+
+        let spec = format_with_preservation(
+            std::slice::from_ref(&message),
+            ThinkingPreservationFormat::ContentPrepend,
+        );
+
+        assert_eq!(spec.len(), 1);
+        assert_eq!(spec[0]["content"], json!("Thinking process\n\nHello"));
+        assert!(spec[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn test_thinking_preservation_content_xml() {
+        let message = Message::assistant()
+            .with_thinking("Thinking process", "")
+            .with_text("Hello");
+
+        let spec = format_with_preservation(
+            std::slice::from_ref(&message),
+            ThinkingPreservationFormat::ContentXml,
+        );
+
+        assert_eq!(spec.len(), 1);
+        assert_eq!(
+            spec[0]["content"],
+            json!("<think>\nThinking process\n</think>\n\nHello")
+        );
+        assert!(spec[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn test_thinking_preservation_reasoning_content_is_unchanged() {
+        let message = Message::assistant()
+            .with_thinking("Thinking process", "")
+            .with_text("Hello");
+
+        let spec = format_with_preservation(
+            std::slice::from_ref(&message),
+            ThinkingPreservationFormat::ReasoningContent,
+        );
+
+        assert_eq!(spec.len(), 1);
+        assert_eq!(spec[0]["content"], json!("Hello"));
+        assert_eq!(spec[0]["reasoning_content"], json!("Thinking process"));
+    }
+
+    #[test]
+    fn test_thinking_preservation_runs_after_split_tool_call_merge() {
+        // Split tool-call messages are reunited by matching reasoning_content, so
+        // inlining must happen afterwards or the merge silently stops working.
+        let messages = vec![
+            Message::assistant().with_thinking("reasoning", ""),
+            Message::assistant()
+                .with_thinking("reasoning", "")
+                .with_tool_request(
+                    "tool1",
+                    Ok(CallToolRequestParams::new("tool_a").with_arguments(object!({}))),
+                ),
+            Message::user().with_tool_response(
+                "tool1",
+                Ok(rmcp::model::CallToolResult::success(vec![
+                    ContentBlock::text("result1"),
+                ])),
+            ),
+            Message::assistant()
+                .with_thinking("reasoning", "")
+                .with_tool_request(
+                    "tool2",
+                    Ok(CallToolRequestParams::new("tool_b").with_arguments(object!({}))),
+                ),
+        ];
+
+        let spec = format_with_preservation(&messages, ThinkingPreservationFormat::ContentXml);
+
+        let assistant: Vec<_> = spec
+            .iter()
+            .filter(|m| m.get("role") == Some(&json!("assistant")))
+            .collect();
+
+        assert_eq!(assistant.len(), 1);
+        assert_eq!(assistant[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert!(assistant[0].get("reasoning_content").is_none());
+        assert_eq!(
+            assistant[0]["content"],
+            json!("<think>\nreasoning\n</think>")
+        );
+    }
+
+    mod cache_prefix_stability {
+        use super::*;
+
+        fn turn_context(time: &str, turn_budget: &str) -> String {
+            format!(
+                "<turn-context>\n\
+                 <current-time>{time}</current-time>\n\
+                 <working-directory>/Users/me/code/goose</working-directory>\n\
+                 <turn-budget>{turn_budget}</turn-budget>\n\
+                 </turn-context>"
+            )
+        }
+
+        fn tool_loop_conversation(turn_context_block: &str) -> Vec<Message> {
+            vec![
+                Message::user().with_text("What does the main entrypoint do?"),
+                Message::assistant().with_text("Let me read it."),
+                Message::user()
+                    .with_text("Now add error handling to it.")
+                    .with_text(turn_context_block),
+                Message::assistant().with_tool_request(
+                    "tool_1",
+                    Ok(CallToolRequestParams::new("read_file")
+                        .with_arguments(object!({"path": "src/main.rs"}))),
+                ),
+                Message::user().with_tool_response(
+                    "tool_1",
+                    Ok(CallToolResult::success(vec![ContentBlock::text(
+                        "fn main() { run(); }",
+                    )])),
+                ),
+            ]
+        }
+
+        #[test]
+        fn turn_context_stays_on_its_source_message() {
+            let block = turn_context("2026-08-03 12:00:00", "14/40 used");
+            let spec = format_messages(&tool_loop_conversation(&block), &ImageFormat::OpenAi);
+
+            let occurrences: Vec<usize> = spec
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| {
+                    m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("<turn-context>"))
+                        .then_some(i)
+                })
+                .collect();
+            assert_eq!(
+                occurrences,
+                vec![2],
+                "turn-context must appear exactly once, on its source message"
+            );
         }
     }
 }

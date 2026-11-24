@@ -3,18 +3,17 @@ use super::{
     PermissionDecision, Session, SessionData, TestConnectionConfig, TestOutput,
 };
 use agent_client_protocol::schema::v1::{
-    ClientCapabilities, CloseSessionRequest, ContentBlock, CreateTerminalRequest,
-    FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
+    CloseSessionRequest, ContentBlock, DeleteSessionRequest, ImageContent, InitializeRequest,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, McpServer, NewSessionRequest,
-    PromptRequest, ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionRequest,
-    SessionConfigKind, SessionConfigOptionCategory, SessionConfigOptionValue, SessionId,
-    SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, StopReason, TerminalOutputRequest, TextContent, ToolCallStatus,
-    WaitForTerminalExitRequest, WriteTextFileRequest,
+    PromptRequest, RequestPermissionRequest, SessionConfigKind, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionId, SessionModeId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent, ToolCallStatus,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectionTo};
 use async_trait::async_trait;
+use futures::io::BufReader;
+use futures::{AsyncBufReadExt, AsyncWriteExt, StreamExt};
 use goose::config::PermissionManager;
 use goose_test_support::{ExpectedSessionId, IgnoreSessionId};
 use std::sync::{Arc, Mutex};
@@ -103,6 +102,75 @@ impl AcpServerConnection {
     }
 }
 
+pub async fn assert_session_response_precedes_available_commands(
+    transport: super::DuplexTransport,
+    method: &str,
+    params: serde_json::Value,
+) {
+    let (mut outgoing, incoming) = transport.into_parts();
+    let mut incoming = BufReader::new(incoming).lines();
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientCapabilities": {}
+        }
+    });
+    outgoing
+        .write_all(format!("{initialize}\n").as_bytes())
+        .await
+        .unwrap();
+    outgoing.flush().await.unwrap();
+    let initialize_response = incoming.next().await.unwrap().unwrap();
+    let initialize_response: serde_json::Value =
+        serde_json::from_str(&initialize_response).unwrap();
+    assert_eq!(initialize_response["id"], 1);
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": method,
+        "params": params,
+    });
+    outgoing
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    outgoing.flush().await.unwrap();
+
+    let response = incoming.next().await.unwrap().unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["id"], 2);
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let message = tokio::time::timeout_at(deadline, incoming.next())
+            .await
+            .expect("timed out waiting for available commands")
+            .expect("ACP connection closed")
+            .unwrap();
+        let message: serde_json::Value = serde_json::from_str(&message).unwrap();
+        if message["params"]["update"]["sessionUpdate"] != "available_commands_update" {
+            continue;
+        }
+
+        assert_eq!(message["params"]["sessionId"], session_id);
+        assert!(message["params"]["update"]["availableCommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["name"] == "goal"));
+        break;
+    }
+}
+
 #[async_trait]
 impl Connection for AcpServerConnection {
     type Session = AcpServerSession;
@@ -138,21 +206,10 @@ impl Connection for AcpServerConnection {
         let notify = Arc::new(Notify::new());
         let permission = Arc::new(Mutex::new(PermissionDecision::Cancel));
 
-        let mut fs_cap = FileSystemCapabilities::default();
-        if config.read_text_file.is_some() {
-            fs_cap = fs_cap.read_text_file(true);
-        }
-        if config.write_text_file.is_some() {
-            fs_cap = fs_cap.write_text_file(true);
-        }
-
         let cx = {
             let updates_clone = updates.clone();
             let notify_clone = notify.clone();
             let permission_clone = permission.clone();
-            let read_handler = config.read_text_file;
-            let write_handler = config.write_text_file;
-            let terminal = config.terminal;
 
             let cx_holder: Arc<Mutex<Option<ConnectionTo<Agent>>>> = Arc::new(Mutex::new(None));
             let cx_holder_clone = cx_holder.clone();
@@ -184,111 +241,31 @@ impl Connection for AcpServerConnection {
                         },
                         agent_client_protocol::on_receive_request!(),
                     )
-                    .on_receive_request(
-                        async move |req: ReadTextFileRequest, responder, _cx| match read_handler {
-                            Some(ref rh) => match rh(&req) {
-                                Ok(resp) => responder.respond(resp),
-                                Err(msg) => responder.respond_with_internal_error(msg),
-                            },
-                            None => responder.respond_with_error(
-                                agent_client_protocol::Error::method_not_found(),
-                            ),
-                        },
-                        agent_client_protocol::on_receive_request!(),
-                    )
-                    .on_receive_request(
-                        async move |req: WriteTextFileRequest, responder, _cx| match write_handler {
-                            Some(ref wh) => match wh(&req) {
-                                Ok(resp) => responder.respond(resp),
-                                Err(msg) => responder.respond_with_internal_error(msg),
-                            },
-                            None => responder.respond_with_error(
-                                agent_client_protocol::Error::method_not_found(),
-                            ),
-                        },
-                        agent_client_protocol::on_receive_request!(),
-                    )
-                    .on_receive_request(
-                        {
-                            let t = terminal.clone();
-                            async move |req: CreateTerminalRequest, responder, _cx| match t {
-                                Some(ref f) => responder.respond(f.on_create(&req.command)),
-                                None => responder.respond_with_error(
-                                    agent_client_protocol::Error::method_not_found(),
-                                ),
-                            }
-                        },
-                        agent_client_protocol::on_receive_request!(),
-                    )
-                    .on_receive_request(
-                        {
-                            let t = terminal.clone();
-                            async move |req: WaitForTerminalExitRequest, responder, _cx| match t {
-                                Some(ref f) => {
-                                    responder.respond(f.on_wait_for_exit(&req.terminal_id))
-                                }
-                                None => responder.respond_with_error(
-                                    agent_client_protocol::Error::method_not_found(),
-                                ),
-                            }
-                        },
-                        agent_client_protocol::on_receive_request!(),
-                    )
-                    .on_receive_request(
-                        {
-                            let t = terminal.clone();
-                            async move |req: TerminalOutputRequest, responder, _cx| match t {
-                                Some(ref f) => responder.respond(f.on_output(&req.terminal_id)),
-                                None => responder.respond_with_error(
-                                    agent_client_protocol::Error::method_not_found(),
-                                ),
-                            }
-                        },
-                        agent_client_protocol::on_receive_request!(),
-                    )
-                    .on_receive_request(
-                        {
-                            let t = terminal.clone();
-                            async move |req: ReleaseTerminalRequest, responder, _cx| match t {
-                                Some(ref f) => responder.respond(f.on_release(&req.terminal_id)),
-                                None => responder.respond_with_error(
-                                    agent_client_protocol::Error::method_not_found(),
-                                ),
-                            }
-                        },
-                        agent_client_protocol::on_receive_request!(),
-                    )
-                    .on_receive_request(
-                        {
-                            let t = terminal.clone();
-                            async move |req: KillTerminalRequest, responder, _cx| match t {
-                                Some(ref f) => responder.respond(f.on_kill(&req.terminal_id)),
-                                None => responder.respond_with_error(
-                                    agent_client_protocol::Error::method_not_found(),
-                                ),
-                            }
-                        },
-                        agent_client_protocol::on_receive_request!(),
-                    )
-                    .connect_with(transport, {
+                    .connect_with(transport.into_byte_streams(), {
                         let cx_holder = cx_holder_clone;
                         async move |cx: ConnectionTo<Agent>| {
                             let resp = cx
-                                .send_request(
-                                    InitializeRequest::new(ProtocolVersion::LATEST)
-                                        .client_capabilities(
-                                            ClientCapabilities::new()
-                                                .fs(fs_cap)
-                                                .terminal(terminal.is_some()),
-                                        ),
-                                )
+                                .send_request(InitializeRequest::new(ProtocolVersion::V1))
                                 .block_task()
                                 .await
                                 .unwrap();
                             assert_eq!(
+                                resp.protocol_version,
+                                ProtocolVersion::V1,
+                                "initialize response must negotiate ACP V1"
+                            );
+                            assert_eq!(
                                 resp.agent_info.as_ref().map(|info| info.name.as_str()),
                                 Some("goose"),
                                 "initialize response must identify the agent"
+                            );
+                            assert!(
+                                resp.agent_capabilities
+                                    .session_capabilities
+                                    .delete
+                                    .as_ref()
+                                    .is_some(),
+                                "initialize response must advertise session/delete"
                             );
 
                             *cx_holder.lock().unwrap() = Some(cx.clone());
@@ -343,6 +320,20 @@ impl Connection for AcpServerConnection {
             _work_dir: work_dir,
         };
         let models = extract_model_state_from_config_options(response.config_options.as_deref());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !self.updates.lock().unwrap().iter().any(|notification| {
+            notification.session_id == response.session_id
+                && matches!(
+                    &notification.update,
+                    SessionUpdate::AvailableCommandsUpdate(_)
+                )
+        }) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for initial available commands"
+            );
+            tokio::task::yield_now().await;
+        }
         self.updates.lock().unwrap().clear();
         Ok(SessionData {
             session,
@@ -401,14 +392,12 @@ impl Connection for AcpServerConnection {
     }
 
     async fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
-        super::send_custom(
-            &self.cx,
-            "session/delete",
-            serde_json::json!({ "sessionId": session_id }),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| e.into())
+        self.cx
+            .send_request(DeleteSessionRequest::new(SessionId::new(session_id)))
+            .block_task()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.into())
     }
 
     async fn set_mode(&self, session_id: &str, mode_id: &str) -> anyhow::Result<()> {
@@ -454,8 +443,7 @@ impl Connection for AcpServerConnection {
     }
 
     fn reset_permissions(&self) {
-        // "" matches all extensions, clearing all stored permission decisions
-        self.permission_manager.remove_extension("");
+        self.permission_manager.clear_permissions();
     }
 }
 

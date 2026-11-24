@@ -1,9 +1,10 @@
+#![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
 mod common_tests;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, PromptRequest, SessionUpdate, StopReason, TextContent,
+    ContentBlock, McpServer, McpServerHttp, PromptRequest, SessionUpdate, StopReason, TextContent,
 };
 use common_tests::fixtures::server::AcpServerConnection;
 use common_tests::fixtures::{
@@ -14,10 +15,10 @@ use goose::acp::server::AcpProviderFactory;
 use goose::providers::base::{MessageStream, Provider};
 use goose_providers::errors::ProviderError;
 use goose_providers::model::ModelConfig;
-use goose_test_support::{EnforceSessionId, IgnoreSessionId};
+use goose_test_support::{EnforceSessionId, IgnoreSessionId, McpFixture, FAKE_CODE};
 use serial_test::serial;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use common_tests::fixtures::OpenAiFixture;
@@ -48,7 +49,7 @@ fn write_acp_global_config(contents: &str) -> PathBuf {
 struct MockProvider {
     name: String,
     recommended_models: Vec<String>,
-    supported_models: Vec<String>,
+    supported_models: Result<Vec<String>, ProviderError>,
 }
 
 #[async_trait::async_trait]
@@ -75,7 +76,7 @@ impl Provider for MockProvider {
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
-        Ok(self.supported_models.clone())
+        self.supported_models.clone()
     }
 }
 
@@ -183,6 +184,79 @@ fn test_custom_get_tools() {
         let response = result.unwrap();
         let tools = response.get("tools").expect("missing 'tools' field");
         assert!(tools.is_array(), "tools should be array");
+    });
+}
+
+#[test]
+#[serial]
+#[cfg(feature = "live-voice")]
+fn test_live_voice_availability_is_bound_to_an_accessible_main_session() {
+    let _guard = env_lock::lock_env([
+        ("GOOSE_LIVE_VOICE_ENABLED", None::<&str>),
+        ("OPENAI_API_KEY", None::<&str>),
+    ]);
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let disabled = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/live-voice/availability",
+            serde_json::json!({
+                "sessionId": session.session_id().0
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(disabled["status"], "unavailable");
+        assert_eq!(disabled["message"], "Live voice is disabled");
+
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/config/upsert",
+            serde_json::json!({
+                "key": "GOOSE_LIVE_VOICE_ENABLED",
+                "value": true,
+                "isSecret": false
+            }),
+        )
+        .await
+        .unwrap();
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/config/upsert",
+            serde_json::json!({
+                "key": "OPENAI_API_KEY",
+                "value": "test-live-key",
+                "isSecret": true
+            }),
+        )
+        .await
+        .unwrap();
+
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/live-voice/availability",
+            serde_json::json!({
+                "sessionId": session.session_id().0
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status"], "ready");
+        assert_eq!(response["message"], "Start Live voice");
+
+        let inaccessible = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/live-voice/availability",
+            serde_json::json!({
+                "sessionId": "not-loaded-on-this-connection"
+            }),
+        )
+        .await;
+        assert!(inaccessible.is_err());
     });
 }
 
@@ -342,7 +416,7 @@ fn test_custom_session_extensions_add_list_remove() {
                 .expect("extensions should be an array");
             extensions
                 .iter()
-                .find(|extension| extension["name"] == extension_name)
+                .find(|entry| entry["extension"]["name"] == extension_name)
                 .cloned()
         };
 
@@ -368,18 +442,39 @@ fn test_custom_session_extensions_add_list_remove() {
         .await;
         assert!(add_result.is_ok(), "expected ok, got: {:?}", add_result);
 
-        let extension = list_extension()
+        let entry = list_extension()
             .await
             .unwrap_or_else(|| panic!("missing added session extension"));
+        assert_eq!(entry["extensionKey"], extension_name);
+        let extension = &entry["extension"];
         assert_eq!(extension["type"], "platform");
         assert_eq!(extension["name"], extension_name);
+
+        let unknown_remove_result = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/extensions/remove",
+            serde_json::json!({
+                "sessionId": session_id.clone(),
+                "extensionKey": "missing-extension",
+            }),
+        )
+        .await;
+        assert_eq!(
+            unknown_remove_result.unwrap_err(),
+            agent_client_protocol::Error::invalid_params()
+                .data("Extension 'missing-extension' not found")
+        );
+        assert!(
+            list_extension().await.is_some(),
+            "unknown key must not remove another extension"
+        );
 
         let remove_result = send_custom(
             conn.cx(),
             "_goose/unstable/session/extensions/remove",
             serde_json::json!({
                 "sessionId": session_id.clone(),
-                "name": extension_name,
+                "extensionKey": extension_name,
             }),
         )
         .await;
@@ -392,50 +487,6 @@ fn test_custom_session_extensions_add_list_remove() {
         assert!(
             list_extension().await.is_none(),
             "removed session extension should not be listed"
-        );
-    });
-}
-
-#[test]
-#[serial]
-fn test_custom_get_available_extensions() {
-    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
-    run_test(async move {
-        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
-        let conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
-
-        let result = send_custom(
-            conn.cx(),
-            "_goose/unstable/extensions/available",
-            serde_json::json!({}),
-        )
-        .await;
-        assert!(result.is_ok(), "expected ok, got: {:?}", result);
-
-        let response = result.unwrap();
-        let extensions = response
-            .get("extensions")
-            .and_then(|extensions| extensions.as_array())
-            .expect("extensions should be an array");
-        assert!(!extensions.is_empty(), "extensions should not be empty");
-        assert!(
-            extensions.iter().all(|extension| matches!(
-                extension["type"].as_str(),
-                Some("builtin" | "platform")
-            )),
-            "available extensions should only include builtin and platform entries"
-        );
-        assert!(
-            extensions.iter().any(|extension| {
-                extension["type"] == "platform" && extension["name"] == "developer"
-            }),
-            "developer platform extension should be available"
-        );
-        assert!(
-            !extensions.iter().any(|extension| {
-                extension["type"] == "platform" && extension["name"] == "orchestrator"
-            }),
-            "hidden orchestrator platform extension should not be available"
         );
     });
 }
@@ -543,7 +594,7 @@ fn test_steer_session_adds_input_to_active_prompt() {
         // steer queued before the turn ends keeps the loop alive (it flips
         // `exit_chat` back to false), so a second provider request fires whose
         // body must now contain the steered text.
-        let openai = OpenAiFixture::new(
+        let openai = OpenAiFixture::with_response_delay(
             vec![
                 (
                     "start work".to_string(),
@@ -555,6 +606,7 @@ fn test_steer_session_adds_input_to_active_prompt() {
                 ),
             ],
             Arc::new(IgnoreSessionId),
+            Duration::from_millis(500),
         )
         .await;
         let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
@@ -720,7 +772,7 @@ fn test_custom_provider_inventory_includes_metadata() {
 
 #[test]
 #[serial]
-fn test_custom_preferences_read_save_remove() {
+fn test_custom_preferences_read_save() {
     let config_dir = write_acp_global_config(
         "GOOSE_MODEL: gpt-4o\nGOOSE_PROVIDER: openai\nGOOSE_AUTO_COMPACT_THRESHOLD: 0.7\nGOOSE_THINKING_EFFORT: high\nVOICE_AUTO_SUBMIT_PHRASES: send it\n",
     );
@@ -771,16 +823,6 @@ fn test_custom_preferences_read_save_remove() {
         .await
         .expect("preferences save should succeed");
 
-        send_custom(
-            conn.cx(),
-            "_goose/unstable/preferences/remove",
-            serde_json::json!({
-                "keys": ["voiceDictationProvider"],
-            }),
-        )
-        .await
-        .expect("preferences remove should succeed");
-
         let response = send_custom(
             conn.cx(),
             "_goose/unstable/preferences/read",
@@ -789,12 +831,12 @@ fn test_custom_preferences_read_save_remove() {
             }),
         )
         .await
-        .expect("preferences read after remove should succeed");
+        .expect("preferences read after save should succeed");
         assert_eq!(
             response.get("values"),
             Some(&serde_json::json!([
                 { "key": "gooseThinkingEffort", "value": "off" },
-                { "key": "voiceDictationProvider", "value": null },
+                { "key": "voiceDictationProvider", "value": "__disabled__" },
                 { "key": "voiceDictationPreferredMic", "value": "mic-1" },
             ]))
         );
@@ -944,104 +986,6 @@ fn test_custom_defaults_save_allows_unlisted_model() {
 
 #[test]
 #[serial]
-fn test_custom_dictation_secret_save_delete() {
-    let _env = env_lock::lock_env([
-        ("GOOSE_DISABLE_KEYRING", Some("1")),
-        ("GROQ_API_KEY", None::<&str>),
-    ]);
-    let config_dir = write_acp_global_config(
-        "GOOSE_MODEL: gpt-4o\nGOOSE_PROVIDER: openai\nGOOSE_DISABLE_KEYRING: true\n",
-    );
-
-    run_test(async move {
-        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
-        let config = TestConnectionConfig {
-            data_root: config_dir.clone(),
-            ..Default::default()
-        };
-        let conn = AcpServerConnection::new(config, openai).await;
-
-        send_custom(
-            conn.cx(),
-            "_goose/unstable/dictation/secret/save",
-            serde_json::json!({
-                "provider": "groq",
-                "value": "groq-key",
-            }),
-        )
-        .await
-        .expect("dictation secret save should succeed");
-
-        let config = send_custom(
-            conn.cx(),
-            "_goose/unstable/dictation/config",
-            serde_json::json!({}),
-        )
-        .await
-        .expect("dictation config should succeed");
-        assert_eq!(
-            config
-                .pointer("/providers/groq/configured")
-                .and_then(|value| value.as_bool()),
-            Some(true)
-        );
-
-        let provider_config_result = send_custom(
-            conn.cx(),
-            "_goose/unstable/dictation/secret/save",
-            serde_json::json!({
-                "provider": "openai",
-                "value": "openai-key",
-            }),
-        )
-        .await;
-        assert!(
-            provider_config_result.is_err(),
-            "provider-config dictation providers should be rejected"
-        );
-
-        let unknown_result = send_custom(
-            conn.cx(),
-            "_goose/unstable/dictation/secret/save",
-            serde_json::json!({
-                "provider": "unknown",
-                "value": "key",
-            }),
-        )
-        .await;
-        assert!(
-            unknown_result.is_err(),
-            "unknown provider should be rejected"
-        );
-
-        send_custom(
-            conn.cx(),
-            "_goose/unstable/dictation/secret/delete",
-            serde_json::json!({
-                "provider": "groq",
-            }),
-        )
-        .await
-        .expect("dictation secret delete should succeed");
-
-        let config = send_custom(
-            conn.cx(),
-            "_goose/unstable/dictation/config",
-            serde_json::json!({}),
-        )
-        .await
-        .expect("dictation config should succeed");
-        assert_eq!(
-            config
-                .pointer("/providers/groq/configured")
-                .and_then(|value| value.as_bool()),
-            Some(false)
-        );
-    });
-}
-
-#[test]
-#[serial]
 fn test_raw_config_and_secret_methods_are_removed() {
     write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
     run_test(async {
@@ -1107,85 +1051,22 @@ fn test_custom_unknown_method() {
 
 #[test]
 #[serial]
-fn test_developer_fs_requests_use_acp_session_id() {
-    run_test(async {
-        let seen_session_id = Arc::new(Mutex::new(None::<String>));
-        let seen_session_id_clone = Arc::clone(&seen_session_id);
-        let openai = OpenAiFixture::new(
-            vec![
-                (
-                    "Use the read tool to read /tmp/test_acp_read.txt and output only its contents."
-                        .to_string(),
-                    include_str!("acp_test_data/openai_fs_read_tool_call.txt"),
-                ),
-                (
-                    r#""content":"test-read-content-12345""#.into(),
-                    include_str!("acp_test_data/openai_fs_read_tool_result.txt"),
-                ),
-            ],
-            Arc::new(IgnoreSessionId),
-        )
-        .await;
-        let config_dir = write_acp_global_config(&format!(
-            "GOOSE_MODEL: gpt-4.1\nGOOSE_PROVIDER: openai\nOPENAI_HOST: {}\n",
-            openai.uri()
-        ));
-        let config = TestConnectionConfig {
-            // gpt-5-nano routes to the Responses API; use a Chat Completions
-            // model so the canned SSE fixtures are parsed correctly.
-            data_root: config_dir,
-            current_model: "gpt-4.1".to_string(),
-            read_text_file: Some(Arc::new(move |req| {
-                *seen_session_id_clone.lock().unwrap() = Some(req.session_id.0.to_string());
-                Ok(
-                    agent_client_protocol::schema::v1::ReadTextFileResponse::new(
-                        "test-read-content-12345",
-                    ),
-                )
-            })),
-            ..Default::default()
-        };
-        let mut conn = AcpServerConnection::new(config, openai).await;
-
-        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
-        let acp_session_id = session.session_id().0.to_string();
-
-        let output = session
-            .prompt(
-                "Use the read tool to read /tmp/test_acp_read.txt and output only its contents.",
-                PermissionDecision::Cancel,
-            )
-            .await
-            .expect("prompt should succeed");
-
-        assert_eq!(output.text, "test-read-content-12345");
-        assert_eq!(
-            seen_session_id.lock().unwrap().as_deref(),
-            Some(acp_session_id.as_str()),
-            "ACP read request should use the ACP session/thread ID",
-        );
-    });
-}
-
-#[test]
-#[serial]
 fn test_custom_provider_supported_models_lists_raw_provider_models() {
     write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
     run_test(async move {
         let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
-        let provider_factory: AcpProviderFactory =
-            Arc::new(|provider_name, _extensions, _working_dir| {
-                Box::pin(async move {
-                    Ok(Arc::new(MockProvider {
-                        name: provider_name,
-                        recommended_models: vec!["canonical-filtered-model".to_string()],
-                        supported_models: vec![
-                            "goose-claude-opus-4-8".to_string(),
-                            "raw-databricks-endpoint".to_string(),
-                        ],
-                    }) as Arc<dyn Provider>)
-                })
-            });
+        let provider_factory: AcpProviderFactory = Arc::new(|provider_name| {
+            Box::pin(async move {
+                Ok(Arc::new(MockProvider {
+                    name: provider_name,
+                    recommended_models: vec!["canonical-filtered-model".to_string()],
+                    supported_models: Ok(vec![
+                        "goose-claude-opus-4-8".to_string(),
+                        "raw-databricks-endpoint".to_string(),
+                    ]),
+                }) as Arc<dyn Provider>)
+            })
+        });
         let conn = AcpServerConnection::new(
             TestConnectionConfig {
                 provider_factory: Some(provider_factory),
@@ -1214,5 +1095,283 @@ fn test_custom_provider_supported_models_lists_raw_provider_models() {
                 "raw-databricks-endpoint"
             ]))
         );
+    });
+}
+
+#[test]
+#[serial]
+fn test_custom_provider_supported_models_maps_not_configured_error() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let provider_factory: AcpProviderFactory = Arc::new(|provider_name| {
+            Box::pin(async move {
+                Ok(Arc::new(MockProvider {
+                    name: provider_name,
+                    recommended_models: Vec::new(),
+                    supported_models: Err(ProviderError::NotConfigured),
+                }) as Arc<dyn Provider>)
+            })
+        });
+        let conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let error = send_custom(
+            conn.cx(),
+            "_goose/unstable/providers/supported-models/list",
+            serde_json::json!({ "providerId": "openai" }),
+        )
+        .await
+        .expect_err("not configured should be returned to the client");
+
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert!(error.to_string().contains("Provider is not configured"));
+    });
+}
+
+#[test]
+#[serial]
+fn test_custom_provider_supported_models_maps_authentication_error() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let provider_factory: AcpProviderFactory = Arc::new(|provider_name| {
+            Box::pin(async move {
+                Ok(Arc::new(MockProvider {
+                    name: provider_name,
+                    recommended_models: Vec::new(),
+                    supported_models: Err(ProviderError::Authentication(
+                        "credentials rejected".to_string(),
+                    )),
+                }) as Arc<dyn Provider>)
+            })
+        });
+        let conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let error = send_custom(
+            conn.cx(),
+            "_goose/unstable/providers/supported-models/list",
+            serde_json::json!({ "providerId": "openai" }),
+        )
+        .await
+        .expect_err("authentication failure should be returned to the client");
+
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::AuthRequired);
+        assert!(error.to_string().contains("credentials rejected"));
+    });
+}
+
+const APP_TOOL: &str = "mcp-fixture__get_code";
+
+async fn connect_with_mcp_fixture(mcp_url: &str, mode: &str) -> (AcpServerConnection, String) {
+    let openai = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;
+    let mcp_servers = vec![McpServer::Http(McpServerHttp::new("mcp-fixture", mcp_url))];
+    let config = TestConnectionConfig {
+        mcp_servers,
+        ..Default::default()
+    };
+    let mut conn = AcpServerConnection::new(config, openai).await;
+    let SessionData { session, .. } = conn.new_session().await.unwrap();
+    let session_id = session.session_id().0.to_string();
+    conn.set_mode(&session_id, mode).await.unwrap();
+    (conn, session_id)
+}
+
+async fn call_app_tool(
+    conn: &AcpServerConnection,
+    session_id: &str,
+) -> Result<serde_json::Value, agent_client_protocol::Error> {
+    send_custom(
+        conn.cx(),
+        "_goose/unstable/tools/call",
+        serde_json::json!({
+            "sessionId": session_id,
+            "extensionName": "mcp-fixture",
+            "name": APP_TOOL
+        }),
+    )
+    .await
+}
+
+#[test]
+#[serial]
+fn test_app_tool_call_requires_auto_mode() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let mcp = McpFixture::new().await;
+
+        for mode in ["approve", "smart_approve"] {
+            let (conn, session_id) = connect_with_mcp_fixture(&mcp.url, mode).await;
+            let error = call_app_tool(&conn, &session_id)
+                .await
+                .expect_err("app tool call should be rejected outside auto mode");
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+            assert!(error
+                .to_string()
+                .contains("app tool calls require auto mode"));
+        }
+    });
+}
+
+#[test]
+#[serial]
+fn test_app_tool_call_dispatched_in_auto_mode() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let mcp = McpFixture::new().await;
+        let (conn, session_id) = connect_with_mcp_fixture(&mcp.url, "auto").await;
+
+        let response = call_app_tool(&conn, &session_id)
+            .await
+            .expect("app tool call should dispatch in auto mode");
+        let text = response["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
+            .collect::<String>();
+        assert!(text.contains(FAKE_CODE));
+    });
+}
+
+#[test]
+#[serial]
+fn test_custom_context_report() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let openai = OpenAiFixture::new(
+            vec![(
+                "start work".to_string(),
+                include_str!("acp_test_data/openai_steer_first.txt"),
+            )],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.to_string();
+
+        let empty = send_custom(
+            conn.cx(),
+            "_goose/unstable/context/report",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .expect("context report on an empty session should succeed");
+        assert!(empty["totalTokens"].as_u64().unwrap() > 0);
+        let turn_context = empty["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|segment| segment["category"] == "turn_context")
+            .expect("report should include turn context");
+        assert!(turn_context["tokenCount"].as_u64().unwrap() > 0);
+
+        session
+            .prompt("start work", PermissionDecision::Cancel)
+            .await
+            .expect("prompt should succeed");
+
+        let report = send_custom(
+            conn.cx(),
+            "_goose/unstable/context/report",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .expect("context report should succeed");
+
+        let segments = report["segments"].as_array().expect("segments array");
+        let categories: Vec<&str> = segments
+            .iter()
+            .map(|segment| segment["category"].as_str().unwrap())
+            .collect();
+        for expected in ["system_prompt", "tool_definitions", "messages"] {
+            assert!(
+                categories.contains(&expected),
+                "missing {expected} in {categories:?}"
+            );
+        }
+
+        let assistant = segments
+            .iter()
+            .find(|segment| segment["label"] == "Assistant messages")
+            .expect("assistant segment");
+        let preview = assistant["parts"][0]["contentPreview"].as_str().unwrap();
+        assert!(preview.contains("first response"), "preview: {preview}");
+
+        let attributed: u64 = segments
+            .iter()
+            .map(|segment| segment["tokenCount"].as_u64().unwrap())
+            .sum();
+        assert_eq!(report["totalTokens"].as_u64().unwrap(), attributed);
+        assert!(report["model"]["contextLimit"].as_u64().unwrap() > 0);
+    });
+}
+
+#[test]
+#[serial]
+fn test_app_tool_call_applies_extension_mutation() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;
+        let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.to_string();
+        conn.set_mode(&session_id, "auto").await.unwrap();
+
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({
+                "sessionId": session_id,
+                "extensionName": "analyze"
+            }),
+        )
+        .await
+        .expect("tools should be listed");
+        assert!(!response["tools"].as_array().unwrap().is_empty());
+
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/tools/call",
+            serde_json::json!({
+                "sessionId": session_id,
+                "extensionName": "Extension Manager",
+                "name": "extensionmanager__manage_extensions",
+                "arguments": {
+                    "action": "disable",
+                    "extension_name": "analyze"
+                }
+            }),
+        )
+        .await
+        .expect("extension mutation should succeed");
+        assert_eq!(response["isError"], false);
+
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({
+                "sessionId": session_id,
+                "extensionName": "analyze"
+            }),
+        )
+        .await
+        .expect("tools should be listed");
+        assert_eq!(response["tools"], serde_json::json!([]));
     });
 }

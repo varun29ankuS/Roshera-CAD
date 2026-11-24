@@ -10,7 +10,7 @@ use crate::base::{ConfigKey, MessageStream, Provider, ProviderMetadata};
 use crate::conversation::message::Message;
 use crate::errors::ProviderError;
 use crate::formats::snowflake::{create_request, get_usage, response_to_message};
-use crate::openai_compatible::{map_http_error_to_provider_error, sanitize_url};
+use crate::openai_compatible::handle_status;
 use crate::retry::ProviderRetry;
 use crate::utils::get_model;
 
@@ -77,8 +77,14 @@ impl SnowflakeProvider {
             host
         };
 
+        let parsed_url = url::Url::parse(&base_url)?;
+        if parsed_url.scheme() != "https" {
+            anyhow::bail!("Snowflake host must use HTTPS");
+        }
+
         let auth = AuthMethod::BearerToken(token);
-        let mut api_client = ApiClient::new_with_tls(base_url, auth, tls_config)?;
+        let mut api_client =
+            ApiClient::new_with_tls(base_url, auth, tls_config)?.with_https_only()?;
         if let Some(request_builder) = request_builder {
             api_client = api_client.with_request_builder(request_builder);
         }
@@ -100,29 +106,39 @@ impl SnowflakeProvider {
             .api_client
             .request("api/v2/cortex/inference:complete")
             .model_headers(model_config)?
+            .streaming(true)
             .response_post(payload)
             .await?;
 
-        let status = response.status();
-        let url = sanitize_url(response.url().as_str());
-        let payload_text: String = response.text().await.ok().unwrap_or_default();
+        let response = handle_status(response).await?;
+        let headers = response.headers().clone();
+        let is_json = headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_ascii_lowercase())
+            .is_some_and(|v| v.contains("json"));
+        let payload_text: String = if !is_json {
+            response.text().await.ok().unwrap_or_default()
+        } else {
+            crate::http_status::read_error_body(response)
+                .await
+                .unwrap_or_default()
+        };
 
-        if status.is_success() {
-            if let Ok(payload) = serde_json::from_str::<Value>(&payload_text) {
-                if payload.get("code").is_some() {
-                    let code = payload
-                        .get("code")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("Unknown code");
-                    let message = payload
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown message");
-                    return Err(ProviderError::RequestFailed(format!(
-                        "{} - {}",
-                        code, message
-                    )));
-                }
+        if let Ok(payload) = serde_json::from_str::<Value>(&payload_text) {
+            if payload.get("code").is_some() {
+                let code = payload
+                    .get("code")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("Unknown code");
+                let message = payload
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown message");
+                return Err(ProviderError::RequestFailed(format!(
+                    "{} - {}",
+                    code, message
+                )));
             }
         }
 
@@ -270,12 +286,7 @@ impl SnowflakeProvider {
             "content_list": content_list
         });
 
-        if status.is_success() {
-            Ok(answer_payload)
-        } else {
-            let error_json = serde_json::from_str::<Value>(&payload_text).ok();
-            Err(map_http_error_to_provider_error(status, error_json, &url))
-        }
+        Ok(answer_payload)
     }
 }
 
@@ -338,5 +349,41 @@ impl Provider for SnowflakeProvider {
             message,
             provider_usage,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_provider(host: &str) -> Result<SnowflakeProvider> {
+        SnowflakeProvider::new(host.to_string(), "token".to_string(), None, None)
+    }
+
+    #[test]
+    fn rejects_http_host() {
+        let error = create_provider("http://account.snowflakecomputing.com").unwrap_err();
+
+        assert!(error.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn accepts_https_host() {
+        let provider = create_provider("https://account.snowflakecomputing.com").unwrap();
+
+        assert_eq!(
+            provider.api_client.host(),
+            "https://account.snowflakecomputing.com"
+        );
+    }
+
+    #[test]
+    fn normalizes_schemeless_host_to_https() {
+        let provider = create_provider("account").unwrap();
+
+        assert_eq!(
+            provider.api_client.host(),
+            "https://account.snowflakecomputing.com"
+        );
     }
 }

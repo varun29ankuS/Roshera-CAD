@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use rmcp::model::Tool;
 
 use crate::anthropic::{AnthropicProvider, AnthropicProviderBuilder, ANTHROPIC_API_VERSION};
@@ -12,7 +14,7 @@ use crate::base::{
 };
 use crate::conversation::message::Message;
 use crate::errors::ProviderError;
-use crate::formats::openai::is_openai_responses_model;
+use crate::formats::openai::{extract_reasoning_effort, is_openai_responses_model};
 use crate::model::ModelConfig;
 use crate::openai::{OpenAiProvider, OpenAiProviderBuilder};
 use crate::openai_compatible::{handle_response_openai_compat, OpenAiCompatibleProvider};
@@ -22,6 +24,9 @@ pub const AZURE_FOUNDRY_DEFAULT_MODEL: &str = "Phi-4";
 pub const AZURE_FOUNDRY_DOC_URL: &str =
     "https://learn.microsoft.com/azure/ai-foundry/foundry-models/how-to/inference";
 
+const DEPLOYMENT_METADATA_TIMEOUT_SECS: u64 = 5;
+const DEPLOYMENT_METADATA_TTL_SECS: u64 = 60;
+
 pub const AZURE_FOUNDRY_KNOWN_MODELS: &[&str] = &[
     "Phi-4",
     "Phi-4-mini",
@@ -29,7 +34,6 @@ pub const AZURE_FOUNDRY_KNOWN_MODELS: &[&str] = &[
     "Mistral-large-2411",
     "Cohere-command-r-plus-08-2024",
     "AI21-Jamba-1.5-Large",
-    "DeepSeek-R1",
     "DeepSeek-V3",
     "glm-4.7",
     "Kimi-K2-Instruct",
@@ -78,6 +82,27 @@ pub enum ModelPublisher {
 struct DeploymentMetadata {
     publisher: ModelPublisher,
     model_name: String,
+}
+
+#[derive(Default)]
+struct DeploymentCache {
+    deployments: HashMap<String, DeploymentMetadata>,
+    fetched_at: Option<Instant>,
+    fetch_failed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeploymentMetadataLookup {
+    ContextDiscovery,
+    InferenceRouting,
+}
+
+impl DeploymentCache {
+    fn applies_to(&self, lookup: DeploymentMetadataLookup) -> bool {
+        self.fetched_at.is_some_and(|fetched_at| {
+            fetched_at.elapsed() < Duration::from_secs(DEPLOYMENT_METADATA_TTL_SECS)
+        }) && (lookup == DeploymentMetadataLookup::ContextDiscovery || !self.fetch_failed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +159,7 @@ pub struct AzureFoundryProvider {
     endpoint: String,
     api_version: Option<String>,
     maas_model: Option<String>,
-    deployments: Mutex<HashMap<String, DeploymentMetadata>>,
+    deployments: Mutex<DeploymentCache>,
 }
 
 impl ProviderDescriptor for AzureFoundryProvider {
@@ -249,7 +274,7 @@ impl AzureFoundryProvider {
             endpoint,
             api_version,
             maas_model,
-            deployments: Mutex::new(HashMap::new()),
+            deployments: Mutex::new(DeploymentCache::default()),
         })
     }
 
@@ -309,23 +334,41 @@ impl AzureFoundryProvider {
         Ok((models, deployments))
     }
 
-    async fn deployment_for(&self, deployment_name: &str) -> Option<DeploymentMetadata> {
-        if let Some(deployment) = self
-            .deployments
-            .lock()
-            .expect("Azure Foundry deployment cache poisoned")
-            .get(deployment_name)
-            .cloned()
+    async fn deployment_for(
+        &self,
+        deployment_name: &str,
+        lookup: DeploymentMetadataLookup,
+    ) -> Option<DeploymentMetadata> {
         {
-            return Some(deployment);
+            let cache = self
+                .deployments
+                .lock()
+                .expect("Azure Foundry deployment cache poisoned");
+            if cache.applies_to(lookup) {
+                return cache.deployments.get(deployment_name).cloned();
+            }
         }
 
-        let (_, deployments) = self.fetch_deployments().await.ok()?;
+        let fetch_result = tokio::time::timeout(
+            Duration::from_secs(DEPLOYMENT_METADATA_TIMEOUT_SECS),
+            self.fetch_deployments(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        let fetch_failed = fetch_result.is_none();
+        let deployments = fetch_result
+            .map(|(_, deployments)| deployments)
+            .unwrap_or_default();
         let deployment = deployments.get(deployment_name).cloned();
         *self
             .deployments
             .lock()
-            .expect("Azure Foundry deployment cache poisoned") = deployments;
+            .expect("Azure Foundry deployment cache poisoned") = DeploymentCache {
+            deployments,
+            fetched_at: Some(Instant::now()),
+            fetch_failed,
+        };
         deployment
     }
 }
@@ -348,21 +391,36 @@ fn model_info_for_deployment(deployment_name: &str, model_name: &str) -> ModelIn
                 "azure_foundry",
                 &model_name.to_ascii_lowercase(),
             )
+        })
+        .or_else(|| {
+            let (base_model, effort) = extract_reasoning_effort(model_name);
+            effort.and_then(|_| {
+                crate::canonical::maybe_get_canonical_model("azure_foundry", &base_model).or_else(
+                    || {
+                        crate::canonical::maybe_get_canonical_model(
+                            "azure_foundry",
+                            &base_model.to_ascii_lowercase(),
+                        )
+                    },
+                )
+            })
         });
     ModelInfo {
         name: deployment_name.to_string(),
         resolved_model: Some(model_name.to_string()),
-        context_limit: canonical
-            .as_ref()
-            .map(|model| model.limit.context)
-            .unwrap_or_else(|| ModelConfig::new(model_name).context_limit()),
+        context_limit: canonical.as_ref().map(|model| model.limit.context),
         input_token_cost: None,
         output_token_cost: None,
+        cache_read_token_cost: None,
+        cache_write_token_cost: None,
         currency: None,
         supports_cache_control: None,
         reasoning: canonical
             .and_then(|model| model.reasoning)
             .unwrap_or_else(|| ModelConfig::new(model_name).is_reasoning_model()),
+        supports_vision: None,
+        thinking_preservation_format: None,
+        request_params: None,
     }
 }
 
@@ -372,11 +430,31 @@ fn configured_client(
     tls_config: Option<TlsConfig>,
     request_builder: Option<RequestBuilderDecorator>,
 ) -> Result<ApiClient> {
+    let restrict_redirects = matches!(&auth, AuthMethod::ApiKey { .. });
     let mut client = ApiClient::new_with_tls(host, auth, tls_config)?;
+    if restrict_redirects {
+        client = client.with_same_origin_redirects()?;
+    }
     if let Some(request_builder) = request_builder {
         client = client.with_request_builder(request_builder);
     }
     Ok(client)
+}
+
+/// Usage chunks carry the model name the inference surface echoes back — the
+/// deployment alias, or a value the endpoint invented — but cost estimation
+/// needs the underlying model the alias resolves to, so re-tag each chunk.
+fn retag_usage_model(stream: MessageStream, model: &str) -> MessageStream {
+    let model = model.to_string();
+    Box::pin(stream.map(move |item| {
+        item.map(|(message, usage)| {
+            let usage = usage.map(|mut usage| {
+                usage.model.clone_from(&model);
+                usage
+            });
+            (message, usage)
+        })
+    }))
 }
 
 #[async_trait]
@@ -410,7 +488,11 @@ impl Provider for AzureFoundryProvider {
         *self
             .deployments
             .lock()
-            .expect("Azure Foundry deployment cache poisoned") = deployments;
+            .expect("Azure Foundry deployment cache poisoned") = DeploymentCache {
+            deployments,
+            fetched_at: Some(Instant::now()),
+            fetch_failed: false,
+        };
         Ok(models)
     }
 
@@ -436,7 +518,11 @@ impl Provider for AzureFoundryProvider {
         *self
             .deployments
             .lock()
-            .expect("Azure Foundry deployment cache poisoned") = deployments;
+            .expect("Azure Foundry deployment cache poisoned") = DeploymentCache {
+            deployments,
+            fetched_at: Some(Instant::now()),
+            fetch_failed: false,
+        };
         Ok(model_info)
     }
 
@@ -444,7 +530,7 @@ impl Provider for AzureFoundryProvider {
         let resolved_model = if let Some(model) = &self.maas_model {
             model.clone()
         } else if is_project_endpoint(&self.endpoint) {
-            self.deployment_for(model_name)
+            self.deployment_for(model_name, DeploymentMetadataLookup::ContextDiscovery)
                 .await
                 .map(|deployment| deployment.model_name)
                 .unwrap_or_else(|| model_name.to_string())
@@ -454,14 +540,14 @@ impl Provider for AzureFoundryProvider {
         Ok(model_info_for_deployment(model_name, &resolved_model))
     }
 
-    async fn get_context_limit(&self, model_config: &ModelConfig) -> Result<usize, ProviderError> {
-        if let Some(context_limit) = model_config.context_limit {
-            return Ok(context_limit);
-        }
-        Ok(self
-            .fetch_model_info(&model_config.model_name)
-            .await?
-            .context_limit)
+    async fn get_context_limit(&self, model: &str, override_limit: Option<usize>) -> usize {
+        goose_provider_types::context_limit::ContextLimitResolver::new(self.get_name())
+            .resolve(model, override_limit, || async {
+                self.fetch_model_info(model)
+                    .await
+                    .map(|info| info.context_limit)
+            })
+            .await
     }
 
     async fn stream(
@@ -482,7 +568,8 @@ impl Provider for AzureFoundryProvider {
             .clone()
             .unwrap_or_else(|| model_config.model_name.clone());
         let deployment = if is_project_endpoint(&self.endpoint) {
-            self.deployment_for(&wire_model).await
+            self.deployment_for(&wire_model, DeploymentMetadataLookup::InferenceRouting)
+                .await
         } else {
             None
         };
@@ -503,7 +590,7 @@ impl Provider for AzureFoundryProvider {
         capability_config.model_name = capability_model.to_string();
         let capability_config =
             capability_config.with_canonical_limits(AZURE_FOUNDRY_PROVIDER_NAME);
-        match route {
+        let stream = match route {
             InferenceRoute::ProjectResponses => {
                 self.responses
                     .as_ref()
@@ -537,7 +624,8 @@ impl Provider for AzureFoundryProvider {
                     )
                     .await
             }
-        }
+        }?;
+        Ok(retag_usage_model(stream, underlying_model))
     }
 }
 
@@ -545,7 +633,7 @@ impl Provider for AzureFoundryProvider {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{body_partial_json, method, path, query_param};
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn project_endpoint(server: &MockServer) -> String {
@@ -602,6 +690,30 @@ mod tests {
         format!(
             "{start}\n\n{block_start}\n\n{delta}\n\n{block_stop}\n\n{message_delta}\n\n{stop}\n\n"
         )
+    }
+
+    #[test]
+    fn routing_retries_cached_deployment_failures() {
+        let cache = DeploymentCache {
+            fetched_at: Some(Instant::now()),
+            fetch_failed: true,
+            ..Default::default()
+        };
+
+        assert!(cache.applies_to(DeploymentMetadataLookup::ContextDiscovery));
+        assert!(!cache.applies_to(DeploymentMetadataLookup::InferenceRouting));
+    }
+
+    #[test]
+    fn routing_reuses_successful_empty_deployment_inventory() {
+        let cache = DeploymentCache {
+            fetched_at: Some(Instant::now()),
+            fetch_failed: false,
+            ..Default::default()
+        };
+
+        assert!(cache.applies_to(DeploymentMetadataLookup::ContextDiscovery));
+        assert!(cache.applies_to(DeploymentMetadataLookup::InferenceRouting));
     }
 
     #[test]
@@ -731,12 +843,129 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn foundry_api_keys_do_not_follow_cross_origin_redirects() {
+        for header_name in ["api-key", "x-api-key"] {
+            let destination = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/capture"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&destination)
+                .await;
+
+            let source = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/redirect"))
+                .and(header(header_name, "foundry-secret"))
+                .respond_with(
+                    ResponseTemplate::new(307)
+                        .append_header("location", format!("{}/capture", destination.uri())),
+                )
+                .expect(1)
+                .mount(&source)
+                .await;
+
+            let client = configured_client(
+                source.uri(),
+                AuthMethod::ApiKey {
+                    header_name: header_name.to_string(),
+                    key: "foundry-secret".to_string(),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert!(client.response_get("redirect").await.is_err());
+            assert!(destination.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn foundry_api_keys_follow_same_origin_redirects() {
+        for header_name in ["api-key", "x-api-key"] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/redirect"))
+                .respond_with(ResponseTemplate::new(307).append_header("location", "/final"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/final"))
+                .and(header(header_name, "foundry-secret"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = configured_client(
+                server.uri(),
+                AuthMethod::ApiKey {
+                    header_name: header_name.to_string(),
+                    key: "foundry-secret".to_string(),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert!(client
+                .response_get("redirect")
+                .await
+                .unwrap()
+                .status()
+                .is_success());
+        }
+    }
+
+    #[tokio::test]
+    async fn foundry_bearer_redirects_keep_reqwest_authorization_behavior() {
+        let destination = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/capture"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&destination)
+            .await;
+
+        let source = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .and(header("authorization", "Bearer foundry-token"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .append_header("location", format!("{}/capture", destination.uri())),
+            )
+            .expect(1)
+            .mount(&source)
+            .await;
+
+        let client = configured_client(
+            source.uri(),
+            AuthMethod::BearerToken("foundry-token".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(client
+            .response_get("redirect")
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        let requests = destination.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.get("authorization").is_none());
+    }
+
     #[test]
     fn deployment_metadata_enriches_context_without_pricing() {
         let info = model_info_for_deployment("production-chat", "gpt-5");
         assert_eq!(info.name, "production-chat");
         assert_eq!(info.resolved_model.as_deref(), Some("gpt-5"));
-        assert_eq!(info.context_limit, 400_000);
+        assert_eq!(info.context_limit, Some(400_000));
         assert_eq!(info.input_token_cost, None);
         assert_eq!(info.output_token_cost, None);
     }
@@ -745,7 +974,7 @@ mod tests {
     fn gpt_5_6_sol_uses_its_full_context_window() {
         let info = model_info_for_deployment("gpt-5.6-sol", "gpt-5.6-sol");
 
-        assert_eq!(info.context_limit, 1_050_000);
+        assert_eq!(info.context_limit, Some(1_050_000));
         assert!(info.reasoning);
     }
 
@@ -813,10 +1042,7 @@ mod tests {
 
         let provider = project_provider(&server);
         assert_eq!(
-            provider
-                .get_context_limit(&ModelConfig::new("production-chat"))
-                .await
-                .unwrap(),
+            provider.get_context_limit("production-chat", None).await,
             400_000
         );
     }
@@ -840,16 +1066,24 @@ mod tests {
 
         let provider = project_provider(&server);
         let config = raw_model_config("gpt-5-high");
-        assert_eq!(provider.get_context_limit(&config).await.unwrap(), 128_000);
+        assert_eq!(
+            provider.get_context_limit(&config.model_name, None).await,
+            128_000
+        );
     }
 
     #[tokio::test]
-    async fn explicit_context_limit_overrides_deployment_metadata() {
+    async fn caller_override_precedes_deployment_metadata() {
         let server = MockServer::start().await;
         let provider = project_provider(&server);
-        let config = raw_model_config("gpt-5-high").with_context_limit(Some(64_000));
+        let config = raw_model_config("gpt-5-high");
 
-        assert_eq!(provider.get_context_limit(&config).await.unwrap(), 64_000);
+        assert_eq!(
+            provider
+                .get_context_limit(&config.model_name, Some(64_000))
+                .await,
+            64_000
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
@@ -898,10 +1132,11 @@ mod tests {
 
         let provider = project_provider(&server);
         let config = ModelConfig::new("production-chat").with_temperature(Some(0.7));
-        provider
+        let (_, usage) = provider
             .complete(&config, "system", &[], &[])
             .await
             .unwrap();
+        assert_eq!(usage.model, "gpt-5");
         let requests = server.received_requests().await.unwrap();
         let payload: serde_json::Value = requests
             .iter()
@@ -925,6 +1160,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/projects/test/deployments"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"value": []})))
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -939,7 +1175,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        project_provider(&server)
+        let provider = project_provider(&server);
+        assert_eq!(
+            provider.get_context_limit("gpt-5-high", None).await,
+            400_000
+        );
+        provider
             .complete(&raw_model_config("gpt-5-high"), "system", &[], &[])
             .await
             .unwrap();
@@ -1165,11 +1406,16 @@ mod tests {
             .await;
 
         let provider = project_provider(&server);
-        for deployment in ["openai-prod", "claude-prod", "partner-prod"] {
-            provider
+        for (deployment, underlying_model) in [
+            ("openai-prod", "gpt-5"),
+            ("claude-prod", "claude-sonnet-4-6"),
+            ("partner-prod", "Mistral-large"),
+        ] {
+            let (_, usage) = provider
                 .complete(&ModelConfig::new(deployment), "system", &[], &[])
                 .await
                 .unwrap();
+            assert_eq!(usage.model, underlying_model);
         }
     }
 }

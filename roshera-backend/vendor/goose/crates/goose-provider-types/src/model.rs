@@ -23,9 +23,24 @@ const INHERITED_SESSION_PARAM_KEYS: &[&str] = &[
     "preserve_unsigned_thinking",
 ];
 
+/// Request params goose consumes itself: formats that forward unknown params into
+/// the payload must skip these, or the provider gets an unrecognized wire parameter.
+pub fn is_goose_internal_request_param(key: &str) -> bool {
+    matches!(
+        key,
+        "thinking_effort"
+            | "disable_prompt_cache"
+            | "cache_ttl"
+            | "emit_clear_thinking"
+            | "preserve_thinking_context"
+            | "preserve_unsigned_thinking"
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelConfig {
     pub model_name: String,
+    #[serde(skip)]
     pub context_limit: Option<usize>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<i32>,
@@ -36,6 +51,8 @@ pub struct ModelConfig {
     pub request_params: Option<HashMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
     /// Per-request HTTP headers attached to outgoing provider calls.
     /// Never serialized into request bodies.
     #[serde(skip)]
@@ -50,7 +67,8 @@ impl<'de> Deserialize<'de> for ModelConfig {
         #[derive(Deserialize)]
         struct RawModelConfig {
             model_name: String,
-            context_limit: Option<usize>,
+            #[serde(rename = "context_limit")]
+            _context_limit: Option<usize>,
             temperature: Option<f32>,
             max_tokens: Option<i32>,
             toolshim: bool,
@@ -59,18 +77,21 @@ impl<'de> Deserialize<'de> for ModelConfig {
             request_params: Option<HashMap<String, Value>>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             reasoning: Option<bool>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            supports_vision: Option<bool>,
         }
 
         let raw = RawModelConfig::deserialize(deserializer)?;
         let mut config = Self {
             model_name: raw.model_name,
-            context_limit: raw.context_limit,
+            context_limit: None,
             temperature: raw.temperature,
             max_tokens: raw.max_tokens,
             toolshim: raw.toolshim,
             toolshim_model: raw.toolshim_model,
             request_params: raw.request_params,
             reasoning: raw.reasoning,
+            supports_vision: raw.supports_vision,
             request_headers: None,
         };
         config.normalize_effort_suffix();
@@ -89,32 +110,45 @@ impl ModelConfig {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
         config.normalize_effort_suffix();
         config
     }
 
-    pub fn with_canonical_limits(mut self, provider_name: &str) -> Self {
+    fn canonical_model(&self, provider_name: &str) -> Option<crate::canonical::CanonicalModel> {
         // Try canonical lookup with the full model name first, then fall back
         // to the name with reasoning-effort suffixes stripped (e.g.
         // "databricks-gpt-5.4-high" → "databricks-gpt-5.4").
-        let canonical =
-            crate::canonical::maybe_get_canonical_model(provider_name, &self.model_name).or_else(
-                || {
-                    let (base, _effort) = extract_reasoning_effort(&self.model_name);
-                    if base != self.model_name {
-                        crate::canonical::maybe_get_canonical_model(provider_name, &base)
-                    } else {
-                        None
-                    }
-                },
-            );
+        crate::canonical::maybe_get_canonical_model(provider_name, &self.model_name).or_else(|| {
+            let (base, _effort) = extract_reasoning_effort(&self.model_name);
+            if base != self.model_name {
+                crate::canonical::maybe_get_canonical_model(provider_name, &base)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn with_canonical_vision_support(mut self, provider_name: &str) -> Self {
+        if self.supports_vision.is_none() {
+            if let Some(canonical) = self.canonical_model(provider_name) {
+                self.supports_vision = Some(
+                    canonical
+                        .modalities
+                        .input
+                        .contains(&crate::canonical::Modality::Image),
+                );
+            }
+        }
+        self
+    }
+
+    pub fn with_canonical_limits(mut self, provider_name: &str) -> Self {
+        let canonical = self.canonical_model(provider_name);
 
         if let Some(canonical) = canonical {
-            if self.context_limit.is_none() {
-                self.context_limit = Some(canonical.limit.context);
-            }
             if self.max_tokens.is_none() {
                 self.max_tokens = canonical
                     .limit
@@ -124,6 +158,14 @@ impl ModelConfig {
             }
             if self.reasoning.is_none() {
                 self.reasoning = canonical.reasoning;
+            }
+            if self.supports_vision.is_none() {
+                self.supports_vision = Some(
+                    canonical
+                        .modalities
+                        .input
+                        .contains(&crate::canonical::Modality::Image),
+                )
             }
         }
 
@@ -200,11 +242,19 @@ impl ModelConfig {
     }
 
     pub fn with_default_thinking_effort(mut self, effort: Option<ThinkingEffort>) -> Self {
-        if self.thinking_effort().is_none() {
+        // Guard on raw-param presence rather than parseability: a persisted
+        // harness value like "default" doesn't parse into ThinkingEffort but
+        // is still an explicit user pick that must not be overwritten.
+        if self.request_param::<String>("thinking_effort").is_none() {
             if let Some(effort) = effort {
                 self = self.with_thinking_effort(effort);
             }
         }
+        self
+    }
+
+    pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = Some(supports_vision);
         self
     }
 
@@ -236,7 +286,20 @@ impl ModelConfig {
     }
 
     pub fn is_openai_reasoning_model(&self) -> bool {
-        is_openai_responses_model(&self.model_name)
+        self.openai_reasoning_for_model(&self.model_name)
+    }
+
+    pub fn openai_reasoning_for_model(&self, model_name: &str) -> bool {
+        let canonical = crate::canonical::maybe_get_canonical_model("openai", model_name);
+        if canonical
+            .as_ref()
+            .is_some_and(|model| !model.id.starts_with("openai/"))
+        {
+            return false;
+        }
+        self.reasoning
+            .or_else(|| canonical.and_then(|model| model.reasoning))
+            .unwrap_or_else(|| is_openai_responses_model(model_name))
     }
 
     pub fn is_reasoning_model(&self) -> bool {
@@ -247,7 +310,41 @@ impl ModelConfig {
         self.is_openai_reasoning_model()
             || self.model_name.to_lowercase().contains("claude")
             || Self::is_gemini3_reasoning_model_name(&self.model_name)
+            || self.is_glm_5_3_reasoning_model()
+            || self.is_kimi_k3_reasoning_model()
             || is_xai_reasoning_model(&self.model_name)
+    }
+
+    pub fn is_glm_5_3_reasoning_model(&self) -> bool {
+        let name = self
+            .model_name
+            .splitn(3, '.')
+            .nth(2)
+            .unwrap_or(&self.model_name);
+        let lower = name.to_lowercase();
+        let segments: Vec<_> = lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        segments
+            .windows(3)
+            .any(|segments| segments == ["glm", "5", "3"])
+    }
+
+    pub fn is_kimi_k3_reasoning_model(&self) -> bool {
+        let name = self
+            .model_name
+            .splitn(3, '.')
+            .nth(2)
+            .unwrap_or(&self.model_name);
+        let lower = name.to_lowercase();
+        let segments: Vec<_> = lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        segments
+            .windows(2)
+            .any(|segments| segments == ["kimi", "k3"])
     }
 
     fn is_gemini3_reasoning_model_name(model_name: &str) -> bool {
@@ -264,7 +361,9 @@ impl ModelConfig {
     }
 
     pub fn normalize_effort_suffix(&mut self) {
-        if !self.is_openai_reasoning_model() && !supports_xai_reasoning_effort(&self.model_name) {
+        if !is_openai_responses_model(&self.model_name)
+            && !supports_xai_reasoning_effort(&self.model_name)
+        {
             return;
         }
         let parts: Vec<&str> = self.model_name.split('-').collect();
@@ -300,6 +399,58 @@ impl ModelConfig {
             .and_then(|s| s.parse::<ThinkingEffort>().ok())
     }
 
+    pub fn with_prompt_cache_disabled(self) -> Self {
+        self.with_merged_request_params(HashMap::from([(
+            "disable_prompt_cache".to_string(),
+            Value::Bool(true),
+        )]))
+    }
+
+    pub fn prompt_cache_disabled(&self) -> bool {
+        self.request_param::<bool>("disable_prompt_cache")
+            .unwrap_or(false)
+    }
+
+    /// Set the prompt-cache TTL requested from providers that support one
+    /// (currently the Anthropic message format). Valid values are "5m" and
+    /// "1h"; absent means the provider default (5m).
+    pub fn with_cache_ttl(self, ttl: &str) -> Self {
+        self.with_merged_request_params(HashMap::from([(
+            "cache_ttl".to_string(),
+            Value::String(ttl.to_string()),
+        )]))
+    }
+
+    /// Remove any prompt-cache TTL request parameter. The TTL is
+    /// configuration state, not session state: callers that resume a
+    /// persisted config drop the stored value and re-derive it from the
+    /// current configuration so a clamped run never sticks to the session.
+    pub fn without_cache_ttl(mut self) -> Self {
+        if let Some(params) = self.request_params.as_mut() {
+            params.remove("cache_ttl");
+            if params.is_empty() {
+                self.request_params = None;
+            }
+        }
+        self
+    }
+
+    /// Clamp the prompt-cache TTL back to the provider default (5m).
+    /// Burst-only surfaces (headless runs, subagents, scheduled recipes) call
+    /// this so a user-level 1h opt-in never pays the 2x cache-write premium on
+    /// workloads that finish in one burst and cannot idle.
+    pub fn with_cache_ttl_clamped(self) -> Self {
+        if self.cache_ttl().is_some_and(|ttl| ttl != "5m") {
+            self.with_cache_ttl("5m")
+        } else {
+            self
+        }
+    }
+
+    pub fn cache_ttl(&self) -> Option<String> {
+        self.request_param::<String>("cache_ttl")
+    }
+
     pub fn request_param<T: for<'de> serde::Deserialize<'de>>(
         &self,
         request_key: &str,
@@ -314,6 +465,52 @@ impl ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_ttl_round_trips_through_request_params() {
+        let config = ModelConfig::new("claude-sonnet-4-5").with_cache_ttl("1h");
+        assert_eq!(config.cache_ttl().as_deref(), Some("1h"));
+        assert!(ModelConfig::new("claude-sonnet-4-5").cache_ttl().is_none());
+    }
+
+    #[test]
+    fn cache_ttl_clamp_resets_one_hour_to_default() {
+        let config = ModelConfig::new("claude-sonnet-4-5")
+            .with_cache_ttl("1h")
+            .with_cache_ttl_clamped();
+        assert_eq!(config.cache_ttl().as_deref(), Some("5m"));
+    }
+
+    #[test]
+    fn without_cache_ttl_removes_the_param_and_empty_map() {
+        let config = ModelConfig::new("claude-sonnet-4-5")
+            .with_cache_ttl("1h")
+            .without_cache_ttl();
+        assert!(config.cache_ttl().is_none());
+        assert!(config.request_params.is_none());
+    }
+
+    #[test]
+    fn without_cache_ttl_preserves_other_request_params() {
+        let config = ModelConfig::new("claude-sonnet-4-5")
+            .with_merged_request_params(HashMap::from([(
+                "thinking_effort".to_string(),
+                serde_json::json!("high"),
+            )]))
+            .with_cache_ttl("1h")
+            .without_cache_ttl();
+        assert!(config.cache_ttl().is_none());
+        assert_eq!(
+            config.request_param::<String>("thinking_effort").as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn cache_ttl_clamp_leaves_unset_ttl_absent() {
+        let config = ModelConfig::new("claude-sonnet-4-5").with_cache_ttl_clamped();
+        assert!(config.cache_ttl().is_none());
+    }
 
     #[test]
     fn request_headers_never_serialize_into_bodies() {
@@ -360,6 +557,31 @@ mod tests {
                     .and_then(|params| params.get("thinking_effort")),
                 Some(&serde_json::json!("high"))
             );
+        }
+
+        #[test]
+        fn with_default_thinking_effort_preserves_unparseable_raw_param() {
+            let config = config_with_params(
+                "test",
+                HashMap::from([("thinking_effort".to_string(), serde_json::json!("default"))]),
+            )
+            .with_default_thinking_effort(Some(ThinkingEffort::High));
+
+            assert_eq!(
+                config
+                    .request_params
+                    .as_ref()
+                    .and_then(|params| params.get("thinking_effort")),
+                Some(&serde_json::json!("default"))
+            );
+        }
+
+        #[test]
+        fn with_default_thinking_effort_applies_when_absent() {
+            let config =
+                ModelConfig::new("test").with_default_thinking_effort(Some(ThinkingEffort::High));
+
+            assert_eq!(config.thinking_effort(), Some(ThinkingEffort::High));
         }
 
         #[test]
@@ -574,6 +796,46 @@ mod tests {
         }
     }
 
+    mod supports_vision {
+        use super::*;
+
+        #[test]
+        fn reads_supports_vision_from_config() {
+            let config: ModelConfig = serde_json::from_str(
+                r#"{"model_name":"gpt-4o","toolshim":false,"supports_vision":true}"#,
+            )
+            .unwrap();
+            assert_eq!(config.supports_vision, Some(true));
+
+            let config: ModelConfig = serde_json::from_str(
+                r#"{"model_name":"gpt-4o","toolshim":false,"supports_vision":false}"#,
+            )
+            .unwrap();
+            assert_eq!(config.supports_vision, Some(false));
+        }
+
+        #[test]
+        fn defaults_supports_vision_to_none_when_absent() {
+            let config: ModelConfig =
+                serde_json::from_str(r#"{"model_name":"deepseek-v4","toolshim":false}"#).unwrap();
+            assert_eq!(config.supports_vision, None);
+        }
+
+        #[test]
+        fn serializes_supports_vision_only_when_some() {
+            let config = ModelConfig::new("gpt-4o").with_vision_support(true);
+            let serialized = serde_json::to_value(&config).unwrap();
+            assert_eq!(
+                serialized.get("supports_vision"),
+                Some(&serde_json::Value::Bool(true))
+            );
+
+            let config = ModelConfig::new("deepseek-v4");
+            let serialized = serde_json::to_value(&config).unwrap();
+            assert!(serialized.get("supports_vision").is_none());
+        }
+    }
+
     mod with_canonical_limits {
         use super::*;
 
@@ -584,23 +846,8 @@ mod tests {
                 ("GOOSE_CONTEXT_LIMIT", None::<&str>),
             ]);
             let config = ModelConfig::new("gpt-4o").with_canonical_limits("openai");
-
-            assert_eq!(config.context_limit, Some(128_000));
             assert_eq!(config.max_tokens, Some(16_384));
             assert_eq!(config.reasoning, Some(false));
-        }
-
-        #[test]
-        fn does_not_override_existing_context_limit() {
-            let _guard = env_lock::lock_env([
-                ("GOOSE_MAX_TOKENS", None::<&str>),
-                ("GOOSE_CONTEXT_LIMIT", None::<&str>),
-            ]);
-            let mut config = ModelConfig::new("gpt-4o");
-            config.context_limit = Some(64_000);
-            let config = config.with_canonical_limits("openai");
-
-            assert_eq!(config.context_limit, Some(64_000));
         }
 
         #[test]
@@ -623,8 +870,6 @@ mod tests {
                 ("GOOSE_CONTEXT_LIMIT", None::<&str>),
             ]);
             let config = ModelConfig::new("moonshotai/kimi-k2.6").with_canonical_limits("nvidia");
-
-            assert_eq!(config.context_limit, Some(262_144));
             assert_eq!(config.max_tokens, None);
             assert_eq!(config.max_output_tokens(), 4_096);
         }
@@ -637,9 +882,19 @@ mod tests {
             ]);
             let config = ModelConfig::new("global.anthropic.claude-sonnet-5")
                 .with_canonical_limits("aws_bedrock");
-
-            assert_eq!(config.context_limit, Some(1_000_000));
             assert_eq!(config.max_tokens, Some(128_000));
+            assert_eq!(config.reasoning, Some(true));
+        }
+
+        #[test]
+        fn resolves_gemini_4_neon_on_databricks() {
+            let _guard = env_lock::lock_env([
+                ("GOOSE_MAX_TOKENS", None::<&str>),
+                ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ]);
+            let config =
+                ModelConfig::new("system.ai.gemini-4-neon").with_canonical_limits("databricks");
+            assert_eq!(config.max_tokens, Some(65_536));
             assert_eq!(config.reasoning, Some(true));
         }
 
@@ -663,32 +918,58 @@ mod tests {
                 ("GOOSE_CONTEXT_LIMIT", None::<&str>),
             ]);
 
-            // "databricks-gpt-5.4-high" should resolve via "databricks-gpt-5.4"
-            let config =
-                ModelConfig::new("databricks-gpt-5.4-high").with_canonical_limits("databricks");
-            assert_eq!(config.context_limit, Some(1_050_000));
-
-            // "gpt-5.4-xhigh" should resolve via "gpt-5.4"
-            let config = ModelConfig::new("gpt-5.4-xhigh").with_canonical_limits("openai");
-            assert_eq!(config.context_limit, Some(1_050_000));
-
             // "gpt-5.6-sol-xhigh" should resolve via "gpt-5.6-sol"
             let config = ModelConfig::new("gpt-5.6-sol-xhigh").with_canonical_limits("openai");
-            assert_eq!(config.context_limit, Some(1_050_000));
             assert_eq!(config.max_tokens, Some(128_000));
             assert_eq!(config.reasoning, Some(true));
-            let canonical = crate::canonical::maybe_get_canonical_model("openai", "gpt-5.6-sol")
-                .expect("gpt-5.6-sol should have canonical metadata");
-            assert_eq!(canonical.temperature, Some(false));
 
             let config = ModelConfig::new("gpt-5.6-sol").with_canonical_limits("chatgpt_codex");
-            assert_eq!(config.context_limit, Some(1_050_000));
             assert_eq!(config.max_tokens, Some(128_000));
             assert_eq!(config.reasoning, Some(true));
+        }
 
-            // "gpt-5.4-nano-low" should resolve via "gpt-5.4-nano"
-            let config = ModelConfig::new("gpt-5.4-nano-low").with_canonical_limits("openai");
-            assert_eq!(config.context_limit, Some(400_000));
+        #[test]
+        fn resolves_gpt_6_astra_limits_for_databricks_model_service() {
+            let _guard = env_lock::lock_env([
+                ("GOOSE_MAX_TOKENS", None::<&str>),
+                ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ]);
+            let config = ModelConfig::new("data_workflow_tools.goose.goose-gpt-6-astra")
+                .with_canonical_limits("databricks_v2");
+
+            let canonical = crate::canonical::maybe_get_canonical_model(
+                "databricks_v2",
+                "data_workflow_tools.goose.goose-gpt-6-astra",
+            )
+            .expect("GPT-6 Astra should have canonical metadata");
+            assert_eq!(canonical.limit.context, 1_050_000);
+            assert_eq!(canonical.limit.output, Some(128_000));
+            assert_eq!(config.max_tokens, Some(128_000));
+            assert_eq!(config.reasoning, Some(true));
+            assert_eq!(config.supports_vision, Some(true));
+        }
+
+        #[test]
+        fn fills_supports_vision_from_canonical_model() {
+            let _guard = env_lock::lock_env([
+                ("GOOSE_MAX_TOKENS", None::<&str>),
+                ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ]);
+            // gpt-4o is a vision model in the canonical catalog (image input modality).
+            let config = ModelConfig::new("gpt-4o").with_canonical_limits("openai");
+            assert_eq!(config.supports_vision, Some(true));
+        }
+
+        #[test]
+        fn does_not_override_existing_supports_vision() {
+            let _guard = env_lock::lock_env([
+                ("GOOSE_MAX_TOKENS", None::<&str>),
+                ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ]);
+            let config = ModelConfig::new("gpt-4o")
+                .with_vision_support(false)
+                .with_canonical_limits("openai");
+            assert_eq!(config.supports_vision, Some(false));
         }
     }
 
@@ -704,41 +985,26 @@ mod tests {
         ];
 
         #[test]
-        fn bare_reasoning_models() {
+        fn uses_catalog_with_reasoning_family_fallback() {
             let _guard = env_lock::lock_env(ENV_LOCK_KEYS);
-            assert!(ModelConfig::new("o1").is_openai_reasoning_model());
-            assert!(ModelConfig::new("o1-preview").is_openai_reasoning_model());
-            assert!(ModelConfig::new("o3").is_openai_reasoning_model());
             assert!(ModelConfig::new("o3-mini").is_openai_reasoning_model());
-            assert!(ModelConfig::new("o4-mini").is_openai_reasoning_model());
-            assert!(ModelConfig::new("gpt-5").is_openai_reasoning_model());
-            assert!(ModelConfig::new("gpt-5-3-codex").is_openai_reasoning_model());
-        }
-
-        #[test]
-        fn goose_prefixed_reasoning_models() {
-            let _guard = env_lock::lock_env(ENV_LOCK_KEYS);
-            assert!(ModelConfig::new("goose-o3-mini").is_openai_reasoning_model());
-            assert!(ModelConfig::new("goose-o4-mini").is_openai_reasoning_model());
-            assert!(ModelConfig::new("goose-gpt-5").is_openai_reasoning_model());
-        }
-
-        #[test]
-        fn databricks_prefixed_reasoning_models() {
-            let _guard = env_lock::lock_env(ENV_LOCK_KEYS);
-            assert!(ModelConfig::new("databricks-o3-mini").is_openai_reasoning_model());
-            assert!(ModelConfig::new("databricks-o4-mini").is_openai_reasoning_model());
-            assert!(ModelConfig::new("databricks-gpt-5").is_openai_reasoning_model());
-        }
-
-        #[test]
-        fn non_reasoning_models() {
-            let _guard = env_lock::lock_env(ENV_LOCK_KEYS);
-            assert!(!ModelConfig::new("claude-sonnet-4").is_openai_reasoning_model());
             assert!(!ModelConfig::new("gpt-4o").is_openai_reasoning_model());
-            assert!(!ModelConfig::new("databricks-claude-sonnet-4").is_openai_reasoning_model());
-            assert!(!ModelConfig::new("goose-claude-sonnet-4").is_openai_reasoning_model());
-            assert!(!ModelConfig::new("llama-3-70b").is_openai_reasoning_model());
+            assert!(ModelConfig::new("gpt-5-unknown-deployment").is_openai_reasoning_model());
+            assert!(ModelConfig::new("o99-unknown").is_openai_reasoning_model());
+            assert!(!ModelConfig::new("future-model").is_openai_reasoning_model());
+        }
+
+        #[test]
+        fn explicit_reasoning_overrides_catalog_and_unknown_names() {
+            let _guard = env_lock::lock_env(ENV_LOCK_KEYS);
+            let mut config = ModelConfig::new("o3-mini");
+            config.reasoning = Some(false);
+            assert!(!config.is_openai_reasoning_model());
+            config.model_name = "future-model".to_string();
+            config.reasoning = Some(true);
+            assert!(config.is_openai_reasoning_model());
+            config.reasoning = Some(false);
+            assert!(!config.is_openai_reasoning_model());
         }
     }
 
@@ -759,9 +1025,36 @@ mod tests {
             assert!(ModelConfig::new("o3-mini").is_reasoning_model());
             assert!(ModelConfig::new("claude-sonnet-4").is_reasoning_model());
             assert!(ModelConfig::new("gemini-3-pro").is_reasoning_model());
+            assert!(ModelConfig::new("glm-5.3").is_reasoning_model());
+            assert!(
+                ModelConfig::new("data_workflow_tools.goose.goose-glm-5-3").is_reasoning_model()
+            );
+            assert!(!ModelConfig::new("glm-5.30").is_reasoning_model());
+            assert!(!ModelConfig::new("glm_5_3_models.prod.llama-3").is_reasoning_model());
             assert!(ModelConfig::new("grok-4.5").is_reasoning_model());
             assert!(ModelConfig::new("grok-4.20-0309-reasoning").is_reasoning_model());
             assert!(!ModelConfig::new("grok-4.20-0309-non-reasoning").is_reasoning_model());
+        }
+
+        #[test]
+        fn recognizes_kimi_k3_without_matching_other_versions() {
+            for model in [
+                "kimi-k3",
+                "moonshotai/kimi-k3",
+                "catalog.schema.goose-kimi-k3",
+                "Kimi-K3",
+            ] {
+                assert!(ModelConfig::new(model).is_reasoning_model(), "{model}");
+                let mut config = ModelConfig::new(model);
+                config.reasoning = Some(false);
+                assert!(!config.is_reasoning_model());
+            }
+            for model in ["kimi-k30", "kimi-k2.5", "kimi-k2-thinking", "notkimi-k3"] {
+                assert!(
+                    !ModelConfig::new(model).is_kimi_k3_reasoning_model(),
+                    "{model}"
+                );
+            }
         }
 
         #[test]

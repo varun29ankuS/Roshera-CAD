@@ -13,19 +13,29 @@ pub(crate) mod declarative_providers {
     use super::*;
 
     expose_declarative_providers!(
+        aigateway,
+        aihubmix,
+        aimlapi,
         alibaba,
         atomic_chat,
+        celeris,
         cerebras,
+        cortecs,
         deepseek,
         empiriolabs,
+        eurouter,
         fireworks,
+        friendli,
         futurmix,
         groq,
         iflytek,
         iflytek_astron,
         inception,
+        ionet,
+        lemonade,
         llama_swap,
         lmstudio,
+        lynkr,
         meta,
         minimax,
         mistral,
@@ -35,20 +45,28 @@ pub(crate) mod declarative_providers {
         nvidia,
         ollama_cloud,
         omlx,
+        onysoft,
         opencode_go,
+        opencode_zen,
+        opper,
         orcarouter,
         ovhcloud,
         perplexity,
+        pleumrouter,
+        routerplex,
         routstr,
         sakana,
         saladcloud,
+        saygm,
         scaleway,
         tanzu,
         tensorix,
         together,
+        trustedrouter,
         venice,
         vercel_ai_gateway,
         zai,
+        zai_coding_plan,
         zhipu,
     );
 }
@@ -107,6 +125,35 @@ impl FromStr for ProviderEngine {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Executed directly, never through a shell, so `args` is never
+    /// shell-interpolated. For shell features, invoke an interpreter
+    /// explicitly, e.g. `command: "/bin/bash"`, `args: ["-c", "..."]`.
+    /// Bare names (no path separator) are resolved via `PATH`; paths are
+    /// resolved against `cwd`.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// How long a fetched credential is cached before the command is re-run,
+    /// in seconds. `0` disables proactive refresh entirely — the command
+    /// only reruns reactively, after an auth failure (matches Codex's
+    /// `refresh_interval_ms: 0` convention).
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval: u64,
+    /// Timeout for the command, in seconds. Defaults to 10s if unset.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Working directory for the command, and the base a relative `command`
+    /// path is resolved against. Defaults to goose's current directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+fn default_refresh_interval() -> u64 {
+    3600
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeclarativeProviderConfig {
     pub name: String,
     pub engine: ProviderEngine,
@@ -117,6 +164,9 @@ pub struct DeclarativeProviderConfig {
     pub base_url: String,
     pub models: Vec<ModelInfo>,
     pub headers: Option<HashMap<String, String>>,
+    /// Overrides the default `agent-session-id` header name for session ID propagation.
+    #[serde(default)]
+    pub session_id_header_override: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub supports_streaming: Option<bool>,
     #[serde(default = "default_requires_auth")]
@@ -127,6 +177,10 @@ pub struct DeclarativeProviderConfig {
     pub base_path: Option<String>,
     #[serde(default)]
     pub env_vars: Option<Vec<EnvVarConfig>>,
+    /// Alternative to `api_key_env`: run a command to fetch/refresh the credential
+    /// instead of reading a static secret. Mutually exclusive with `api_key_env`.
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
     /// Controls whether `fetch_supported_models` calls the provider's `/v1/models`
     /// endpoint or returns the static `models` list directly.
     ///
@@ -141,10 +195,15 @@ pub struct DeclarativeProviderConfig {
     pub model_doc_link: Option<String>,
     #[serde(default)]
     pub setup_steps: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_non_empty_string")]
-    pub fast_model: Option<String>,
+    #[serde(default)]
+    pub toolshim: bool,
     #[serde(default)]
     pub preserves_thinking: bool,
+    /// Enables Z.AI's `clear_thinking` field, which Anthropic does not support.
+    #[serde(default)]
+    pub emit_clear_thinking: bool,
+    #[serde(default)]
+    pub setup: Option<goose_provider_types::canonical::catalog::ProviderSetupMetadata>,
 }
 
 fn default_requires_auth() -> bool {
@@ -175,6 +234,18 @@ impl DeclarativeProviderConfig {
 
     pub fn models(&self) -> &[ModelInfo] {
         &self.models
+    }
+
+    /// Errors if both `api_key_env` and `auth.command` are set; they're
+    /// alternative ways to authenticate and mutually exclusive.
+    pub fn validate_auth(&self) -> anyhow::Result<()> {
+        if self.auth.is_some() && !self.api_key_env.is_empty() {
+            anyhow::bail!(
+                "Provider '{}' sets both `api_key_env` and `auth.command`; these are mutually exclusive.",
+                self.name
+            );
+        }
+        Ok(())
     }
 }
 
@@ -366,6 +437,25 @@ mod tests {
         assert!(!config.preserves_thinking);
     }
 
+    #[test]
+    fn vercel_ai_gateway_json_refreshes_models_against_vercel_catalog() {
+        let config = deserialize_provider_config(crate::vercel_ai_gateway::JSON)
+            .expect("vercel_ai_gateway.json should parse");
+
+        assert_eq!(config.dynamic_models, Some(true));
+        assert_eq!(config.catalog_provider_id.as_deref(), Some("vercel"));
+    }
+
+    #[test]
+    fn setup_metadata_rejects_unknown_fields() {
+        let mut definition: serde_json::Value = serde_json::from_str(crate::groq::JSON).unwrap();
+        definition["setup"]["description"] = json!("This field would be ignored");
+
+        let error = deserialize_provider_config(&definition.to_string()).unwrap_err();
+
+        assert!(error.to_string().contains("unknown field `description`"));
+    }
+
     fn placeholder_var_names(template: &str) -> Vec<String> {
         template
             .split("${")
@@ -464,6 +554,20 @@ mod tests {
         }
 
         assert!(!seen_ids.is_empty(), "no bundled providers were found");
+    }
+
+    #[test]
+    fn opencode_go_overrides_session_id_header() {
+        let config = fixed_provider_configs()
+            .expect("bundled providers should load")
+            .into_iter()
+            .find(|config| config.name == "opencode_go")
+            .expect("opencode_go should be bundled");
+
+        assert_eq!(
+            config.session_id_header_override.as_deref(),
+            Some("x-opencode-session")
+        );
     }
 
     #[test]

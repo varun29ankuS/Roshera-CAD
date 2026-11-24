@@ -1,14 +1,17 @@
+#![cfg(feature = "scheduler")]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use goose::agents::{Agent, AgentConfig, GoosePlatform};
-use goose::config::permission::PermissionManager;
+use goose::agents::ScheduleTool;
 use goose::config::GooseMode;
+use goose::conversation::message::{Message, MessageContent};
 use goose::scheduler::{ScheduledJob, SchedulerError, ValidatedScheduleRecipe};
 use goose::scheduler_trait::SchedulerTrait;
-use goose::session::{Session, SessionManager};
+use goose::session::{Session, SessionManager, SessionType};
+use rmcp::model::{Annotations, ContentBlock, Role, TextContent};
 use tempfile::TempDir;
 
 struct MockScheduler {
@@ -105,41 +108,110 @@ impl SchedulerTrait for MockScheduler {
     }
 }
 
-fn agent_with_scheduler(temp_dir: &TempDir, scheduler: Arc<MockScheduler>) -> Agent {
+fn schedule_tool(temp_dir: &TempDir, scheduler: Arc<MockScheduler>) -> ScheduleTool {
     let data_dir = temp_dir.path().join("data");
     let session_manager = Arc::new(SessionManager::new(data_dir.clone()));
-    let permission_manager = Arc::new(PermissionManager::new(data_dir));
-    let config = AgentConfig::new(
-        session_manager,
-        permission_manager,
-        Some(scheduler),
-        GooseMode::Auto,
-        false,
-        GoosePlatform::GooseCli,
-    );
-    Agent::with_config(config)
+    ScheduleTool::new(scheduler, session_manager)
 }
 
-async fn create_schedule(agent: &Agent, recipe_path: &Path) -> Result<(), String> {
-    agent
-        .handle_schedule_management(
-            serde_json::json!({
-                "action": "create",
-                "recipe_path": recipe_path,
-                "cron_expression": "0 * * * *"
-            }),
-            "test-request".to_string(),
-        )
+async fn create_schedule(schedule_tool: &ScheduleTool, recipe_path: &Path) -> Result<(), String> {
+    schedule_tool
+        .execute(serde_json::json!({
+            "action": "create",
+            "recipe_path": recipe_path,
+            "cron_expression": "0 * * * *"
+        }))
         .await
         .map(|_| ())
         .map_err(|error| error.message.to_string())
 }
 
 #[tokio::test]
+async fn session_content_only_serializes_agent_visible_conversation() {
+    let temp_dir = TempDir::new().unwrap();
+    let scheduler = Arc::new(MockScheduler::new());
+    let working_dir = temp_dir.path().join("project");
+    let session_manager = Arc::new(SessionManager::new(temp_dir.path().join("data")));
+    let tool = ScheduleTool::new(scheduler, session_manager.clone());
+    let session = session_manager
+        .create_session(
+            working_dir.clone(),
+            "Project session".to_string(),
+            SessionType::Scheduled,
+            GooseMode::Auto,
+        )
+        .await
+        .unwrap();
+    let user_only = |text: &str| {
+        MessageContent::Text(
+            TextContent::new(text)
+                .with_annotations(Annotations::default().with_audience(vec![Role::User])),
+        )
+    };
+
+    session_manager
+        .add_message(
+            &session.id,
+            &Message::user()
+                .with_text("hidden-message-secret")
+                .user_only(),
+        )
+        .await
+        .unwrap();
+    session_manager
+        .add_message(
+            &session.id,
+            &Message::assistant()
+                .with_content(user_only("hidden-content-secret"))
+                .with_text("shared-content"),
+        )
+        .await
+        .unwrap();
+    session_manager
+        .add_message(&session.id, &Message::user().with_text("visible-message"))
+        .await
+        .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "session_content",
+            "session_id": session.id,
+        }))
+        .await
+        .unwrap();
+    let ContentBlock::Text(content) = &result[0] else {
+        panic!("expected text content");
+    };
+    assert_eq!(
+        content
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.audience.as_deref()),
+        Some(&[Role::Assistant][..])
+    );
+    let (_, session_json) = content.text.split_once("\nSession:\n").unwrap();
+    let serialized: serde_json::Value = serde_json::from_str(session_json).unwrap();
+
+    assert_eq!(serialized["id"], session.id);
+    assert_eq!(
+        serialized["working_dir"],
+        working_dir.to_string_lossy().as_ref()
+    );
+    assert_eq!(serialized["name"], "Project session");
+    assert_eq!(serialized["session_type"], "scheduled");
+    assert_eq!(serialized["goose_mode"], "auto");
+    assert_eq!(serialized["message_count"], 3);
+    assert!(!content.text.contains("hidden-message-secret"));
+    assert!(!content.text.contains("hidden-content-secret"));
+    assert!(content.text.contains("shared-content"));
+    assert!(content.text.contains("visible-message"));
+}
+
+#[tokio::test]
 async fn parse_errors_do_not_reflect_recipe_contents() {
     let temp_dir = TempDir::new().unwrap();
     let scheduler = Arc::new(MockScheduler::new());
-    let agent = agent_with_scheduler(&temp_dir, scheduler.clone());
+    let tool = schedule_tool(&temp_dir, scheduler.clone());
     let cases = [
         ("invalid.yaml", "yaml-secret-242", "Invalid YAML recipe"),
         ("invalid.json", "\"json-secret-242\"", "Invalid JSON recipe"),
@@ -148,7 +220,7 @@ async fn parse_errors_do_not_reflect_recipe_contents() {
     for (name, secret, expected) in cases {
         let path = temp_dir.path().join(name);
         std::fs::write(&path, secret).unwrap();
-        let message = create_schedule(&agent, &path).await.unwrap_err();
+        let message = create_schedule(&tool, &path).await.unwrap_err();
         assert_eq!(message, expected);
         assert!(!message.contains(secret));
     }
@@ -157,12 +229,47 @@ async fn parse_errors_do_not_reflect_recipe_contents() {
 }
 
 #[tokio::test]
+async fn reports_actionable_schema_errors_without_reflecting_values() {
+    let temp_dir = TempDir::new().unwrap();
+    let scheduler = Arc::new(MockScheduler::new());
+    let tool = schedule_tool(&temp_dir, scheduler.clone());
+    let cases = [
+        (
+            "missing-title.yaml",
+            "description: Missing title\nprompt: Run safely\n".to_string(),
+            "Invalid recipe: missing field `title`",
+            "Missing title",
+        ),
+        (
+            "invalid-input-type.yaml",
+            "title: Test\ndescription: hi\nprompt: Run {{ item }}\nparameters:\n  - key: item\n    input_type: yaml-secret-242\n    requirement: required\n    description: hi\n"
+                .to_string(),
+            "Invalid recipe: parameters[0].input_type is invalid",
+            "yaml-secret-242",
+        ),
+    ];
+
+    for (name, content, expected, secret) in cases {
+        let path = temp_dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+
+        let message = create_schedule(&tool, &path).await.unwrap_err();
+
+        assert_eq!(message, expected);
+        assert!(!message.contains(secret));
+    }
+
+    assert!(scheduler.jobs.lock().await.is_empty());
+    assert!(scheduler.validated_recipes.lock().await.is_empty());
+}
+
+#[tokio::test]
 async fn rejects_non_regular_recipe_path() {
     let temp_dir = TempDir::new().unwrap();
     let scheduler = Arc::new(MockScheduler::new());
-    let agent = agent_with_scheduler(&temp_dir, scheduler.clone());
+    let tool = schedule_tool(&temp_dir, scheduler.clone());
 
-    let message = create_schedule(&agent, temp_dir.path()).await.unwrap_err();
+    let message = create_schedule(&tool, temp_dir.path()).await.unwrap_err();
 
     assert_eq!(message, "Recipe path must reference a regular file");
     assert!(scheduler.jobs.lock().await.is_empty());
@@ -177,7 +284,7 @@ async fn rejects_fifo_without_blocking() {
 
     let temp_dir = TempDir::new().unwrap();
     let scheduler = Arc::new(MockScheduler::new());
-    let agent = agent_with_scheduler(&temp_dir, scheduler.clone());
+    let tool = schedule_tool(&temp_dir, scheduler.clone());
     let path = temp_dir.path().join("recipe.yaml");
     let fifo_path = CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: fifo_path is a valid, NUL-terminated path and mode contains only permission bits.
@@ -196,7 +303,7 @@ async fn rejects_fifo_without_blocking() {
         timed_out
     });
 
-    let message = create_schedule(&agent, &path).await.unwrap_err();
+    let message = create_schedule(&tool, &path).await.unwrap_err();
     let _ = finished_tx.send(());
 
     assert!(!watchdog.join().unwrap(), "FIFO validation blocked on open");
@@ -209,7 +316,7 @@ async fn rejects_fifo_without_blocking() {
 async fn accepts_symlink_to_regular_recipe_with_canonical_provenance() {
     let temp_dir = TempDir::new().unwrap();
     let scheduler = Arc::new(MockScheduler::new());
-    let agent = agent_with_scheduler(&temp_dir, scheduler.clone());
+    let tool = schedule_tool(&temp_dir, scheduler.clone());
     let target = temp_dir.path().join("target.yaml");
     let link = temp_dir.path().join("recipe-link.yaml");
     std::fs::write(
@@ -219,7 +326,7 @@ async fn accepts_symlink_to_regular_recipe_with_canonical_provenance() {
     .unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    create_schedule(&agent, &link).await.unwrap();
+    create_schedule(&tool, &link).await.unwrap();
 
     let canonical_target = target.canonicalize().unwrap();
     let jobs = scheduler.jobs.lock().await;
@@ -234,14 +341,14 @@ async fn accepts_symlink_to_regular_recipe_with_canonical_provenance() {
 async fn rejects_oversized_recipe() {
     let temp_dir = TempDir::new().unwrap();
     let scheduler = Arc::new(MockScheduler::new());
-    let agent = agent_with_scheduler(&temp_dir, scheduler.clone());
+    let tool = schedule_tool(&temp_dir, scheduler.clone());
     let path = temp_dir.path().join("oversized.yaml");
     std::fs::File::create(&path)
         .unwrap()
         .set_len(1_048_577)
         .unwrap();
 
-    let message = create_schedule(&agent, &path).await.unwrap_err();
+    let message = create_schedule(&tool, &path).await.unwrap_err();
 
     assert_eq!(message, "Recipe file exceeds the 1048576 byte limit");
     assert!(scheduler.jobs.lock().await.is_empty());
@@ -251,12 +358,12 @@ async fn rejects_oversized_recipe() {
 async fn accepts_valid_regular_recipe() {
     let temp_dir = TempDir::new().unwrap();
     let scheduler = Arc::new(MockScheduler::new());
-    let agent = agent_with_scheduler(&temp_dir, scheduler.clone());
+    let tool = schedule_tool(&temp_dir, scheduler.clone());
     let path = temp_dir.path().join("valid.yaml");
     let recipe = b"title: Valid recipe\ndescription: A small recipe\nprompt: Run safely\n";
     std::fs::write(&path, recipe).unwrap();
 
-    create_schedule(&agent, &path).await.unwrap();
+    create_schedule(&tool, &path).await.unwrap();
 
     assert_eq!(scheduler.jobs.lock().await.len(), 1);
     assert_eq!(

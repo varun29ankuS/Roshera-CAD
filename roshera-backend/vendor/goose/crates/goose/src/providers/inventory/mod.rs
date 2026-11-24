@@ -7,8 +7,10 @@ pub use resolver::{
 };
 
 use super::base::{ConfigKey, ModelInfo, Provider, ProviderType};
-use super::canonical::{map_provider_name, map_to_canonical_model, CanonicalModelRegistry};
-use super::catalog::ProviderSetupCategory;
+use super::canonical::{
+    map_provider_name, map_to_canonical_model, maybe_get_canonical_model_with_variant_fallback,
+    CanonicalModelRegistry,
+};
 use crate::config::declarative_providers::{DeclarativeProviderConfig, ProviderEngine};
 use crate::config::Config;
 use crate::session::session_manager::SessionStorage;
@@ -34,8 +36,12 @@ pub struct ProviderInventoryEntry {
     pub description: String,
     pub default_model: String,
     pub configured: bool,
+    pub available: bool,
     pub provider_type: ProviderType,
-    pub category: ProviderSetupCategory,
+    pub acp: bool,
+    pub visible_in_setup: bool,
+    pub deprecated: bool,
+    pub replacement: Option<String>,
     pub config_keys: Vec<ConfigKey>,
     pub setup_steps: Vec<String>,
     pub supports_refresh: bool,
@@ -44,7 +50,6 @@ pub struct ProviderInventoryEntry {
     pub last_updated_at: Option<DateTime<Utc>>,
     pub last_refresh_attempt_at: Option<DateTime<Utc>>,
     pub last_refresh_error: Option<String>,
-    pub model_selection_hint: Option<String>,
 }
 
 /// Families whose latest model should be surfaced in the compact picker.
@@ -160,6 +165,7 @@ pub struct RefreshSkip {
 pub(crate) struct RefreshJob {
     pub provider_id: String,
     pub identity: InventoryIdentity,
+    pub toolshim: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -260,13 +266,17 @@ struct ProviderDescriptor {
     default_model: String,
     identity: InventoryIdentity,
     configured: bool,
+    available: bool,
     provider_type: ProviderType,
-    category: ProviderSetupCategory,
+    acp: bool,
+    visible_in_setup: bool,
+    deprecated: bool,
+    replacement: Option<String>,
     config_keys: Vec<ConfigKey>,
     setup_steps: Vec<String>,
     supports_refresh: bool,
+    toolshim: bool,
     static_models: Vec<ModelInfo>,
-    model_selection_hint: Option<String>,
 }
 
 impl ProviderInventoryService {
@@ -303,8 +313,12 @@ impl ProviderInventoryService {
             description: descriptor.description,
             default_model: descriptor.default_model,
             configured: descriptor.configured,
+            available: descriptor.available,
             provider_type: descriptor.provider_type,
-            category: descriptor.category,
+            acp: descriptor.acp,
+            visible_in_setup: descriptor.visible_in_setup,
+            deprecated: descriptor.deprecated,
+            replacement: descriptor.replacement,
             config_keys: descriptor.config_keys,
             setup_steps: descriptor.setup_steps,
             supports_refresh: descriptor.supports_refresh,
@@ -317,7 +331,6 @@ impl ProviderInventoryService {
                 .as_ref()
                 .and_then(|snapshot| snapshot.last_refresh_attempt_at),
             last_refresh_error: snapshot.and_then(|snapshot| snapshot.last_refresh_error),
-            model_selection_hint: descriptor.model_selection_hint,
         }))
     }
 
@@ -427,6 +440,7 @@ impl ProviderInventoryService {
             plan.started.push(RefreshJob {
                 provider_id: descriptor.provider_id,
                 identity: descriptor.identity,
+                toolshim: descriptor.toolshim,
             });
         }
 
@@ -613,16 +627,15 @@ impl ProviderInventoryService {
                     .find(|job| job.provider_id == provider_id);
                 if let Some(refresh_job) = refresh_job {
                     let mut refresh_guard = self.refresh_guard(&refresh_job.identity);
+                    let toolshim = refresh_job.toolshim;
                     let fetch_result: Result<Vec<String>> =
                         match ensure_refresh_identity_current(&provider_id, &refresh_job.identity)
                             .await
                         {
                             Ok(()) => {
-                                match AssertUnwindSafe(provider.fetch_recommended_models(
-                                    crate::model_config::global_toolshim(),
-                                ))
-                                .catch_unwind()
-                                .await
+                                match AssertUnwindSafe(provider.fetch_recommended_models(toolshim))
+                                    .catch_unwind()
+                                    .await
                                 {
                                     Ok(Ok(models)) => Ok(models),
                                     Ok(Err(error)) => Err(anyhow::anyhow!(error.to_string())),
@@ -715,15 +728,26 @@ impl ProviderInventoryService {
             description: metadata.description.clone(),
             default_model: metadata.default_model.clone(),
             identity,
-            configured: entry.inventory_configured(),
+            configured: if metadata.setup.as_ref().is_some_and(|setup| setup.acp) {
+                crate::config::get_provider_entry(Config::global(), provider_id)
+                    .is_some_and(|entry| entry.enabled && entry.configured)
+            } else {
+                entry.inventory_configured()
+            },
+            available: entry.inventory_configured(),
             provider_type: entry.provider_type(),
-            category: crate::providers::catalog::get_provider_setup_category(&metadata.name)
-                .unwrap_or(ProviderSetupCategory::Model),
+            acp: metadata.setup.as_ref().is_some_and(|setup| setup.acp),
+            visible_in_setup: metadata.deprecated.is_none(),
+            deprecated: metadata.deprecated.is_some(),
+            replacement: metadata
+                .deprecated
+                .as_ref()
+                .and_then(|deprecated| deprecated.replacement.clone()),
             config_keys: metadata.config_keys.clone(),
             setup_steps: metadata.setup_steps.clone(),
             supports_refresh: entry.supports_inventory_refresh(),
+            toolshim: entry.toolshim_enabled(crate::model_config::global_toolshim()),
             static_models: metadata.known_models,
-            model_selection_hint: metadata.model_selection_hint,
         }))
     }
 
@@ -937,6 +961,10 @@ pub fn declarative_inventory_identity(
         "skip_canonical_filtering".to_string(),
         config.skip_canonical_filtering.to_string(),
     );
+    identity.public_inputs.insert(
+        "toolshim".to_string(),
+        (config.toolshim || crate::model_config::global_toolshim()).to_string(),
+    );
     if !config.models.is_empty() {
         identity.public_inputs.insert(
             "models".to_string(),
@@ -954,11 +982,30 @@ pub fn declarative_inventory_identity(
             .public_inputs
             .insert("headers".to_string(), serialize_string_map(headers)?);
     }
+    if let Some(header_name) = &config.session_id_header_override {
+        identity.public_inputs.insert(
+            "session_id_header_override".to_string(),
+            header_name.clone(),
+        );
+    }
     if !config.api_key_env.is_empty() {
         if let Some(value) = config_secret_value(global, &config.api_key_env) {
             identity
                 .secret_inputs
                 .insert(config.api_key_env.clone(), value);
+        }
+    }
+    if let Some(auth) = &config.auth {
+        identity
+            .secret_inputs
+            .insert("auth_command".to_string(), auth.command.clone());
+        identity
+            .secret_inputs
+            .insert("auth_args".to_string(), serde_json::to_string(&auth.args)?);
+        if let Some(cwd) = &auth.cwd {
+            identity
+                .secret_inputs
+                .insert("auth_cwd".to_string(), cwd.clone());
         }
     }
 
@@ -1010,6 +1057,10 @@ fn fallback_inventory_identity(provider_id: &str) -> InventoryIdentityInput {
     )
 }
 
+fn is_databricks_v2_model_service(provider_family: &str, model_id: &str) -> bool {
+    provider_family == "databricks_v2" && model_id.splitn(3, '.').count() == 3
+}
+
 fn enrich_model_ids_with_canonical(
     provider_family: &str,
     model_ids: &[String],
@@ -1029,11 +1080,16 @@ fn enrich_model_ids_with_canonical(
     }
 
     let mut models: Vec<InventoryModel> = Vec::new();
-    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
 
     for id in model_ids {
         let model = enriched_model(provider_family, id, None);
-        if !seen_names.insert(model.name.clone()) {
+        let dedup_key = if is_databricks_v2_model_service(provider_family, id) {
+            id
+        } else {
+            &model.name
+        };
+        if !seen_keys.insert(dedup_key.clone()) {
             continue;
         }
         models.push(model);
@@ -1045,7 +1101,9 @@ fn enrich_model_ids_with_canonical(
     if matches!(provider_family, "databricks" | "databricks_v2") {
         let mut name_to_idx: HashMap<String, usize> = HashMap::new();
         for (idx, model) in models.iter().enumerate() {
-            name_to_idx.insert(model.name.clone(), idx);
+            if !is_databricks_v2_model_service(provider_family, &model.id) {
+                name_to_idx.insert(model.name.clone(), idx);
+            }
         }
         for id in model_ids {
             if !id.starts_with("goose-") {
@@ -1082,7 +1140,7 @@ fn configured_models_to_inventory(
     let mut result: Vec<InventoryModel> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     for model in models {
-        let enriched = enriched_model(provider_family, &model.name, Some(model.context_limit));
+        let enriched = enriched_model(provider_family, &model.name, model.context_limit);
         if seen_names.insert(enriched.name.clone()) {
             result.push(enriched);
         }
@@ -1125,11 +1183,19 @@ fn enriched_model(
     model_id: &str,
     fallback_context_limit: Option<usize>,
 ) -> InventoryModel {
-    let registry = CanonicalModelRegistry::bundled().ok();
-    let canonical = registry.as_ref().and_then(|registry| {
-        let canonical_id = map_to_canonical_model(provider_family, model_id, registry)?;
+    // The registry guard is dropped inside the closure: the fallback below takes its own
+    // read lock, and a nested read can block behind a queued catalog refresh.
+    let canonical = CanonicalModelRegistry::bundled().ok().and_then(|registry| {
+        let canonical_id = map_to_canonical_model(provider_family, model_id, &registry)?;
         let (provider, model) = canonical_id.split_once('/')?;
         registry.get(provider, model).cloned()
+    });
+    // A variant borrows its base row's metadata but keeps its own id as the name,
+    // so the picker still lists it next to the base model.
+    let metadata = canonical.clone().or_else(|| {
+        maybe_get_canonical_model_with_variant_fallback(provider_family, model_id)
+            .filter(|(_, is_variant_fallback)| *is_variant_fallback)
+            .map(|(model, _)| model)
     });
 
     InventoryModel {
@@ -1138,12 +1204,12 @@ fn enriched_model(
             .as_ref()
             .map(|model| model.name.clone())
             .unwrap_or_else(|| model_id.to_string()),
-        family: canonical.as_ref().and_then(|model| model.family.clone()),
-        context_limit: canonical
+        family: metadata.as_ref().and_then(|model| model.family.clone()),
+        context_limit: metadata
             .as_ref()
             .map(|model| model.limit.context)
             .or(fallback_context_limit),
-        reasoning: canonical.as_ref().and_then(|model| model.reasoning),
+        reasoning: metadata.as_ref().and_then(|model| model.reasoning),
         recommended: false,
     }
 }
@@ -1202,6 +1268,26 @@ mod tests {
             provider_id: provider_id.to_string(),
             provider_family: provider_id.to_string(),
             inventory_key: inventory_key.to_string(),
+        }
+    }
+
+    #[test]
+    fn openrouter_inventory_keeps_base_and_unlisted_variants() {
+        let ids = vec![
+            "deepseek/deepseek-v4-flash".to_string(),
+            "deepseek/deepseek-v4-flash:batch".to_string(),
+            "deepseek/deepseek-v4-flash:free".to_string(),
+        ];
+        let models = enrich_model_ids_with_canonical("openrouter", &ids);
+        assert_eq!(
+            models.iter().map(|model| &model.id).collect::<Vec<_>>(),
+            ids.iter().collect::<Vec<_>>()
+        );
+        for variant in &models[1..] {
+            assert_eq!(variant.name, variant.id);
+            assert_eq!(variant.family, models[0].family);
+            assert_eq!(variant.context_limit, models[0].context_limit);
+            assert_eq!(variant.reasoning, models[0].reasoning);
         }
     }
 
@@ -1289,11 +1375,24 @@ mod tests {
 
     #[test]
     fn configured_models_use_canonical_enrichment() {
-        let models =
-            configured_models_to_inventory("anthropic", &[ModelInfo::new("claude-sonnet-4-5", 0)]);
+        let models = configured_models_to_inventory(
+            "anthropic",
+            &[ModelInfo::new("claude-sonnet-4-5").with_context_limit(0)],
+        );
 
         assert_eq!(models.len(), 1);
         assert!(models[0].name.contains("Claude"));
+    }
+
+    #[test]
+    fn vercel_inventory_enriches_gateway_model_ids() {
+        let models =
+            enrich_model_ids_with_canonical("vercel", &["moonshotai/kimi-k2.5".to_string()]);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "Kimi K2.5");
+        assert!(models[0].context_limit.is_some());
+        assert!(models[0].reasoning.is_some());
     }
 
     #[test]
@@ -1317,8 +1416,32 @@ mod tests {
     }
 
     #[test]
+    fn databricks_v2_inventory_preserves_distinct_model_service_fqns() {
+        let model_ids = [
+            "alpha.prod.claude-sonnet-4-5",
+            "beta.prod.claude-sonnet-4-5",
+            "alpha.prod.claude-sonnet-4-5",
+        ]
+        .map(String::from);
+        let models = enrich_model_ids_with_canonical("databricks_v2", &model_ids);
+
+        let ids = models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "alpha.prod.claude-sonnet-4-5",
+                "beta.prod.claude-sonnet-4-5"
+            ]
+        );
+        assert_eq!(models[0].name, models[1].name);
+    }
+
+    #[test]
     fn inventory_uses_configured_models_before_first_successful_refresh() {
-        let configured_models = [ModelInfo::new("claude-sonnet-4-5", 0)];
+        let configured_models = [ModelInfo::new("claude-sonnet-4-5").with_context_limit(0)];
         let snapshot = InventorySnapshot {
             models: vec![],
             last_updated_at: None,
@@ -1335,7 +1458,7 @@ mod tests {
 
     #[test]
     fn inventory_preserves_empty_models_after_successful_refresh() {
-        let configured_models = [ModelInfo::new("claude-sonnet-4-5", 0)];
+        let configured_models = [ModelInfo::new("claude-sonnet-4-5").with_context_limit(0)];
         let snapshot = InventorySnapshot {
             models: vec![],
             last_updated_at: Some(Utc::now()),
@@ -1351,7 +1474,7 @@ mod tests {
 
     #[test]
     fn inventory_ignores_stale_snapshots_for_static_providers() {
-        let configured_models = [ModelInfo::new("gpt-5.6", 0)];
+        let configured_models = [ModelInfo::new("gpt-5.6").with_context_limit(0)];
         let snapshot = InventorySnapshot {
             models: vec![InventoryModel {
                 id: "gpt-5.5".to_string(),

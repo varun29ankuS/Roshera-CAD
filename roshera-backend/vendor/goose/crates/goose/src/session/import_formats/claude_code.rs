@@ -136,11 +136,10 @@ pub fn convert(content: &str) -> Result<String> {
         name: &name,
         created_at,
         updated_at,
-        usage: Usage::new(Some(total_input as i32), Some(total_output as i32), None)
-            .with_cache_tokens(
-                (total_cache_read > 0).then_some(total_cache_read as i32),
-                (total_cache_write > 0).then_some(total_cache_write as i32),
-            ),
+        usage: Usage::new(Some(total_input), Some(total_output), None).with_cache_tokens(
+            (total_cache_read > 0).then_some(total_cache_read),
+            (total_cache_write > 0).then_some(total_cache_write),
+        ),
         accumulated_cost: None,
         conversation,
     });
@@ -331,6 +330,57 @@ mod tests {
         let resp = &msgs[2];
         let content = resp["content"].as_array().unwrap();
         assert!(content.iter().any(|c| c["type"] == "toolResponse"));
+    }
+
+    #[test]
+    fn sanitizes_unicode_tags_in_tool_result() {
+        let jsonl = serde_json::json!({
+            "type": "user",
+            "sessionId": "s",
+            "uuid": "u1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "cwd": "/tmp",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [{"type": "text", "text": "visible\u{E0041}世界"}]
+                }]
+            }
+        })
+        .to_string();
+
+        let json = convert(&jsonl).unwrap();
+
+        assert!(json.contains("visible世界"));
+        assert!(!json.contains('\u{E0041}'));
+    }
+
+    #[test]
+    fn sanitizes_unicode_tags_in_tool_result_error() {
+        let jsonl = serde_json::json!({
+            "type": "user",
+            "sessionId": "s",
+            "uuid": "u1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "cwd": "/tmp",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "is_error": true,
+                    "content": "failed\u{E0041}café"
+                }]
+            }
+        })
+        .to_string();
+
+        let json = convert(&jsonl).unwrap();
+
+        assert!(json.contains("failedcafé"));
+        assert!(!json.contains('\u{E0041}'));
     }
 
     #[test]

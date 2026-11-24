@@ -1,5 +1,6 @@
 use crate::conversation::message::{Message, MessageContentBlock};
 use crate::conversation::token_usage::Usage;
+use crate::documents::{unsupported_document_text, UNSUPPORTED_PROVIDER_REASON};
 use crate::errors::ProviderError;
 use crate::mcp_utils::extract_text_from_resource;
 use crate::model::ModelConfig;
@@ -64,7 +65,7 @@ pub fn format_messages(messages: &[Message]) -> Vec<Value> {
                 }
                 MessageContentBlock::ToolConfirmationRequest(_) => {}
                 MessageContentBlock::ActionRequired(_) => {}
-                MessageContentBlock::SystemNotification(_) => {
+                MessageContentBlock::SystemNotification(_) | MessageContentBlock::Error(_) => {
                     // Skip
                 }
                 MessageContentBlock::Thinking(_thinking) => {
@@ -74,8 +75,14 @@ pub fn format_messages(messages: &[Message]) -> Vec<Value> {
                     // Skip redacted thinking for now
                 }
                 MessageContentBlock::Image(_) => continue, // Snowflake doesn't support image content yet
-                MessageContentBlock::FrontendToolRequest(_tool_request) => {
-                    // Skip frontend tool requests
+                MessageContentBlock::Document(document) => {
+                    if !text_content.is_empty() {
+                        text_content.push('\n');
+                    }
+                    text_content.push_str(&unsupported_document_text(
+                        document,
+                        UNSUPPORTED_PROVIDER_REASON,
+                    ));
                 }
             }
         }
@@ -292,18 +299,12 @@ pub fn response_to_message(response: &Value) -> Result<Message> {
 pub fn get_usage(data: &Value) -> Result<Usage> {
     // Extract usage data if available
     if let Some(usage) = data.get("usage") {
-        let input_tokens = usage
-            .get("input_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as i32);
+        let input_tokens = usage.get("input_tokens").and_then(|v| v.as_i64());
 
-        let output_tokens = usage
-            .get("output_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as i32);
+        let output_tokens = usage.get("output_tokens").and_then(|v| v.as_i64());
 
         let total_tokens = match (input_tokens, output_tokens) {
-            (Some(input), Some(output)) => Some(input + output),
+            (Some(input), Some(output)) => Some(input.saturating_add(output)),
             _ => None,
         };
 

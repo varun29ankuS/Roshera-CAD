@@ -1,11 +1,11 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use goose_sdk_types::custom_requests::{
     RecipeAuthorDto, RecipeDto, RecipeExtensionDto, RecipeParameterDto,
     RecipeParameterInputTypeDto, RecipeParameterRequirementDto, RecipeResponseDto,
     RecipeRetryConfigDto, RecipeSettingsDto, RecipeSuccessCheckDto, SubRecipeDto,
 };
 
-use crate::agents::extension::{Envs, ExtensionConfig};
+use crate::agents::extension_config::{Envs, ExtensionConfig};
 use crate::agents::types::{RetryConfig, SuccessCheck};
 use crate::recipe::{
     Author, Recipe, RecipeParameter, RecipeParameterInputType, RecipeParameterRequirement,
@@ -27,7 +27,7 @@ impl TryFrom<RecipeDto> for Recipe {
                 .map(|extensions| {
                     extensions
                         .into_iter()
-                        .map(ExtensionConfig::try_from)
+                        .map(extension_from_dto)
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
@@ -61,7 +61,7 @@ impl TryFrom<Recipe> for RecipeDto {
                 .map(|extensions| {
                     extensions
                         .into_iter()
-                        .map(RecipeExtensionDto::try_from)
+                        .map(extension_to_dto)
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
@@ -279,177 +279,174 @@ impl From<SuccessCheck> for RecipeSuccessCheckDto {
     }
 }
 
-impl TryFrom<RecipeExtensionDto> for ExtensionConfig {
-    type Error = anyhow::Error;
-
-    fn try_from(dto: RecipeExtensionDto) -> Result<Self> {
-        Ok(match dto {
-            RecipeExtensionDto::Builtin {
-                name,
-                description,
-                display_name,
-                timeout,
-                bundled,
-                available_tools,
-            } => Self::Builtin {
-                name,
-                description: description.unwrap_or_default(),
-                display_name,
-                timeout,
-                bundled,
-                available_tools: available_tools.unwrap_or_default(),
-            },
-            RecipeExtensionDto::Platform {
-                name,
-                description,
-                display_name,
-                bundled,
-                available_tools,
-            } => Self::Platform {
-                name,
-                description: description.unwrap_or_default(),
-                display_name,
-                bundled,
-                available_tools: available_tools.unwrap_or_default(),
-            },
-            RecipeExtensionDto::Stdio {
-                name,
-                description,
-                cmd,
-                args,
-                envs,
-                env_keys,
-                timeout,
-                cwd,
-                bundled,
-                available_tools,
-            } => Self::Stdio {
-                name,
-                description: description.unwrap_or_default(),
-                cmd,
-                args,
-                envs: Envs::new(envs),
-                env_keys,
-                timeout,
-                cwd,
-                bundled,
-                available_tools: available_tools.unwrap_or_default(),
-            },
-            RecipeExtensionDto::StreamableHttp {
-                name,
-                description,
-                uri,
-                envs,
-                env_keys,
-                headers,
-                timeout,
-                socket,
-                bundled,
-                available_tools,
-            } => Self::StreamableHttp {
-                name,
-                description: description.unwrap_or_default(),
-                uri,
-                envs: Envs::new(envs),
-                env_keys,
-                headers,
-                timeout,
-                socket,
-                bundled,
-                available_tools: available_tools.unwrap_or_default(),
-            },
-        })
-    }
+fn extension_from_dto(dto: RecipeExtensionDto) -> Result<ExtensionConfig> {
+    Ok(match dto {
+        RecipeExtensionDto::Builtin {
+            name,
+            description,
+            display_name,
+            timeout,
+            bundled,
+            available_tools,
+        } => ExtensionConfig::Builtin {
+            name,
+            description: description.unwrap_or_default(),
+            display_name,
+            timeout,
+            bundled,
+            available_tools: available_tools.unwrap_or_default(),
+        },
+        RecipeExtensionDto::Platform {
+            name,
+            description,
+            display_name,
+            bundled,
+            available_tools,
+        } => ExtensionConfig::Platform {
+            name,
+            description: description.unwrap_or_default(),
+            display_name,
+            bundled,
+            available_tools: available_tools.unwrap_or_default(),
+        },
+        RecipeExtensionDto::Stdio {
+            name,
+            description,
+            cmd,
+            args,
+            envs,
+            env_keys,
+            timeout,
+            cwd,
+            bundled,
+            available_tools,
+        } => ExtensionConfig::External(goose_agent::extension::ExtensionConfig::Stdio {
+            name,
+            description: description.unwrap_or_default(),
+            cmd,
+            args,
+            envs: Envs::new(envs),
+            env_keys,
+            timeout,
+            cwd,
+            bundled,
+            available_tools: available_tools.unwrap_or_default(),
+        }),
+        RecipeExtensionDto::StreamableHttp {
+            name,
+            description,
+            uri,
+            envs,
+            env_keys,
+            headers,
+            timeout,
+            socket,
+            client_id,
+            client_secret_key,
+            scopes,
+            bundled,
+            available_tools,
+        } => ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
+            name,
+            description: description.unwrap_or_default(),
+            uri,
+            envs: Envs::new(envs),
+            env_keys,
+            headers,
+            timeout,
+            socket,
+            client_id,
+            client_secret_key,
+            scopes,
+            bundled,
+            available_tools: available_tools.unwrap_or_default(),
+        }),
+    })
 }
 
-impl TryFrom<ExtensionConfig> for RecipeExtensionDto {
-    type Error = anyhow::Error;
-
-    fn try_from(extension: ExtensionConfig) -> Result<Self> {
-        Ok(match extension {
-            ExtensionConfig::Builtin {
-                name,
-                description,
-                display_name,
-                timeout,
-                bundled,
-                available_tools,
-            } => Self::Builtin {
-                name,
-                description: Some(description),
-                display_name,
-                timeout,
-                bundled,
-                available_tools: available_tools_to_wire(available_tools),
-            },
-            ExtensionConfig::Platform {
-                name,
-                description,
-                display_name,
-                bundled,
-                available_tools,
-            } => Self::Platform {
-                name,
-                description: Some(description),
-                display_name,
-                bundled,
-                available_tools: available_tools_to_wire(available_tools),
-            },
-            ExtensionConfig::Stdio {
-                name,
-                description,
-                cmd,
-                args,
-                envs,
-                env_keys,
-                timeout,
-                cwd,
-                bundled,
-                available_tools,
-            } => Self::Stdio {
-                name,
-                description: Some(description),
-                cmd,
-                args,
-                envs: envs.get_env(),
-                env_keys,
-                timeout,
-                cwd,
-                bundled,
-                available_tools: available_tools_to_wire(available_tools),
-            },
-            ExtensionConfig::StreamableHttp {
-                name,
-                description,
-                uri,
-                envs,
-                env_keys,
-                headers,
-                timeout,
-                socket,
-                bundled,
-                available_tools,
-            } => Self::StreamableHttp {
-                name,
-                description: Some(description),
-                uri,
-                envs: envs.get_env(),
-                env_keys,
-                headers,
-                timeout,
-                socket,
-                bundled,
-                available_tools: available_tools_to_wire(available_tools),
-            },
-            ExtensionConfig::Sse { .. } => bail_unsupported_extension("sse")?,
-            ExtensionConfig::Frontend { .. } => bail_unsupported_extension("frontend")?,
-            ExtensionConfig::InlinePython { .. } => bail_unsupported_extension("inline_python")?,
-        })
-    }
-}
-
-fn bail_unsupported_extension(extension_type: &str) -> Result<RecipeExtensionDto> {
-    bail!("recipe extension type `{extension_type}` is not supported by RecipeDto")
+fn extension_to_dto(extension: ExtensionConfig) -> Result<RecipeExtensionDto> {
+    Ok(match extension {
+        ExtensionConfig::Builtin {
+            name,
+            description,
+            display_name,
+            timeout,
+            bundled,
+            available_tools,
+        } => RecipeExtensionDto::Builtin {
+            name,
+            description: Some(description),
+            display_name,
+            timeout,
+            bundled,
+            available_tools: available_tools_to_wire(available_tools),
+        },
+        ExtensionConfig::Platform {
+            name,
+            description,
+            display_name,
+            bundled,
+            available_tools,
+        } => RecipeExtensionDto::Platform {
+            name,
+            description: Some(description),
+            display_name,
+            bundled,
+            available_tools: available_tools_to_wire(available_tools),
+        },
+        ExtensionConfig::External(goose_agent::extension::ExtensionConfig::Stdio {
+            name,
+            description,
+            cmd,
+            args,
+            envs,
+            env_keys,
+            timeout,
+            cwd,
+            bundled,
+            available_tools,
+        }) => RecipeExtensionDto::Stdio {
+            name,
+            description: Some(description),
+            cmd,
+            args,
+            envs: envs.get_env(),
+            env_keys,
+            timeout,
+            cwd,
+            bundled,
+            available_tools: available_tools_to_wire(available_tools),
+        },
+        ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
+            name,
+            description,
+            uri,
+            envs,
+            env_keys,
+            headers,
+            timeout,
+            socket,
+            client_id,
+            client_secret_key,
+            scopes,
+            bundled,
+            available_tools,
+        }) => RecipeExtensionDto::StreamableHttp {
+            name,
+            description: Some(description),
+            uri,
+            envs: envs.get_env(),
+            env_keys,
+            headers,
+            timeout,
+            socket,
+            client_id,
+            client_secret_key,
+            scopes,
+            bundled,
+            available_tools: available_tools_to_wire(available_tools),
+        },
+    })
 }
 
 fn available_tools_to_wire(available_tools: Vec<String>) -> Option<Vec<String>> {
@@ -523,6 +520,9 @@ mod tests {
                     headers: HashMap::from([("X-Test".to_string(), "true".to_string())]),
                     timeout: Some(30),
                     socket: None,
+                    client_id: None,
+                    client_secret_key: None,
+                    scopes: vec![],
                     bundled: Some(false),
                     available_tools: Some(vec!["fetch".to_string()]),
                 },
@@ -586,22 +586,24 @@ mod tests {
             extension => panic!("expected builtin extension, got {extension:?}"),
         }
         match &recipe.extensions.as_ref().unwrap()[1] {
-            ExtensionConfig::Stdio {
+            ExtensionConfig::External(goose_agent::extension::ExtensionConfig::Stdio {
                 envs,
                 available_tools,
                 ..
-            } => {
+            }) => {
                 assert_eq!(envs.get_env()["LOCAL_MODE"], "true");
                 assert_eq!(available_tools, &vec!["run".to_string()]);
             }
             extension => panic!("expected stdio extension, got {extension:?}"),
         }
         match &recipe.extensions.as_ref().unwrap()[2] {
-            ExtensionConfig::StreamableHttp {
-                envs,
-                available_tools,
-                ..
-            } => {
+            ExtensionConfig::External(
+                goose_agent::extension::ExtensionConfig::StreamableHttp {
+                    envs,
+                    available_tools,
+                    ..
+                },
+            ) => {
                 assert_eq!(envs.get_env()["REMOTE_MODE"], "true");
                 assert_eq!(available_tools, &vec!["fetch".to_string()]);
             }
@@ -624,35 +626,5 @@ mod tests {
         assert_eq!(serialized["extensions"][1]["available_tools"][0], "run");
         assert_eq!(serialized["extensions"][2]["envs"]["REMOTE_MODE"], "true");
         assert_eq!(serialized["extensions"][2]["available_tools"][0], "fetch");
-    }
-
-    #[test]
-    fn recipe_dto_rejects_unsupported_internal_extension_variants() {
-        let recipe = Recipe {
-            version: "1.0.0".to_string(),
-            title: "Unsupported Extension".to_string(),
-            description: "Uses an unsupported recipe extension".to_string(),
-            instructions: Some("Run".to_string()),
-            prompt: None,
-            extensions: Some(vec![ExtensionConfig::InlinePython {
-                name: "inline".to_string(),
-                description: "Inline Python".to_string(),
-                code: "print('hello')".to_string(),
-                timeout: Some(30),
-                dependencies: None,
-                available_tools: Vec::new(),
-            }]),
-            settings: None,
-            activities: None,
-            author: None,
-            parameters: None,
-            response: None,
-            sub_recipes: None,
-            retry: None,
-        };
-
-        let err = RecipeDto::try_from(recipe).unwrap_err().to_string();
-        assert!(err.contains("inline_python"));
-        assert!(err.contains("not supported"));
     }
 }

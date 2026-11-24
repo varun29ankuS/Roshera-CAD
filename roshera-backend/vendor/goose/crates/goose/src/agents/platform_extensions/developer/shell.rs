@@ -3,22 +3,15 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(not(windows))]
-use std::sync::Arc;
-#[cfg(not(windows))]
-use std::sync::Mutex;
 use std::time::Duration;
 
 use rmcp::model::{Annotations, CallToolResult, ContentBlock, TextContent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
-#[cfg(not(windows))]
-use tokio::sync::OnceCell;
-#[cfg(not(windows))]
-use tokio::task::JoinHandle;
 use tokio_stream::{wrappers::SplitStream, StreamExt};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::agents::tool_execution::ToolCallNotificationEmitter;
 use crate::subprocess::SubprocessExt;
@@ -28,6 +21,7 @@ pub use super::shell_output_streaming::{
     ShellOutputStream, DEVELOPER_SHELL_OUTPUT_NOTIFICATION_METHOD,
 };
 use super::shell_output_streaming::{ShellOutputBatcher, SHELL_LIVE_OUTPUT_FLUSH_INTERVAL};
+use super::shell_process::ShellProcess;
 
 /// Check if the current process is running inside a Flatpak sandbox.
 ///
@@ -41,49 +35,58 @@ pub(crate) fn is_flatpak() -> bool {
 #[cfg(not(windows))]
 const FLATPAK_HOST_ARGS: [&str; 2] = ["--host", "--watch-bus"];
 
+/// `flatpak-spawn --host` runs commands with the session helper's environment, not
+/// ours, and nothing outside the sandbox can resolve the host's login-shell PATH
+/// for us, so pass it along explicitly.
 #[cfg(not(windows))]
-pub(crate) fn flatpak_spawn_command() -> tokio::process::Command {
+pub(crate) async fn flatpak_spawn_command() -> tokio::process::Command {
+    static HOST_LOGIN_PATH: tokio::sync::OnceCell<Option<String>> =
+        tokio::sync::OnceCell::const_new();
+    let host_path = HOST_LOGIN_PATH.get_or_init(resolve_host_login_path).await;
+
     let mut command = tokio::process::Command::new("flatpak-spawn");
     command.args(FLATPAK_HOST_ARGS);
-    command
-}
-
-#[cfg(not(windows))]
-fn flatpak_spawn_process() -> std::process::Command {
-    let mut command = std::process::Command::new("flatpak-spawn");
-    command.args(FLATPAK_HOST_ARGS);
-    command
-}
-
-#[cfg(not(windows))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UnixShellFlavor {
-    Posix,
-    Nushell,
-}
-
-#[cfg(not(windows))]
-fn unix_shell_flavor(shell: &str) -> UnixShellFlavor {
-    let name = std::path::Path::new(shell)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(shell)
-        .to_ascii_lowercase();
-
-    match name.as_str() {
-        "nu" | "nushell" => UnixShellFlavor::Nushell,
-        _ => UnixShellFlavor::Posix,
+    if let Some(path) = host_path {
+        command.arg(format!("--env=PATH={path}"));
     }
+    command
+}
+
+/// Flatpak sets `SHELL=/bin/sh` inside the sandbox, so the login shell has to come
+/// from the host's account database.
+#[cfg(not(windows))]
+async fn resolve_host_login_path() -> Option<String> {
+    let passwd = run_on_host(&["sh", "-c", r#"getent passwd "$(id -un)""#]).await;
+    let shell = passwd
+        .as_deref()
+        .and_then(|entry| entry.split(':').nth(6))
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or("bash");
+    run_on_host(&[shell, "-l", "-i", "-c", "printenv PATH"]).await
 }
 
 #[cfg(not(windows))]
-fn unix_login_shell_command_args(shell: &str) -> [&'static str; 4] {
-    let probe = match unix_shell_flavor(shell) {
-        UnixShellFlavor::Nushell => "print ($env.PATH | str join (char esep))",
-        UnixShellFlavor::Posix => "echo $PATH",
-    };
-
-    ["-l", "-i", "-c", probe]
+async fn run_on_host(args: &[&str]) -> Option<String> {
+    let mut command = tokio::process::Command::new("flatpak-spawn");
+    command
+        .args(FLATPAK_HOST_ARGS)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(not(windows))]
@@ -91,13 +94,13 @@ fn unix_shell_command_args(command_line: &str) -> [&str; 2] {
     ["-c", command_line]
 }
 
-/// Resolve the preferred Unix shell for command execution, respecting GOOSE_SHELL.
+/// Resolve the shell used to run Developer extension commands on Windows,
+/// respecting `GOOSE_SHELL`.
 ///
-/// Auto-detected shells are returned as basenames (e.g. `"bash"`) so that
-/// `Command::new` resolves them on `PATH` at spawn time — this also keeps
-/// Flatpak happy, where absolute paths from inside the sandbox don't match
-/// the host filesystem. `GOOSE_SHELL` is passed through as-is.
-///
+/// Defaults to `cmd` when `GOOSE_SHELL` is unset. The invocation flags are
+/// chosen automatically from the executable name in `build_shell_command`,
+/// so callers only ever provide a bare executable path or name — see that
+/// function for the flag mapping.
 #[cfg(windows)]
 fn windows_shell() -> String {
     std::env::var("GOOSE_SHELL").unwrap_or_else(|_| "cmd".to_string())
@@ -156,8 +159,9 @@ fn unix_shell() -> String {
 }
 
 const OUTPUT_LIMIT_LINES: usize = 2000;
-pub const OUTPUT_LIMIT_BYTES: usize = 50_000;
+const OUTPUT_LIMIT_BYTES: usize = 50_000;
 const OUTPUT_PREVIEW_LINES: usize = 50;
+const OUTPUT_PREVIEW_BYTES: usize = 10_000;
 
 const OUTPUT_SLOTS: usize = 8;
 
@@ -205,152 +209,16 @@ pub struct ShellOutput {
     pub output_collection_error: Option<String>,
 }
 
-/// Resolve the user's full PATH by running a login shell.
-///
-/// When goosed is launched from a desktop app (e.g. Electron), it may inherit
-/// a minimal PATH like `/usr/bin:/bin`. This function spawns a login shell to
-/// source the user's profile and recover the full PATH.
-#[cfg(not(windows))]
-pub(crate) fn resolve_login_shell_path() -> Option<String> {
-    use process_wrap::std::{CommandWrap, ProcessSession};
-
-    let shell = unix_shell();
-    let login_args = unix_login_shell_command_args(&shell);
-
-    // Build the command, varying only the flatpak vs direct invocation.
-    let mut cmd = if is_flatpak() {
-        let mut c = flatpak_spawn_process();
-        c.arg(&shell).args(login_args);
-        CommandWrap::from(c)
-    } else {
-        let mut c = std::process::Command::new(&shell);
-        c.args(login_args);
-        CommandWrap::from(c)
-    };
-
-    cmd.command_mut()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-
-    // Spawn in a new session so that bash's interactive job-control setup
-    // (TIOCSPGRP) cannot steal the terminal foreground from goose, which
-    // would cause goose to receive SIGTTIN and be suspended on startup.
-    cmd.wrap(ProcessSession);
-
-    let mut child = cmd.spawn().ok()?;
-
-    let mut stdout = child.stdout().take()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        use std::io::Read;
-        if stdout.read_to_end(&mut buf).is_ok() {
-            let _ = tx.send(buf);
-        }
-    });
-
-    match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(buf)
-            if child
-                .wait()
-                .is_ok_and(|s: std::process::ExitStatus| s.success()) =>
-        {
-            // Take the last non-empty line — interactive shells may emit
-            // extra output from profile scripts before our echo.
-            String::from_utf8_lossy(&buf)
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .map(|line| line.trim().to_string())
-                .filter(|path| !path.is_empty())
-        }
-        _ => {
-            let _ = child.kill();
-            None
-        }
-    }
-}
-
-/// Resolves the user's login-shell PATH in the background.
-///
-/// Spawned at `ShellTool` construction so the ~hundreds-of-ms cost of sourcing
-/// the user's shell profile overlaps with the rest of agent setup and the
-/// first LLM turn. The first `shell` invocation awaits the result; subsequent
-/// invocations read from the cached cell.
-#[cfg(not(windows))]
-struct LoginPath {
-    cell: OnceCell<Option<Arc<str>>>,
-    handle: Mutex<Option<JoinHandle<Option<String>>>>,
-}
-
-#[cfg(not(windows))]
-impl LoginPath {
-    fn spawn() -> Self {
-        let handle = tokio::task::spawn_blocking(resolve_login_shell_path);
-        Self {
-            cell: OnceCell::new(),
-            handle: Mutex::new(Some(handle)),
-        }
-    }
-
-    fn resolved(value: Option<String>) -> Self {
-        let cell = OnceCell::new();
-        let _ = cell.set(value.map(Arc::from));
-        Self {
-            cell,
-            handle: Mutex::new(None),
-        }
-    }
-
-    async fn get(&self) -> Option<Arc<str>> {
-        self.cell
-            .get_or_init(|| async {
-                let handle = self
-                    .handle
-                    .lock()
-                    .expect("login_path mutex poisoned")
-                    .take();
-                match handle {
-                    Some(h) => h.await.ok().flatten().map(Arc::from),
-                    None => None,
-                }
-            })
-            .await
-            .clone()
-    }
-}
-
 pub struct ShellTool {
     output_dir: tempfile::TempDir,
     call_index: AtomicUsize,
-    #[cfg(not(windows))]
-    login_path: LoginPath,
 }
 
 impl ShellTool {
-    pub fn new(use_login_shell_path: bool) -> std::io::Result<Self> {
-        #[cfg(windows)]
-        let _unused = use_login_shell_path;
+    pub fn new() -> std::io::Result<Self> {
         Ok(Self {
-            output_dir: tempfile::tempdir()?,
+            output_dir: crate::utils::private_tempdir_builder().tempdir()?,
             call_index: AtomicUsize::new(0),
-            #[cfg(not(windows))]
-            login_path: if use_login_shell_path {
-                LoginPath::spawn()
-            } else {
-                LoginPath::resolved(None)
-            },
-        })
-    }
-
-    #[cfg(test)]
-    pub fn new_for_test() -> std::io::Result<Self> {
-        Ok(Self {
-            output_dir: tempfile::tempdir()?,
-            call_index: AtomicUsize::new(0),
-            #[cfg(not(windows))]
-            login_path: LoginPath::resolved(None),
         })
     }
 
@@ -388,18 +256,20 @@ impl ShellTool {
             return Self::error_result("Command cannot be empty.", None);
         }
 
-        #[cfg(not(windows))]
-        let login_path = self.login_path.get().await;
-        #[cfg(not(windows))]
-        let login_path_ref = login_path.as_deref();
         #[cfg(windows)]
-        let login_path_ref: Option<&str> = None;
+        if shell_basename(&windows_shell()) == "cmd" && params.command.contains(['\n', '\r']) {
+            return Self::error_result(
+                "cmd.exe silently truncates commands at newlines — only the first line executes, \
+                 with exit code 0. Use `&` to chain commands on one line \
+                 (e.g. `echo a & echo b`), or set GOOSE_SHELL=powershell.",
+                None,
+            );
+        }
 
         let execution = match run_command(
             &params.command,
             params.timeout_secs,
             working_dir,
-            login_path_ref,
             session_id,
             notification_emitter,
             cancellation_token,
@@ -547,71 +417,70 @@ async fn run_command(
     command_line: &str,
     timeout_secs: Option<u64>,
     working_dir: Option<&std::path::Path>,
-    login_path: Option<&str>,
     session_id: Option<&str>,
     notification_emitter: Option<ToolCallNotificationEmitter>,
     cancellation_token: CancellationToken,
 ) -> Result<ExecutionOutput, String> {
-    let timeout_secs = Some(resolve_shell_timeout(timeout_secs));
+    let deadline = Some(resolve_shell_timeout(timeout_secs))
+        .filter(|secs| *secs > 0)
+        .map(|secs| tokio::time::Instant::now() + Duration::from_secs(secs));
+    let not_started = |timed_out| ExecutionOutput {
+        lines: Vec::new(),
+        exit_code: None,
+        timed_out,
+        output_truncated: false,
+        output_collection_error: None,
+    };
 
-    let mut command = build_shell_command(command_line, working_dir, login_path, session_id);
+    let mut command = tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => return Ok(not_started(false)),
+        _ = sleep_until_deadline(deadline) => return Ok(not_started(true)),
+        command = build_shell_command(command_line, working_dir, session_id) => command,
+    };
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.stdin(Stdio::null());
 
-    let mut child = command
-        .spawn()
+    let mut process = ShellProcess::spawn(&mut command)
         .map_err(|error| format!("Failed to spawn shell command: {}", error))?;
 
-    let child_stdout = child
+    let child_stdout = process
+        .child
         .stdout
         .take()
         .ok_or_else(|| "Failed to capture stdout".to_string())?;
-    let child_stderr = child
+    let child_stderr = process
+        .child
         .stderr
         .take()
         .ok_or_else(|| "Failed to capture stderr".to_string())?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let output_task = tokio::spawn(collect_tagged_lines(
+    let output_task = AbortOnDropHandle::new(tokio::spawn(collect_tagged_lines(
         child_stdout,
         child_stderr,
         tx,
         notification_emitter,
-    ));
+    )));
     let abort_handle = output_task.abort_handle();
 
     let mut timed_out = false;
-    let exit_code = if let Some(timeout_secs) = timeout_secs.filter(|value| *value > 0) {
-        tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()) => match result {
-                Ok(wait_result) => wait_result
-                    .map_err(|error| format!("Failed waiting on shell command: {}", error))?
-                    .code(),
-                Err(_) => {
-                    timed_out = true;
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    None
-                }
-            },
-            _ = cancellation_token.cancelled() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                None
-            }
+    let exit_code = tokio::select! {
+        result = process.wait() => result
+            .map_err(|error| format!("Failed waiting on shell command: {}", error))?
+            .code(),
+        _ = sleep_until_deadline(deadline) => {
+            timed_out = true;
+            process.kill().await
+                .map_err(|error| format!("Failed to stop shell command: {}", error))?;
+            None
         }
-    } else {
-        tokio::select! {
-            result = child.wait() => result
-                .map_err(|error| format!("Failed waiting on shell command: {}", error))?
-                .code(),
-            _ = cancellation_token.cancelled() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                None
-            }
+        _ = cancellation_token.cancelled() => {
+            process.kill().await
+                .map_err(|error| format!("Failed to stop shell command: {}", error))?;
+            None
         }
     };
 
@@ -656,10 +525,28 @@ async fn run_command(
     })
 }
 
-fn build_shell_command(
+async fn sleep_until_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Build the `Command` that executes a single command line via the configured shell.
+///
+/// The invocation flags are selected automatically from the shell executable
+/// name, so setting `GOOSE_SHELL` to a bare executable is enough — users never
+/// need to supply command-style flags themselves:
+///
+/// - PowerShell (`pwsh`, `powershell`) → `-NoProfile -NonInteractive -Command`
+/// - cmd (`cmd`) → `/C`
+/// - POSIX shells (bash, zsh, … via Cygwin/MSYS2) → `-c`
+///
+/// On Unix the default shell (`bash`, falling back to `sh`) is likewise invoked
+/// as `<shell> -c <line>`.
+async fn build_shell_command(
     command_line: &str,
     working_dir: Option<&std::path::Path>,
-    login_path: Option<&str>,
     session_id: Option<&str>,
 ) -> tokio::process::Command {
     #[cfg(windows)]
@@ -682,9 +569,6 @@ fn build_shell_command(
         if let Some(path) = working_dir {
             command.current_dir(path);
         }
-        if let Some(path) = login_path {
-            command.env("PATH", path);
-        }
         command
     };
 
@@ -693,26 +577,12 @@ fn build_shell_command(
         let shell = unix_shell();
 
         if is_flatpak() {
-            let mut command = flatpak_spawn_command();
-            if let Some(dir) = working_dir {
-                command.arg(format!("--directory={}", dir.display()));
-            }
-            if let Some(path) = login_path {
-                command.arg(format!("--env=PATH={}", path));
-            }
-            apply_flatpak_session_environment(&mut command, session_id);
-            command
-                .arg(&shell)
-                .args(unix_shell_command_args(command_line));
-            command
+            flatpak_shell_command(&shell, command_line, working_dir, session_id).await
         } else {
             let mut command = tokio::process::Command::new(shell);
             command.args(unix_shell_command_args(command_line));
             if let Some(path) = working_dir {
                 command.current_dir(path);
-            }
-            if let Some(path) = login_path {
-                command.env("PATH", path);
             }
             apply_session_environment(&mut command, session_id);
             command
@@ -725,7 +595,28 @@ fn build_shell_command(
     command
 }
 
+#[cfg(not(windows))]
+async fn flatpak_shell_command(
+    shell: &str,
+    command_line: &str,
+    working_dir: Option<&std::path::Path>,
+    session_id: Option<&str>,
+) -> tokio::process::Command {
+    let mut command = flatpak_spawn_command().await;
+    if let Some(dir) = working_dir {
+        command.arg(format!("--directory={}", dir.display()));
+    }
+    apply_flatpak_session_environment(&mut command, session_id);
+    command
+        .arg(shell)
+        .args(unix_shell_command_args(command_line));
+    command
+}
+
+const AGENT_ENVIRONMENT: [(&str, &str); 2] = [("AGENT", "goose"), ("GOOSE_TERMINAL", "1")];
+
 fn apply_session_environment(command: &mut tokio::process::Command, session_id: Option<&str>) {
+    command.envs(AGENT_ENVIRONMENT);
     if let Some(session_id) = session_id.filter(|id| !id.is_empty()) {
         command.env("AGENT_SESSION_ID", session_id);
     } else {
@@ -738,6 +629,9 @@ fn apply_flatpak_session_environment(
     command: &mut tokio::process::Command,
     session_id: Option<&str>,
 ) {
+    for (key, value) in AGENT_ENVIRONMENT {
+        command.arg(format!("--env={key}={value}"));
+    }
     if let Some(session_id) = session_id.filter(|id| !id.is_empty()) {
         command.arg(format!("--env=AGENT_SESSION_ID={session_id}"));
     } else {
@@ -878,7 +772,7 @@ fn truncate_output(
     let output_path = save_full_output(full_output, label, output_dir)?;
 
     let preview_start = total_lines.saturating_sub(OUTPUT_PREVIEW_LINES);
-    let preview = lines[preview_start..].join("\n");
+    let preview = truncate_preview_bytes(lines[preview_start..].join("\n"));
 
     let reason = if exceeded_lines {
         format!("Output exceeded {OUTPUT_LIMIT_LINES} line limit ({total_lines} lines total).")
@@ -896,6 +790,21 @@ fn truncate_output(
             reason,
         }),
     })
+}
+
+/// Keep the preview's tail within OUTPUT_PREVIEW_BYTES so lines without
+/// newlines (progress bars using `\r`, minified or base64 content) cannot
+/// smuggle an unbounded preview past the line-based truncation.
+#[allow(clippy::string_slice)] // The start index is snapped to a char boundary.
+fn truncate_preview_bytes(preview: String) -> String {
+    if preview.len() <= OUTPUT_PREVIEW_BYTES {
+        return preview;
+    }
+    let mut start = preview.len() - OUTPUT_PREVIEW_BYTES;
+    while !preview.is_char_boundary(start) {
+        start += 1;
+    }
+    preview[start..].to_string()
 }
 
 fn save_full_output(
@@ -930,7 +839,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_executes_command() {
-        let tool = ShellTool::new_for_test().unwrap();
+        let tool = ShellTool::new().unwrap();
         let result = tool
             .shell(ShellParams {
                 command: "echo hello".to_string(),
@@ -942,10 +851,24 @@ mod tests {
         assert!(extract_text(&result).contains("hello"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn output_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tool = ShellTool::new().unwrap();
+        let mode = std::fs::metadata(tool.output_dir.path())
+            .unwrap()
+            .permissions()
+            .mode();
+
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
     #[cfg(not(windows))]
     #[tokio::test]
     async fn full_live_notification_channel_does_not_change_final_output() {
-        let tool = ShellTool::new_for_test().unwrap();
+        let tool = ShellTool::new().unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
         let result = tool
             .shell_with_cwd_and_emitter(
@@ -970,7 +893,7 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn shell_returns_error_for_non_zero_exit() {
-        let tool = ShellTool::new_for_test().unwrap();
+        let tool = ShellTool::new().unwrap();
         let result = tool
             .shell(ShellParams {
                 command: "echo fail && exit 7".to_string(),
@@ -986,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn shell_uses_working_dir_for_relative_execution() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellTool::new_for_test().unwrap();
+        let tool = ShellTool::new().unwrap();
         let result = tool
             .shell_with_cwd(
                 ShellParams {
@@ -1019,13 +942,14 @@ mod tests {
 
             apply_session_environment(&mut command, session_id);
 
-            assert_eq!(
-                command
-                    .as_std()
-                    .get_envs()
-                    .find_map(|(key, value)| (key == "AGENT_SESSION_ID").then_some(value)),
-                expected
-            );
+            let envs: Vec<_> = command.as_std().get_envs().collect();
+            let env = |name: &str| {
+                envs.iter()
+                    .find_map(|(key, value)| (*key == name).then_some(*value))
+            };
+            assert_eq!(env("AGENT_SESSION_ID"), expected);
+            assert_eq!(env("AGENT"), Some(Some(std::ffi::OsStr::new("goose"))));
+            assert_eq!(env("GOOSE_TERMINAL"), Some(Some(std::ffi::OsStr::new("1"))));
         }
     }
 
@@ -1046,7 +970,7 @@ mod tests {
                     .get_args()
                     .map(|arg| arg.to_string_lossy().into_owned())
                     .collect::<Vec<_>>(),
-                vec![expected]
+                vec!["--env=AGENT=goose", "--env=GOOSE_TERMINAL=1", expected]
             );
         }
     }
@@ -1054,7 +978,7 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn shell_kills_child_on_cancellation() {
-        let tool = ShellTool::new_for_test().unwrap();
+        let tool = ShellTool::new().unwrap();
         let token = CancellationToken::new();
         let token_clone = token.clone();
 
@@ -1088,28 +1012,50 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[test]
-    fn unix_shell_flavor_detects_nushell_names() {
-        assert_eq!(unix_shell_flavor("nu"), UnixShellFlavor::Nushell);
-        assert_eq!(unix_shell_flavor("nushell"), UnixShellFlavor::Nushell);
-        assert_eq!(
-            unix_shell_flavor("/etc/profiles/per-user/can/bin/nu"),
-            UnixShellFlavor::Nushell
-        );
-        assert_eq!(unix_shell_flavor("/bin/bash"), UnixShellFlavor::Posix);
-    }
+    #[tokio::test]
+    async fn flatpak_commands_carry_the_host_accounts_login_path() {
+        use std::os::unix::fs::PermissionsExt;
 
-    #[cfg(not(windows))]
-    #[test]
-    fn unix_login_shell_command_args_use_nushell_probe() {
-        assert_eq!(
-            unix_login_shell_command_args("nu"),
-            ["-l", "-i", "-c", "print ($env.PATH | str join (char esep))"]
+        let dir = tempfile::tempdir().unwrap();
+        let login_shell = dir.path().join("login-shell");
+        let fake_spawn = dir.path().join("flatpak-spawn");
+        std::fs::write(
+            &login_shell,
+            "#!/bin/sh\n[ \"$*\" = '-l -i -c printenv PATH' ] || exit 1\necho 'Welcome back!'\necho\necho /home/me/.cargo/bin:/usr/bin\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &fake_spawn,
+            format!(
+                "#!/bin/sh\n[ \"$1 $2\" = '--host --watch-bus' ] || exit 1\nshift 2\nif [ \"$1\" = sh ]; then echo 'me:x:1000:1000::/home/me:{}'; exit; fi\nexec \"$@\"\n",
+                login_shell.display()
+            ),
+        )
+        .unwrap();
+        for script in [&login_shell, &fake_spawn] {
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap()
         );
-        assert_eq!(
-            unix_login_shell_command_args("/bin/bash"),
-            ["-l", "-i", "-c", "echo $PATH"]
-        );
+        let _guard = env_lock::lock_env([("PATH", Some(path.as_str()))]);
+
+        let shell_command =
+            flatpak_shell_command("bash", "echo hi", Some(dir.path()), Some("session-1")).await;
+        let hook_command = crate::hooks::flatpak_hook_command("echo hi", dir.path()).await;
+
+        for command in [&shell_command, &hook_command] {
+            let command = command.as_std();
+            let args: Vec<_> = command.get_args().collect();
+            assert_eq!(command.get_program(), "flatpak-spawn");
+            assert!(
+                args.iter()
+                    .any(|arg| *arg == "--env=PATH=/home/me/.cargo/bin:/usr/bin"),
+                "{args:?}"
+            );
+        }
     }
 
     #[cfg(not(windows))]
@@ -1189,6 +1135,30 @@ mod tests {
     }
 
     #[test]
+    fn render_output_preview_is_byte_bounded_for_giant_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "x".repeat(200_000);
+
+        let result = render_output(&input, "test_giant_line", dir.path()).unwrap();
+
+        assert!(result.text.len() <= OUTPUT_PREVIEW_BYTES);
+        let info = result
+            .truncation
+            .as_ref()
+            .expect("expected truncation info");
+        assert!(info.reason.contains("byte limit"));
+        assert_eq!(std::fs::read_to_string(&info.path).unwrap().len(), 200_000);
+    }
+
+    #[test]
+    fn truncate_preview_bytes_respects_char_boundaries() {
+        let preview = "é".repeat(OUTPUT_PREVIEW_BYTES);
+        let truncated = truncate_preview_bytes(preview);
+        assert!(truncated.len() <= OUTPUT_PREVIEW_BYTES);
+        assert!(truncated.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
     fn save_full_output_reuses_same_path() {
         let dir = tempfile::tempdir().unwrap();
         let path1 = save_full_output("first", "test_reuse", dir.path()).unwrap();
@@ -1211,7 +1181,7 @@ mod tests {
 
     #[test]
     fn call_index_cycles_through_slots() {
-        let tool = ShellTool::new_for_test().unwrap();
+        let tool = ShellTool::new().unwrap();
         for _cycle in 0..3 {
             for expected in 0..OUTPUT_SLOTS {
                 let slot = tool.call_index.fetch_add(1, Ordering::Relaxed) % OUTPUT_SLOTS;
@@ -1220,9 +1190,32 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_rejects_newline_in_command() {
+        for command in ["echo a\necho b", "echo a\r\necho b", "echo a\recho b"] {
+            let tool = ShellTool::new().unwrap();
+            let result = tool
+                .shell(ShellParams {
+                    command: command.to_string(),
+                    timeout_secs: None,
+                })
+                .await;
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "expected error for {command:?}"
+            );
+            assert!(
+                extract_text(&result).contains("cmd.exe"),
+                "error should mention cmd.exe for {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn concurrent_calls_get_distinct_slots() {
-        let tool = ShellTool::new_for_test().unwrap();
+        let tool = ShellTool::new().unwrap();
         let mut slots: Vec<usize> = (0..OUTPUT_SLOTS)
             .map(|_| tool.call_index.fetch_add(1, Ordering::Relaxed) % OUTPUT_SLOTS)
             .collect();
@@ -1243,7 +1236,7 @@ mod tests {
             }
         }
 
-        let tool = ShellTool::new_for_test().unwrap();
+        let tool = ShellTool::new().unwrap();
         let start = std::time::Instant::now();
         let result = tool
             .shell(ShellParams {
@@ -1298,7 +1291,7 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn shell_kills_hanging_command_after_explicit_timeout() {
-        let tool = ShellTool::new_for_test().unwrap();
+        let tool = ShellTool::new().unwrap();
         let start = std::time::Instant::now();
         let result = tool
             .shell(ShellParams {

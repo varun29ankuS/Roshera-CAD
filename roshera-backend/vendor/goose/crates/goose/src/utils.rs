@@ -28,14 +28,16 @@ pub fn contains_unicode_tags(text: &str) -> bool {
     text.chars().any(is_in_unicode_tag_range)
 }
 
+pub fn strip_unicode_tags(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !is_in_unicode_tag_range(c))
+        .collect()
+}
+
 /// Sanitize Unicode Tags Block characters from text
 pub fn sanitize_unicode_tags(text: &str) -> String {
     let normalized: String = text.nfc().collect();
-
-    normalized
-        .chars()
-        .filter(|&c| !is_in_unicode_tag_range(c))
-        .collect()
+    strip_unicode_tags(&normalized)
 }
 
 /// Safely truncate a string at character boundaries, not byte boundaries
@@ -56,6 +58,24 @@ pub fn safe_truncate(s: &str, max_chars: usize) -> String {
         let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
         format!("{}...", truncated)
     }
+}
+
+/// `tempfile` creates directories with the default mode, so under a shared temporary root
+/// other users could read what goose writes into them. On Unix this builder creates them
+/// with `0700` instead.
+#[cfg(unix)]
+pub fn private_tempdir_builder() -> tempfile::Builder<'static, 'static> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut builder = tempfile::Builder::new();
+    builder.permissions(std::fs::Permissions::from_mode(0o700));
+    builder
+}
+
+// The Windows temporary directory is already private to each user.
+#[cfg(not(unix))]
+pub fn private_tempdir_builder() -> tempfile::Builder<'static, 'static> {
+    tempfile::Builder::new()
 }
 
 pub fn is_token_cancelled(cancellation_token: &Option<CancellationToken>) -> bool {
@@ -132,6 +152,12 @@ mod tests {
         let clean_text = "Hello world 世界 🌍";
         let cleaned = sanitize_unicode_tags(clean_text);
         assert_eq!(cleaned, clean_text);
+    }
+
+    #[test]
+    fn test_strip_unicode_tags_preserves_canonical_form() {
+        let decomposed = "cafe\u{301}\u{E0041}";
+        assert_eq!(strip_unicode_tags(decomposed), "cafe\u{301}");
     }
 
     #[test]
@@ -216,6 +242,21 @@ mod tests {
             split_command_args("O'Reilly wrote don't split").unwrap(),
             vec!["O'Reilly", "wrote", "don't", "split"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_tempdir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = private_tempdir_builder().tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let nested = private_tempdir_builder().tempdir_in(parent.path()).unwrap();
+
+        for path in [dir.path(), nested.path()] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", path.display());
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@ use rmcp::{
         CallToolResult, ContentBlock, ErrorCode, ErrorData, Implementation, InitializeResult,
         ListResourcesResult, MetaObject, PaginatedRequestParams, ReadResourceRequestParams,
         ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
-        ServerInfo,
+        ServerConfig,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
@@ -75,43 +75,6 @@ const UI_RESOURCES: &[UIResourceDef] = &[
         description: "Diagram visualization from Mermaid syntax",
     },
 ];
-
-/// Validates that the data parameter is a proper JSON value and not a string
-fn validate_data_param(params: &Value, allow_array: bool) -> Result<Value, ErrorData> {
-    let data_value = params.get("data").ok_or_else(|| {
-        ErrorData::new(
-            ErrorCode::INVALID_PARAMS,
-            "Missing 'data' parameter".to_string(),
-            None,
-        )
-    })?;
-
-    if data_value.is_string() {
-        return Err(ErrorData::new(
-            ErrorCode::INVALID_PARAMS,
-            "The 'data' parameter must be a JSON object, not a JSON string. Please provide valid JSON without comments.".to_string(),
-            None,
-        ));
-    }
-
-    if allow_array {
-        if !data_value.is_object() && !data_value.is_array() {
-            return Err(ErrorData::new(
-                ErrorCode::INVALID_PARAMS,
-                "The 'data' parameter must be a JSON object or array.".to_string(),
-                None,
-            ));
-        }
-    } else if !data_value.is_object() {
-        return Err(ErrorData::new(
-            ErrorCode::INVALID_PARAMS,
-            "The 'data' parameter must be a JSON object.".to_string(),
-            None,
-        ));
-    }
-
-    Ok(data_value.clone())
-}
 
 fn validation_err(msg: impl Into<String>) -> ErrorData {
     ErrorData::new(ErrorCode::INVALID_PARAMS, msg.into(), None)
@@ -662,7 +625,7 @@ impl Default for AutoVisualiserRouter {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AutoVisualiserRouter {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         InitializeResult::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -890,16 +853,8 @@ Example:
     ) -> Result<CallToolResult, ErrorData> {
         let inner = params.0;
         inner.data.validate()?;
-        let data = validate_data_param(
-            &serde_json::to_value(inner).map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INVALID_PARAMS,
-                    format!("Invalid parameters: {}", e),
-                    None,
-                )
-            })?,
-            false,
-        )?;
+        let data = serde_json::to_value(inner.data)
+            .map_err(|e| validation_err(format!("Invalid parameters: {e}")))?;
 
         let node_count = data
             .get("nodes")
@@ -954,16 +909,8 @@ Example:
     ) -> Result<CallToolResult, ErrorData> {
         let inner = params.0;
         inner.data.validate()?;
-        let data = validate_data_param(
-            &serde_json::to_value(inner).map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INVALID_PARAMS,
-                    format!("Invalid parameters: {}", e),
-                    None,
-                )
-            })?,
-            false,
-        )?;
+        let data = serde_json::to_value(inner.data)
+            .map_err(|e| validation_err(format!("Invalid parameters: {e}")))?;
 
         let label_count = data
             .get("labels")
@@ -1033,16 +980,8 @@ Example multiple charts (array of chart objects):
     ) -> Result<CallToolResult, ErrorData> {
         let inner = params.0;
         validate_donut_charts(&inner.data)?;
-        let data = validate_data_param(
-            &serde_json::to_value(inner).map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INVALID_PARAMS,
-                    format!("Invalid parameters: {}", e),
-                    None,
-                )
-            })?,
-            true,
-        )?;
+        let data = serde_json::to_value(inner.data)
+            .map_err(|e| validation_err(format!("Invalid parameters: {e}")))?;
 
         let charts = data.as_array().ok_or_else(|| {
             ErrorData::new(
@@ -1101,16 +1040,8 @@ Example:
     ) -> Result<CallToolResult, ErrorData> {
         let inner = params.0;
         inner.data.validate()?;
-        let data = validate_data_param(
-            &serde_json::to_value(inner).map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INVALID_PARAMS,
-                    format!("Invalid parameters: {}", e),
-                    None,
-                )
-            })?,
-            false,
-        )?;
+        let data = serde_json::to_value(inner.data)
+            .map_err(|e| validation_err(format!("Invalid parameters: {e}")))?;
 
         let root_name = data.get("name").and_then(|v| v.as_str()).unwrap_or("Root");
         let child_count = data
@@ -1157,16 +1088,8 @@ Example:
     ) -> Result<CallToolResult, ErrorData> {
         let inner = params.0;
         inner.data.validate()?;
-        let data = validate_data_param(
-            &serde_json::to_value(inner).map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INVALID_PARAMS,
-                    format!("Invalid parameters: {}", e),
-                    None,
-                )
-            })?,
-            false,
-        )?;
+        let data = serde_json::to_value(inner.data)
+            .map_err(|e| validation_err(format!("Invalid parameters: {e}")))?;
 
         let entity_count = data
             .get("labels")
@@ -1223,16 +1146,8 @@ Example:
     ) -> Result<CallToolResult, ErrorData> {
         let inner = params.0;
         inner.data.validate()?;
-        let data = validate_data_param(
-            &serde_json::to_value(inner).map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INVALID_PARAMS,
-                    format!("Invalid parameters: {}", e),
-                    None,
-                )
-            })?,
-            false,
-        )?;
+        let data = serde_json::to_value(inner.data)
+            .map_err(|e| validation_err(format!("Invalid parameters: {e}")))?;
 
         let title = data
             .get("title")
@@ -1317,16 +1232,8 @@ Example:
     ) -> Result<CallToolResult, ErrorData> {
         let inner = params.0;
         inner.data.validate()?;
-        let data = validate_data_param(
-            &serde_json::to_value(inner).map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INVALID_PARAMS,
-                    format!("Invalid parameters: {}", e),
-                    None,
-                )
-            })?,
-            false,
-        )?;
+        let data = serde_json::to_value(inner.data)
+            .map_err(|e| validation_err(format!("Invalid parameters: {e}")))?;
 
         // Build a text fallback describing the chart for non-UI hosts
         let chart_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("chart");
@@ -1360,141 +1267,6 @@ mod tests {
     use super::*;
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::ContentBlock;
-    use serde_json::json;
-
-    #[test]
-    fn test_validate_data_param_rejects_string() {
-        // Test that a string value for data is rejected
-        let params = json!({
-            "data": "{\"labels\": [\"A\", \"B\"], \"matrix\": [[0, 1], [1, 0]]}"
-        });
-
-        let result = validate_data_param(&params, false);
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-        assert!(err
-            .message
-            .contains("must be a JSON object, not a JSON string"));
-        assert!(err.message.contains("without comments"));
-    }
-
-    #[test]
-    fn test_validate_data_param_accepts_object() {
-        // Test that a proper object is accepted
-        let params = json!({
-            "data": {
-                "labels": ["A", "B"],
-                "matrix": [[0, 1], [1, 0]]
-            }
-        });
-
-        let result = validate_data_param(&params, false);
-        assert!(result.is_ok());
-
-        let data = result.unwrap();
-        assert!(data.is_object());
-        assert_eq!(data["labels"][0], "A");
-    }
-
-    #[test]
-    fn test_validate_data_param_rejects_array_when_not_allowed() {
-        // Test that an array is rejected when allow_array is false
-        let params = json!({
-            "data": [
-                {"label": "A", "value": 10},
-                {"label": "B", "value": 20}
-            ]
-        });
-
-        let result = validate_data_param(&params, false);
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-        assert!(err.message.contains("must be a JSON object"));
-    }
-
-    #[test]
-    fn test_validate_data_param_accepts_array_when_allowed() {
-        // Test that an array is accepted when allow_array is true
-        let params = json!({
-            "data": [
-                {"label": "A", "value": 10},
-                {"label": "B", "value": 20}
-            ]
-        });
-
-        let result = validate_data_param(&params, true);
-        assert!(result.is_ok());
-
-        let data = result.unwrap();
-        assert!(data.is_array());
-        assert_eq!(data[0]["label"], "A");
-    }
-
-    #[test]
-    fn test_validate_data_param_missing_data() {
-        // Test that missing data parameter is rejected
-        let params = json!({
-            "other": "value"
-        });
-
-        let result = validate_data_param(&params, false);
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-        assert!(err.message.contains("Missing 'data' parameter"));
-    }
-
-    #[test]
-    fn test_validate_data_param_rejects_primitive_values() {
-        // Test that primitive values (number, boolean) are rejected
-        let params_number = json!({
-            "data": 42
-        });
-
-        let result = validate_data_param(&params_number, false);
-        assert!(result.is_err());
-
-        let params_bool = json!({
-            "data": true
-        });
-
-        let result = validate_data_param(&params_bool, false);
-        assert!(result.is_err());
-
-        let params_null = json!({
-            "data": null
-        });
-
-        let result = validate_data_param(&params_null, false);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_data_param_with_json_containing_comments_as_string() {
-        // Test that JSON with comments passed as a string is rejected
-        let params = json!({
-            "data": r#"{
-                "labels": ["A", "B"],
-                "matrix": [
-                    [0, 1],  // This is a comment
-                    [1, 0]   /* Another comment */
-                ]
-            }"#
-        });
-
-        let result = validate_data_param(&params, false);
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-        assert!(err.message.contains("not a JSON string"));
-        assert!(err.message.contains("without comments"));
-    }
 
     fn assert_mcp_apps_result(
         tool_result: &CallToolResult,
@@ -1720,6 +1492,64 @@ mod tests {
         assert!(result.is_ok());
         assert_mcp_apps_result(&result.unwrap(), "ui://autovisualiser/mermaid", "mermaid");
     }
+
+    #[test]
+    fn donut_legend_renders_dynamic_values_as_text() {
+        let html = AutoVisualiserRouter::new()
+            .get_template_html("ui://autovisualiser/donut")
+            .unwrap();
+
+        assert!(!html.contains("legendEl.innerHTML"));
+        assert!(html.contains("labelEl.textContent = label"));
+        assert!(html.contains("valueEl.textContent = pct"));
+    }
+
+    #[test]
+    fn chord_tooltips_render_dynamic_values_as_text() {
+        let html = AutoVisualiserRouter::new()
+            .get_template_html("ui://autovisualiser/chord")
+            .unwrap();
+
+        assert!(!html.contains(".html("));
+        assert!(html.contains(".text(line)"));
+        assert!(html.contains("data.labels[d.source.index]"));
+        assert!(html.contains("data.labels[d.target.index]"));
+    }
+
+    #[test]
+    fn mermaid_errors_render_as_text_without_changing_svg_rendering() {
+        let html = AutoVisualiserRouter::new()
+            .get_template_html("ui://autovisualiser/mermaid")
+            .unwrap();
+
+        assert!(html.contains("errorEl.textContent = String(err.message || err)"));
+        assert!(html.contains("output.replaceChildren(errorEl)"));
+        assert!(html.contains("output.innerHTML = result.svg"));
+        assert!(!html.contains("'<div class=\"mermaid-error\">' +"));
+    }
+
+    #[test]
+    fn sankey_tooltips_render_dynamic_values_as_text() {
+        let html = AutoVisualiserRouter::new()
+            .get_template_html("ui://autovisualiser/sankey")
+            .unwrap();
+
+        assert!(!html.contains(".html("));
+        assert!(html.contains("tooltip.append(index === 0 ? \"strong\" : \"span\").text(line)"));
+        assert!(html.contains("d.source.name + \" → \" + d.target.name"));
+        assert!(html.contains("var lines = [d.name]"));
+    }
+
+    #[test]
+    fn treemap_tooltips_render_dynamic_values_as_text() {
+        let html = AutoVisualiserRouter::new()
+            .get_template_html("ui://autovisualiser/treemap")
+            .unwrap();
+
+        assert!(!html.contains("tt.innerHTML"));
+        assert!(html.contains("name.textContent = d.data.name"));
+        assert!(html.contains("document.createTextNode(d.data.category)"));
+    }
 }
 
 #[cfg(test)]
@@ -1729,9 +1559,7 @@ mod donut_format_tests {
 
     fn round_trip(input: serde_json::Value) -> Result<serde_json::Value, String> {
         let parsed: RenderDonutParams = serde_json::from_value(input).map_err(|e| e.to_string())?;
-        let serialized = serde_json::to_value(&parsed).map_err(|e| e.to_string())?;
-        // Simulate validate_data_param extracting "data"
-        Ok(serialized.get("data").cloned().unwrap_or(serialized))
+        serde_json::to_value(&parsed.data).map_err(|e| e.to_string())
     }
 
     #[test]

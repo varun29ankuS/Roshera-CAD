@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures::future::BoxFuture;
@@ -35,9 +35,6 @@ pub const CODEX_KNOWN_MODELS: &[&str] = &[
     "gpt-5.1-codex-mini",
 ];
 pub const CODEX_DOC_URL: &str = "https://developers.openai.com/codex/cli";
-
-/// Valid reasoning effort levels for Codex
-pub const CODEX_REASONING_LEVELS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 
 /// Spawns the Codex CLI (`codex exec`) as a one-shot child process per turn.
 /// Text prompt is piped via stdin (`-`), images are passed as temporary files
@@ -85,15 +82,6 @@ impl CodexProvider {
         }
     }
 
-    #[cfg(test)]
-    fn supports_reasoning_effort(_model_name: &str, reasoning_effort: &str) -> bool {
-        if !CODEX_REASONING_LEVELS.contains(&reasoning_effort) {
-            return false;
-        }
-
-        true
-    }
-
     /// Apply permission flags based on GooseMode
     fn apply_permission_flags(
         cmd: &mut Command,
@@ -111,10 +99,6 @@ impl CodexProvider {
             GooseMode::Approve => {
                 // Default codex behavior - interactive approvals
                 // No special flags needed
-            }
-            GooseMode::Chat => {
-                // Read-only sandbox mode
-                cmd.arg("--sandbox").arg("read-only");
             }
         }
         Ok(())
@@ -295,22 +279,15 @@ impl CodexProvider {
     /// Codex `input_tokens` already includes `cached_input_tokens`.
     fn extract_usage(usage_info: &serde_json::Value, usage: &mut Usage) {
         if usage.input_tokens.is_none() {
-            usage.input_tokens = usage_info
-                .get("input_tokens")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
+            usage.input_tokens = usage_info.get("input_tokens").and_then(|v| v.as_i64());
         }
         if usage.output_tokens.is_none() {
-            usage.output_tokens = usage_info
-                .get("output_tokens")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
+            usage.output_tokens = usage_info.get("output_tokens").and_then(|v| v.as_i64());
         }
         if usage.cache_read_input_tokens.is_none() {
             usage.cache_read_input_tokens = usage_info
                 .get("cached_input_tokens")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
+                .and_then(|v| v.as_i64());
         }
     }
 
@@ -567,11 +544,24 @@ fn toml_quote(s: &str) -> String {
 // up in process argv, visible via `ps`. Claude Code avoids this by writing to a
 // temp file with 0o600 permissions.
 // Tracking: https://github.com/openai/codex/issues/2628
-fn codex_mcp_config_overrides(extensions: &[ExtensionConfig]) -> Vec<String> {
+fn codex_mcp_config_overrides(extensions: &[ExtensionConfig]) -> Result<Vec<String>> {
     let mut overrides = Vec::new();
     for extension in extensions {
         match extension {
-            ExtensionConfig::StreamableHttp { uri, headers, .. } => {
+            ExtensionConfig::External(
+                goose_agent::extension::ExtensionConfig::StreamableHttp {
+                    name,
+                    socket: Some(_),
+                    ..
+                },
+            ) => {
+                return Err(anyhow!(
+                    "Codex provider does not support socket-backed Streamable HTTP extension '{name}'; use a provider that preserves socket-backed MCP transport, or remove the socket setting only if remote HTTP is intended"
+                ));
+            }
+            ExtensionConfig::External(
+                goose_agent::extension::ExtensionConfig::StreamableHttp { uri, headers, .. },
+            ) => {
                 let key = extension.key();
                 overrides.push(format!("mcp_servers.{}.url={}", key, toml_quote(uri)));
                 if !headers.is_empty() {
@@ -588,9 +578,12 @@ fn codex_mcp_config_overrides(extensions: &[ExtensionConfig]) -> Vec<String> {
                     ));
                 }
             }
-            ExtensionConfig::Stdio {
-                cmd, args, envs, ..
-            } => {
+            ExtensionConfig::External(goose_agent::extension::ExtensionConfig::Stdio {
+                cmd,
+                args,
+                envs,
+                ..
+            }) => {
                 let key = extension.key();
                 overrides.push(format!("mcp_servers.{}.command={}", key, toml_quote(cmd)));
                 if !args.is_empty() {
@@ -614,13 +607,10 @@ fn codex_mcp_config_overrides(extensions: &[ExtensionConfig]) -> Vec<String> {
                     ));
                 }
             }
-            ExtensionConfig::Sse { name, .. } => {
-                tracing::debug!(name, "skipping SSE extension, migrate to streamable_http");
-            }
             _ => {}
         }
     }
-    overrides
+    Ok(overrides)
 }
 
 impl goose_providers::base::ProviderDescriptor for CodexProvider {
@@ -637,11 +627,13 @@ impl goose_providers::base::ProviderDescriptor for CodexProvider {
                 ConfigKey::new("CODEX_SKIP_GIT_CHECK", false, false, Some("false"), true),
             ],
         )
+        .deprecated(Some("codex-acp"))
     }
 }
 
 impl ProviderDef for CodexProvider {
     type Provider = Self;
+    const SESSION_BOUND: bool = true;
 
     fn from_env(
         extensions: Vec<ExtensionConfig>,
@@ -667,7 +659,7 @@ impl ProviderDef for CodexProvider {
                 command: resolved_command,
                 name: CODEX_PROVIDER_NAME.to_string(),
                 skip_git_check,
-                mcp_config_overrides: codex_mcp_config_overrides(&resolved),
+                mcp_config_overrides: codex_mcp_config_overrides(&resolved)?,
                 mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
             })
         })
@@ -680,6 +672,10 @@ impl Provider for CodexProvider {
         &self.name
     }
 
+    fn uses_local_session_naming(&self) -> bool {
+        true
+    }
+
     async fn stream(
         &self,
         model_config: &ModelConfig,
@@ -688,17 +684,6 @@ impl Provider for CodexProvider {
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
         let session_id = crate::session_context::current_session_id().unwrap_or_default();
-        if super::cli_common::is_session_description_request(system) {
-            let (message, provider_usage) = super::cli_common::generate_simple_session_description(
-                &model_config.model_name,
-                messages,
-            )?;
-            return Ok(super::base::stream_from_single_message(
-                message,
-                provider_usage,
-            ));
-        }
-
         let goose_mode = {
             let map = self.mode_by_session.read().await;
             map.get(&session_id).copied().unwrap_or_default()
@@ -756,7 +741,27 @@ mod tests {
     use goose_providers::base::ProviderDescriptor as _;
     use goose_test_support::TEST_IMAGE_B64;
     use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use test_case::test_case;
+
+    #[cfg(unix)]
+    fn recording_cli(directory: &Path) -> PathBuf {
+        let command = directory.join("codex-recording-shim");
+        fs::write(
+            &command,
+            r#"#!/bin/sh
+record_dir=${0%/*}
+cat > "$record_dir/stdin"
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"provider response"}}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        command
+    }
 
     #[test]
     fn test_codex_metadata() {
@@ -772,7 +777,7 @@ mod tests {
     }
 
     #[test_case(
-        ExtensionConfig::Stdio {
+        ExtensionConfig::External(goose_agent::extension::ExtensionConfig::Stdio {
             name: "lookup".into(),
             cmd: "node".into(),
             args: vec!["server.js".into()],
@@ -783,7 +788,7 @@ mod tests {
             cwd: None,
             bundled: None,
             available_tools: vec![],
-        },
+        }),
         &[
             r#"mcp_servers.lookup.command="node""#,
             r#"mcp_servers.lookup.args=["server.js"]"#,
@@ -792,7 +797,7 @@ mod tests {
         ; "stdio_converts_to_mcp_overrides"
     )]
     #[test_case(
-        ExtensionConfig::StreamableHttp {
+        ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
             name: "lookup".into(),
             description: String::new(),
             uri: "http://localhost/mcp".into(),
@@ -801,9 +806,12 @@ mod tests {
             headers: HashMap::from([("Authorization".into(), "Bearer token".into())]),
             timeout: None,
             socket: None,
+            client_id: None,
+            client_secret_key: None,
+            scopes: vec![],
             bundled: Some(false),
             available_tools: vec![],
-        },
+        }),
         &[
             r#"mcp_servers.lookup.url="http://localhost/mcp""#,
             r#"mcp_servers.lookup.http_headers={"Authorization" = "Bearer token"}"#,
@@ -811,7 +819,7 @@ mod tests {
         ; "streamable_http_converts_to_mcp_overrides"
     )]
     #[test_case(
-        ExtensionConfig::StreamableHttp {
+        ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
             name: "mcp_kiwi_com".into(),
             description: String::new(),
             uri: "https://mcp.kiwi.com".into(),
@@ -820,16 +828,19 @@ mod tests {
             headers: HashMap::new(),
             timeout: None,
             socket: None,
+            client_id: None,
+            client_secret_key: None,
+            scopes: vec![],
             bundled: None,
             available_tools: vec![],
-        },
+        }),
         &[
             r#"mcp_servers.mcp_kiwi_com.url="https://mcp.kiwi.com""#,
         ]
         ; "resolved_name_used_as_key_http"
     )]
     #[test_case(
-        ExtensionConfig::Stdio {
+        ExtensionConfig::External(goose_agent::extension::ExtensionConfig::Stdio {
             name: "my-server".into(),
             cmd: "/usr/bin/my-server".into(),
             args: vec![],
@@ -840,16 +851,46 @@ mod tests {
             cwd: None,
             bundled: None,
             available_tools: vec![],
-        },
+        }),
         &[
             r#"mcp_servers.my-server.command="/usr/bin/my-server""#,
         ]
         ; "resolved_name_used_as_key_stdio"
     )]
     fn test_codex_mcp_overrides(config: ExtensionConfig, expected: &[&str]) {
-        let overrides = codex_mcp_config_overrides(&[config]);
+        let overrides = codex_mcp_config_overrides(&[config]).unwrap();
         let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
         assert_eq!(overrides, expected);
+    }
+
+    #[test]
+    fn test_codex_rejects_socket_backed_streamable_http() {
+        let config =
+            ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
+                name: "private-service".into(),
+                description: String::new(),
+                uri: "http://attacker.example/mcp".into(),
+                envs: Envs::default(),
+                env_keys: vec![],
+                headers: HashMap::from([(
+                    "Authorization".into(),
+                    "Bearer must-not-be-forwarded".into(),
+                )]),
+                timeout: None,
+                socket: Some("/run/private-service.sock".into()),
+                client_id: None,
+                client_secret_key: None,
+                scopes: vec![],
+                bundled: None,
+                available_tools: vec![],
+            });
+
+        let error = codex_mcp_config_overrides(&[config]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Codex provider does not support socket-backed Streamable HTTP extension 'private-service'; use a provider that preserves socket-backed MCP transport, or remove the socket setting only if remote HTTP is intended"
+        );
     }
 
     #[test_case("simple", r#""simple""# ; "no_special_chars")]
@@ -993,30 +1034,6 @@ mod tests {
         let lines: Vec<String> = vec![];
         let result = provider.parse_response(&lines);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_reasoning_level_validation() {
-        assert!(CODEX_REASONING_LEVELS.contains(&"none"));
-        assert!(CODEX_REASONING_LEVELS.contains(&"low"));
-        assert!(CODEX_REASONING_LEVELS.contains(&"medium"));
-        assert!(CODEX_REASONING_LEVELS.contains(&"high"));
-        assert!(CODEX_REASONING_LEVELS.contains(&"xhigh"));
-        assert!(!CODEX_REASONING_LEVELS.contains(&"minimal"));
-        assert!(!CODEX_REASONING_LEVELS.contains(&"invalid"));
-    }
-
-    #[test]
-    fn test_reasoning_effort_support_by_model() {
-        assert!(CodexProvider::supports_reasoning_effort("gpt-5.2", "none"));
-        assert!(CodexProvider::supports_reasoning_effort(
-            "gpt-5.2-codex",
-            "none"
-        ));
-        assert!(CodexProvider::supports_reasoning_effort(
-            "gpt-5.2-codex",
-            "xhigh"
-        ));
     }
 
     #[test]
@@ -1209,6 +1226,47 @@ mod tests {
     }
 
     #[test]
+    fn session_naming_is_local() {
+        let provider = CodexProvider {
+            command: PathBuf::from("codex"),
+            name: "codex".to_string(),
+            skip_git_check: false,
+            mcp_config_overrides: Vec::new(),
+            mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
+        };
+
+        assert!(provider.uses_local_session_naming());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn former_session_title_phrase_reaches_cli() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = CodexProvider {
+            command: recording_cli(directory.path()),
+            name: "codex".to_string(),
+            skip_git_check: false,
+            mcp_config_overrides: Vec::new(),
+            mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
+        };
+
+        let (message, _) = provider
+            .complete(
+                &ModelConfig::new(CODEX_DEFAULT_MODEL),
+                "answer in four words or less",
+                &[Message::user().with_text("ordinary request")],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(message.as_concat_text(), "provider response");
+        assert!(fs::read_to_string(directory.path().join("stdin"))
+            .unwrap()
+            .contains("answer in four words or less"));
+    }
+
+    #[test]
     fn test_config_keys() {
         let metadata = CodexProvider::metadata();
         assert_eq!(metadata.config_keys.len(), 2);
@@ -1302,7 +1360,6 @@ mod tests {
     #[test_case(GooseMode::Auto, &["--yolo"] ; "auto_yolo")]
     #[test_case(GooseMode::SmartApprove, &["--full-auto"] ; "smart_approve_full_auto")]
     #[test_case(GooseMode::Approve, &[] as &[&str] ; "approve_no_flags")]
-    #[test_case(GooseMode::Chat, &["--sandbox", "read-only"] ; "chat_read_only")]
     fn test_apply_permission_flags(mode: GooseMode, expected: &[&str]) {
         let mut cmd = tokio::process::Command::new("codex");
         CodexProvider::apply_permission_flags(&mut cmd, mode).unwrap();

@@ -1,8 +1,11 @@
+#![cfg(feature = "acp-http")]
+#![recursion_limit = "256"]
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Method, Request, Response, StatusCode};
 use axum::Router;
+use goose::acp::server::AcpBuiltinSelection;
 use goose::acp::server_factory::{AcpServer, AcpServerFactoryConfig};
 use goose::acp::transport::{create_acp_router, create_router};
 use goose::agents::GoosePlatform;
@@ -16,26 +19,24 @@ fn test_router(require_token: bool, dir: &tempfile::TempDir) -> Router {
 
 fn test_acp_router(dir: &tempfile::TempDir) -> Router {
     let server = Arc::new(AcpServer::new(AcpServerFactoryConfig {
-        builtins: vec![],
-        data_dir: dir.path().join("data"),
+        builtins: AcpBuiltinSelection::default(),
         config_dir: dir.path().join("config"),
         goose_platform: GoosePlatform::GooseCli,
         additional_source_roots: Vec::new(),
+        session_cwd: None,
         enable_scheduler: false,
-        max_active_sessions: None,
     }));
     create_acp_router(server)
 }
 
 fn test_authenticated_acp_router(dir: &tempfile::TempDir) -> Router {
     let server = Arc::new(AcpServer::new(AcpServerFactoryConfig {
-        builtins: vec![],
-        data_dir: dir.path().join("data"),
+        builtins: AcpBuiltinSelection::default(),
         config_dir: dir.path().join("config"),
         goose_platform: GoosePlatform::GooseCli,
         additional_source_roots: Vec::new(),
+        session_cwd: None,
         enable_scheduler: false,
-        max_active_sessions: None,
     }));
     create_router(server, SECRET.to_string(), true, Vec::new())
 }
@@ -46,13 +47,12 @@ fn test_router_with_origins(
     additional_allowed_origins: Vec<HeaderValue>,
 ) -> Router {
     let server = Arc::new(AcpServer::new(AcpServerFactoryConfig {
-        builtins: vec![],
-        data_dir: dir.path().join("data"),
+        builtins: AcpBuiltinSelection::default(),
         config_dir: dir.path().join("config"),
         goose_platform: GoosePlatform::GooseCli,
         additional_source_roots: Vec::new(),
+        session_cwd: None,
         enable_scheduler: false,
-        max_active_sessions: None,
     }));
     create_router(
         server,

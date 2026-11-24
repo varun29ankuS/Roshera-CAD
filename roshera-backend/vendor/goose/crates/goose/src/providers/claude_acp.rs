@@ -11,6 +11,7 @@ use crate::config::{Config, GooseMode};
 use crate::providers::base::{
     current_working_dir, ProviderDef, ProviderDescriptor, ProviderMetadata,
 };
+use crate::providers::catalog::ProviderSetupMetadata;
 
 pub(crate) const CLAUDE_ACP_PROVIDER_NAME: &str = "claude-acp";
 const CLAUDE_ACP_DOC_URL: &str = "https://github.com/agentclientprotocol/claude-agent-acp";
@@ -22,7 +23,7 @@ impl goose_providers::base::ProviderDescriptor for ClaudeAcpProvider {
     fn metadata() -> ProviderMetadata {
         ProviderMetadata::new(
             CLAUDE_ACP_PROVIDER_NAME,
-            "Claude Code",
+            "Claude Code ACP",
             "Use goose with your Claude Code subscription via the claude-agent-acp adapter.",
             ACP_CURRENT_MODEL,
             vec![],
@@ -32,14 +33,23 @@ impl goose_providers::base::ProviderDescriptor for ClaudeAcpProvider {
         .with_setup_steps(vec![
             "Install the ACP adapter: `npm install -g @agentclientprotocol/claude-agent-acp`",
             "Ensure your Claude CLI is authenticated (run `claude` to verify)",
-            "Add to your goose config file (`~/.config/goose/config.yaml` on macOS/Linux):\n  GOOSE_PROVIDER: claude-acp\n  GOOSE_MODEL: current\n  claude-acp_configured: true",
-            "Restart goose for changes to take effect",
         ])
+        .with_setup(
+            ProviderSetupMetadata::cli_agent(
+                CLAUDE_ACP_BINARY,
+                &["claude-acp", "claude_code", "claude"],
+            )
+            .with_acp()
+            .with_docs_url("https://docs.anthropic.com/en/docs/claude-code")
+            .with_capabilities(true, true, true),
+        )
     }
 }
 
 impl ProviderDef for ClaudeAcpProvider {
     type Provider = AcpProvider;
+    const SESSION_BOUND: bool = true;
+    const RUNS_OWN_TOOL_LOOP: bool = true;
 
     fn from_env(
         extensions: Vec<crate::config::ExtensionConfig>,
@@ -59,7 +69,7 @@ impl ProviderDef for ClaudeAcpProvider {
             let resolved_command = SearchPaths::builder()
                 .with_npm()
                 .resolve(CLAUDE_ACP_BINARY)?;
-            let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
+            let goose_mode = config.resolve_goose_mode()?;
 
             let mode_mapping = HashMap::from([
                 // Closest to "autonomous": bypassPermissions skips confirmations.
@@ -68,8 +78,6 @@ impl ProviderDef for ClaudeAcpProvider {
                 (GooseMode::Approve, vec!["default".to_string()]),
                 // acceptEdits auto-accepts file edits but still prompts for risky ops.
                 (GooseMode::SmartApprove, vec!["acceptEdits".to_string()]),
-                // Plan mode disables tool execution, aligning with chat-only intent.
-                (GooseMode::Chat, vec!["plan".to_string()]),
             ]);
 
             let provider_config = AcpProviderConfig {

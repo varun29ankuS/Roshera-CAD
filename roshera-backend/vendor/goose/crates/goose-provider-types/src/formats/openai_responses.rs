@@ -1,12 +1,18 @@
-use crate::conversation::message::{Message, MessageContentBlock};
+use crate::conversation::message::{Message, MessageContentBlock, ThinkingContentBlock};
 use crate::conversation::token_usage::{ProviderUsage, Usage};
-use crate::errors::ProviderError;
-use crate::formats::openai::{
-    extract_reasoning_effort, is_openai_responses_model, openai_reasoning_effort_for_thinking,
-    sanitize_function_name,
+use crate::documents::{
+    convert_document, document_media_type_is_supported, unsupported_document_text, DocumentFormat,
+    ASSISTANT_ROLE_REASON, UNSUPPORTED_MEDIA_TYPE_REASON,
 };
+use crate::errors::ProviderError;
+use crate::formats::anthropic::thinking_block_is_stale;
+use crate::formats::openai::{
+    extract_reasoning_effort, openai_reasoning_effort_for_thinking, sanitize_function_name,
+};
+use crate::maybe_send::MaybeSend;
 use crate::mcp_utils::extract_text_from_resource;
-use crate::model::ModelConfig;
+use crate::model::{is_goose_internal_request_param, ModelConfig};
+use crate::utils::{sanitize_unicode_tags, strip_unicode_tags};
 use anyhow::{anyhow, Error};
 use async_stream::try_stream;
 use chrono;
@@ -14,11 +20,15 @@ use futures::Stream;
 use rmcp::model::{object, CallToolRequestParams, ContentBlock, Role, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResponsesApiResponse {
     pub id: String,
     pub object: String,
+    // Not every OpenAI-compatible provider echoes created_at back; the value
+    // is carried but never used, so tolerate its absence.
+    #[serde(default)]
     pub created_at: i64,
     pub status: String,
     pub model: String,
@@ -35,16 +45,59 @@ pub struct SummaryText {
     pub text: String,
 }
 
-fn reasoning_from_summary(summary: &[SummaryText]) -> Option<MessageContentBlock> {
+fn reasoning_from_output(
+    summary: &[SummaryText],
+    encrypted_content: Option<&str>,
+) -> Option<MessageContentBlock> {
     let text: String = summary
         .iter()
-        .map(|s| s.text.as_str())
+        .map(|s| sanitize_unicode_tags(&s.text))
         .collect::<Vec<_>>()
         .join("\n");
-    if text.is_empty() {
+    let encrypted_content = encrypted_content.unwrap_or_default();
+    if text.is_empty() && encrypted_content.is_empty() {
         None
     } else {
-        Some(MessageContentBlock::thinking(text, ""))
+        Some(MessageContentBlock::thinking(text, encrypted_content))
+    }
+}
+
+/// The thinking signature slot also carries Anthropic signatures and reasoning
+/// imported from other accounts, which the API rejects, so only reasoning that
+/// `current_model` produced in this session is replayed.
+pub fn reasoning_input_item(
+    message: &Message,
+    thinking: &ThinkingContentBlock,
+    current_model: &str,
+) -> Option<Value> {
+    if thinking.signature.is_empty()
+        || message.metadata.inference.is_none()
+        || thinking_block_is_stale(message, Some(current_model))
+    {
+        return None;
+    }
+    let summary: Vec<Value> = if thinking.thinking.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "type": "summary_text", "text": thinking.thinking })]
+    };
+    Some(json!({
+        "type": "reasoning",
+        "summary": summary,
+        "encrypted_content": thinking.signature
+    }))
+}
+
+pub fn is_encrypted_reasoning_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("encrypted content") && lower.contains("could not be verified")
+}
+
+/// Rejected reasoning stays in the session, so callers retry once without any
+/// reasoning items rather than failing every later request.
+pub fn strip_reasoning_items(payload: &mut Value) {
+    if let Some(input) = payload.get_mut("input").and_then(Value::as_array_mut) {
+        input.retain(|item| item["type"] != "reasoning");
     }
 }
 
@@ -57,6 +110,8 @@ pub enum ResponseOutputItem {
         id: Option<String>,
         #[serde(default)]
         summary: Vec<SummaryText>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
     },
     Message {
         // `id` and `status` are required when the OpenAI API emits these
@@ -93,6 +148,9 @@ pub enum ResponseContentBlock {
     Refusal {
         refusal: String,
     },
+    ReasoningText {
+        text: String,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -107,11 +165,31 @@ pub struct ResponseReasoningInfo {
     pub summary: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ResponseIncompleteDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+fn is_output_token_limit_incomplete_reason(reason: &str) -> bool {
+    matches!(reason, "max_output_tokens" | "max_tokens")
+}
+
+fn response_reached_output_token_limit(
+    status: &str,
+    incomplete_details: Option<&ResponseIncompleteDetails>,
+) -> bool {
+    status == "incomplete"
+        && incomplete_details
+            .and_then(|details| details.reason.as_deref())
+            .is_some_and(is_output_token_limit_incomplete_reason)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResponseUsage {
-    pub input_tokens: i32,
-    pub output_tokens: i32,
-    pub total_tokens: i32,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens_details: Option<InputTokensDetails>,
 }
@@ -119,22 +197,23 @@ pub struct ResponseUsage {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InputTokensDetails {
     #[serde(default)]
-    pub cached_tokens: Option<i32>,
+    pub cached_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<i64>,
 }
 
 impl ResponseUsage {
     fn to_usage(&self) -> Usage {
-        // input_tokens already includes cached tokens
-        let cached_tokens = self
-            .input_tokens_details
-            .as_ref()
-            .and_then(|d| d.cached_tokens);
+        // input_tokens already includes both cache reads and cache writes
+        let details = self.input_tokens_details.as_ref();
+        let cached_tokens = details.and_then(|d| d.cached_tokens);
+        let cache_write_tokens = details.and_then(|d| d.cache_write_tokens);
         Usage::new(
             Some(self.input_tokens),
             Some(self.output_tokens),
             Some(self.total_tokens),
         )
-        .with_cache_tokens(cached_tokens, None)
+        .with_cache_tokens(cached_tokens, cache_write_tokens)
     }
 }
 
@@ -207,6 +286,11 @@ pub enum ResponsesStreamEvent {
         sequence_number: i32,
         response: ResponseMetadata,
     },
+    #[serde(rename = "response.incomplete")]
+    ResponseIncomplete {
+        sequence_number: i32,
+        response: ResponseMetadata,
+    },
     #[serde(rename = "response.failed")]
     ResponseFailed { sequence_number: i32, error: Value },
     #[serde(rename = "response.function_call_arguments.delta")]
@@ -262,6 +346,7 @@ fn is_known_responses_stream_event_type(event_type: &str) -> bool {
             | "response.content_part.done"
             | "response.output_text.done"
             | "response.completed"
+            | "response.incomplete"
             | "response.failed"
             | "response.function_call_arguments.delta"
             | "response.function_call_arguments.done"
@@ -272,6 +357,25 @@ fn is_known_responses_stream_event_type(event_type: &str) -> bool {
     )
 }
 
+fn responses_stream_error(error: &Value) -> ProviderError {
+    let details = format!("Responses API error: {error}");
+    match (
+        error.get("type").and_then(Value::as_str),
+        error.get("code").and_then(Value::as_str),
+    ) {
+        (Some("service_unavailable_error" | "server_error"), _)
+        | (_, Some("server_is_overloaded" | "server_error")) => ProviderError::ServerError(details),
+        (Some("rate_limit_error"), _) | (_, Some("rate_limit_exceeded")) => {
+            ProviderError::RateLimitExceeded {
+                details,
+                retry_delay: None,
+            }
+        }
+        (_, Some("context_length_exceeded")) => ProviderError::ContextLengthExceeded(details),
+        _ => ProviderError::RequestFailed(details),
+    }
+}
+
 fn parse_responses_stream_event(data_line: &str) -> anyhow::Result<Option<ResponsesStreamEvent>> {
     let raw_event: Value = serde_json::from_str(data_line).map_err(|e| {
         ProviderError::stream_decode_error(format!(
@@ -280,7 +384,23 @@ fn parse_responses_stream_event(data_line: &str) -> anyhow::Result<Option<Respon
         ))
     })?;
 
-    let Some(event_type) = raw_event.get("type").and_then(Value::as_str) else {
+    let event_type = raw_event.get("type").and_then(Value::as_str);
+    let error = raw_event
+        .get("error")
+        .filter(|error| !error.is_null())
+        .or_else(|| {
+            (event_type == Some("response.failed"))
+                .then(|| raw_event.pointer("/response/error"))
+                .flatten()
+                .filter(|error| !error.is_null())
+        });
+    if let Some(error) = error
+        .or_else(|| matches!(event_type, Some("error" | "response.failed")).then_some(&raw_event))
+    {
+        return Err(responses_stream_error(error).into());
+    }
+
+    let Some(event_type) = event_type else {
         return Ok(None);
     };
 
@@ -301,6 +421,7 @@ fn parse_responses_stream_event(data_line: &str) -> anyhow::Result<Option<Respon
 pub struct ResponseMetadata {
     pub id: String,
     pub object: String,
+    #[serde(default)]
     pub created_at: i64,
     pub status: String,
     pub model: String,
@@ -310,6 +431,8 @@ pub struct ResponseMetadata {
     pub usage: Option<ResponseUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponseReasoningInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<ResponseIncompleteDetails>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -321,6 +444,8 @@ pub enum ResponseOutputItemInfo {
         id: Option<String>,
         #[serde(default)]
         summary: Vec<SummaryText>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
     },
     Message {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -356,6 +481,9 @@ pub enum ContentBlockPart {
     Refusal {
         refusal: String,
     },
+    ReasoningText {
+        text: String,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -363,7 +491,12 @@ pub enum ContentBlockPart {
     },
 }
 
-fn add_message_items(input_items: &mut Vec<Value>, messages: &[Message]) {
+fn add_message_items(
+    input_items: &mut Vec<Value>,
+    messages: &[Message],
+    supports_vision: bool,
+    current_model: &str,
+) {
     for message in messages.iter().filter(|m| m.is_agent_visible()) {
         let role = match message.role {
             Role::User => "user",
@@ -375,15 +508,24 @@ fn add_message_items(input_items: &mut Vec<Value>, messages: &[Message]) {
         for content in &message.content {
             match content {
                 MessageContentBlock::Text(text) if !text.text.is_empty() => {
-                    let content_type = if message.role == Role::Assistant {
-                        "output_text"
+                    if message.role == Role::Assistant {
+                        // Responses output_text items require annotations even when empty.
+                        text_items.push(json!({
+                            "type": "output_text",
+                            "text": text.text,
+                            "annotations": []
+                        }));
                     } else {
-                        "input_text"
-                    };
-                    text_items.push(json!({
-                        "type": content_type,
-                        "text": text.text
-                    }));
+                        text_items.push(json!({
+                            "type": "input_text",
+                            "text": text.text
+                        }));
+                    }
+                }
+                // Streamed text is stored ahead of the reasoning that produced it,
+                // so pending text is left to flush after the reasoning item.
+                MessageContentBlock::Thinking(thinking) if message.role == Role::Assistant => {
+                    input_items.extend(reasoning_input_item(message, thinking, current_model));
                 }
                 MessageContentBlock::ToolRequest(request) if message.role == Role::Assistant => {
                     if !text_items.is_empty() {
@@ -428,10 +570,36 @@ fn add_message_items(input_items: &mut Vec<Value>, messages: &[Message]) {
                     }
                 }
                 MessageContentBlock::Image(image) => {
-                    text_items.push(json!({
-                        "type": "input_image",
-                        "image_url": format!("data:{};base64,{}", image.mime_type, image.data)
-                    }));
+                    if supports_vision {
+                        text_items.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", image.mime_type, image.data)
+                        }));
+                    } else {
+                        text_items.push(json!({
+                            "type": "input_text",
+                            "text": "[image omitted: model does not support vision]"
+                        }));
+                    }
+                }
+                MessageContentBlock::Document(document) => {
+                    if message.role != Role::User {
+                        text_items.push(json!({
+                            "type": "output_text",
+                            "text": unsupported_document_text(document, ASSISTANT_ROLE_REASON),
+                            "annotations": []
+                        }));
+                    } else if document_media_type_is_supported(&document.mime_type) {
+                        let mut converted = convert_document(document, &DocumentFormat::OpenAi);
+                        let mut file = converted["file"].take();
+                        file["type"] = json!("input_file");
+                        text_items.push(file);
+                    } else {
+                        text_items.push(json!({
+                            "type": "input_text",
+                            "text": unsupported_document_text(document, UNSUPPORTED_MEDIA_TYPE_REASON)
+                        }));
+                    }
                 }
                 MessageContentBlock::ToolResponse(response) => {
                     if !text_items.is_empty() {
@@ -445,10 +613,11 @@ fn add_message_items(input_items: &mut Vec<Value>, messages: &[Message]) {
 
                     match &response.tool_result {
                         Ok(contents) => {
-                            let has_images = contents
-                                .content
-                                .iter()
-                                .any(|c| matches!(c, ContentBlock::Image(_)));
+                            let has_images = supports_vision
+                                && contents
+                                    .content
+                                    .iter()
+                                    .any(|c| matches!(c, ContentBlock::Image(_)));
 
                             let output = if has_images {
                                 json!(contents
@@ -484,17 +653,18 @@ fn add_message_items(input_items: &mut Vec<Value>, messages: &[Message]) {
                                 json!(contents
                                     .content
                                     .iter()
-                                    .filter_map(|c| match c {
-                                        ContentBlock::Text(t) => Some(t.text.clone()),
+                                    .map(|c| match c {
+                                        ContentBlock::Text(t) => t.text.clone(),
                                         ContentBlock::Resource(r) => {
-                                            Some(extract_text_from_resource(&r.resource))
+                                            extract_text_from_resource(&r.resource)
                                         }
-                                        ContentBlock::Audio(_) => Some("[Audio content]".into()),
+                                        ContentBlock::Audio(_) => "[Audio content]".into(),
                                         ContentBlock::ResourceLink(_) => {
-                                            Some("[Resource link]".into())
+                                            "[Resource link]".into()
                                         }
-                                        ContentBlock::Image(_) => None,
-                                        _ => Some("[Unsupported content]".into()),
+                                        ContentBlock::Image(_) =>
+                                            "[image omitted: model does not support vision]".into(),
+                                        _ => "[Unsupported content]".into(),
                                     })
                                     .collect::<Vec<String>>()
                                     .join("\n"))
@@ -519,43 +689,6 @@ fn add_message_items(input_items: &mut Vec<Value>, messages: &[Message]) {
                         }
                     }
                 }
-                MessageContentBlock::FrontendToolRequest(request) => {
-                    if !text_items.is_empty() {
-                        input_items.push(json!({
-                            "type": "message",
-                            "role": role,
-                            "content": text_items
-                        }));
-                        text_items = Vec::new();
-                    }
-
-                    match &request.tool_call {
-                        Ok(tool_call) => {
-                            let sanitized_name = sanitize_function_name(&tool_call.name);
-                            let arguments_str = tool_call
-                                .arguments
-                                .as_ref()
-                                .map(|args| {
-                                    serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string())
-                                })
-                                .unwrap_or_else(|| "{}".to_string());
-
-                            input_items.push(json!({
-                                "type": "function_call",
-                                "call_id": request.id,
-                                "name": sanitized_name,
-                                "arguments": arguments_str
-                            }));
-                        }
-                        Err(e) => {
-                            input_items.push(json!({
-                                "type": "function_call_output",
-                                "call_id": request.id,
-                                "output": format!("Error: {}", e.message)
-                            }));
-                        }
-                    }
-                }
                 _ => {}
             }
         }
@@ -568,14 +701,6 @@ fn add_message_items(input_items: &mut Vec<Value>, messages: &[Message]) {
             }));
         }
     }
-}
-
-fn is_gpt_5_6_model(model_name: &str) -> bool {
-    let normalized = model_name.to_ascii_lowercase();
-    normalized == "gpt-5.6"
-        || normalized.starts_with("gpt-5.6-")
-        || normalized == "gpt-5-6"
-        || normalized.starts_with("gpt-5-6-")
 }
 
 pub fn create_responses_request(
@@ -616,13 +741,18 @@ pub fn create_responses_request_for_model(
         }));
     }
 
-    add_message_items(&mut input_items, messages);
+    add_message_items(
+        &mut input_items,
+        messages,
+        model_config.supports_vision.unwrap_or_default(),
+        &model_config.model_name,
+    );
 
     let (model_name, legacy_reasoning_effort) = extract_reasoning_effort(capability_model_name);
     // All models routed here are responses-capable; temperature is rejected
     // by the API for reasoning models regardless of whether an explicit
     // effort suffix was provided.
-    let is_reasoning_model = is_openai_responses_model(&model_name);
+    let is_reasoning_model = model_config.openai_reasoning_for_model(&model_name);
     let reasoning_effort = if is_reasoning_model {
         if let Some(effort) = legacy_reasoning_effort.as_deref() {
             if effort.eq_ignore_ascii_case("none") {
@@ -642,6 +772,9 @@ pub fn create_responses_request_for_model(
     } else {
         None
     };
+    let reasoning_effort = model_config
+        .request_param::<String>("reasoning_effort")
+        .or(reasoning_effort);
 
     let store = model_config.request_param::<bool>("store").unwrap_or(false);
     let reasoning_mode = model_config
@@ -657,30 +790,35 @@ pub fn create_responses_request_for_model(
             }
         })
         .transpose()?;
-    if reasoning_mode.is_some() && !is_gpt_5_6_model(&model_name) {
-        return Err(anyhow!(
-            "reasoning_mode is only supported for GPT-5.6 models"
-        ));
-    }
     let mut payload = json!({
         "model": wire_model_name,
         "input": input_items,
         "store": store,
     });
 
-    if reasoning_effort.is_some() || reasoning_mode.is_some() {
-        let mut reasoning = serde_json::Map::new();
+    let mut reasoning = native_request_object(model_config, "reasoning")?;
+    if model_config
+        .request_params
+        .as_ref()
+        .is_some_and(|params| params.contains_key("reasoning"))
+        || reasoning_effort.is_some()
+        || reasoning_mode.is_some()
+    {
         if let Some(effort) = reasoning_effort {
-            reasoning.insert("effort".to_string(), json!(effort));
-            reasoning.insert("summary".to_string(), json!("auto"));
+            reasoning.entry("effort").or_insert_with(|| json!(effort));
+            reasoning.entry("summary").or_insert_with(|| json!("auto"));
         }
         if let Some(mode) = reasoning_mode {
-            reasoning.insert("mode".to_string(), json!(mode));
+            reasoning.entry("mode").or_insert_with(|| json!(mode));
         }
         payload
             .as_object_mut()
             .unwrap()
             .insert("reasoning".to_string(), Value::Object(reasoning));
+    }
+
+    if is_reasoning_model {
+        payload["include"] = json!(["reasoning.encrypted_content"]);
     }
 
     if !tools.is_empty() {
@@ -712,23 +850,166 @@ pub fn create_responses_request_for_model(
         }
     }
 
-    if let Some(max_tokens) = model_config.max_tokens {
-        payload
-            .as_object_mut()
-            .unwrap()
-            .insert("max_output_tokens".to_string(), json!(max_tokens));
+    let params = model_config.request_params.as_ref();
+    let chat_token_limit = ["max_completion_tokens", "max_tokens"]
+        .into_iter()
+        .filter_map(|key| {
+            params
+                .and_then(|params| params.get(key))
+                .map(|value| (key, value))
+        })
+        .map(|(key, value)| {
+            let limit = value
+                .as_i64()
+                .filter(|limit| *limit > 0 && *limit <= i32::MAX as i64)
+                .ok_or_else(|| anyhow!("{key} must be a positive integer"))?;
+            Ok(limit as i32)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if chat_token_limit.len() == 2 && chat_token_limit[0] != chat_token_limit[1] {
+        return Err(anyhow!(
+            "max_completion_tokens and max_tokens must agree for Responses API"
+        ));
+    }
+    if let Some(max_tokens) = model_config
+        .max_tokens
+        .or_else(|| chat_token_limit.first().copied())
+    {
+        payload["max_output_tokens"] = json!(max_tokens);
+    }
+
+    if let Some(params) = params {
+        let mut text = native_request_object(model_config, "text")?;
+        if let Some(response_format) = params.get("response_format") {
+            let format = match response_format.get("type").and_then(Value::as_str) {
+                Some("json_object" | "text") => response_format.clone(),
+                Some("json_schema") => {
+                    let schema = response_format
+                        .get("json_schema")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| anyhow!("response_format.json_schema must be an object"))?;
+                    let mut format = schema.clone();
+                    format.insert("type".to_string(), json!("json_schema"));
+                    Value::Object(format)
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "Unsupported response_format for Responses API: {response_format}"
+                    ))
+                }
+            };
+            text.entry("format").or_insert(format);
+        }
+        if params.contains_key("text") || !text.is_empty() {
+            payload["text"] = Value::Object(text);
+        }
+        let object = payload.as_object_mut().unwrap();
+        for (key, value) in params {
+            if is_goose_internal_request_param(key) {
+                continue;
+            }
+            if matches!(
+                key.as_str(),
+                "model"
+                    | "input"
+                    | "messages"
+                    | "tools"
+                    | "stream"
+                    | "stream_options"
+                    | "reasoning"
+                    | "reasoning_mode"
+                    | "reasoning_effort"
+                    | "max_tokens"
+                    | "max_completion_tokens"
+                    | "response_format"
+                    | "text"
+            ) {
+                continue;
+            }
+            object.insert(key.clone(), value.clone());
+        }
     }
 
     Ok(payload)
 }
 
+fn native_request_object(
+    model_config: &ModelConfig,
+    key: &str,
+) -> anyhow::Result<serde_json::Map<String, Value>> {
+    model_config
+        .request_params
+        .as_ref()
+        .and_then(|params| params.get(key))
+        .map(|value| {
+            value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow!("{key} must be an object"))
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn sanitize_tool_arguments(value: Value) -> anyhow::Result<Value> {
+    match value {
+        Value::String(text) => Ok(Value::String(strip_unicode_tags(&text))),
+        Value::Array(values) => Ok(Value::Array(
+            values
+                .into_iter()
+                .map(sanitize_tool_arguments)
+                .collect::<anyhow::Result<_>>()?,
+        )),
+        Value::Object(values) => {
+            let mut sanitized = serde_json::Map::new();
+            for (key, value) in values {
+                let key = strip_unicode_tags(&key);
+                if sanitized.contains_key(&key) {
+                    return Err(anyhow!(
+                        "Responses tool arguments contain duplicate key after Unicode tag sanitization"
+                    ));
+                }
+                sanitized.insert(key, sanitize_tool_arguments(value)?);
+            }
+            Ok(Value::Object(sanitized))
+        }
+        value => Ok(value),
+    }
+}
+
+fn parse_tool_arguments(arguments: &str) -> anyhow::Result<Value> {
+    if arguments.is_empty() {
+        Ok(json!({}))
+    } else {
+        match serde_json::from_str(arguments) {
+            Ok(value) => sanitize_tool_arguments(value),
+            Err(_) => Ok(json!({})),
+        }
+    }
+}
+
+fn sanitize_tool_request_id(id: &str, seen_ids: &mut HashSet<String>) -> anyhow::Result<String> {
+    let id = strip_unicode_tags(id);
+    if !seen_ids.insert(id.clone()) {
+        return Err(anyhow!(
+            "Responses tool calls contain duplicate ID after Unicode tag sanitization"
+        ));
+    }
+    Ok(id)
+}
+
 pub fn responses_api_to_message(response: &ResponsesApiResponse) -> anyhow::Result<Message> {
     let mut content = Vec::new();
+    let mut tool_request_ids = HashSet::new();
 
     for item in &response.output {
         match item {
-            ResponseOutputItem::Reasoning { summary, .. } => {
-                content.extend(reasoning_from_summary(summary));
+            ResponseOutputItem::Reasoning {
+                summary,
+                encrypted_content,
+                ..
+            } => {
+                content.extend(reasoning_from_output(summary, encrypted_content.as_deref()));
             }
             ResponseOutputItem::Message {
                 content: msg_content,
@@ -737,20 +1018,31 @@ pub fn responses_api_to_message(response: &ResponsesApiResponse) -> anyhow::Resu
                 for block in msg_content {
                     match block {
                         ResponseContentBlock::OutputText { text, .. } => {
+                            let text = sanitize_unicode_tags(text);
                             if !text.is_empty() {
                                 content.push(MessageContentBlock::text(text));
                             }
                         }
                         ResponseContentBlock::Refusal { refusal } => {
+                            let refusal = sanitize_unicode_tags(refusal);
                             if !refusal.is_empty() {
                                 content.push(MessageContentBlock::text(refusal));
                             }
                         }
+                        ResponseContentBlock::ReasoningText { text } => {
+                            let text = sanitize_unicode_tags(text);
+                            if !text.is_empty() {
+                                content.push(MessageContentBlock::thinking(text, ""));
+                            }
+                        }
                         ResponseContentBlock::ToolCall { id, name, input } => {
+                            let id = sanitize_tool_request_id(id, &mut tool_request_ids)?;
                             content.push(MessageContentBlock::tool_request(
-                                id.clone(),
-                                Ok(CallToolRequestParams::new(name.clone())
-                                    .with_arguments(object(input.clone()))),
+                                id,
+                                Ok(CallToolRequestParams::new(strip_unicode_tags(name))
+                                    .with_arguments(object(sanitize_tool_arguments(
+                                        input.clone(),
+                                    )?))),
                             ));
                         }
                     }
@@ -766,15 +1058,12 @@ pub fn responses_api_to_message(response: &ResponsesApiResponse) -> anyhow::Resu
                 let request_id = call_id.clone().or_else(|| id.clone()).ok_or_else(|| {
                     anyhow!("Responses function_call output missing call_id and id")
                 })?;
-                let parsed_args = if arguments.is_empty() {
-                    json!({})
-                } else {
-                    serde_json::from_str(arguments).unwrap_or_else(|_| json!({}))
-                };
+                let request_id = sanitize_tool_request_id(&request_id, &mut tool_request_ids)?;
+                let parsed_args = parse_tool_arguments(arguments)?;
 
                 content.push(MessageContentBlock::tool_request(
                     request_id,
-                    Ok(CallToolRequestParams::new(name.clone())
+                    Ok(CallToolRequestParams::new(strip_unicode_tags(name))
                         .with_arguments(object(parsed_args))),
                 ));
             }
@@ -800,23 +1089,39 @@ fn process_streaming_output_items(
     is_text_response: bool,
 ) -> anyhow::Result<Vec<MessageContentBlock>> {
     let mut content = Vec::new();
+    let mut tool_request_ids = HashSet::new();
 
     for item in output_items {
         match item {
-            ResponseOutputItemInfo::Reasoning { summary, .. } => {
-                content.extend(reasoning_from_summary(&summary));
+            ResponseOutputItemInfo::Reasoning {
+                summary,
+                encrypted_content,
+                ..
+            } => {
+                content.extend(reasoning_from_output(
+                    &summary,
+                    encrypted_content.as_deref(),
+                ));
             }
             ResponseOutputItemInfo::Message { content: parts, .. } => {
                 for part in parts {
                     match part {
                         ContentBlockPart::OutputText { text, .. } => {
+                            let text = sanitize_unicode_tags(&text);
                             if !text.is_empty() && !is_text_response {
-                                content.push(MessageContentBlock::text(&text));
+                                content.push(MessageContentBlock::text(text));
                             }
                         }
                         ContentBlockPart::Refusal { refusal } => {
+                            let refusal = sanitize_unicode_tags(&refusal);
                             if !refusal.is_empty() && !is_text_response {
-                                content.push(MessageContentBlock::text(&refusal));
+                                content.push(MessageContentBlock::text(refusal));
+                            }
+                        }
+                        ContentBlockPart::ReasoningText { text } => {
+                            let text = sanitize_unicode_tags(&text);
+                            if !text.is_empty() {
+                                content.push(MessageContentBlock::thinking(text, ""));
                             }
                         }
                         ContentBlockPart::ToolCall {
@@ -824,15 +1129,12 @@ fn process_streaming_output_items(
                             name,
                             arguments,
                         } => {
-                            let parsed_args = if arguments.is_empty() {
-                                json!({})
-                            } else {
-                                serde_json::from_str(&arguments).unwrap_or_else(|_| json!({}))
-                            };
+                            let id = sanitize_tool_request_id(&id, &mut tool_request_ids)?;
+                            let parsed_args = parse_tool_arguments(&arguments)?;
 
                             content.push(MessageContentBlock::tool_request(
                                 id,
-                                Ok(CallToolRequestParams::new(name)
+                                Ok(CallToolRequestParams::new(strip_unicode_tags(&name))
                                     .with_arguments(object(parsed_args))),
                             ));
                         }
@@ -849,15 +1151,13 @@ fn process_streaming_output_items(
                 let request_id = call_id.or(id).ok_or_else(|| {
                     anyhow!("Responses function_call output missing call_id and id")
                 })?;
-                let parsed_args = if arguments.is_empty() {
-                    json!({})
-                } else {
-                    serde_json::from_str(&arguments).unwrap_or_else(|_| json!({}))
-                };
+                let request_id = sanitize_tool_request_id(&request_id, &mut tool_request_ids)?;
+                let parsed_args = parse_tool_arguments(&arguments)?;
 
                 content.push(MessageContentBlock::tool_request(
                     request_id,
-                    Ok(CallToolRequestParams::new(name).with_arguments(object(parsed_args))),
+                    Ok(CallToolRequestParams::new(strip_unicode_tags(&name))
+                        .with_arguments(object(parsed_args))),
                 ));
             }
         }
@@ -866,11 +1166,40 @@ fn process_streaming_output_items(
     Ok(content)
 }
 
+fn output_token_limit_marker(id: Option<String>) -> Message {
+    let mut message = Message::assistant();
+    if let Some(id) = id {
+        message = message.with_id(id);
+    }
+    message.metadata.output_token_limit_reached = true;
+    message
+}
+
+/// Parse a line per the SSE grammar and return its field name:
+/// - `field: value` / `field:value` -> `Some(field)`
+/// - `field` (no colon, empty value) -> `Some(field)`
+/// - `: comment` -> `Some("")`
+///
+/// Returns `None` when the line does not look like an SSE field (e.g. a
+/// bare JSON payload such as `{"type": ...}`), so callers can fall back
+/// to parsing it as JSON.
+fn sse_field_name(line: &str) -> Option<&str> {
+    let field = line.split_once(':').map_or(line, |(name, _)| name);
+    if field.is_empty() {
+        return Some("");
+    }
+    let field_like = !field.contains(char::is_whitespace)
+        && field
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    field_like.then_some(field)
+}
+
 pub fn responses_api_to_streaming_message<S>(
     mut stream: S,
 ) -> impl Stream<Item = anyhow::Result<(Option<Message>, Option<ProviderUsage>)>> + 'static
 where
-    S: Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
+    S: Stream<Item = anyhow::Result<String>> + Unpin + MaybeSend + 'static,
 {
     try_stream! {
         use futures::StreamExt;
@@ -881,6 +1210,7 @@ where
         let mut final_usage: Option<ProviderUsage> = None;
         let mut output_items: Vec<ResponseOutputItemInfo> = Vec::new();
         let mut is_text_response = false;
+        let mut output_token_limit_reached = false;
 
         'outer: while let Some(response) = stream.next().await {
             let response_str = response?;
@@ -900,11 +1230,13 @@ where
                 response_str.strip_prefix("data: ").unwrap()
             } else if response_str.starts_with("data:") {
                 response_str.strip_prefix("data:").unwrap()
-            } else if response_str.starts_with("event: ") || response_str.starts_with("event:") {
-                // Skip event type lines
+            } else if sse_field_name(&response_str).is_some_and(|f| f != "data") {
+                // Skip payload-free SSE fields: event, id, retry, comments,
+                // colon-less fields with empty values, and unknown extension
+                // fields — the SSE spec requires all of these to be ignored.
                 continue;
             } else {
-                // Try to parse as-is when there's no prefix
+                // Try to parse as-is when there's no prefix (bare JSON frames)
                 &response_str
             };
 
@@ -925,6 +1257,7 @@ where
 
                 ResponsesStreamEvent::OutputTextDelta { delta, .. } => {
                     is_text_response = true;
+                    let delta = strip_unicode_tags(&delta);
                     if !delta.is_empty() {
                         accumulated_text.push_str(&delta);
 
@@ -958,11 +1291,50 @@ where
                         Usage::default,
                         ResponseUsage::to_usage,
                     );
-                    final_usage = Some(ProviderUsage::new(model.clone(), usage));
+                    let mut pu = ProviderUsage::new(model.clone(), usage);
+                    pu.finish_reasons = Some(vec![response.status.clone()]);
+                    pu.response_id = Some(response.id.clone());
+                    final_usage = Some(pu);
 
                     // For complete output, use the response output items
                     if !response.output.is_empty() {
                         output_items = response.output;
+                    }
+
+                    break 'outer;
+                }
+
+                ResponsesStreamEvent::ResponseIncomplete { response, .. } => {
+                    let model = model_name.as_ref().unwrap_or(&response.model);
+                    let usage = response.usage.as_ref().map_or_else(
+                        Usage::default,
+                        ResponseUsage::to_usage,
+                    );
+                    let mut pu = ProviderUsage::new(model.clone(), usage);
+                    pu.finish_reasons = Some(vec![response
+                        .incomplete_details
+                        .as_ref()
+                        .and_then(|details| details.reason.clone())
+                        .unwrap_or_else(|| response.status.clone())]);
+                    pu.response_id = Some(response.id.clone());
+                    final_usage = Some(pu);
+                    response_id = Some(response.id.clone());
+                    output_token_limit_reached = response_reached_output_token_limit(
+                        &response.status,
+                        response.incomplete_details.as_ref(),
+                    );
+
+                    if !response.output.is_empty() {
+                        output_items = response
+                            .output
+                            .into_iter()
+                            .filter(|item| match item {
+                                ResponseOutputItemInfo::FunctionCall { status, .. } => {
+                                    status.as_deref() == Some("completed")
+                                }
+                                _ => true,
+                            })
+                            .collect();
                     }
 
                     break 'outer;
@@ -979,6 +1351,7 @@ where
 
                 ResponsesStreamEvent::RefusalDelta { delta, .. } => {
                     is_text_response = true;
+                    let delta = strip_unicode_tags(&delta);
                     if !delta.is_empty() {
                         accumulated_text.push_str(&delta);
 
@@ -1020,6 +1393,12 @@ where
             }
         }
 
+        if final_usage.is_none() {
+            Err(ProviderError::stream_decode_error(
+                "Responses stream ended without a completion event",
+            ))?;
+        }
+
         // Process final output items and yield usage data
         let content = process_streaming_output_items(output_items, is_text_response)?;
 
@@ -1028,10 +1407,62 @@ where
             if let Some(id) = response_id {
                 message = message.with_id(id);
             }
+            message.metadata.output_token_limit_reached = output_token_limit_reached;
             yield (Some(message), final_usage);
+        } else if output_token_limit_reached {
+            yield (Some(output_token_limit_marker(response_id)), final_usage);
         } else if let Some(usage) = final_usage {
             yield (None, Some(usage));
         }
+    }
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    fn format(messages: &[Message]) -> Vec<Value> {
+        let mut items = Vec::new();
+        add_message_items(&mut items, messages, true, "gpt-5.6");
+        items
+    }
+
+    #[test]
+    fn user_document_becomes_an_input_file_item() {
+        let items = format(&[Message::user().with_document(
+            "cGRmLWJ5dGVz",
+            "application/pdf",
+            Some("q3-report.pdf".to_string()),
+        )]);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(
+            items[0]["content"][0],
+            json!({
+                "type": "input_file",
+                "filename": "q3-report.pdf",
+                "file_data": "data:application/pdf;base64,cGRmLWJ5dGVz",
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_document_becomes_an_output_text_item() {
+        let items = format(&[Message::assistant().with_document(
+            "cGRmLWJ5dGVz",
+            "application/pdf",
+            Some("q3-report.pdf".to_string()),
+        )]);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["role"], "assistant");
+        let part = &items[0]["content"][0];
+        assert_eq!(part["type"], "output_text");
+        let text = part["text"].as_str().unwrap();
+        assert!(text.contains("q3-report.pdf"), "{text}");
+        assert!(text.contains("user messages"), "{text}");
+        assert!(!text.contains("cGRmLWJ5dGVz"), "{text}");
     }
 }
 
@@ -1089,6 +1520,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_responses_stream_ignores_sse_field_lines() -> anyhow::Result<()> {
+        let lines = vec![
+            "id:1".to_string(),
+            "id".to_string(),
+            "x-trace: abc123".to_string(),
+            "retry: 100".to_string(),
+            ": keepalive comment".to_string(),
+            r#"data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"qwen3.8-max","output":[]}}"#.to_string(),
+            "event: response.output_text.delta".to_string(),
+            r#"data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hello"}"#.to_string(),
+            r#"data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_1","output_index":0,"content_index":0,"delta":" world"}"#.to_string(),
+            r#"data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"completed","model":"qwen3.8-max","output":[],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        let mut text_parts = Vec::new();
+        while let Some(item) = messages.next().await {
+            let (message, _) = item?;
+            if let Some(msg) = message {
+                for content in msg.content {
+                    if let MessageContentBlock::Text(text) = content {
+                        text_parts.push(text.text.clone());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(text_parts.concat(), "Hello world");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_responses_stream_completed_allows_missing_output() -> anyhow::Result<()> {
         let lines = vec![
             r#"data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"gpt-5.2-pro","output":[]}}"#.to_string(),
@@ -1125,6 +1592,135 @@ mod tests {
         assert_eq!(usage.usage.input_tokens, Some(10));
         assert_eq!(usage.usage.output_tokens, Some(4));
         assert_eq!(usage.usage.total_tokens, Some(14));
+
+        Ok(())
+    }
+
+    // OpenAI-compatible providers do not all echo `created_at` back on
+    // `response.*` events; a strict i64 there terminates the whole session on
+    // the first event. The timestamp is carried but never used, so a missing
+    // field must degrade to the default instead of killing the stream.
+    #[tokio::test]
+    async fn test_responses_stream_tolerates_missing_created_at() -> anyhow::Result<()> {
+        let lines = vec![
+            r#"data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_1","object":"response","status":"in_progress","model":"gpt-5.2-pro","output":[]}}"#.to_string(),
+            r#"data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hello"}"#.to_string(),
+            r#"data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_1","output_index":0,"content_index":0,"delta":" world"}"#.to_string(),
+            r#"data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.2-pro","output":[],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        let mut text_parts = Vec::new();
+        while let Some(item) = messages.next().await {
+            let (message, _) = item?;
+            if let Some(msg) = message {
+                for content in msg.content {
+                    if let MessageContentBlock::Text(text) = content {
+                        text_parts.push(text.text.clone());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(text_parts.concat(), "Hello world");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_responses_stream_marks_output_token_limit_when_incomplete() -> anyhow::Result<()>
+    {
+        let lines = vec![
+            r#"data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"gpt-5.2-pro","output":[]}}"#.to_string(),
+            r#"data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Partial response"}"#.to_string(),
+            r#"data: {"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"incomplete","model":"gpt-5.2-pro","output":[],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        let mut text_parts = Vec::new();
+        let mut output_token_limit_markers = Vec::new();
+        let mut usage: Option<ProviderUsage> = None;
+
+        while let Some(item) = messages.next().await {
+            let (message, maybe_usage) = item?;
+            if let Some(msg) = message {
+                if msg.metadata.output_token_limit_reached {
+                    output_token_limit_markers.push((msg.id.clone(), msg.content.is_empty()));
+                }
+                for content in msg.content {
+                    if let MessageContentBlock::Text(text) = content {
+                        text_parts.push(text.text);
+                    }
+                }
+            }
+            if let Some(final_usage) = maybe_usage {
+                usage = Some(final_usage);
+            }
+        }
+
+        assert_eq!(text_parts.concat(), "Partial response");
+        assert_eq!(
+            output_token_limit_markers,
+            vec![(Some("resp_1".to_string()), true)]
+        );
+        let usage = usage.expect("usage should be present when the response is incomplete");
+        assert_eq!(usage.model, "gpt-5.2-pro");
+        assert_eq!(usage.usage.input_tokens, Some(10));
+        assert_eq!(usage.usage.output_tokens, Some(5));
+        assert_eq!(usage.usage.total_tokens, Some(15));
+        assert_eq!(
+            usage.finish_reasons.as_deref(),
+            Some(&["max_output_tokens".to_string()][..])
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_responses_stream_drops_incomplete_function_calls() -> anyhow::Result<()> {
+        let lines = vec![
+            r#"data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"gpt-5.2-pro","output":[]}}"#.to_string(),
+            r#"data: {"type":"response.incomplete","sequence_number":2,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"incomplete","model":"gpt-5.2-pro","output":[{"type":"function_call","id":"fc_complete","status":"completed","call_id":"call_complete","name":"read_file","arguments":"{\"path\":\"README.md\"}"},{"type":"function_call","id":"fc_partial","status":"in_progress","call_id":"call_partial","name":"shell","arguments":"{\"command\":\"echo"}],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        let mut tool_request_ids = Vec::new();
+        let mut output_token_limit_reached = false;
+        let mut usage: Option<ProviderUsage> = None;
+
+        while let Some(item) = messages.next().await {
+            let (message, maybe_usage) = item?;
+            if let Some(msg) = message {
+                output_token_limit_reached |= msg.metadata.output_token_limit_reached;
+                for content in msg.content {
+                    if let MessageContentBlock::ToolRequest(request) = content {
+                        tool_request_ids.push(request.id);
+                    }
+                }
+            }
+            if let Some(final_usage) = maybe_usage {
+                usage = Some(final_usage);
+            }
+        }
+
+        assert_eq!(tool_request_ids, vec!["call_complete"]);
+        assert!(output_token_limit_reached);
+        let usage = usage.expect("usage should be present when the response is incomplete");
+        assert_eq!(usage.usage.input_tokens, Some(10));
+        assert_eq!(usage.usage.output_tokens, Some(5));
+        assert_eq!(usage.usage.total_tokens, Some(15));
 
         Ok(())
     }
@@ -1220,8 +1816,8 @@ mod tests {
                     "type": "reasoning",
                     "id": "rs_1",
                     "summary": [
-                        { "type": "summary_text", "text": "Thinking about the question..." },
-                        { "type": "summary_text", "text": "The answer is straightforward." }
+                        { "type": "summary_text", "text": "Thinking\u{E0041} about the question..." },
+                        { "type": "summary_text", "text": "The answer is\u{E0042} straightforward." }
                     ]
                 },
                 {
@@ -1257,7 +1853,7 @@ mod tests {
             "type": "reasoning",
             "id": "rs_1",
             "summary": [
-                { "type": "summary_text", "text": "Let me think step by step." }
+                { "type": "summary_text", "text": "Let me\u{E0041} think step by step." }
             ]
         });
         let message_item = serde_json::json!({
@@ -1269,12 +1865,8 @@ mod tests {
         });
 
         let lines = vec![
-            format!(
-                r#"data: {{"type":"response.created","sequence_number":1,"response":{{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"gpt-5","output":[]}}}}"#
-            ),
-            format!(
-                r#"data: {{"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_1","output_index":1,"content_index":0,"delta":"Paris."}}"#
-            ),
+            r#"data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"gpt-5","output":[]}}"#.to_string(),
+            r#"data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_1","output_index":1,"content_index":0,"delta":"Paris."}"#.to_string(),
             format!(
                 r#"data: {{"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{}}}"#,
                 serde_json::to_string(&reasoning_item)?
@@ -1357,6 +1949,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -1419,6 +2012,153 @@ mod tests {
     }
 
     #[test]
+    fn test_responses_api_to_message_sanitizes_tool_arguments() {
+        let response = ResponsesApiResponse {
+            id: "resp_1".to_string(),
+            object: "response".to_string(),
+            created_at: 0,
+            status: "completed".to_string(),
+            model: "gpt-5.3-codex".to_string(),
+            output: vec![
+                ResponseOutputItem::Message {
+                    id: Some("msg_1".to_string()),
+                    status: Some("completed".to_string()),
+                    role: "assistant".to_string(),
+                    content: vec![ResponseContentBlock::ToolCall {
+                        id: "call_\u{E0041}1".to_string(),
+                        name: "sh\u{E0041}ell".to_string(),
+                        input: json!({"prompt": "visible e\u{301}\u{E0041}text"}),
+                    }],
+                },
+                ResponseOutputItem::FunctionCall {
+                    id: None,
+                    status: Some("completed".to_string()),
+                    call_id: Some("call_\u{E0042}2".to_string()),
+                    name: "sh\u{E0042}ell".to_string(),
+                    arguments: serde_json::to_string(
+                        &json!({"prompt": "visible e\u{301}\u{E0042}text"}),
+                    )
+                    .unwrap(),
+                },
+            ],
+            reasoning: None,
+            usage: None,
+        };
+
+        let message = responses_api_to_message(&response).unwrap();
+        for (content, expected_id) in message.content.into_iter().zip(["call_1", "call_2"]) {
+            let MessageContentBlock::ToolRequest(tool_request) = content else {
+                panic!("expected tool request content");
+            };
+            assert_eq!(tool_request.id, expected_id);
+            let tool_call = tool_request.tool_call.expect("expected valid tool call");
+            assert_eq!(tool_call.name, "shell");
+            assert_eq!(
+                tool_call
+                    .arguments
+                    .expect("expected arguments")
+                    .get("prompt"),
+                Some(&json!("visible e\u{301}text"))
+            );
+        }
+    }
+
+    #[test]
+    fn test_responses_api_to_message_rejects_sanitized_tool_request_id_collisions() {
+        let response = ResponsesApiResponse {
+            id: "resp_1".to_string(),
+            object: "response".to_string(),
+            created_at: 0,
+            status: "completed".to_string(),
+            model: "gpt-5.3-codex".to_string(),
+            output: vec![
+                ResponseOutputItem::Message {
+                    id: Some("msg_1".to_string()),
+                    status: Some("completed".to_string()),
+                    role: "assistant".to_string(),
+                    content: vec![ResponseContentBlock::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "shell".to_string(),
+                        input: json!({}),
+                    }],
+                },
+                ResponseOutputItem::FunctionCall {
+                    id: None,
+                    status: Some("completed".to_string()),
+                    call_id: Some("call_\u{E0041}1".to_string()),
+                    name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ],
+            reasoning: None,
+            usage: None,
+        };
+
+        let error = responses_api_to_message(&response).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate ID after Unicode tag sanitization"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_responses_api_to_message_rejects_sanitized_tool_argument_key_collisions() {
+        let colliding_arguments = json!({
+            "command": "visible",
+            "comm\u{E0041}and": "hidden",
+        });
+        let responses = [
+            ResponsesApiResponse {
+                id: "resp_1".to_string(),
+                object: "response".to_string(),
+                created_at: 0,
+                status: "completed".to_string(),
+                model: "gpt-5.3-codex".to_string(),
+                output: vec![ResponseOutputItem::Message {
+                    id: Some("msg_1".to_string()),
+                    status: Some("completed".to_string()),
+                    role: "assistant".to_string(),
+                    content: vec![ResponseContentBlock::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "shell".to_string(),
+                        input: colliding_arguments.clone(),
+                    }],
+                }],
+                reasoning: None,
+                usage: None,
+            },
+            ResponsesApiResponse {
+                id: "resp_2".to_string(),
+                object: "response".to_string(),
+                created_at: 0,
+                status: "completed".to_string(),
+                model: "gpt-5.3-codex".to_string(),
+                output: vec![ResponseOutputItem::FunctionCall {
+                    id: None,
+                    status: Some("completed".to_string()),
+                    call_id: Some("call_2".to_string()),
+                    name: "shell".to_string(),
+                    arguments: serde_json::to_string(&colliding_arguments).unwrap(),
+                }],
+                reasoning: None,
+                usage: None,
+            },
+        ];
+
+        for response in responses {
+            let error = responses_api_to_message(&response).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate key after Unicode tag sanitization"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn test_deserialize_reasoning_info_with_null_effort() {
         let json = r#"{"effort": null}"#;
         let info: ResponseReasoningInfo = serde_json::from_str(json).unwrap();
@@ -1445,6 +2185,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -1489,6 +2230,7 @@ mod tests {
                 toolshim_model: None,
                 request_params: None,
                 reasoning: None,
+                supports_vision: None,
                 request_headers: None,
             };
 
@@ -1525,36 +2267,83 @@ mod tests {
         let result = create_responses_request(&model_config, "You are helpful.", &[], &[]).unwrap();
 
         assert_eq!(result["model"], "gpt-5.6-sol");
-        assert_eq!(result["reasoning"]["effort"], "xhigh");
+        assert_eq!(result["reasoning"]["effort"], "max");
         assert_eq!(result["reasoning"]["summary"], "auto");
     }
 
     #[test]
-    fn test_responses_request_supports_gpt_5_6_reasoning_mode() {
-        let model_config = ModelConfig::new("gpt-5.6-sol").with_merged_request_params(
-            std::collections::HashMap::from([("reasoning_mode".to_string(), json!("pro"))]),
-        );
+    fn test_responses_request_always_on_gpt6_off_uses_low_not_none() {
+        for model_name in [
+            "gpt-6-astra",
+            "data_workflow_tools.goose.goose-gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-1-sol",
+            "goose-gpt-6-1-sol",
+            "catalog.schema.goose-gpt-6-1-sol",
+            "openrouter/openai/gpt-6-1-sol",
+        ] {
+            let model_config = ModelConfig::new(model_name)
+                .with_thinking_effort(crate::thinking::ThinkingEffort::Off);
 
+            let result =
+                create_responses_request(&model_config, "You are helpful.", &[], &[]).unwrap();
+
+            assert_eq!(result["model"], model_name, "{model_name}");
+            assert_eq!(
+                result["reasoning"]["effort"], "low",
+                "{model_name} Off should serialize as low, not none"
+            );
+        }
+
+        let model_config = ModelConfig::new("gpt-5.6-luna")
+            .with_thinking_effort(crate::thinking::ThinkingEffort::Off);
         let result = create_responses_request(&model_config, "You are helpful.", &[], &[]).unwrap();
-
-        assert_eq!(result["reasoning"]["mode"], "pro");
-        assert!(result["reasoning"].get("effort").is_none());
-        assert!(result["reasoning"].get("summary").is_none());
+        assert_eq!(result["reasoning"]["effort"], "none");
     }
 
     #[test]
-    fn test_responses_request_rejects_reasoning_mode_for_non_gpt_5_6_model() {
-        for model_name in ["gpt-5.5", "gpt-5.60"] {
+    fn test_responses_request_supports_gpt_5_6_reasoning_mode() {
+        for model_name in [
+            "gpt-5.6-sol",
+            "openrouter/openai/gpt-5.6-sol",
+            "vendor-gpt-5-6",
+        ] {
             let model_config = ModelConfig::new(model_name).with_merged_request_params(
                 std::collections::HashMap::from([("reasoning_mode".to_string(), json!("pro"))]),
             );
 
-            let error = create_responses_request(&model_config, "You are helpful.", &[], &[])
-                .expect_err("reasoning mode should be gated to GPT-5.6 models");
+            let result =
+                create_responses_request(&model_config, "You are helpful.", &[], &[]).unwrap();
 
-            assert!(error
-                .to_string()
-                .contains("reasoning_mode is only supported for GPT-5.6 models"));
+            assert_eq!(result["reasoning"]["mode"], "pro");
+            assert!(result["reasoning"].get("effort").is_none());
+            assert!(result["reasoning"].get("summary").is_none());
+        }
+    }
+
+    #[test]
+    fn test_responses_request_forwards_reasoning_mode_without_model_name_gate() {
+        for model_name in ["gpt-5.5", "gpt-6-astra", "future-reasoner"] {
+            let model_config = ModelConfig::new(model_name).with_merged_request_params(
+                std::collections::HashMap::from([("reasoning_mode".to_string(), json!("pro"))]),
+            );
+
+            let request = create_responses_request(&model_config, "You are helpful.", &[], &[])
+                .expect("the API decides which models support reasoning.mode");
+            assert_eq!(request["reasoning"]["mode"], "pro", "{model_name}");
+            assert!(request["reasoning"].get("effort").is_none());
+        }
+    }
+
+    #[test]
+    fn test_responses_request_rejects_invalid_reasoning_mode_value() {
+        for value in ["fast", "", "pro "] {
+            let model_config = ModelConfig::new("gpt-6-astra").with_merged_request_params(
+                std::collections::HashMap::from([("reasoning_mode".to_string(), json!(value))]),
+            );
+            let error = create_responses_request(&model_config, "You are helpful.", &[], &[])
+                .expect_err("only standard or pro are valid reasoning modes");
+            assert!(error.to_string().contains("Invalid reasoning_mode"));
         }
     }
 
@@ -1570,6 +2359,7 @@ mod tests {
                 toolshim_model: None,
                 request_params: None,
                 reasoning: None,
+                supports_vision: None,
                 request_headers: None,
             };
 
@@ -1610,6 +2400,138 @@ mod tests {
     }
 
     #[test]
+    fn unknown_compatible_alias_preserves_temperature() {
+        let mut config = ModelConfig::new("private-model")
+            .with_thinking_effort(crate::thinking::ThinkingEffort::High);
+        config.temperature = Some(0.5);
+        let payload = create_responses_request(&config, "system", &[], &[]).unwrap();
+        assert!(payload.get("reasoning").is_none());
+        assert_eq!(payload["temperature"], 0.5);
+    }
+
+    #[test]
+    fn responses_request_composes_native_options_and_aliases() {
+        let cases = [
+            (
+                json!({"text": {"verbosity": "low"}}),
+                json!({"text": {"verbosity": "low"}}),
+            ),
+            (
+                json!({"text": {"verbosity": "low"}, "response_format": {"type": "json_object"}}),
+                json!({"text": {"verbosity": "low", "format": {"type": "json_object"}}}),
+            ),
+            (
+                json!({"text": {"format": {"type": "text"}}, "response_format": {"type": "json_object"}}),
+                json!({"text": {"format": {"type": "text"}}}),
+            ),
+            (
+                json!({"reasoning": {"effort": "high", "summary": "detailed"}, "reasoning_effort": "low"}),
+                json!({"reasoning": {"effort": "high", "summary": "detailed"}}),
+            ),
+            (
+                json!({"reasoning": {}, "text": {}}),
+                json!({"reasoning": {}, "text": {}}),
+            ),
+            (
+                json!({"top_p": 0.8, "metadata": {"experiment": "test"}, "stop": ["end"]}),
+                json!({"top_p": 0.8, "metadata": {"experiment": "test"}, "stop": ["end"]}),
+            ),
+        ];
+        for (params, expected) in cases {
+            let config = ModelConfig::new("gpt-4o")
+                .with_merged_request_params(serde_json::from_value(params).unwrap());
+            let payload = create_responses_request(&config, "system", &[], &[]).unwrap();
+            for (key, value) in expected.as_object().unwrap() {
+                assert_eq!(&payload[key], value, "{key}");
+            }
+            for alias in ["reasoning_effort", "reasoning_mode", "response_format"] {
+                assert!(payload.get(alias).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn native_text_parameter_must_be_an_object() {
+        let config = ModelConfig::new("gpt-4o").with_merged_request_params(
+            std::collections::HashMap::from([("text".to_string(), json!("low"))]),
+        );
+        let error = create_responses_request(&config, "system", &[], &[]).unwrap_err();
+        assert!(error.to_string().contains("text must be an object"));
+    }
+
+    #[test]
+    fn native_reasoning_object_takes_precedence_over_aliases_and_thinking_effort() {
+        let config = ModelConfig::new("gpt-5.4")
+            .with_thinking_effort(crate::thinking::ThinkingEffort::Low)
+            .with_merged_request_params(std::collections::HashMap::from([
+                ("reasoning_effort".to_string(), json!("medium")),
+                ("reasoning_mode".to_string(), json!("standard")),
+                (
+                    "reasoning".to_string(),
+                    json!({
+                        "effort": "high", "summary": "detailed", "mode": "pro"
+                    }),
+                ),
+            ]));
+        let payload = create_responses_request(&config, "system", &[], &[]).unwrap();
+        assert_eq!(
+            payload["reasoning"],
+            json!({
+                "effort": "high", "summary": "detailed", "mode": "pro"
+            })
+        );
+    }
+
+    #[test]
+    fn native_reasoning_object_merges_inferred_effort_without_losing_summary() {
+        let config = ModelConfig::new("gpt-5.4")
+            .with_thinking_effort(crate::thinking::ThinkingEffort::High)
+            .with_merged_request_params(std::collections::HashMap::from([(
+                "reasoning".to_string(),
+                json!({"summary": "detailed"}),
+            )]));
+        let payload = create_responses_request(&config, "system", &[], &[]).unwrap();
+        assert_eq!(payload["reasoning"]["effort"], "high");
+        assert_eq!(payload["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
+    fn native_reasoning_object_is_forwarded_without_inferred_effort() {
+        let config =
+            ModelConfig::new("gpt-4o").with_merged_request_params(std::collections::HashMap::from(
+                [("reasoning".to_string(), json!({"summary": "detailed"}))],
+            ));
+        let payload = create_responses_request(&config, "system", &[], &[]).unwrap();
+        assert_eq!(payload["reasoning"], json!({"summary": "detailed"}));
+    }
+
+    #[test]
+    fn native_reasoning_parameter_must_be_an_object() {
+        let config = ModelConfig::new("gpt-5.4").with_merged_request_params(
+            std::collections::HashMap::from([("reasoning".to_string(), json!("high"))]),
+        );
+        let error = create_responses_request(&config, "system", &[], &[]).unwrap_err();
+        assert!(error.to_string().contains("reasoning must be an object"));
+    }
+
+    #[test]
+    fn explicit_reasoning_metadata_overrides_model_name_in_responses() {
+        let mut config = ModelConfig::new("future-reasoner")
+            .with_thinking_effort(crate::thinking::ThinkingEffort::High);
+        config.reasoning = Some(true);
+        let payload = create_responses_request(&config, "system", &[], &[]).unwrap();
+        assert_eq!(payload["reasoning"]["effort"], "high");
+        assert!(payload.get("temperature").is_none());
+
+        config.model_name = "gpt-5.4".to_string();
+        config.reasoning = Some(false);
+        config.temperature = Some(0.5);
+        let payload = create_responses_request(&config, "system", &[], &[]).unwrap();
+        assert!(payload.get("reasoning").is_none());
+        assert_eq!(payload["temperature"], 0.5);
+    }
+
+    #[test]
     fn test_responses_request_non_reasoning_model_ignores_global_thinking_effort() {
         let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", Some("high"))]);
         let model_config = ModelConfig {
@@ -1621,6 +2543,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -1647,6 +2570,7 @@ mod tests {
                 serde_json::json!(true),
             )])),
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -1672,6 +2596,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: Some(true),
             request_headers: None,
         };
 
@@ -1721,6 +2646,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: Some(true),
             request_headers: None,
         };
 
@@ -1758,6 +2684,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -1790,6 +2717,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -1821,6 +2749,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -1855,6 +2784,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -1894,6 +2824,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -1920,6 +2851,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: Some(true),
             request_headers: None,
         };
 
@@ -1952,6 +2884,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: Some(true),
             request_headers: None,
         };
 
@@ -1970,7 +2903,69 @@ mod tests {
     }
 
     #[test]
-    fn test_assistant_text_uses_output_text_type() {
+    fn test_user_image_omitted_when_not_vision() {
+        use crate::conversation::message::Message;
+
+        let messages = vec![Message::user()
+            .with_text("describe this image")
+            .with_image("aW1hZ2VkYXRh", "image/png")];
+
+        // Non-vision: explicit image content is replaced with a text placeholder
+        // at format time — session history is untouched.
+        let model_config = ModelConfig::new("o3-mini");
+        let result = create_responses_request(&model_config, "", &messages, &[]).unwrap();
+        let input = result["input"].as_array().unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "describe this image");
+        assert_eq!(content[1]["type"], "input_text");
+        assert_eq!(
+            content[1]["text"],
+            "[image omitted: model does not support vision]"
+        );
+
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("input_image"));
+        assert!(!serialized.contains("data:image"));
+    }
+
+    #[test]
+    fn test_tool_response_image_omitted_when_not_vision() {
+        use crate::conversation::message::Message;
+        use rmcp::model::{CallToolResult, ContentBlock};
+
+        let messages = vec![
+            Message::user().with_content(MessageContentBlock::tool_response(
+                "call_1",
+                Ok(CallToolResult::success(vec![
+                    ContentBlock::text("caption"),
+                    ContentBlock::image("a+/=".to_string(), "image/png".to_string()),
+                ])),
+            )),
+        ];
+
+        // Non-vision: images in tool results are omitted from the output
+        // string (with a note) instead of being emitted as input_image items.
+        let model_config = ModelConfig::new("o3-mini");
+        let result = create_responses_request(&model_config, "", &messages, &[]).unwrap();
+        let input = result["input"].as_array().unwrap();
+
+        assert_eq!(input[0]["type"], "function_call_output");
+        let output = input[0]["output"].as_str().unwrap();
+        assert!(output.contains("caption"));
+        assert!(output.contains("[image omitted: model does not support vision]"));
+
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("input_image"));
+        assert!(!serialized.contains("data:image"));
+    }
+
+    #[test]
+    fn test_assistant_text_uses_output_text_with_annotations() {
         use crate::conversation::message::Message;
 
         let messages = vec![Message::assistant().with_text("hello")];
@@ -1984,6 +2979,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -1993,6 +2989,147 @@ mod tests {
         assert_eq!(input[0]["role"], "assistant");
         assert_eq!(input[0]["content"][0]["type"], "output_text");
         assert_eq!(input[0]["content"][0]["text"], "hello");
+        assert_eq!(input[0]["content"][0]["annotations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_responses_api_to_message_sanitizes_unicode_tags() {
+        let response: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 0,
+            "status": "completed",
+            "model": "gpt-5.5",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "visible\u{E0041}text"},
+                    {"type": "refusal", "refusal": "cannot\u{E0042}help"}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let message = responses_api_to_message(&response).unwrap();
+        let text = message
+            .content
+            .iter()
+            .filter_map(MessageContentBlock::as_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(text, vec!["visibletext", "cannothelp"]);
+    }
+
+    #[test]
+    fn test_streaming_output_items_sanitize_unicode_tags() {
+        let item: ResponseOutputItemInfo = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "id": "msg_1",
+            "status": "completed",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "visible\u{E0041}text"},
+                {"type": "refusal", "refusal": "cannot\u{E0042}help"}
+            ]
+        }))
+        .unwrap();
+
+        let content = process_streaming_output_items(vec![item], false).unwrap();
+        let text = content
+            .iter()
+            .filter_map(MessageContentBlock::as_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(text, vec!["visibletext", "cannothelp"]);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_deltas_sanitize_unicode_tags() -> anyhow::Result<()> {
+        let lines = vec![
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {
+                        "id": "resp_1",
+                        "object": "response",
+                        "created_at": 0,
+                        "status": "in_progress",
+                        "model": "gpt-5.5",
+                        "output": []
+                    }
+                })
+            ),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 2,
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "visible\u{E0041}te"
+                })
+            ),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 3,
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "xt e"
+                })
+            ),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 4,
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "\u{301}"
+                })
+            ),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.refusal.delta",
+                    "sequence_number": 5,
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 1,
+                    "delta": "cannot\u{E0042}help"
+                })
+            ),
+            r#"data: {"type":"response.completed","sequence_number":6,"response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"gpt-5.5","output":[]}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        let mut text = Vec::new();
+        while let Some(item) = messages.next().await {
+            if let Some(message) = item?.0 {
+                text.extend(
+                    message
+                        .content
+                        .iter()
+                        .filter_map(MessageContentBlock::as_text)
+                        .map(str::to_owned),
+                );
+            }
+        }
+
+        assert_eq!(text.concat(), "visibletext e\u{301}cannothelp");
+        Ok(())
     }
 
     #[test]
@@ -2085,6 +3222,43 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_text_content_part_deserializes() {
+        let json = r#"{"type":"response.content_part.added","content_index":0,"item_id":"64cda83e-03b0-4e61-ab77-30d06ffe7f23","output_index":0,"part":{"type":"reasoning_text","text":"thinking..."},"sequence_number":3}"#;
+
+        let event: ResponsesStreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ResponsesStreamEvent::ContentBlockPartAdded { part, .. } => match part {
+                ContentBlockPart::ReasoningText { text } => {
+                    assert_eq!(text, "thinking...");
+                }
+                _ => panic!("expected ReasoningText part"),
+            },
+            _ => panic!("expected ContentBlockPartAdded event"),
+        }
+    }
+
+    #[test]
+    fn test_reasoning_text_surfaces_as_thinking_block() -> anyhow::Result<()> {
+        let output_items = vec![ResponseOutputItemInfo::Message {
+            id: Some("msg_1".to_string()),
+            status: Some("completed".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentBlockPart::ReasoningText {
+                text: "thinking...".to_string(),
+            }],
+        }];
+
+        let content = process_streaming_output_items(output_items, true)?;
+        assert_eq!(content.len(), 1, "reasoning text should be kept");
+        assert!(
+            matches!(content[0], MessageContentBlock::Thinking(_)),
+            "reasoning text should become a thinking block"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_function_call_output_requires_call_id_or_id() {
         let output_items = vec![ResponseOutputItemInfo::FunctionCall {
             id: None,
@@ -2102,44 +3276,123 @@ mod tests {
     }
 
     #[test]
-    fn test_frontend_tool_request_serialized_in_responses_request() {
-        use crate::conversation::message::Message;
-        use rmcp::model::{CallToolResult, ContentBlock};
-
-        let messages = vec![
-            Message::assistant().with_frontend_tool_request(
-                "call_ft1",
-                Ok(CallToolRequestParams::new("browser_click")
-                    .with_arguments(object!({"selector": "#btn"}))),
-            ),
-            Message::user().with_content(MessageContentBlock::tool_response(
-                "call_ft1",
-                Ok(CallToolResult::success(vec![ContentBlock::text("clicked")])),
-            )),
+    fn test_streaming_output_items_sanitize_tool_arguments() -> anyhow::Result<()> {
+        let output_items = vec![
+            ResponseOutputItemInfo::Message {
+                id: Some("msg_1".to_string()),
+                status: Some("completed".to_string()),
+                role: "assistant".to_string(),
+                content: vec![ContentBlockPart::ToolCall {
+                    id: "call_\u{E0041}1".to_string(),
+                    name: "sh\u{E0041}ell".to_string(),
+                    arguments: serde_json::to_string(
+                        &json!({"prompt": "visible e\u{301}\u{E0041}text"}),
+                    )?,
+                }],
+            },
+            ResponseOutputItemInfo::FunctionCall {
+                id: None,
+                status: Some("completed".to_string()),
+                call_id: Some("call_\u{E0042}2".to_string()),
+                name: "sh\u{E0042}ell".to_string(),
+                arguments: serde_json::to_string(
+                    &json!({"prompt": "visible e\u{301}\u{E0042}text"}),
+                )?,
+            },
         ];
 
-        let model_config = ModelConfig {
-            model_name: "gpt-5.5".to_string(),
-            context_limit: None,
-            temperature: None,
-            max_tokens: None,
-            toolshim: false,
-            toolshim_model: None,
-            request_params: None,
-            reasoning: None,
-            request_headers: None,
-        };
+        let content = process_streaming_output_items(output_items, false)?;
+        for (content, expected_id) in content.into_iter().zip(["call_1", "call_2"]) {
+            let MessageContentBlock::ToolRequest(tool_request) = content else {
+                panic!("expected tool request content");
+            };
+            assert_eq!(tool_request.id, expected_id);
+            let tool_call = tool_request.tool_call.expect("expected valid tool call");
+            assert_eq!(tool_call.name, "shell");
+            assert_eq!(
+                tool_call
+                    .arguments
+                    .expect("expected arguments")
+                    .get("prompt"),
+                Some(&json!("visible e\u{301}text"))
+            );
+        }
 
-        let result = create_responses_request(&model_config, "", &messages, &[]).unwrap();
-        let input = result["input"].as_array().unwrap();
+        Ok(())
+    }
 
-        assert_eq!(input[0]["type"], "function_call");
-        assert_eq!(input[0]["call_id"], "call_ft1");
-        assert_eq!(input[0]["name"], "browser_click");
+    #[test]
+    fn test_streaming_output_items_reject_sanitized_tool_request_id_collisions(
+    ) -> anyhow::Result<()> {
+        let output_items = vec![
+            ResponseOutputItemInfo::Message {
+                id: Some("msg_1".to_string()),
+                status: Some("completed".to_string()),
+                role: "assistant".to_string(),
+                content: vec![ContentBlockPart::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            ResponseOutputItemInfo::FunctionCall {
+                id: None,
+                status: Some("completed".to_string()),
+                call_id: Some("call_\u{E0041}1".to_string()),
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+            },
+        ];
 
-        assert_eq!(input[1]["type"], "function_call_output");
-        assert_eq!(input[1]["call_id"], "call_ft1");
-        assert_eq!(input[1]["output"], "clicked");
+        let error = process_streaming_output_items(output_items, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate ID after Unicode tag sanitization"),
+            "unexpected error: {error}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_streaming_output_items_reject_sanitized_tool_argument_key_collisions(
+    ) -> anyhow::Result<()> {
+        let colliding_arguments = json!({
+            "command": "visible",
+            "comm\u{E0041}and": "hidden",
+        });
+        let output_items = [
+            ResponseOutputItemInfo::Message {
+                id: Some("msg_1".to_string()),
+                status: Some("completed".to_string()),
+                role: "assistant".to_string(),
+                content: vec![ContentBlockPart::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: serde_json::to_string(&colliding_arguments)?,
+                }],
+            },
+            ResponseOutputItemInfo::FunctionCall {
+                id: None,
+                status: Some("completed".to_string()),
+                call_id: Some("call_2".to_string()),
+                name: "shell".to_string(),
+                arguments: serde_json::to_string(&colliding_arguments)?,
+            },
+        ];
+
+        for output_item in output_items {
+            let error = process_streaming_output_items(vec![output_item], false).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate key after Unicode tag sanitization"),
+                "unexpected error: {error}"
+            );
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -2152,8 +3405,8 @@ mod tests {
                 Ok(CallToolRequestParams::new("Crack Catcher")
                     .with_arguments(object!({"prompt": "verify the work"}))),
             ),
-            Message::assistant().with_frontend_tool_request(
-                "call_frontend_agent",
+            Message::assistant().with_tool_request(
+                "call_review_agent",
                 Ok(CallToolRequestParams::new("@Review Agent")
                     .with_arguments(object!({"prompt": "check it"}))),
             ),
@@ -2168,6 +3421,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -2179,7 +3433,7 @@ mod tests {
         assert_eq!(input[0]["name"], "Crack_Catcher");
 
         assert_eq!(input[1]["type"], "function_call");
-        assert_eq!(input[1]["call_id"], "call_frontend_agent");
+        assert_eq!(input[1]["call_id"], "call_review_agent");
         assert_eq!(input[1]["name"], "_Review_Agent");
     }
 
@@ -2200,6 +3454,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -2232,6 +3487,7 @@ mod tests {
             toolshim_model: None,
             request_params: None,
             reasoning: None,
+            supports_vision: None,
             request_headers: None,
         };
 
@@ -2247,41 +3503,56 @@ mod tests {
             .contains("invalid arguments"));
     }
 
-    #[test]
-    fn test_frontend_tool_request_error_emits_function_call_output() {
-        use crate::conversation::message::Message;
-        use rmcp::model::{ErrorCode, ErrorData};
+    #[tokio::test]
+    async fn test_encrypted_reasoning_replays_only_for_its_model() -> anyhow::Result<()> {
+        use crate::conversation::message::InferenceMetadata;
+        use rmcp::model::CallToolResult;
 
-        let messages = vec![Message::assistant().with_frontend_tool_request(
-            "call_ft_err",
-            Err(ErrorData {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: "malformed arguments".into(),
-                data: None,
-            }),
+        let reasoning_item = json!({
+            "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc-1"
+        });
+        let call_item = json!({
+            "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "shell", "arguments": "{}"
+        });
+        let lines = vec![format!(
+            r#"data: {{"type":"response.completed","sequence_number":1,"response":{{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6","output":[{reasoning_item},{call_item}]}}}}"#
         )];
-
-        let model_config = ModelConfig {
-            model_name: "gpt-5.5".to_string(),
-            context_limit: None,
-            temperature: None,
-            max_tokens: None,
-            toolshim: false,
-            toolshim_model: None,
-            request_params: None,
-            reasoning: None,
-            request_headers: None,
+        let stream =
+            responses_api_to_streaming_message(tokio_stream::iter(lines.into_iter().map(Ok)));
+        futures::pin_mut!(stream);
+        let (Some(assistant), _) = stream.next().await.unwrap()? else {
+            panic!("expected a message");
         };
+        let assistant = assistant.with_inference(InferenceMetadata {
+            provider: "openai".to_string(),
+            requested_model: "gpt-5.6".to_string(),
+            resolved_model: None,
+            provider_session_id: None,
+        });
+        let messages = vec![
+            Message::user().with_text("list files"),
+            assistant,
+            Message::user().with_content(MessageContentBlock::tool_response(
+                "call_1",
+                Ok(CallToolResult::success(vec![ContentBlock::text("a.txt")])),
+            )),
+        ];
 
-        let result = create_responses_request(&model_config, "", &messages, &[]).unwrap();
-        let input = result["input"].as_array().unwrap();
+        let same = create_responses_request(&ModelConfig::new("gpt-5.6"), "", &messages, &[])?;
+        assert_eq!(same["include"], json!(["reasoning.encrypted_content"]));
+        let input = same["input"].as_array().unwrap();
+        assert_eq!(
+            input[1],
+            json!({ "type": "reasoning", "summary": [], "encrypted_content": "enc-1" })
+        );
+        assert_eq!(input[2]["type"], "function_call");
 
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_ft_err");
-        assert!(input[0]["output"]
-            .as_str()
+        let other = create_responses_request(&ModelConfig::new("gpt-5.5"), "", &messages, &[])?;
+        assert!(!other["input"]
+            .as_array()
             .unwrap()
-            .contains("malformed arguments"));
+            .iter()
+            .any(|item| item["type"] == "reasoning"));
+        Ok(())
     }
 }

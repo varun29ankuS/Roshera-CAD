@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use once_cell::sync::Lazy;
-use reqwest::{Client, StatusCode};
+use reqwest::{header::HeaderMap, Client, StatusCode};
 use serde_json::Value;
 use tokio::time::sleep;
 use tokio_util::io::StreamReader;
@@ -18,7 +18,7 @@ use crate::conversation::message::Message;
 use crate::providers::api_client::RequestBuilderDecorator;
 use crate::providers::base::{
     ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata,
-    DEFAULT_PROVIDER_TIMEOUT_SECS,
+    DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_PROVIDER_TIMEOUT_SECS,
 };
 use goose_providers::model::ModelConfig;
 
@@ -30,6 +30,7 @@ use crate::providers::gcpauth::GcpAuth;
 use crate::providers::openai_compatible::{map_http_error_to_provider_error, sanitize_url};
 use crate::providers::retry::RetryConfig;
 use goose_providers::errors::ProviderError;
+use goose_providers::http_status::{extract_retry_after, read_error_body};
 use goose_providers::request_log::{start_log, LoggerHandleExt};
 use rmcp::model::Tool;
 
@@ -60,6 +61,25 @@ fn rate_limit_error_message(response_text: &str) -> String {
 const OVERLOADED_ERROR_MSG: &str =
     "Vertex AI Provider API is temporarily overloaded. This is similar to a rate limit \
      error but indicates backend processing capacity issues.";
+
+fn map_429_retry(
+    headers: &HeaderMap,
+    body: &str,
+    attempt: usize,
+    retry_config: &RetryConfig,
+) -> (ProviderError, Duration) {
+    let details = rate_limit_error_message(body);
+    let payload = serde_json::from_str::<Value>(body).ok();
+    let retry_delay = extract_retry_after(headers, payload.as_ref());
+    let sleep_for = retry_delay.unwrap_or_else(|| retry_config.delay_for_attempt(attempt));
+    (
+        ProviderError::RateLimitExceeded {
+            details,
+            retry_delay,
+        },
+        sleep_for,
+    )
+}
 
 fn build_vertex_url(
     host: &str,
@@ -96,19 +116,25 @@ fn build_vertex_url(
         ModelProvider::Google | ModelProvider::MaaS(_) => "v1beta1",
     };
 
-    let path = format!(
-        "{}/projects/{}/locations/{}/publishers/{}/models/{}:{}",
-        api_version,
-        project_id,
-        target_location,
-        provider.as_str(),
-        model_name,
-        endpoint
-    );
-
-    let mut url = base_url
-        .join(&path)
-        .map_err(|e| GcpVertexAIError::InvalidUrl(e.to_string()))?;
+    let provider_name = provider.as_str();
+    let model_endpoint = format!("{model_name}:{endpoint}");
+    let mut url = base_url;
+    url.path_segments_mut()
+        .map_err(|_| {
+            GcpVertexAIError::InvalidUrl("Vertex AI host cannot be a base URL".to_string())
+        })?
+        .clear()
+        .extend([
+            api_version,
+            "projects",
+            project_id,
+            "locations",
+            target_location,
+            "publishers",
+            &provider_name,
+            "models",
+            &model_endpoint,
+        ]);
 
     if streaming && !matches!(provider, ModelProvider::Anthropic) {
         url.set_query(Some("alt=sse"));
@@ -174,7 +200,8 @@ impl GcpVertexAIProvider {
         let host = Self::build_host_url(&location);
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_PROVIDER_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+            .read_timeout(Duration::from_secs(DEFAULT_PROVIDER_TIMEOUT_SECS))
             .build()?;
 
         let auth = GcpAuth::new().await?;
@@ -327,11 +354,13 @@ impl GcpVertexAIProvider {
                 }
             }
 
-            let response = (self.request_builder)(request)
-                .map_err(|e| ProviderError::ExecutionError(e.to_string()))?
-                .send()
-                .await
-                .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
+            let request = (self.request_builder)(request)
+                .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
+            let response = goose_providers::http_status::send_bounded(
+                request,
+                Duration::from_secs(DEFAULT_PROVIDER_TIMEOUT_SECS),
+            )
+            .await?;
 
             let status = response.status();
 
@@ -345,13 +374,15 @@ impl GcpVertexAIProvider {
                         }),
                     );
                 }
-                let msg = rate_limit_error_message(&response.text().await.unwrap_or_default());
-                tracing::warn!("429 (attempt {rate_limit_attempts}/{max_retries}): {msg}");
-                last_error = Some(ProviderError::RateLimitExceeded {
-                    details: msg,
-                    retry_delay: None,
-                });
-                sleep(self.retry_config.delay_for_attempt(rate_limit_attempts)).await;
+                let headers = response.headers().clone();
+                let body = read_error_body(response).await.unwrap_or_default();
+                let (err, sleep_for) =
+                    map_429_retry(&headers, &body, rate_limit_attempts, &self.retry_config);
+                if let ProviderError::RateLimitExceeded { details, .. } = &err {
+                    tracing::warn!("429 (attempt {rate_limit_attempts}/{max_retries}): {details}");
+                }
+                last_error = Some(err);
+                sleep(sleep_for).await;
             } else if status == *STATUS_API_OVERLOADED {
                 overloaded_attempts += 1;
                 if overloaded_attempts > max_retries {
@@ -389,7 +420,7 @@ impl GcpVertexAIProvider {
                 )));
             } else {
                 let url = sanitize_url(response.url().as_str());
-                let response_text = response.text().await.unwrap_or_default();
+                let response_text = read_error_body(response).await.unwrap_or_default();
                 let payload = serde_json::from_str::<Value>(&response_text).ok();
                 return Err(map_http_error_to_provider_error(status, payload, &url));
             }
@@ -459,6 +490,7 @@ impl GcpVertexAIProvider {
         let response = match self
             .client
             .post(&url)
+            .timeout(Duration::from_secs(DEFAULT_PROVIDER_TIMEOUT_SECS))
             .header("Authorization", &auth_header)
             .json(&payload)
             .send()
@@ -579,6 +611,15 @@ impl goose_providers::base::ProviderDescriptor for GcpVertexAIProvider {
                 ),
             ],
         )
+        .with_setup(
+            crate::providers::catalog::ProviderSetupMetadata::new(
+                crate::providers::catalog::ProviderSetupCategory::Model,
+                crate::providers::catalog::ProviderSetupMethod::CloudCredentials,
+                crate::providers::catalog::ProviderSetupGroup::Additional,
+            )
+            .with_field("GCP_PROJECT_ID", "Project ID", Some("my-gcp-project"), None)
+            .with_field("GCP_LOCATION", "Location", Some("us-central1"), None),
+        )
     }
 }
 
@@ -685,6 +726,55 @@ mod tests {
     }
 
     #[test]
+    fn test_429_retry_honors_retry_after_header() {
+        let config = RetryConfig::new(5, 1000, 2.0, 32000);
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "30".parse().unwrap());
+        let (err, sleep_for) =
+            map_429_retry(&headers, r#"{"error":{"message":"slow"}}"#, 1, &config);
+        match err {
+            ProviderError::RateLimitExceeded { retry_delay, .. } => {
+                assert_eq!(retry_delay, Some(Duration::from_secs(30)));
+            }
+            other => panic!("expected rate limit, got: {other:?}"),
+        }
+        assert_eq!(sleep_for, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_429_retry_honors_retry_after_body_seconds() {
+        let config = RetryConfig::new(5, 1000, 2.0, 32000);
+        let body = r#"{"error":{"metadata":{"retry_after_seconds":45.0}}}"#;
+        let (err, sleep_for) = map_429_retry(&HeaderMap::new(), body, 1, &config);
+        match err {
+            ProviderError::RateLimitExceeded { retry_delay, .. } => {
+                assert_eq!(retry_delay, Some(Duration::from_secs(45)));
+            }
+            other => panic!("expected rate limit, got: {other:?}"),
+        }
+        assert_eq!(sleep_for, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn test_429_retry_falls_back_to_backoff_without_hint() {
+        let config = RetryConfig::new(5, 1000, 2.0, 32000);
+        let (err, sleep_for) = map_429_retry(
+            &HeaderMap::new(),
+            r#"{"error":{"message":"slow"}}"#,
+            1,
+            &config,
+        );
+        match err {
+            ProviderError::RateLimitExceeded { retry_delay, .. } => {
+                assert_eq!(retry_delay, None);
+            }
+            other => panic!("expected rate limit, got: {other:?}"),
+        }
+        let ms = sleep_for.as_millis();
+        assert!((800..=1200).contains(&ms), "unexpected backoff: {ms}ms");
+    }
+
+    #[test]
     fn test_status_overloaded_code() {
         // Test that we correctly handle the 529 status code
 
@@ -723,7 +813,10 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(anthropic_url.as_str().contains(":rawPredict"));
+        assert_eq!(
+            anthropic_url.as_str(),
+            "https://us-east5-aiplatform.googleapis.com/v1/projects/test-project/locations/us-east5/publishers/anthropic/models/claude-sonnet-4@20250514:rawPredict"
+        );
 
         let anthropic_stream = build_vertex_url(
             "https://us-east5-aiplatform.googleapis.com",
@@ -735,8 +828,10 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(anthropic_stream.as_str().contains(":streamRawPredict"));
-        assert!(anthropic_stream.query().is_none());
+        assert_eq!(
+            anthropic_stream.as_str(),
+            "https://us-east5-aiplatform.googleapis.com/v1/projects/test-project/locations/us-east5/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict"
+        );
 
         let google_stream = build_vertex_url(
             "https://us-central1-aiplatform.googleapis.com",
@@ -748,8 +843,84 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(google_stream.as_str().contains(":streamGenerateContent"));
-        assert_eq!(google_stream.query(), Some("alt=sse"));
+        assert_eq!(
+            google_stream.as_str(),
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+
+        let maas_url = build_vertex_url(
+            "https://us-central1-aiplatform.googleapis.com",
+            "us-central1",
+            "test-project",
+            "qwen3-coder-480b-a35b-instruct-maas",
+            ModelProvider::MaaS("qwen".to_string()),
+            "us-central1",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            maas_url.as_str(),
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/test-project/locations/us-central1/publishers/qwen/models/qwen3-coder-480b-a35b-instruct-maas:generateContent"
+        );
+    }
+
+    #[test]
+    fn test_build_vertex_url_encodes_model_path_segment() {
+        let model_names = [
+            "claude-x/../../../../../../../../projects/attacker/locations/us-east5/endpoints/123",
+            r"claude-x\..\endpoints\123",
+            "claude-x%2F..%2Fprojects%2Fattacker",
+            "claude-x?alt=sse",
+            "claude-x#fragment",
+        ];
+
+        for model_name in model_names {
+            let url = build_vertex_url(
+                "https://us-east5-aiplatform.googleapis.com",
+                "us-east5",
+                "test-project",
+                model_name,
+                ModelProvider::Anthropic,
+                "us-east5",
+                true,
+            )
+            .unwrap();
+
+            let model_path = url
+                .path()
+                .strip_prefix(
+                    "/v1/projects/test-project/locations/us-east5/publishers/anthropic/models/",
+                )
+                .unwrap();
+            assert!(
+                !model_path.contains('/'),
+                "model escaped its segment: {url}"
+            );
+            assert_eq!(url.host_str(), Some("us-east5-aiplatform.googleapis.com"));
+            assert_eq!(url.query(), None);
+            assert_eq!(url.fragment(), None);
+        }
+    }
+
+    #[test]
+    fn test_build_vertex_url_encodes_maas_publisher_segment() {
+        let model_name = "../qwen-maas";
+        let provider = RequestContext::new(model_name).unwrap().provider();
+        let url = build_vertex_url(
+            "https://us-central1-aiplatform.googleapis.com",
+            "us-central1",
+            "test-project",
+            model_name,
+            provider,
+            "us-central1",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/test-project/locations/us-central1/publishers/..%2Fqwen/models/..%2Fqwen-maas:generateContent"
+        );
     }
 
     #[test]

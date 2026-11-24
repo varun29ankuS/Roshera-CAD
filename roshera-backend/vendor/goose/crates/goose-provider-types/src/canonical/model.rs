@@ -52,16 +52,61 @@ pub struct Pricing {
     /// Cost per million cached write tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write: Option<f64>,
+
+    /// Long-context rates that replace the base rates for the whole request
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<PricingTier>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricingTier {
+    /// The tier applies once the prompt exceeds this many input tokens
+    pub above_input_tokens: u64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<f64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<f64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
 }
 
 impl Pricing {
-    pub fn estimate_cost(&self, usage: &Usage) -> Option<f64> {
-        let input_price = self.input?;
-        let output_price = self.output?;
-        let cache_read_price = self.cache_read.unwrap_or(input_price);
-        let cache_write_price = self.cache_write.unwrap_or(input_price);
+    /// True when the entry carries no usable rate signal: `estimate_cost` needs both
+    /// an input and an output price, so an unset or literal-zero value in either field
+    /// makes the whole estimate wrong-low rather than merely incomplete. Mirrors the
+    /// `is_price_gap` predicate in `goose::providers::canonical_cost`.
+    pub fn has_no_usable_rate(&self) -> bool {
+        fn is_gap(price: Option<f64>) -> bool {
+            matches!(price, None | Some(0.0))
+        }
+        is_gap(self.input) || is_gap(self.output)
+    }
 
-        let input_tokens = usage.input_tokens.unwrap_or(0).max(0) as f64;
+    pub fn estimate_cost(&self, usage: &Usage) -> Option<f64> {
+        let prompt_tokens = usage.input_tokens.unwrap_or(0).max(0) as u64;
+        let tier = self
+            .tiers
+            .iter()
+            .filter(|tier| prompt_tokens > tier.above_input_tokens)
+            .max_by_key(|tier| tier.above_input_tokens);
+        let input_price = tier.and_then(|t| t.input).or(self.input)?;
+        let output_price = tier.and_then(|t| t.output).or(self.output)?;
+        let cache_read_price = tier
+            .and_then(|t| t.cache_read)
+            .or(self.cache_read)
+            .unwrap_or(input_price);
+        let cache_write_price = tier
+            .and_then(|t| t.cache_write)
+            .or(self.cache_write)
+            .unwrap_or(input_price);
+
+        let input_tokens = prompt_tokens as f64;
         let output_tokens = usage.output_tokens.unwrap_or(0).max(0) as f64;
         let cache_read_tokens = usage.cache_read_input_tokens.unwrap_or(0).max(0) as f64;
         let cache_write_tokens = usage.cache_write_input_tokens.unwrap_or(0).max(0) as f64;
@@ -115,6 +160,10 @@ pub struct CanonicalModel {
     /// Whether the model supports reasoning/thinking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+
+    /// Allowed values of the OpenAI-style reasoning effort parameter, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<String>>,
 
     /// Request shape to use when enabling thinking/reasoning.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,6 +221,7 @@ mod tests {
             output,
             cache_read,
             cache_write,
+            tiers: Vec::new(),
         }
     }
 
@@ -205,6 +255,20 @@ mod tests {
         assert!(pricing(Some(2.0), None, None, None)
             .estimate_cost(&usage)
             .is_none());
+    }
+
+    #[test]
+    fn has_no_usable_rate_covers_absent_zero_and_asymmetric_prices() {
+        assert!(pricing(None, None, None, None).has_no_usable_rate());
+        assert!(pricing(Some(0.0), Some(0.0), None, None).has_no_usable_rate());
+        // A half-zero rate would bill one side at nothing, so it is not usable either.
+        assert!(pricing(Some(0.0), Some(5.0), None, None).has_no_usable_rate());
+        assert!(pricing(Some(5.0), Some(0.0), None, None).has_no_usable_rate());
+        assert!(pricing(None, Some(5.0), None, None).has_no_usable_rate());
+
+        assert!(!pricing(Some(1.25), Some(10.0), None, None).has_no_usable_rate());
+        // Zero cache rates are legitimate: free cache reads on a paid model.
+        assert!(!pricing(Some(1.25), Some(10.0), Some(0.0), Some(0.0)).has_no_usable_rate());
     }
 
     #[test]

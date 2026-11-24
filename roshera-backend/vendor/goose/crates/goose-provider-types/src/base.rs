@@ -2,19 +2,27 @@ use async_trait::async_trait;
 use futures::Stream;
 use rmcp::model::Tool;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::pin::Pin;
+use tokio::sync::watch;
 
 use crate::{
-    canonical::{map_to_canonical_model, CanonicalModelRegistry},
+    canonical::{
+        catalog::ProviderSetupMetadata, map_to_canonical_model, recommended_models_from_registry,
+        CanonicalModelRegistry,
+    },
     conversation::{
         message::{Message, MessageContentBlock},
         token_usage::{ProviderUsage, Usage},
     },
     errors::ProviderError,
     goose_mode::GooseMode,
+    maybe_send::{MaybeSend, MaybeSync},
     model::ModelConfig,
     permission::PermissionConfirmation,
     retry::RetryConfig,
+    thinking::ThinkingEffortSupport,
 };
 
 /// Metadata about a provider's configuration requirements and capabilities
@@ -37,13 +45,17 @@ pub struct ProviderMetadata {
     /// step-by-step instructions for set up providers eg: api key
     #[serde(default)]
     pub setup_steps: Vec<String>,
-    /// Hint shown in the model picker when this provider manages its own model selection.
+    /// Setup information exposed to clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_selection_hint: Option<String>,
-    /// The name of a fast/cheap model to use for lightweight tasks (e.g. session naming,
-    /// compaction). When set, fast-path callers prefer this model over the main model.
+    pub setup: Option<ProviderSetupMetadata>,
+    /// Structured deprecation information for providers kept for compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fast_model: Option<String>,
+    pub deprecated: Option<ProviderDeprecation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderDeprecation {
+    pub replacement: Option<String>,
 }
 
 impl ProviderMetadata {
@@ -68,8 +80,8 @@ impl ProviderMetadata {
             model_doc_link: model_doc_link.to_string(),
             config_keys,
             setup_steps: vec![],
-            model_selection_hint: None,
-            fast_model: None,
+            setup: None,
+            deprecated: None,
         }
     }
 
@@ -91,8 +103,8 @@ impl ProviderMetadata {
             model_doc_link: model_doc_link.to_string(),
             config_keys,
             setup_steps: vec![],
-            model_selection_hint: None,
-            fast_model: None,
+            setup: None,
+            deprecated: None,
         }
     }
 
@@ -106,8 +118,8 @@ impl ProviderMetadata {
             model_doc_link: "".to_string(),
             config_keys: vec![],
             setup_steps: vec![],
-            model_selection_hint: None,
-            fast_model: None,
+            setup: None,
+            deprecated: None,
         }
     }
 
@@ -116,13 +128,15 @@ impl ProviderMetadata {
         self
     }
 
-    pub fn with_model_selection_hint(mut self, hint: &str) -> Self {
-        self.model_selection_hint = Some(hint.to_string());
+    pub fn with_setup(mut self, setup: ProviderSetupMetadata) -> Self {
+        self.setup = Some(setup);
         self
     }
 
-    pub fn with_fast_model(mut self, fast_model: &str) -> Self {
-        self.fast_model = Some(fast_model.to_string());
+    pub fn deprecated(mut self, replacement: Option<&str>) -> Self {
+        self.deprecated = Some(ProviderDeprecation {
+            replacement: replacement.map(str::to_string),
+        });
         self
     }
 }
@@ -216,6 +230,21 @@ impl ConfigKey {
     }
 }
 
+/// How a model's thinking is replayed back to the provider on subsequent turns.
+///
+/// Cerebras rejects requests that replay `messages[].reasoning_content`, so such models
+/// declare an inline `content` form instead.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingPreservationFormat {
+    /// Prepend the thinking to the message content as plain text.
+    ContentPrepend,
+    /// Prepend the thinking to the message content wrapped in `<think>` tags.
+    ContentXml,
+    /// Replay in the separate `reasoning_content` field, the OpenAI-compatible default.
+    ReasoningContent,
+}
+
 /// Information about a model's capabilities
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelInfo {
@@ -225,11 +254,17 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_model: Option<String>,
     /// The maximum context length this model supports
-    pub context_limit: usize,
+    pub context_limit: Option<usize>,
     /// Cost per token for input in USD (optional)
     pub input_token_cost: Option<f64>,
     /// Cost per token for output in USD (optional)
     pub output_token_cost: Option<f64>,
+    /// Cost per cached input token read in USD
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_token_cost: Option<f64>,
+    /// Cost per input token written to cache in USD
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_token_cost: Option<f64>,
     /// Currency for the costs (default: "$")
     pub currency: Option<String>,
     /// Whether this model supports cache control
@@ -237,21 +272,48 @@ pub struct ModelInfo {
     /// Whether this model supports reasoning/thinking controls
     #[serde(default)]
     pub reasoning: bool,
+    /// Whether this model accepts image input; when set, overrides canonical detection
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_preservation_format: Option<ThinkingPreservationFormat>,
+    /// Static params merged into the request body for this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_params: Option<HashMap<String, Value>>,
 }
 
 impl ModelInfo {
-    /// Create a new ModelInfo with just name and context limit
-    pub fn new(name: impl Into<String>, context_limit: usize) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             resolved_model: None,
-            context_limit,
+            context_limit: None,
             input_token_cost: None,
             output_token_cost: None,
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             currency: None,
             supports_cache_control: None,
             reasoning: false,
+            supports_vision: None,
+            thinking_preservation_format: None,
+            request_params: None,
         }
+    }
+
+    pub fn with_context_limit(mut self, context_limit: usize) -> Self {
+        self.context_limit = Some(context_limit);
+        self
+    }
+
+    pub fn with_optional_context_limit(mut self, context_limit: Option<usize>) -> Self {
+        self.context_limit = context_limit;
+        self
+    }
+
+    pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = Some(supports_vision);
+        self
     }
 
     /// Create a new ModelInfo with cost information (per token)
@@ -264,12 +326,17 @@ impl ModelInfo {
         Self {
             name: name.into(),
             resolved_model: None,
-            context_limit,
+            context_limit: Some(context_limit),
             input_token_cost: Some(input_cost),
             output_token_cost: Some(output_cost),
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             currency: Some("$".to_string()),
             supports_cache_control: None,
             reasoning: false,
+            supports_vision: None,
+            thinking_preservation_format: None,
+            request_params: None,
         }
     }
 }
@@ -281,9 +348,14 @@ pub trait ProviderDescriptor {
 /// A message stream yields partial text content but complete tool calls, all within the Message object
 /// So a message with text will contain potentially just a word of a longer response, but tool calls
 /// messages will only be yielded once concatenated.
+#[cfg(not(target_arch = "wasm32"))]
 pub type MessageStream = Pin<
     Box<dyn Stream<Item = Result<(Option<Message>, Option<ProviderUsage>), ProviderError>> + Send>,
 >;
+
+#[cfg(target_arch = "wasm32")]
+pub type MessageStream =
+    Pin<Box<dyn Stream<Item = Result<(Option<Message>, Option<ProviderUsage>), ProviderError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionRouting {
@@ -307,15 +379,53 @@ pub fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> M
     ModelInfo {
         name: model_name.to_string(),
         resolved_model: None,
-        context_limit: ModelConfig::new(model_name)
-            .with_canonical_limits(provider_name)
-            .context_limit(),
+        context_limit: canonical.as_ref().map(|model| model.limit.context),
         input_token_cost: None,
         output_token_cost: None,
+        cache_read_token_cost: None,
+        cache_write_token_cost: None,
         currency: None,
         supports_cache_control: None,
         reasoning,
+        supports_vision: None,
+        thinking_preservation_format: None,
+        request_params: None,
     }
+}
+
+/// Model IDs are case-sensitive; declarations apply only to the requested ID.
+pub fn find_declared_model<'a>(models: &'a [ModelInfo], model_name: &str) -> Option<&'a ModelInfo> {
+    models.iter().find(|model| model.name == model_name)
+}
+
+/// Build `ModelInfo` for discovered model names, preferring metadata declared in
+/// provider configuration over the canonical registry.
+///
+/// Configured entries are authoritative: a statically declared model carries its
+/// own `context_limit`/`reasoning` values, which the canonical registry does not
+/// know about. Names absent from `configured` fall back to registry metadata.
+pub fn merge_configured_model_info(
+    provider_name: &str,
+    model_names: &[String],
+    configured: &[ModelInfo],
+) -> Vec<ModelInfo> {
+    model_names
+        .iter()
+        .map(|model_name| {
+            configured
+                .iter()
+                .find(|declared| declared.name == *model_name)
+                .cloned()
+                .unwrap_or_else(|| model_info_for_provider_model(provider_name, model_name))
+        })
+        .collect()
+}
+
+pub fn known_models_from_registry(provider: &str) -> Vec<ModelInfo> {
+    recommended_models_from_registry(provider)
+        .into_iter()
+        .map(|name| model_info_for_provider_model(provider, &name))
+        .collect()
 }
 
 /// Collect all chunks from a MessageStream into a single Message and ProviderUsage
@@ -333,6 +443,14 @@ pub async fn collect_stream(
         if let Some(msg) = msg_opt {
             final_message = Some(match final_message {
                 Some(mut prev) => {
+                    // A multi-block message is a complete unit from the
+                    // provider (e.g. a closing Thinking block bundled with the
+                    // start of subsequent content), not a raw incremental
+                    // delta — mirror Conversation::push's `content.len() == 1`
+                    // gate so thinking coalescing only fires for single-block
+                    // deltas, never absorbing the first block of a multi-block
+                    // chunk into the prior message's last block.
+                    let is_single_block_delta = msg.content.len() == 1;
                     for new_content in msg.content {
                         match (&mut prev.content.last_mut(), &new_content) {
                             // Coalesce consecutive text blocks
@@ -349,6 +467,23 @@ pub async fn collect_stream(
                                     .and_then(|a| a.audience.as_ref()) =>
                             {
                                 last_text.text.push_str(&new_text.text);
+                            }
+                            // Coalesce consecutive thinking blocks, mirroring
+                            // Conversation::push's signature rules: append while
+                            // the previous block is unsigned or the incoming
+                            // delta shares its signature; a signed block never
+                            // absorbs a differently-signed delta.
+                            (
+                                Some(MessageContentBlock::Thinking(last_thinking)),
+                                MessageContentBlock::Thinking(new_thinking),
+                            ) if is_single_block_delta
+                                && (last_thinking.signature.is_empty()
+                                    || new_thinking.signature == last_thinking.signature) =>
+                            {
+                                last_thinking.thinking.push_str(&new_thinking.thinking);
+                                if !new_thinking.signature.is_empty() {
+                                    last_thinking.signature = new_thinking.signature.clone();
+                                }
                             }
                             _ => {
                                 prev.content.push(new_content);
@@ -392,10 +527,19 @@ pub fn stream_from_single_message(message: Message, usage: ProviderUsage) -> Mes
 }
 
 /// Base trait for AI providers (OpenAI, Anthropic, etc)
-#[async_trait]
-pub trait Provider: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait Provider: MaybeSend + MaybeSync {
     /// Get the name of this provider instance
     fn get_name(&self) -> &str;
+
+    fn provider_session_id(&self) -> Option<String> {
+        None
+    }
+
+    async fn resume(&self, _session_id: &str) -> Result<(), ProviderError> {
+        Ok(())
+    }
 
     /// Primary streaming method that all providers must implement.
     async fn stream(
@@ -417,13 +561,15 @@ pub trait Provider: Send + Sync {
         collect_stream(stream).await
     }
 
-    /// Resolve the effective context limit for a model config.
+    /// Resolve the effective context limit for a model.
     ///
-    /// Providers may override this to enrich the limit with provider-specific
-    /// metadata (e.g. cached model info or a value captured from a remote
-    /// session). The default returns the limit derived from the model config.
-    async fn get_context_limit(&self, model_config: &ModelConfig) -> Result<usize, ProviderError> {
-        Ok(model_config.context_limit())
+    /// `override_limit` is consumer policy and takes precedence over provider
+    /// configuration and discovery. The method is infallible because providers
+    /// fall through to canonical metadata and the global default.
+    async fn get_context_limit(&self, model: &str, override_limit: Option<usize>) -> usize {
+        crate::context_limit::ContextLimitResolver::new(self.get_name())
+            .resolve(model, override_limit, || async { Ok(None) })
+            .await
     }
 
     fn retry_config(&self) -> RetryConfig {
@@ -472,7 +618,7 @@ pub trait Provider: Send + Sync {
         let mut models_with_dates: Vec<(String, Option<String>)> = all_models
             .iter()
             .filter_map(|model| {
-                let canonical_model = map_to_canonical_model(provider_name, model, registry)
+                let canonical_model = map_to_canonical_model(provider_name, model, &registry)
                     .and_then(|canonical_id| {
                         let (provider, model_name) = canonical_id.split_once('/')?;
                         registry.get(provider, model_name)
@@ -542,7 +688,7 @@ pub trait Provider: Send + Sync {
         Ok(map_to_canonical_model(
             self.get_name(),
             provider_model,
-            registry,
+            &registry,
         ))
     }
 
@@ -552,6 +698,14 @@ pub trait Provider: Send + Sync {
     /// the provider's internal state is the source of truth.
     fn manages_own_context(&self) -> bool {
         false
+    }
+
+    fn uses_local_session_naming(&self) -> bool {
+        self.manages_own_context()
+    }
+
+    fn supports_builtin_tools(&self) -> bool {
+        !self.manages_own_context()
     }
 
     /// Configure OAuth authentication for this provider
@@ -581,6 +735,40 @@ pub trait Provider: Send + Sync {
         Ok(())
     }
 
+    /// How this provider participates in thinking-effort selection. Providers
+    /// that manage reasoning through an external harness report the harness's
+    /// advertised capability; the default keeps the model-name-based path.
+    fn thinking_effort_support(&self) -> ThinkingEffortSupport {
+        ThinkingEffortSupport::Unspecified
+    }
+
+    /// Subscribe to provider-managed thinking-effort capability changes.
+    /// Providers without an asynchronous capability source return `None`.
+    fn subscribe_thinking_effort_support(&self) -> Option<watch::Receiver<ThinkingEffortSupport>> {
+        None
+    }
+
+    /// Forward a thinking-effort selection to the provider. Returns `Ok(true)`
+    /// when the provider applied the value itself (no provider recreation
+    /// needed); `Ok(false)` when the caller should use the legacy path.
+    async fn set_thinking_effort(
+        &self,
+        _session_id: &str,
+        _value: &str,
+    ) -> Result<bool, ProviderError> {
+        Ok(false)
+    }
+
+    /// Apply a session's model selection after the provider is installed.
+    /// Providers that manage their own model (e.g. ACP harnesses) override
+    /// this to sync the selection before the first prompt.
+    async fn apply_model_selection(
+        &self,
+        _model_config: &ModelConfig,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     fn permission_routing(&self) -> PermissionRouting {
         PermissionRouting::Noop
     }
@@ -598,6 +786,29 @@ pub trait Provider: Send + Sync {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn merge_configured_model_info_falls_back_to_registry_for_undeclared_models() {
+        let declared = ModelInfo {
+            reasoning: true,
+            ..ModelInfo::new("declared-model").with_context_limit(4096)
+        };
+
+        let merged = merge_configured_model_info(
+            "openai",
+            &["declared-model".to_string(), "gpt-4o".to_string()],
+            std::slice::from_ref(&declared),
+        );
+
+        assert_eq!(merged[0].context_limit, Some(4096));
+        assert!(merged[0].reasoning);
+
+        assert_eq!(merged[1].name, "gpt-4o");
+        assert_eq!(
+            merged[1].context_limit,
+            model_info_for_provider_model("openai", "gpt-4o").context_limit
+        );
+    }
 
     struct ModelInventoryProvider {
         models: Vec<String>,
@@ -747,6 +958,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_collect_stream_coalesces_thinking_deltas() {
+        use futures::stream;
+
+        let delta = |t: &str| Ok((Some(Message::assistant().with_thinking(t, "")), None));
+        let stream = stream::iter([delta("Thinking"), delta(" Process"), delta(":")]);
+
+        let (message, _) = collect_stream(Box::pin(stream)).await.unwrap();
+
+        assert_eq!(
+            message.content.len(),
+            1,
+            "thinking deltas must coalesce into one block, got {:?}",
+            message.content
+        );
+        match &message.content[0] {
+            MessageContentBlock::Thinking(t) => assert_eq!(t.thinking, "Thinking Process:"),
+            other => panic!("expected Thinking, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_never_merges_distinctly_signed_thinking_blocks() {
+        use futures::stream;
+
+        let delta =
+            |t: &str, sig: &str| Ok((Some(Message::assistant().with_thinking(t, sig)), None));
+        // Two complete, independently-signed thinking blocks streamed back to
+        // back must stay separate, not merge into one.
+        let stream = stream::iter([delta("first", "sig-a"), delta("second", "sig-b")]);
+
+        let (message, _) = collect_stream(Box::pin(stream)).await.unwrap();
+
+        assert_eq!(message.content.len(), 2);
+        match (&message.content[0], &message.content[1]) {
+            (MessageContentBlock::Thinking(a), MessageContentBlock::Thinking(b)) => {
+                assert_eq!(a.thinking, "first");
+                assert_eq!(a.signature, "sig-a");
+                assert_eq!(b.thinking, "second");
+                assert_eq!(b.signature, "sig-b");
+            }
+            other => panic!("expected two Thinking blocks, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_unsigned_body_adopts_closing_signature() {
+        use futures::stream;
+
+        let delta =
+            |t: &str, sig: &str| Ok((Some(Message::assistant().with_thinking(t, sig)), None));
+        // An unsigned body streamed as several deltas, closed by a delta that
+        // finally carries the signature — the whole block adopts it.
+        let stream = stream::iter([
+            delta("Thinking", ""),
+            delta(" more", ""),
+            delta("", "sig-final"),
+        ]);
+
+        let (message, _) = collect_stream(Box::pin(stream)).await.unwrap();
+
+        assert_eq!(message.content.len(), 1);
+        match &message.content[0] {
+            MessageContentBlock::Thinking(t) => {
+                assert_eq!(t.thinking, "Thinking more");
+                assert_eq!(t.signature, "sig-final");
+            }
+            other => panic!("expected Thinking, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_unsigned_thinking_after_signed_starts_a_new_block() {
+        use futures::stream;
+
+        let delta =
+            |t: &str, sig: &str| Ok((Some(Message::assistant().with_thinking(t, sig)), None));
+        // An unsigned delta arriving after a signed (closed) block belongs to
+        // the next block, not the closed one — signature-at-end streams emit
+        // the first text of block N+1 before its own signature.
+        let stream = stream::iter([delta("first", "sig-a"), delta("second", "")]);
+
+        let (message, _) = collect_stream(Box::pin(stream)).await.unwrap();
+
+        assert_eq!(message.content.len(), 2);
+        match (&message.content[0], &message.content[1]) {
+            (MessageContentBlock::Thinking(a), MessageContentBlock::Thinking(b)) => {
+                assert_eq!(a.thinking, "first");
+                assert_eq!(a.signature, "sig-a");
+                assert_eq!(b.thinking, "second");
+                assert_eq!(b.signature, "");
+            }
+            other => panic!("expected two Thinking blocks, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_multi_block_chunk_does_not_merge_into_prior_thinking() {
+        use futures::stream;
+
+        let unsigned_delta = |t: &str| Ok((Some(Message::assistant().with_thinking(t, "")), None));
+        // A single chunk that already bundles a complete (signed) Thinking
+        // block with subsequent content is a structured unit from the
+        // provider, not a raw delta — its first block must not merge into
+        // whatever unsigned Thinking preceded it (mirrors Conversation::push's
+        // `content.len() == 1` gate). Regression for a maintainer-caught bug:
+        // this used to sign the concatenation of "prior" + "next", erasing
+        // the block boundary.
+        let multi_block = Ok((
+            Some(
+                Message::assistant()
+                    .with_thinking("next", "sig")
+                    .with_text("after"),
+            ),
+            None,
+        ));
+        let stream = stream::iter([unsigned_delta("prior"), multi_block]);
+
+        let (message, _) = collect_stream(Box::pin(stream)).await.unwrap();
+
+        assert_eq!(message.content.len(), 3, "got {:?}", message.content);
+        match (
+            &message.content[0],
+            &message.content[1],
+            &message.content[2],
+        ) {
+            (
+                MessageContentBlock::Thinking(a),
+                MessageContentBlock::Thinking(b),
+                MessageContentBlock::Text(c),
+            ) => {
+                assert_eq!(a.thinking, "prior");
+                assert_eq!(
+                    a.signature, "",
+                    "prior block must stay unsigned and unmerged"
+                );
+                assert_eq!(b.thinking, "next");
+                assert_eq!(b.signature, "sig");
+                assert_eq!(c.text, "after");
+            }
+            other => panic!("expected Thinking, Thinking, Text, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn recommended_models_preserve_unknown_future_models() {
         let provider = ModelInventoryProvider {
             models: vec![
@@ -769,25 +1124,35 @@ mod tests {
         let info = ModelInfo {
             name: "test-model".to_string(),
             resolved_model: None,
-            context_limit: 1000,
+            context_limit: Some(1000),
             input_token_cost: None,
             output_token_cost: None,
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             currency: None,
             supports_cache_control: None,
             reasoning: false,
+            supports_vision: None,
+            thinking_preservation_format: None,
+            request_params: None,
         };
-        assert_eq!(info.context_limit, 1000);
+        assert_eq!(info.context_limit, Some(1000));
 
         // Test equality
         let info2 = ModelInfo {
             name: "test-model".to_string(),
             resolved_model: None,
-            context_limit: 1000,
+            context_limit: Some(1000),
             input_token_cost: None,
             output_token_cost: None,
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             currency: None,
             supports_cache_control: None,
             reasoning: false,
+            supports_vision: None,
+            thinking_preservation_format: None,
+            request_params: None,
         };
         assert_eq!(info, info2);
 
@@ -795,21 +1160,53 @@ mod tests {
         let info3 = ModelInfo {
             name: "test-model".to_string(),
             resolved_model: None,
-            context_limit: 2000,
+            context_limit: Some(2000),
             input_token_cost: None,
             output_token_cost: None,
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             currency: None,
             supports_cache_control: None,
             reasoning: false,
+            supports_vision: None,
+            thinking_preservation_format: None,
+            request_params: None,
         };
         assert_ne!(info, info3);
+    }
+
+    #[test]
+    fn test_model_info_deserializes_thinking_preservation_and_request_params() {
+        let info: ModelInfo = serde_json::from_str(
+            r#"{
+                "name": "zai-glm-4.7",
+                "context_limit": 131072,
+                "thinking_preservation_format": "content_xml",
+                "request_params": {"reasoning_format": "parsed"}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            info.thinking_preservation_format,
+            Some(ThinkingPreservationFormat::ContentXml)
+        );
+        assert_eq!(
+            info.request_params.unwrap().get("reasoning_format"),
+            Some(&serde_json::json!("parsed"))
+        );
+
+        let bare: ModelInfo =
+            serde_json::from_str(r#"{"name": "gpt-4o", "context_limit": 128000}"#).unwrap();
+        assert_eq!(bare.thinking_preservation_format, None);
+        assert_eq!(bare.request_params, None);
     }
 
     #[test]
     fn test_model_info_with_cost() {
         let info = ModelInfo::with_cost("gpt-4o", 128000, 0.0000025, 0.00001);
         assert_eq!(info.name, "gpt-4o");
-        assert_eq!(info.context_limit, 128000);
+        assert_eq!(info.context_limit, Some(128000));
         assert_eq!(info.input_token_cost, Some(0.0000025));
         assert_eq!(info.output_token_cost, Some(0.00001));
         assert_eq!(info.currency, Some("$".to_string()));

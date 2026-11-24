@@ -1,48 +1,13 @@
+use super::message_meta::{
+    content_chunk_for_message, merge_message_meta, populate_output_token_limit_content,
+};
 use super::tool_calls::conversion::{
-    build_initial_tool_call, tool_call_update_fields_from_response, trusted_update_meta,
+    build_initial_tool_call_with_message_meta, tool_call_update_fields_from_response,
+    tool_response_meta,
 };
 use super::tool_calls::enrichment::tool_chain_summary;
 use super::*;
-use agent_client_protocol::schema::v1::{MessageId, ToolCall};
-
-fn replay_message_meta(message: &Message) -> Meta {
-    let mut meta = serde_json::Map::new();
-    meta.insert(
-        "goose".to_string(),
-        serde_json::Value::Object(replay_message_goose_meta(message)),
-    );
-    meta
-}
-
-fn replay_message_goose_meta(message: &Message) -> serde_json::Map<String, serde_json::Value> {
-    let mut goose = serde_json::Map::new();
-    goose.insert("created".to_string(), serde_json::json!(message.created));
-    if let Some(id) = &message.id {
-        goose.insert("messageId".to_string(), serde_json::json!(id));
-    }
-    if message.metadata.steer {
-        goose.insert("steer".to_string(), serde_json::json!(true));
-    }
-    goose
-}
-
-fn merge_replay_message_meta(meta: Option<Meta>, message: &Message) -> Meta {
-    let replay_goose = replay_message_goose_meta(message);
-    let mut meta = meta.unwrap_or_default();
-    let goose_value = meta
-        .entry("goose".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-    if let serde_json::Value::Object(goose) = goose_value {
-        for (key, value) in replay_goose {
-            goose.insert(key, value);
-        }
-    } else {
-        *goose_value = serde_json::Value::Object(replay_goose);
-    }
-
-    meta
-}
+use agent_client_protocol::schema::v1::ToolCall;
 
 fn replay_audience_annotations(audience: &[Role]) -> Annotations {
     Annotations::new().audience(
@@ -56,13 +21,27 @@ fn replay_audience_annotations(audience: &[Role]) -> Annotations {
     )
 }
 
+fn messages_for_acp_replay(conversation: &Conversation) -> Vec<Message> {
+    conversation
+        .messages()
+        .iter()
+        .filter(|message| message.is_user_visible())
+        .map(Message::user_visible_content)
+        .map(|mut message| {
+            populate_output_token_limit_content(&mut message);
+            message
+        })
+        .filter(|message| !message.content.is_empty())
+        .collect()
+}
+
 fn send_replay_content_chunk(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
     message: &Message,
     content: ContentBlock,
 ) -> std::result::Result<(), agent_client_protocol::Error> {
-    let chunk = replay_content_chunk_for_message(message, content);
+    let chunk = content_chunk_for_message(message, content);
     let update = match message.role {
         Role::User => SessionUpdate::UserMessageChunk(chunk),
         Role::Assistant => SessionUpdate::AgentMessageChunk(chunk),
@@ -70,20 +49,16 @@ fn send_replay_content_chunk(
     cx.send_notification(SessionNotification::new(session_id.clone(), update))
 }
 
-fn replay_content_chunk_for_message(message: &Message, content: ContentBlock) -> ContentChunk {
-    let mut chunk = ContentChunk::new(content).meta(replay_message_meta(message));
-    if let Some(message_id) = message.id.as_deref() {
-        chunk = chunk.message_id(MessageId::new(message_id));
-    }
-    chunk
-}
-
 fn build_replayed_tool_call(
     tool_request: &ToolRequest,
+    message: &Message,
     client_requests_tool_call_label_enrichment: bool,
 ) -> ToolCall {
-    let mut tool_call =
-        build_initial_tool_call(tool_request, client_requests_tool_call_label_enrichment);
+    let mut tool_call = build_initial_tool_call_with_message_meta(
+        tool_request,
+        message,
+        client_requests_tool_call_label_enrichment,
+    );
 
     if !client_requests_tool_call_label_enrichment {
         return tool_call;
@@ -108,24 +83,51 @@ fn build_replayed_tool_call(
     tool_call
 }
 
+/// Where to start replaying so that at most roughly `tail` trailing messages
+/// are sent without splitting a turn: walk backwards from `len - tail` to the
+/// nearest turn boundary (a visible user message that is not a tool response),
+/// so tool request/response pairs are never separated. Returns 0 (full
+/// replay) when the history is short enough or no boundary exists.
+fn replay_start_index(messages: &[Message], tail: usize) -> usize {
+    if tail == 0 || messages.len() <= tail {
+        return 0;
+    }
+    let candidate = messages.len() - tail;
+    messages[..=candidate]
+        .iter()
+        .rposition(|message| message.role == Role::User && !message.is_tool_response())
+        .unwrap_or(0)
+}
+
+fn replay_tail_from_meta(meta: Option<&Meta>) -> Option<usize> {
+    meta.and_then(|m| m.get("replayTail"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+}
+
 fn replay_conversation_to_client(
     cx: &ConnectionTo<Client>,
     session: &Session,
     supports_goose_custom_notifications: bool,
     client_requests_tool_call_label_enrichment: bool,
-) -> Result<(), agent_client_protocol::Error> {
+    replay_tail: Option<usize>,
+) -> Result<usize, agent_client_protocol::Error> {
     let session_id = SessionId::new(session.id.clone());
     let tool_call_notifier = ToolCallNotifier::new(cx, &session_id);
 
     let messages = session
         .conversation
         .as_ref()
-        .map(|c| c.user_visible_messages())
+        .map(messages_for_acp_replay)
         .unwrap_or_default();
+    let skipped = replay_tail
+        .map(|tail| replay_start_index(&messages, tail))
+        .unwrap_or(0);
+    let messages = &messages[skipped..];
 
     let mut replay_tool_requests = HashMap::new();
 
-    for message in &messages {
+    for message in messages {
         for content_item in &message.content {
             match content_item {
                 MessageContent::Text(text) => {
@@ -156,12 +158,11 @@ fn replay_conversation_to_client(
                 MessageContent::ToolRequest(tool_request) => {
                     replay_tool_requests.insert(tool_request.id.clone(), tool_request.clone());
 
-                    let mut tool_call = build_replayed_tool_call(
+                    let tool_call = build_replayed_tool_call(
                         tool_request,
+                        message,
                         client_requests_tool_call_label_enrichment,
                     );
-                    let meta = tool_call.meta.take();
-                    let tool_call = tool_call.meta(merge_replay_message_meta(meta, message));
 
                     tool_call_notifier.send_initial(tool_call)?;
                 }
@@ -169,25 +170,30 @@ fn replay_conversation_to_client(
                     let fields = tool_call_update_fields_from_response(
                         tool_response,
                         replay_tool_requests.get(&tool_response.id),
-                        true,
                     );
+                    let meta = tool_response_meta(tool_response).unwrap_or_default();
 
                     let update =
                         ToolCallUpdate::new(ToolCallId::new(tool_response.id.clone()), fields)
-                            .meta(merge_replay_message_meta(
-                                trusted_update_meta(tool_response),
-                                message,
-                            ));
+                            .meta(merge_message_meta(meta, message));
                     tool_call_notifier.send_update(update)?;
                 }
                 MessageContent::Thinking(thinking) => {
                     cx.send_notification(SessionNotification::new(
                         session_id.clone(),
-                        SessionUpdate::AgentThoughtChunk(replay_content_chunk_for_message(
+                        SessionUpdate::AgentThoughtChunk(content_chunk_for_message(
                             message,
                             ContentBlock::Text(TextContent::new(thinking.thinking.clone())),
                         )),
                     ))?;
+                }
+                MessageContent::Error(error) => {
+                    send_replay_content_chunk(
+                        cx,
+                        &session_id,
+                        message,
+                        ContentBlock::Text(TextContent::new(error.message.clone())),
+                    )?;
                 }
                 MessageContent::SystemNotification(_) => {}
                 _ => {}
@@ -207,21 +213,168 @@ fn replay_conversation_to_client(
         }
     }
 
-    Ok(())
+    Ok(skipped)
 }
 
-impl GooseAcpAgent {
-    pub(super) async fn handle_load_session(
+impl AcpConnection {
+    fn resend_pending_tool_permissions(
         &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &str,
+        requests: &[ToolConfirmationRequest],
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let acp_session_id = SessionId::new(session_id.to_string());
+        for request in requests {
+            self.handle_tool_permission_request(
+                cx,
+                &acp_session_id,
+                PendingToolPermission {
+                    request_id: request.id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    arguments: request.arguments.clone(),
+                    prompt: request.prompt.clone(),
+                },
+                SessionTarget {
+                    session_id: session_id.to_string(),
+                    cancel_token: cancel_token.clone(),
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
+    async fn start_resumed_state_machine_turn(
+        self: &Arc<Self>,
+        cx: &ConnectionTo<Client>,
+        session_id: &str,
+        requests: &[ToolConfirmationRequest],
+    ) -> Result<(), agent_client_protocol::Error> {
+        let run_id = format!("resume_{}", Uuid::new_v4());
+        let cancel_token = CancellationToken::new();
+        self.start_active_run(session_id, run_id.clone(), cancel_token.clone())
+            .await?;
+
+        let acp_session_id = SessionId::new(session_id.to_string());
+        if let Err(error) = Self::send_active_run_update(cx, &acp_session_id, Some(&run_id)) {
+            self.clear_active_run(session_id, &run_id).await;
+            return Err(error);
+        }
+
+        let session_config = SessionConfig {
+            id: session_id.to_string(),
+            schedule_id: None,
+            max_turns: None,
+        };
+        let stream = match self
+            .services
+            .resume_turn(session_config, cancel_token.clone())
+            .await
+        {
+            Ok(Some(stream)) => stream,
+            Ok(None) => {
+                self.clear_active_run(session_id, &run_id).await;
+                Self::send_active_run_update(cx, &acp_session_id, None)?;
+                return Ok(());
+            }
+            Err(error) => {
+                self.clear_active_run(session_id, &run_id).await;
+                let _ = Self::send_active_run_update(cx, &acp_session_id, None);
+                return Err(agent_client_protocol::Error::internal_error().data(format!(
+                    "Failed to resume pending tool confirmation: {error}"
+                )));
+            }
+        };
+
+        let server = Arc::clone(self);
+        let task_cx = cx.clone();
+        let task_session_id = session_id.to_string();
+        let task_run_id = run_id.clone();
+        let task_cancel_token = cancel_token.clone();
+        let task_acp_session_id = acp_session_id.clone();
+        if let Err(error) = cx.spawn(async move {
+            let _run_guard = ActiveRunDropGuard {
+                services: Arc::clone(&server.services),
+                session_id: task_session_id.clone(),
+                run_id: task_run_id.clone(),
+                cancel_token: task_cancel_token.clone(),
+            };
+            let result = server
+                .forward_agent_stream(
+                    &task_cx,
+                    &task_acp_session_id,
+                    &task_session_id,
+                    &task_cancel_token,
+                    stream,
+                )
+                .await;
+            if let Err(error) = server
+                .send_session_usage_updates(
+                    &task_cx,
+                    &task_acp_session_id,
+                    &task_session_id,
+                    &mut None,
+                )
+                .await
+            {
+                warn!(
+                    session_id = task_session_id,
+                    ?error,
+                    "Failed to update usage after resumed ACP turn"
+                );
+            }
+            server
+                .clear_active_run(&task_session_id, &task_run_id)
+                .await;
+            if let Err(error) = Self::send_active_run_update(&task_cx, &task_acp_session_id, None) {
+                warn!(
+                    session_id = task_session_id,
+                    ?error,
+                    "Failed to clear resumed ACP run status"
+                );
+            }
+            if let Err(error) = result {
+                warn!(
+                    session_id = task_session_id,
+                    ?error,
+                    "Resumed ACP state-machine turn failed"
+                );
+            }
+            Ok(())
+        }) {
+            cancel_token.cancel();
+            self.clear_active_run(session_id, &run_id).await;
+            let _ = Self::send_active_run_update(cx, &SessionId::new(session_id), None);
+            return Err(error);
+        }
+
+        if let Err(error) = self.resend_pending_tool_permissions(
+            cx,
+            session_id,
+            requests,
+            Some(cancel_token.clone()),
+        ) {
+            cancel_token.cancel();
+            self.clear_active_run(session_id, &run_id).await;
+            let _ = Self::send_active_run_update(cx, &acp_session_id, None);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    pub(super) async fn handle_load_session(
+        self: &Arc<Self>,
         cx: &ConnectionTo<Client>,
         args: LoadSessionRequest,
     ) -> Result<LoadSessionResponse, agent_client_protocol::Error> {
         debug!(?args, "load session request");
-        validate_absolute_cwd(&args.cwd)?;
 
         let session_id_str = args.session_id.0.to_string();
 
         let mut session = self
+            .services
             .session_manager
             .get_session(&session_id_str, true)
             .await
@@ -230,43 +383,73 @@ impl GooseAcpAgent {
                     .data(format!("Session not found: {}", session_id_str))
             })?;
 
-        session = self
-            .prepare_session_for_activation(session, args.cwd.clone(), args.mcp_servers, true)
-            .await?;
+        let cwd = effective_session_cwd(self.session_cwd.as_deref(), &args.cwd);
+        validate_absolute_cwd(&cwd)?;
 
-        replay_conversation_to_client(
+        session = self
+            .prepare_session_for_activation(session, cwd, args.mcp_servers, true)
+            .await?;
+        self.render_stored_recipe_template(&mut session).await?;
+
+        let replayed_from = replay_conversation_to_client(
             cx,
             &session,
             self.supports_goose_custom_notifications(),
             self.requests_tool_call_label_enrichment(),
+            replay_tail_from_meta(args.meta.as_ref()),
         )?;
-        let (agent, extension_results) = self.prepare_acp_session_agent(cx, &session).await?;
-        self.apply_session_recipe(&agent, &session).await?;
-        self.register_acp_session(session_id_str.clone(), agent.clone())
-            .await;
-
+        let pending_confirmations = session
+            .conversation
+            .as_ref()
+            .map(pending_tool_confirmations)
+            .unwrap_or_default();
+        let awaiting_confirmation = !pending_confirmations.is_empty()
+            || session
+                .conversation
+                .as_ref()
+                .is_some_and(has_unapplied_tool_confirmation_response);
+        let extension_results = self.prepare_acp_session(cx, &session).await?;
+        self.register_acp_session(session_id_str.clone()).await;
+        let provider = self
+            .services
+            .provider(&session.id)
+            .await
+            .internal_err_ctx("Failed to get provider while loading ACP session")?;
+        resume_saved_provider_session(&provider, session.conversation.as_ref()).await;
         session = self
+            .services
             .session_manager
             .get_session(&session_id_str, false)
             .await
             .internal_err_ctx("Failed to reload session")?;
 
-        agent
-            .extension_manager
-            .update_working_dir(&session.working_dir)
-            .await;
-
-        let (mode_state, config_options) =
-            build_session_setup_config(&self.provider_inventory, &session).await?;
-
-        self.notify_session_setup(cx, &session).await?;
+        let (mode_state, config_options) = build_session_setup_config(
+            &self.provider_inventory,
+            &session,
+            &agent_thinking_effort_support(&self.services, &session.id).await,
+        )
+        .await?;
 
         let mut response = LoadSessionResponse::new().modes(mode_state);
         if let Some(co) = config_options {
             response = response.config_options(co);
         }
 
-        response = response.meta(session_response_meta(&session, &extension_results));
+        let mut meta = session_response_meta(&session, &extension_results);
+        if replayed_from > 0 {
+            meta.insert(
+                "replaySkipped".to_string(),
+                serde_json::Value::Number(replayed_from.into()),
+            );
+        }
+        response = response.meta(meta);
+
+        let is_subagent = session.session_type == SessionType::SubAgent;
+        let already_running = self.runs().agent_run_id(&session_id_str).is_some();
+        if awaiting_confirmation && !is_subagent && !already_running {
+            self.start_resumed_state_machine_turn(cx, &session_id_str, &pending_confirmations)
+                .await?;
+        }
 
         self.closed_session_ids.lock().await.remove(&session_id_str);
         Ok(response)
@@ -276,7 +459,213 @@ impl GooseAcpAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::message::InferenceMetadata;
+    use goose_providers::thinking::{
+        ThinkingEffortCapability, ThinkingEffortOption, ThinkingEffortSupport,
+    };
     use rmcp::model::CallToolRequestParams;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct ResumeEffortProvider {
+        resumed: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ResumeEffortProvider {
+        fn get_name(&self) -> &str {
+            "claude-acp"
+        }
+
+        async fn resume(&self, session_id: &str) -> std::result::Result<(), ProviderError> {
+            assert_eq!(session_id, "saved-inner-session");
+            self.resumed.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        fn thinking_effort_support(&self) -> ThinkingEffortSupport {
+            let value = if self.resumed.load(Ordering::Acquire) {
+                "high"
+            } else {
+                "low"
+            };
+            ThinkingEffortSupport::Options(ThinkingEffortCapability {
+                option_id: "effort".to_string(),
+                values: vec![ThinkingEffortOption {
+                    value: value.to_string(),
+                    label: value.to_string(),
+                }],
+                current: Some(value.to_string()),
+            })
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[rmcp::model::Tool],
+        ) -> std::result::Result<crate::providers::base::MessageStream, ProviderError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_provider_session_is_resumed_before_effort_snapshot() {
+        let provider = Arc::new(ResumeEffortProvider {
+            resumed: AtomicBool::new(false),
+        });
+        let conversation = Conversation::new_unvalidated([Message::assistant().with_inference(
+            InferenceMetadata {
+                provider: "claude-acp".to_string(),
+                requested_model: "current".to_string(),
+                resolved_model: None,
+                provider_session_id: Some("saved-inner-session".to_string()),
+            },
+        )]);
+
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        resume_saved_provider_session(&provider_dyn, Some(&conversation)).await;
+
+        let ThinkingEffortSupport::Options(capability) = provider.thinking_effort_support() else {
+            panic!("expected resumed effort capability");
+        };
+        assert_eq!(capability.current.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn replay_start_index_short_history_replays_everything() {
+        let messages = vec![
+            Message::user().with_text("q1"),
+            Message::assistant().with_text("a1"),
+        ];
+        assert_eq!(replay_start_index(&messages, 10), 0);
+        assert_eq!(replay_start_index(&messages, 2), 0);
+    }
+
+    #[test]
+    fn replay_start_index_zero_tail_replays_everything() {
+        let messages = vec![
+            Message::user().with_text("q1"),
+            Message::assistant().with_text("a1"),
+        ];
+        assert_eq!(replay_start_index(&messages, 0), 0);
+    }
+
+    #[test]
+    fn replay_start_index_starts_at_turn_boundary() {
+        let messages = vec![
+            Message::user().with_text("q1"),
+            Message::assistant().with_text("a1"),
+            Message::user().with_text("q2"),
+            Message::assistant().with_text("a2"),
+            Message::user().with_text("q3"),
+            Message::assistant().with_text("a3"),
+        ];
+        // tail=3 → candidate index 3 (a2); nearest user boundary at or before is q2 (index 2)
+        assert_eq!(replay_start_index(&messages, 3), 2);
+        // tail=1 → candidate index 5 (a3); boundary is q3 (index 4)
+        assert_eq!(replay_start_index(&messages, 1), 4);
+    }
+
+    #[test]
+    fn replay_start_index_never_splits_tool_call_pairs() {
+        let tool_request = Message::assistant()
+            .with_tool_request("tool_1", Ok(CallToolRequestParams::new("developer__shell")));
+        let tool_response = Message::user()
+            .with_tool_response("tool_1", Ok(rmcp::model::CallToolResult::success(vec![])));
+        let messages = vec![
+            Message::user().with_text("q1"),
+            tool_request,
+            tool_response,
+            Message::assistant().with_text("a1"),
+        ];
+        // tail=2 → candidate is the tool response; it is not a turn boundary,
+        // so we walk back to q1 (index 0) rather than splitting the pair.
+        assert_eq!(replay_start_index(&messages, 2), 0);
+    }
+
+    #[test]
+    fn replay_start_index_no_boundary_replays_everything() {
+        let messages = vec![
+            Message::assistant().with_text("a1"),
+            Message::assistant().with_text("a2"),
+            Message::assistant().with_text("a3"),
+        ];
+        assert_eq!(replay_start_index(&messages, 1), 0);
+    }
+
+    #[test]
+    fn acp_replay_populates_only_empty_marked_assistant_messages() {
+        let visible_message = Message::assistant()
+            .with_text("visible")
+            .with_id("msg_visible");
+        let empty_message = Message::assistant().with_id("msg_empty");
+
+        let mut marked_message = Message::assistant().with_id("msg_limited");
+        marked_message.metadata.output_token_limit_reached = true;
+
+        let mut marked_user_message = Message::user().with_id("msg_user");
+        marked_user_message.metadata.output_token_limit_reached = true;
+
+        let mut hidden_marked_message = Message::assistant()
+            .with_id("msg_hidden")
+            .with_visibility(false, false);
+        hidden_marked_message.metadata.output_token_limit_reached = true;
+
+        let conversation = Conversation::new_unvalidated([
+            visible_message,
+            empty_message,
+            marked_message,
+            marked_user_message,
+            hidden_marked_message,
+        ]);
+
+        let messages = messages_for_acp_replay(&conversation);
+
+        assert_eq!(
+            messages
+                .iter()
+                .filter_map(|message| message.id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["msg_visible", "msg_limited"]
+        );
+        assert_eq!(
+            messages[1].as_concat_text(),
+            "Response stopped because the model reached its output-token limit."
+        );
+        assert!(messages[1].metadata.output_token_limit_reached);
+        assert!(conversation.messages()[2].content.is_empty());
+    }
+
+    #[test]
+    fn acp_replay_sends_the_model_that_produced_each_message() {
+        let conversation = Conversation::new_unvalidated([Message::assistant()
+            .with_text("answer")
+            .with_id("msg_replayed")
+            .with_inference(InferenceMetadata {
+                provider: "anthropic".to_string(),
+                requested_model: "claude-sonnet-4-5".to_string(),
+                resolved_model: None,
+                provider_session_id: None,
+            })]);
+
+        let messages = messages_for_acp_replay(&conversation);
+        let chunk =
+            content_chunk_for_message(&messages[0], ContentBlock::Text(TextContent::new("answer")));
+
+        assert_eq!(
+            chunk
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("goose"))
+                .and_then(|goose| goose.get("inference")),
+            Some(&serde_json::json!({
+                "provider": "anthropic",
+                "requestedModel": "claude-sonnet-4-5",
+            })),
+        );
+    }
 
     fn persisted_enriched_tool_request() -> ToolRequest {
         ToolRequest {
@@ -295,7 +684,11 @@ mod tests {
 
     #[test]
     fn replay_includes_persisted_enrichment_when_requested() {
-        let tool_call = build_replayed_tool_call(&persisted_enriched_tool_request(), true);
+        let mut message =
+            Message::new(Role::Assistant, 1_700_000_000, vec![]).with_id("msg_replay");
+        message.metadata.output_token_limit_reached = true;
+        let tool_call =
+            build_replayed_tool_call(&persisted_enriched_tool_request(), &message, true);
         let goose = tool_call
             .meta
             .as_ref()
@@ -304,20 +697,28 @@ mod tests {
 
         assert_eq!(tool_call.title, "applied dark mode polish");
         assert_eq!(
-            goose.get("toolCall"),
-            Some(
-                &serde_json::json!({ "toolName": "developer__shell", "extensionName": "developer" })
-            ),
-        );
-        assert_eq!(
-            goose.get("toolChainSummary"),
-            Some(&serde_json::json!({ "summary": "applied dark mode polish", "count": 3 })),
+            goose,
+            &serde_json::json!({
+                "created": 1_700_000_000,
+                "messageId": "msg_replay",
+                "outputTokenLimitReached": true,
+                "toolCall": {
+                    "toolName": "developer__shell",
+                    "extensionName": "developer",
+                },
+                "toolChainSummary": {
+                    "summary": "applied dark mode polish",
+                    "count": 3,
+                },
+            }),
         );
     }
 
     #[test]
     fn replay_omits_persisted_enrichment_when_not_requested() {
-        let tool_call = build_replayed_tool_call(&persisted_enriched_tool_request(), false);
+        let message = Message::new(Role::Assistant, 1_700_000_000, vec![]).with_id("msg_replay");
+        let tool_call =
+            build_replayed_tool_call(&persisted_enriched_tool_request(), &message, false);
         let goose = tool_call
             .meta
             .as_ref()
@@ -326,105 +727,42 @@ mod tests {
 
         assert_eq!(tool_call.title, "developer: shell");
         assert_eq!(
-            goose.get("toolCall"),
-            Some(
-                &serde_json::json!({ "toolName": "developer__shell", "extensionName": "developer" })
-            ),
-        );
-        assert_eq!(goose.get("toolChainSummary"), None);
-    }
-
-    #[test]
-    fn merge_replay_message_meta_preserves_existing_goose_meta() {
-        let message = Message::new(Role::Assistant, 1_700_000_000, vec![]).with_id("msg_1");
-        let existing = serde_json::from_value(serde_json::json!({
-            "goose": {
-                "mcpApp": {
-                    "resourceUri": "ui://trusted/app",
-                    "extensionName": "weather",
-                    "toolName": "weather__render",
+            goose,
+            &serde_json::json!({
+                "created": 1_700_000_000,
+                "messageId": "msg_replay",
+                "toolCall": {
+                    "toolName": "developer__shell",
+                    "extensionName": "developer",
                 },
-            }
-        }))
-        .unwrap();
-
-        let merged = merge_replay_message_meta(Some(existing), &message);
-
-        assert_eq!(
-            merged.get("goose"),
-            Some(&serde_json::json!({
-                "created": 1_700_000_000,
-                "messageId": "msg_1",
-                "mcpApp": {
-                    "resourceUri": "ui://trusted/app",
-                    "extensionName": "weather",
-                    "toolName": "weather__render",
-                },
-            })),
+            }),
         );
     }
 
     #[test]
-    fn merge_replay_message_meta_creates_fresh_when_none() {
-        let message = Message::new(Role::Assistant, 1_700_000_000, vec![]).with_id("msg_2");
+    fn pending_permissions_are_limited_to_the_active_turn() {
+        let approval = |id: &str| {
+            Message::assistant().with_action_required(
+                id,
+                "tool".to_string(),
+                Default::default(),
+                None,
+            )
+        };
+        let conversation = Conversation::new_unvalidated([
+            Message::user().with_text("old turn"),
+            approval("old"),
+            Message::user().with_text("current turn"),
+            approval("current"),
+        ]);
 
-        let merged = merge_replay_message_meta(None, &message);
+        let approval_ids = pending_tool_confirmations(&conversation)
+            .into_iter()
+            .map(|request| request.id)
+            .collect::<Vec<_>>();
+        assert_eq!(approval_ids, ["current"]);
 
-        assert_eq!(
-            merged.get("goose"),
-            Some(&serde_json::json!({
-                "created": 1_700_000_000,
-                "messageId": "msg_2",
-            })),
-        );
-
-        let chunk = replay_content_chunk_for_message(
-            &message,
-            ContentBlock::Text(TextContent::new("replayed text")),
-        );
-
-        assert_eq!(chunk.message_id, Some(MessageId::new("msg_2")));
-    }
-
-    #[test]
-    fn merge_replay_message_meta_includes_steer_marker() {
-        let message = Message::new(Role::User, 1_700_000_000, vec![])
-            .with_id("msg_steer")
-            .with_steer();
-
-        let merged = merge_replay_message_meta(None, &message);
-
-        assert_eq!(
-            merged.get("goose"),
-            Some(&serde_json::json!({
-                "created": 1_700_000_000,
-                "messageId": "msg_steer",
-                "steer": true,
-            })),
-            "replay must carry the steer marker so the boundary survives reload"
-        );
-    }
-
-    #[test]
-    fn merge_replay_message_meta_omits_steer_when_not_set() {
-        let message = Message::new(Role::Assistant, 1_700_000_000, vec![]).with_id("msg_plain");
-
-        let merged = merge_replay_message_meta(None, &message);
-
-        assert_eq!(merged.get("goose").and_then(|g| g.get("steer")), None);
-    }
-
-    #[test]
-    fn merge_replay_message_meta_omits_message_id_when_none() {
-        let message = Message::new(Role::Assistant, 1_700_000_000, vec![]);
-
-        let merged = merge_replay_message_meta(None, &message);
-
-        assert_eq!(
-            merged.get("goose"),
-            Some(&serde_json::json!({
-                "created": 1_700_000_000,
-            })),
-        );
+        let no_kickoff = Conversation::new_unvalidated([approval("orphan")]);
+        assert_eq!(pending_tool_confirmations(&no_kickoff).len(), 1);
     }
 }

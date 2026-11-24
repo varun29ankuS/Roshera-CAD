@@ -5,7 +5,6 @@ use super::openai_compatible::{
     stream_openai_compat,
 };
 use super::retry::ProviderRetry;
-use crate::config::signup_tetrate::TETRATE_DEFAULT_MODEL;
 use crate::conversation::message::Message;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,20 +19,17 @@ use rmcp::model::Tool;
 use serde_json::Value;
 
 pub const TETRATE_PROVIDER_NAME: &str = "tetrate";
+pub const TETRATE_DEFAULT_MODEL: &str = "claude-haiku-5-5";
 pub const TETRATE_DOC_URL: &str = "https://router.tetrate.ai";
 pub const TETRATE_BILLING_URL: &str = "https://router.tetrate.ai/billing";
 
 pub const TETRATE_KNOWN_MODELS: &[&str] = &[
-    "claude-opus-4-1",
-    "claude-3-7-sonnet-latest",
-    "claude-sonnet-4-20250514",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-5-nano",
-    "gpt-4.1",
+    TETRATE_DEFAULT_MODEL,
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
+    "gpt-6.1-sol",
+    "gemini-3.5-flash",
+    "xai/grok-4.7",
 ];
 
 #[derive(serde::Serialize)]
@@ -154,6 +150,7 @@ impl Provider for TetrateProvider {
                     .api_client
                     .request("v1/chat/completions")
                     .model_headers(model_config)?
+                    .streaming(true)
                     .response_post(&payload)
                     .await?;
                 let resp = handle_status(resp)
@@ -168,22 +165,21 @@ impl Provider for TetrateProvider {
                     .is_some_and(|v| v.contains("json"));
 
                 if is_json {
-                    // Streaming responses should be SSE; when we get JSON instead, parse it to map
-                    // explicit error payloads and otherwise fail as a protocol mismatch.
-                    let body = handle_response_openai_compat(resp)
+                    let body = goose_providers::http_status::read_error_body(resp)
                         .await
-                        .map_err(Self::enrich_credits_error)?;
-                    if body.get("error").is_some() {
-                        return Err(Self::error_from_tetrate_error_payload(
-                            body,
-                            "v1/chat/completions",
-                        ));
+                        .unwrap_or_default();
+                    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if payload.get("error").is_some() {
+                            return Err(Self::error_from_tetrate_error_payload(
+                                payload,
+                                "v1/chat/completions",
+                            ));
+                        }
                     }
 
-                    return Err(ProviderError::ExecutionError(
-                        "Expected streaming response but received non-streaming payload"
-                            .to_string(),
-                    ));
+                    return Err(ProviderError::ExecutionError(format!(
+                        "Expected streaming response but received non-streaming payload: {body}"
+                    )));
                 }
 
                 Ok(resp)

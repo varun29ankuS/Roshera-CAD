@@ -17,6 +17,7 @@ pub mod bedrock;
 pub mod canonical {
     pub use goose_providers::canonical::*;
 }
+pub mod canonical_cost;
 mod catalog_util;
 pub mod catalog {
     pub use super::catalog_util::*;
@@ -27,6 +28,7 @@ pub mod claude_code;
 pub(crate) mod cli_common;
 pub mod codex;
 pub mod codex_acp;
+pub mod command_auth;
 pub mod copilot_acp;
 pub mod cursor_agent;
 pub mod custom_provider_config;
@@ -41,6 +43,7 @@ pub mod githubcopilot;
 pub mod google {
     pub use goose_providers::google::*;
 }
+pub mod gondola;
 pub mod google_def;
 pub mod http_status {
     pub use goose_providers::http_status::*;
@@ -53,6 +56,7 @@ pub mod kimicode;
 pub mod litellm;
 #[cfg(feature = "local-inference")]
 pub mod local_inference;
+pub mod muse_code_def;
 pub mod nanogpt;
 pub mod oauth;
 pub mod oauth_device_flow;
@@ -67,9 +71,12 @@ pub mod openai {
 pub mod openai_compatible {
     pub use goose_providers::openai_compatible::*;
 }
-pub mod openrouter;
+pub mod openrouter {
+    pub use goose_providers::openrouter::*;
+}
+pub mod openrouter_def;
 pub mod pi_acp;
-mod private_file;
+pub(crate) mod private_file;
 pub mod provider_registry;
 pub mod provider_secrets;
 pub mod provider_test;
@@ -93,8 +100,7 @@ pub mod xai;
 pub mod xai_oauth;
 
 pub use init::{
-    cleanup_provider, create, create_with_default_model, create_with_named_model,
-    create_with_working_dir, get_from_registry, inventory_identity, providers,
-    refresh_custom_providers,
+    cleanup_provider, create, create_with_default_model, get_from_registry, inventory_identity,
+    providers, refresh_custom_providers,
 };
 pub use retry::{retry_operation, RetryConfig};

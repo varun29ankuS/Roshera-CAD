@@ -1,19 +1,24 @@
 //! Everything specific to skills: filesystem discovery (`SKILL.md` walking +
-//! built-ins) and the runtime MCP client (`client` submodule). User-facing
-//! CRUD lives in `crate::sources`, which generalizes across source types.
+//! built-ins) and reading supporting files. User-facing CRUD lives in
+//! `crate::sources`, which generalizes across source types.
 
-mod arguments;
 mod builtin;
-pub mod client;
+mod supporting_files;
 
-pub use client::{SkillsClient, EXTENSION_NAME};
+pub(crate) use supporting_files::{
+    create_source_file, load_supporting_file, read_source_file, write_source_file,
+};
 
 use crate::config::{paths::Paths, Config};
-use crate::plugins::installed_plugin_skill_dirs;
+use crate::plugins::discovery::PluginScope;
+use crate::plugins::{
+    configured_project_plugin_skill_dirs, enabled_plugin_skill_dirs_with_config,
+    installed_plugin_skill_dirs,
+};
 use crate::sources::parse_frontmatter;
 use agent_client_protocol::Error;
 use anyhow::Result;
-use arguments::apply_skill_arguments;
+use goose_agent::skills::SkillRoot;
 use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
 use serde::Deserialize;
 use serde_json::Value;
@@ -114,51 +119,23 @@ fn resolve_docs_root_placeholder(skill: &SourceEntry, content: &str, docs_root: 
     content.replace(GOOSE_DOCS_ROOT_PLACEHOLDER, docs_root)
 }
 
-fn loaded_skill_context(skill: &SourceEntry, content: &str) -> Result<String> {
+pub fn skills_for_session(working_dir: &Path) -> Result<Vec<SourceEntry>> {
     let docs_root = Config::global()
         .get_goose_docs_root()?
         .unwrap_or_else(|| DEFAULT_GOOSE_DOCS_ROOT.to_string());
-    let content = resolve_docs_root_placeholder(skill, content, &docs_root);
-
-    let title = format!("{} ({})", skill.name, skill.source_type);
-    let mut output = format!(
-        "# Loaded Skill: {title}\n\n{}\n\n## Content\n\n{}\n",
-        skill.description, content
-    );
-
-    if !skill.supporting_files.is_empty() {
-        let skill_dir = Path::new(&skill.path);
-        output.push_str(&format!(
-            "\n## Supporting Files\n\nSkill directory: {}\n\n\
-             Relative paths in this skill resolve from the skill directory. \
-             The shell tool runs in the session working directory, so use the \
-             resolved path below or `cd` into the skill directory before running \
-             supporting scripts.\n\n",
-            skill.path
-        ));
-        for file in &skill.supporting_files {
-            if let Ok(relative) = Path::new(file).strip_prefix(skill_dir) {
-                let rel_str = relative.to_string_lossy().replace('\\', "/");
-                let resolved_path = Path::new(file).to_string_lossy().replace('\\', "/");
-                output.push_str(&format!(
-                    "- {} → {} (load_skill(name: \"{}/{}\"))\n",
-                    rel_str, resolved_path, skill.name, rel_str
-                ));
-            }
-        }
-    }
-
-    Ok(output)
-}
-
-pub fn loaded_skill_context_with_args(skill: &SourceEntry, args: Option<&str>) -> Result<String> {
-    let content = if let Some(args) = args {
-        apply_skill_arguments(&skill.content, args, &skill_argument_names(skill))?
-    } else {
-        skill.content.clone()
-    };
-
-    loaded_skill_context(skill, &content)
+    Ok(discover_skills(Some(working_dir))
+        .into_iter()
+        .filter(|skill| {
+            matches!(
+                skill.source_type,
+                SourceType::Skill | SourceType::BuiltinSkill
+            )
+        })
+        .map(|mut skill| {
+            skill.content = resolve_docs_root_placeholder(&skill, &skill.content, &docs_root);
+            skill
+        })
+        .collect())
 }
 
 pub fn skill_argument_hint(skill: &SourceEntry) -> Option<String> {
@@ -170,24 +147,23 @@ pub fn skill_argument_hint(skill: &SourceEntry) -> Option<String> {
         .map(str::to_string)
 }
 
-pub fn skill_argument_names(skill: &SourceEntry) -> Vec<String> {
-    skill
-        .properties
-        .get("arguments")
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str())
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn canonicalize_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn is_lexical_project_plugin_path(path: &Path) -> bool {
+    if path.starts_with(Paths::plugins_dir()) {
+        return false;
+    }
+
+    path.ancestors().any(|ancestor| {
+        ancestor.file_name().and_then(|name| name.to_str()) == Some("plugins")
+            && ancestor
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some(".agents")
+    })
 }
 
 fn inferred_discoverable_skill_root(path: &Path) -> Option<PathBuf> {
@@ -223,16 +199,30 @@ fn inferred_discoverable_skill_root(path: &Path) -> Option<PathBuf> {
     })
 }
 
-pub(crate) fn resolve_discoverable_skill_dir(path: &str) -> Result<PathBuf, Error> {
+fn resolve_discoverable_skill_dir_with_config(
+    path: &str,
+    config: &Config,
+) -> Result<PathBuf, Error> {
     if path.is_empty() {
         return Err(Error::invalid_params().data("Source path must not be empty"));
+    }
+
+    if is_lexical_project_plugin_path(Path::new(path)) {
+        return Err(Error::invalid_params().data(format!("Source \"{}\" not found", path)));
     }
 
     let canonical_dir = Path::new(path)
         .canonicalize()
         .map_err(|_| Error::invalid_params().data(format!("Source \"{}\" not found", path)))?;
 
-    if inferred_discoverable_skill_root(&canonical_dir).is_none()
+    let configured_project_plugin_path = !Path::new(path).starts_with(Paths::plugins_dir())
+        && configured_project_plugin_skill_dirs(config)
+            .into_iter()
+            .map(|root| canonicalize_or_original(&root))
+            .any(|root| canonical_dir.starts_with(root));
+
+    if configured_project_plugin_path
+        || inferred_discoverable_skill_root(&canonical_dir).is_none()
         || !canonical_dir.is_dir()
         || !canonical_dir.join("SKILL.md").is_file()
     {
@@ -240,6 +230,10 @@ pub(crate) fn resolve_discoverable_skill_dir(path: &str) -> Result<PathBuf, Erro
     }
 
     Ok(canonical_dir)
+}
+
+pub(crate) fn resolve_discoverable_skill_dir(path: &str) -> Result<PathBuf, Error> {
+    resolve_discoverable_skill_dir_with_config(path, Config::global())
 }
 
 pub(crate) fn resolve_skill_dir(path: &str) -> Result<PathBuf, Error> {
@@ -314,34 +308,99 @@ pub(crate) fn parse_skill_frontmatter(raw: &str) -> (String, String) {
 /// global (home-rooted) location. Order matches discovery precedence: project
 /// dirs first, then global dirs.
 pub fn all_skill_dirs(working_dir: Option<&Path>) -> Vec<(PathBuf, bool)> {
-    let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
+    all_skill_dirs_with_config(working_dir, Config::global())
+        .into_iter()
+        .map(|dir| (dir.path, dir.is_global))
+        .collect()
+}
+
+struct SkillDirectory {
+    path: PathBuf,
+    is_global: bool,
+    writable: bool,
+    preserve_path: bool,
+}
+
+fn all_skill_dirs_with_config(working_dir: Option<&Path>, config: &Config) -> Vec<SkillDirectory> {
+    let mut dirs = Vec::new();
+    let plugin_dirs = enabled_plugin_skill_dirs_with_config(working_dir, config);
 
     if let Some(wd) = working_dir {
-        dirs.push((wd.join(".agents").join("skills"), false));
-        dirs.push((wd.join(".goose").join("skills"), false));
-        dirs.push((wd.join(".claude").join("skills"), false));
+        for path in [
+            wd.join(".agents").join("skills"),
+            wd.join(".goose").join("skills"),
+            wd.join(".claude").join("skills"),
+        ] {
+            dirs.push(SkillDirectory {
+                path,
+                is_global: false,
+                writable: true,
+                preserve_path: false,
+            });
+        }
     }
+    dirs.extend(
+        plugin_dirs
+            .iter()
+            .filter(|(_, scope)| *scope == PluginScope::Project)
+            .map(|(path, _)| SkillDirectory {
+                path: path.clone(),
+                is_global: false,
+                writable: false,
+                preserve_path: true,
+            }),
+    );
 
     let home = dirs::home_dir();
     if let Some(h) = home.as_ref() {
-        dirs.push((h.join(".agents").join("skills"), true));
+        dirs.push(SkillDirectory {
+            path: h.join(".agents").join("skills"),
+            is_global: true,
+            writable: true,
+            preserve_path: false,
+        });
     }
-    dirs.push((Paths::config_dir().join("skills"), true));
+    dirs.push(SkillDirectory {
+        path: Paths::config_dir().join("skills"),
+        is_global: true,
+        writable: true,
+        preserve_path: false,
+    });
     if let Some(h) = home.as_ref() {
-        dirs.push((h.join(".claude").join("skills"), true));
-        dirs.push((h.join(".config").join("agents").join("skills"), true));
+        for path in [
+            h.join(".claude").join("skills"),
+            h.join(".config").join("agents").join("skills"),
+        ] {
+            dirs.push(SkillDirectory {
+                path,
+                is_global: true,
+                writable: true,
+                preserve_path: false,
+            });
+        }
     }
 
     dirs.extend(
-        installed_plugin_skill_dirs()
+        plugin_dirs
             .into_iter()
-            .map(|dir| (dir, true)),
+            .filter(|(_, scope)| *scope == PluginScope::User)
+            .map(|(path, _)| SkillDirectory {
+                path,
+                is_global: true,
+                writable: true,
+                preserve_path: true,
+            }),
     );
 
     dirs
 }
 
-fn parse_skill_content(content: &str, path: &Path, global: bool) -> Option<SourceEntry> {
+fn parse_skill_content(
+    content: &str,
+    path: &Path,
+    global: bool,
+    writable: bool,
+) -> Option<SourceEntry> {
     let (metadata, body): (SkillFrontmatter, String) = match parse_frontmatter(content) {
         Ok(Some(parsed)) => parsed,
         Ok(None) => return None,
@@ -374,121 +433,33 @@ fn parse_skill_content(content: &str, path: &Path, global: bool) -> Option<Sourc
         content: body,
         path: path.to_string_lossy().into_owned(),
         global,
-        writable: true,
+        writable,
         supporting_files: Vec::new(),
         properties: metadata.metadata,
     })
-}
-
-fn should_skip_dir(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".git") | Some(".hg") | Some(".svn")
-    )
-}
-
-fn walk_files_recursively<F, G>(
-    dir: &Path,
-    visited_dirs: &mut HashSet<PathBuf>,
-    should_descend: &mut G,
-    visit_file: &mut F,
-) where
-    F: FnMut(&Path),
-    G: FnMut(&Path) -> bool,
-{
-    let canonical_dir = match std::fs::canonicalize(dir) {
-        Ok(path) => path,
-        Err(_) => return,
-    };
-
-    if !visited_dirs.insert(canonical_dir) {
-        return;
-    }
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if should_descend(&path) {
-                walk_files_recursively(&path, visited_dirs, should_descend, visit_file);
-            }
-        } else if path.is_file() {
-            visit_file(&path);
-        }
-    }
-}
-
-fn scan_skills_from_dir(dir: &Path, global: bool, seen: &mut HashSet<String>) -> Vec<SourceEntry> {
-    let mut skill_files = Vec::new();
-    let mut visited_dirs = HashSet::new();
-
-    walk_files_recursively(
-        dir,
-        &mut visited_dirs,
-        &mut |path| !should_skip_dir(path),
-        &mut |path| {
-            if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
-                skill_files.push(path.to_path_buf());
-            }
-        },
-    );
-
-    let mut sources = Vec::new();
-    for skill_file in skill_files {
-        let Some(skill_dir) = skill_file.parent() else {
-            continue;
-        };
-        let content = match std::fs::read_to_string(&skill_file) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to read skill file {}: {}", skill_file.display(), e);
-                continue;
-            }
-        };
-
-        if let Some(mut source) = parse_skill_content(&content, skill_dir, global) {
-            if !seen.contains(&source.name) {
-                let mut files = Vec::new();
-                let mut visited_support_dirs = HashSet::new();
-                walk_files_recursively(
-                    skill_dir,
-                    &mut visited_support_dirs,
-                    &mut |path| !should_skip_dir(path) && !path.join("SKILL.md").is_file(),
-                    &mut |path| {
-                        if path.file_name().and_then(|n| n.to_str()) != Some("SKILL.md") {
-                            files.push(path.to_string_lossy().into_owned());
-                        }
-                    },
-                );
-                source.supporting_files = files;
-
-                seen.insert(source.name.clone());
-                sources.push(source);
-            }
-        }
-    }
-    sources
 }
 
 /// Discover skills from all configured filesystem locations and built-ins.
 /// Each returned entry has `global` set according to the directory it was
 /// found in (or `true` for built-ins).
 pub fn discover_skills(working_dir: Option<&Path>) -> Vec<SourceEntry> {
-    let mut sources: Vec<SourceEntry> = Vec::new();
-    let mut seen = HashSet::new();
+    discover_skills_with_config(working_dir, Config::global())
+}
 
-    for (dir, is_global) in all_skill_dirs(working_dir) {
-        for source in scan_skills_from_dir(&dir, is_global, &mut seen) {
-            sources.push(source);
-        }
-    }
+fn discover_skills_with_config(working_dir: Option<&Path>, config: &Config) -> Vec<SourceEntry> {
+    let roots = all_skill_dirs_with_config(working_dir, config)
+        .into_iter()
+        .map(|dir| SkillRoot {
+            path: dir.path,
+            global: dir.is_global,
+            writable: dir.writable,
+            preserve_path: dir.preserve_path,
+        });
+    let mut sources = goose_agent::skills::discover_skills(roots);
+    let mut seen: HashSet<_> = sources.iter().map(|source| source.name.clone()).collect();
 
     for content in builtin::get_all() {
-        if let Some(source) = parse_skill_content(content, &PathBuf::new(), true) {
+        if let Some(source) = parse_skill_content(content, &PathBuf::new(), true, true) {
             if !seen.contains(&source.name) {
                 seen.insert(source.name.clone());
                 let path = format!("builtin://skills/{}", source.name);
@@ -519,23 +490,43 @@ pub fn list_installed_skills(working_dir: Option<&Path>) -> Vec<SourceEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    fn skill_with_content(content: &str) -> SourceEntry {
-        SourceEntry {
-            source_type: SourceType::Skill,
-            name: "test-skill".to_string(),
-            description: "Test skill".to_string(),
-            content: content.to_string(),
-            path: String::new(),
-            global: false,
-            writable: true,
-            supporting_files: Vec::new(),
-            properties: HashMap::from([(
-                "arguments".to_string(),
-                json!(["component", "from", "to"]),
-            )]),
-        }
+    fn write_test_skill(dir: &Path, name: &str, body: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Test skill\n---\n{body}"),
+        )
+        .unwrap();
+    }
+
+    fn assert_path_rejected_by_source_crud(path: &str, name: &str, skill_dir: &Path) {
+        let update_err = crate::sources::update_source_with_roots(
+            SourceType::Skill,
+            path,
+            name,
+            "updated",
+            "updated body",
+            crate::sources::UpdateSourceOptions {
+                properties: Some(HashMap::new()),
+                additional_roots: &[],
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{update_err:?}").contains("not found"));
+
+        let delete_err = crate::sources::delete_source(SourceType::Skill, path).unwrap_err();
+        assert!(format!("{delete_err:?}").contains("not found"));
+
+        let export_err = crate::sources::export_source(SourceType::Skill, path).unwrap_err();
+        assert!(format!("{export_err:?}").contains("not found"));
+        assert!(skill_dir.join("SKILL.md").is_file());
+    }
+
+    fn assert_read_only_and_rejected_by_source_crud(skill: &SourceEntry, skill_dir: &Path) {
+        assert!(!skill.global);
+        assert!(!skill.writable);
+        assert_path_rejected_by_source_crud(&skill.path, &skill.name, skill_dir);
     }
 
     fn builtin_goose_doc_guide_skill() -> SourceEntry {
@@ -550,42 +541,6 @@ mod tests {
             supporting_files: Vec::new(),
             properties: HashMap::new(),
         }
-    }
-
-    #[test]
-    fn loaded_skill_context_with_args_replaces_arguments_placeholder_with_raw_args() {
-        let skill = skill_with_content("Review $ARGUMENTS carefully.");
-
-        let rendered = loaded_skill_context_with_args(&skill, Some("src/foo.rs --strict")).unwrap();
-
-        assert!(rendered.contains("Review src/foo.rs --strict carefully."));
-    }
-
-    #[test]
-    fn loaded_skill_context_with_args_uses_context_without_args() {
-        let skill = skill_with_content("Review the code carefully.");
-
-        let rendered = loaded_skill_context_with_args(&skill, None).unwrap();
-
-        assert!(rendered.contains("# Loaded Skill: test-skill (skill)"));
-        assert!(rendered.contains("## Content\n\nReview the code carefully."));
-    }
-
-    #[test]
-    fn loaded_skill_context_shows_resolved_paths_for_supporting_files() {
-        let skill_dir = std::env::temp_dir().join("goose-test-skill");
-        let script_path = skill_dir.join("scripts").join("my-tool.exe");
-        let mut skill = skill_with_content("Run scripts/my-tool.exe.");
-        skill.path = skill_dir.to_string_lossy().into_owned();
-        skill.supporting_files = vec![script_path.to_string_lossy().into_owned()];
-
-        let rendered = loaded_skill_context_with_args(&skill, None).unwrap();
-        let resolved_path = script_path.to_string_lossy().replace('\\', "/");
-
-        assert!(rendered.contains("Relative paths in this skill resolve from the skill directory"));
-        assert!(rendered.contains("scripts/my-tool.exe"));
-        assert!(rendered.contains(&resolved_path));
-        assert!(rendered.contains("load_skill(name: \"test-skill/scripts/my-tool.exe\")"));
     }
 
     #[test]
@@ -606,5 +561,440 @@ mod tests {
         let rendered = resolve_docs_root_placeholder(&skill, &skill.content, "/tmp/goose-docs");
 
         assert_eq!(rendered, skill.content);
+    }
+
+    #[test]
+    fn project_plugin_skill_precedes_global_skill_with_same_name() {
+        let project = tempfile::tempdir().unwrap();
+        let path_root = tempfile::tempdir().unwrap();
+        let plugin_root = project.path().join(".agents/plugins/project-plugin");
+        write_test_skill(
+            &plugin_root.join("skills/collision"),
+            "collision",
+            "project plugin body",
+        );
+        write_test_skill(
+            &path_root.path().join("config/skills/collision"),
+            "collision",
+            "global body",
+        );
+
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        config
+            .set_param(
+                "plugins",
+                HashMap::from([(
+                    plugin_root.to_string_lossy().into_owned(),
+                    HashMap::from([("enabled", true)]),
+                )]),
+            )
+            .unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+
+        let skill = discover_skills_with_config(Some(project.path()), &config)
+            .into_iter()
+            .find(|skill| skill.name == "collision")
+            .unwrap();
+
+        assert_eq!(skill.content.trim(), "project plugin body");
+        assert!(!skill.global);
+        assert!(!skill.writable);
+        assert!(Path::new(&skill.path).starts_with(&plugin_root));
+    }
+
+    #[test]
+    fn user_plugin_skill_remains_writable_when_project_root_is_path_root() {
+        let path_root = tempfile::tempdir().unwrap();
+        let plugin_root = path_root.path().join(".agents/plugins/user-plugin");
+        write_test_skill(
+            &plugin_root.join("skills/user-owned"),
+            "user-owned",
+            "user body",
+        );
+
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        config
+            .set_param(
+                "plugins",
+                HashMap::from([(
+                    plugin_root.to_string_lossy().into_owned(),
+                    HashMap::from([("enabled", true)]),
+                )]),
+            )
+            .unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+
+        let skill = discover_skills_with_config(Some(path_root.path()), &config)
+            .into_iter()
+            .find(|skill| skill.name == "user-owned")
+            .unwrap();
+
+        assert!(skill.global);
+        assert!(skill.writable);
+    }
+
+    #[test]
+    fn exclusive_project_plugin_manifest_omits_default_skill_root() {
+        let project = tempfile::tempdir().unwrap();
+        let path_root = tempfile::tempdir().unwrap();
+        let plugin_root = project.path().join(".agents/plugins/project-plugin");
+        write_test_skill(
+            &plugin_root.join("skills/excluded"),
+            "excluded",
+            "excluded body",
+        );
+        write_test_skill(
+            &plugin_root.join("custom-skills/included"),
+            "included",
+            "included body",
+        );
+        std::fs::write(
+            plugin_root.join("plugin.json"),
+            r#"{"name":"project-plugin","skills":{"exclusive":true,"paths":["./custom-skills"]}}"#,
+        )
+        .unwrap();
+
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        config
+            .set_param(
+                "plugins",
+                HashMap::from([(
+                    plugin_root.to_string_lossy().into_owned(),
+                    HashMap::from([("enabled", true)]),
+                )]),
+            )
+            .unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+
+        let skills = discover_skills_with_config(Some(project.path()), &config);
+
+        assert!(skills.iter().any(|skill| skill.name == "included"));
+        assert!(!skills.iter().any(|skill| skill.name == "excluded"));
+    }
+
+    #[test]
+    fn project_plugin_skill_is_rejected_by_source_crud_before_discovery() {
+        let project = tempfile::tempdir().unwrap();
+        let path_root = tempfile::tempdir().unwrap();
+        let plugin_root = project.path().join(".agents/plugins/project-plugin");
+        let skill_dir = plugin_root.join(".agents/skills/plugin-owned");
+        write_test_skill(&skill_dir, "plugin-owned", "plugin body");
+        std::fs::write(
+            plugin_root.join("plugin.json"),
+            r#"{"name":"project-plugin","skills":{"paths":["./.agents/skills"]}}"#,
+        )
+        .unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+
+        assert_path_rejected_by_source_crud(
+            skill_dir.to_str().unwrap(),
+            "plugin-owned",
+            &skill_dir,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_disabled_project_plugin_canonical_path_is_rejected() {
+        let project = tempfile::tempdir().unwrap();
+        let path_root = tempfile::tempdir().unwrap();
+        let external_root = tempfile::tempdir().unwrap();
+        let plugin_link = project.path().join(".agents/plugins/project-plugin");
+        let skill_dir = external_root.path().join(".agents/skills/plugin-owned");
+        write_test_skill(&skill_dir, "plugin-owned", "plugin body");
+        std::fs::write(
+            external_root.path().join("plugin.json"),
+            r#"{"name":"project-plugin","skills":{"paths":["./.agents/skills"]}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin_link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(external_root.path(), &plugin_link).unwrap();
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        config
+            .set_param(
+                "plugins",
+                HashMap::from([(
+                    plugin_link.to_string_lossy().into_owned(),
+                    HashMap::from([("enabled", false)]),
+                )]),
+            )
+            .unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+
+        let err = resolve_discoverable_skill_dir_with_config(skill_dir.to_str().unwrap(), &config)
+            .unwrap_err();
+
+        assert!(format!("{err:?}").contains("not found"));
+        assert!(skill_dir.join("SKILL.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_disabled_project_plugin_canonical_path_is_rejected() {
+        let project = tempfile::tempdir().unwrap();
+        let path_root = tempfile::tempdir().unwrap();
+        let external_root = tempfile::tempdir().unwrap();
+        let plugin_link = project.path().join(".agents/plugins/project-plugin");
+        let skill_dir = external_root.path().join(".agents/skills/plugin-owned");
+        write_test_skill(&skill_dir, "plugin-owned", "plugin body");
+        std::fs::write(
+            external_root.path().join("plugin.json"),
+            r#"{"name":"project-plugin","skills":{"paths":["./.agents/skills"]}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin_link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(external_root.path(), &plugin_link).unwrap();
+        let settings_dir = project.path().join(".config/goose");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        std::fs::write(
+            settings_dir.join("settings.json"),
+            r#"{"disabledPlugins":["project-plugin"]}"#,
+        )
+        .unwrap();
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+
+        let plugins = crate::plugins::discovery::discover_enabled_plugins_with_config(
+            Some(project.path()),
+            &config,
+        );
+        assert!(plugins.iter().all(|plugin| plugin.name != "project-plugin"));
+
+        let err = resolve_discoverable_skill_dir_with_config(skill_dir.to_str().unwrap(), &config)
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("not found"));
+        assert!(skill_dir.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn nested_project_plugin_skill_is_listed_read_only_and_rejected_by_source_crud() {
+        let project = tempfile::tempdir().unwrap();
+        let path_root = tempfile::tempdir().unwrap();
+        let plugin_root = project.path().join(".agents/plugins/project-plugin");
+        let skill_dir = plugin_root.join(".agents/skills/plugin-owned");
+        write_test_skill(&skill_dir, "plugin-owned", "plugin body");
+        std::fs::write(
+            plugin_root.join("plugin.json"),
+            r#"{"name":"project-plugin","skills":{"paths":["./.agents/skills"]}}"#,
+        )
+        .unwrap();
+
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        config
+            .set_param(
+                "plugins",
+                HashMap::from([(
+                    plugin_root.to_string_lossy().into_owned(),
+                    HashMap::from([("enabled", true)]),
+                )]),
+            )
+            .unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+
+        let skill = discover_skills_with_config(Some(project.path()), &config)
+            .into_iter()
+            .find(|skill| skill.name == "plugin-owned")
+            .unwrap();
+        assert_read_only_and_rejected_by_source_crud(&skill, &skill_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_project_plugin_skill_is_rejected_by_source_crud() {
+        let project = tempfile::tempdir().unwrap();
+        let path_root = tempfile::tempdir().unwrap();
+        let external_root = tempfile::tempdir().unwrap();
+        let plugin_link = project.path().join(".agents/plugins/project-plugin");
+        let skill_dir = external_root.path().join(".agents/skills/plugin-owned");
+        write_test_skill(&skill_dir, "plugin-owned", "plugin body");
+        std::fs::write(
+            external_root.path().join("plugin.json"),
+            r#"{"name":"project-plugin","skills":{"paths":["./.agents/skills"]}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin_link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(external_root.path(), &plugin_link).unwrap();
+
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        config
+            .set_param(
+                "plugins",
+                HashMap::from([(
+                    plugin_link.to_string_lossy().into_owned(),
+                    HashMap::from([("enabled", true)]),
+                )]),
+            )
+            .unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+
+        let skill = discover_skills_with_config(Some(project.path()), &config)
+            .into_iter()
+            .find(|skill| skill.name == "plugin-owned")
+            .unwrap();
+
+        assert!(Path::new(&skill.path).starts_with(&plugin_link));
+        assert_read_only_and_rejected_by_source_crud(&skill, &skill_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_user_plugin_skill_remains_writable_for_source_crud() {
+        let path_root = tempfile::tempdir().unwrap();
+        let external_parent = tempfile::tempdir().unwrap();
+        let external_root = external_parent.path().join(".agents/plugins/user-plugin");
+        let skill_dir = external_root.join(".agents/skills/user-owned");
+        write_test_skill(&skill_dir, "user-owned", "user body");
+        std::fs::write(
+            external_root.join("plugin.json"),
+            r#"{"name":"user-plugin","skills":{"paths":["./.agents/skills"]}}"#,
+        )
+        .unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        let project_path_root = tempfile::tempdir().unwrap();
+        let project_plugin_link = project.path().join(".agents/plugins/user-plugin");
+        std::fs::create_dir_all(project_plugin_link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&external_root, &project_plugin_link).unwrap();
+        let project_config = Config::new(
+            project_path_root.path().join("test-config.yaml"),
+            "skills-test",
+        )
+        .unwrap();
+        project_config
+            .set_param(
+                "plugins",
+                HashMap::from([(
+                    project_plugin_link.to_string_lossy().into_owned(),
+                    HashMap::from([("enabled", true)]),
+                )]),
+            )
+            .unwrap();
+        {
+            let _guard = env_lock::lock_env([
+                ("GOOSE_PATH_ROOT", project_path_root.path().to_str()),
+                ("PLUGINS", None),
+            ]);
+            let project_skill = discover_skills_with_config(Some(project.path()), &project_config)
+                .into_iter()
+                .find(|skill| skill.name == "user-owned")
+                .unwrap();
+            assert!(!project_skill.writable);
+        }
+
+        let plugin_link = path_root.path().join(".agents/plugins/user-plugin");
+        std::fs::create_dir_all(plugin_link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&external_root, &plugin_link).unwrap();
+
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        config
+            .set_param(
+                "plugins",
+                HashMap::from([(
+                    plugin_link.to_string_lossy().into_owned(),
+                    HashMap::from([("enabled", true)]),
+                )]),
+            )
+            .unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+
+        let skill = discover_skills_with_config(None, &config)
+            .into_iter()
+            .find(|skill| skill.name == "user-owned")
+            .unwrap();
+        assert!(skill.global);
+        assert!(skill.writable);
+        assert!(Path::new(&skill.path).starts_with(&plugin_link));
+        assert!(resolve_discoverable_skill_dir_with_config(&skill.path, &project_config).is_ok());
+
+        let updated = crate::sources::update_source_with_roots(
+            SourceType::Skill,
+            &skill.path,
+            "user-owned",
+            "updated",
+            "updated body",
+            crate::sources::UpdateSourceOptions {
+                properties: Some(HashMap::new()),
+                additional_roots: &[],
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.content, "updated body");
+
+        let (exported, _) = crate::sources::export_source(SourceType::Skill, &skill.path).unwrap();
+        assert!(exported.contains("updated body"));
+
+        crate::sources::delete_source(SourceType::Skill, &skill.path).unwrap();
+        assert!(!skill_dir.exists());
+    }
+
+    #[test]
+    fn ordinary_project_skill_under_plugin_manifest_remains_writable() {
+        let project = tempfile::tempdir().unwrap();
+        let path_root = tempfile::tempdir().unwrap();
+        let skill_dir = project.path().join(".agents/skills/project-owned");
+        write_test_skill(&skill_dir, "project-owned", "project body");
+        std::fs::write(
+            project.path().join("plugin.json"),
+            r#"{"name":"ordinary-project","skills":{"paths":["./.agents/skills"]}}"#,
+        )
+        .unwrap();
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+
+        let skill = discover_skills_with_config(Some(project.path()), &config)
+            .into_iter()
+            .find(|skill| skill.name == "project-owned")
+            .unwrap();
+        assert!(skill.writable);
+
+        let updated = crate::sources::update_source_with_roots(
+            SourceType::Skill,
+            &skill.path,
+            "project-owned",
+            "updated",
+            "updated body",
+            crate::sources::UpdateSourceOptions {
+                properties: Some(HashMap::new()),
+                additional_roots: &[],
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.content, "updated body");
+
+        let (exported, _) = crate::sources::export_source(SourceType::Skill, &skill.path).unwrap();
+        assert!(exported.contains("updated body"));
+
+        crate::sources::delete_source(SourceType::Skill, &skill.path).unwrap();
+        assert!(!skill_dir.exists());
     }
 }

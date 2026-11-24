@@ -26,13 +26,42 @@ pub struct GooseSessionNotification {
     "mapping": {
         "usage_update": "#/$defs/SessionUsageUpdate",
         "status_message": "#/$defs/StatusMessageUpdate",
-        "message_usage": "#/$defs/MessageUsageUpdate"
+        "message_usage": "#/$defs/MessageUsageUpdate",
+        "live_voice_interaction_ended": "#/$defs/LiveVoiceInteractionEndedUpdate"
     }
 }))]
 pub enum GooseSessionUpdate {
     UsageUpdate(SessionUsageUpdate),
     StatusMessage(StatusMessageUpdate),
     MessageUsage(MessageUsageUpdate),
+    LiveVoiceInteractionEnded(LiveVoiceInteractionEndedUpdate),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveVoiceInteractionEndedUpdate {
+    pub interaction_id: String,
+    pub outcome: LiveVoiceInteractionOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveVoiceInteractionOutcome {
+    Stopped,
+    Failed,
+}
+
+/// Dedicated provider notification for OAuth device-code flow.
+/// Sent during provider authentication when the ACP client supports
+/// `goose.customNotifications` — avoids a fake empty session ID.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcNotification)]
+#[notification(method = "_goose/unstable/providers/authentication/device-code")]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDeviceCodeNotification {
+    pub provider_id: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
 }
 
 impl Default for GooseSessionUpdate {
@@ -69,15 +98,15 @@ pub struct MessageUsageUpdate {
 #[serde(rename_all = "camelCase")]
 pub struct MessageUsageData {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_tokens: Option<i32>,
+    pub input_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<i32>,
+    pub output_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_tokens: Option<i32>,
+    pub total_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read_tokens: Option<i32>,
+    pub cache_read_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_write_tokens: Option<i32>,
+    pub cache_write_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,7 +171,10 @@ where
 /// notification, define the struct above (with `JsonRpcNotification` +
 /// `Default`) and add one line below.
 pub fn custom_notification_schemas(generator: &mut SchemaGenerator) -> Vec<CustomMethodSchema> {
-    vec![notification_schema::<GooseSessionNotification>(generator)]
+    vec![
+        notification_schema::<GooseSessionNotification>(generator),
+        notification_schema::<ProviderDeviceCodeNotification>(generator),
+    ]
 }
 
 #[cfg(test)]
@@ -173,6 +205,33 @@ mod tests {
                         "type": "notice",
                         "message": "Compaction complete"
                     }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn live_voice_interaction_ended_serializes_to_expected_wire_shape() {
+        let notification = GooseSessionNotification {
+            session_id: "s1".to_string(),
+            update: GooseSessionUpdate::LiveVoiceInteractionEnded(
+                LiveVoiceInteractionEndedUpdate {
+                    interaction_id: "live_opaque".to_string(),
+                    outcome: LiveVoiceInteractionOutcome::Failed,
+                },
+            ),
+        };
+
+        let value = serde_json::to_value(notification).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "live_voice_interaction_ended",
+                    "interactionId": "live_opaque",
+                    "outcome": "failed"
                 }
             })
         );

@@ -19,17 +19,7 @@ pub struct ExtensionEntry {
     pub config: ExtensionConfig,
 }
 
-pub fn name_to_key(name: &str) -> String {
-    let mut result = String::with_capacity(name.len());
-    for c in name.chars() {
-        result.push(match c {
-            c if c.is_ascii_alphanumeric() || c == '_' || c == '-' => c,
-            c if c.is_whitespace() => continue,
-            _ => '_',
-        });
-    }
-    result.to_lowercase()
-}
+pub use goose_agent::extension::name_to_key;
 
 pub(crate) fn is_extension_available(config: &ExtensionConfig) -> bool {
     match config {
@@ -37,6 +27,18 @@ pub(crate) fn is_extension_available(config: &ExtensionConfig) -> bool {
             crate::agents::extension::PLATFORM_EXTENSIONS.contains_key(name_to_key(name).as_str())
         }
         _ => true,
+    }
+}
+
+fn inject_name_if_missing(key: &str, value: serde_yaml::Value) -> serde_yaml::Value {
+    let name_key = serde_yaml::Value::String("name".to_string());
+    if let serde_yaml::Value::Mapping(mut map) = value {
+        if !map.contains_key(&name_key) {
+            map.insert(name_key, serde_yaml::Value::String(key.to_string()));
+        }
+        serde_yaml::Value::Mapping(map)
+    } else {
+        value
     }
 }
 
@@ -48,7 +50,8 @@ fn parse_extensions_map(raw: &Mapping) -> IndexMap<String, ExtensionEntry> {
             continue;
         };
 
-        match serde_yaml::from_value::<ExtensionEntry>(v.clone()) {
+        let v = inject_name_if_missing(key, v.clone());
+        match serde_yaml::from_value::<ExtensionEntry>(v) {
             Ok(entry) => {
                 if !is_extension_available(&entry.config) {
                     continue;
@@ -198,6 +201,17 @@ pub fn is_extension_enabled(key: &str) -> bool {
     extensions.get(key).map(|e| e.enabled).unwrap_or(false)
 }
 
+/// Returns the configured enabled state for an extension, or `None` when it has no entry.
+pub fn configured_enabled_state(config: &Config, name: &str) -> Option<bool> {
+    let extensions = get_extensions_map_with_config(config);
+    let key = name_to_key(name);
+    extensions
+        .values()
+        .find(|entry| entry.config.name() == name)
+        .or_else(|| extensions.get(&key))
+        .map(|entry| entry.enabled)
+}
+
 pub fn get_enabled_extensions() -> Vec<ExtensionConfig> {
     get_all_extensions()
         .into_iter()
@@ -255,15 +269,20 @@ pub fn get_warnings() -> Vec<String> {
 
     let mut warnings = Vec::new();
     for (k, v) in raw {
-        if let (serde_yaml::Value::String(key), Ok(entry)) =
-            (k, serde_yaml::from_value::<ExtensionEntry>(v))
-        {
-            if matches!(entry.config, ExtensionConfig::Sse { .. }) {
-                warnings.push(format!(
-                    "'{}': SSE is unsupported, migrate to streamable_http",
-                    key
-                ));
-            }
+        let Some(key) = k.as_str() else {
+            continue;
+        };
+        let Some(extension) = v.as_mapping() else {
+            continue;
+        };
+        let extension_type = extension
+            .get(serde_yaml::Value::String("type".to_string()))
+            .and_then(serde_yaml::Value::as_str);
+        if extension_type == Some("sse") {
+            warnings.push(format!(
+                "'{}': SSE is unsupported, migrate to streamable_http",
+                key
+            ));
         }
     }
     warnings
@@ -295,6 +314,13 @@ mod tests {
     use tempfile::NamedTempFile;
     use tracing::{Event, Level, Subscriber};
     use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn extension_names_have_stable_keys() {
+        assert_eq!(name_to_key("Test Client"), "testclient");
+        assert_eq!(name_to_key("__cli__ent__"), "__cli__ent__");
+        assert_eq!(name_to_key("client 🚀"), "client_");
+    }
 
     fn test_config(content: &str) -> (Config, NamedTempFile, NamedTempFile) {
         let config_file = NamedTempFile::new().unwrap();
@@ -473,7 +499,7 @@ extensions:
     fn test_get_extension_by_name_resolves_saved_entry_by_key() {
         let saved = ExtensionEntry {
             enabled: true,
-            config: ExtensionConfig::Stdio {
+            config: ExtensionConfig::External(goose_agent::extension::ExtensionConfig::Stdio {
                 name: "My Tool".to_string(),
                 description: "saved description".to_string(),
                 cmd: "my-tool".to_string(),
@@ -484,7 +510,7 @@ extensions:
                 cwd: None,
                 bundled: None,
                 available_tools: vec!["run".to_string()],
-            },
+            }),
         };
         let key = saved.config.key();
         assert_ne!(key, saved.config.name());
@@ -495,11 +521,11 @@ extensions:
         let resolved = get_extension_by_name_with_config(&config, &key).unwrap();
 
         match resolved {
-            ExtensionConfig::Stdio {
+            ExtensionConfig::External(goose_agent::extension::ExtensionConfig::Stdio {
                 timeout,
                 available_tools,
                 ..
-            } => {
+            }) => {
                 assert_eq!(timeout, Some(120));
                 assert_eq!(available_tools, vec!["run".to_string()]);
             }
@@ -590,6 +616,97 @@ extensions:
     }
 
     #[test]
+    fn test_stdio_without_name_uses_map_key() {
+        let (config, _config_file, _secrets_file) = test_config(
+            r#"
+extensions:
+  firecrawl:
+    enabled: true
+    type: stdio
+    cmd: npx
+    args: ["-y", "firecrawl-mcp"]
+    envs:
+      FIRECRAWL_API_KEY: test-key
+"#,
+        );
+
+        let extensions = get_extensions_map_with_config(&config);
+        let entry = extensions
+            .get("firecrawl")
+            .expect("firecrawl extension should parse");
+        assert_eq!(entry.config.name(), "firecrawl");
+        assert!(entry.enabled);
+    }
+
+    #[test]
+    fn test_stdio_env_alias_accepted() {
+        let (config, _config_file, _secrets_file) = test_config(
+            r#"
+extensions:
+  brave-search:
+    enabled: true
+    type: stdio
+    name: brave-search
+    cmd: npx
+    args: ["-y", "@modelcontextprotocol/server-brave-search"]
+    env:
+      BRAVE_API_KEY: test-key
+"#,
+        );
+
+        let extensions = get_extensions_map_with_config(&config);
+        let entry = extensions
+            .get("brave-search")
+            .expect("brave-search extension should parse");
+        match &entry.config {
+            ExtensionConfig::External(goose_agent::extension::ExtensionConfig::Stdio {
+                envs,
+                ..
+            }) => {
+                assert_eq!(
+                    envs.get_env().get("BRAVE_API_KEY"),
+                    Some(&"test-key".to_string())
+                );
+            }
+            other => panic!("expected Stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stdio_env_alias_without_name_uses_map_key() {
+        let (config, _config_file, _secrets_file) = test_config(
+            r#"
+extensions:
+  brave-search:
+    enabled: true
+    type: stdio
+    cmd: npx
+    args: ["-y", "@modelcontextprotocol/server-brave-search"]
+    env:
+      BRAVE_API_KEY: test-key
+"#,
+        );
+
+        let extensions = get_extensions_map_with_config(&config);
+        let entry = extensions
+            .get("brave-search")
+            .expect("brave-search extension should parse when name is missing and env: is used");
+        assert_eq!(entry.config.name(), "brave-search");
+        match &entry.config {
+            ExtensionConfig::External(goose_agent::extension::ExtensionConfig::Stdio {
+                envs,
+                ..
+            }) => {
+                assert_eq!(
+                    envs.get_env().get("BRAVE_API_KEY"),
+                    Some(&"test-key".to_string())
+                );
+            }
+            other => panic!("expected Stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_deserialization_failure_logs_offending_key() {
         let (config, _config_file, _secrets_file) = test_config(
             r#"
@@ -662,5 +779,41 @@ extensions:
             "expected no logs for other extension keys, got {:?}",
             other_keys
         );
+    }
+
+    #[test]
+    fn test_configured_enabled_state_unknown_extension_is_none() {
+        let (config, _config_file, _secrets_file) = test_config("");
+
+        assert_eq!(
+            configured_enabled_state(&config, "not_a_real_extension"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_default_on_extension_enabled_when_config_empty() {
+        let (config, _config_file, _secrets_file) = test_config("");
+
+        assert_eq!(configured_enabled_state(&config, "developer"), Some(true));
+    }
+
+    #[test]
+    fn test_configured_enabled_state_tracks_changes() {
+        let (config, _config_file, _secrets_file) = test_config("");
+        set_extension_with_config(&config, builtin_entry("developer", false));
+
+        assert_eq!(configured_enabled_state(&config, "developer"), Some(false));
+
+        set_extension_enabled_with_config(&config, "developer", true);
+        assert_eq!(configured_enabled_state(&config, "developer"), Some(true));
+    }
+
+    #[cfg(feature = "chat-recall")]
+    #[test]
+    fn test_default_off_extension_disabled_when_config_empty() {
+        let (config, _config_file, _secrets_file) = test_config("");
+
+        assert_eq!(configured_enabled_state(&config, "chatrecall"), Some(false));
     }
 }

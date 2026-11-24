@@ -105,11 +105,18 @@ png = "0.17"
 #   fails closed). See api-server/src/goose_acp.rs for the rest of the
 #   lockdown story.
 #
-# VENDORED (2026-11-04): goose is now part of Roshera — its source lives in
-# `roshera-backend/vendor/goose` (copied from upstream rev 022c17c3, Apache-2.0,
-# see vendor/goose/VENDORED.md). The harness is ours to change; every rule
-# above still applies to the vendored copy.
-goose = { path = "../vendor/goose/crates/goose", default-features = false }
+# VENDORED (2026-11-04): goose is part of Roshera — its source lives in
+# `roshera-backend/vendor/goose` (upstream v1.60.2 since 2026-11-24, first
+# vendored at rev 022c17c3 / 1.45.0; Apache-2.0, see vendor/goose/VENDORED.md
+# for the upgrade record and what an upgrade must re-prove). The harness is
+# ours to change; every rule above still applies to the vendored copy.
+#
+# ONE feature, and only this one (goose 1.60, 2026-11-24): `acp-http` -- the
+# HTTP transport for `/acp` (`goose::acp::transport::create_acp_router`),
+# which Roshera already served on goose 1.45, where it was not gated. It
+# adds `agent-client-protocol-http` (the ACP HTTP server) and nothing from
+# the MUST-NOT list above.
+goose = { path = "../vendor/goose/crates/goose", default-features = false, features = ["acp-http"] }
 
 # Job Object API for `child_process_lifetime.rs` (a killed server takes its
 # `node` MCP children with it). 0.61 is the version tokio already locks, so
@@ -129,6 +136,13 @@ hyper = "1.0"
 # resolved in Cargo.lock (0.26.2) transitively via axum's `ws` feature,
 # so this adds no new dependency to the build graph.
 tokio-tungstenite = "0.26"
+# For the goose end-to-end test that calls a tool through goose's own MCP
+# client (`goose_acp::tests::a_workbench_switch_reaches_the_goose_agent`):
+# the request type and cancellation token goose's API takes. Both already in
+# Cargo.lock through goose (rmcp pinned to the version goose 1.60.2 was
+# released against), so no new crate enters the build graph.
+rmcp = { version = "=3.10.0", default-features = false }
+tokio-util = "0.7"
 
 [lints]
 workspace = true

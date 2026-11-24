@@ -1,0 +1,314 @@
+//! Decides whether a completed response should finish, continue, or retry the turn.
+
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use std::time::Duration;
+
+use crate::agents::retry::{
+    execute_on_failure_command_with_timeout, execute_success_checks_with_timeout,
+};
+use crate::agents::state_machine::{
+    applied, ends_turn, messages_since_kickoff, not_applicable, yielded, yielded_with, Command,
+    ConversationEffect, Emitter, GooseEffect, Operation, OperationResult,
+};
+use crate::agents::types::RetryConfig;
+use crate::conversation::message::{Message, MessageErrorKind, SystemNotificationType};
+use crate::conversation::Conversation;
+use crate::session::{GoalState, Session};
+
+pub(super) const NUDGED: &str = "nudged";
+pub(super) const ATTEMPTS: &str = "attempts";
+
+fn retry_error(error: &str) -> Message {
+    Message::assistant().with_error(
+        MessageErrorKind::Other,
+        format!("Retry logic encountered an error: {error}"),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum GoalKind {
+    Goal,
+    Grind,
+}
+
+pub struct RetryOperation {
+    retry_timeout: Duration,
+    on_failure_timeout: Duration,
+}
+
+impl RetryOperation {
+    pub fn new(retry_timeout: Duration, on_failure_timeout: Duration) -> Self {
+        Self {
+            retry_timeout,
+            on_failure_timeout,
+        }
+    }
+
+    fn retry_config(session: &Session) -> Option<&RetryConfig> {
+        session
+            .recipe
+            .as_ref()
+            .and_then(|recipe| recipe.retry.as_ref())
+    }
+
+    fn reset_conversation(conversation: &Conversation) -> Result<Conversation> {
+        let messages = messages_since_kickoff(conversation)?;
+        let kickoff = conversation.len() - messages.len();
+        Ok(Conversation::new_unvalidated(
+            conversation.messages()[..=kickoff].to_vec(),
+        ))
+    }
+
+    fn goal_was_nudged(&self, messages: &[Message]) -> bool {
+        messages
+            .iter()
+            .any(|message| self.message_meta(message, NUDGED).is_some())
+    }
+
+    /// Attempts are counted on the kickoff message because a retry replaces the
+    /// conversation with everything up to and including it — the only message
+    /// that outlives the attempt it belongs to.
+    fn attempts(&self, messages: &[Message]) -> u32 {
+        messages
+            .first()
+            .and_then(|message| self.message_meta(message, ATTEMPTS))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32
+    }
+
+    async fn goal_command(
+        &self,
+        kind: GoalKind,
+        params: &str,
+        session: &Session,
+        conversation: &Conversation,
+        emit: &Emitter,
+    ) -> Result<OperationResult<GooseEffect>> {
+        let mut state = GoalState::of(session);
+        let (name, label, target) = match kind {
+            GoalKind::Goal => ("goal", "goal", &mut state.goal),
+            GoalKind::Grind => ("grind", "grind goal", &mut state.grind),
+        };
+        let starts_turn = !params.is_empty() && !matches!(params, "off" | "clear" | "none");
+
+        let response = if params.is_empty() {
+            match target {
+                Some(value) => Message::assistant().with_text(format!("Current {label}: {value}")),
+                None => Message::assistant().with_text(format!(
+                    "No {label} set. Use `/{command_name} <description>` to set one.",
+                    command_name = name
+                )),
+            }
+        } else if !starts_turn {
+            *target = None;
+            let text = match kind {
+                GoalKind::Goal => "Goal cleared. The agent will finish normally.",
+                GoalKind::Grind => "Grind cleared. The agent will finish normally.",
+            };
+            Message::assistant().with_text(text)
+        } else {
+            *target = Some(params.to_string());
+            let text = match kind {
+                GoalKind::Goal => format!(
+                    "Goal set. The agent will verify this goal is met before finishing:\n\n> {params}"
+                ),
+                GoalKind::Grind => format!(
+                    "Grind goal set. The agent will keep working until max_turns is reached:\n\n> {params}"
+                ),
+            };
+            Message::assistant().with_text(text)
+        };
+
+        let command_message = messages_since_kickoff(conversation)?
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("slash command conversation has no kickoff message"))?;
+        let message_id = command_message
+            .id
+            .clone()
+            .ok_or_else(|| anyhow!("Persisted slash command message has no id"))?;
+        let command_message = command_message.with_visibility(true, false);
+        let response = response.with_visibility(true, false);
+        emit.message(command_message);
+        let response = emit.message(response);
+
+        let mut effects = vec![
+            ConversationEffect::SetMessageVisibility {
+                message_id,
+                user_visible: true,
+                agent_visible: false,
+            }
+            .into(),
+            response.into(),
+        ];
+        if !params.is_empty() {
+            effects.push(GooseEffect::extension_state(&state)?);
+        }
+        if starts_turn {
+            effects.push(
+                Message::user()
+                    .with_text(format!(
+                        "Start working toward this goal now:\n\n**Goal:** {params}"
+                    ))
+                    .with_visibility(false, true)
+                    .into(),
+            );
+        } else {
+            return yielded_with(effects);
+        }
+        applied(effects)
+    }
+}
+
+#[async_trait]
+impl Operation<Session, GooseEffect> for RetryOperation {
+    fn name(&self) -> &'static str {
+        "retry"
+    }
+
+    async fn commands(&self, _session: &Session) -> Result<Vec<Command<'_, Session, GooseEffect>>> {
+        Ok(vec![
+            Command::new(
+                "goal",
+                "Set a goal the agent must satisfy before finishing, or clear with /goal off",
+                move |call| {
+                    Box::pin(self.goal_command(
+                        GoalKind::Goal,
+                        call.arguments,
+                        call.session,
+                        call.conversation,
+                        call.emit,
+                    ))
+                },
+            ),
+            Command::new(
+                "grind",
+                "Set a goal the agent pursues relentlessly until max_turns, or clear with /grind off",
+                move |call| {
+                    Box::pin(self.goal_command(
+                        GoalKind::Grind,
+                        call.arguments,
+                        call.session,
+                        call.conversation,
+                        call.emit,
+                    ))
+                },
+            ),
+        ])
+    }
+
+    async fn run(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+        emit: &Emitter,
+    ) -> Result<OperationResult<GooseEffect>> {
+        let messages = messages_since_kickoff(conversation)?;
+        if !ends_turn(messages) {
+            return not_applicable();
+        }
+
+        let state = GoalState::of(session);
+        if !self.goal_was_nudged(messages) {
+            if let Some(goal) = &state.goal {
+                let nudge = format!(
+                    "Before finishing, check whether the following goal has been fully met:\n\n\
+                     **Goal:** {goal}\n\n\
+                     If not, continue working toward it."
+                );
+                let mut message = Message::user()
+                    .with_text(&nudge)
+                    .with_visibility(false, true);
+                self.set_message_meta(&mut message, NUDGED, serde_json::json!(true));
+                emit.message(Message::assistant().with_system_notification(
+                    SystemNotificationType::InlineMessage,
+                    format!("Goal: {goal}"),
+                ));
+                return applied([message.into()]);
+            }
+        }
+
+        if let Some(grind) = &state.grind {
+            let nudge = format!(
+                "Keep working. The grind goal is not yet complete:\n\n\
+                 **Goal:** {grind}\n\n\
+                 Continue until it is fully done."
+            );
+            let message = Message::user()
+                .with_text(&nudge)
+                .with_visibility(false, true);
+            emit.message(Message::assistant().with_system_notification(
+                SystemNotificationType::InlineMessage,
+                format!("Grind: {grind}"),
+            ));
+            return applied([message.into()]);
+        }
+
+        if state.goal.is_some() {
+            return applied([GooseEffect::extension_state(&GoalState::default())?]);
+        }
+
+        let Some(retry_config) = Self::retry_config(session) else {
+            return not_applicable();
+        };
+
+        let retry_timeout = retry_config
+            .timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(self.retry_timeout);
+        let success =
+            execute_success_checks_with_timeout(&retry_config.checks, retry_timeout).await;
+        let success = match success {
+            Ok(success) => success,
+            Err(error) => {
+                let message = emit.message(retry_error(&error.to_string()));
+                return applied([message.into()]);
+            }
+        };
+        if success {
+            if messages
+                .last()
+                .is_some_and(|message| message.content.is_empty())
+            {
+                return yielded();
+            }
+            return not_applicable();
+        }
+
+        let attempts = self.attempts(messages);
+        if attempts >= retry_config.max_retries {
+            let message = Message::assistant().with_error(
+                MessageErrorKind::Other,
+                format!(
+                    "Maximum retry attempts ({}) exceeded. Unable to complete the task successfully.",
+                    retry_config.max_retries
+                ),
+            );
+            #[cfg(feature = "telemetry")]
+            crate::posthog::emit_error(
+                "retry_max_exceeded",
+                &format!("Max retries ({}) exceeded", retry_config.max_retries),
+            );
+            let message = emit.message(message);
+            return applied([message.into()]);
+        }
+
+        if let Some(command) = &retry_config.on_failure {
+            let timeout = retry_config
+                .on_failure_timeout_seconds
+                .map(Duration::from_secs)
+                .unwrap_or(self.on_failure_timeout);
+            if let Err(error) = execute_on_failure_command_with_timeout(command, timeout).await {
+                let message = emit.message(retry_error(&error.to_string()));
+                return applied([message.into()]);
+            }
+        }
+
+        let mut reset = Self::reset_conversation(conversation)?;
+        if let Some(kickoff) = reset.messages_mut().last_mut() {
+            self.set_message_meta(kickoff, ATTEMPTS, serde_json::json!(attempts + 1));
+        }
+        applied([reset.into()])
+    }
+}

@@ -1,21 +1,27 @@
 use super::*;
 
-impl GooseAcpAgent {
+impl AcpConnection {
     #[allow(dead_code)]
     pub(super) async fn handle_fork_session(
         &self,
         cx: &ConnectionTo<Client>,
         args: ForkSessionRequest,
     ) -> Result<ForkSessionResponse, agent_client_protocol::Error> {
-        validate_absolute_cwd(&args.cwd)?;
         let conversation_before = conversation_before_from_meta(args.meta.as_ref())?;
         let source_session_id = &*args.session_id.0;
 
         let source = self
+            .services
             .session_manager
             .get_session(source_session_id, false)
             .await
             .internal_err()?;
+
+        // Resolve and validate the effective cwd before copying anything, so a
+        // bad request cannot leave a stray "(copy)" session in the store.
+        let cwd = effective_session_cwd(self.session_cwd.as_deref(), &args.cwd);
+        validate_absolute_cwd(&cwd)?;
+
         let fork_name = if source.name.trim().is_empty() {
             "(copy)".to_string()
         } else {
@@ -23,6 +29,7 @@ impl GooseAcpAgent {
         };
 
         let new_session = self
+            .services
             .session_manager
             .copy_session(source_session_id, fork_name)
             .await
@@ -30,31 +37,35 @@ impl GooseAcpAgent {
         let new_session_id = new_session.id.clone();
 
         if let Some(conversation_before) = conversation_before {
-            self.session_manager
+            self.services
+                .session_manager
                 .truncate_conversation(&new_session_id, conversation_before)
                 .await
                 .internal_err()?;
         }
 
         let new_session = self
+            .services
             .session_manager
-            .get_session(&new_session_id, false)
+            .get_session(&new_session_id, true)
             .await
             .internal_err()?;
 
-        let goose_session = self
-            .prepare_session_for_activation(
-                new_session.clone(),
-                args.cwd.clone(),
-                args.mcp_servers,
-                false,
-            )
+        let mut goose_session = self
+            .prepare_session_for_activation(new_session.clone(), cwd, args.mcp_servers, true)
+            .await?;
+        self.render_stored_recipe_template(&mut goose_session)
             .await?;
 
-        let (agent, extension_results) = self.prepare_acp_session_agent(cx, &goose_session).await?;
-        self.apply_session_recipe(&agent, &goose_session).await?;
-        self.register_acp_session(goose_session.id.clone(), agent)
-            .await;
+        let extension_results = self.prepare_acp_session(cx, &goose_session).await?;
+        self.register_acp_session(goose_session.id.clone()).await;
+        let provider = self
+            .services
+            .provider(&goose_session.id)
+            .await
+            .internal_err_ctx("Failed to get provider while forking ACP session")?;
+        resume_saved_provider_session(&provider, goose_session.conversation.as_ref()).await;
+        let effort_support = agent_thinking_effort_support(&self.services, &goose_session.id).await;
 
         let acp_session_id = SessionId::new(new_session_id.clone());
         let mut meta = session_meta(&goose_session);
@@ -63,7 +74,8 @@ impl GooseAcpAgent {
         }
 
         let (mode_state, config_options) =
-            build_session_setup_config(&self.provider_inventory, &goose_session).await?;
+            build_session_setup_config(&self.provider_inventory, &goose_session, &effort_support)
+                .await?;
 
         let mut response = ForkSessionResponse::new(acp_session_id.clone())
             .modes(mode_state)
@@ -72,7 +84,6 @@ impl GooseAcpAgent {
         if let Some(co) = config_options {
             response = response.config_options(co);
         }
-        self.notify_session_setup(cx, &goose_session).await?;
         Ok(response)
     }
 }

@@ -25,6 +25,10 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "builtin"
+            },
             "name": {
               "type": "string"
             },
@@ -62,10 +66,6 @@
                 "type": "string"
               },
               "description": "Tool allowlist for this extension. Omit this field to allow all tools."
-            },
-            "type": {
-              "type": "string",
-              "const": "builtin"
             }
           },
           "required": [
@@ -76,6 +76,10 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "platform"
+            },
             "name": {
               "type": "string"
             },
@@ -106,10 +110,6 @@
                 "type": "string"
               },
               "description": "Tool allowlist for this extension. Omit this field to allow all tools."
-            },
-            "type": {
-              "type": "string",
-              "const": "platform"
             }
           },
           "required": [
@@ -120,6 +120,10 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "mcp"
+            },
             "server": {
               "$ref": "#/$defs/McpServer"
             },
@@ -148,6 +152,27 @@
                 "null"
               ]
             },
+            "clientId": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Pre-registered OAuth client ID for the server's authorization server."
+            },
+            "clientSecretKey": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Name of the env/secret key holding the OAuth client secret."
+            },
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "OAuth scopes to request with `client_id`."
+            },
             "bundled": {
               "type": [
                 "boolean",
@@ -163,10 +188,6 @@
                 "type": "string"
               },
               "description": "Tool allowlist for this extension. Omit this field to allow all tools."
-            },
-            "type": {
-              "type": "string",
-              "const": "mcp"
             }
           },
           "required": [
@@ -207,20 +228,6 @@
           "description": "SSE transport configuration\n\nOnly available when the Agent capabilities indicate `mcp_capabilities.sse` is `true`."
         },
         {
-          "$ref": "#/$defs/McpServerAcp",
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "acp"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nACP transport configuration\n\nOnly available when the Agent capabilities indicate `mcp_capabilities.acp` is `true`.\nThe MCP server is provided by an ACP component and communicates over the ACP channel."
-        },
-        {
           "$ref": "#/$defs/McpServerStdio",
           "description": "Stdio transport configuration\n\nAll Agents MUST support this transport."
         }
@@ -244,7 +251,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -277,7 +285,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         },
         "type": {
           "type": "string",
@@ -316,7 +325,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         },
         "type": {
           "type": "string",
@@ -331,36 +341,6 @@
       ],
       "description": "SSE transport configuration for MCP."
     },
-    "McpServerAcpId": {
-      "type": "string",
-      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nUnique identifier for an MCP server using the ACP transport.\n\nThe value is opaque and generated by the ACP component providing the MCP server. It is\nused by `mcp/connect` to route connection requests back to the component that declared the\nserver."
-    },
-    "McpServerAcp": {
-      "type": "object",
-      "properties": {
-        "name": {
-          "type": "string",
-          "description": "Human-readable name identifying this MCP server."
-        },
-        "id": {
-          "$ref": "#/$defs/McpServerAcpId",
-          "description": "Unique identifier for this MCP server, generated by the component providing it.\n\nProviders MUST NOT reuse an ID for multiple ACP-transport MCP servers that are visible\non the same ACP connection."
-        },
-        "_meta": {
-          "type": [
-            "object",
-            "null"
-          ],
-          "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
-        }
-      },
-      "required": [
-        "name",
-        "id"
-      ],
-      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nACP transport configuration for MCP.\n\nThe MCP server is provided by an ACP component and communicates over the ACP channel\nusing `mcp/connect`, `mcp/message`, and `mcp/disconnect`."
-    },
     "McpServerStdio": {
       "type": "object",
       "properties": {
@@ -370,7 +350,7 @@
         },
         "command": {
           "type": "string",
-          "description": "Path to the MCP server executable."
+          "description": "Absolute path to the MCP server executable."
         },
         "args": {
           "type": "array",
@@ -392,7 +372,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -420,7 +401,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -440,13 +422,13 @@
         "sessionId": {
           "type": "string"
         },
-        "name": {
+        "extensionKey": {
           "type": "string"
         }
       },
       "required": [
         "sessionId",
-        "name"
+        "extensionKey"
       ],
       "description": "Remove an extension from an active session.",
       "x-side": "agent",
@@ -579,6 +561,9 @@
         "sessionId": {
           "type": "string"
         },
+        "extensionName": {
+          "type": "string"
+        },
         "name": {
           "type": "string"
         },
@@ -588,6 +573,7 @@
       },
       "required": [
         "sessionId",
+        "extensionName",
         "name"
       ],
       "description": "Call a tool from an extension.",
@@ -659,6 +645,7 @@
           ]
         }
       },
+      "description": "List available goose apps, optionally scoped to a session.",
       "x-side": "agent",
       "x-method": "_goose/unstable/apps/list"
     },
@@ -684,6 +671,7 @@
       "required": [
         "name"
       ],
+      "description": "Export a goose app as HTML.",
       "x-side": "agent",
       "x-method": "_goose/unstable/apps/export"
     },
@@ -710,6 +698,7 @@
       "required": [
         "html"
       ],
+      "description": "Import a goose app from HTML.",
       "x-side": "agent",
       "x-method": "_goose/unstable/apps/import"
     },
@@ -740,6 +729,7 @@
       "required": [
         "name"
       ],
+      "description": "Delete a goose app by name.",
       "x-side": "agent",
       "x-method": "_goose/unstable/apps/delete"
     },
@@ -802,7 +792,7 @@
         "sessionId",
         "text"
       ],
-      "description": "Set, append, or clear system prompt text for a session.\n\n`mode: \"set\"` replaces Goose's base system prompt. `mode: \"append\"` adds an\ninstruction under \"Additional Instructions\". Reusing a key replaces the\nprevious value for that mode/key; sending empty text clears it.",
+      "description": "Set, append, or clear system prompt text for a session.\n\n`mode: \"set\"` replaces goose's base system prompt. `mode: \"append\"` adds an\ninstruction under \"Additional Instructions\". Reusing a key replaces the\nprevious value for that mode/key; sending empty text clears it.",
       "x-side": "agent",
       "x-method": "_goose/unstable/session/system-prompt/set"
     },
@@ -944,7 +934,8 @@
             "string",
             "null"
           ],
-          "description": "Timestamp indicating when the underlying resource was last modified."
+          "description": "Timestamp indicating when the underlying resource was last modified.",
+          "x-deserialize-default-on-error": {}
         },
         "priority": {
           "type": [
@@ -952,7 +943,8 @@
             "null"
           ],
           "format": "double",
-          "description": "Relative importance of this content when clients choose what to surface."
+          "description": "Relative importance of this content when clients choose what to surface.",
+          "x-deserialize-default-on-error": {}
         },
         "_meta": {
           "type": [
@@ -960,7 +952,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "description": "Optional annotations for the client. The client can use annotations to inform how objects are used or displayed"
@@ -1005,7 +998,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -1041,7 +1035,8 @@
             "string",
             "null"
           ],
-          "description": "URI associated with this resource or media payload."
+          "description": "URI associated with this resource or media payload.",
+          "x-deserialize-default-on-error": {}
         },
         "_meta": {
           "type": [
@@ -1049,7 +1044,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -1087,7 +1083,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -1116,14 +1113,16 @@
             "string",
             "null"
           ],
-          "description": "Optional human-readable details shown with this protocol object."
+          "description": "Optional human-readable details shown with this protocol object.",
+          "x-deserialize-default-on-error": {}
         },
         "mimeType": {
           "type": [
             "string",
             "null"
           ],
-          "description": "MIME type describing the encoded media payload."
+          "description": "MIME type describing the encoded media payload.",
+          "x-deserialize-default-on-error": {}
         },
         "name": {
           "type": "string",
@@ -1134,6 +1133,7 @@
             "integer",
             "null"
           ],
+          "x-deserialize-default-on-error": {},
           "description": "Optional size of the linked resource in bytes, if known."
         },
         "title": {
@@ -1141,7 +1141,8 @@
             "string",
             "null"
           ],
-          "description": "Optional display title for end-user UI."
+          "description": "Optional display title for end-user UI.",
+          "x-deserialize-default-on-error": {}
         },
         "uri": {
           "type": "string",
@@ -1153,7 +1154,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -1183,7 +1185,8 @@
             "string",
             "null"
           ],
-          "description": "MIME type describing the encoded media payload."
+          "description": "MIME type describing the encoded media payload.",
+          "x-deserialize-default-on-error": {}
         },
         "text": {
           "type": "string",
@@ -1199,7 +1202,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -1220,7 +1224,8 @@
             "string",
             "null"
           ],
-          "description": "MIME type describing the encoded media payload."
+          "description": "MIME type describing the encoded media payload.",
+          "x-deserialize-default-on-error": {}
         },
         "uri": {
           "type": "string",
@@ -1232,7 +1237,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -1266,7 +1272,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -1291,6 +1298,117 @@
       ],
       "x-side": "agent",
       "x-method": "_goose/unstable/session/steer"
+    },
+    "LiveVoiceAvailabilityRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "_meta": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "description": "Ask whether a new or existing chat can enter direct Live voice.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/live-voice/availability"
+    },
+    "LiveVoiceAvailabilityResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/LiveVoiceStatus"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "message"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/live-voice/availability"
+    },
+    "LiveVoiceStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "unavailable"
+      ]
+    },
+    "LiveVoiceStartRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "offerSdp": {
+          "type": "string"
+        },
+        "instructions": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Added after goose's live voice instructions, including any configured\nones, for this interaction only. Blank text adds nothing."
+        },
+        "_meta": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "sessionId",
+        "offerSdp"
+      ],
+      "description": "Start a live voice interaction for a session.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/live-voice/start"
+    },
+    "LiveVoiceStartResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "interactionId": {
+          "type": "string"
+        },
+        "answerSdp": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "interactionId",
+        "answerSdp"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/live-voice/start"
+    },
+    "LiveVoiceStopRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "interactionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "interactionId"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/live-voice/stop"
     },
     "DiagnosticsGetRequest_unstable": {
       "type": "object",
@@ -1327,9 +1445,175 @@
       "x-side": "agent",
       "x-method": "_goose/unstable/diagnostics/get"
     },
+    "ContextReportRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "description": "Break down what fills the model's context window if the session were\nprompted right now. Makes no model call.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/context/report"
+    },
+    "ContextReportResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "$ref": "#/$defs/ContextReportModel"
+        },
+        "totalTokens": {
+          "type": "integer",
+          "description": "Measured with goose's local tokenizer; always the sum of the segments.",
+          "minimum": 0
+        },
+        "segments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContextSegment"
+          },
+          "description": "Non-overlapping. Prompt and tool segments come in request order; the\nconversation follows grouped by message kind, with each part labelled\nby its position in the request."
+        },
+        "providerManagesContext": {
+          "type": "boolean",
+          "description": "The provider keeps its own history and only receives the latest prompt\n(Claude Code, Gemini CLI), so goose assembles no request to break down;\n`segments` is empty and `total_tokens` is zero."
+        },
+        "autoCompactionPending": {
+          "type": "boolean",
+          "description": "The session is past the auto-compaction threshold, so the loop compacts\nthe conversation before it sends the next request."
+        }
+      },
+      "required": [
+        "model",
+        "totalTokens",
+        "segments",
+        "providerManagesContext",
+        "autoCompactionPending"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/context/report"
+    },
+    "ContextReportModel": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelName": {
+          "type": "string"
+        },
+        "contextLimit": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "modelName",
+        "contextLimit"
+      ]
+    },
+    "ContextSegment": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/ContextCategory"
+        },
+        "label": {
+          "type": "string"
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Display-only provenance, such as a file path or a tool count."
+        },
+        "tokenCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contentPreview": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Truncated with a trailing `… (+N more chars)` marker. Omitted when\n`parts` carries the previews."
+        },
+        "parts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContextPart"
+          }
+        }
+      },
+      "required": [
+        "category",
+        "label",
+        "tokenCount"
+      ]
+    },
+    "ContextCategory": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "extension_instructions",
+            "turn_context",
+            "tool_definitions",
+            "compaction_summary",
+            "messages"
+          ]
+        },
+        {
+          "type": "string",
+          "const": "system_prompt",
+          "description": "The base prompt, plus the residual row that reconciles the segments\nwith the request total."
+        },
+        {
+          "type": "string",
+          "const": "additional_instructions",
+          "description": "Hint files, project instructions and other prompt extras."
+        }
+      ]
+    },
+    "ContextPart": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tokenCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contentPreview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "tokenCount"
+      ],
+      "description": "Parts add up to their segment's `tokenCount`, except where a segment is\nsplit into prose sections; there the headings and framing are carried by\nthe segment alone."
+    },
     "ListPromptsRequest_unstable": {
       "type": "object",
-      "description": "List all available Goose prompt templates.",
+      "description": "List all available goose prompt templates.",
       "x-side": "agent",
       "x-method": "_goose/unstable/config/prompts/list"
     },
@@ -1389,7 +1673,7 @@
       "required": [
         "name"
       ],
-      "description": "Read a Goose prompt template.",
+      "description": "Read a goose prompt template.",
       "x-side": "agent",
       "x-method": "_goose/unstable/config/prompts/get"
     },
@@ -1432,7 +1716,7 @@
         "name",
         "content"
       ],
-      "description": "Save a custom Goose prompt template.",
+      "description": "Save a custom goose prompt template.",
       "x-side": "agent",
       "x-method": "_goose/unstable/config/prompts/save"
     },
@@ -1458,23 +1742,9 @@
       "required": [
         "name"
       ],
-      "description": "Reset a Goose prompt template to its default content.",
+      "description": "Reset a goose prompt template to its default content.",
       "x-side": "agent",
       "x-method": "_goose/unstable/config/prompts/reset"
-    },
-    "DeleteSessionRequest": {
-      "type": "object",
-      "properties": {
-        "sessionId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "sessionId"
-      ],
-      "description": "Delete a session.",
-      "x-side": "agent",
-      "x-method": "session/delete"
     },
     "GetConfigExtensionsRequest_unstable": {
       "type": "object",
@@ -1526,28 +1796,6 @@
         "extension",
         "enabled"
       ]
-    },
-    "GetAvailableExtensionsRequest_unstable": {
-      "type": "object",
-      "description": "List Goose-owned extension definitions available to configure or enable.",
-      "x-side": "agent",
-      "x-method": "_goose/unstable/extensions/available"
-    },
-    "GetAvailableExtensionsResponse_unstable": {
-      "type": "object",
-      "properties": {
-        "extensions": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/GooseExtension"
-          }
-        }
-      },
-      "required": [
-        "extensions"
-      ],
-      "x-side": "agent",
-      "x-method": "_goose/unstable/extensions/available"
     },
     "AddConfigExtensionRequest_unstable": {
       "type": "object",
@@ -1609,6 +1857,7 @@
       "required": [
         "sessionId"
       ],
+      "description": "List extensions enabled for an active session.",
       "x-side": "agent",
       "x-method": "_goose/unstable/session/extensions/list"
     },
@@ -1618,7 +1867,7 @@
         "extensions": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/GooseExtension"
+            "$ref": "#/$defs/SessionExtensionEntry"
           }
         }
       },
@@ -1627,6 +1876,21 @@
       ],
       "x-side": "agent",
       "x-method": "_goose/unstable/session/extensions/list"
+    },
+    "SessionExtensionEntry": {
+      "type": "object",
+      "properties": {
+        "extension": {
+          "$ref": "#/$defs/GooseExtension"
+        },
+        "extensionKey": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "extension",
+        "extensionKey"
+      ]
     },
     "ListProvidersRequest_unstable": {
       "type": "object",
@@ -1684,13 +1948,33 @@
           "type": "boolean",
           "description": "Whether Goose has enough configuration to use this provider."
         },
+        "available": {
+          "type": "boolean",
+          "description": "Whether the provider's external runtime or required configuration is available."
+        },
         "providerType": {
           "type": "string",
           "description": "Provider classification such as `Preferred`, `Builtin`, `Declarative`, or `Custom`."
         },
-        "category": {
-          "$ref": "#/$defs/ProviderSetupCategoryDto",
-          "description": "Whether this inventory entry represents an agent provider or a model provider."
+        "acp": {
+          "type": "boolean",
+          "description": "Whether this provider communicates through ACP.",
+          "default": false
+        },
+        "visibleInSetup": {
+          "type": "boolean",
+          "description": "Whether this provider should appear in normal provider setup UIs."
+        },
+        "deprecated": {
+          "type": "boolean",
+          "description": "Whether this provider is retained only for compatibility."
+        },
+        "replacement": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Preferred replacement for a deprecated provider."
         },
         "configKeys": {
           "type": "array",
@@ -1745,13 +2029,6 @@
         "stale": {
           "type": "boolean",
           "description": "Whether we believe this data may be outdated."
-        },
-        "modelSelectionHint": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "Guidance message shown when this provider manages its own model selection externally."
         }
       },
       "required": [
@@ -1760,8 +2037,10 @@
         "description",
         "defaultModel",
         "configured",
+        "available",
         "providerType",
-        "category",
+        "visibleInSetup",
+        "deprecated",
         "configKeys",
         "setupSteps",
         "supportsRefresh",
@@ -1770,13 +2049,6 @@
         "stale"
       ],
       "description": "Provider inventory entry."
-    },
-    "ProviderSetupCategoryDto": {
-      "type": "string",
-      "enum": [
-        "agent",
-        "model"
-      ]
     },
     "ProviderConfigKey": {
       "type": "object",
@@ -1995,6 +2267,11 @@
         "category": {
           "$ref": "#/$defs/ProviderSetupCategoryDto"
         },
+        "acp": {
+          "type": "boolean",
+          "description": "Whether this provider communicates through ACP.",
+          "default": false
+        },
         "description": {
           "type": "string"
         },
@@ -2060,6 +2337,13 @@
         "supportsInstall",
         "supportsAuth",
         "supportsAuthStatus"
+      ]
+    },
+    "ProviderSetupCategoryDto": {
+      "type": "string",
+      "enum": [
+        "agent",
+        "model"
       ]
     },
     "ProviderSetupMethodDto": {
@@ -2296,15 +2580,19 @@
             "boolean",
             "null"
           ]
+        },
+        "toolshim": {
+          "type": "boolean"
         }
       },
       "required": [
         "engine",
         "displayName",
         "apiUrl",
-        "requiresAuth"
+        "requiresAuth",
+        "toolshim"
       ],
-      "description": "Create a custom provider backed by Goose's declarative provider store.",
+      "description": "Create a custom provider backed by goose's declarative provider store.",
       "x-side": "agent",
       "x-method": "_goose/unstable/providers/custom/create"
     },
@@ -2479,6 +2767,9 @@
             "null"
           ]
         },
+        "toolshim": {
+          "type": "boolean"
+        },
         "apiKeyEnv": {
           "type": [
             "string",
@@ -2498,6 +2789,7 @@
         "displayName",
         "apiUrl",
         "requiresAuth",
+        "toolshim",
         "apiKeySet",
         "preservesThinking"
       ]
@@ -2563,6 +2855,9 @@
             "boolean",
             "null"
           ]
+        },
+        "toolshim": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -2570,9 +2865,10 @@
         "engine",
         "displayName",
         "apiUrl",
-        "requiresAuth"
+        "requiresAuth",
+        "toolshim"
       ],
-      "description": "Update a custom provider backed by Goose's declarative provider store.",
+      "description": "Update a custom provider backed by goose's declarative provider store.",
       "x-side": "agent",
       "x-method": "_goose/unstable/providers/custom/update"
     },
@@ -2607,7 +2903,7 @@
       "required": [
         "providerId"
       ],
-      "description": "Delete a custom provider from Goose's declarative provider store.",
+      "description": "Delete a custom provider from goose's declarative provider store.",
       "x-side": "agent",
       "x-method": "_goose/unstable/providers/custom/delete"
     },
@@ -2643,6 +2939,43 @@
       "description": "Trigger a background refresh of provider inventories.",
       "x-side": "agent",
       "x-method": "_goose/unstable/providers/inventory/refresh"
+    },
+    "ProviderReadinessCheckRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "providerId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "providerId"
+      ],
+      "description": "Check whether an ACP provider can initialize and create a session.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/providers/readiness/check"
+    },
+    "ProviderReadinessCheckResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "providerId": {
+          "type": "string"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "providerId",
+        "ready"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/providers/readiness/check"
     },
     "ProviderConfigReadRequest_unstable": {
       "type": "object",
@@ -2817,7 +3150,7 @@
     },
     "ProviderSecretsListRequest_unstable": {
       "type": "object",
-      "description": "List provider credentials stored locally by Goose.",
+      "description": "List provider credentials stored locally by goose.",
       "x-side": "agent",
       "x-method": "_goose/unstable/providers/secrets/list"
     },
@@ -3093,21 +3426,6 @@
       "x-side": "agent",
       "x-method": "_goose/unstable/preferences/save"
     },
-    "PreferencesRemoveRequest_unstable": {
-      "type": "object",
-      "properties": {
-        "keys": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PreferenceKey"
-          },
-          "default": []
-        }
-      },
-      "description": "Remove allowlisted user preferences.",
-      "x-side": "agent",
-      "x-method": "_goose/unstable/preferences/remove"
-    },
     "ConfigReadRequest_unstable": {
       "type": "object",
       "properties": {
@@ -3122,6 +3440,7 @@
       "required": [
         "key"
       ],
+      "description": "Read one goose configuration value.",
       "x-side": "agent",
       "x-method": "_goose/unstable/config/read"
     },
@@ -3151,6 +3470,7 @@
         "key",
         "value"
       ],
+      "description": "Create or replace one goose configuration value.",
       "x-side": "agent",
       "x-method": "_goose/unstable/config/upsert"
     },
@@ -3168,11 +3488,13 @@
       "required": [
         "key"
       ],
+      "description": "Remove one goose configuration value.",
       "x-side": "agent",
       "x-method": "_goose/unstable/config/remove"
     },
     "ConfigReadAllRequest_unstable": {
       "type": "object",
+      "description": "Read all non-secret goose configuration values.",
       "x-side": "agent",
       "x-method": "_goose/unstable/config/read-all"
     },
@@ -3192,7 +3514,7 @@
     },
     "DefaultsReadRequest_unstable": {
       "type": "object",
-      "description": "Read Goose default provider and model configuration.",
+      "description": "Read goose default provider and model configuration.",
       "x-side": "agent",
       "x-method": "_goose/unstable/defaults/read"
     },
@@ -3230,13 +3552,13 @@
       "required": [
         "providerId"
       ],
-      "description": "Save Goose default provider and model configuration.",
+      "description": "Save goose default provider and model configuration.",
       "x-side": "agent",
       "x-method": "_goose/unstable/defaults/save"
     },
     "DefaultsClearRequest_unstable": {
       "type": "object",
-      "description": "Clear Goose default provider and model configuration.",
+      "description": "Clear goose default provider and model configuration.",
       "x-side": "agent",
       "x-method": "_goose/unstable/defaults/clear"
     },
@@ -3252,7 +3574,7 @@
           "default": []
         }
       },
-      "description": "Scan for existing Goose and compatible app data that onboarding can import.",
+      "description": "Scan for existing goose and compatible app data that onboarding can import.",
       "x-side": "agent",
       "x-method": "_goose/unstable/onboarding/import/scan"
     },
@@ -3409,14 +3731,25 @@
       "properties": {
         "sessionId": {
           "type": "string"
+        },
+        "format": {
+          "$ref": "#/$defs/SessionExportFormat",
+          "default": "json"
         }
       },
       "required": [
         "sessionId"
       ],
-      "description": "Export a session as a JSON string.",
+      "description": "Export a session as a JSON or markdown string.",
       "x-side": "agent",
       "x-method": "_goose/unstable/session/export"
+    },
+    "SessionExportFormat": {
+      "type": "string",
+      "enum": [
+        "json",
+        "markdown"
+      ]
     },
     "ExportSessionResponse_unstable": {
       "type": "object",
@@ -3428,7 +3761,7 @@
       "required": [
         "data"
       ],
-      "description": "Export session response — raw JSON of the goose session with `conversation`.",
+      "description": "Export session response — raw JSON of the goose session with `conversation`,\nor a markdown transcript when `format` is `markdown`.",
       "x-side": "agent",
       "x-method": "_goose/unstable/session/export"
     },
@@ -3437,26 +3770,14 @@
       "properties": {
         "input": {
           "type": "string"
-        },
-        "source": {
-          "$ref": "#/$defs/SessionImportSource"
         }
       },
       "required": [
-        "input",
-        "source"
+        "input"
       ],
-      "description": "Import a session from a JSON string or share link.",
+      "description": "Import a session from a serialized session JSON string.",
       "x-side": "agent",
       "x-method": "_goose/unstable/session/import"
-    },
-    "SessionImportSource": {
-      "type": "string",
-      "enum": [
-        "auto",
-        "json",
-        "nostr"
-      ]
     },
     "ImportSessionResponse_unstable": {
       "type": "object",
@@ -3489,54 +3810,6 @@
       "x-side": "agent",
       "x-method": "_goose/unstable/session/import"
     },
-    "ShareSessionNostrRequest_unstable": {
-      "type": "object",
-      "properties": {
-        "sessionId": {
-          "type": "string"
-        },
-        "relays": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "required": [
-        "sessionId",
-        "relays"
-      ],
-      "x-side": "agent",
-      "x-method": "_goose/unstable/session/share/nostr"
-    },
-    "ShareSessionNostrResponse_unstable": {
-      "type": "object",
-      "properties": {
-        "deeplink": {
-          "type": "string"
-        },
-        "nevent": {
-          "type": "string"
-        },
-        "eventId": {
-          "type": "string"
-        },
-        "relays": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "required": [
-        "deeplink",
-        "nevent",
-        "eventId",
-        "relays"
-      ],
-      "x-side": "agent",
-      "x-method": "_goose/unstable/session/share/nostr"
-    },
     "EncodeRecipeRequest_unstable": {
       "type": "object",
       "properties": {
@@ -3547,6 +3820,7 @@
       "required": [
         "recipe"
       ],
+      "description": "Encode a recipe as a goose deep link.",
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/encode"
     },
@@ -3662,6 +3936,10 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "builtin"
+            },
             "name": {
               "type": "string"
             },
@@ -3699,10 +3977,6 @@
                 "type": "string"
               },
               "description": "Tool allowlist for this extension. Omit this field to allow all tools."
-            },
-            "type": {
-              "type": "string",
-              "const": "builtin"
             }
           },
           "required": [
@@ -3713,6 +3987,10 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "platform"
+            },
             "name": {
               "type": "string"
             },
@@ -3743,10 +4021,6 @@
                 "type": "string"
               },
               "description": "Tool allowlist for this extension. Omit this field to allow all tools."
-            },
-            "type": {
-              "type": "string",
-              "const": "platform"
             }
           },
           "required": [
@@ -3757,6 +4031,10 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "stdio"
+            },
             "name": {
               "type": "string"
             },
@@ -3815,10 +4093,6 @@
                 "type": "string"
               },
               "description": "Tool allowlist for this extension. Omit this field to allow all tools."
-            },
-            "type": {
-              "type": "string",
-              "const": "stdio"
             }
           },
           "required": [
@@ -3830,6 +4104,10 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "streamable_http"
+            },
             "name": {
               "type": "string"
             },
@@ -3873,6 +4151,27 @@
                 "null"
               ]
             },
+            "client_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Pre-registered OAuth client ID for the server's authorization server."
+            },
+            "client_secret_key": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Name of the env/secret key holding the OAuth client secret."
+            },
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "OAuth scopes to request with `client_id`."
+            },
             "bundled": {
               "type": [
                 "boolean",
@@ -3888,10 +4187,6 @@
                 "type": "string"
               },
               "description": "Tool allowlist for this extension. Omit this field to allow all tools."
-            },
-            "type": {
-              "type": "string",
-              "const": "streamable_http"
             }
           },
           "required": [
@@ -4091,12 +4386,12 @@
         {
           "type": "object",
           "properties": {
-            "command": {
-              "type": "string"
-            },
             "type": {
               "type": "string",
               "const": "shell"
+            },
+            "command": {
+              "type": "string"
             }
           },
           "required": [
@@ -4129,6 +4424,7 @@
       "required": [
         "deeplink"
       ],
+      "description": "Decode a goose deep link into a recipe.",
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/decode"
     },
@@ -4155,6 +4451,7 @@
       "required": [
         "recipe"
       ],
+      "description": "Scan a recipe for security warnings.",
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/scan"
     },
@@ -4173,6 +4470,7 @@
     },
     "ListRecipesRequest_unstable": {
       "type": "object",
+      "description": "List recipes in the local recipe library.",
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/list"
     },
@@ -4237,6 +4535,7 @@
       "required": [
         "id"
       ],
+      "description": "Delete a recipe from the local recipe library.",
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/delete"
     },
@@ -4256,6 +4555,7 @@
       "required": [
         "id"
       ],
+      "description": "Set or clear a recipe's cron schedule.",
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/schedule"
     },
@@ -4275,6 +4575,7 @@
       "required": [
         "id"
       ],
+      "description": "Set or clear a recipe's slash command.",
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/slash-command"
     },
@@ -4294,6 +4595,7 @@
       "required": [
         "recipe"
       ],
+      "description": "Save a recipe to the local recipe library.",
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/save"
     },
@@ -4328,6 +4630,7 @@
       "required": [
         "content"
       ],
+      "description": "Parse serialized recipe content.",
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/parse"
     },
@@ -4354,6 +4657,7 @@
       "required": [
         "recipe"
       ],
+      "description": "Serialize a recipe as YAML.",
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/to-yaml"
     },
@@ -4372,6 +4676,7 @@
     },
     "ListSchedulesRequest_unstable": {
       "type": "object",
+      "description": "List scheduled recipe jobs.",
       "x-side": "agent",
       "x-method": "_goose/unstable/schedules/list"
     },
@@ -4451,6 +4756,7 @@
         "scheduleId",
         "limit"
       ],
+      "description": "List recent sessions created by a scheduled recipe job.",
       "x-side": "agent",
       "x-method": "_goose/unstable/schedules/sessions/list"
     },
@@ -4486,7 +4792,9 @@
           "items": {
             "type": "string"
           },
-          "description": "Additional workspace roots reported for this session. Each path must be absolute.\n\nWhen present, this is the complete ordered additional-root list reported\nby the Agent. Omitted and empty values are equivalent: the response\nreports no additional roots."
+          "description": "Additional workspace roots reported for this session. Each path must be absolute.\n\nWhen present, this is the complete ordered additional-root list reported\nby the Agent. Omitted and empty values are equivalent: the response\nreports no additional roots.",
+          "x-deserialize-default-on-error": {},
+          "x-deserialize-skip-invalid-items": {}
         },
         "title": {
           "type": [
@@ -4510,7 +4818,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -4541,6 +4850,7 @@
         "recipe",
         "cron"
       ],
+      "description": "Create a scheduled recipe job.",
       "x-side": "agent",
       "x-method": "_goose/unstable/schedules/create"
     },
@@ -4567,6 +4877,7 @@
       "required": [
         "scheduleId"
       ],
+      "description": "Delete a scheduled recipe job.",
       "x-side": "agent",
       "x-method": "_goose/unstable/schedules/delete"
     },
@@ -4580,6 +4891,7 @@
       "required": [
         "scheduleId"
       ],
+      "description": "Pause a scheduled recipe job.",
       "x-side": "agent",
       "x-method": "_goose/unstable/schedules/pause"
     },
@@ -4593,6 +4905,7 @@
       "required": [
         "scheduleId"
       ],
+      "description": "Resume a paused scheduled recipe job.",
       "x-side": "agent",
       "x-method": "_goose/unstable/schedules/unpause"
     },
@@ -4610,6 +4923,7 @@
         "scheduleId",
         "cron"
       ],
+      "description": "Update the cron expression for a scheduled recipe job.",
       "x-side": "agent",
       "x-method": "_goose/unstable/schedules/update"
     },
@@ -4636,6 +4950,7 @@
       "required": [
         "scheduleId"
       ],
+      "description": "Run a scheduled recipe job immediately.",
       "x-side": "agent",
       "x-method": "_goose/unstable/schedules/run-now"
     },
@@ -4675,6 +4990,7 @@
       "required": [
         "jobId"
       ],
+      "description": "Stop a currently running scheduled job.",
       "x-side": "agent",
       "x-method": "_goose/unstable/schedules/running-job/kill"
     },
@@ -4701,6 +5017,7 @@
       "required": [
         "jobId"
       ],
+      "description": "Inspect the current state of a running scheduled job.",
       "x-side": "agent",
       "x-method": "_goose/unstable/schedules/running-job/inspect"
     },
@@ -4910,12 +5227,12 @@
         {
           "type": "object",
           "properties": {
-            "projectDir": {
-              "type": "string"
-            },
             "scope": {
               "type": "string",
               "const": "projectDir"
+            },
+            "projectDir": {
+              "type": "string"
             }
           },
           "required": [
@@ -4926,12 +5243,12 @@
         {
           "type": "object",
           "properties": {
-            "projectId": {
-              "type": "string"
-            },
             "scope": {
               "type": "string",
               "const": "projectId"
+            },
+            "projectId": {
+              "type": "string"
             }
           },
           "required": [
@@ -5182,7 +5499,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -5213,7 +5531,8 @@
             "null"
           ],
           "additionalProperties": {},
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)"
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+          "x-deserialize-default-on-error": {}
         }
       },
       "required": [
@@ -5503,38 +5822,6 @@
         "description"
       ]
     },
-    "DictationSecretSaveRequest_unstable": {
-      "type": "object",
-      "properties": {
-        "provider": {
-          "type": "string"
-        },
-        "value": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "provider",
-        "value"
-      ],
-      "description": "Set a dictation provider secret value.",
-      "x-side": "agent",
-      "x-method": "_goose/unstable/dictation/secret/save"
-    },
-    "DictationSecretDeleteRequest_unstable": {
-      "type": "object",
-      "properties": {
-        "provider": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "provider"
-      ],
-      "description": "Remove a dictation provider secret value.",
-      "x-side": "agent",
-      "x-method": "_goose/unstable/dictation/secret/delete"
-    },
     "DictationModelsListRequest_unstable": {
       "type": "object",
       "description": "List available local Whisper models with their download status.",
@@ -5700,26 +5987,9 @@
       "x-side": "agent",
       "x-method": "_goose/unstable/dictation/models/delete"
     },
-    "DictationModelSelectRequest_unstable": {
-      "type": "object",
-      "properties": {
-        "provider": {
-          "type": "string"
-        },
-        "modelId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "provider",
-        "modelId"
-      ],
-      "description": "Persist the user's model selection for a given provider.",
-      "x-side": "agent",
-      "x-method": "_goose/unstable/dictation/models/select"
-    },
     "LocalInferenceModelsListRequest_unstable": {
       "type": "object",
+      "description": "List locally available inference models.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/models/list"
     },
@@ -5981,6 +6251,10 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "Temperature"
+            },
             "temperature": {
               "type": "number",
               "format": "float"
@@ -6002,10 +6276,6 @@
                 "null"
               ],
               "minimum": 0
-            },
-            "type": {
-              "type": "string",
-              "const": "Temperature"
             }
           },
           "required": [
@@ -6019,6 +6289,10 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "MirostatV2"
+            },
             "tau": {
               "type": "number",
               "format": "float"
@@ -6033,10 +6307,6 @@
                 "null"
               ],
               "minimum": 0
-            },
-            "type": {
-              "type": "string",
-              "const": "MirostatV2"
             }
           },
           "required": [
@@ -6072,12 +6342,12 @@
         {
           "type": "object",
           "properties": {
-            "name": {
-              "type": "string"
-            },
             "type": {
               "type": "string",
               "const": "builtin"
+            },
+            "name": {
+              "type": "string"
             }
           },
           "required": [
@@ -6088,12 +6358,12 @@
         {
           "type": "object",
           "properties": {
-            "template": {
-              "type": "string"
-            },
             "type": {
               "type": "string",
               "const": "custom_inline"
+            },
+            "template": {
+              "type": "string"
             }
           },
           "required": [
@@ -6125,6 +6395,7 @@
       "required": [
         "spec"
       ],
+      "description": "Download a model for local inference.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/models/download"
     },
@@ -6151,6 +6422,7 @@
       "required": [
         "modelId"
       ],
+      "description": "Get the progress of a local model download.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/models/download/progress"
     },
@@ -6235,6 +6507,7 @@
       "required": [
         "modelId"
       ],
+      "description": "Cancel a local model download.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/models/download/cancel"
     },
@@ -6248,6 +6521,7 @@
       "required": [
         "modelId"
       ],
+      "description": "Delete a downloaded local inference model.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/models/delete"
     },
@@ -6261,6 +6535,7 @@
       "required": [
         "modelId"
       ],
+      "description": "Evict a local inference model from memory.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/models/evict"
     },
@@ -6274,6 +6549,7 @@
       "required": [
         "modelId"
       ],
+      "description": "Read the sampling settings for a local inference model.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/models/settings/read"
     },
@@ -6304,6 +6580,7 @@
         "modelId",
         "settings"
       ],
+      "description": "Update the sampling settings for a local inference model.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/models/settings/update"
     },
@@ -6337,6 +6614,7 @@
       "required": [
         "query"
       ],
+      "description": "Search Hugging Face for local inference models.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/huggingface/search"
     },
@@ -6500,6 +6778,7 @@
       "required": [
         "repoId"
       ],
+      "description": "List downloadable variants of a Hugging Face model repository.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/huggingface/repo/variants"
     },
@@ -6547,6 +6826,7 @@
     },
     "LocalInferenceBuiltinChatTemplatesListRequest_unstable": {
       "type": "object",
+      "description": "List built-in chat templates for local inference.",
       "x-side": "agent",
       "x-method": "_goose/unstable/local-inference/chat-templates/builtin/list"
     },
@@ -6624,6 +6904,19 @@
           "required": [
             "sessionUpdate"
           ]
+        },
+        {
+          "$ref": "#/$defs/LiveVoiceInteractionEndedUpdate",
+          "type": "object",
+          "properties": {
+            "sessionUpdate": {
+              "type": "string",
+              "const": "live_voice_interaction_ended"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ]
         }
       ],
       "description": "Discriminated union of goose-specific session update payloads.\nVariant tag matches ACP's convention (`sessionUpdate: \"<snake_case>\"`).\n\n`discriminator.mapping` is what makes TS codegen (`@hey-api/openapi-ts`)\nemit the correct snake_case tag value even when this enum has a single\nvariant. Add a mapping entry per variant.",
@@ -6632,7 +6925,8 @@
         "mapping": {
           "usage_update": "#/$defs/SessionUsageUpdate",
           "status_message": "#/$defs/StatusMessageUpdate",
-          "message_usage": "#/$defs/MessageUsageUpdate"
+          "message_usage": "#/$defs/MessageUsageUpdate",
+          "live_voice_interaction_ended": "#/$defs/LiveVoiceInteractionEndedUpdate"
         }
       }
     },
@@ -6676,12 +6970,12 @@
         {
           "type": "object",
           "properties": {
-            "message": {
-              "type": "string"
-            },
             "type": {
               "type": "string",
               "const": "notice"
+            },
+            "message": {
+              "type": "string"
             }
           },
           "required": [
@@ -6692,12 +6986,12 @@
         {
           "type": "object",
           "properties": {
-            "message": {
-              "type": "string"
-            },
             "type": {
               "type": "string",
               "const": "progress"
+            },
+            "message": {
+              "type": "string"
             }
           },
           "required": [
@@ -6825,6 +7119,55 @@
       ],
       "description": "Per-message token usage/cost/timing, keyed by the message id used for\nchunk matching. Sent live after a turn's messages and on replay."
     },
+    "LiveVoiceInteractionOutcome": {
+      "type": "string",
+      "enum": [
+        "stopped",
+        "failed"
+      ]
+    },
+    "LiveVoiceInteractionEndedUpdate": {
+      "type": "object",
+      "properties": {
+        "interactionId": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/LiveVoiceInteractionOutcome"
+        }
+      },
+      "required": [
+        "interactionId",
+        "outcome"
+      ]
+    },
+    "ProviderDeviceCodeNotification_unstable": {
+      "type": "object",
+      "properties": {
+        "providerId": {
+          "type": "string"
+        },
+        "userCode": {
+          "type": "string"
+        },
+        "verificationUri": {
+          "type": "string"
+        },
+        "expiresIn": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "providerId",
+        "userCode",
+        "verificationUri",
+        "expiresIn"
+      ],
+      "description": "Dedicated provider notification for OAuth device-code flow.\nSent during provider authentication when the ACP client supports\n`goose.customNotifications` — avoids a fake empty session ID.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/providers/authentication/device-code"
+    },
     "RequestRecipeParams_unstable": {
       "type": "object",
       "properties": {
@@ -6836,12 +7179,19 @@
           "items": {
             "$ref": "#/$defs/RecipeParameterDto"
           }
+        },
+        "parameterScopeId": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
         "sessionId",
         "parameters"
       ],
+      "description": "Ask the client to provide values for a recipe's parameters.",
       "x-side": "client",
       "x-method": "_goose/unstable/session/recipe/request-params"
     },
@@ -7002,11 +7352,47 @@
                 {
                   "allOf": [
                     {
+                      "$ref": "#/$defs/LiveVoiceAvailabilityRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/session/live-voice/availability",
+                  "title": "LiveVoiceAvailabilityRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/LiveVoiceStartRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/session/live-voice/start",
+                  "title": "LiveVoiceStartRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/LiveVoiceStopRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/session/live-voice/stop",
+                  "title": "LiveVoiceStopRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
                       "$ref": "#/$defs/DiagnosticsGetRequest_unstable"
                     }
                   ],
                   "description": "Params for _goose/unstable/diagnostics/get",
                   "title": "DiagnosticsGetRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/ContextReportRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/context/report",
+                  "title": "ContextReportRequest_unstable"
                 },
                 {
                   "allOf": [
@@ -7047,29 +7433,11 @@
                 {
                   "allOf": [
                     {
-                      "$ref": "#/$defs/DeleteSessionRequest"
-                    }
-                  ],
-                  "description": "Params for session/delete",
-                  "title": "DeleteSessionRequest"
-                },
-                {
-                  "allOf": [
-                    {
                       "$ref": "#/$defs/GetConfigExtensionsRequest_unstable"
                     }
                   ],
                   "description": "Params for _goose/unstable/config/extensions/list",
                   "title": "GetConfigExtensionsRequest_unstable"
-                },
-                {
-                  "allOf": [
-                    {
-                      "$ref": "#/$defs/GetAvailableExtensionsRequest_unstable"
-                    }
-                  ],
-                  "description": "Params for _goose/unstable/extensions/available",
-                  "title": "GetAvailableExtensionsRequest_unstable"
                 },
                 {
                   "allOf": [
@@ -7200,6 +7568,15 @@
                 {
                   "allOf": [
                     {
+                      "$ref": "#/$defs/ProviderReadinessCheckRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/providers/readiness/check",
+                  "title": "ProviderReadinessCheckRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
                       "$ref": "#/$defs/ProviderConfigReadRequest_unstable"
                     }
                   ],
@@ -7286,15 +7663,6 @@
                   ],
                   "description": "Params for _goose/unstable/preferences/save",
                   "title": "PreferencesSaveRequest_unstable"
-                },
-                {
-                  "allOf": [
-                    {
-                      "$ref": "#/$defs/PreferencesRemoveRequest_unstable"
-                    }
-                  ],
-                  "description": "Params for _goose/unstable/preferences/remove",
-                  "title": "PreferencesRemoveRequest_unstable"
                 },
                 {
                   "allOf": [
@@ -7394,15 +7762,6 @@
                   ],
                   "description": "Params for _goose/unstable/session/import",
                   "title": "ImportSessionRequest_unstable"
-                },
-                {
-                  "allOf": [
-                    {
-                      "$ref": "#/$defs/ShareSessionNostrRequest_unstable"
-                    }
-                  ],
-                  "description": "Params for _goose/unstable/session/share/nostr",
-                  "title": "ShareSessionNostrRequest_unstable"
                 },
                 {
                   "allOf": [
@@ -7731,24 +8090,6 @@
                 {
                   "allOf": [
                     {
-                      "$ref": "#/$defs/DictationSecretSaveRequest_unstable"
-                    }
-                  ],
-                  "description": "Params for _goose/unstable/dictation/secret/save",
-                  "title": "DictationSecretSaveRequest_unstable"
-                },
-                {
-                  "allOf": [
-                    {
-                      "$ref": "#/$defs/DictationSecretDeleteRequest_unstable"
-                    }
-                  ],
-                  "description": "Params for _goose/unstable/dictation/secret/delete",
-                  "title": "DictationSecretDeleteRequest_unstable"
-                },
-                {
-                  "allOf": [
-                    {
                       "$ref": "#/$defs/DictationModelsListRequest_unstable"
                     }
                   ],
@@ -7790,15 +8131,6 @@
                   ],
                   "description": "Params for _goose/unstable/dictation/models/delete",
                   "title": "DictationModelDeleteRequest_unstable"
-                },
-                {
-                  "allOf": [
-                    {
-                      "$ref": "#/$defs/DictationModelSelectRequest_unstable"
-                    }
-                  ],
-                  "description": "Params for _goose/unstable/dictation/models/select",
-                  "title": "DictationModelSelectRequest_unstable"
                 },
                 {
                   "allOf": [
@@ -8012,10 +8344,34 @@
                     {
                       "allOf": [
                         {
+                          "$ref": "#/$defs/LiveVoiceAvailabilityResponse_unstable"
+                        }
+                      ],
+                      "title": "LiveVoiceAvailabilityResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/LiveVoiceStartResponse_unstable"
+                        }
+                      ],
+                      "title": "LiveVoiceStartResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
                           "$ref": "#/$defs/DiagnosticsGetResponse_unstable"
                         }
                       ],
                       "title": "DiagnosticsGetResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/ContextReportResponse_unstable"
+                        }
+                      ],
+                      "title": "ContextReportResponse_unstable"
                     },
                     {
                       "allOf": [
@@ -8048,14 +8404,6 @@
                         }
                       ],
                       "title": "GetConfigExtensionsResponse_unstable"
-                    },
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/$defs/GetAvailableExtensionsResponse_unstable"
-                        }
-                      ],
-                      "title": "GetAvailableExtensionsResponse_unstable"
                     },
                     {
                       "allOf": [
@@ -8144,6 +8492,14 @@
                         }
                       ],
                       "title": "RefreshProviderInventoryResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/ProviderReadinessCheckResponse_unstable"
+                        }
+                      ],
+                      "title": "ProviderReadinessCheckResponse_unstable"
                     },
                     {
                       "allOf": [
@@ -8248,14 +8604,6 @@
                         }
                       ],
                       "title": "ImportSessionResponse_unstable"
-                    },
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/$defs/ShareSessionNostrResponse_unstable"
-                        }
-                      ],
-                      "title": "ShareSessionNostrResponse_unstable"
                     },
                     {
                       "allOf": [
@@ -8592,6 +8940,15 @@
                   ],
                   "description": "Params for _goose/unstable/session/update",
                   "title": "GooseSessionNotification_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/ProviderDeviceCodeNotification_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/providers/authentication/device-code",
+                  "title": "ProviderDeviceCodeNotification_unstable"
                 }
               ]
             },

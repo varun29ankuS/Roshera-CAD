@@ -17,10 +17,13 @@ use crate::conversation::message::{Message, MessageContent};
 use crate::providers::bedrock::BEDROCK_PROVIDER_NAME;
 use crate::providers::canonical::maybe_get_canonical_model;
 use crate::providers::formats::anthropic::{
-    adaptive_output_effort, model_supports_temperature, thinking_budget_tokens,
-    thinking_type_for_provider, ThinkingType, ANTHROPIC_PROVIDER_NAME, MIN_ANSWER_TOKENS,
+    adaptive_output_effort, model_supports_temperature, requires_explicit_thinking_disable,
+    thinking_block_is_stale, thinking_budget_tokens, thinking_type_for_provider, ThinkingType,
+    ANTHROPIC_PROVIDER_NAME, MIN_ANSWER_TOKENS,
 };
+use crate::utils::{sanitize_unicode_tags, strip_unicode_tags};
 use goose_providers::conversation::token_usage::Usage;
+use goose_providers::documents::{unsupported_document_text, UNSUPPORTED_PROVIDER_REASON};
 use goose_providers::model::ModelConfig;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -28,12 +31,16 @@ use regex::Regex;
 static BEDROCK_VERSION_SUFFIX_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"-v\d+(:\d+)?$").unwrap());
 
 pub fn bedrock_anthropic_thinking_fields(model_config: &ModelConfig) -> Option<Document> {
-    let thinking_type = bedrock_anthropic_thinking_type(model_config);
+    let anthropic_config = bedrock_anthropic_model_config(model_config)?;
+    let thinking_type = thinking_type_for_provider(ANTHROPIC_PROVIDER_NAME, &anthropic_config);
     let thinking = match thinking_type {
-        ThinkingType::Adaptive => Document::Object(HashMap::from([(
-            "type".to_string(),
-            Document::String("adaptive".to_string()),
-        )])),
+        ThinkingType::Adaptive => Document::Object(HashMap::from([
+            ("type".to_string(), Document::String("adaptive".to_string())),
+            (
+                "display".to_string(),
+                Document::String("summarized".to_string()),
+            ),
+        ])),
         ThinkingType::Enabled => {
             // Thinking tokens count against `maxTokens`, which `bedrock_inference_config`
             // now sends when explicitly configured. Mirror the Anthropic formatter: clamp
@@ -53,9 +60,24 @@ pub fn bedrock_anthropic_thinking_fields(model_config: &ModelConfig) -> Option<D
                     "budget_tokens".to_string(),
                     Document::Number(Number::PosInt(budget_tokens as u64)),
                 ),
+                (
+                    "display".to_string(),
+                    Document::String("summarized".to_string()),
+                ),
             ]))
         }
-        ThinkingType::Disabled => return None,
+        ThinkingType::Disabled => {
+            if !requires_explicit_thinking_disable(
+                ANTHROPIC_PROVIDER_NAME,
+                &anthropic_config.model_name,
+            ) {
+                return None;
+            }
+            Document::Object(HashMap::from([(
+                "type".to_string(),
+                Document::String("disabled".to_string()),
+            )]))
+        }
     };
 
     let mut fields = HashMap::from([("thinking".to_string(), thinking)]);
@@ -73,17 +95,13 @@ pub fn bedrock_anthropic_thinking_fields(model_config: &ModelConfig) -> Option<D
     Some(Document::Object(fields))
 }
 
-fn bedrock_anthropic_thinking_type(model_config: &ModelConfig) -> ThinkingType {
-    let Some((_, anthropic_model)) = model_config.model_name.rsplit_once("anthropic.") else {
-        return ThinkingType::Disabled;
-    };
+fn bedrock_anthropic_model_config(model_config: &ModelConfig) -> Option<ModelConfig> {
+    let (_, anthropic_model) = model_config.model_name.rsplit_once("anthropic.")?;
 
-    let anthropic_config = ModelConfig {
+    Some(ModelConfig {
         model_name: strip_bedrock_version_suffix(anthropic_model),
         ..model_config.clone()
-    };
-
-    thinking_type_for_provider(ANTHROPIC_PROVIDER_NAME, &anthropic_config)
+    })
 }
 
 /// Bedrock model ids carry a `-v1:0` style suffix (e.g.
@@ -131,16 +149,11 @@ pub fn bedrock_inference_config(model_config: &ModelConfig) -> bedrock::Inferenc
 }
 
 /// Whether `temperature` may be sent for this Bedrock model. For `anthropic.*`
-/// ids we resolve against the Anthropic canonical registry (mapping the model
-/// name the same way [`bedrock_anthropic_thinking_type`] does); for other known
+/// ids we resolve against the Anthropic canonical registry; for other known
 /// Bedrock ids we consult the Bedrock canonical registry and otherwise keep the
 /// permissive fallback used by [`model_supports_temperature`].
 fn bedrock_model_supports_temperature(model_config: &ModelConfig) -> bool {
-    if let Some((_, anthropic_model)) = model_config.model_name.rsplit_once("anthropic.") {
-        let anthropic_config = ModelConfig {
-            model_name: strip_bedrock_version_suffix(anthropic_model),
-            ..model_config.clone()
-        };
+    if let Some(anthropic_config) = bedrock_anthropic_model_config(model_config) {
         model_supports_temperature(ANTHROPIC_PROVIDER_NAME, &anthropic_config)
     } else {
         maybe_get_canonical_model(BEDROCK_PROVIDER_NAME, &model_config.model_name)
@@ -152,11 +165,30 @@ fn bedrock_model_supports_temperature(model_config: &ModelConfig) -> bool {
 pub fn to_bedrock_message_with_caching(
     message: &Message,
     enable_caching: bool,
+    current_model: Option<&str>,
+    documents_supported: bool,
 ) -> Result<bedrock::Message> {
+    let thinking_is_stale = thinking_block_is_stale(message, current_model);
     let mut content_blocks: Vec<bedrock::ContentBlock> = message
         .content
         .iter()
-        .map(to_bedrock_message_content)
+        .filter(|content| {
+            if matches!(
+                content,
+                MessageContent::ActionRequired(_) | MessageContent::ToolConfirmationRequest(_)
+            ) {
+                return false;
+            }
+            if !thinking_is_stale {
+                return true;
+            }
+            match content {
+                MessageContent::Thinking(thinking) => thinking.signature.is_empty(),
+                MessageContent::RedactedThinking(_) => false,
+                _ => true,
+            }
+        })
+        .map(|content| to_bedrock_message_content(content, documents_supported))
         .collect::<Result<_>>()?;
 
     if enable_caching && !content_blocks.is_empty() {
@@ -175,18 +207,24 @@ pub fn to_bedrock_message_with_caching(
         .map_err(|err| anyhow!("Failed to construct Bedrock message: {}", err))
 }
 
-pub fn to_bedrock_message_content(content: &MessageContent) -> Result<bedrock::ContentBlock> {
+pub fn to_bedrock_message_content(
+    content: &MessageContent,
+    documents_supported: bool,
+) -> Result<bedrock::ContentBlock> {
     Ok(match content {
         MessageContent::Text(text) => bedrock::ContentBlock::Text(text.text.to_string()),
-        MessageContent::ToolConfirmationRequest(_tool_confirmation_request) => {
-            bedrock::ContentBlock::Text("".to_string())
+        MessageContent::ToolConfirmationRequest(_) => {
+            bail!("ToolConfirmationRequest should be filtered before Bedrock conversion")
         }
-        MessageContent::ActionRequired(_action_required) => {
-            bedrock::ContentBlock::Text("".to_string())
+        MessageContent::ActionRequired(_) => {
+            bail!("ActionRequired should be filtered before Bedrock conversion")
         }
         MessageContent::Image(image) => {
             bedrock::ContentBlock::Image(to_bedrock_image(&image.data, &image.mime_type)?)
         }
+        MessageContent::Document(document) => bedrock::ContentBlock::Text(
+            unsupported_document_text(document, UNSUPPORTED_PROVIDER_REASON),
+        ),
         MessageContent::Thinking(thinking) => {
             let mut builder = bedrock::ReasoningTextBlock::builder().text(&thinking.thinking);
             if !thinking.signature.is_empty() {
@@ -209,28 +247,10 @@ pub fn to_bedrock_message_content(content: &MessageContent) -> Result<bedrock::C
         MessageContent::SystemNotification(_) => {
             bail!("SystemNotification should not get passed to the provider")
         }
-        MessageContent::ToolRequest(tool_req) => {
-            let tool_use_id = tool_req.id.to_string();
-            let tool_use = if let Ok(call) = tool_req.tool_call.as_ref() {
-                bedrock::ToolUseBlock::builder()
-                    .tool_use_id(tool_use_id)
-                    .name(call.name.to_string())
-                    .input(to_bedrock_json(&args_to_value(call.arguments.clone())))
-                    .build()
-            } else {
-                // Unparseable tool call: emit a placeholder tool_use so the paired
-                // tool_result isn't orphaned — Bedrock rejects a tool_use with no name
-                // and a tool_result with no matching tool_use. Mirrors the
-                // OpenAI/Databricks/Anthropic formatters.
-                bedrock::ToolUseBlock::builder()
-                    .tool_use_id(tool_use_id)
-                    .name("unparseable_tool_call")
-                    .input(to_bedrock_json(&args_to_value(None)))
-                    .build()
-            }?;
-            bedrock::ContentBlock::ToolUse(tool_use)
+        MessageContent::Error(_) => {
+            bail!("Error content should not get passed to the provider")
         }
-        MessageContent::FrontendToolRequest(tool_req) => {
+        MessageContent::ToolRequest(tool_req) => {
             let tool_use_id = tool_req.id.to_string();
             let tool_use = if let Ok(call) = tool_req.tool_call.as_ref() {
                 bedrock::ToolUseBlock::builder()
@@ -257,15 +277,20 @@ pub fn to_bedrock_message_content(content: &MessageContent) -> Result<bedrock::C
                     result
                         .content
                         .iter()
-                        .map(|c| to_bedrock_tool_result_content_block(&tool_res.id, c.clone()))
+                        .map(|c| {
+                            to_bedrock_tool_result_content_block(
+                                &tool_res.id,
+                                c.clone(),
+                                documents_supported,
+                            )
+                        })
                         .collect::<Result<_>>()?,
                 ),
                 Err(error) => {
-                    // For errors, create a text content block with the error message
-                    Some(vec![bedrock::ToolResultContentBlock::Text(format!(
-                        "The tool call returned the following error:\n{}",
-                        error
-                    ))])
+                    let message = format!("The tool call returned the following error:\n{}", error);
+                    Some(vec![bedrock::ToolResultContentBlock::Text(
+                        crate::utils::sanitize_unicode_tags(&message),
+                    )])
                 }
             };
             bedrock::ContentBlock::ToolResult(
@@ -290,6 +315,7 @@ pub fn to_bedrock_message_content(content: &MessageContent) -> Result<bedrock::C
 pub fn to_bedrock_tool_result_content_block(
     tool_use_id: &str,
     content: ContentBlock,
+    documents_supported: bool,
 ) -> Result<bedrock::ToolResultContentBlock> {
     Ok(match content {
         ContentBlock::Text(text) => bedrock::ToolResultContentBlock::Text(text.text),
@@ -300,11 +326,16 @@ pub fn to_bedrock_tool_result_content_block(
             bedrock::ToolResultContentBlock::Text("[Resource link]".to_string())
         }
         ContentBlock::Resource(resource) => match &resource.resource {
-            ResourceContents::TextResourceContents { text, .. } => {
+            ResourceContents::TextResourceContents { text, .. } if documents_supported => {
                 match to_bedrock_document(tool_use_id, &resource.resource)? {
                     Some(doc) => bedrock::ToolResultContentBlock::Document(doc),
-                    None => bedrock::ToolResultContentBlock::Text(text.to_string()),
+                    None => {
+                        bedrock::ToolResultContentBlock::Text(sanitize_unicode_tags(text.as_str()))
+                    }
                 }
+            }
+            ResourceContents::TextResourceContents { text, .. } => {
+                bedrock::ToolResultContentBlock::Text(sanitize_unicode_tags(text.as_str()))
             }
             ResourceContents::BlobResourceContents { .. } => {
                 bail!("Blob resource content is not supported by Bedrock provider yet")
@@ -366,6 +397,7 @@ pub fn to_bedrock_tool(tool: &Tool) -> Result<bedrock::Tool> {
     if !input_schema.contains_key("type") {
         input_schema.insert("type".to_string(), Value::String("object".to_string()));
     }
+    let input_schema = sanitize_json_unicode_tags(Value::Object(input_schema))?;
 
     Ok(bedrock::Tool::ToolSpec(
         bedrock::ToolSpecification::builder()
@@ -373,14 +405,38 @@ pub fn to_bedrock_tool(tool: &Tool) -> Result<bedrock::Tool> {
             .description(
                 tool.description
                     .as_ref()
-                    .map(|d| d.to_string())
+                    .map(|d| strip_unicode_tags(d))
                     .unwrap_or_default(),
             )
             .input_schema(bedrock::ToolInputSchema::Json(to_bedrock_json(
-                &Value::Object(input_schema),
+                &input_schema,
             )))
             .build()?,
     ))
+}
+
+pub(crate) fn sanitize_json_unicode_tags(value: Value) -> Result<Value> {
+    Ok(match value {
+        Value::String(text) => Value::String(strip_unicode_tags(&text)),
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(sanitize_json_unicode_tags)
+                .collect::<Result<_>>()?,
+        ),
+        Value::Object(values) => {
+            let mut sanitized = serde_json::Map::new();
+            for (key, value) in values {
+                let key = strip_unicode_tags(&key);
+                if sanitized.contains_key(&key) {
+                    bail!("JSON contains a duplicate key after Unicode tag sanitization");
+                }
+                sanitized.insert(key, sanitize_json_unicode_tags(value)?);
+            }
+            Value::Object(sanitized)
+        }
+        value => value,
+    })
 }
 
 fn args_to_value(args: Option<serde_json::Map<String, Value>>) -> Value {
@@ -419,7 +475,9 @@ fn to_bedrock_document(
     content: &ResourceContents,
 ) -> Result<Option<bedrock::DocumentBlock>> {
     let (uri, text) = match content {
-        ResourceContents::TextResourceContents { uri, text, .. } => (uri, text),
+        ResourceContents::TextResourceContents { uri, text, .. } => {
+            (uri, sanitize_unicode_tags(text))
+        }
         ResourceContents::BlobResourceContents { .. } => {
             bail!("Blob resource content is not supported by Bedrock provider yet")
         }
@@ -470,11 +528,18 @@ pub fn from_bedrock_message(message: &bedrock::Message) -> Result<Message> {
 pub fn from_bedrock_content_block(block: &bedrock::ContentBlock) -> Result<MessageContent> {
     Ok(match block {
         bedrock::ContentBlock::Text(text) => MessageContent::text(text),
-        bedrock::ContentBlock::ToolUse(tool_use) => MessageContent::tool_request(
-            tool_use.tool_use_id.to_string(),
-            Ok(CallToolRequestParams::new(tool_use.name.clone())
-                .with_arguments(object(from_bedrock_json(&tool_use.input.clone())?))),
-        ),
+        bedrock::ContentBlock::ToolUse(tool_use) => {
+            let arguments = from_bedrock_json(&tool_use.input.clone())
+                .and_then(sanitize_json_unicode_tags)
+                .map(|arguments| {
+                    CallToolRequestParams::new(tool_use.name.clone())
+                        .with_arguments(object(arguments))
+                })
+                .map_err(|error| {
+                    ErrorData::new(ErrorCode::INVALID_PARAMS, error.to_string(), None)
+                });
+            MessageContent::tool_request(tool_use.tool_use_id.to_string(), arguments)
+        }
         bedrock::ContentBlock::ToolResult(tool_res) => MessageContent::tool_response(
             tool_res.tool_use_id.to_string(),
             if tool_res.content.is_empty() {
@@ -574,13 +639,17 @@ pub fn from_bedrock_role(role: &bedrock::ConversationRole) -> Result<Role> {
 }
 
 pub fn from_bedrock_usage(usage: &bedrock::TokenUsage) -> Usage {
-    Usage::from_cache_exclusive_input(
-        Some(usage.input_tokens),
-        Some(usage.output_tokens),
-        Some(usage.total_tokens),
-        usage.cache_read_input_tokens,
-        usage.cache_write_input_tokens,
+    let cache_read = usage.cache_read_input_tokens.map(i64::from);
+    let cache_write = usage.cache_write_input_tokens.map(i64::from);
+    let input_tokens = i64::from(usage.input_tokens)
+        .saturating_add(cache_read.unwrap_or(0))
+        .saturating_add(cache_write.unwrap_or(0));
+    Usage::new(
+        Some(input_tokens),
+        Some(i64::from(usage.output_tokens)),
+        Some(i64::from(usage.total_tokens)),
     )
+    .with_cache_tokens(cache_read, cache_write)
 }
 
 pub fn from_bedrock_json(document: &Document) -> Result<Value> {
@@ -628,7 +697,8 @@ mod tests {
             json!({
                 "thinking": {
                     "type": "enabled",
-                    "budget_tokens": 4000
+                    "budget_tokens": 4000,
+                    "display": "summarized"
                 }
             })
         );
@@ -652,7 +722,8 @@ mod tests {
             json!({
                 "thinking": {
                     "type": "enabled",
-                    "budget_tokens": 3000 - 1024
+                    "budget_tokens": 3000 - 1024,
+                    "display": "summarized"
                 }
             })
         );
@@ -682,6 +753,13 @@ mod tests {
         )]));
 
         assert!(bedrock_anthropic_thinking_fields(&config).is_none());
+
+        config.model_name = "us.anthropic.claude-opus-4-7-20251101-v1:0".to_string();
+        let fields = bedrock_anthropic_thinking_fields(&config).expect("thinking fields");
+        assert_eq!(
+            from_bedrock_json(&fields).unwrap(),
+            json!({ "thinking": {"type": "disabled"} })
+        );
     }
 
     #[test]
@@ -697,7 +775,7 @@ mod tests {
         assert_eq!(
             from_bedrock_json(&fields).unwrap(),
             json!({
-                "thinking": {"type": "adaptive"},
+                "thinking": {"type": "adaptive", "display": "summarized"},
                 "output_config": {"effort": "high"}
             })
         );
@@ -716,7 +794,7 @@ mod tests {
         assert_eq!(
             from_bedrock_json(&fields).unwrap(),
             json!({
-                "thinking": {"type": "adaptive"},
+                "thinking": {"type": "adaptive", "display": "summarized"},
                 "output_config": {"effort": "low"}
             })
         );
@@ -735,7 +813,7 @@ mod tests {
         assert_eq!(
             from_bedrock_json(&fields).unwrap(),
             json!({
-                "thinking": {"type": "adaptive"},
+                "thinking": {"type": "adaptive", "display": "summarized"},
                 "output_config": {"effort": "low"}
             })
         );
@@ -798,11 +876,75 @@ mod tests {
     }
 
     #[test]
+    fn test_to_bedrock_tool_sanitizes_description_and_schema_metadata() -> Result<()> {
+        let tool = Tool::new(
+            "lookup",
+            "検索\u{E0041} ツール cafe\u{301}",
+            serde_json::Map::from_iter([
+                ("type".to_string(), json!("object")),
+                (
+                    "properties".to_string(),
+                    json!({
+                        "pro\u{E0042}mpt": {
+                            "type": "string",
+                            "description": "都市🌍\u{E0043}"
+                        }
+                    }),
+                ),
+            ]),
+        );
+
+        let bedrock_tool = to_bedrock_tool(&tool)?;
+        let spec = bedrock_tool
+            .as_tool_spec()
+            .expect("expected Bedrock tool specification");
+        assert_eq!(spec.description(), Some("検索 ツール cafe\u{301}"));
+
+        let schema = spec
+            .input_schema()
+            .expect("expected input schema")
+            .as_json()
+            .expect("expected JSON input schema");
+        assert_eq!(
+            from_bedrock_json(schema)?,
+            json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "都市🌍"
+                    }
+                }
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_to_bedrock_tool_rejects_schema_key_collision_after_sanitization() {
+        let mut properties = serde_json::Map::new();
+        properties.insert("prompt".to_string(), json!({"type": "string"}));
+        properties.insert("pro\u{E0041}mpt".to_string(), json!({"type": "string"}));
+        let tool = Tool::new(
+            "lookup",
+            "Lookup",
+            serde_json::Map::from_iter([
+                ("type".to_string(), json!("object")),
+                ("properties".to_string(), Value::Object(properties)),
+            ]),
+        );
+
+        let error = to_bedrock_tool(&tool).expect_err("sanitized keys must remain unique");
+        assert!(error.to_string().contains("duplicate key"));
+    }
+
+    #[test]
     fn test_to_bedrock_message_content_image() -> Result<()> {
         let image = ImageContent::new(TEST_IMAGE_B64.to_string(), "image/png".to_string());
 
         let message_content = MessageContent::Image(image);
-        let result = to_bedrock_message_content(&message_content)?;
+        let result = to_bedrock_message_content(&message_content, true)?;
 
         // Verify we get an Image content block
         assert!(matches!(result, bedrock::ContentBlock::Image(_)));
@@ -811,12 +953,110 @@ mod tests {
     }
 
     #[test]
+    fn test_from_bedrock_tool_use_sanitizes_nested_arguments() -> Result<()> {
+        let original = bedrock::ContentBlock::ToolUse(
+            bedrock::ToolUseBlock::builder()
+                .tool_use_id("tool-1")
+                .name("lookup")
+                .input(to_bedrock_json(&json!({
+                    "query": "visible\u{E0041}text",
+                    "nested": [{"cit\u{E0042}y": "東京🌍\u{E0043}"}],
+                    "path": "cafe\u{301}.txt"
+                })))
+                .build()?,
+        );
+
+        let MessageContent::ToolRequest(request) = from_bedrock_content_block(&original)? else {
+            panic!("expected tool request");
+        };
+        let call = request.tool_call.expect("expected valid tool call");
+        assert_eq!(
+            call.arguments,
+            Some(object(json!({
+                "query": "visibletext",
+                "nested": [{"city": "東京🌍"}],
+                "path": "cafe\u{301}.txt"
+            })))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_bedrock_tool_use_collision_yields_error_request() -> Result<()> {
+        let original = bedrock::ContentBlock::ToolUse(
+            bedrock::ToolUseBlock::builder()
+                .tool_use_id("tool-1")
+                .name("lookup")
+                .input(to_bedrock_json(&json!({
+                    "prompt": "visible",
+                    "pro\u{E0041}mpt": "hidden"
+                })))
+                .build()?,
+        );
+
+        let MessageContent::ToolRequest(request) = from_bedrock_content_block(&original)? else {
+            panic!("expected tool request");
+        };
+        let error = request
+            .tool_call
+            .expect_err("sanitized key collision must produce an invalid tool call");
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("duplicate key"));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_to_bedrock_tool_result_content_block_image() -> Result<()> {
         let content = ContentBlock::image(TEST_IMAGE_B64.to_string(), "image/png".to_string());
-        let result = to_bedrock_tool_result_content_block("test_id", content)?;
+        let result = to_bedrock_tool_result_content_block("test_id", content, true)?;
 
         // Verify the wrapper correctly converts ContentBlock::Image to ToolResultContentBlock::Image
         assert!(matches!(result, bedrock::ToolResultContentBlock::Image(_)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_to_bedrock_tool_result_sanitizes_text_resource_fallback() -> Result<()> {
+        let content = ContentBlock::embedded_text("file:///result.bin", "visible\u{E0041}text");
+        let result = to_bedrock_tool_result_content_block("test_id", content, true)?;
+
+        let bedrock::ToolResultContentBlock::Text(text) = result else {
+            panic!("expected text fallback");
+        };
+        assert_eq!(text, "visibletext");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_to_bedrock_tool_result_demotes_document_resource_when_unsupported() -> Result<()> {
+        let content =
+            ContentBlock::embedded_text("file:///repro/sample.md", "visible\u{E0041}text");
+        let result = to_bedrock_tool_result_content_block("test_id", content, false)?;
+
+        let bedrock::ToolResultContentBlock::Text(text) = result else {
+            panic!("expected text fallback");
+        };
+        assert_eq!(text, "visibletext");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_to_bedrock_tool_result_sanitizes_document_resource() -> Result<()> {
+        let content = ContentBlock::embedded_text("file:///result.txt", "visible\u{E0041}text");
+        let result = to_bedrock_tool_result_content_block("test_id", content, true)?;
+
+        let bedrock::ToolResultContentBlock::Document(document) = result else {
+            panic!("expected document");
+        };
+        let Some(bedrock::DocumentSource::Bytes(bytes)) = document.source() else {
+            panic!("expected document bytes");
+        };
+        assert_eq!(bytes.as_ref(), b"visibletext");
 
         Ok(())
     }
@@ -835,7 +1075,7 @@ mod tests {
                 MessageContent::text("Second text"),
             ],
         );
-        let bedrock_message = to_bedrock_message_with_caching(&message, true)?;
+        let bedrock_message = to_bedrock_message_with_caching(&message, true, None, true)?;
         assert_eq!(bedrock_message.content.len(), 3);
         if let bedrock::ContentBlock::Text(text) = &bedrock_message.content[0] {
             assert_eq!(text, "First text");
@@ -853,7 +1093,7 @@ mod tests {
         ));
 
         // Caching disabled: no cache point added
-        let no_cache = to_bedrock_message_with_caching(&message, false)?;
+        let no_cache = to_bedrock_message_with_caching(&message, false, None, true)?;
         assert_eq!(no_cache.content.len(), 2);
         for block in &no_cache.content {
             assert!(!matches!(block, bedrock::ContentBlock::CachePoint(_)));
@@ -861,18 +1101,71 @@ mod tests {
 
         // Empty content: no cache point added even with caching enabled
         let empty = Message::new(Role::User, Utc::now().timestamp(), vec![]);
-        let empty_msg = to_bedrock_message_with_caching(&empty, true)?;
+        let empty_msg = to_bedrock_message_with_caching(&empty, true, None, true)?;
         assert_eq!(empty_msg.content.len(), 0);
 
         Ok(())
     }
 
+    fn signed_thinking_from_model(model: &str) -> Message {
+        use crate::conversation::message::InferenceMetadata;
+
+        Message::assistant()
+            .with_content(MessageContent::thinking("internal", "sig-abc"))
+            .with_text("answer")
+            .with_inference(InferenceMetadata {
+                provider: "aws_bedrock".to_string(),
+                requested_model: model.to_string(),
+                resolved_model: None,
+                provider_session_id: None,
+            })
+    }
+
     #[test]
-    fn test_from_bedrock_usage_folds_cache_tokens_into_input() {
+    fn keeps_signed_thinking_from_the_same_model() -> Result<()> {
+        let message = signed_thinking_from_model("anthropic.claude-sonnet-4");
+        let formatted = to_bedrock_message_with_caching(
+            &message,
+            false,
+            Some("anthropic.claude-sonnet-4"),
+            true,
+        )?;
+
+        assert!(matches!(
+            formatted.content[0],
+            bedrock::ContentBlock::ReasoningContent(_)
+        ));
+        assert!(matches!(
+            formatted.content[1],
+            bedrock::ContentBlock::Text(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn drops_signed_thinking_from_a_different_model() -> Result<()> {
+        let message = signed_thinking_from_model("anthropic.claude-opus-4");
+        let formatted = to_bedrock_message_with_caching(
+            &message,
+            false,
+            Some("anthropic.claude-sonnet-4"),
+            true,
+        )?;
+
+        assert_eq!(formatted.content.len(), 1);
+        assert!(matches!(
+            formatted.content[0],
+            bedrock::ContentBlock::Text(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_bedrock_usage_includes_cache_in_input_and_preserves_total() {
         let usage = bedrock::TokenUsage::builder()
             .input_tokens(7)
             .output_tokens(50)
-            .total_tokens(57)
+            .total_tokens(6057)
             .cache_read_input_tokens(5000)
             .cache_write_input_tokens(1000)
             .build()
@@ -985,7 +1278,7 @@ mod tests {
     #[test]
     fn test_to_bedrock_message_content_thinking() -> Result<()> {
         let message_content = MessageContent::thinking("because of X", "sig-abc");
-        let block = to_bedrock_message_content(&message_content)?;
+        let block = to_bedrock_message_content(&message_content, true)?;
 
         match block {
             bedrock::ContentBlock::ReasoningContent(
@@ -1005,7 +1298,7 @@ mod tests {
     #[test]
     fn test_to_bedrock_message_content_thinking_without_signature() -> Result<()> {
         let message_content = MessageContent::thinking("silent reasoning", "");
-        let block = to_bedrock_message_content(&message_content)?;
+        let block = to_bedrock_message_content(&message_content, true)?;
 
         match block {
             bedrock::ContentBlock::ReasoningContent(
@@ -1028,7 +1321,7 @@ mod tests {
         let encoded = base64::prelude::BASE64_STANDARD.encode(raw);
         let message_content = MessageContent::redacted_thinking(encoded);
 
-        let block = to_bedrock_message_content(&message_content)?;
+        let block = to_bedrock_message_content(&message_content, true)?;
         match block {
             bedrock::ContentBlock::ReasoningContent(
                 bedrock::ReasoningContentBlock::RedactedContent(blob),
@@ -1047,7 +1340,7 @@ mod tests {
     fn test_to_bedrock_message_content_redacted_thinking_opaque_payload() -> Result<()> {
         let message_content = MessageContent::redacted_thinking("opaque_not_base64!@#".to_string());
 
-        let block = to_bedrock_message_content(&message_content)?;
+        let block = to_bedrock_message_content(&message_content, true)?;
         match block {
             bedrock::ContentBlock::Text(text) => assert_eq!(text, ""),
             other => panic!(
@@ -1069,7 +1362,7 @@ mod tests {
             ));
 
         let message_content = from_bedrock_content_block(&original)?;
-        let round_tripped = to_bedrock_message_content(&message_content)?;
+        let round_tripped = to_bedrock_message_content(&message_content, true)?;
 
         match round_tripped {
             bedrock::ContentBlock::ReasoningContent(
@@ -1096,7 +1389,7 @@ mod tests {
         );
 
         let message_content = from_bedrock_content_block(&original)?;
-        let round_tripped = to_bedrock_message_content(&message_content)?;
+        let round_tripped = to_bedrock_message_content(&message_content, true)?;
 
         match round_tripped {
             bedrock::ContentBlock::ReasoningContent(
@@ -1208,7 +1501,7 @@ mod tests {
             ],
         );
 
-        let bedrock_message = to_bedrock_message_with_caching(&message, true)?;
+        let bedrock_message = to_bedrock_message_with_caching(&message, true, None, true)?;
 
         // Verify cache point is added after all content blocks (text + tool request + cache point)
         assert_eq!(bedrock_message.content.len(), 3);
@@ -1240,13 +1533,56 @@ mod tests {
             None,
         );
         let content = MessageContent::tool_request("call_bad".to_string(), Err(err));
-        match to_bedrock_message_content(&content)? {
+        match to_bedrock_message_content(&content, true)? {
             bedrock::ContentBlock::ToolUse(tu) => {
                 assert_eq!(tu.tool_use_id, "call_bad");
                 assert_eq!(tu.name, "unparseable_tool_call");
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn tool_response_error_sanitizes_unicode_tags() -> Result<()> {
+        let error = ErrorData::new(
+            ErrorCode::INTERNAL_ERROR,
+            "visible\u{E0041}\u{E0042} error".to_string(),
+            None,
+        );
+        let content = MessageContent::tool_response("call_hidden".to_string(), Err(error));
+
+        let bedrock::ContentBlock::ToolResult(result) = to_bedrock_message_content(&content, true)?
+        else {
+            panic!("expected ToolResult");
+        };
+        let bedrock::ToolResultContentBlock::Text(text) = &result.content[0] else {
+            panic!("expected text error content");
+        };
+
+        assert!(!crate::utils::contains_unicode_tags(text.as_str()));
+        assert!(text.contains("visible error"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_response_error_preserves_ordinary_text() -> Result<()> {
+        let error = ErrorData::new(
+            ErrorCode::INTERNAL_ERROR,
+            "ordinary tool failure".to_string(),
+            None,
+        );
+        let content = MessageContent::tool_response("call_error".to_string(), Err(error));
+
+        let bedrock::ContentBlock::ToolResult(result) = to_bedrock_message_content(&content, true)?
+        else {
+            panic!("expected ToolResult");
+        };
+        let bedrock::ToolResultContentBlock::Text(text) = &result.content[0] else {
+            panic!("expected text error content");
+        };
+
+        assert!(text.contains("ordinary tool failure"));
         Ok(())
     }
 
@@ -1266,7 +1602,7 @@ mod tests {
             )],
         );
 
-        let bedrock_message = to_bedrock_message_with_caching(&message, true)?;
+        let bedrock_message = to_bedrock_message_with_caching(&message, true, None, true)?;
 
         // Verify cache point is added after tool response content
         assert_eq!(bedrock_message.content.len(), 2);
@@ -1306,7 +1642,7 @@ mod tests {
             ],
         );
 
-        let bedrock_message = to_bedrock_message_with_caching(&message, true)?;
+        let bedrock_message = to_bedrock_message_with_caching(&message, true, None, true)?;
 
         // Verify cache point is added at the end after all tool requests
         assert_eq!(bedrock_message.content.len(), 4);
@@ -1372,30 +1708,50 @@ mod tests {
 
     #[test]
     fn test_bedrock_inference_config_omits_temperature_for_unsupported_model() {
-        // The Anthropic canonical registry maps this id and reports whether a
-        // custom temperature may be sent; when it cannot, temperature is left
-        // unset so the server default is used.
-        let mut config = ModelConfig::new("us.anthropic.claude-sonnet-4-5-20250929-v1:0");
-        config.temperature = Some(0.5);
-
-        let supported = bedrock_model_supports_temperature(&config);
-        let inference_config = bedrock_inference_config(&config);
-
-        if supported {
-            assert_eq!(inference_config.temperature(), Some(0.5));
-        } else {
-            assert_eq!(inference_config.temperature(), None);
-        }
-    }
-
-    #[test]
-    fn test_bedrock_inference_config_omits_temperature_for_bedrock_registry_unsupported_model() {
-        let mut config = ModelConfig::new("openai.gpt-5.4");
+        let mut config = ModelConfig::new("global.anthropic.claude-sonnet-5");
         config.temperature = Some(0.5);
 
         let inference_config = bedrock_inference_config(&config);
 
         assert!(!bedrock_model_supports_temperature(&config));
         assert_eq!(inference_config.temperature(), None);
+    }
+
+    #[test]
+    fn test_elicitation_message_becomes_empty() {
+        use crate::conversation::message::{ActionRequired, ActionRequiredData};
+        use rmcp::model::Role;
+
+        let elicitation_request = Message::new(
+            Role::Assistant,
+            Utc::now().timestamp(),
+            vec![MessageContent::ActionRequired(ActionRequired {
+                data: ActionRequiredData::Elicitation {
+                    id: "elicit-1".to_string(),
+                    message: "Choose something".to_string(),
+                    requested_schema: serde_json::json!({}),
+                },
+            })],
+        );
+
+        let elicitation_response = Message::new(
+            Role::User,
+            Utc::now().timestamp(),
+            vec![MessageContent::ActionRequired(ActionRequired {
+                data: ActionRequiredData::ElicitationResponse {
+                    id: "elicit-1".to_string(),
+                    user_data: serde_json::json!({"choice": "yes"}),
+                    action: rmcp::model::ElicitationAction::Accept,
+                },
+            })],
+        );
+
+        let request_result =
+            to_bedrock_message_with_caching(&elicitation_request, false, None, true).unwrap();
+        let response_result =
+            to_bedrock_message_with_caching(&elicitation_response, false, None, true).unwrap();
+
+        assert!(request_result.content().is_empty());
+        assert!(response_result.content().is_empty());
     }
 }

@@ -253,14 +253,11 @@ pub fn convert(content: &str) -> Result<String> {
         created_at,
         updated_at,
         usage: Usage::new(
-            (total_input > 0).then_some(total_input as i32),
-            (total_output > 0).then_some(total_output as i32),
+            (total_input > 0).then_some(total_input),
+            (total_output > 0).then_some(total_output),
             None,
         )
-        .with_cache_tokens(
-            (total_cache_read > 0).then_some(total_cache_read as i32),
-            None,
-        ),
+        .with_cache_tokens((total_cache_read > 0).then_some(total_cache_read), None),
         accumulated_cost: None,
         conversation,
     });
@@ -339,6 +336,34 @@ mod tests {
             .unwrap()
             .iter()
             .any(|c| c["type"] == "toolResponse"));
+    }
+
+    #[test]
+    fn sanitizes_unicode_tags_in_function_call_output() {
+        let jsonl = [
+            serde_json::json!({
+                "timestamp": "2026-05-22T13:37:22Z",
+                "type": "session_meta",
+                "payload": {"id": "s", "cwd": "/w"}
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-05-22T13:37:23Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "visible\u{E0041}世界"
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+
+        let json = convert(&jsonl).unwrap();
+
+        assert!(json.contains("visible世界"));
+        assert!(!json.contains('\u{E0041}'));
     }
 
     #[test]

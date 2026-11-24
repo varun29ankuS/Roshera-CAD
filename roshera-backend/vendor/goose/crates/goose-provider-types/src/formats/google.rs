@@ -1,6 +1,10 @@
 use crate::conversation::token_usage::{ProviderUsage, Usage};
+use crate::documents::{
+    document_media_type_is_supported, unsupported_document_text, UNSUPPORTED_MEDIA_TYPE_REASON,
+};
 use crate::errors::ProviderError;
 use crate::formats::openai::{is_valid_function_name, sanitize_function_name};
+use crate::maybe_send::MaybeSend;
 use crate::mcp_utils::extract_text_from_resource;
 use crate::model::ModelConfig;
 use crate::thinking::ThinkingEffort;
@@ -88,18 +92,9 @@ pub fn format_messages(messages: &[Message], nested_function_response_media: boo
         })
         .collect();
 
-    let tool_names: HashMap<_, _> = filtered
-        .iter()
-        .flat_map(|message| &message.content)
-        .filter_map(|content| match content {
-            MessageContentBlock::ToolRequest(request) => request
-                .tool_call
-                .as_ref()
-                .ok()
-                .map(|tool_call| (request.id.as_str(), sanitize_function_name(&tool_call.name))),
-            _ => None,
-        })
-        .collect();
+    // Record names as we walk the conversation so a reused tool-call id
+    // resolves to the nearest preceding request, not a later overwrite.
+    let mut tool_names: HashMap<&str, String> = HashMap::new();
 
     let active_loop_start_idx = filtered
         .iter()
@@ -132,12 +127,11 @@ pub fn format_messages(messages: &[Message], nested_function_response_media: boo
                     }
                     MessageContentBlock::ToolRequest(request) => match &request.tool_call {
                         Ok(tool_call) => {
+                            let name = sanitize_function_name(&tool_call.name);
+                            tool_names.insert(request.id.as_str(), name.clone());
                             let mut function_call_part = Map::new();
                             function_call_part.insert("id".to_string(), json!(request.id));
-                            function_call_part.insert(
-                                "name".to_string(),
-                                json!(sanitize_function_name(&tool_call.name)),
-                            );
+                            function_call_part.insert("name".to_string(), json!(name));
 
                             if let Some(args) = &tool_call.arguments {
                                 if !args.is_empty() {
@@ -254,6 +248,20 @@ pub fn format_messages(messages: &[Message], nested_function_response_media: boo
                                 "data": image.data,
                             }
                         }));
+                    }
+                    MessageContentBlock::Document(document) => {
+                        if document_media_type_is_supported(&document.mime_type) {
+                            parts.push(json!({
+                                "inline_data": {
+                                    "mime_type": document.mime_type,
+                                    "data": document.data,
+                                }
+                            }));
+                        } else {
+                            parts.push(json!({
+                                "text": unsupported_document_text(document, UNSUPPORTED_MEDIA_TYPE_REASON)
+                            }));
+                        }
                     }
 
                     _ => {}
@@ -400,21 +408,36 @@ pub fn get_usage(data: &Value) -> Result<Usage> {
     if let Some(usage_meta_data) = data.get("usageMetadata") {
         let input_tokens = usage_meta_data
             .get("promptTokenCount")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as i32);
-        let output_tokens = usage_meta_data
+            .and_then(|v| v.as_i64());
+        // `candidatesTokenCount` is the visible output; thinking models
+        // (Gemini 2.5/3) report reasoning tokens separately in
+        // `thoughtsTokenCount`, and per the API spec `totalTokenCount` =
+        // prompt + thoughts + candidates. Fold thoughts into `output_tokens` so
+        // the record reconciles (input + output == total) and cost, which
+        // Google bills at the output rate, is correct -- matching the OpenAI
+        // (completion_tokens includes reasoning) and Anthropic (output_tokens
+        // includes thinking) adapters.
+        let candidates_tokens = usage_meta_data
             .get("candidatesTokenCount")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as i32);
+            .and_then(|v| v.as_i64());
+        let thoughts_tokens = usage_meta_data
+            .get("thoughtsTokenCount")
+            .and_then(|v| v.as_i64());
+        let output_tokens = match (candidates_tokens, thoughts_tokens) {
+            (None, None) => None,
+            (candidates, thoughts) => Some(
+                candidates
+                    .unwrap_or(0)
+                    .saturating_add(thoughts.unwrap_or(0)),
+            ),
+        };
         let total_tokens = usage_meta_data
             .get("totalTokenCount")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as i32);
+            .and_then(|v| v.as_i64());
         // promptTokenCount already includes cachedContentTokenCount
         let cached_tokens = usage_meta_data
             .get("cachedContentTokenCount")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as i32);
+            .and_then(|v| v.as_i64());
         Ok(Usage::new(input_tokens, output_tokens, total_tokens)
             .with_cache_tokens(cached_tokens, None))
     } else {
@@ -431,7 +454,7 @@ pub fn response_to_streaming_message<S>(
     mut stream: S,
 ) -> impl futures::Stream<Item = anyhow::Result<(Option<Message>, Option<ProviderUsage>)>> + 'static
 where
-    S: futures::Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
+    S: futures::Stream<Item = anyhow::Result<String>> + Unpin + MaybeSend + 'static,
 {
     use async_stream::try_stream;
     use futures::StreamExt;
@@ -441,6 +464,8 @@ where
         let mut last_signature: Option<String> = None;
         let stream_id = Uuid::new_v4().to_string();
         let mut incomplete_data: Option<String> = None;
+        let mut last_finish_reason: Option<String> = None;
+        let mut last_response_id: Option<String> = None;
 
         while let Some(line_result) = stream.next().await {
             let line = line_result?;
@@ -517,10 +542,22 @@ where
                 }
             }
 
-            let parts = chunk
+            if let Some(response_id) = chunk.get("responseId").and_then(|v| v.as_str()) {
+                last_response_id = Some(response_id.to_string());
+            }
+
+            let candidate = chunk
                 .get("candidates")
                 .and_then(|v| v.as_array())
-                .and_then(|c| c.first())
+                .and_then(|c| c.first());
+            if let Some(reason) = candidate
+                .and_then(|c| c.get("finishReason"))
+                .and_then(|v| v.as_str())
+            {
+                last_finish_reason = Some(reason.to_string());
+            }
+
+            let parts = candidate
                 .and_then(|c| c.get("content"))
                 .and_then(|c| c.get("parts"))
                 .and_then(|p| p.as_array());
@@ -539,7 +576,11 @@ where
             }
         }
 
-        if let Some(usage) = final_usage {
+        if let Some(mut usage) = final_usage {
+            if let Some(reason) = last_finish_reason {
+                usage.finish_reasons = Some(vec![reason]);
+            }
+            usage.response_id = last_response_id;
             yield (None, Some(usage));
         }
     }
@@ -579,6 +620,64 @@ enum ThinkingLevel {
     Low,
     Medium,
     High,
+    Xhigh,
+}
+
+impl ThinkingLevel {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            _ => None,
+        }
+    }
+}
+
+/// Gemini 3 replaced `thinkingBudget` with `thinkingLevel`, and later
+/// generations keep it, so any major version from 3 up takes the level path.
+fn uses_thinking_level(model_name: &str) -> bool {
+    let name = model_name.to_lowercase();
+    let name = name.rsplit('/').next().unwrap_or(&name);
+    name.strip_prefix("gemini-")
+        .map(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 3)
+}
+
+/// The catalog lists each model's levels (not every Gemini 4 model has
+/// `xhigh`); without a catalog entry only the levels every thinking-level
+/// model accepts are assumed.
+fn supports_thinking_level(model_name: &str, level: &str) -> bool {
+    match crate::canonical::maybe_get_canonical_model("google", model_name)
+        .and_then(|model| model.reasoning_efforts)
+    {
+        Some(levels) => levels.iter().any(|value| value == level),
+        None if model_name.to_lowercase().starts_with("gemini-3-pro") => {
+            ["low", "high"].contains(&level)
+        }
+        None => ["low", "medium", "high"].contains(&level),
+    }
+}
+
+fn thinking_level_for_effort(model_name: &str, effort: ThinkingEffort) -> Option<ThinkingLevel> {
+    let preferred: &[&str] = match effort {
+        ThinkingEffort::Off => &["minimal"],
+        ThinkingEffort::Low => &["low", "minimal", "medium", "high"],
+        ThinkingEffort::Medium => &["medium", "low", "high"],
+        ThinkingEffort::High => &["high", "medium", "xhigh", "low"],
+        ThinkingEffort::Max => &["xhigh", "high", "medium", "low"],
+    };
+    preferred
+        .iter()
+        .find(|level| supports_thinking_level(model_name, level))
+        .and_then(|level| ThinkingLevel::parse(level))
 }
 
 #[derive(Serialize)]
@@ -609,13 +708,14 @@ fn get_thinking_config(
     if model_config.reasoning == Some(false)
         || model_config.thinking_effort() == Some(ThinkingEffort::Off)
     {
-        let model_name = model_config.model_name.to_lowercase();
-        if model_name.starts_with("gemini-3.5") || model_name.starts_with("gemini-3.6") {
-            return Some(ThinkingConfig {
-                thinking_level: Some(ThinkingLevel::Minimal),
-                thinking_budget: None,
-                include_thoughts: false,
-            });
+        if uses_thinking_level(&model_config.model_name) {
+            return thinking_level_for_effort(&model_config.model_name, ThinkingEffort::Off).map(
+                |level| ThinkingConfig {
+                    thinking_level: Some(level),
+                    thinking_budget: None,
+                    include_thoughts: false,
+                },
+            );
         }
         // Gemini 2.5 Flash defaults to dynamic thinking; only an explicit budget
         // of 0 turns it off. Other families can't be disabled, so leave them unset.
@@ -632,29 +732,25 @@ fn get_thinking_config(
         }
         return None;
     }
-    let model_name = model_config.model_name.to_lowercase();
-    let is_gemini_3 = model_name.starts_with("gemini-3");
-    let is_gemini_25 = model_name.starts_with("gemini-2.5");
-    if !is_gemini_3 && !is_gemini_25 {
+    let is_thinking_level_model = uses_thinking_level(&model_config.model_name);
+    let is_gemini_25 = model_config
+        .model_name
+        .to_lowercase()
+        .starts_with("gemini-2.5");
+    if !is_thinking_level_model && !is_gemini_25 {
         return None;
     }
 
-    if is_gemini_3 {
+    if is_thinking_level_model {
         let effort = model_config
             .thinking_effort()
             .unwrap_or(ThinkingEffort::Off);
         if effort == ThinkingEffort::Off {
             return None;
         }
-        let thinking_level = match effort {
-            ThinkingEffort::Off | ThinkingEffort::Low => ThinkingLevel::Low,
-            ThinkingEffort::Medium if model_name.starts_with("gemini-3-pro") => ThinkingLevel::Low,
-            ThinkingEffort::Medium => ThinkingLevel::Medium,
-            ThinkingEffort::High | ThinkingEffort::Max => ThinkingLevel::High,
-        };
 
-        Some(ThinkingConfig {
-            thinking_level: Some(thinking_level),
+        thinking_level_for_effort(&model_config.model_name, effort).map(|level| ThinkingConfig {
+            thinking_level: Some(level),
             thinking_budget: None,
             include_thoughts: true,
         })
@@ -718,12 +814,9 @@ fn create_request_impl(
     };
 
     let thinking_config = get_thinking_config(model_config, thinking_budget);
-    let temperature = (!model_config
-        .model_name
-        .to_lowercase()
-        .starts_with("gemini-3"))
-    .then(|| model_config.temperature.map(|t| t as f64))
-    .flatten();
+    let temperature = (!uses_thinking_level(&model_config.model_name))
+        .then(|| model_config.temperature.map(|t| t as f64))
+        .flatten();
 
     let generation_config = Some(GenerationConfig {
         temperature,
@@ -735,13 +828,7 @@ fn create_request_impl(
         system_instruction: SystemInstruction {
             parts: [TextPart { text: system }],
         },
-        contents: format_messages(
-            messages,
-            model_config
-                .model_name
-                .to_lowercase()
-                .starts_with("gemini-3"),
-        ),
+        contents: format_messages(messages, uses_thinking_level(&model_config.model_name)),
         tools: tools_wrapper,
         generation_config,
     };
@@ -833,6 +920,33 @@ mod tests {
     }
 
     #[test]
+    fn test_get_usage_includes_thinking_tokens() {
+        // Gemini thinking models (2.5/3, the goose defaults) report reasoning
+        // tokens separately in `thoughtsTokenCount`, and per the API spec
+        // `totalTokenCount` = prompt + thoughts + candidates. `output_tokens`
+        // must include thoughts so the record reconciles (input + output ==
+        // total) and cost, which Google bills at the output rate, is correct --
+        // matching the OpenAI (completion_tokens includes reasoning) and
+        // Anthropic (output_tokens includes thinking) adapters.
+        let data = json!({
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 50,
+                "thoughtsTokenCount": 200,
+                "totalTokenCount": 350
+            }
+        });
+        let usage = get_usage(&data).unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(250));
+        assert_eq!(usage.total_tokens, Some(350));
+        assert_eq!(
+            usage.input_tokens.unwrap() + usage.output_tokens.unwrap(),
+            usage.total_tokens.unwrap(),
+        );
+    }
+
+    #[test]
     fn test_message_to_google_spec_text_message() {
         let messages = vec![
             set_up_text_message("Hello", Role::User),
@@ -871,6 +985,31 @@ mod tests {
         assert_eq!(
             payload[0]["parts"][1]["inline_data"]["data"],
             "base64encodeddata"
+        );
+    }
+
+    #[test]
+    fn test_message_to_google_spec_document_only_message() {
+        let messages = vec![Message::new(
+            Role::User,
+            0,
+            vec![MessageContentBlock::document(
+                "base64pdfdata".to_string(),
+                "application/pdf".to_string(),
+                Some("report.pdf".to_string()),
+            )],
+        )];
+        let payload = format_messages(&messages, false);
+
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0]["role"], "user");
+        assert_eq!(
+            payload[0]["parts"][0]["inline_data"]["mime_type"],
+            "application/pdf"
+        );
+        assert_eq!(
+            payload[0]["parts"][0]["inline_data"]["data"],
+            "base64pdfdata"
         );
     }
 
@@ -918,6 +1057,24 @@ mod tests {
     }
 
     #[test]
+    fn test_message_to_google_spec_sanitizes_resource_tool_response() {
+        let messages = vec![set_up_tool_response_message(
+            "response_id",
+            vec![ContentBlock::embedded_text(
+                "file:///result.txt",
+                "visible\u{E0041}text",
+            )],
+        )];
+
+        let payload = format_messages(&messages, false);
+
+        assert_eq!(
+            payload[0]["parts"][0]["functionResponse"]["response"]["content"]["text"],
+            "visibletext"
+        );
+    }
+
+    #[test]
     fn test_function_response_matches_function_call() {
         let messages = vec![
             set_up_tool_request_message("call_123", CallToolRequestParams::new("read_file")),
@@ -932,6 +1089,38 @@ mod tests {
                 "id": "call_123",
                 "name": "read_file",
                 "response": {"content": {"text": "contents"}}
+            })
+        );
+    }
+
+    #[test]
+    fn test_reused_tool_call_id_keeps_each_response_name() {
+        let messages = vec![
+            set_up_tool_request_message(
+                "call_3407",
+                CallToolRequestParams::new("download_document"),
+            ),
+            set_up_tool_response_message("call_3407", vec![ContentBlock::text("the document")]),
+            set_up_tool_request_message("call_3407", CallToolRequestParams::new("shell")),
+            set_up_tool_response_message("call_3407", vec![ContentBlock::text("shell output")]),
+        ];
+
+        let payload = format_messages(&messages, false);
+
+        assert_eq!(
+            payload[1]["parts"][0]["functionResponse"],
+            json!({
+                "id": "call_3407",
+                "name": "download_document",
+                "response": {"content": {"text": "the document"}}
+            })
+        );
+        assert_eq!(
+            payload[3]["parts"][0]["functionResponse"],
+            json!({
+                "id": "call_3407",
+                "name": "shell",
+                "response": {"content": {"text": "shell output"}}
             })
         );
     }
@@ -1390,6 +1579,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_streaming_response_metadata() {
+        use futures::StreamExt;
+
+        let lines = vec![Ok(
+            r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1,"totalTokenCount":3},"modelVersion":"gemini-test","responseId":"response-123"}"#
+                .to_string(),
+        )];
+        let stream = Box::pin(futures::stream::iter(lines));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+        let mut final_usage = None;
+
+        while let Some(result) = message_stream.next().await {
+            let (_, usage) = result.unwrap();
+            if usage.is_some() {
+                final_usage = usage;
+            }
+        }
+
+        let usage = final_usage.unwrap();
+        assert_eq!(usage.finish_reasons, Some(vec!["STOP".to_string()]));
+        assert_eq!(usage.response_id.as_deref(), Some("response-123"));
+    }
+
+    #[tokio::test]
     async fn test_streaming_function_call() {
         use futures::StreamExt;
 
@@ -1709,6 +1922,32 @@ data: [DONE]"#;
         let config = ModelConfig::new("gpt-4o");
         let result = get_thinking_config(&config, None);
         assert!(result.is_none());
+    }
+
+    fn thinking_level_json(model: &str, effort: ThinkingEffort) -> Value {
+        let config = ModelConfig::new(model).with_thinking_effort(effort);
+        let payload = create_request(&config, "system", &[], &[]).unwrap();
+        payload["generationConfig"]["thinkingConfig"]["thinkingLevel"].clone()
+    }
+
+    #[test]
+    fn test_max_effort_uses_xhigh_only_where_the_catalog_lists_it() {
+        assert_eq!(
+            thinking_level_json("gemini-4-hydrogen", ThinkingEffort::Max),
+            json!("xhigh")
+        );
+        assert_eq!(
+            thinking_level_json("gemini-4-neon", ThinkingEffort::Max),
+            json!("xhigh")
+        );
+        assert_eq!(
+            thinking_level_json("gemini-4-argon", ThinkingEffort::Max),
+            json!("high")
+        );
+        assert_eq!(
+            thinking_level_json("gemini-4-hydrogen", ThinkingEffort::High),
+            json!("high")
+        );
     }
 
     #[test]

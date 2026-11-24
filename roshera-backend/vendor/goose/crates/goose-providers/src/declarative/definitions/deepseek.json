@@ -2,13 +2,13 @@
   "name": "custom_deepseek",
   "engine": "openai",
   "display_name": "DeepSeek",
-  "description": "Custom DeepSeek provider",
+  "description": "DeepSeek chat and reasoning models",
   "api_key_env": "DEEPSEEK_API_KEY",
   "base_url": "https://api.deepseek.com",
   "models": [
     {
-      "name": "deepseek-v4-flash",
-      "context_limit": 128000,
+      "name": "deepseek-flash",
+      "context_limit": null,
       "input_token_cost": null,
       "output_token_cost": null,
       "currency": null,
@@ -34,5 +34,11 @@
   "headers": null,
   "timeout_seconds": null,
   "preserves_thinking": true,
-  "supports_streaming": true
+  "supports_streaming": true,
+  "setup": {
+    "category": "model",
+    "setup_method": "single_api_key",
+    "group": "additional",
+    "docs_url": "https://platform.deepseek.com/api_keys"
+  }
 }

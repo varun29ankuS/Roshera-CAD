@@ -11,6 +11,7 @@ use crate::config::{Config, GooseMode};
 use crate::providers::base::{
     current_working_dir, ProviderDef, ProviderDescriptor, ProviderMetadata,
 };
+use crate::providers::catalog::ProviderSetupMetadata;
 
 pub(crate) const AMP_ACP_PROVIDER_NAME: &str = "amp-acp";
 const AMP_ACP_DOC_URL: &str = "https://ampcode.com";
@@ -33,15 +34,20 @@ impl goose_providers::base::ProviderDescriptor for AmpAcpProvider {
             "Install the Amp CLI: `curl -fsSL https://ampcode.com/install.sh | bash`",
             "Install the ACP adapter: `npm install -g amp-acp`",
             "Ensure your Amp CLI is authenticated (run `amp` to verify)",
-            "Add to your goose config file (`~/.config/goose/config.yaml` on macOS/Linux):\n  GOOSE_PROVIDER: amp-acp\n  GOOSE_MODEL: current\n  amp-acp_configured: true",
-            "Restart goose for changes to take effect",
         ])
-        .with_model_selection_hint("Use the Amp CLI to configure models")
+        .with_setup(
+            ProviderSetupMetadata::cli_agent(AMP_ACP_BINARY, &["amp-acp", "amp"])
+                .with_acp()
+                .with_docs_url("https://ampcode.com")
+                .with_capabilities(true, true, true),
+        )
     }
 }
 
 impl ProviderDef for AmpAcpProvider {
     type Provider = AcpProvider;
+    const SESSION_BOUND: bool = true;
+    const RUNS_OWN_TOOL_LOOP: bool = true;
 
     fn from_env(
         extensions: Vec<crate::config::ExtensionConfig>,
@@ -58,7 +64,7 @@ impl ProviderDef for AmpAcpProvider {
         Box::pin(async move {
             let config = Config::global();
             let resolved_command = SearchPaths::builder().with_npm().resolve(AMP_ACP_BINARY)?;
-            let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
+            let goose_mode = config.resolve_goose_mode()?;
 
             let mode_mapping = HashMap::from([
                 // "bypass" skips confirmations, closest to autonomous mode.
@@ -66,7 +72,6 @@ impl ProviderDef for AmpAcpProvider {
                 // "default" prompts before risky actions.
                 (GooseMode::Approve, vec!["default".to_string()]),
                 (GooseMode::SmartApprove, vec!["default".to_string()]),
-                (GooseMode::Chat, vec!["default".to_string()]),
             ]);
 
             let provider_config = AcpProviderConfig {
