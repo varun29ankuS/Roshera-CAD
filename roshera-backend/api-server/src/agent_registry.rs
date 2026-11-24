@@ -805,6 +805,22 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "timeline_dependencies",
+            Timeline,
+            Experimental,
+            Curated,
+            "Which feature is built from which: the branch's recorded operations as a graph (each event and the earlier events it uses); with from_seq or from_event, the features an edit there would rebuild, in order. Read-only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "branch": {"type": "string", "default": "main"},
+                    "from_seq": {"type": "integer"},
+                    "from_event": {"type": "string", "format": "uuid"}
+                },
+                "required": []
+            }),
+        ),
+        t(
             "timeline_scrub",
             Timeline,
             Experimental,
@@ -2546,7 +2562,9 @@ mod tests {
         // 121 -> 124 (2026-11-23): sim_mesh, sim_setup, sim_session -- the study
         // walked through with the person, stage by stage.
         // 124 -> 125 (2026-11-23): sim_materials -- the cited material library.
-        assert_eq!(tools.len(), 125, "expected 125 tools, got {}", tools.len());
+        // 125 -> 126 (2026-11-24): timeline_dependencies -- the feature graph and
+        // what an edit would rebuild, for the agent.
+        assert_eq!(tools.len(), 126, "expected 126 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2563,7 +2581,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 137, "125 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 138, "126 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");

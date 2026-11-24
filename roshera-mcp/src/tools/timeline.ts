@@ -171,6 +171,53 @@ export function registerTimelineTools(server: ToolHost) {
   );
 
   server.tool(
+    "timeline_dependencies",
+    "WHICH FEATURE IS BUILT FROM WHICH: the branch's recorded operations as a " +
+      "graph -- each event (seq, op) and the earlier events it uses. With " +
+      "from_seq (or from_event), the features an edit there would rebuild, in " +
+      "order. Read-only: nothing is rebuilt. Use before a mould or an edit to " +
+      "see what it reaches.",
+    {
+      branch: z.string().default("main").describe("timeline branch id ('main' = trunk)"),
+      from_seq: z.number().int().optional().describe("sequence number of the event to edit: returns what it would rebuild"),
+      from_event: z.string().uuid().optional().describe("the same, by event id"),
+    },
+    async ({ branch, from_seq, from_event }) => {
+      try {
+        const base = `/api/timeline/dependency-graph/${encodeURIComponent(branch)}`;
+        const g = await api("GET", base);
+        const nodes: any[] = g?.nodes ?? [];
+        const seqOf = new Map(nodes.map((n) => [n.id, n.sequence_number]));
+        const opOf = new Map(nodes.map((n) => [n.id, n.operation_type]));
+        let origin = from_event;
+        if (origin === undefined && from_seq !== undefined) {
+          origin = nodes.find((n) => n.sequence_number === from_seq)?.id;
+          if (origin === undefined) {
+            return fail(new Error(`no event with sequence ${from_seq} on branch '${branch}' (it has ${nodes.length} events)`));
+          }
+        }
+        const plan = origin
+          ? (await api("GET", `${base}?rebuild_from=${encodeURIComponent(origin)}`))?.rebuild_plan ?? []
+          : null;
+        return ok({
+          branch,
+          events: nodes.map((n) => ({ seq: n.sequence_number, op: n.operation_type, id: n.id })),
+          // [from_seq, to_seq]: `to` is built from `from`; critical = it cannot be substituted.
+          uses: (g?.edges ?? []).map((e: any) => [seqOf.get(e.from), seqOf.get(e.to), e.critical === true]),
+          ...(plan !== null
+            ? {
+                rebuild_from: { seq: seqOf.get(origin as string), op: opOf.get(origin as string) },
+                would_rebuild: plan.map((id: string) => ({ seq: seqOf.get(id), op: opOf.get(id) })),
+              }
+            : {}),
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
     "timeline_scrub",
     "Look at the scene AS OF a past event — non-destructive (live scene " +
       "untouched). Returns object count + mesh stats at that moment.",

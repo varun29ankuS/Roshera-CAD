@@ -6780,6 +6780,65 @@ async fn live_bore_radius(state: &AppState) -> Option<f64> {
     best
 }
 
+/// RED→GREEN (2026-11-24) — the dependency graph covers the WHOLE branch. The
+/// handler read only the first 100 events (`Some(100)`), silently: on a longer
+/// history every later feature, and every edge into it, was missing, and a
+/// rebuild plan from an early event omitted the features downstream of event
+/// 100 -- "no downstream impact" for features that would be dirtied. Seeds 100
+/// boxes, then a box, a cylinder and their boolean (events 101-103).
+#[tokio::test]
+async fn dependency_graph_covers_every_event_past_one_hundred() {
+    let state = make_test_state().await;
+    for i in 0..100 {
+        let (s, body) = dispatch(
+            &state,
+            json_post(
+                "/api/geometry/box",
+                json!({"width": 1.0 + f64::from(i) * 0.01, "depth": 1.0, "height": 1.0}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "box {i} must 200; body = {body}");
+    }
+    let _drill = seed_bored_box_live(&state).await;
+
+    let (ds, dbody) = dispatch(&state, json_get("/api/timeline/dependency-graph/main")).await;
+    assert_eq!(
+        ds,
+        StatusCode::OK,
+        "dep-graph/main must 200; body = {dbody}"
+    );
+    let nodes = dbody["nodes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        nodes.len() >= 103,
+        "every recorded event must be a node: got {} (the first 100 only?)",
+        nodes.len()
+    );
+    let boolean = nodes
+        .iter()
+        .find(|n| {
+            n["operation_type"]
+                .as_str()
+                .is_some_and(|k| k.contains("boolean"))
+        })
+        .and_then(|n| n["id"].as_str())
+        .map(str::to_string)
+        .expect("the boolean (event ~103) must be a node");
+    let into_boolean = dbody["edges"]
+        .as_array()
+        .map(|es| {
+            es.iter()
+                .filter(|e| e["to"].as_str() == Some(boolean.as_str()))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        into_boolean, 2,
+        "the boolean depends on its box and its cylinder; body edges = {}",
+        dbody["edges"]
+    );
+}
+
 /// #29 RED→GREEN — `GET /api/timeline/sessions` must list the LIVE session that
 /// backs a part built purely through the live geometry tools. Before the wiring
 /// there was no such route (404) and no session for the live path ("sessions is

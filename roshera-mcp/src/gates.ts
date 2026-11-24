@@ -279,6 +279,7 @@ const READ_ONLY = new Set<string>([
   "timeline_checkpoints",
   "timeline_scrub",
   "rebuild_certificate",
+  "timeline_dependencies",
   "label_list",
   "label_resolve",
   "lens_explain",

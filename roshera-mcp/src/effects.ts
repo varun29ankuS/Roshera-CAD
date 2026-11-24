@@ -36,7 +36,7 @@ export const READ_TOOLS: ReadonlySet<string> = new Set([
   // reading a sketch
   "psketch_certify", "psketch_dof", "plane_from_face",
   // reading history
-  "rebuild_certificate", "recipe_get", "timeline_branches", "timeline_checkpoints",
+  "rebuild_certificate", "recipe_get", "timeline_dependencies", "timeline_branches", "timeline_checkpoints",
   "timeline_conflicts", "timeline_history", "timeline_scrub",
   // reading labels and the notebook
   "blackboard_list", "label_list", "label_resolve",

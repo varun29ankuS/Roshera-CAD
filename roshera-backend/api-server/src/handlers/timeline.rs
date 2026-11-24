@@ -1989,8 +1989,11 @@ pub async fn get_dependency_graph(
     let timeline = state.timeline.read().await;
     let branch_id = resolve_branch_ref(&branch_id)?;
 
+    // The WHOLE branch: a dependency graph of the first N events is a wrong
+    // answer, not a page -- every later feature and every edge into it would
+    // be missing, and a rebuild plan would omit what an edit really dirties.
     let events = timeline
-        .get_branch_events(&branch_id, Some(0), Some(100))
+        .get_branch_events(&branch_id, Some(0), None)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     let graph = timeline_engine::build_dependency_graph(&events);
