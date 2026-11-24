@@ -97,6 +97,8 @@ export const DOMAIN_BENCHES: ReadonlySet<Bench> = new Set<Bench>(["sketch", "ass
 
 let workingBench: Bench | null = null;
 let workingFrom: string | null = null;
+/** True once the agent's own calls (or a bench entry) have set the context. */
+let workingTouched = false;
 let shapeTools: ReadonlySet<string> = new Set();
 
 /** The tools that make or change a part (set once by surface.ts from the create/modify modules). */
@@ -110,9 +112,11 @@ export function noteWorkingCall(name: string): void {
   if (DOMAIN_BENCHES.has(bench)) {
     workingBench = bench;
     workingFrom = name;
+    workingTouched = true;
   } else if (shapeTools.has(name)) {
     workingBench = null;
     workingFrom = name;
+    workingTouched = true;
   }
 }
 
@@ -120,6 +124,18 @@ export function noteWorkingCall(name: string): void {
 export function noteBenchEntered(bench: Bench | null): void {
   workingBench = bench !== null && DOMAIN_BENCHES.has(bench) ? bench : null;
   workingFrom = bench === null ? null : `workbench('${bench}')`;
+  workingTouched = true;
+}
+
+/**
+ * Where a NEW session starts: the domain the document's own state names
+ * (an open, current study). Applies only before the agent's own calls have
+ * set the context -- they always win.
+ */
+export function seedWorkingContext(bench: Bench, from: string): void {
+  if (workingTouched) return;
+  workingBench = bench;
+  workingFrom = from;
 }
 
 /** The current working context: the domain bench (or null = the part) and what set it. */
@@ -131,6 +147,7 @@ export function workingContext(): { bench: Bench | null; from: string | null } {
 export function resetWorkingContext(): void {
   workingBench = null;
   workingFrom = null;
+  workingTouched = false;
 }
 
 export class ToolTable implements ToolHost {

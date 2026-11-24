@@ -27,9 +27,9 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { BASE, AUTH_HEADERS, bindSessionDocument, ID_SPACES_INSTRUCTIONS } from "./core.js";
+import { BASE, AUTH_HEADERS, api, bindSessionDocument, ID_SPACES_INSTRUCTIONS } from "./core.js";
 import { RegisteredTool, canonicalJson, fnv1a64hex } from "./registry.js";
-import { setRegistryWarning } from "./metatools.js";
+import { setRegistryWarning, setDocumentContextProbe, type DocumentStudy } from "./metatools.js";
 import { fetchLiveDefs, loadCheckedInDefs, type ServedRegistry } from "./served.js";
 import {
   buildTableWithControls,
@@ -91,6 +91,16 @@ if (served === null) {
   console.error(`roshera-mcp: ${served.tools.length} backend-defined tools from ${served.source}.`);
 }
 const { table, workbench } = buildTableWithControls(served);
+// Where this session starts: the document's open study, read once on the
+// first find_tool (metatools.ts). A 404 (no study) or an unreachable backend
+// is "no context" -- never a guess.
+setDocumentContextProbe(async (): Promise<DocumentStudy> => {
+  try {
+    return (await api("GET", "/api/agent/sim/session")) as DocumentStudy;
+  } catch {
+    return null;
+  }
+});
 
 // ── 2. Mount the active surface onto the live server ─────────────────────────
 // Default = minimal-complete (core verbs + workbench/cad_program + 3 meta-tools);

@@ -31,6 +31,7 @@ import {
   toolJsonSchema,
   estimateTokens,
   workingContext,
+  seedWorkingContext,
   Bench,
 } from "./registry.js";
 import { ok, fail } from "./core.js";
@@ -525,6 +526,44 @@ export function inferredDomain(query: string): { bench: Bench; words: string[] }
   return hits.length === 1 ? hits[0] : null;
 }
 
+// ─── Where a new session starts: the document's own state ───────────────────
+//
+// A new session (a new in-app agent tab) knows nothing of the work already in
+// the document. The probe reads the document's open study once per session;
+// a current one (part unchanged since) makes the study the starting context.
+// The probe is installed by the server's entry point (index.ts) and is null
+// in the test harness, so no test depends on whatever document is open.
+
+/** The document's open study, as the backend reports it, or null when none. */
+export type DocumentStudy = { stage?: string; solid?: number; stale?: boolean } | null;
+let documentProbe: (() => Promise<DocumentStudy>) | null = null;
+let documentChecked = false;
+
+export function setDocumentContextProbe(probe: (() => Promise<DocumentStudy>) | null): void {
+  documentProbe = probe;
+}
+
+/** Ask the document again (a new session; tests). */
+export function resetDocumentContext(): void {
+  documentChecked = false;
+}
+
+async function seedFromDocument(): Promise<void> {
+  if (documentChecked || documentProbe === null) return;
+  documentChecked = true;
+  try {
+    const study = await documentProbe();
+    if (study && study.stale === false) {
+      seedWorkingContext(
+        "simulate",
+        `the document's open study (stage ${study.stage ?? "?"}, part ${study.solid ?? "?"})`,
+      );
+    }
+  } catch {
+    // Unreachable backend or no study: no context -- never a guess.
+  }
+}
+
 /** Words that add no intent to a bare verb ("solve it again now"). */
 const FILLER = new Set(["again", "now", "once", "go", "ahead", "then", "next", "ok", "okay"].map(stem));
 
@@ -761,6 +800,7 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
           token_estimate: e ? estimateTokens(e) : 0,
         };
       };
+      await seedFromDocument();
       const ctx = workingContext();
 
       // A bare verb ("solve it") means what it means in the working context.

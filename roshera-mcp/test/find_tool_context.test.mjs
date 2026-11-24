@@ -207,6 +207,56 @@ for (const [query, expected] of [
   else fail(`"${q}" was read as study work: ${first(r)} ${JSON.stringify(r.context ?? {})}`);
 }
 
+// (x10) frozen 2026-11-24 before the code: a NEW session starts where the
+// document's work is -- an open, current study makes the study the context
+// until the agent's own calls say otherwise.
+console.log("(x10) a new session starts in the document's open study");
+{
+  const { setDocumentContextProbe, resetDocumentContext } = await import("./.build/metatools.js");
+  const fresh = async (probe) => {
+    resetWorkingContext();
+    resetDocumentContext();
+    setDocumentContextProbe(probe);
+  };
+
+  await fresh(async () => ({ stage: "setup", solid: 2, stale: false }));
+  let r = await find("run it");
+  if (first(r) === "sim_static" && /study/.test(r.resolved_by ?? "")) pass(`open study: "run it" -> sim_static (${r.resolved_by})`);
+  else fail(`open study: "run it" -> ${first(r)} / ${r.resolved_by}`);
+
+  await fresh(async () => ({ stage: "result", solid: 2, stale: true }));
+  r = await find("solve it");
+  if (r.ambiguous) pass("a stale study (the part changed since) sets no context: 'solve it' stays ambiguous");
+  else fail(`stale study: ${first(r)} ${r.resolved_by ?? ""}`);
+
+  await fresh(async () => null); // no study in the document
+  r = await find("solve it");
+  if (r.ambiguous) pass("no study: 'solve it' stays ambiguous");
+  else fail(`no study: ${first(r)}`);
+
+  await fresh(async () => ({ stage: "setup", solid: 2, stale: false }));
+  noteWorkingCall("psketch_constrain"); // the agent's own work comes first
+  r = await find("solve it");
+  if (first(r) === "psketch_solve") pass("the agent's own sketch call outranks the document's study");
+  else fail(`own call vs document: ${first(r)} / ${r.resolved_by}`);
+
+  let asked = 0;
+  await fresh(async () => { asked += 1; return { stage: "mesh", solid: 2, stale: false }; });
+  await find("run it");
+  await find("run it");
+  if (asked === 1) pass("the document is asked once per session");
+  else fail(`document asked ${asked} times`);
+
+  await fresh(async () => { throw new Error("backend down"); });
+  r = await find("solve it");
+  if (r.ambiguous) pass("an unreachable backend sets no context (never a guess)");
+  else fail(`probe error: ${first(r)}`);
+
+  setDocumentContextProbe(null);
+  resetDocumentContext();
+  resetWorkingContext();
+}
+
 console.log("(x6) a resolved verb costs one match");
 {
   resetWorkingContext();
