@@ -7,7 +7,7 @@
  * transport; it only builds the in-memory table.
  */
 
-import { ToolTable, RegisteredTool, estimateTokens } from "./registry.js";
+import { ToolTable, RegisteredTool, estimateTokens, setShapeTools } from "./registry.js";
 import { registerMetaTools } from "./metatools.js";
 import { Workbench, registerWorkbenchTool } from "./workbench.js";
 import { registerCadProgram } from "./cad_program.js";
@@ -133,8 +133,13 @@ export function buildTableWithControls(served: ServedRegistry | null = loadCheck
   registerPerceptionTools(table);
   registerInspectTools(table);
   registerQueryTools(table);
+  // The tools that make or change a part, read from the modules that register
+  // them (never listed by hand): a call to one puts the working context back
+  // on the part (registry.ts, noteWorkingCall).
+  const beforeShape = new Set(table.names());
   registerCreateTools(table);
   registerModifyTools(table);
+  setShapeTools(table.names().filter((n) => !beforeShape.has(n)));
   registerPsketchTools(table);
   registerIoTools(table);
   registerTimelineTools(table);

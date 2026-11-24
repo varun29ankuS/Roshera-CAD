@@ -23,6 +23,7 @@ import {
   Bench,
   metaFor,
   estimateTokens,
+  noteBenchEntered,
 } from "./registry.js";
 import type { SurfaceMode } from "./surface.js";
 import { ok } from "./core.js";
@@ -319,6 +320,7 @@ export class Workbench {
 
     this.apply(toEnable, toDisable);
     this.active = target;
+    noteBenchEntered(target);
 
     const st = this.status();
     const caveat =

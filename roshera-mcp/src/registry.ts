@@ -79,6 +79,59 @@ function isZodSchema(v: unknown): v is z.ZodTypeAny {
   );
 }
 
+// ─── The session's WORKING CONTEXT (find_tool reads it) ─────────────────────
+//
+// What the agent is doing right now, as a domain: the bench it entered, or the
+// domain of its last WORKING call -- a sketch, assembly, drawing or simulate
+// tool. A call that makes or changes a part (the create/modify tools) puts the
+// context back on the part (null). Every other call -- a render, a list, a
+// lookup, a question to the person, a checkpoint -- leaves it as it was: a read
+// in the middle of a study does not end the study. find_tool uses it to give a
+// word the meaning it has in that domain ("solve it" in a study is sim_static;
+// "fix the bottom face" there is a support), so the same calls followed by the
+// same query always give the same answer.
+
+/** The benches that are a DOMAIN of work (a context), not a cross-cutting aid. */
+export const DOMAIN_BENCHES: ReadonlySet<Bench> = new Set<Bench>(["sketch", "assembly", "drawing", "simulate"]);
+
+let workingBench: Bench | null = null;
+let workingFrom: string | null = null;
+let shapeTools: ReadonlySet<string> = new Set();
+
+/** The tools that make or change a part (set once by surface.ts from the create/modify modules). */
+export function setShapeTools(names: Iterable<string>): void {
+  shapeTools = new Set(names);
+}
+
+/** Record one dispatched call's effect on the working context. */
+export function noteWorkingCall(name: string): void {
+  const { bench } = metaFor(name);
+  if (DOMAIN_BENCHES.has(bench)) {
+    workingBench = bench;
+    workingFrom = name;
+  } else if (shapeTools.has(name)) {
+    workingBench = null;
+    workingFrom = name;
+  }
+}
+
+/** Entering a bench sets the context to it; core_only clears it. */
+export function noteBenchEntered(bench: Bench | null): void {
+  workingBench = bench !== null && DOMAIN_BENCHES.has(bench) ? bench : null;
+  workingFrom = bench === null ? null : `workbench('${bench}')`;
+}
+
+/** The current working context: the domain bench (or null = the part) and what set it. */
+export function workingContext(): { bench: Bench | null; from: string | null } {
+  return { bench: workingBench, from: workingFrom };
+}
+
+/** Back to no context (tests; a fresh session starts here). */
+export function resetWorkingContext(): void {
+  workingBench = null;
+  workingFrom = null;
+}
+
 export class ToolTable implements ToolHost {
   private readonly tools = new Map<string, RegisteredTool>();
 
@@ -149,6 +202,7 @@ export class ToolTable implements ToolHost {
         recordDispatchOutcome(t.name, args, decision.refusal, turn);
         return decision.refusal;
       }
+      noteWorkingCall(t.name);
       let result = await rawHandler(args, extra, decision);
       if (decision.preflight && decision.preflight.length > 0) {
         result = attachGatePreflightGaps(result, decision.preflight);

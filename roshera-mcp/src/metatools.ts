@@ -30,6 +30,8 @@ import {
   metaFor,
   toolJsonSchema,
   estimateTokens,
+  workingContext,
+  Bench,
 } from "./registry.js";
 import { ok, fail } from "./core.js";
 
@@ -429,12 +431,59 @@ function sheetContextTokens(table: ToolTable): Set<string> {
   return context;
 }
 
+// ─── Meaning in context: the ontology's first slice ──────────────────────────
+//
+// A generic verb names a different tool in each domain: "solve" is the sketch
+// solver in a sketch, the mate solver in an assembly and the study's run in a
+// strength study. Ranking words cannot tell them apart -- the domain can. This
+// table is that knowledge as DATA (word -> meaning per domain), so it can move
+// into the ontology/graph store unchanged; test/find_tool_context.test.mjs
+// checks every tool it names exists in the bench it is listed under. `core` is
+// the part's own meaning: used when no domain is in use, or when the domain
+// gives the verb none.
+export const VERB_MEANINGS: Record<string, { words: string[]; means: Partial<Record<Bench, string>> }> = {
+  solve: {
+    words: ["solve"],
+    means: { sketch: "psketch_solve", assembly: "assembly_solve", simulate: "sim_static" },
+  },
+  run: { words: ["run"], means: { simulate: "sim_static" } },
+  verify: {
+    words: ["verify", "certify", "validate"],
+    means: { core: "verify_part", sketch: "psketch_certify", assembly: "assembly_certify" },
+  },
+  export: { words: ["export"], means: { core: "export_part", drawing: "drawing_export_sheet" } },
+};
+
+/** Words that add no intent to a bare verb ("solve it again now"). */
+const FILLER = new Set(["again", "now", "once", "go", "ahead", "then", "next", "ok", "okay"].map(stem));
+
+/** The order benches are listed in when a word is ambiguous between them. */
+const BENCH_ORDER: Bench[] = ["core", "sketch", "assembly", "drawing", "analysis", "simulate", "labels", "timeline", "meta"];
+
+/** The verb a query consists of (filler aside), if it is one of VERB_MEANINGS'. */
+function bareVerbOf(query: string): string | null {
+  const toks = tokenize(query).filter((t) => !FILLER.has(t));
+  if (toks.length !== 1) return null;
+  for (const [verb, { words }] of Object.entries(VERB_MEANINGS))
+    if (words.some((w) => stem(w) === toks[0])) return verb;
+  return null;
+}
+
+/**
+ * A tool in the working context's bench outranks one outside it by this
+ * factor: in a study, "fix the bottom face as the support" is a support
+ * (sim_setup), not a face pick. Context lifts; it does not override a
+ * clearly stronger match elsewhere ("export the part as stl" stays export_part).
+ */
+const W_CONTEXT = 1.25;
+
 /** Rank the whole table against a query; deterministic total order. */
 export function rankTools(
   table: ToolTable,
   query: string,
   benchFilter?: string,
   limit = 5,
+  contextBench: Bench | null = null,
 ): Scored[] {
   const queryTokens = tokenize(query);
   const queryCreates = queryTokens.some((t) => CREATE_VERB_STEMS.has(t));
@@ -455,6 +504,7 @@ export function rankTools(
     let score = scoreTool(entry, queryTokens, queryCreates, queryMutates, purposeWords, nameIdf, purposeIdf);
     // A bench filter is itself the context: the caller asked for the bench.
     if (!sheetContext && !benchFilter && isSheetVerb(entry.name)) score *= SHEET_VERB_OUT_OF_CONTEXT;
+    if (contextBench !== null && !benchFilter && bench === contextBench) score *= W_CONTEXT;
     if (score <= 0) continue;
     scored.push({
       name: entry.name,
@@ -603,7 +653,48 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
         .describe("max results (default 5)"),
     },
     async ({ query, bench, limit }) => {
-      const results = rankTools(table, query, bench, limit ?? 5);
+      const brief = (name: string) => {
+        const e = table.get(name);
+        return {
+          name,
+          bench: metaFor(name).bench,
+          purpose: gist(e?.description ?? ""),
+          token_estimate: e ? estimateTokens(e) : 0,
+        };
+      };
+      const ctx = workingContext();
+
+      // A bare verb ("solve it") means what it means in the working context.
+      const verb = bench ? null : bareVerbOf(query);
+      if (verb) {
+        const means = VERB_MEANINGS[verb].means;
+        const inDomain = ctx.bench !== null ? means[ctx.bench] : undefined;
+        const pick = inDomain ?? means.core;
+        if (pick && table.has(pick)) {
+          return okMeta({
+            query,
+            matches: [brief(pick)],
+            resolved_by: inDomain
+              ? `working in '${ctx.bench}' (${ctx.from}): '${verb}' there means ${pick}`
+              : ctx.bench !== null
+                ? `'${verb}' has no meaning in '${ctx.bench}'; the part's own: ${pick}`
+                : `no domain in use, so the part's own meaning: ${pick}`,
+            next: "invoke({name, args}); describe_tool({name}) for its arguments.",
+          });
+        }
+        const order = BENCH_ORDER.filter((b) => means[b] && table.has(means[b] as string));
+        return okMeta({
+          query,
+          ambiguous: {
+            verb,
+            means: Object.fromEntries(order.map((b) => [b, means[b]])),
+            resolve: `'${verb}' means a different tool in each domain and none is in use: enter one (workbench('${order[0]}')) or name it in the query (e.g. '${verb} the ${order[0]}').`,
+          },
+          matches: order.map((b) => brief(means[b] as string)),
+        });
+      }
+
+      const results = rankTools(table, query, bench, limit ?? 5, ctx.bench);
       if (results.length === 0) {
         return okMeta({
           query,
