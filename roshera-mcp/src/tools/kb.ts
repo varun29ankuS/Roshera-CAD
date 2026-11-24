@@ -277,6 +277,18 @@ const PLAYBOOK_META: Record<string, PlaybookMeta> = {
     certification:
       "kernel verdicts: verify_part soundness, part_features hole sizes, verify_claim volume, gdt_fcf flatness and position per hole (RFS), dfm_check when FDM. NOT kernel verdicts: ISO 2768 general tolerances, edge-distance adequacy (a table comparison against EN 1993-1-8, not a load rating), threads, surface finish, and CNC/laser/waterjet process rules.",
   },
+  // The strength-study skill (2026-11-24, authored in kb_data.ts): the staged
+  // study walked through with the person -- held once here instead of being
+  // repeated in every sim_* tool's purpose.
+  strength_study: {
+    tool_sequence: [
+      "verify_part", "sim_session", "guide_attention", "sim_mesh", "ask_choice",
+      "sim_materials", "sim_setup", "ask_choice", "sim_static",
+    ],
+    section: "strength-study skill 2026-11-24",
+    certification:
+      "kernel verdicts: the set-up check (the part cannot move under the supports; the loads are consistent), the force balance, the mesh-to-mesh convergence and the solved-on-the-approved-mesh check. Engine results (Gmsh mesh, CalculiX solve) are interim engines' numbers, named as such. NOT verdicts: the supports, loads, material and safety factor (the person's facts), a TYPICAL yield (indicative only), and fatigue, buckling, contact, plasticity, dynamics and temperature -- never claimed.",
+  },
 };
 
 const KB_DOC = "policy KB (vault Research/2026-07-31-policy-knowledge-base.md)";
@@ -296,7 +308,9 @@ export function registerKbTools(server: ToolHost): void {
       "real MCP tools in order; part-family playbooks (aerofoil_section, " +
       "sheet_metal_bracket, mounting_plate) also carry a worked_example; " +
       "manufacturing_drawing = the drafting skill (purpose, ISO sheet/views/" +
-      "dimensions/tolerances, the review loop) — read it BEFORE make_drawing. kind " +
+      "dimensions/tolerances, the review loop) — read it BEFORE make_drawing; " +
+      "strength_study = the staged FEA study walked through with the person " +
+      "(mesh, set-up, run, report) — read it BEFORE sim_mesh. kind " +
       "'reference' = cited engineering data: clearance_hole (bolt clearance " +
       "diameter, ISO 273), tap_drill (tap drill size for a thread), " +
       "general_tolerance (ISO 2768 band), fit_class (ISO 286 hole/shaft fit " +

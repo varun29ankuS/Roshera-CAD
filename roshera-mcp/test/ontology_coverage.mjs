@@ -262,7 +262,7 @@ console.log("(o5) MCP↔backend bench parity (parsed from agent_registry.rs, no 
   }
 
   if (rustSource !== null) {
-    const BENCH_WORDS = ["Core", "Sketch", "Assembly", "Drawing", "Analysis", "Labels", "Timeline"];
+    const BENCH_WORDS = ["Core", "Sketch", "Assembly", "Drawing", "Analysis", "Simulate", "Labels", "Timeline"];
     const T_CALL = new RegExp(
       `^[ \\t]*t\\(\\s*[\\r\\n]+[ \\t]*"([a-zA-Z0-9_]+)",[ \\t]*[\\r\\n]+[ \\t]*(${BENCH_WORDS.join("|")}),`,
       "gm",

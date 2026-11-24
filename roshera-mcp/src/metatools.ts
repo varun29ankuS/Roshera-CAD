@@ -85,7 +85,15 @@ const SYNONYM_GROUPS: string[][] = [
   ["section", "slice", "cutaway"],
   ["label", "name", "tag", "annotate", "call"],
   ["export", "save", "write"],
-  ["import", "load", "open"],
+  // "load" is NOT here: in a CAD tool a load is a force ("strong enough under
+  // load" ranked import_step first). "load the step file" still finds
+  // import_step through "step" and "file".
+  ["import", "open"],
+  // A strength study's set-up words (2026-11-24): what pushes on the part...
+  ["load", "force", "push", "pull", "press", "newton"],
+  // ...and what holds it.
+  ["support", "fixture", "restrain", "restraint", "held", "hold", "anchor"],
+  ["material", "alloy", "steel", "aluminium", "aluminum", "titanium", "grade"],
   ["shell", "hollow", "wall"],
   ["move", "translate", "shift", "reposition", "transform", "nudge", "rotate", "rotation", "reorient"],
   ["collide", "collision", "interference", "clash"],
@@ -538,6 +546,37 @@ export async function validateOp(
 
 // ─── Registration ────────────────────────────────────────────────────────────
 
+/** Most characters a purpose's gist keeps in a search result. */
+const GIST_MAX = 200;
+/** A first sentence shorter than this runs on into the next. */
+const GIST_MIN_SENTENCE = 30;
+
+/**
+ * A purpose's gist: its first sentence, at most GIST_MAX characters (cut at a
+ * word, marked with an ellipsis). What a search result or the catalog shows;
+ * describe_tool shows the whole purpose.
+ */
+export function gist(purpose: string, max: number = GIST_MAX): string {
+  const text = purpose.trim();
+  // A sentence ends at . ! ? before a space or the end -- not after an
+  // abbreviation ("e.g.", "i.e.", "vs.", "etc.") or inside a decimal. A first
+  // sentence too short to say what the tool does ("THE FULL CERTIFICATE.")
+  // runs on into the next.
+  let end = -1;
+  for (const m of text.matchAll(/[.!?](?=\s|$)/g)) {
+    const before = text.slice(0, m.index);
+    if (/(\be\.g|\bi\.e|\bvs|\betc|\bcf)$/i.test(before)) continue;
+    if (m.index + 1 < GIST_MIN_SENTENCE) continue;
+    end = m.index;
+    break;
+  }
+  const first = end >= 0 ? text.slice(0, end + 1) : text;
+  if (first.length <= max) return first;
+  const cut = first.slice(0, max);
+  const space = cut.lastIndexOf(" ");
+  return (space > max / 2 ? cut.slice(0, space) : cut).replace(/[\s,;:(—-]+$/, "") + "…";
+}
+
 export function registerMetaTools(host: ToolHost, table: ToolTable): void {
   host.tool(
     "find_tool",
@@ -552,7 +591,7 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
         .min(1)
         .describe("what you want to do, e.g. 'drill a bolt circle' or 'measure two faces'"),
       bench: z
-        .enum(["core", "sketch", "assembly", "drawing", "analysis", "labels", "timeline", "meta"])
+        .enum(["core", "sketch", "assembly", "drawing", "analysis", "simulate", "labels", "timeline", "meta"])
         .optional()
         .describe("restrict results to one bench"),
       limit: z
@@ -577,13 +616,17 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
       }
       return okMeta({
         query,
+        // The ranking reads every word of each purpose; the RESULT carries
+        // only its gist -- a search that returned five full purposes cost up
+        // to 2.6k tokens, mostly a workflow repeated per tool. describe_tool
+        // has the whole text.
         matches: results.map((r) => ({
           name: r.name,
           bench: r.bench,
-          purpose: r.purpose,
+          purpose: gist(r.purpose),
           token_estimate: r.token_estimate,
         })),
-        next: "describe_tool({name}) for the full schema, then invoke({name, args}) to run it.",
+        next: "describe_tool({name}) for the full purpose and schema, then invoke({name, args}) to run it. workbench('catalog') lists every tool by bench.",
       });
     },
   );

@@ -65,6 +65,17 @@ console.log("(d) HASH: TS FNV-1a-64 reproduces canonical reference vectors");
     pass("canonicalJson sorts keys recursively, compact");
   else fail(`canonicalJson wrong: ${canon}`);
 
+  // The cross-language fixture pinned on BOTH sides (agent_registry.rs test
+  // registry_hash_is_over_sorted_keys_and_matches_the_mcp): rows built with
+  // keys out of order hash to the same value the kernel serves.
+  const xfix = canonicalJson([
+    { name: "b_tool", bench: "core", input_schema: { type: "object", properties: { z: { type: "number" }, a: { type: "string" } } } },
+    { purpose: "x", name: "a_tool" },
+  ]);
+  if (fnv1a64hex(xfix) === "b8293979858e86f0")
+    pass("cross-language registry fixture hashes to the kernel's pinned value");
+  else fail(`cross-language fixture hash ${fnv1a64hex(xfix)} != b8293979858e86f0`);
+
   // Independent BigInt reference of FNV-1a-64 — the "Rust-computed vector by
   // hand from the algorithm". Cross-checks the production impl on a registry-
   // shaped fixture and pins the value.

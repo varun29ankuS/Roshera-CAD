@@ -35,7 +35,7 @@ use tower::ServiceExt;
 /// branching/certification). The registry MUST classify every tool into
 /// exactly one of these.
 const ALLOWED_BENCHES: &[&str] = &[
-    "core", "sketch", "assembly", "drawing", "analysis", "labels", "timeline",
+    "core", "sketch", "assembly", "drawing", "analysis", "simulate", "labels", "timeline",
 ];
 
 /// The tool names `roshera-mcp` classifies today, read from ITS OWN table.

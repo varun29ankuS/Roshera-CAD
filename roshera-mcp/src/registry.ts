@@ -198,6 +198,7 @@ export type Bench =
   | "assembly"
   | "drawing"
   | "analysis"
+  | "simulate"
   | "labels"
   | "timeline"
   | "meta";
@@ -383,11 +384,11 @@ const BENCH_OF: Record<string, Bench> = {
   // A linear static study (POST /api/agent/parts/{id}/sim/static): set-up
   // checks, mesh, solve, a verdict with its evidence. Reads the part, writes
   // nothing.
-  sim_mesh: "analysis",
-  sim_setup: "analysis",
-  sim_static: "analysis",
-  sim_session: "analysis",
-  sim_materials: "analysis",
+  sim_mesh: "simulate",
+  sim_setup: "simulate",
+  sim_static: "simulate",
+  sim_session: "simulate",
+  sim_materials: "simulate",
   kb_lookup: "analysis",
   ground_truth: "analysis",
   measure_faces: "analysis",

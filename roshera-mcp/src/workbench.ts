@@ -26,6 +26,7 @@ import {
 } from "./registry.js";
 import type { SurfaceMode } from "./surface.js";
 import { ok } from "./core.js";
+import { gist } from "./metatools.js";
 
 /** The user-facing `workbench(mode)` argument. */
 export type WorkbenchMode =
@@ -33,10 +34,12 @@ export type WorkbenchMode =
   | "assembly"
   | "drawing"
   | "analysis"
+  | "simulate"
   | "labels"
   | "timeline"
   | "core_only"
-  | "status";
+  | "status"
+  | "catalog";
 
 /** The benches a `workbench` call can switch between (core/meta are always on). */
 export const SWITCHABLE_BENCHES: Bench[] = [
@@ -44,6 +47,7 @@ export const SWITCHABLE_BENCHES: Bench[] = [
   "assembly",
   "drawing",
   "analysis",
+  "simulate",
   "labels",
   "timeline",
 ];
@@ -118,6 +122,34 @@ export interface WorkbenchResult extends WorkbenchStatus {
   switched: boolean;
   exposed_bench_tools: string[];
   notice: string;
+}
+
+/** Most characters of a tool's purpose the catalog shows (the map stays ~4k tokens). */
+const CATALOG_GIST_MAX = 90;
+
+/** What each bench is FOR, in one line -- the catalog's headings. */
+export const BENCH_PURPOSE: Record<Bench, string> = {
+  core: "Make, combine, change, inspect and certify parts; always live.",
+  sketch: "Constrained 2D sketches (psketch_*), solved and certified, then extruded or revolved.",
+  assembly: "Place part instances, mate them, solve and count freedoms, check interference.",
+  drawing: "Manufacturing drawings: views, dimensions, GD&T, the sheet's layout and its review.",
+  analysis: "Ask the geometry: measure, probe, find features, check manufacturability, look up cited engineering data.",
+  simulate: "Strength studies (FEA), walked through with the person: mesh -> supports, loads, material -> run -> verdict.",
+  labels: "Names on faces and edges, the shared notebook, and questions to the person.",
+  timeline: "History: checkpoints, undo/redo, branches, merge, scrub, certified recipes.",
+  meta: "Find, describe and run any tool: find_tool, describe_tool, invoke.",
+};
+
+export interface WorkbenchCatalog {
+  active_bench: string;
+  tool_count: number;
+  benches: Array<{
+    bench: Bench;
+    for: string;
+    tool_count: number;
+    tools: Array<{ name: string; does: string; live?: boolean }>;
+  }>;
+  how: string;
 }
 
 export class Workbench {
@@ -216,7 +248,35 @@ export class Workbench {
    * with an honest notice; in `minimal` mode it flips the live toolset and
    * always carries the client-capability caveat (spec honesty §3.5).
    */
-  enter(mode: WorkbenchMode): WorkbenchResult {
+  /**
+   * The MAP of the whole surface: every bench, what it is for, and each of
+   * its tools with the gist of what it does -- so an agent can see what
+   * exists instead of guessing search words. Changes nothing.
+   */
+  catalog(): WorkbenchCatalog {
+    const order: Bench[] = ["core", ...SWITCHABLE_BENCHES, "meta"];
+    const live = new Set(this.exposedNames());
+    const benches = order.map((b) => {
+      const tools = this.benchToolNames(b).map((name) => {
+        const e = this.table.get(name);
+        return {
+          name,
+          does: gist(e?.description ?? "", CATALOG_GIST_MAX),
+          ...(live.has(name) || b === "meta" ? { live: true } : {}),
+        };
+      });
+      return { bench: b, for: BENCH_PURPOSE[b], tool_count: tools.length, tools };
+    });
+    return {
+      active_bench: this.active ?? "core_only",
+      tool_count: this.table.size,
+      benches,
+      how: "Tools marked live are callable directly. Any other tool: workbench('<bench>') makes its bench live, or invoke({name, args}) runs it now (describe_tool({name}) shows its arguments). find_tool searches by intent.",
+    };
+  }
+
+  enter(mode: WorkbenchMode): WorkbenchResult | WorkbenchCatalog {
+    if (mode === "catalog") return this.catalog();
     if (mode === "status") {
       return {
         ...this.status(),
@@ -293,27 +353,22 @@ export class Workbench {
 export function registerWorkbenchTool(host: ToolHost, wb: Workbench): void {
   host.tool(
     "workbench",
-    "Switch the LIVE toolset to a CAD workbench — an attention optimization, " +
-      "never a capability gate (find_tool/describe_tool/invoke reach every tool " +
-      "in any mode). Entering a bench adds its tools to the always-on core+meta " +
-      "surface and retires the previous bench. modes: 'sketch' (psketch_*), " +
-      "'assembly', 'drawing' (dimensions/GD&T), 'analysis' (queries/ground_truth), " +
-      "'labels' (labels + the shared human-visible notebook), 'timeline' " +
-      "(history/branch/merge/moulds), 'core_only' (retire the bench), 'status' " +
-      "(active bench, exposed count, token bill).",
+    "The MAP and the benches. 'catalog' lists every tool by bench with what it does -- start here. Entering a bench makes its tools live beside core+meta and retires the previous one (attention only: invoke runs any tool in any mode). Benches: sketch, assembly, drawing (dimensions/GD&T), analysis (measure/probe/DFM/knowledge), simulate (strength studies), labels (labels/notebook/questions), timeline (history/branches). 'core_only' retires the bench; 'status' = live count + token bill.",
     {
       mode: z
         .enum([
+          "catalog",
           "sketch",
           "assembly",
           "drawing",
           "analysis",
+          "simulate",
           "labels",
           "timeline",
           "core_only",
           "status",
         ])
-        .describe("bench to enter, 'core_only' to retire the bench, or 'status'"),
+        .describe("'catalog' for the map, a bench to enter, 'core_only' to retire the bench, or 'status'"),
     },
     async ({ mode }) => ok(wb.enter(mode as WorkbenchMode)),
   );

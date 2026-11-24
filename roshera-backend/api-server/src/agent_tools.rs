@@ -55,7 +55,7 @@ const DEFINITION_FILES: &[(&str, &str)] =
 
 /// The benches a definition may declare (the same set as `agent_registry`).
 const BENCHES: &[&str] = &[
-    "core", "sketch", "assembly", "drawing", "analysis", "labels", "timeline",
+    "core", "sketch", "assembly", "drawing", "analysis", "simulate", "labels", "timeline",
 ];
 
 #[derive(Debug, Clone, Deserialize)]

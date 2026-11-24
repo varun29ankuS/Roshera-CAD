@@ -24,12 +24,12 @@
 import {
   buildTableWithControls,
   MINIMAL_SURFACE,
-} from "../dist/surface.js";
+} from "./.build/surface.js";
 import {
   Workbench,
   SWITCHABLE_BENCHES,
   LIVE_SURFACE_CEILING,
-} from "../dist/workbench.js";
+} from "./.build/workbench.js";
 
 let failures = 0;
 const fail = (m) => {
@@ -94,8 +94,16 @@ console.log("(w1) WORKBENCH status shape");
     // gdt_dimensional_delete).
     // 19 -> 20 (2026-11-20): drawing_spaces.
     // 20 -> 21 (2026-11-20): drawing_look.
-    drawing: 21,
+    // 21 -> 27 (2026-11-24 repin): the six layout verbs (drawing_move_dimension,
+    // drawing_align, drawing_move_view, drawing_reattach_leader,
+    // drawing_remove_view, drawing_remove_dimension) landed 2026-11-20 with the
+    // ceiling raised to 58 but this pin left at 21 -- this file was in no npm
+    // script; it now runs in test:gates.
+    drawing: 27,
+    // 14 -> 19 (sim_* landed 2026-11-23) -> 14 (2026-11-24): the five sim_*
+    // tools moved to their own 'simulate' bench.
     analysis: 14,
+    simulate: 5,
     labels: 11,
     // 15 -> 16 (2026-08-11, task #10): `recipe_get` — retrieval of a
     // certified past build as a re-parameterizable plan. History/
@@ -318,6 +326,10 @@ function installBoxMock({ failBoxAt = 0 } = {}) {
         text: async () =>
           JSON.stringify({
             object: { id: `uuid-${state.boxPosts}` },
+            // The kernel's embedded certificate: an uncertified body reads NO
+            // VERDICT (core.ts perceptionFromBody), never SOUND from validity.
+            sound: true,
+            cert: { sound: true, brep_valid: true, watertight: true, manifold: true, boundary_edges: 0, nonmanifold_edges: 0 },
             valid: true,
             watertight: true,
             face_count: 6,

@@ -260,15 +260,11 @@ export function registerInspectTools(server: ToolHost) {
   // the person's Simulate tab; each names the revision it builds on, and the
   // kernel refuses a stage that does not build on the current one -- a run is
   // always of the set-up the person last saw.
+  // The walk-through lives ONCE, in the strength_study playbook: repeated in
+  // every sim_* purpose it made each search hit cost 400-900 tokens.
   const STUDY_FLOW =
-    "A strength study is walked through WITH the person, one stage at a time: " +
-    "(0) guide_attention({action:'workspace', mode:'simulate'}) so they watch it; " +
-    "(1) sim_mesh -- the mesh appears on the part; ask_choice whether it is right " +
-    "(e.g. 'Looks right' / 'Finer' / 'Coarser'), re-mesh until they approve; " +
-    "(2) sim_setup with the mesh stage's revision -- supports (blue) and loads " +
-    "(orange arrows) appear on the part; ask_choice whether they are right, " +
-    "including anything you assumed; (3) sim_static with the set-up's revision. " +
-    "Never skip an ask. Units mm, N, MPa.";
+    "The person approves each stage before the next: read " +
+    "kb_lookup({kind:'playbook', key:'strength_study'}) before the first stage. Units mm, N, MPa.";
   const supportsSchema = z
     .array(
       z.object({
@@ -351,8 +347,9 @@ export function registerInspectTools(server: ToolHost) {
 
   server.tool(
     "sim_setup",
-    "STRENGTH STUDY, STAGE 2 -- SET-UP: how the part is held, what loads it, what it " +
-      "is made of and the safety factor it must reach. Checked by the kernel exactly " +
+    "STRENGTH STUDY, STAGE 2 -- SET-UP: how the part is held (supports: fixed, " +
+      "bolted, pinned, sliding faces), the forces on its faces, what it is made of " +
+      "and the safety factor it must reach. Checked by the kernel exactly " +
       "as the run will check it (refused with 'sim_part_can_move' and the free " +
       "motions in words when the supports leave it free), then drawn on the part " +
       "(supports blue, loads as orange arrows). Must name the MESH stage's revision; " +
@@ -421,7 +418,8 @@ export function registerInspectTools(server: ToolHost) {
 
   server.tool(
     "sim_materials",
-    "The built-in MATERIAL LIBRARY for a strength study: each material's stiffness " +
+    "The built-in MATERIAL LIBRARY for a strength study (steels, aluminium alloys and " +
+      "more): each material's stiffness " +
       "(E, Poisson) and yield, where each comes from, and whether the yield is a " +
       "SPECIFIED MINIMUM (a standard's floor -- fit for a design check) or TYPICAL (a " +
       "data-sheet average, not a design minimum). Offer these to the person with " +

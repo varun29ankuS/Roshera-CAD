@@ -59,6 +59,7 @@ pub enum Bench {
     Analysis,
     Labels,
     Timeline,
+    Simulate,
 }
 
 impl Bench {
@@ -71,6 +72,7 @@ impl Bench {
             Bench::Analysis => "analysis",
             Bench::Labels => "labels",
             Bench::Timeline => "timeline",
+            Bench::Simulate => "simulate",
         }
     }
 }
@@ -1822,7 +1824,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "sim_mesh",
-            Analysis,
+            Simulate,
             Experimental,
             Curated,
             "Strength study, stage 1 of 3, MESH: make the study's two meshes (coarse, and the fine one the stress is read from; mesher Gmsh, interim) without solving, and show the fine one on the part in the person's Simulate tab. Starts a new study in this document; returns the counts, the size, the distance to the true surface and the revision sim_setup must name. Open the Simulate tab first (guide_attention, mode simulate) and ask the person whether the mesh is right before stage 2. Refused if the part is stale or unsound.",
@@ -1842,7 +1844,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "sim_setup",
-            Analysis,
+            Simulate,
             Experimental,
             Curated,
             "Strength study, stage 2 of 3, SET-UP: supports, loads, material and the safety factor, checked exactly as the run will check them (refused with the free motions in words when the part can still move) and drawn on the part (supports blue, loads as orange arrows). Must name the mesh stage's revision; returns the revision sim_static must name. Ask the person whether the set-up is right before stage 3. Units mm, N, MPa; never invent a material value or source.",
@@ -1862,7 +1864,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "sim_static",
-            Analysis,
+            Simulate,
             Experimental,
             Curated,
             "Strength study, stage 3 of 3, RUN: solve exactly the set-up the person approved (named by sim_setup's revision) on the mesh they approved, twice (coarse + fine, CalculiX), and answer with a verdict only the evidence supports: holds / fails against the safety factor, or undecided with the reason (supports do not carry the load; peak stress did not converge; no yield with a source). Adds the check 'solved on the mesh you approved'. Refused (409) when the study has moved on since that revision.",
@@ -1877,7 +1879,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "sim_materials",
-            Analysis,
+            Simulate,
             Experimental,
             Curated,
             "The built-in material library for a strength study: each material's stiffness (E, Poisson) and yield, where each comes from, and whether the yield is a specified minimum (a standard's floor, fit for a design check) or typical (a data-sheet average, not a design minimum). Offer them to the person; pass the chosen values, the yield source and the yield basis to sim_setup.",
@@ -1888,7 +1890,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "sim_session",
-            Analysis,
+            Simulate,
             Experimental,
             Curated,
             "Read this document's current strength study: stage (mesh / setup / result), part, revision, the mesh, the set-up and the result, whoever drove it. Pick a study up where it was left instead of asking the person again for what is recorded; stale: the part changed since.",
@@ -2194,11 +2196,11 @@ fn raw_tools() -> Vec<ToolSpec> {
             Core,
             Stable,
             Curated,
-            "Switch the LIVE toolset to a CAD workbench — an attention optimization, never a capability gate (find_tool/describe_tool/invoke reach every tool in any mode). Entering a bench adds its tools to the always-on core+meta surface and retires the previous bench. modes: 'sketch' (psketch_*), 'assembly', 'drawing' (dimensions/GD&T), 'analysis' (queries/ground_truth), 'labels' (labels + the shared human-visible notebook), 'timeline' (history/branch/merge/moulds), 'core_only' (retire the bench), 'status' (active bench, exposed count, token bill).",
+            "The MAP and the benches. 'catalog' lists every tool by bench with what it does -- start here. Entering a bench makes its tools live beside core+meta and retires the previous one (attention only: invoke runs any tool in any mode). Benches: sketch, assembly, drawing (dimensions/GD&T), analysis (measure/probe/DFM/knowledge), simulate (strength studies), labels (labels/notebook/questions), timeline (history/branches). 'core_only' retires the bench; 'status' = live count + token bill.",
             json!({
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "enum": ["sketch", "assembly", "drawing", "analysis", "labels", "timeline", "core_only", "status"], "description": "bench to enter, 'core_only' to retire the bench, or 'status'"}
+                    "mode": {"type": "string", "enum": ["catalog", "sketch", "assembly", "drawing", "analysis", "simulate", "labels", "timeline", "core_only", "status"], "description": "'catalog' for the map, a bench to enter, 'core_only' to retire the bench, or 'status'"}
                 },
                 "required": ["mode"],
                 "additionalProperties": false
@@ -2301,6 +2303,37 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// The value with every object's keys in sorted order, at every depth.
+///
+/// The drift hash is defined over SORTED keys (the MCP recomputes it the same
+/// way). `serde_json::Map` keeps INSERTION order whenever any crate in the
+/// build enables serde_json's `preserve_order` feature (feature unification),
+/// so the order `to_string` emits cannot be assumed; it is imposed here.
+/// Inserting keys in sorted order yields sorted output for both map backings.
+fn sorted_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for k in keys {
+                if let Some(v) = map.get(k) {
+                    out.insert(k.clone(), sorted_keys(v));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// FNV-1a-64 over the canonical JSON (sorted keys, compact) of `value`.
+fn canonical_hash(value: &Value) -> u64 {
+    let canonical = serde_json::to_string(&sorted_keys(value)).unwrap_or_default();
+    fnv1a_64(canonical.as_bytes())
+}
+
 /// Build the served registry `Value`. Deterministic except for `generated_at`.
 fn build_registry() -> Value {
     // Kernel-served descriptions: for `SchemaSource::Kernel` rows, pull the
@@ -2368,11 +2401,7 @@ fn build_registry() -> Value {
             .cmp(b.get("name").and_then(Value::as_str).unwrap_or(""))
     });
 
-    // Canonical bytes for the drift hash: serde_json's Map is a BTreeMap (no
-    // `preserve_order` feature in this workspace), so `to_string` emits keys in
-    // sorted order at every nesting level — the array is already canonical.
-    let canonical = serde_json::to_string(&Value::Array(tools.clone())).unwrap_or_default();
-    let registry_hash = format!("{:016x}", fnv1a_64(canonical.as_bytes()));
+    let registry_hash = format!("{:016x}", canonical_hash(&Value::Array(tools.clone())));
 
     // Per-bench counts — a cheap disclosure of the surface's shape.
     let mut bench_counts = serde_json::Map::new();
@@ -2384,6 +2413,7 @@ fn build_registry() -> Value {
         Bench::Analysis,
         Bench::Labels,
         Bench::Timeline,
+        Bench::Simulate,
     ] {
         let n = tools
             .iter()
@@ -2425,7 +2455,7 @@ mod tests {
     #[test]
     fn every_tool_has_an_allowed_bench_and_unique_name() {
         let allowed = [
-            "core", "sketch", "assembly", "drawing", "analysis", "labels", "timeline",
+            "core", "sketch", "assembly", "drawing", "analysis", "labels", "timeline", "simulate",
         ];
         let tools = raw_tools();
         let mut seen = std::collections::HashSet::new();
@@ -2603,5 +2633,46 @@ mod tests {
         let hb = b.get("registry_hash").and_then(Value::as_str).unwrap_or("");
         assert_eq!(ha, hb, "hash must be stable across builds");
         assert_eq!(ha.len(), 16, "fnv1a-64 hash renders as 16 hex chars");
+    }
+
+    /// The hash is over SORTED keys whatever order the rows were built in --
+    /// the MCP recomputes it over sorted keys, and pins this same fixture to
+    /// the same value (roshera-mcp/test/scale_s2.mjs). With serde_json's
+    /// `preserve_order` unified into the build, hashing `to_string` directly
+    /// gave the insertion order and the MCP could never reproduce the hash.
+    #[test]
+    fn registry_hash_is_over_sorted_keys_and_matches_the_mcp() {
+        let rows = json!([
+            {
+                "name": "b_tool",
+                "bench": "core",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "z": { "type": "number" }, "a": { "type": "string" } }
+                }
+            },
+            { "purpose": "x", "name": "a_tool" }
+        ]);
+        assert_eq!(
+            serde_json::to_string(&sorted_keys(&rows)).unwrap_or_default(),
+            r#"[{"bench":"core","input_schema":{"properties":{"a":{"type":"string"},"z":{"type":"number"}},"type":"object"},"name":"b_tool"},{"name":"a_tool","purpose":"x"}]"#
+        );
+        assert_eq!(
+            format!("{:016x}", canonical_hash(&rows)),
+            "b8293979858e86f0"
+        );
+    }
+
+    /// The served hash is reproducible from the served tools by sorting keys:
+    /// exactly what the MCP does on connect.
+    #[test]
+    fn served_registry_hash_reproduces_from_its_own_tools() {
+        let reg = build_registry();
+        let served = reg
+            .get("registry_hash")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tools = reg.get("tools").cloned().unwrap_or(Value::Null);
+        assert_eq!(served, format!("{:016x}", canonical_hash(&tools)));
     }
 }
