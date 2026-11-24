@@ -109,7 +109,8 @@ console.log("(w1) WORKBENCH status shape");
     // certified past build as a re-parameterizable plan. History/
     // certification concern, same bench as the rest of the family.
     // 16 -> 17 (2026-11-24): timeline_dependencies.
-    timeline: 17,
+    // 17 -> 18 (2026-11-24): timeline_material_change.
+    timeline: 18,
   };
   for (const [bench, expected] of Object.entries(EXPECTED_BENCH_COUNTS)) {
     const got = st.benches[bench];
@@ -131,16 +132,16 @@ console.log("(w1b) WORKBENCH: 'timeline' is switchable (history/branching/certif
   else fail(`SWITCHABLE_BENCHES missing 'timeline': ${SWITCHABLE_BENCHES.join(",")}`);
 
   const timelineTools = workbench.benchToolNames("timeline");
-  if (timelineTools.length === 17)
+  if (timelineTools.length === 18)
     pass(`timeline bench holds exactly 16 tools: ${timelineTools.join(",")}`);
-  else fail(`timeline bench holds ${timelineTools.length} tools, expected 17: ${timelineTools.join(",")}`);
+  else fail(`timeline bench holds ${timelineTools.length} tools, expected 18: ${timelineTools.join(",")}`);
 
   // index.ts pre-mounts every switchable-bench tool (disabled) at startup so a
   // later enable() has a real handle to flip — a tool missing from this set
   // would report switched=true while nothing actually becomes live.
   const preMounted = new Set(workbench.allSwitchableBenchTools());
   const allPreMounted = timelineTools.every((n) => preMounted.has(n));
-  if (allPreMounted) pass("all 17 timeline tools are in allSwitchableBenchTools() (pre-mount set)");
+  if (allPreMounted) pass("all 18 timeline tools are in allSwitchableBenchTools() (pre-mount set)");
   else fail(`timeline tools missing from allSwitchableBenchTools(): ${timelineTools.filter((n) => !preMounted.has(n)).join(",")}`);
 
   const r = workbench.enter("timeline");
@@ -160,9 +161,9 @@ console.log("(w1b) WORKBENCH: 'timeline' is switchable (history/branching/certif
   // the arithmetic); it is now the honest count.
   // +14 -> +15 (2026-08-11, task #10): recipe_get is the 16th timeline tool
   // and is NOT core-resident, so it adds one to the on-top-of-core count.
-  if (r.exposed_count === MINIMAL_SURFACE.length + 16)
-    pass(`timeline exposed_count = ${r.exposed_count} = MINIMAL_SURFACE(${MINIMAL_SURFACE.length}) + 16 (17 timeline tools, 1 already core-resident)`);
-  else fail(`timeline exposed_count ${r.exposed_count} ≠ ${MINIMAL_SURFACE.length + 16}`);
+  if (r.exposed_count === MINIMAL_SURFACE.length + 17)
+    pass(`timeline exposed_count = ${r.exposed_count} = MINIMAL_SURFACE(${MINIMAL_SURFACE.length}) + 17 (18 timeline tools, 1 already core-resident)`);
+  else fail(`timeline exposed_count ${r.exposed_count} ≠ ${MINIMAL_SURFACE.length + 17}`);
 
   const back = workbench.enter("core_only");
   const afterCore = new Set(workbench.exposedNames());

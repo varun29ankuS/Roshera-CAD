@@ -280,6 +280,7 @@ const READ_ONLY = new Set<string>([
   "timeline_scrub",
   "rebuild_certificate",
   "timeline_dependencies",
+  "timeline_material_change",
   "label_list",
   "label_resolve",
   "lens_explain",

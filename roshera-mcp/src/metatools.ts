@@ -177,6 +177,11 @@ const PHRASES: Array<[RegExp, string]> = [
   [/\bwhat\s+else\s+(?:rebuilds?|changes?|updates?|breaks?|moves?)\b/g, " dependencies downstream "],
   [/\b(?:down|up)stream(?:\s+of)?\b/g, " dependencies downstream "],
   [/\bdepends?\s+on\b|\bdependen(?:t|ts|cy|cies)\b/g, " dependencies downstream "],
+  // What an edit did to the solid (timeline_material_change): "what did the
+  // fillet remove", "the part before and after the cut". Not "diff" or
+  // "difference" alone -- a boolean difference and a branch diff use them.
+  [/\bwhat\s+did\s+(?:the|that|this|my|it)?\s*(?:\w+\s+)?(?:remove|add|take\s+away|cut\s+away|cut|change|do\s+to)\b/g, " material change "],
+  [/\bbefore\s+and\s+after\b/g, " material change "],
   // "step 6" is a step of the history, never the STEP file format.
   [/\bstep\s+\d+\b/g, " event "],
   // A number followed by N / kN is a force ("push with 200 N"): the unit

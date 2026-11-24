@@ -11998,6 +11998,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/timeline/dependency-graph/{branch_id}",
             get(crate::handlers::timeline::get_dependency_graph),
         )
+        .route(
+            "/api/timeline/material-change/{branch_id}",
+            get(crate::handlers::timeline::get_material_change),
+        )
         // Task #10 — RECIPES FROM LINEAGE. Projects a proven build's event
         // log into a retrievable, re-parameterizable PLAN: ordered op kinds,
         // their RECORDED parameters, the intent recorded on each event, the

@@ -218,6 +218,30 @@ export function registerTimelineTools(server: ToolHost) {
   );
 
   server.tool(
+    "timeline_material_change",
+    "WHAT AN EDIT DID TO THE MATERIAL: where material was added or removed " +
+      "between two steps (from_seq -> to_seq) -- each region's centre, extent, " +
+      "estimated volume and the surface that bounds it (a drilled hole: " +
+      "'removed', Cylinder) -- plus both states' EXACT volumes. Measured on the " +
+      "exact solid; region sizes are estimates at the stated cell size, and a " +
+      "change thinner than a cell shows only in the exact volume change. Read-only.",
+    {
+      branch: z.string().default("main").describe("timeline branch id ('main' = trunk)"),
+      from_seq: z.number().int().describe("the earlier step (sequence number, timeline_dependencies)"),
+      to_seq: z.number().int().describe("the later step"),
+      n: z.number().int().optional().describe("cells along the longest axis (4..48, default 24): finer = smaller changes seen, slower"),
+    },
+    async ({ branch, from_seq, to_seq, n }) => {
+      try {
+        const qs = `from=${from_seq}&to=${to_seq}${n !== undefined ? `&n=${n}` : ""}`;
+        return ok(await api("GET", `/api/timeline/material-change/${encodeURIComponent(branch)}?${qs}`));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
     "timeline_scrub",
     "Look at the scene AS OF a past event — non-destructive (live scene " +
       "untouched). Returns object count + mesh stats at that moment.",

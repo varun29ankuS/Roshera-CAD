@@ -257,6 +257,20 @@ console.log("(x10) a new session starts in the document's open study");
   resetWorkingContext();
 }
 
+// (x11) frozen 2026-11-24 before timeline_material_change existed.
+console.log("(x11) a question about what an edit did finds the material-change tool");
+for (const query of [
+  "where did material change between step 6 and step 9",
+  "what did the fillet remove",
+  "diff the part before and after the cut",
+]) {
+  resetWorkingContext();
+  await bench("core_only");
+  const r = await find(query);
+  if (first(r) === "timeline_material_change") pass(`"${query}" -> timeline_material_change`);
+  else fail(`"${query}" -> ${first(r)} (${(r.matches ?? []).map((m) => m.name).join(", ")})`);
+}
+
 console.log("(x6) a resolved verb costs one match");
 {
   resetWorkingContext();

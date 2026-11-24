@@ -835,6 +835,7 @@ fn describe_operation(method: &Method, path: &str, body: Option<&Value>) -> Opti
         ["timeline", "branch", "create"] if post => "create branch",
         ["timeline", "branch", "switch", _] if post => "switch branch",
         ["timeline", "dependency-graph", _] if get => "dependency-graph query",
+        ["timeline", "material-change", _] if get => "material change query",
         ["timeline", "rebuild-certificate", _] if get => "rebuild certificate",
         ["branches"] if post => "create branch",
         ["branches"] if get => "list branches",

@@ -73,7 +73,7 @@ impl OccupancyGrid {
 /// envelope) rather than the `&mut`-requiring `Solid::bounding_box`, so the
 /// whole query stays on a read lock. `None` if the solid contributes no
 /// geometry.
-fn solid_world_box(model: &BRepModel, solid_id: SolidId) -> Option<(Point3, Point3)> {
+pub(crate) fn solid_world_box(model: &BRepModel, solid_id: SolidId) -> Option<(Point3, Point3)> {
     let solid = model.solids.get(solid_id)?;
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);

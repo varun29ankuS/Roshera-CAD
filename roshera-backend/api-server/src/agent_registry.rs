@@ -821,6 +821,23 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "timeline_material_change",
+            Timeline,
+            Experimental,
+            Curated,
+            "What an edit did to the material: where material was added or removed between two steps (each region's centre, extent, estimated volume and bounding surface kind) plus both states' exact volumes. Measured on the exact solid; region sizes are estimates at the stated cell size. Read-only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "branch": {"type": "string", "default": "main"},
+                    "from_seq": {"type": "integer"},
+                    "to_seq": {"type": "integer"},
+                    "n": {"type": "integer"}
+                },
+                "required": ["from_seq", "to_seq"]
+            }),
+        ),
+        t(
             "timeline_scrub",
             Timeline,
             Experimental,
@@ -2564,7 +2581,9 @@ mod tests {
         // 124 -> 125 (2026-11-23): sim_materials -- the cited material library.
         // 125 -> 126 (2026-11-24): timeline_dependencies -- the feature graph and
         // what an edit would rebuild, for the agent.
-        assert_eq!(tools.len(), 126, "expected 126 tools, got {}", tools.len());
+        // 126 -> 127 (2026-11-24): timeline_material_change -- where material
+        // changed between two steps, on the exact solid.
+        assert_eq!(tools.len(), 127, "expected 127 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2581,7 +2600,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 138, "126 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 139, "127 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");

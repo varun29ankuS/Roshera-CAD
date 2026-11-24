@@ -6780,6 +6780,72 @@ async fn live_bore_radius(state: &AppState) -> Option<f64> {
     best
 }
 
+/// `GET /api/timeline/material-change/{branch}` (2026-11-24): where material
+/// changed between two steps, from the rebuilt states. A box, then a
+/// cylinder, then their difference: from the box's step to the cut's step,
+/// exactly one region is REMOVED, bounded by a cylinder, and the exact volume
+/// fell by the hole's pi r^2 h. Refused, never guessed: from >= to, and an
+/// unknown step.
+#[tokio::test]
+async fn material_change_between_two_steps_finds_the_drilled_hole() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+    let (_, dg) = dispatch(&state, json_get("/api/timeline/dependency-graph/main")).await;
+    let nodes = dg["nodes"].as_array().cloned().unwrap_or_default();
+    let seq_of = |kind: &str| {
+        nodes
+            .iter()
+            .find(|n| {
+                n["operation_type"]
+                    .as_str()
+                    .is_some_and(|k| k.contains(kind))
+            })
+            .and_then(|n| n["sequence_number"].as_u64())
+            .unwrap_or_else(|| panic!("no '{kind}' step in {nodes:?}"))
+    };
+    // "Before" is the step just before the cylinder: a live box is recorded as
+    // create (centred on the origin) THEN placed, so its create step is not
+    // yet the block the hole is drilled in.
+    let (block, cut) = (seq_of("cylinder") - 1, seq_of("boolean"));
+
+    let (s, body) = dispatch(
+        &state,
+        json_get(&format!(
+            "/api/timeline/material-change/main?from={block}&to={cut}&n=20"
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    let regions = body["regions"].as_array().cloned().unwrap_or_default();
+    assert_eq!(regions.len(), 1, "one change: {body}");
+    assert_eq!(regions[0]["kind"], "removed", "{body}");
+    let surface = regions[0]["surface"].as_str().unwrap_or("").to_lowercase();
+    assert!(surface.contains("cylind"), "named by its wall: {body}");
+    // r = 3 through a 20 mm block: the exact volume falls by pi * 9 * 20.
+    let exact = std::f64::consts::PI * 9.0 * 20.0;
+    let dv = body["volume_change_mm3"].as_f64().unwrap_or(0.0);
+    assert!(
+        (dv + exact).abs() / exact < 0.01,
+        "exact volume change {dv} vs -{exact}: {body}"
+    );
+    assert!(
+        body["cell_mm"].as_f64().unwrap_or(0.0) > 0.0,
+        "the cell size is stated"
+    );
+
+    for (q, why) in [
+        (format!("from={cut}&to={block}"), "from must be earlier"),
+        (format!("from={block}&to=9999"), "unknown step"),
+    ] {
+        let (s, body) = dispatch(
+            &state,
+            json_get(&format!("/api/timeline/material-change/main?{q}")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{why}: {body}");
+    }
+}
+
 /// RED→GREEN (2026-11-24) — the dependency graph covers the WHOLE branch. The
 /// handler read only the first 100 events (`Some(100)`), silently: on a longer
 /// history every later feature, and every edge into it, was missing, and a

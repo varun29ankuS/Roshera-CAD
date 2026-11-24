@@ -1926,6 +1926,155 @@ fn assemble_subtree(
     Some(node)
 }
 
+/// Query string for [`get_material_change`].
+#[derive(Deserialize)]
+pub struct MaterialChangeQuery {
+    /// The earlier step (sequence number).
+    pub from: u64,
+    /// The later step.
+    pub to: u64,
+    /// Cells along the longest axis (kernel clamps to 4..=48; default 24).
+    pub n: Option<usize>,
+}
+
+/// Exact volume of every solid in `model`, summed (mass properties).
+fn total_volume(model: &mut geometry_engine::primitives::topology_builder::BRepModel) -> f64 {
+    let ids: Vec<_> = model.solids.iter().map(|(sid, _)| sid).collect();
+    ids.into_iter()
+        .filter_map(|sid| model.mass_properties_for(sid).map(|r| r.volume))
+        .sum()
+}
+
+fn round3(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
+}
+
+/// `GET /api/timeline/material-change/{branch}?from=&to=&n=` -- where the
+/// material changed between two steps of the history.
+///
+/// Both steps are rebuilt from the recorded events (the scrubber's replay)
+/// and compared by `geometry_engine::queries::change::material_change`: each
+/// sample's inside/outside is the EXACT signed distance; region extents,
+/// centres and volumes are estimates at the stated cell size. The two
+/// states' EXACT volumes (mass properties) ride along, because the grid
+/// alone never proves "no change": a change thinner than a cell falls
+/// between samples, and a moved hole changes no volume. Refused, never
+/// guessed: an unknown step, `from >= to`, or a step whose history does not
+/// rebuild cleanly. Regions name a surface KIND and a world point -- never a
+/// face id, which would belong to the rebuilt scratch model, not the live one.
+pub async fn get_material_change(
+    State(state): State<AppState>,
+    Path(branch_ref): Path<String>,
+    Query(q): Query<MaterialChangeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let _ = state.timeline_recorder.settle().await;
+    let mut all = {
+        let timeline = state.timeline.read().await;
+        let branch_id = resolve_branch_ref_typed(&branch_ref)?;
+        timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| branch_has_no_history(&branch_ref))?
+    };
+    all.sort_by_key(|e| e.sequence_number);
+    let last = all.last().map(|e| e.sequence_number);
+    let step = |seq: u64| all.iter().any(|e| e.sequence_number == seq);
+    if q.from >= q.to {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "from ({}) must be an earlier step than to ({})",
+                q.from, q.to
+            ),
+        ));
+    }
+    for seq in [q.from, q.to] {
+        if !step(seq) {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "no step {seq} on branch '{branch_ref}' (its steps run to {})",
+                    last.map_or("none".to_string(), |s| s.to_string())
+                ),
+            ));
+        }
+    }
+    let before: Vec<_> = all
+        .iter()
+        .filter(|e| e.sequence_number <= q.from)
+        .cloned()
+        .collect();
+    let after: Vec<_> = all
+        .iter()
+        .filter(|e| e.sequence_number <= q.to)
+        .cloned()
+        .collect();
+    let n = q.n.unwrap_or(24);
+    let (from, to) = (q.from, q.to);
+
+    let frames = state.frames.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let (mut a, out_a, _) = frames.replay(&before);
+        let (mut b, out_b, _) = frames.replay(&after);
+        for (seq, out) in [(from, &out_a), (to, &out_b)] {
+            if out.events_skipped > 0 {
+                let why = out
+                    .first_failure
+                    .as_ref()
+                    .map(|f| format!("{f:?}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "step {seq} does not rebuild cleanly ({} event(s) refused on replay: {why}); \
+                     the state is not what the history says, so it is not compared",
+                    out.events_skipped
+                ));
+            }
+        }
+        let change = geometry_engine::queries::change::material_change(&a, &b, n);
+        let va = total_volume(&mut a);
+        let vb = total_volume(&mut b);
+        Ok((change, va, vb))
+    })
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            ErrorCode::Internal,
+            "material change: the comparison failed",
+        )
+    })?;
+    let (change, va, vb) = result.map_err(|why| ApiError::new(ErrorCode::InvalidParameter, why))?;
+
+    let dv = vb - va;
+    let h = change.cell;
+    let tol = 1e-6 * va.abs().max(vb.abs()) + 1e-9;
+    let note = if !change.regions.is_empty() {
+        format!("regions located at cell {:.3} mm: their extents and volumes are estimates at that size; the volumes above are exact", h)
+    } else if dv.abs() > tol {
+        format!("the exact volume changed by {:.3} mm3, but by less than the cell size {:.3} mm: re-ask with a larger n", dv, h)
+    } else {
+        format!("no difference detected at cell {:.3} mm and no volume change -- a change thinner than the cell would not show", h)
+    };
+    let pt = |p: geometry_engine::math::Point3| [round3(p.x), round3(p.y), round3(p.z)];
+    Ok(Json(serde_json::json!({
+        "branch": branch_ref,
+        "from": { "seq": from, "volume_mm3": round3(va) },
+        "to": { "seq": to, "volume_mm3": round3(vb) },
+        "volume_change_mm3": round3(dv),
+        "cell_mm": round3(h),
+        "regions": change.regions.iter().map(|r| serde_json::json!({
+            "kind": match r.kind {
+                geometry_engine::queries::change::ChangeKind::Added => "added",
+                geometry_engine::queries::change::ChangeKind::Removed => "removed",
+            },
+            "center": pt(r.center),
+            "min": pt(r.min),
+            "max": pt(r.max),
+            "volume_estimate_mm3": round3(r.volume_estimate),
+            "surface": r.surface,
+        })).collect::<Vec<_>>(),
+        "note": note,
+    })))
+}
+
 /// One node of the read-only dependency-graph projection.
 #[derive(Serialize)]
 pub struct DepGraphNode {

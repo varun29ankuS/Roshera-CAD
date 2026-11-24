@@ -128,6 +128,10 @@ surfaces, not a mesh). Call each one directly with invoke, with no find_tool rou
 - Are there hidden voids or thin walls anywhere? Use
   `invoke({name: 'occupancy_view', args: {part_id}})`. It is a slice-by-slice X-ray of the
   exact solid.
+- What did that edit actually do to the material? Use
+  `invoke({name: 'timeline_material_change', args: {from_seq, to_seq}})`, with the steps
+  before and after the edit (timeline_dependencies lists them). It returns each region added
+  or removed, with the surface that bounds it, plus both exact volumes.
 - How far apart are two parts? `invoke({name: 'part_distance', args: {part_a, part_b}})`
   measures their bounding boxes. That is an estimate, never an exact clearance between
   curved faces, so say so when you report it.
