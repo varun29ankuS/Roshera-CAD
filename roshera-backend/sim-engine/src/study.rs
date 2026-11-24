@@ -16,6 +16,9 @@ pub struct Study {
     pub goal: Goal,
     #[serde(default)]
     pub mesh: MeshControl,
+    /// How closely the meshes must agree (defaults: 2 % movement, 5 % stress).
+    #[serde(default)]
+    pub accuracy: Accuracy,
 }
 
 /// How a set of faces is held.
@@ -90,6 +93,57 @@ pub struct Goal {
 pub struct MeshControl {
     #[serde(default)]
     pub size_mm: Option<f64>,
+    /// Elements around a full circle on curved faces; `None`: 12; 0: off.
+    #[serde(default)]
+    pub curve_elements: Option<u32>,
+    /// Finer elements near chosen faces (a fillet, a hole edge).
+    #[serde(default)]
+    pub local: Vec<LocalSize>,
+    /// Refine at the stress peak until it settles; `None`: yes.
+    #[serde(default)]
+    pub refine_at_peak: Option<bool>,
+    /// At most this many refinements at the peak; `None`: 3.
+    #[serde(default)]
+    pub max_refinements: Option<usize>,
+    /// No refinement past this many nodes; `None`: 150 000 (a laptop).
+    #[serde(default)]
+    pub node_budget: Option<usize>,
+}
+
+/// Elements of at most `size_mm` near `faces`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalSize {
+    pub faces: Vec<u32>,
+    pub size_mm: f64,
+}
+
+/// How closely the meshes must agree for an answer to stand.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Accuracy {
+    /// The largest movement on the last two meshes, apart by at most this
+    /// fraction (0.02 = 2 %).
+    #[serde(default = "displacement_tolerance")]
+    pub displacement: f64,
+    /// The peak stress on the last two meshes, apart by at most this.
+    #[serde(default = "stress_tolerance")]
+    pub stress: f64,
+}
+
+fn displacement_tolerance() -> f64 {
+    0.02
+}
+
+fn stress_tolerance() -> f64 {
+    0.05
+}
+
+impl Default for Accuracy {
+    fn default() -> Self {
+        Accuracy {
+            displacement: displacement_tolerance(),
+            stress: stress_tolerance(),
+        }
+    }
 }
 
 /// The fine mesh's size as a share of the coarse mesh's.

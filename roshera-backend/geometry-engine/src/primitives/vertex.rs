@@ -166,9 +166,23 @@ impl SpatialHashKey {
     }
 }
 
+/// The vertices a running operation may weld to: its operands' own, and any
+/// it makes itself (every id at or above `watermark`). While set, every
+/// lookup in [`VertexStore`] skips a coincident vertex outside it and makes a
+/// fresh one -- so an operation on one solid never welds to another solid that
+/// merely sits at the same place (two identical L-brackets built in one spot
+/// shared corner vertices, and a fillet on one then broke the other).
+#[derive(Debug, Clone)]
+pub struct VertexReuseScope {
+    pub operands: std::collections::HashSet<VertexId>,
+    pub watermark: VertexId,
+}
+
 /// Vertex storage with advanced features
 #[derive(Debug)]
 pub struct VertexStore {
+    /// Set while an operation on named solids runs (`VertexReuseScope`).
+    reuse_scope: Option<VertexReuseScope>,
     /// X coordinates packed together (SIMD-friendly)
     x_coords: Vec<f64>,
     /// Y coordinates packed together (SIMD-friendly)
@@ -219,6 +233,7 @@ impl VertexStore {
             tolerances: Vec::with_capacity(capacity),
             spatial_hash: DashMap::with_capacity(capacity / 4), // Smaller spatial hash
             attributes: DashMap::new(),
+            reuse_scope: None,
             next_id: AtomicU32::new(0),
             grid_size: tolerance * 10.0, // Grid size based on tolerance
             enable_deduplication: tolerance > 1e-10, // Disable for very small tolerances
@@ -238,6 +253,7 @@ impl VertexStore {
             tolerances: Vec::with_capacity(capacity),
             spatial_hash: DashMap::new(), // Empty spatial hash
             attributes: DashMap::new(),
+            reuse_scope: None,
             next_id: AtomicU32::new(0),
             grid_size: 0.0,
             enable_deduplication: false,
@@ -273,6 +289,7 @@ impl VertexStore {
             tolerances: self.tolerances.clone(),
             spatial_hash,
             attributes,
+            reuse_scope: self.reuse_scope.clone(),
             next_id: AtomicU32::new(self.next_id.load(Ordering::Acquire)),
             grid_size: self.grid_size,
             enable_deduplication: self.enable_deduplication,
@@ -294,8 +311,8 @@ impl VertexStore {
         // Fast linear search through vertices for deduplication
         // This is much faster than DashMap for small numbers of vertices (like primitive creation)
         for i in 0..self.x_coords.len() {
-            // Skip deleted vertices
-            if self.flags[i] & VertexFlags::DELETED != 0 {
+            // Skip deleted vertices, and any the running operation may not reuse.
+            if self.flags[i] & VertexFlags::DELETED != 0 || !self.may_reuse(i) {
                 continue;
             }
 
@@ -320,6 +337,25 @@ impl VertexStore {
         self.add_unchecked_with_tolerance(x, y, z, tolerance)
     }
 
+    /// Limit every lookup to the vertices `scope` admits (`None`: all), and
+    /// return the scope that was in force, so nested operations restore it.
+    pub fn set_reuse_scope(&mut self, scope: Option<VertexReuseScope>) -> Option<VertexReuseScope> {
+        std::mem::replace(&mut self.reuse_scope, scope)
+    }
+
+    /// Whether a lookup may return vertex slot `i` under the current scope.
+    fn may_reuse(&self, i: usize) -> bool {
+        match &self.reuse_scope {
+            None => true,
+            Some(s) => i as VertexId >= s.watermark || s.operands.contains(&(i as VertexId)),
+        }
+    }
+    /// The id the next vertex added will get: every vertex made after this
+    /// call has an id at or above it.
+    pub fn next_vertex_id(&self) -> VertexId {
+        self.next_id.load(Ordering::Relaxed)
+    }
+
     /// Add vertex with full deduplication (use sparingly - expensive)
     ///
     /// Coincidence ball is `max(caller, stored)` per vertex (see
@@ -335,6 +371,9 @@ impl VertexStore {
         if let Some(candidates_ref) = self.spatial_hash.get(&key) {
             for &id in candidates_ref.value().iter() {
                 let idx = id as usize;
+                if !self.may_reuse(idx) {
+                    continue;
+                }
                 let dx = self.x_coords[idx] - x;
                 let dy = self.y_coords[idx] - y;
                 let dz = self.z_coords[idx] - z;
@@ -383,6 +422,9 @@ impl VertexStore {
             if let Some(candidates) = self.spatial_hash.get(&key) {
                 for &id in candidates.iter() {
                     let idx = id as usize;
+                    if !self.may_reuse(idx) {
+                        continue;
+                    }
                     let dx = self.x_coords[idx] - x;
                     let dy = self.y_coords[idx] - y;
                     let dz = self.z_coords[idx] - z;

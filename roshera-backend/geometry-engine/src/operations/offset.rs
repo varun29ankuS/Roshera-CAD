@@ -107,7 +107,10 @@ pub fn offset_face(
     if options.common.validate_before {
         lifecycle::validate_can_apply(model, OpSpec::OffsetFace { face_id })?;
     }
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = lifecycle::operand_vertices(model, &OpSpec::OffsetFace { face_id });
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         // Validate inputs
         validate_offset_face_inputs(model, face_id, &options)?;
 
@@ -172,7 +175,10 @@ pub fn offset_solid(
     if options.common.validate_before {
         lifecycle::validate_can_apply(model, OpSpec::OffsetSolid { solid_id })?;
     }
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = lifecycle::operand_vertices(model, &OpSpec::OffsetSolid { solid_id });
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         offset_solid_body(model, solid_id, thickness, faces_to_remove, options)
     })
 }

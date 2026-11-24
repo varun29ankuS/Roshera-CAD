@@ -371,7 +371,11 @@ pub fn fillet_edges(
     // before the blend can refuse; left in place, that change is in the live
     // model but in no recorded event, so the model and its replay disagree.
     let before = crate::primitives::snapshot::ModelSnapshot::take(model);
+    // Weld only to this part's own vertices: a coincident vertex of another
+    // part (an identical bracket in the same place) is never reused.
+    let prior_scope = model.begin_vertex_reuse_scope(&[solid_id]);
     let result = fillet_edges_unguarded(model, solid_id, edges, options);
+    model.end_vertex_reuse_scope(prior_scope);
     if result.is_err() {
         before.restore(model);
     }

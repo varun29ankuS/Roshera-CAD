@@ -930,6 +930,85 @@ impl BRepModel {
         swept
     }
 
+    // --- Vertex reuse scope (solids at one place stay independent) ---
+
+    /// Every vertex of `solids` (all their shells' faces' loops).
+    pub fn solid_vertices(&self, solids: &[SolidId]) -> std::collections::HashSet<VertexId> {
+        let mut out = std::collections::HashSet::new();
+        for &s in solids {
+            let Some(solid) = self.solids.get(s) else {
+                continue;
+            };
+            let shells: Vec<ShellId> = std::iter::once(solid.outer_shell)
+                .chain(solid.inner_shells.iter().copied())
+                .chain(solid.peer_shells.iter().copied())
+                .collect();
+            for sh in shells {
+                let Some(shell) = self.shells.get(sh) else {
+                    continue;
+                };
+                for &f in &shell.faces {
+                    let Some(face) = self.faces.get(f) else {
+                        continue;
+                    };
+                    for l in
+                        std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied())
+                    {
+                        let Some(lp) = self.loops.get(l) else {
+                            continue;
+                        };
+                        for &e in &lp.edges {
+                            if let Some(edge) = self.edges.get(e) {
+                                out.insert(edge.start_vertex);
+                                out.insert(edge.end_vertex);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Limit vertex welding, until [`Self::end_vertex_reuse_scope`], to
+    /// `solids`' own vertices and to vertices made from now on: no lookup in
+    /// the vertex store returns another solid's coincident vertex. Returns
+    /// the scope in force before, for `end_vertex_reuse_scope` to restore
+    /// (operations nest: a fillet may run a boolean).
+    pub fn begin_vertex_reuse_scope(
+        &mut self,
+        solids: &[SolidId],
+    ) -> Option<crate::primitives::vertex::VertexReuseScope> {
+        let operands = self.solid_vertices(solids);
+        self.begin_vertex_reuse_scope_with(operands)
+    }
+
+    /// [`Self::begin_vertex_reuse_scope`] for an explicit vertex set (an
+    /// operation's operands, see `lifecycle::operand_vertices`).
+    pub fn begin_vertex_reuse_scope_with(
+        &mut self,
+        operands: std::collections::HashSet<VertexId>,
+    ) -> Option<crate::primitives::vertex::VertexReuseScope> {
+        // Nested: the inner operation may still reuse what the outer one made.
+        let prior = self.vertices.set_reuse_scope(None);
+        let watermark = self.vertices.next_vertex_id();
+        let watermark = prior
+            .as_ref()
+            .map_or(watermark, |p| p.watermark.min(watermark));
+        self.vertices
+            .set_reuse_scope(Some(crate::primitives::vertex::VertexReuseScope {
+                operands,
+                watermark,
+            }));
+        prior
+    }
+    /// Restore the scope [`Self::begin_vertex_reuse_scope`] returned.
+    pub fn end_vertex_reuse_scope(
+        &mut self,
+        prior: Option<crate::primitives::vertex::VertexReuseScope>,
+    ) {
+        self.vertices.set_reuse_scope(prior);
+    }
     // --- Persistent-id accessors (#11, slice 40-A) ---
 
     /// Assign a [`PersistentId`] to a face, maintaining the inverse map.

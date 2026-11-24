@@ -371,7 +371,12 @@ pub fn boolean_operation(
     // op that can leave a half-split shell behind on a coplanar-face
     // degeneracy. The snapshot ensures the input solids are intact
     // on failure.
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to the operands' own vertices and to vertices this boolean
+    // makes: a coincident vertex of ANOTHER part (an identical bracket built
+    // in the same place) must never be reused, or an operation on one part
+    // reaches into the other. Lifted however the boolean returns.
+    let prior_scope = model.begin_vertex_reuse_scope(&[solid_a, solid_b]);
+    let outcome = lifecycle::with_rollback(model, move |model| {
         pipeline_trace(format_args!(
             "stage=entry op={:?} solid_a={} solid_b={}",
             operation, solid_a, solid_b,
@@ -692,6 +697,19 @@ pub fn boolean_operation(
             model.solid_pids.remove(&solid_a);
             model.set_solid_pid(result_solid, pid);
         }
+        // ...and its name: "bracket base" joined to an upright is still the
+        // bracket, not an anonymous "solid_5". B's name is taken only when
+        // A has none.
+        let name = model
+            .solids
+            .get(solid_a)
+            .and_then(|s| s.name.clone())
+            .or_else(|| model.solids.get(solid_b).and_then(|s| s.name.clone()));
+        if let (Some(name), Some(result)) = (name, model.solids.get_mut(result_solid)) {
+            if result.name.is_none() {
+                result.name = Some(name);
+            }
+        }
 
         let op_kind = match operation {
             BooleanOp::Union => "boolean_union",
@@ -841,7 +859,9 @@ pub fn boolean_operation(
         );
 
         Ok(result_solid)
-    })
+    });
+    model.end_vertex_reuse_scope(prior_scope);
+    outcome
 }
 
 /// Below this face-pair count, brute-force iteration beats the cost of

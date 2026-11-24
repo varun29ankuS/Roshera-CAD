@@ -3765,8 +3765,9 @@ pub struct SimSession {
     pub revision: String,
     pub solid: u32,
     pub stage: SimStage,
-    /// The coarse mesh size the person approved (`None`: the automatic size).
-    pub mesh_size_mm: Option<f64>,
+    /// The mesh settings the person approved (size, curvature, local sizes,
+    /// refinement at the peak): the run meshes with exactly these.
+    pub mesh_control: sim_engine::study::MeshControl,
     pub mesh: Option<sim_engine::preview::MeshPreview>,
     pub wire: Option<sim_engine::preview::MeshWire>,
     pub study: Option<sim_engine::study::Study>,
@@ -3909,31 +3910,25 @@ async fn sim_blocking<T: Send + 'static>(
     }
 }
 
-/// Body of `POST .../sim/static/mesh`.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct SimMeshRequest {
-    /// The coarse mesh's largest element, mm; absent: the automatic size.
-    #[serde(default)]
-    pub size_mm: Option<f64>,
-}
-
 /// `POST /api/agent/parts/{id}/sim/static/mesh` — STAGE 1: make the study's
 /// two meshes (coarse, and the fine one the stress is read from) without
 /// solving, and show the fine one on the part. Starts a new study session
-/// for the document. 200: `{revision, stage, solid, mesh_size_mm, mesh,
+/// for the document. Body: the mesh settings (`sim_engine::study::MeshControl`:
+/// size, curvature, local sizes, refinement at the peak). 200: `{revision,
+/// stage, solid, mesh_control, mesh,
 /// wire}`. Refused as `/sim/static` is (404, 422 stale/unsound, 503 engines).
 pub async fn part_sim_mesh(
     State(state): State<AppState>,
     crate::part_mgr::ActiveModelKeyed(model_handle, key): crate::part_mgr::ActiveModelKeyed,
     Path(id): Path<u32>,
-    Json(req): Json<SimMeshRequest>,
+    Json(control): Json<sim_engine::study::MeshControl>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if let Some(refused) = sim_gate(&model_handle, id).await {
         return refused;
     }
-    let size = req.size_mm;
+    let asked = control.clone();
     let made = sim_blocking(model_handle.clone(), move |model, engines, dir| {
-        sim_engine::preview::mesh_preview(model, id as SolidId, size, engines, dir)
+        sim_engine::preview::mesh_preview(model, id as SolidId, &asked, engines, dir)
     })
     .await;
     match made {
@@ -3942,7 +3937,7 @@ pub async fn part_sim_mesh(
                 revision: new_revision(),
                 solid: id,
                 stage: SimStage::Mesh,
-                mesh_size_mm: size,
+                mesh_control: control,
                 mesh: Some(mesh),
                 wire: Some(wire),
                 study: None,
@@ -3992,7 +3987,8 @@ pub async fn part_sim_setup(
         return refused;
     }
     let mut study = req.study;
-    study.mesh.size_mm = meshed.mesh_size_mm;
+    // The mesh is the one approved at the mesh stage, in every setting.
+    study.mesh = meshed.mesh_control.clone();
     let checked = {
         let model = model_handle.read().await;
         sim_engine::run::check_setup(&model, id as SolidId, &study)
@@ -4112,7 +4108,7 @@ pub async fn part_sim_static(
                     revision: new_revision(),
                     solid: id,
                     stage: SimStage::Result,
-                    mesh_size_mm: asked.mesh.size_mm,
+                    mesh_control: asked.mesh.clone(),
                     mesh: None,
                     wire: None,
                     study: Some(asked),

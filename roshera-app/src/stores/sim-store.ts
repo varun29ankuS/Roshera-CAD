@@ -5,8 +5,10 @@ import {
   type StepId,
   type FieldShown,
   type LoadEntry,
+  type LocalEntry,
   type MaterialEntry,
   type MeshPreview,
+  type MeshStats,
   type MeshWire,
   type Setup,
   type SimSession,
@@ -31,6 +33,9 @@ interface SimState {
   /** The server revision on screen; a new one is loaded once. */
   revision: string | null
   mesh: MeshPreview | null
+  /** The last proving mesh made, kept after a settings change clears the
+   *  mesh -- the node estimate for new settings scales from it. */
+  lastMeshFine: MeshStats | null
   wire: MeshWire | null
   setup: Setup
   report: StaticReport | null
@@ -42,8 +47,8 @@ interface SimState {
   focus: { kind: 'support' | 'load'; index: number } | null
   /** The step on screen. */
   step: StepId
-  /** The support or load whose faces the person is clicking now. */
-  picking: { kind: 'support' | 'load'; index: number } | null
+  /** The support, load or finer-here row whose faces the person is clicking now. */
+  picking: { kind: 'support' | 'load' | 'local'; index: number } | null
 
   setPart: (objectId: string | null) => void
   addSupport: (s: SupportEntry) => void
@@ -55,6 +60,13 @@ interface SimState {
   setMaterial: (m: Partial<MaterialEntry>) => void
   setGoal: (minSafetyFactor: string) => void
   setMeshSize: (meshSizeMm: string) => void
+  /** A mesh setting changed: the mesh on screen no longer matches it and is
+   *  cleared, to be made again. */
+  setMesh: (patch: Partial<Pick<Setup, 'meshSizeMm' | 'curveElements' | 'refineAtPeak' | 'maxRefinements' | 'nodeBudget'>>) => void
+  setAccuracy: (patch: Partial<Pick<Setup, 'stressPct' | 'displacementPct'>>) => void
+  addLocal: (l: LocalEntry) => void
+  updateLocal: (index: number, l: Partial<LocalEntry>) => void
+  removeLocal: (index: number) => void
   setReport: (report: StaticReport | null) => void
   show: (shown: FieldShown) => void
   setDeformed: (deformed: boolean) => void
@@ -73,6 +85,13 @@ const EMPTY_SETUP: Setup = {
   material: { name: '', youngs_modulus_mpa: '', poisson_ratio: '', yield_strength_mpa: '', source: '', yieldBasis: null },
   minSafetyFactor: '',
   meshSizeMm: '',
+  curveElements: '',
+  local: [],
+  refineAtPeak: true,
+  maxRefinements: '',
+  nodeBudget: '',
+  stressPct: '',
+  displacementPct: '',
 }
 
 /** Any change to the set-up in the panel makes what is shown stale: the
@@ -85,6 +104,7 @@ export const useSimStore = create<SimState>((set) => ({
   stage: null,
   revision: null,
   mesh: null,
+  lastMeshFine: null,
   wire: null,
   setup: EMPTY_SETUP,
   report: null,
@@ -98,7 +118,7 @@ export const useSimStore = create<SimState>((set) => ({
     set((s) =>
       s.objectId === objectId
         ? s
-        : { objectId, setup: EMPTY_SETUP, report: null, stage: null, mesh: null, wire: null, focus: null, picking: null },
+        : { objectId, setup: EMPTY_SETUP, report: null, stage: null, mesh: null, lastMeshFine: s.mesh?.fine ?? s.lastMeshFine, wire: null, focus: null, picking: null },
     ),
   addSupport: (sup) => set((s) => edit({ ...s.setup, supports: [...s.setup.supports, sup] })),
   updateSupport: (i, sup) =>
@@ -111,7 +131,19 @@ export const useSimStore = create<SimState>((set) => ({
   removeLoad: (i) => set((s) => ({ ...edit({ ...s.setup, loads: s.setup.loads.filter((_, j) => j !== i) }), focus: null })),
   setMaterial: (m) => set((s) => edit({ ...s.setup, material: { ...s.setup.material, ...m } })),
   setGoal: (minSafetyFactor) => set((s) => edit({ ...s.setup, minSafetyFactor })),
-  setMeshSize: (meshSizeMm) => set((s) => edit({ ...s.setup, meshSizeMm })),
+  setMeshSize: (meshSizeMm) => set((s) => ({ ...edit({ ...s.setup, meshSizeMm }), mesh: null, lastMeshFine: s.mesh?.fine ?? s.lastMeshFine, wire: null })),
+  setMesh: (patch) => set((s) => ({ ...edit({ ...s.setup, ...patch }), mesh: null, lastMeshFine: s.mesh?.fine ?? s.lastMeshFine, wire: null })),
+  setAccuracy: (patch) => set((s) => edit({ ...s.setup, ...patch })),
+  addLocal: (l) => set((s) => ({ ...edit({ ...s.setup, local: [...s.setup.local, l] }), mesh: null, lastMeshFine: s.mesh?.fine ?? s.lastMeshFine, wire: null })),
+  updateLocal: (i, l) =>
+    set((s) => ({
+      ...edit({ ...s.setup, local: s.setup.local.map((x, j) => (j === i ? { ...x, ...l } : x)) }),
+      mesh: null,
+      lastMeshFine: s.mesh?.fine ?? s.lastMeshFine,
+      wire: null,
+    })),
+  removeLocal: (i) =>
+    set((s) => ({ ...edit({ ...s.setup, local: s.setup.local.filter((_, j) => j !== i) }), mesh: null, lastMeshFine: s.mesh?.fine ?? s.lastMeshFine, wire: null, focus: null })),
   setReport: (report) => set({ report, stage: report ? 'result' : null }),
   show: (shown) => set({ shown }),
   setDeformed: (deformed) => set({ deformed }),
@@ -122,6 +154,7 @@ export const useSimStore = create<SimState>((set) => ({
       stage: session.stage,
       revision: session.revision,
       mesh: session.mesh,
+      lastMeshFine: session.mesh?.fine ?? null,
       wire: session.wire,
       setup: session.study ? setupOf(session.study) : EMPTY_SETUP,
       report: session.stage === 'result' ? session.report : null,

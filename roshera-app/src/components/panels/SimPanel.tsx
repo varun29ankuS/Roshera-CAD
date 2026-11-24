@@ -10,6 +10,7 @@ import {
   SUPPORT_KINDS,
   deformScale,
   engineLabel,
+  finalRun,
   entryOf,
   fetchMaterials,
   fetchSession,
@@ -17,6 +18,9 @@ import {
   flipped,
   forceOf,
   makeMesh,
+  meshControlOf,
+  DENSITY,
+  estimateNodes,
   runApproved,
   setupGaps,
   stressColor,
@@ -101,7 +105,13 @@ export function SimPanel() {
     () => [...objects.values()].filter((o) => typeof solidOf(o) === 'number' && o.visible !== false),
     [objects],
   )
-  const fallback = (parts.find((p) => selectedIds.has(p.id)) ?? parts[0])?.id ?? null
+  // The part you selected, else the newest: the one you are working on,
+  // not the oldest in the document.
+  const newest = parts.reduce<CADObject | undefined>(
+    (best, p) => ((solidOf(p) ?? -1) > (best ? (solidOf(best) ?? -1) : -1) ? p : best),
+    undefined,
+  )
+  const fallback = (parts.find((p) => selectedIds.has(p.id)) ?? newest)?.id ?? null
   const partId = sim.objectId && objects.has(sim.objectId) ? sim.objectId : fallback
   const part = partId ? objects.get(partId) : undefined
   const solidId = part ? solidOf(part) : undefined
@@ -140,6 +150,8 @@ export function SimPanel() {
     if (!picking || !partId) return
     if (picking.kind === 'support') {
       updateSupport(picking.index, { faces: picked })
+    } else if (picking.kind === 'local') {
+      useSimStore.getState().updateLocal(picking.index, { faces: picked })
     } else {
       const mesh = meshRefs.get(partId)
       const ids = objects.get(partId)?.mesh.faceIds
@@ -151,7 +163,7 @@ export function SimPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [picked])
 
-  const startPicking = (kind: 'support' | 'load', index: number, faces: number[]) => {
+  const startPicking = (kind: 'support' | 'load' | 'local', index: number, faces: number[]) => {
     clearPicks()
     if (partId) for (const f of faces) addPick({ objectId: partId, type: 'face', index: f, resolved: true })
     sim.setPicking({ kind, index })
@@ -180,6 +192,14 @@ export function SimPanel() {
   const gaps = setupGaps(setup)
   const study = studyOf(setup)
   const meshed = sim.mesh !== null
+  // The part's largest extent, for the mesh density slider (mm).
+  const partExtent = useMemo(() => {
+    const g = partId ? meshRefs.get(partId)?.geometry : undefined
+    if (!g) return null
+    if (!g.boundingBox) g.computeBoundingBox()
+    const b = g.boundingBox
+    return b ? Math.max(b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z) : null
+  }, [partId, meshRefs])
 
   const fail = (out: { kind: string; reason?: string; motions?: string[] }) => {
     if (out.kind === 'can_move') setPhase({ kind: 'can_move', motions: out.motions ?? [] })
@@ -195,8 +215,12 @@ export function SimPanel() {
       setPhase({ kind: 'refused', reason: 'The part could not be verified.' })
       return
     }
-    const size = Number(setup.meshSizeMm)
-    const out = await makeMesh(solidId, setup.meshSizeMm.trim() !== '' && size > 0 ? size : null).catch((e) => ({
+    const settings = meshControlOf(setup)
+    if ('error' in settings) {
+      setPhase({ kind: 'refused', reason: settings.error })
+      return
+    }
+    const out = await makeMesh(solidId, settings.control).catch((e) => ({
       kind: 'refused' as const,
       reason: e instanceof Error ? e.message : String(e),
     }))
@@ -346,30 +370,15 @@ export function SimPanel() {
           )}
 
           {step === 'mesh' && (
-            <>
-              <label className="flex items-center gap-2">
-                <span className="w-24 text-muted-foreground">Element size</span>
-                <input className={cn(field, 'w-16 font-mono')} placeholder="auto" value={setup.meshSizeMm} onChange={(e) => sim.setMeshSize(e.target.value)} inputMode="decimal" />
-                <span className="text-muted-foreground">mm</span>
-              </label>
-              <button type="button" className={btn} disabled={!part || phase.kind === 'busy'} onClick={() => void mesh()}>
-                {sim.mesh ? 'Make the mesh again' : 'Make the mesh'}
-              </button>
-              {sim.mesh && (
-                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 rounded bg-muted/40 px-2 py-1.5">
-                  <dt className="text-muted-foreground">Proving mesh</dt>
-                  <dd className="text-right font-mono">
-                    {sim.mesh.fine.nodes.toLocaleString()} nodes · {sim.mesh.fine.elements.toLocaleString()} elements
-                  </dd>
-                  <dt className="text-muted-foreground">Element size</dt>
-                  <dd className="text-right font-mono">{sim.mesh.fine.size_mm.toFixed(2)} mm</dd>
-                  <dt className="text-muted-foreground">Checking mesh</dt>
-                  <dd className="text-right font-mono">{sim.mesh.coarse.nodes.toLocaleString()} nodes</dd>
-                  <dt className="text-muted-foreground">Off the true surface</dt>
-                  <dd className="text-right font-mono">{sim.mesh.fine.boundary_deviation_mm.toPrecision(2)} mm</dd>
-                </dl>
-              )}
-            </>
+            <MeshStep
+              extent={partExtent}
+              busy={phase.kind === 'busy'}
+              canMesh={!!part}
+              onMesh={() => void mesh()}
+              picking={picking}
+              onPick={(index, faces) => startPicking('local', index, faces)}
+              onStopPicking={stopPicking}
+            />
           )}
 
           {step === 'supports' && (
@@ -562,6 +571,7 @@ export function SimPanel() {
                 <span className="w-24 text-muted-foreground">Safety factor ≥</span>
                 <input className={cn(field, 'w-16 font-mono')} placeholder="e.g. 2" value={setup.minSafetyFactor} onChange={(e) => sim.setGoal(e.target.value)} inputMode="decimal" />
               </label>
+              <AccuracySettings />
               <button type="button" className={primary} disabled={!study || !meshed || phase.kind === 'busy'} onClick={() => void run()}>
                 <Play size={11} aria-hidden /> Run study
               </button>
@@ -643,11 +653,11 @@ function Results({ onEdit }: { onEdit: () => void }) {
 
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 border-b border-border/70 px-3 py-2.5">
         <dt className="text-muted-foreground">Peak stress</dt>
-        <dd className="text-right font-mono">{fmt(report.fine.peak_von_mises_mpa, 'MPa')}</dd>
+        <dd className="text-right font-mono">{fmt(finalRun(report).peak_von_mises_mpa, 'MPa')}</dd>
         <dt className="text-muted-foreground">Largest movement</dt>
-        <dd className="text-right font-mono">{fmt(report.fine.max_displacement_mm, 'mm')}</dd>
-        <dt className="text-muted-foreground">Mesh (proving)</dt>
-        <dd className="text-right font-mono">{report.fine.mesh.nodes.toLocaleString()} nodes</dd>
+        <dd className="text-right font-mono">{fmt(finalRun(report).max_displacement_mm, 'mm')}</dd>
+        <dt className="text-muted-foreground">{(report.refined?.length ?? 0) > 0 ? `Mesh (refined ×${report.refined?.length} at the peak)` : 'Mesh (proving)'}</dt>
+        <dd className="text-right font-mono">{finalRun(report).mesh.nodes.toLocaleString()} nodes</dd>
       </dl>
 
       <div className="flex flex-col gap-1.5 border-b border-border/70 px-3 py-2.5">
@@ -708,5 +718,253 @@ function Results({ onEdit }: { onEdit: () => void }) {
         </button>
       </div>
     </div>
+  )
+}
+
+/** The mesh step in full: how fine (a density slider, or an exact size),
+ *  how it follows curves, where to be finer, what kind of element, and --
+ *  once made -- how good it is. Any change clears the mesh on screen until
+ *  it is made again, so the mesh approved is always the mesh shown. */
+function MeshStep({
+  extent,
+  busy,
+  canMesh,
+  onMesh,
+  picking,
+  onPick,
+  onStopPicking,
+}: {
+  extent: number | null
+  busy: boolean
+  canMesh: boolean
+  onMesh: () => void
+  picking: { kind: 'support' | 'load' | 'local'; index: number } | null
+  onPick: (index: number, faces: number[]) => void
+  onStopPicking: () => void
+}) {
+  const setup = useSimStore((s) => s.setup)
+  const mesh = useSimStore((s) => s.mesh)
+  const setMesh = useSimStore((s) => s.setMesh)
+  const addLocal = useSimStore((s) => s.addLocal)
+  const updateLocal = useSimStore((s) => s.updateLocal)
+  const removeLocal = useSimStore((s) => s.removeLocal)
+  const lastMade = useSimStore((s) => s.mesh?.fine ?? s.lastMeshFine)
+
+  // The size the settings ask for: the exact size if typed, else the slider.
+  const typed = Number(setup.meshSizeMm)
+  const stop = extent && setup.meshSizeMm.trim() !== '' && typed > 0
+    ? DENSITY.reduce((best, d, i) => (Math.abs(extent / d.divisor - typed) < Math.abs(extent / DENSITY[best].divisor - typed) ? i : best), 0)
+    : 2
+  const coarseSize = setup.meshSizeMm.trim() !== '' && typed > 0 ? typed : extent ? extent / DENSITY[2].divisor : null
+  const fineSize = coarseSize ? coarseSize * 0.6 : null
+  const estimate = lastMade && fineSize ? estimateNodes(lastMade, fineSize) : null
+  const quality = mesh?.fine
+  const verdict = (q: number | undefined) =>
+    q === undefined ? null : q >= 0.3 ? { label: 'good', cls: 'text-emerald-700 dark:text-emerald-300' } : q >= 0.15 ? { label: 'acceptable', cls: 'text-amber-700 dark:text-amber-300' } : { label: 'poor', cls: 'text-red-700 dark:text-red-300' }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* How fine */}
+      <div className="flex flex-col gap-1.5">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">How fine</span>
+        <input
+          type="range"
+          min={0}
+          max={DENSITY.length - 1}
+          step={1}
+          value={stop}
+          disabled={!extent}
+          onChange={(e) => {
+            const d = DENSITY[Number(e.target.value)]
+            if (extent) setMesh({ meshSizeMm: (Math.round((extent / d.divisor) * 100) / 100).toString() })
+          }}
+          aria-label="Mesh density"
+          className="w-full accent-sky-600"
+        />
+        <div className="flex justify-between text-[10px] text-muted-foreground">
+          <span>Coarse · faster</span>
+          <span className="font-medium text-foreground">{DENSITY[stop].label}</span>
+          <span>Fine · more accurate</span>
+        </div>
+        <label className="flex items-center gap-2">
+          <span className="w-28 text-muted-foreground">Element size</span>
+          <input
+            className={cn(field, 'w-20 font-mono')}
+            placeholder={coarseSize ? coarseSize.toFixed(2) : 'auto'}
+            value={setup.meshSizeMm}
+            onChange={(e) => setMesh({ meshSizeMm: e.target.value })}
+            inputMode="decimal"
+            aria-label="Element size (mm)"
+          />
+          <span className="text-muted-foreground">mm</span>
+        </label>
+        <span className="text-[11px] text-muted-foreground">
+          Two meshes are made: a checking mesh at this size and a proving mesh at 0.6× ({fineSize ? `${fineSize.toFixed(2)} mm` : '—'}); the stress is read from the proving mesh, and the two must agree.
+          {estimate !== null && ` About ${estimate.toLocaleString()} nodes on the proving mesh.`}
+        </span>
+      </div>
+
+      {/* Curves */}
+      <div className="flex flex-col gap-1.5">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">On curves</span>
+        <label className="flex items-center gap-2">
+          <span className="w-28 text-muted-foreground">Elements per circle</span>
+          <input
+            className={cn(field, 'w-16 font-mono')}
+            placeholder="12"
+            value={setup.curveElements}
+            onChange={(e) => setMesh({ curveElements: e.target.value })}
+            inputMode="numeric"
+            aria-label="Elements around a full circle"
+          />
+        </label>
+        <span className="text-[11px] text-muted-foreground">Fillets and holes get smaller elements so a full circle has this many; 0 turns it off.</span>
+      </div>
+
+      {/* Finer here */}
+      <div className="flex flex-col gap-1.5">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Finer here</span>
+        {setup.local.map((l, i) => {
+          const active = picking?.kind === 'local' && picking.index === i
+          return (
+            <div key={i} className={cn('flex flex-col gap-1 rounded border px-2 py-1.5', active ? 'border-sky-500 bg-sky-500/10' : 'border-border/60')}>
+              <div className="flex items-center gap-1.5">
+                <span className="flex-1">
+                  {l.faces.length} face{l.faces.length === 1 ? '' : 's'}
+                </span>
+                <input
+                  className={cn(field, 'h-6 w-16 font-mono')}
+                  value={l.sizeMm}
+                  onChange={(e) => updateLocal(i, { sizeMm: e.target.value })}
+                  inputMode="decimal"
+                  aria-label="Element size near these faces (mm)"
+                />
+                <span className="text-muted-foreground">mm</span>
+                <button type="button" className={btn} onClick={() => (active ? onStopPicking() : onPick(i, l.faces))}>
+                  {active ? 'Done' : 'Pick faces'}
+                </button>
+                <button
+                  type="button"
+                  className="cad-focus p-1 text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    if (active) onStopPicking()
+                    removeLocal(i)
+                  }}
+                  aria-label="Remove"
+                >
+                  <Trash2 size={12} />
+                </button>
+              </div>
+              {active && <span className="text-[11px] text-sky-800 dark:text-sky-200">Click the faces to mesh finer -- a fillet, a hole edge, where the stress gathers.</span>}
+            </div>
+          )
+        })}
+        <button
+          type="button"
+          className={btn}
+          onClick={() => {
+            const n = setup.local.length
+            addLocal({ faces: [], sizeMm: fineSize ? (Math.round(fineSize * 0.4 * 100) / 100).toString() : '1' })
+            onPick(n, [])
+          }}
+        >
+          <Plus size={11} aria-hidden /> Finer on faces
+        </button>
+      </div>
+
+      {/* Element */}
+      <div className="flex flex-col gap-1">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Element</span>
+        <span>Quadratic tetrahedra (10 nodes)</span>
+        <span className="text-[11px] text-muted-foreground">Curved edges and accurate stresses with few elements; mesher Gmsh (interim).</span>
+      </div>
+
+      <button type="button" className={btn} disabled={!canMesh || busy} onClick={onMesh}>
+        {mesh ? 'Make the mesh again' : 'Make the mesh'}
+      </button>
+
+      {/* What was made */}
+      {mesh && quality && (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 rounded bg-muted/40 px-2 py-1.5">
+          <dt className="text-muted-foreground">Proving mesh</dt>
+          <dd className="text-right font-mono">
+            {mesh.fine.nodes.toLocaleString()} nodes · {mesh.fine.elements.toLocaleString()} elements
+          </dd>
+          <dt className="text-muted-foreground">Checking mesh</dt>
+          <dd className="text-right font-mono">
+            {mesh.coarse.nodes.toLocaleString()} nodes · {mesh.coarse.elements.toLocaleString()} elements
+          </dd>
+          <dt className="text-muted-foreground">Element size</dt>
+          <dd className="text-right font-mono">
+            {mesh.coarse.size_mm.toFixed(2)} → {mesh.fine.size_mm.toFixed(2)} mm
+          </dd>
+          {quality.quality_min !== undefined && (
+            <>
+              <dt className="text-muted-foreground" title="Normalised mean ratio: 1 = a perfect tetrahedron, toward 0 = a flat sliver">Element shape</dt>
+              <dd className="text-right font-mono">
+                worst {quality.quality_min.toFixed(2)} · average {(quality.quality_mean ?? 0).toFixed(2)}{' '}
+                <span className={verdict(quality.quality_min)?.cls}>({verdict(quality.quality_min)?.label})</span>
+              </dd>
+              <dt className="text-muted-foreground">Poor elements</dt>
+              <dd className="text-right font-mono">
+                {(quality.poor_elements ?? 0).toLocaleString()}
+                {mesh.fine.elements > 0 && ` (${(((quality.poor_elements ?? 0) / mesh.fine.elements) * 100).toFixed(2)} %)`}
+              </dd>
+            </>
+          )}
+          <dt className="text-muted-foreground" title="Measured against the part's display triangles: an upper bound -- the mesh nodes lie on the exact surface">Fits the part within</dt>
+          <dd className="text-right font-mono">{mesh.fine.boundary_deviation_mm.toPrecision(2)} mm</dd>
+          <dt className="text-muted-foreground">Made in</dt>
+          <dd className="text-right font-mono">{(mesh.coarse.mesher_seconds + mesh.fine.mesher_seconds).toFixed(1)} s</dd>
+        </dl>
+      )}
+      {!mesh && lastMade && <span className="text-[11px] text-amber-700 dark:text-amber-300">The settings changed: make the mesh again to see it.</span>}
+    </div>
+  )
+}
+
+/** How closely the meshes must agree for the answer to stand, and how far
+ *  the kernel may refine at the peak to get there. */
+function AccuracySettings() {
+  const setup = useSimStore((s) => s.setup)
+  const setAccuracy = useSimStore((s) => s.setAccuracy)
+  const setMesh = useSimStore((s) => s.setMesh)
+  return (
+    <details className="rounded border border-border/60 px-2 py-1.5">
+      <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Accuracy</summary>
+      <div className="mt-2 flex flex-col gap-1.5">
+        <label className="flex items-center gap-2">
+          <span className="w-40 text-muted-foreground">Peak stress agrees within</span>
+          <input className={cn(field, 'h-6 w-14 font-mono')} placeholder="5" value={setup.stressPct} onChange={(e) => setAccuracy({ stressPct: e.target.value })} inputMode="decimal" />
+          <span className="text-muted-foreground">%</span>
+        </label>
+        <label className="flex items-center gap-2">
+          <span className="w-40 text-muted-foreground">Movement agrees within</span>
+          <input className={cn(field, 'h-6 w-14 font-mono')} placeholder="2" value={setup.displacementPct} onChange={(e) => setAccuracy({ displacementPct: e.target.value })} inputMode="decimal" />
+          <span className="text-muted-foreground">%</span>
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={setup.refineAtPeak} onChange={(e) => setMesh({ refineAtPeak: e.target.checked })} />
+          <span>Refine at the peak until it settles</span>
+        </label>
+        {setup.refineAtPeak && (
+          <>
+            <label className="flex items-center gap-2 pl-5">
+              <span className="w-32 text-muted-foreground">At most</span>
+              <input className={cn(field, 'h-6 w-14 font-mono')} placeholder="3" value={setup.maxRefinements} onChange={(e) => setMesh({ maxRefinements: e.target.value })} inputMode="numeric" />
+              <span className="text-muted-foreground">refinements</span>
+            </label>
+            <label className="flex items-center gap-2 pl-5">
+              <span className="w-32 text-muted-foreground">Up to</span>
+              <input className={cn(field, 'h-6 w-20 font-mono')} placeholder="150000" value={setup.nodeBudget} onChange={(e) => setMesh({ nodeBudget: e.target.value })} inputMode="numeric" />
+              <span className="text-muted-foreground">nodes</span>
+            </label>
+          </>
+        )}
+        <span className="text-[11px] text-muted-foreground">
+          Tighter limits and more refinement take longer; a peak that never settles is a sharp corner -- round it.
+        </span>
+      </div>
+    </details>
   )
 }

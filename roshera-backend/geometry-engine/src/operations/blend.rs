@@ -107,7 +107,16 @@ pub fn blend_faces(
             },
         )?;
     }
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = lifecycle::operand_vertices(
+        model,
+        &OpSpec::BlendFaces {
+            face_a: face1_id,
+            face_b: face2_id,
+        },
+    );
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         blend_faces_body(model, face1_id, face2_id, blend_curves, options)
     })
 }

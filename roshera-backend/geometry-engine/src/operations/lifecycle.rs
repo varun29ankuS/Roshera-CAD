@@ -339,6 +339,100 @@ where
     }
 }
 
+/// The vertices an operation on `spec`'s operands may weld to: every vertex
+/// of the solids it works on (a face's or edge's owning solid included), and
+/// the vertices of free profile edges it builds from. `None` for `Generic`
+/// operations, which make no welds (delete, transform, pattern copies).
+///
+/// Run with [`with_rollback_scoped`], so that no vertex lookup inside the
+/// operation returns a coincident vertex of ANOTHER part: two identical
+/// L-brackets built in one place shared corner vertices, and a fillet on one
+/// then broke the other.
+pub fn operand_vertices(
+    model: &BRepModel,
+    spec: &OpSpec<'_>,
+) -> Option<std::collections::HashSet<VertexId>> {
+    let mut solids: Vec<SolidId> = Vec::new();
+    let mut faces: Vec<FaceId> = Vec::new();
+    let mut edges: Vec<EdgeId> = Vec::new();
+    match spec {
+        OpSpec::Generic => return None,
+        OpSpec::FilletEdges { solid_id, .. }
+        | OpSpec::ChamferEdges { solid_id, .. }
+        | OpSpec::OffsetSolid { solid_id } => solids.push(*solid_id),
+        OpSpec::Boolean { solid_a, solid_b } => solids.extend([*solid_a, *solid_b]),
+        OpSpec::ExtrudeFace { face_id }
+        | OpSpec::RevolveFace { face_id }
+        | OpSpec::OffsetFace { face_id } => faces.push(*face_id),
+        OpSpec::BlendFaces { face_a, face_b } => faces.extend([*face_a, *face_b]),
+        OpSpec::Draft { face_ids } | OpSpec::Modify { face_ids } => {
+            faces.extend(face_ids.iter().copied())
+        }
+        OpSpec::ExtrudeProfile { profile_edges } | OpSpec::RevolveProfile { profile_edges } => {
+            edges.extend(profile_edges.iter().copied())
+        }
+        OpSpec::SweepProfile {
+            profile_edges,
+            path_edges,
+        } => edges.extend(profile_edges.iter().chain(path_edges.iter()).copied()),
+        OpSpec::LoftProfiles { profiles } => edges.extend(profiles.iter().flatten().copied()),
+    }
+    // A face's owning solids, and the face's own vertices (a free face).
+    if !faces.is_empty() {
+        for (sid, solid) in model.solids.iter() {
+            let shells = std::iter::once(solid.outer_shell)
+                .chain(solid.inner_shells.iter().copied())
+                .chain(solid.peer_shells.iter().copied());
+            for sh in shells {
+                if model
+                    .shells
+                    .get(sh)
+                    .is_some_and(|s| s.faces.iter().any(|f| faces.contains(f)))
+                {
+                    solids.push(sid);
+                }
+            }
+        }
+        for &f in &faces {
+            if let Some(face) = model.faces.get(f) {
+                for l in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+                    if let Some(lp) = model.loops.get(l) {
+                        edges.extend(lp.edges.iter().copied());
+                    }
+                }
+            }
+        }
+    }
+    let mut vertices = model.solid_vertices(&solids);
+    for e in edges {
+        if let Some(edge) = model.edges.get(e) {
+            vertices.insert(edge.start_vertex);
+            vertices.insert(edge.end_vertex);
+        }
+    }
+    Some(vertices)
+}
+
+/// [`with_rollback`] inside a vertex reuse scope: `operands` (from
+/// [`operand_vertices`]; an empty set for an operation that builds only new
+/// geometry) and whatever the operation itself creates. `None`: unscoped.
+pub fn with_rollback_scoped<T, F>(
+    model: &mut BRepModel,
+    operands: Option<std::collections::HashSet<VertexId>>,
+    body: F,
+) -> OperationResult<T>
+where
+    F: FnOnce(&mut BRepModel) -> OperationResult<T>,
+{
+    let Some(operands) = operands else {
+        return with_rollback(model, body);
+    };
+    let prior = model.begin_vertex_reuse_scope_with(operands);
+    let out = with_rollback(model, body);
+    model.end_vertex_reuse_scope(prior);
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------

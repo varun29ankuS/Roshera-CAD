@@ -30,7 +30,18 @@ export interface Study {
     yield_basis?: YieldBasis
   }
   goal: { min_safety_factor: number }
-  mesh: { size_mm?: number }
+  mesh: MeshControl
+  accuracy?: { stress: number; displacement: number }
+}
+
+/** The mesh settings (sim-engine `MeshControl`). */
+export interface MeshControl {
+  size_mm?: number
+  curve_elements?: number
+  local?: { faces: number[]; size_mm: number }[]
+  refine_at_peak?: boolean
+  max_refinements?: number
+  node_budget?: number
 }
 
 export interface MeshStats {
@@ -39,6 +50,11 @@ export interface MeshStats {
   elements: number
   boundary_deviation_mm: number
   mesher_seconds: number
+  /** Element shape, normalised mean ratio: 1 = regular, toward 0 = sliver. */
+  quality_min?: number
+  quality_mean?: number
+  /** Elements below 0.2. */
+  poor_elements?: number
 }
 
 export interface RunResult {
@@ -82,6 +98,16 @@ export interface StaticReport {
   face_pids: [number, string][]
   assumptions: string[]
   field: SurfaceField
+  /** Runs refined at the peak after the two approved meshes (the verdict
+   *  reads the last); absent or empty when the peak settled on them. */
+  refined?: RunResult[]
+}
+
+/** The run a report's numbers come from: the last refinement, else the
+ *  fine (proving) mesh. */
+export function finalRun(report: StaticReport): RunResult {
+  const r = report.refined ?? []
+  return r.length > 0 ? r[r.length - 1] : report.fine
 }
 
 // ─── The set-up as the person enters it ─────────────────────────────────
@@ -137,12 +163,72 @@ export interface MaterialEntry {
   yieldBasis: YieldBasis | null
 }
 
+/** Finer elements near some faces, as the panel holds it. */
+export interface LocalEntry {
+  faces: number[]
+  sizeMm: string
+}
+
 export interface Setup {
   supports: SupportEntry[]
   loads: LoadEntry[]
   material: MaterialEntry
   minSafetyFactor: string
   meshSizeMm: string
+  /** Elements around a full circle on curved faces ('' = default 12). */
+  curveElements: string
+  local: LocalEntry[]
+  refineAtPeak: boolean
+  maxRefinements: string
+  nodeBudget: string
+  /** Agreement the last two meshes must reach, percent ('' = default). */
+  stressPct: string
+  displacementPct: string
+}
+
+/** The density stops of the mesh slider: element size as a share of the
+ *  part's largest extent. */
+export const DENSITY: { label: string; divisor: number }[] = [
+  { label: 'Very coarse', divisor: 10 },
+  { label: 'Coarse', divisor: 14 },
+  { label: 'Standard', divisor: 20 },
+  { label: 'Fine', divisor: 28 },
+  { label: 'Very fine', divisor: 40 },
+]
+
+/** The kernel's mesh settings for a set-up ('' fields left to their
+ *  defaults), or null with the reason when one is not valid. */
+export function meshControlOf(setup: Setup): { control: MeshControl } | { error: string } {
+  const pos = (s: string) => (s.trim() === '' ? undefined : Number(s))
+  const size = pos(setup.meshSizeMm)
+  if (size !== undefined && !(size > 0)) return { error: 'The element size must be above 0 mm' }
+  const curve = pos(setup.curveElements)
+  if (curve !== undefined && !(Number.isInteger(curve) && curve >= 0)) return { error: 'Elements around a circle must be a whole number' }
+  const local: { faces: number[]; size_mm: number }[] = []
+  for (const l of setup.local) {
+    if (l.faces.length === 0) continue
+    const s = Number(l.sizeMm)
+    if (!(s > 0)) return { error: 'Every finer-here size must be above 0 mm' }
+    local.push({ faces: [...l.faces], size_mm: s })
+  }
+  const levels = pos(setup.maxRefinements)
+  const budget = pos(setup.nodeBudget)
+  return {
+    control: {
+      ...(size !== undefined ? { size_mm: size } : {}),
+      ...(curve !== undefined ? { curve_elements: curve } : {}),
+      local,
+      refine_at_peak: setup.refineAtPeak,
+      ...(levels !== undefined ? { max_refinements: levels } : {}),
+      ...(budget !== undefined ? { node_budget: budget } : {}),
+    },
+  }
+}
+
+/** An estimate of the proving mesh's nodes at element size `size`, scaled
+ *  from a mesh actually made at `from` (nodes go with the cube of 1/size). */
+export function estimateNodes(made: MeshStats, size: number): number {
+  return Math.round(made.nodes * Math.pow(made.size_mm / size, 3))
 }
 
 const AXES: Record<Exclude<LoadDirection, 'into' | 'out' | 'given'>, Vec3> = {
@@ -201,8 +287,12 @@ export function setupGaps(setup: Setup): string[] {
   if (m.yield_strength_mpa.trim() !== '' && (y === null || y <= 0)) gaps.push('The yield strength must be above 0 MPa')
   const sf = num(setup.minSafetyFactor)
   if (sf === null || sf <= 0) gaps.push('Set the safety factor the part must reach')
-  const size = num(setup.meshSizeMm)
-  if (setup.meshSizeMm.trim() !== '' && (size === null || size <= 0)) gaps.push('The mesh size must be above 0 mm')
+  const mesh = meshControlOf(setup)
+  if ('error' in mesh) gaps.push(mesh.error)
+  for (const [v, what] of [[setup.stressPct, 'stress'], [setup.displacementPct, 'movement']] as const) {
+    const n = num(v)
+    if (v.trim() !== '' && (n === null || n <= 0 || n >= 100)) gaps.push(`The ${what} agreement must be between 0 and 100 %`)
+  }
   return [...new Set(gaps)]
 }
 
@@ -211,7 +301,7 @@ export function studyOf(setup: Setup): Study | null {
   if (setupGaps(setup).length > 0) return null
   const m = setup.material
   const y = num(m.yield_strength_mpa)
-  const size = num(setup.meshSizeMm)
+  const mesh = meshControlOf(setup)
   return {
     supports: setup.supports.filter((s) => s.faces.length > 0).map((s) => ({ kind: s.kind, faces: [...s.faces] })),
     loads: setup.loads.map((l) => ({ faces: [...l.faces], force_n: forceOf(l) as Vec3, spread: l.spread })),
@@ -224,7 +314,11 @@ export function studyOf(setup: Setup): Study | null {
       ...(m.yieldBasis ? { yield_basis: m.yieldBasis } : {}),
     },
     goal: { min_safety_factor: Number(setup.minSafetyFactor) },
-    mesh: size !== null ? { size_mm: size } : {},
+    mesh: 'control' in mesh ? mesh.control : {},
+    accuracy: {
+      stress: setup.stressPct.trim() === '' ? 0.05 : Number(setup.stressPct) / 100,
+      displacement: setup.displacementPct.trim() === '' ? 0.02 : Number(setup.displacementPct) / 100,
+    },
   }
 }
 
@@ -251,7 +345,14 @@ export function setupOf(study: Study): Setup {
       yieldBasis: m.yield_basis ?? null,
     },
     minSafetyFactor: String(study.goal.min_safety_factor),
-    meshSizeMm: study.mesh?.size_mm !== undefined && study.mesh?.size_mm !== null ? String(study.mesh.size_mm) : '',
+    meshSizeMm: study.mesh?.size_mm != null ? String(study.mesh.size_mm) : '',
+    curveElements: study.mesh?.curve_elements != null ? String(study.mesh.curve_elements) : '',
+    local: (study.mesh?.local ?? []).map((l) => ({ faces: [...l.faces], sizeMm: String(l.size_mm) })),
+    refineAtPeak: study.mesh?.refine_at_peak ?? true,
+    maxRefinements: study.mesh?.max_refinements != null ? String(study.mesh.max_refinements) : '',
+    nodeBudget: study.mesh?.node_budget != null ? String(study.mesh.node_budget) : '',
+    stressPct: study.accuracy ? String(Math.round(study.accuracy.stress * 1000) / 10) : '',
+    displacementPct: study.accuracy ? String(Math.round(study.accuracy.displacement * 1000) / 10) : '',
   }
 }
 
@@ -275,7 +376,7 @@ export interface SimSession {
   revision: string
   solid: number
   stage: SimStage
-  mesh_size_mm: number | null
+  mesh_control: MeshControl
   mesh: MeshPreview | null
   wire: MeshWire | null
   study: Study | null
@@ -513,8 +614,8 @@ async function postStage(path: string, body: unknown): Promise<StageRun> {
 }
 
 /** Stage 1: make the study's meshes and show them. */
-export function makeMesh(solidId: number, sizeMm: number | null): Promise<StageRun> {
-  return postStage(`/api/agent/parts/${solidId}/sim/static/mesh`, sizeMm ? { size_mm: sizeMm } : {})
+export function makeMesh(solidId: number, control: MeshControl): Promise<StageRun> {
+  return postStage(`/api/agent/parts/${solidId}/sim/static/mesh`, control)
 }
 
 /** Stage 2: the set-up, for the mesh shown at `revision`. */

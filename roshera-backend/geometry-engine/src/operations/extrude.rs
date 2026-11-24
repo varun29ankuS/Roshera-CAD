@@ -548,7 +548,10 @@ pub fn extrude_face(
         lifecycle::validate_can_apply(model, OpSpec::ExtrudeFace { face_id })?;
     }
 
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = lifecycle::operand_vertices(model, &OpSpec::ExtrudeFace { face_id });
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         // Validate inputs
         validate_extrude_inputs(model, face_id, &options)?;
 
@@ -1614,7 +1617,15 @@ pub fn extrude_profile(
     // edge/loop/face stores before `extrude_face` is called; without
     // an outer snapshot, a failed profile-to-face step would leave
     // orphaned topology even though the user-observable op failed.
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = lifecycle::operand_vertices(
+        model,
+        &OpSpec::ExtrudeProfile {
+            profile_edges: &profile_edges,
+        },
+    );
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         let face_id = create_face_from_profile(model, profile_edges)?;
         extrude_face(model, face_id, options)
     })
@@ -1642,7 +1653,10 @@ pub fn extrude_polygon(
     use crate::primitives::curve::Line;
 
     let points = profile.to_vec();
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = Some(std::collections::HashSet::new());
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         let mut profile_edges = Vec::with_capacity(points.len());
         for i in 0..points.len() {
             let p_start = points[i];

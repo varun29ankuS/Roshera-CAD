@@ -95,6 +95,7 @@ fn a_part_on_a_roller_is_refused_with_its_free_motions() {
             min_safety_factor: 2.0,
         },
         mesh: MeshControl::default(),
+        accuracy: Default::default(),
     };
     let dir = std::env::temp_dir().join("roshera-sim-roller");
     match run_static(&m, s, &study, &no_engines(), &dir) {
@@ -146,7 +147,11 @@ fn a_cantilever_deflects_as_the_beam_formula_says() {
         goal: Goal {
             min_safety_factor: 2.0,
         },
-        mesh: MeshControl { size_mm: Some(5.0) },
+        mesh: MeshControl {
+            size_mm: Some(5.0),
+            ..Default::default()
+        },
+        accuracy: Default::default(),
     };
     let dir = std::env::temp_dir().join("roshera-sim-cantilever");
     let _ = std::fs::remove_dir_all(&dir);
@@ -247,7 +252,7 @@ fn a_cantilever_deflects_as_the_beam_formula_says() {
     let (preview, wire) = sim_engine::preview::mesh_preview(
         &m,
         s,
-        study.mesh.size_mm,
+        &study.mesh,
         &engines,
         &std::env::temp_dir().join("roshera-sim-cantilever-preview"),
     )
@@ -294,7 +299,11 @@ fn a_cube_on_rollers_compresses_exactly() {
         goal: Goal {
             min_safety_factor: 2.0,
         },
-        mesh: MeshControl { size_mm: Some(5.0) },
+        mesh: MeshControl {
+            size_mm: Some(5.0),
+            ..Default::default()
+        },
+        accuracy: Default::default(),
     };
     let dir = std::env::temp_dir().join("roshera-sim-rollers");
     let _ = std::fs::remove_dir_all(&dir);
@@ -381,4 +390,215 @@ fn a_curved_wall_is_meshed_on_the_true_surface() {
         worst < 1e-6,
         "a wall node lies {worst:.3e} mm off the radius"
     );
+}
+
+/// The filleted L-bracket of 2026-11-24: a 60 x 40 x 6 base and a 6 x 40 x 50
+/// upright joined, the inside corner rounded R5. Returns the model, the
+/// solid, the base's bottom, the upright's top and the fillet face.
+fn filleted_l() -> (BRepModel, u32, u32, u32, u32) {
+    use geometry_engine::math::{Matrix4, Vector3};
+    use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+    use geometry_engine::operations::fillet::{fillet_edges, FilletOptions, FilletType};
+    use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+    let mut m = BRepModel::new();
+    let mut place = |m: &mut BRepModel, w: f64, d: f64, h: f64, at: [f64; 3]| -> u32 {
+        let s = match TopologyBuilder::new(m).create_box_3d(w, d, h) {
+            Ok(GeometryId::Solid(s)) => s,
+            other => panic!("box: {other:?}"),
+        };
+        let lo = [
+            face_at(m, s, 0, -1.0),
+            face_at(m, s, 1, -1.0),
+            face_at(m, s, 2, -1.0),
+        ];
+        let _ = lo;
+        let mesh = tessellate_solid(m.solids.get(s).unwrap(), m, &TessellationParams::default());
+        let mut c = [0.0; 3];
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for v in &mesh.vertices {
+            let p = [v.position.x, v.position.y, v.position.z];
+            for i in 0..3 {
+                lo[i] = lo[i].min(p[i]);
+                hi[i] = hi[i].max(p[i]);
+            }
+        }
+        for i in 0..3 {
+            c[i] = (lo[i] + hi[i]) / 2.0;
+        }
+        transform_solid(
+            m,
+            s,
+            Matrix4::from_translation(&Vector3::new(at[0] - c[0], at[1] - c[1], at[2] - c[2])),
+            TransformOptions::default(),
+        )
+        .unwrap();
+        s
+    };
+    let base = place(&mut m, 60.0, 40.0, 6.0, [0.0, 0.0, 3.0]);
+    let upright = place(&mut m, 6.0, 40.0, 50.0, [-27.0, 0.0, 25.0]);
+    let l = boolean_operation(
+        &mut m,
+        base,
+        upright,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .unwrap();
+    // The inside corner: the edge shared by the base's top and the upright's
+    // inner face (each the face whose triangles sit at that plane).
+    let top = face_at_plane(&m, l, 2, 6.0);
+    let inner = face_at_plane(&m, l, 0, -24.0);
+    let edges = |f: u32| -> Vec<u32> {
+        let face = m.faces.get(f).unwrap();
+        m.loops.get(face.outer_loop).unwrap().edges.clone()
+    };
+    let corner: Vec<u32> = edges(top)
+        .into_iter()
+        .filter(|e| edges(inner).contains(e))
+        .collect();
+    assert_eq!(corner.len(), 1, "one inside corner");
+    let blend = fillet_edges(
+        &mut m,
+        l,
+        corner,
+        FilletOptions {
+            fillet_type: FilletType::Constant(5.0),
+            radius: 5.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let bottom = face_at(&m, l, 2, -1.0);
+    let upright_top = face_at(&m, l, 2, 1.0);
+    let _ = m.certify_solid(l);
+    (m, l, bottom, upright_top, blend[0])
+}
+
+/// The planar face of `solid` whose triangles all lie at `value` on `axis`.
+fn face_at_plane(m: &BRepModel, solid: u32, axis: usize, value: f64) -> u32 {
+    let mesh = tessellate_solid(
+        m.solids.get(solid).unwrap(),
+        m,
+        &TessellationParams::default(),
+    );
+    let mut on: std::collections::BTreeMap<u32, bool> = std::collections::BTreeMap::new();
+    for (t, &f) in mesh.triangles.iter().zip(&mesh.face_map) {
+        let all = t.iter().all(|&i| {
+            let p = mesh.vertices[i as usize].position;
+            ([p.x, p.y, p.z][axis] - value).abs() < 1e-6
+        });
+        let e = on.entry(f).or_insert(true);
+        *e = *e && all;
+    }
+    *on.iter().find(|(_, &v)| v).expect("a face on that plane").0
+}
+
+/// Refinement at the peak: on the filleted bracket the default meshes leave
+/// the fillet's peak unsettled (37 -> 40 MPa, 2026-11-24); refining around
+/// the peak must settle it -- a real stress concentration converges -- and
+/// with refinement off the run must say the peak did not settle.
+///
+/// Needs Gmsh and CalculiX: run with `--ignored`.
+#[test]
+#[ignore = "needs Gmsh and CalculiX; run with --ignored"]
+fn a_fillet_peak_settles_when_refined_at_the_peak() {
+    let engines = Engines::discover().expect("Gmsh and CalculiX installed");
+    let (m, s, bottom, top, _) = filleted_l();
+    let study = |refine: bool| Study {
+        supports: vec![Support {
+            kind: SupportKind::Fixed,
+            faces: vec![bottom],
+        }],
+        loads: vec![Load {
+            faces: vec![top],
+            force_n: [200.0, 0.0, 0.0],
+            spread: Spread::Even,
+        }],
+        material: aluminium(Some(276.0)),
+        goal: Goal {
+            min_safety_factor: 2.0,
+        },
+        mesh: MeshControl {
+            refine_at_peak: Some(refine),
+            ..Default::default()
+        },
+        accuracy: Default::default(),
+    };
+    let dir = std::env::temp_dir().join("roshera-sim-fillet");
+    let _ = std::fs::remove_dir_all(&dir);
+    let off = run_static(&m, s, &study(false), &engines, &dir.join("off")).expect("runs");
+    let peak_check = |r: &sim_engine::run::StaticReport| {
+        r.checks
+            .iter()
+            .find(|c| c.name == "peak stress converged")
+            .cloned()
+            .unwrap()
+    };
+    assert!(off.refined.is_empty());
+    assert!(
+        !peak_check(&off).passed,
+        "unrefined, the fillet peak does not settle: {:?}",
+        peak_check(&off)
+    );
+    let on = run_static(&m, s, &study(true), &engines, &dir.join("on")).expect("runs");
+    assert!(!on.refined.is_empty(), "the run refined at the peak");
+    let check = peak_check(&on);
+    eprintln!(
+        "refined: {:?}",
+        on.refined
+            .iter()
+            .map(|r| (r.mesh.nodes, r.peak_von_mises_mpa))
+            .collect::<Vec<_>>()
+    );
+    eprintln!("{check:?}");
+    assert!(
+        check.passed,
+        "refined at the peak, the fillet's stress settles: {check:?}"
+    );
+    assert!(
+        matches!(on.verdict, Verdict::Holds { .. }),
+        "{:?}",
+        on.verdict
+    );
+}
+
+/// Finer here: a local size on the fillet face makes a finer mesh there --
+/// more nodes than the default -- and the element-shape figures are real.
+///
+/// Needs Gmsh: run with `--ignored`.
+#[test]
+#[ignore = "needs Gmsh; run with --ignored"]
+fn a_local_size_makes_the_mesh_finer_there_and_shape_is_reported() {
+    let engines = Engines::discover().expect("Gmsh installed");
+    let (m, s, _, _, fillet) = filleted_l();
+    let dir = std::env::temp_dir().join("roshera-sim-local");
+    let _ = std::fs::remove_dir_all(&dir);
+    let (plain, _) = sim_engine::preview::mesh_preview(
+        &m,
+        s,
+        &MeshControl::default(),
+        &engines,
+        &dir.join("plain"),
+    )
+    .unwrap();
+    let finer = MeshControl {
+        local: vec![sim_engine::study::LocalSize {
+            faces: vec![fillet],
+            size_mm: 0.6,
+        }],
+        ..Default::default()
+    };
+    let (local, _) =
+        sim_engine::preview::mesh_preview(&m, s, &finer, &engines, &dir.join("local")).unwrap();
+    assert!(
+        local.fine.nodes > plain.fine.nodes * 11 / 10,
+        "finer near the fillet: {} vs {} nodes",
+        local.fine.nodes,
+        plain.fine.nodes
+    );
+    for st in [&plain.fine, &local.fine] {
+        assert!(st.quality_min > 0.0 && st.quality_min <= 1.0, "{st:?}");
+        assert!(st.quality_mean > 0.5 && st.quality_mean <= 1.0, "{st:?}");
+    }
 }

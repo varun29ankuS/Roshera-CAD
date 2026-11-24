@@ -12,9 +12,9 @@ use geometry_engine::primitives::topology_builder::BRepModel;
 use serde::{Deserialize, Serialize};
 
 use crate::engines::Engines;
-use crate::mesh::{mesh_solid, MeshStats, VolumeMesh};
-use crate::run::{coarse_mesh_size, StudyError, ENGINE_LIMIT};
-use crate::study::FINE_RATIO;
+use crate::mesh::{mesh_solid_graded, MeshStats, VolumeMesh};
+use crate::run::{coarse_mesh_size, mesh_options, StudyError, ENGINE_LIMIT};
+use crate::study::{MeshControl, FINE_RATIO};
 
 /// What the mesh stage shows in numbers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,27 +32,31 @@ pub struct MeshWire {
     pub edges: Vec<[u32; 2]>,
 }
 
-/// Mesh `solid` as a study would -- coarse, then fine -- without solving.
+/// Mesh `solid` as a study would -- coarse, then fine, with the same
+/// grading (`run::mesh_options`) -- without solving.
 pub fn mesh_preview(
     model: &BRepModel,
     solid: SolidId,
-    asked_size: Option<f64>,
+    control: &MeshControl,
     engines: &Engines,
     workdir: &Path,
 ) -> Result<(MeshPreview, MeshWire), StudyError> {
-    let size = coarse_mesh_size(model, solid, asked_size)?;
-    let (_, coarse) = mesh_solid(
+    let size = coarse_mesh_size(model, solid, control.size_mm)?;
+    let options = mesh_options(model, solid, control, size)?;
+    let (_, coarse) = mesh_solid_graded(
         model,
         solid,
         size,
+        &options,
         &engines.mesher,
         &workdir.join("coarse"),
         ENGINE_LIMIT,
     )?;
-    let (mesh, fine) = mesh_solid(
+    let (mesh, fine) = mesh_solid_graded(
         model,
         solid,
         size * FINE_RATIO,
+        &options,
         &engines.mesher,
         &workdir.join("fine"),
         ENGINE_LIMIT,

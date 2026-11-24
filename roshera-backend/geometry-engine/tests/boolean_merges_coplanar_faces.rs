@@ -186,3 +186,186 @@ fn the_inside_corner_of_a_joined_l_takes_a_fillet() {
     let cert = m.certify_solid(l);
     assert!(cert.is_sound(), "the filleted L is sound: {cert:?}");
 }
+
+/// A second identical L built on top of the first leaves the first one
+/// sound. The kernel shares vertices and edges between solids at the same
+/// place; an operation on the second must never rewrite the first.
+/// (Varun 2026-11-24: yesterday's L-bracket read UNSOUND -- "the boundary
+/// walk of loop 14 on face 14 does not close" -- after the same L was built
+/// again at the same place and filleted.)
+#[test]
+fn building_the_same_l_again_leaves_the_first_sound() {
+    let mut m = BRepModel::new();
+    let first = l_bracket(&mut m);
+    assert!(
+        m.certify_solid(first).is_sound(),
+        "the first L is sound on its own"
+    );
+    let second = l_bracket(&mut m);
+    let cert = m.certify_solid(first);
+    assert!(
+        cert.is_sound(),
+        "the first L after the second is built: {:?}",
+        cert.errors
+    );
+    assert!(m.certify_solid(second).is_sound(), "the second L is sound");
+}
+
+/// ...and filleting the second's inside corner leaves the first sound too.
+#[test]
+fn filleting_a_second_identical_l_leaves_the_first_sound() {
+    let mut m = BRepModel::new();
+    let first = l_bracket(&mut m);
+    let second = l_bracket(&mut m);
+    let top = face_at(&m, second, Vector3::new(0.0, 0.0, 1.0), 6.0);
+    let inner = face_at(&m, second, Vector3::new(1.0, 0.0, 0.0), -24.0);
+    let shared: Vec<EdgeId> = edges_of(&m, top[0])
+        .into_iter()
+        .filter(|e| edges_of(&m, inner[0]).contains(e))
+        .collect();
+    fillet_edges(
+        &mut m,
+        second,
+        shared,
+        FilletOptions {
+            fillet_type: FilletType::Constant(5.0),
+            radius: 5.0,
+            ..Default::default()
+        },
+    )
+    .expect("fillet the second L");
+    let cert = m.certify_solid(first);
+    assert!(
+        cert.is_sound(),
+        "the first L after the second is filleted: {:?}",
+        cert.errors
+    );
+}
+fn topo_of(
+    m: &BRepModel,
+    s: SolidId,
+) -> (
+    std::collections::BTreeSet<u32>,
+    std::collections::BTreeSet<u32>,
+) {
+    let mut vs = std::collections::BTreeSet::new();
+    let mut es = std::collections::BTreeSet::new();
+    for f in faces_of(m, s) {
+        for e in edges_of(m, f) {
+            es.insert(e);
+            let edge = m.edges.get(e).expect("edge");
+            vs.insert(edge.start_vertex);
+            vs.insert(edge.end_vertex);
+        }
+    }
+    (vs, es)
+}
+
+/// Two solids share no vertex and no edge, whatever their positions.
+#[test]
+fn two_identical_ls_share_no_topology() {
+    let mut m = BRepModel::new();
+    let base1 = boxed(&mut m, 60.0, 40.0, 6.0, [0.0, 0.0, 3.0]);
+    let up1 = boxed(&mut m, 6.0, 40.0, 50.0, [-27.0, 0.0, 25.0]);
+    let (v, e) = (topo_of(&m, base1), topo_of(&m, up1));
+    assert!(
+        v.0.is_disjoint(&e.0) && v.1.is_disjoint(&e.1),
+        "two boxes share topology before any boolean"
+    );
+    let first = boolean_operation(
+        &mut m,
+        base1,
+        up1,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("union 1");
+    let base2 = boxed(&mut m, 60.0, 40.0, 6.0, [0.0, 0.0, 3.0]);
+    let (a, b) = (topo_of(&m, first), topo_of(&m, base2));
+    assert!(
+        a.0.is_disjoint(&b.0),
+        "a new box shares vertices {:?} with the first L",
+        a.0.intersection(&b.0).collect::<Vec<_>>()
+    );
+    assert!(
+        a.1.is_disjoint(&b.1),
+        "a new box shares edges {:?} with the first L",
+        a.1.intersection(&b.1).collect::<Vec<_>>()
+    );
+    let up2 = boxed(&mut m, 6.0, 40.0, 50.0, [-27.0, 0.0, 25.0]);
+    let second = boolean_operation(
+        &mut m,
+        base2,
+        up2,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("union 2");
+    let (a, b) = (topo_of(&m, first), topo_of(&m, second));
+    assert!(
+        a.0.is_disjoint(&b.0),
+        "the two Ls share vertices {:?}",
+        a.0.intersection(&b.0).collect::<Vec<_>>()
+    );
+    assert!(
+        a.1.is_disjoint(&b.1),
+        "the two Ls share edges {:?}",
+        a.1.intersection(&b.1).collect::<Vec<_>>()
+    );
+}
+
+/// A joined part keeps its name: "bracket base" joined to an upright is
+/// still the bracket, not an anonymous "solid_5".
+#[test]
+fn a_joined_part_keeps_its_name() {
+    let mut m = BRepModel::new();
+    let base = boxed(&mut m, 60.0, 40.0, 6.0, [0.0, 0.0, 3.0]);
+    let upright = boxed(&mut m, 6.0, 40.0, 50.0, [-27.0, 0.0, 25.0]);
+    m.solids.get_mut(base).expect("base").name = Some("bracket base".to_string());
+    m.solids.get_mut(upright).expect("upright").name = Some("bracket upright".to_string());
+    let l = boolean_operation(
+        &mut m,
+        base,
+        upright,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("union");
+    assert_eq!(
+        m.solids.get(l).and_then(|s| s.name.clone()).as_deref(),
+        Some("bracket base")
+    );
+}
+
+/// Every operation, not only booleans, keeps parts independent: a square
+/// extruded exactly over an existing box shares none of its vertices.
+#[test]
+fn an_extrusion_over_another_part_shares_none_of_its_vertices() {
+    use geometry_engine::math::{Point3, Tolerance};
+    use geometry_engine::operations::extrude::{extrude_polygon, ExtrudeOptions};
+    let mut m = BRepModel::new();
+    let block = boxed(&mut m, 20.0, 20.0, 10.0, [0.0, 0.0, 5.0]);
+    let square = [
+        Point3::new(-10.0, -10.0, 0.0),
+        Point3::new(10.0, -10.0, 0.0),
+        Point3::new(10.0, 10.0, 0.0),
+        Point3::new(-10.0, 10.0, 0.0),
+    ];
+    let prism = extrude_polygon(
+        &mut m,
+        &square,
+        ExtrudeOptions {
+            direction: Vector3::new(0.0, 0.0, 1.0),
+            distance: 10.0,
+            ..Default::default()
+        },
+        Tolerance::default(),
+    )
+    .expect("extrude");
+    let (a, b) = (topo_of(&m, block), topo_of(&m, prism));
+    assert!(
+        a.0.is_disjoint(&b.0),
+        "the extrusion reuses the block's vertices {:?}",
+        a.0.intersection(&b.0).collect::<Vec<_>>()
+    );
+}

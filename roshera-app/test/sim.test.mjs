@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-const { wireSegments, setupOf, forceOf, setupGaps, studyOf, simRunOf, verdictView, stressColor, fieldBuffers, deformScale, fieldRange } =
+const { meshControlOf, estimateNodes, finalRun, wireSegments, setupOf, forceOf, setupGaps, studyOf, simRunOf, verdictView, stressColor, fieldBuffers, deformScale, fieldRange } =
   await import('../src/lib/sim.ts')
 
 const material = { name: 'Al 6061-T6', youngs_modulus_mpa: '68900', poisson_ratio: '0.33', yield_strength_mpa: '276', source: 'customer datasheet' }
@@ -11,6 +11,13 @@ const setup = (over = {}) => ({
   material,
   minSafetyFactor: '2',
   meshSizeMm: '',
+  curveElements: '',
+  local: [],
+  refineAtPeak: true,
+  maxRefinements: '',
+  nodeBudget: '',
+  stressPct: '',
+  displacementPct: '',
   ...over,
 })
 
@@ -28,7 +35,8 @@ test('a complete set-up becomes the kernel study verbatim; optional values are l
     loads: [{ faces: [7], force_n: [0, 0, -100], spread: 'even' }],
     material: { name: 'Al 6061-T6', youngs_modulus_mpa: 68900, poisson_ratio: 0.33, yield_strength_mpa: 276, source: 'customer datasheet' },
     goal: { min_safety_factor: 2 },
-    mesh: {},
+    mesh: { local: [], refine_at_peak: true },
+    accuracy: { stress: 0.05, displacement: 0.02 },
   })
   const noYield = studyOf(setup({ material: { ...material, yield_strength_mpa: '', source: '' } }))
   assert.equal('yield_strength_mpa' in noYield.material, false, 'a blank yield is absent, so the kernel refuses a safety factor')
@@ -115,9 +123,34 @@ test("an agent's study is shown as it was run, and runs again unchanged", () => 
   assert.equal(setup.loads[0].direction, 'given')
   assert.deepEqual(forceOf(setup.loads[0]), [200, 0, 30], 'the force vector the agent gave, not an axis')
   assert.equal(setup.material.yield_strength_mpa, '', 'no yield given stays no yield')
-  assert.deepEqual(studyOf(setup), agent, 'the same study goes back to the kernel')
+  // The same study, its defaults written out.
+  assert.deepEqual(
+    studyOf(setup),
+    { ...agent, mesh: { local: [], refine_at_peak: true }, accuracy: { stress: 0.05, displacement: 0.02 } },
+    'the same study goes back to the kernel',
+  )
 })
 test('the mesh wireframe draws each element edge once, end to end', () => {
   const w = wireSegments({ positions: [[0, 0, 0], [1, 0, 0], [0, 2, 0]], edges: [[0, 1], [1, 2]] })
   assert.deepEqual([...w], [0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 2, 0])
+})
+test("a report's numbers come from its last run: the last refinement, else the proving mesh", () => {
+  const run = (peak) => ({ peak_von_mises_mpa: peak })
+  assert.equal(finalRun({ fine: run(39.7) }).peak_von_mises_mpa, 39.7)
+  assert.equal(finalRun({ fine: run(39.7), refined: [] }).peak_von_mises_mpa, 39.7)
+  assert.equal(finalRun({ fine: run(39.7), refined: [run(41.2), run(41.6)] }).peak_von_mises_mpa, 41.6)
+})
+test('the mesh settings go to the kernel as set, and bad ones are refused with a reason', () => {
+  const s = setup({ meshSizeMm: '3', curveElements: '16', local: [{ faces: [7], sizeMm: '0.8' }, { faces: [], sizeMm: '1' }], refineAtPeak: false, maxRefinements: '2', nodeBudget: '90000' })
+  assert.deepEqual(meshControlOf(s), {
+    control: { size_mm: 3, curve_elements: 16, local: [{ faces: [7], size_mm: 0.8 }], refine_at_peak: false, max_refinements: 2, node_budget: 90000 },
+  })
+  assert.match(meshControlOf(setup({ meshSizeMm: '-1' })).error, /above 0/)
+  assert.match(meshControlOf(setup({ curveElements: '2.5' })).error, /whole number/)
+  assert.match(meshControlOf(setup({ local: [{ faces: [3], sizeMm: '0' }] })).error, /above 0/)
+})
+
+test('the node estimate scales with the cube of 1 / element size, from a mesh actually made', () => {
+  assert.equal(estimateNodes({ nodes: 40000, size_mm: 1.8 }, 0.9), 320000)
+  assert.equal(estimateNodes({ nodes: 40000, size_mm: 1.8 }, 3.6), 5000)
 })

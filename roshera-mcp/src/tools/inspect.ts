@@ -315,13 +315,32 @@ export function registerInspectTools(server: ToolHost) {
       mesh_size_mm: z
         .number()
         .optional()
-        .describe("coarse mesh's largest element; default a twentieth of the part; the fine mesh uses 0.6 of it"),
+        .describe("coarse mesh's largest element; default a twentieth of the part; the fine (proving) mesh uses 0.6 of it. Smaller = finer"),
+      curve_elements: z
+        .number()
+        .int()
+        .optional()
+        .describe("elements around a full circle on curved faces (default 12; 0 = off); more = finer on fillets and holes"),
+      local: z
+        .array(z.object({ faces: z.array(z.number().int()).min(1), size_mm: z.number() }))
+        .optional()
+        .describe("finer elements near chosen faces (a fillet, a hole edge): each faces + their element size, mm"),
+      refine_at_peak: z.boolean().optional().describe("refine at the stress peak until it settles (default true)"),
+      max_refinements: z.number().int().optional().describe("at most this many refinements at the peak (default 3)"),
+      node_budget: z.number().int().optional().describe("no refinement past this many nodes (default 150000, a laptop)"),
     },
     async (args) => {
       try {
         return ok(
           simForAgent(
-            await api("POST", `/api/agent/parts/${args.part_id}/sim/static/mesh`, { size_mm: args.mesh_size_mm }),
+            await api("POST", `/api/agent/parts/${args.part_id}/sim/static/mesh`, {
+              size_mm: args.mesh_size_mm,
+              curve_elements: args.curve_elements,
+              local: args.local ?? [],
+              refine_at_peak: args.refine_at_peak,
+              max_refinements: args.max_refinements,
+              node_budget: args.node_budget,
+            }),
           ),
         );
       } catch (e) {
@@ -346,6 +365,10 @@ export function registerInspectTools(server: ToolHost) {
       loads: loadsSchema,
       material: materialSchema,
       min_safety_factor: z.number().describe("the goal: yield / peak stress must reach this"),
+      accuracy: z
+        .object({ stress: z.number().optional(), displacement: z.number().optional() })
+        .optional()
+        .describe("how closely the last two meshes must agree, as fractions (defaults: stress 0.05, displacement 0.02)"),
     },
     async (args) => {
       try {
@@ -359,6 +382,7 @@ export function registerInspectTools(server: ToolHost) {
                 material: args.material,
                 goal: { min_safety_factor: args.min_safety_factor },
                 mesh: {},
+                ...(args.accuracy ? { accuracy: args.accuracy } : {}),
               },
             }),
           ),

@@ -51,6 +51,15 @@ pub struct MeshStats {
     /// (measured against its certified tessellation), mm.
     pub boundary_deviation_mm: f64,
     pub mesher_seconds: f64,
+    /// Element shape, normalised mean ratio (1 = a regular tetrahedron,
+    /// toward 0 = a flat sliver): the worst element and the average.
+    #[serde(default)]
+    pub quality_min: f64,
+    #[serde(default)]
+    pub quality_mean: f64,
+    /// Elements below 0.2 -- shapes that degrade the stress near them.
+    #[serde(default)]
+    pub poor_elements: usize,
 }
 
 /// Why a mesh could not be made.
@@ -68,12 +77,66 @@ pub enum MeshError {
     Unclassified(f64),
 }
 
+/// How a mesh is graded beyond its general size.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MeshOptions {
+    /// Elements around a full circle on curved faces (Gmsh's
+    /// curvature-based size); `None`: 12. `Some(0)`: off.
+    pub curve_elements: Option<u32>,
+    /// Finer elements near chosen faces: each a box around a face, `size`
+    /// inside, growing back to the general size over `reach`.
+    pub boxes: Vec<SizeBox>,
+    /// Finer elements around a stress peak (refinement at the peak).
+    pub ball: Option<Refine>,
+}
+
+/// A local size: elements of at most `size` within the box, back to the
+/// general size over `reach` outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SizeBox {
+    pub lo: [f64; 3],
+    pub hi: [f64; 3],
+    pub size: f64,
+    pub reach: f64,
+}
+
+/// Finer elements inside a ball: where a stress peak did not settle, the
+/// mesh is refined there (`size` inside `radius` of `center`), growing back
+/// to the general size over another radius.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Refine {
+    pub center: [f64; 3],
+    pub radius: f64,
+    pub size: f64,
+}
+
 /// Mesh `solid` with largest element `size_mm`, in `workdir`, through
 /// `mesher`.
 pub fn mesh_solid(
     model: &BRepModel,
     solid: SolidId,
     size_mm: f64,
+    mesher: &EngineInfo,
+    workdir: &Path,
+    limit: Duration,
+) -> Result<(VolumeMesh, MeshStats), MeshError> {
+    mesh_solid_graded(
+        model,
+        solid,
+        size_mm,
+        &MeshOptions::default(),
+        mesher,
+        workdir,
+        limit,
+    )
+}
+
+/// [`mesh_solid`], graded by `options` (curvature, local sizes, a peak ball).
+pub fn mesh_solid_graded(
+    model: &BRepModel,
+    solid: SolidId,
+    size_mm: f64,
+    options: &MeshOptions,
     mesher: &EngineInfo,
     workdir: &Path,
     limit: Duration,
@@ -91,8 +154,11 @@ pub fn mesh_solid(
     .map_err(|e| MeshError::Export(e.to_string()))?;
     let (lo, hi) = solid_bounds(model, solid).ok_or(MeshError::Empty)?;
     let pad = 1e-3 * (0..3).map(|i| hi[i] - lo[i]).fold(1.0_f64, f64::max);
-    std::fs::write(workdir.join("part.geo"), geo_script(size_mm, lo, hi, pad))
-        .map_err(|e| MeshError::Export(e.to_string()))?;
+    std::fs::write(
+        workdir.join("part.geo"),
+        geo_script(size_mm, lo, hi, pad, options),
+    )
+    .map_err(|e| MeshError::Export(e.to_string()))?;
     let took = run(
         mesher,
         &["part.geo", "-3", "-format", "msh2", "-o", "part.msh"],
@@ -107,12 +173,16 @@ pub fn mesh_solid(
         return Err(MeshError::Empty);
     }
     let (boundary, deviation) = classify(model, solid, &nodes, &tris)?;
+    let (quality_min, quality_mean, poor_elements) = shape_quality(&nodes, &tets);
     let stats = MeshStats {
         size_mm,
         nodes: nodes.len(),
         elements: tets.len(),
         boundary_deviation_mm: deviation,
         mesher_seconds: took.as_secs_f64(),
+        quality_min,
+        quality_mean,
+        poor_elements,
     };
     Ok((
         VolumeMesh {
@@ -125,8 +195,43 @@ pub fn mesh_solid(
 }
 
 /// The Gmsh script: read the part, keep the volume inside the solid's box,
-/// quadratic tets graded by curvature, every boundary surface its own group.
-fn geo_script(size: f64, lo: [f64; 3], hi: [f64; 3], pad: f64) -> String {
+/// quadratic tets graded by curvature and by `options`' local sizes, every
+/// boundary surface its own group.
+fn geo_script(size: f64, lo: [f64; 3], hi: [f64; 3], pad: f64, options: &MeshOptions) -> String {
+    use std::fmt::Write as _;
+    let mut fields = String::new();
+    let mut ids: Vec<usize> = Vec::new();
+    let mut smallest = size;
+    if let Some(r) = &options.ball {
+        let id = 1;
+        let _ = write!(
+            fields,
+            "Field[{id}] = Ball;\nField[{id}].Radius = {};\nField[{id}].Thickness = {};\nField[{id}].VIn = {};\nField[{id}].VOut = {size};\nField[{id}].XCenter = {};\nField[{id}].YCenter = {};\nField[{id}].ZCenter = {};\n",
+            r.radius, r.radius, r.size, r.center[0], r.center[1], r.center[2]
+        );
+        ids.push(id);
+        smallest = smallest.min(r.size);
+    }
+    for (k, b) in options.boxes.iter().enumerate() {
+        let id = 10 + k;
+        let _ = write!(
+            fields,
+            "Field[{id}] = Box;\nField[{id}].VIn = {};\nField[{id}].VOut = {size};\nField[{id}].XMin = {};\nField[{id}].YMin = {};\nField[{id}].ZMin = {};\nField[{id}].XMax = {};\nField[{id}].YMax = {};\nField[{id}].ZMax = {};\nField[{id}].Thickness = {};\n",
+            b.size, b.lo[0], b.lo[1], b.lo[2], b.hi[0], b.hi[1], b.hi[2], b.reach
+        );
+        ids.push(id);
+        smallest = smallest.min(b.size);
+    }
+    if !ids.is_empty() {
+        let list: Vec<String> = ids.iter().map(usize::to_string).collect();
+        let _ = write!(
+            fields,
+            "Field[100] = Min;\nField[100].FieldsList = {{{}}};\nBackground Field = 100;\n",
+            list.join(", ")
+        );
+    }
+    let curve = options.curve_elements.unwrap_or(12);
+    let min = (size / 8.0).min(smallest / 2.0);
     format!(
         r#"SetFactory("OpenCASCADE");
 Geometry.OCCTargetUnit = "MM";
@@ -135,8 +240,8 @@ v[] = Volume In BoundingBox{{{}, {}, {}, {}, {}, {}}};
 Mesh.ElementOrder = 2;
 Mesh.MeshSizeMax = {size};
 Mesh.MeshSizeMin = {min};
-Mesh.MeshSizeFromCurvature = 12;
-Physical Volume(1) = {{v[]}};
+Mesh.MeshSizeFromCurvature = {curve};
+{fields}Physical Volume(1) = {{v[]}};
 s[] = Boundary{{ Volume{{v[]}}; }};
 For i In {{0:#s[]-1}}
   Physical Surface(Abs(s[i])) = {{Abs(s[i])}};
@@ -148,10 +253,56 @@ EndFor
         hi[0] + pad,
         hi[1] + pad,
         hi[2] + pad,
-        min = size / 8.0,
     )
 }
 
+/// Element shape over the mesh: the normalised mean ratio of each
+/// tetrahedron's corners, `12 (3V)^(2/3) / sum of squared edge lengths`
+/// (1 for a regular tetrahedron, toward 0 for a sliver). Returns the worst,
+/// the average, and how many fall below 0.2.
+pub(crate) fn shape_quality(
+    nodes: &BTreeMap<u64, [f64; 3]>,
+    tets: &[[u64; 10]],
+) -> (f64, f64, usize) {
+    let mut worst = 1.0_f64;
+    let mut sum = 0.0;
+    let mut poor = 0usize;
+    let mut counted = 0usize;
+    for t in tets {
+        let p: Vec<[f64; 3]> = t[..4]
+            .iter()
+            .filter_map(|n| nodes.get(n).copied())
+            .collect();
+        if p.len() != 4 {
+            continue;
+        }
+        let d = |a: [f64; 3], b: [f64; 3]| [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let (u, v, w) = (d(p[0], p[1]), d(p[0], p[2]), d(p[0], p[3]));
+        let vol = (u[0] * (v[1] * w[2] - v[2] * w[1]) - u[1] * (v[0] * w[2] - v[2] * w[0])
+            + u[2] * (v[0] * w[1] - v[1] * w[0]))
+            .abs()
+            / 6.0;
+        let mut edges = 0.0;
+        for (i, j) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
+            let e = d(p[i], p[j]);
+            edges += e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+        }
+        if !(edges > 0.0) {
+            continue;
+        }
+        let q = (12.0 * (3.0 * vol).powf(2.0 / 3.0) / edges).clamp(0.0, 1.0);
+        worst = worst.min(q);
+        sum += q;
+        counted += 1;
+        if q < 0.2 {
+            poor += 1;
+        }
+    }
+    if counted == 0 {
+        return (0.0, 0.0, 0);
+    }
+    (worst, sum / counted as f64, poor)
+}
 fn solid_bounds(model: &BRepModel, solid: SolidId) -> Option<([f64; 3], [f64; 3])> {
     let mesh = tessellate_solid(
         model.solids.get(solid)?,

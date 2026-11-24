@@ -83,7 +83,10 @@ pub fn revolve_face(
         lifecycle::validate_can_apply(model, OpSpec::RevolveFace { face_id })?;
     }
 
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = lifecycle::operand_vertices(model, &OpSpec::RevolveFace { face_id });
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         // Validate inputs
         validate_revolve_inputs(model, face_id, &options)?;
 
@@ -165,7 +168,15 @@ pub fn revolve_profile(
             },
         )?;
     }
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = lifecycle::operand_vertices(
+        model,
+        &OpSpec::RevolveProfile {
+            profile_edges: &profile_edges,
+        },
+    );
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         let face_id = create_face_from_profile(model, profile_edges)?;
         revolve_face(model, face_id, options)
     })

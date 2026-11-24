@@ -1830,7 +1830,12 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
-                    "mesh_size_mm": {"type": "number", "description": "coarse mesh's largest element; default a twentieth of the part; the fine mesh uses 0.6 of it"}
+                    "mesh_size_mm": {"type": "number", "description": "coarse mesh's largest element; default a twentieth of the part; the fine (proving) mesh uses 0.6 of it. Smaller = finer"},
+                    "curve_elements": {"type": "integer", "description": "elements around a full circle on curved faces (default 12; 0 = off)"},
+                    "local": {"type": "array", "description": "finer elements near chosen faces: each {faces: [face ids], size_mm}"},
+                    "refine_at_peak": {"type": "boolean", "description": "refine at the stress peak until it settles (default true)"},
+                    "max_refinements": {"type": "integer", "description": "at most this many refinements at the peak (default 3)"},
+                    "node_budget": {"type": "integer", "description": "no refinement past this many nodes (default 150000)"}
                 },
                 "required": ["part_id"]
             }),
@@ -1849,7 +1854,8 @@ fn raw_tools() -> Vec<ToolSpec> {
                     "supports": {"type": "array", "description": "how the part is held: each {kind: fixed | bolt_clamp | pin | slider, faces: [face ids]}"},
                     "loads": {"type": "array", "description": "forces on faces: each {faces: [face ids], force_n: [x,y,z] total N, spread: even | bearing}"},
                     "material": {"type": "object", "description": "{name, youngs_modulus_mpa, poisson_ratio, yield_strength_mpa?, source?}"},
-                    "min_safety_factor": {"type": "number", "description": "the goal: yield / peak stress must reach this"}
+                    "min_safety_factor": {"type": "number", "description": "the goal: yield / peak stress must reach this"},
+                    "accuracy": {"type": "object", "description": "how closely the last two meshes must agree, as fractions: {stress (default 0.05), displacement (default 0.02)}"}
                 },
                 "required": ["part_id", "revision", "supports", "loads", "material", "min_safety_factor"]
             }),

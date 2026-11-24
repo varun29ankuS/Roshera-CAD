@@ -19,18 +19,31 @@ use serde::{Deserialize, Serialize};
 use crate::ccx::{solve_static, von_mises, DeckHold, DeckLoad, DeckSupport, SolveError};
 use crate::engines::Engines;
 use crate::field::{surface_field, SurfaceField};
-use crate::mesh::{mesh_solid, MeshError, MeshStats};
+use crate::mesh::{mesh_solid_graded, MeshError, MeshOptions, MeshStats, Refine, SizeBox};
 use crate::rigid::{free_motions, FreeMotion, HeldPoint, Holds};
-use crate::study::{Study, SupportKind, FINE_RATIO};
+use crate::study::{MeshControl, Study, SupportKind, FINE_RATIO};
 
 /// Time each engine run may take.
 pub(crate) const ENGINE_LIMIT: Duration = Duration::from_secs(600);
 /// Reactions must balance the applied load to this share.
 const BALANCE_TOL: f64 = 0.01;
-/// The two meshes' largest displacements must agree to this share.
-const DISPLACEMENT_TOL: f64 = 0.02;
-/// The two meshes' peak stresses must agree to this share.
-const STRESS_TOL: f64 = 0.05;
+/// At most this many refinements at the peak after the two approved meshes.
+const MAX_REFINEMENTS: usize = 3;
+/// No refinement whose mesh would pass this many nodes (about twice the last):
+/// a laptop solves it in seconds to a minute, without running out of memory.
+const NODE_BUDGET: usize = 150_000;
+
+/// How the refinements read in a check's detail.
+fn refined_note(refined: &[RunResult]) -> String {
+    match refined.len() {
+        0 => String::new(),
+        n => format!(
+            " (after {n} refinement{} at the peak, {} nodes)",
+            if n == 1 { "" } else { "s" },
+            refined[n - 1].mesh.nodes
+        ),
+    }
+}
 
 /// One run's numbers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,8 +90,12 @@ pub struct StaticReport {
     /// The persistent ids of the faces the study names (hex), for replay.
     pub face_pids: Vec<(u32, String)>,
     pub assumptions: Vec<String>,
-    /// The fine run's result on the part's surface, for the viewport.
+    /// The last run's result on the part's surface, for the viewport.
     pub field: SurfaceField,
+    /// Runs refined at the peak after the two approved meshes, in order
+    /// (empty when the peak settled on them): the verdict reads the last.
+    #[serde(default)]
+    pub refined: Vec<RunResult>,
 }
 
 /// Why a study was not run at all.
@@ -230,6 +247,68 @@ pub fn coarse_mesh_size(
     Ok(extent / 20.0)
 }
 
+/// The mesher's grading for `control` on `solid`: curvature, and a size box
+/// around each face given a local size (the face's own extent, reaching
+/// back to the general `size` over one general element). Refused when a
+/// local size names a face not on this part or is not above 0.
+pub fn mesh_options(
+    model: &BRepModel,
+    solid: SolidId,
+    control: &MeshControl,
+    size: f64,
+) -> Result<MeshOptions, StudyError> {
+    let mut boxes = Vec::new();
+    if !control.local.is_empty() {
+        let surface = tessellate_solid(
+            model
+                .solids
+                .get(solid)
+                .ok_or(StudyError::UnknownSolid(solid))?,
+            model,
+            &TessellationParams::default(),
+        );
+        for local in &control.local {
+            if !(local.size_mm > 0.0) {
+                return Err(StudyError::MeshSize(local.size_mm));
+            }
+            let mut lo = [f64::INFINITY; 3];
+            let mut hi = [f64::NEG_INFINITY; 3];
+            for &f in &local.faces {
+                if !surface.face_map.contains(&f) {
+                    return Err(StudyError::UnknownFace(f));
+                }
+            }
+            for (t, f) in surface.triangles.iter().zip(&surface.face_map) {
+                if !local.faces.contains(f) {
+                    continue;
+                }
+                for &i in t {
+                    let p = surface.vertices[i as usize].position;
+                    for (k, c) in [p.x, p.y, p.z].into_iter().enumerate() {
+                        lo[k] = lo[k].min(c);
+                        hi[k] = hi[k].max(c);
+                    }
+                }
+            }
+            if lo[0].is_finite() {
+                // A flat face's box has no thickness: give it the local size.
+                let pad = local.size_mm;
+                boxes.push(SizeBox {
+                    lo: [lo[0] - pad, lo[1] - pad, lo[2] - pad],
+                    hi: [hi[0] + pad, hi[1] + pad, hi[2] + pad],
+                    size: local.size_mm,
+                    reach: size,
+                });
+            }
+        }
+    }
+    Ok(MeshOptions {
+        curve_elements: control.curve_elements,
+        boxes,
+        ball: None,
+    })
+}
+
 /// Run `study` on `solid`, its engine files in `workdir`.
 pub fn run_static(
     model: &BRepModel,
@@ -263,9 +342,25 @@ pub fn run_static(
             t[2] + l.force_n[2],
         ]
     });
-    let solve_at = |size: f64, label: &str| -> Result<(RunResult, SurfaceField), StudyError> {
+    let graded = mesh_options(model, solid, &study.mesh, coarse_size)?;
+    let solve_at = |size: f64,
+                    refine: Option<&Refine>,
+                    label: &str|
+     -> Result<(RunResult, SurfaceField), StudyError> {
         let dir = workdir.join(label);
-        let (mesh, stats) = mesh_solid(model, solid, size, &engines.mesher, &dir, ENGINE_LIMIT)?;
+        let options = MeshOptions {
+            ball: refine.copied(),
+            ..graded.clone()
+        };
+        let (mesh, stats) = mesh_solid_graded(
+            model,
+            solid,
+            size,
+            &options,
+            &engines.mesher,
+            &dir,
+            ENGINE_LIMIT,
+        )?;
         let loads: Vec<DeckLoad<'_>> = study
             .loads
             .iter()
@@ -309,11 +404,55 @@ pub fn run_static(
             field,
         ))
     };
-    let (coarse, _) = solve_at(coarse_size, "coarse")?;
-    let (fine, field) = solve_at(coarse_size * FINE_RATIO, "fine")?;
+    let (coarse, _) = solve_at(coarse_size, None, "coarse")?;
+    let (fine, mut field) = solve_at(coarse_size * FINE_RATIO, None, "fine")?;
+
+    // ── Refine at the peak until it settles ───────────────────────────────
+    // A peak that moves between the two meshes is either a mesh too coarse
+    // where the stress gathers (a fillet, a hole edge) or a sharp corner,
+    // where the stress has no limit. Refine in a ball around the peak and
+    // solve again: a real peak settles; a sharp corner keeps climbing.
+    let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-300);
+    let fine_size = coarse_size * FINE_RATIO;
+    let mut refined: Vec<RunResult> = Vec::new();
+    let mut inside = fine_size;
+    let max_refinements = if study.mesh.refine_at_peak.unwrap_or(true) {
+        study.mesh.max_refinements.unwrap_or(MAX_REFINEMENTS)
+    } else {
+        0
+    };
+    let node_budget = study.mesh.node_budget.unwrap_or(NODE_BUDGET);
+    let (stress_tol, displacement_tol) = (study.accuracy.stress, study.accuracy.displacement);
+    for level in 1..=max_refinements {
+        let (prev, last) = match refined.len() {
+            0 => (&coarse, &fine),
+            1 => (&fine, &refined[0]),
+            n => (&refined[n - 2], &refined[n - 1]),
+        };
+        if rel(prev.peak_von_mises_mpa, last.peak_von_mises_mpa) <= stress_tol {
+            break;
+        }
+        if last.mesh.nodes.saturating_mul(2) > node_budget {
+            break;
+        }
+        inside *= FINE_RATIO;
+        let ball = Refine {
+            center: last.peak_at,
+            radius: 3.0 * fine_size,
+            size: inside,
+        };
+        let (run, f) = solve_at(fine_size, Some(&ball), &format!("refine{level}"))?;
+        refined.push(run);
+        field = f;
+    }
+    // The pair the convergence is read from: the last two runs.
+    let (before, last) = match refined.len() {
+        0 => (&coarse, &fine),
+        1 => (&fine, &refined[0]),
+        n => (&refined[n - 2], &refined[n - 1]),
+    };
 
     // ── Checks and verdict ────────────────────────────────────────────────
-    let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-300);
     let mut checks = vec![Check {
         name: "held".to_string(),
         passed: true,
@@ -343,7 +482,7 @@ pub fn run_static(
             100.0 * imbalance
         ),
     });
-    let d_agree = rel(coarse.max_displacement_mm, fine.max_displacement_mm) <= DISPLACEMENT_TOL;
+    let d_agree = rel(coarse.max_displacement_mm, fine.max_displacement_mm) <= displacement_tol;
     checks.push(Check {
         name: "displacement converged".to_string(),
         passed: d_agree,
@@ -352,19 +491,23 @@ pub fn run_static(
             coarse.max_displacement_mm, fine.max_displacement_mm
         ),
     });
-    let s_agree = rel(coarse.peak_von_mises_mpa, fine.peak_von_mises_mpa) <= STRESS_TOL;
+    let s_agree = rel(before.peak_von_mises_mpa, last.peak_von_mises_mpa) <= stress_tol;
     checks.push(Check {
         name: "peak stress converged".to_string(),
         passed: s_agree,
         detail: if s_agree {
             format!(
-                "{:.1} MPa vs {:.1} MPa on the two meshes",
-                coarse.peak_von_mises_mpa, fine.peak_von_mises_mpa
+                "{:.1} MPa vs {:.1} MPa on the last two meshes{}",
+                before.peak_von_mises_mpa,
+                last.peak_von_mises_mpa,
+                refined_note(&refined)
             )
         } else {
             format!(
-                "{:.1} MPa then {:.1} MPa: it rises with the mesh -- a sharp corner (not a real stress) or the mesh is too coarse there",
-                coarse.peak_von_mises_mpa, fine.peak_von_mises_mpa
+                "{:.1} MPa then {:.1} MPa: it still rises with the mesh{} -- a sharp corner, where the stress has no limit (round it), or more refinement than this machine's budget",
+                before.peak_von_mises_mpa,
+                last.peak_von_mises_mpa,
+                refined_note(&refined)
             )
         },
     });
@@ -387,7 +530,7 @@ pub fn run_static(
     } else {
         match (m.yield_strength_mpa, m.source.as_deref()) {
             (Some(y), Some(src)) if y > 0.0 && !src.trim().is_empty() => {
-                let sf = y / fine.peak_von_mises_mpa.max(1e-300);
+                let sf = y / last.peak_von_mises_mpa.max(1e-300);
                 if sf >= study.goal.min_safety_factor {
                     Verdict::Holds {
                         safety_factor: sf,
@@ -452,6 +595,7 @@ pub fn run_static(
         face_pids,
         assumptions,
         field,
+        refined,
     })
 }
 

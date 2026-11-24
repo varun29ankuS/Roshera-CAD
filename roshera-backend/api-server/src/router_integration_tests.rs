@@ -14672,6 +14672,9 @@ async fn a_study_is_staged_and_each_stage_builds_on_the_current_one() {
         elements: 40,
         boundary_deviation_mm: 0.0,
         mesher_seconds: 0.1,
+        quality_min: 0.4,
+        quality_mean: 0.8,
+        poor_elements: 0,
     };
     state.sim_sessions.insert(
         doc,
@@ -14679,7 +14682,10 @@ async fn a_study_is_staged_and_each_stage_builds_on_the_current_one() {
             revision: "mesh-1".to_string(),
             solid: solid_id,
             stage: crate::handlers::agent::SimStage::Mesh,
-            mesh_size_mm: Some(2.0),
+            mesh_control: sim_engine::study::MeshControl {
+                size_mm: Some(2.0),
+                ..Default::default()
+            },
             mesh: Some(sim_engine::preview::MeshPreview {
                 coarse: stats.clone(),
                 fine: stats,

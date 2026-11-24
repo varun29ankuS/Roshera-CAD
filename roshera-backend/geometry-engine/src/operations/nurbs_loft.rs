@@ -108,7 +108,10 @@ pub fn nurbs_loft(
         .map(|ring| ring.iter().map(|p| [p.x, p.y, p.z]).collect())
         .collect();
 
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = Some(std::collections::HashSet::new());
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         let tol = Tolerance::default();
 
         // ---- seam vertices: the surface's u=0 endpoints. ----

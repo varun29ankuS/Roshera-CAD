@@ -142,7 +142,10 @@ pub fn apply_draft(
     if options.common.validate_before {
         lifecycle::validate_can_apply(model, OpSpec::Draft { face_ids: &faces })?;
     }
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = lifecycle::operand_vertices(model, &OpSpec::Draft { face_ids: &faces });
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         apply_draft_body(model, solid_id, faces, options)
     })
 }

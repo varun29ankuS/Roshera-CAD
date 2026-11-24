@@ -104,7 +104,15 @@ pub fn loft_profiles(
             },
         )?;
     }
-    lifecycle::with_rollback(model, move |model| {
+    // Weld only to this operation's operands and what it makes: never to a
+    // coincident vertex of another part (lifecycle::operand_vertices).
+    let operands = lifecycle::operand_vertices(
+        model,
+        &OpSpec::LoftProfiles {
+            profiles: &profiles,
+        },
+    );
+    lifecycle::with_rollback_scoped(model, operands, move |model| {
         loft_profiles_body(model, profiles, options)
     })
 }
