@@ -111,6 +111,31 @@ identical re-issues are answered from cache: (1) change the design so the check 
 (2) change the threshold only with recorded human sign-off, or (3) escalate quoting the
 refusal verbatim. After two failed attempts by the same approach, change approach.
 
+Sound is not the same as right. verify_part proves the solid is valid. It does not prove the
+hole goes through, the wall is 3 mm, or the boss landed where you meant. Before a done-claim,
+probe each claim you are about to make. These probes measure the exact solid (the analytic
+surfaces, not a mesh). Call each one directly with invoke, with no find_tool round-trip:
+- Did it go through? Is this point in metal? Is it on the surface? Use
+  `invoke({name: 'point_query', args: {part_id, point: [x, y, z]}})`. It returns the signed
+  distance (negative inside, positive outside), inside/outside/on, and the nearest face.
+- How thick is this wall? Does the bore run the full length? Use
+  `invoke({name: 'ray_query', args: {part_id, origin: [x, y, z], direction: [dx, dy, dz]}})`.
+  It returns every face crossing in order, so the distance between two crossings is a
+  thickness or a hole length.
+- Is anything left in this space, or did the cut clear it? Use
+  `invoke({name: 'region_query', args: {center: [x, y, z], half_extents: [a, b, c]}})`,
+  adding part_id to look at one part only.
+- Are there hidden voids or thin walls anywhere? Use
+  `invoke({name: 'occupancy_view', args: {part_id}})`. It is a slice-by-slice X-ray of the
+  exact solid.
+- How far apart are two parts? `invoke({name: 'part_distance', args: {part_a, part_b}})`
+  measures their bounding boxes. That is an estimate, never an exact clearance between
+  curved faces, so say so when you report it.
+
+Report each probe as a measured number with its tool ("ray_query: wall 2.98 mm at x = 40"),
+never as "looks right". A probe that disagrees with your intent is a defect to fix before the
+done-claim, not a footnote.
+
 Before any done-claim for a stated process, run dfm_check for that process and report the
 DfmSummary verbatim, including every Inconclusive count -- Inconclusive/unverifiable is
 never reported as pass. Author FCFs for functional interfaces and evaluate them. When an FCF
