@@ -178,6 +178,11 @@ const PHRASES: Array<[RegExp, string]> = [
   [/\bdepends?\s+on\b|\bdependen(?:t|ts|cy|cies)\b/g, " dependencies downstream "],
   // "step 6" is a step of the history, never the STEP file format.
   [/\bstep\s+\d+\b/g, " event "],
+  // A number followed by N / kN is a force ("push with 200 N"): the unit
+  // alone is a 1-character token tokenize drops. Read as "force", never
+  // "newton": psketch_solve's purpose speaks of Newton's METHOD.
+  [/\b\d+(?:\.\d+)?\s?k?n\b/g, " force "],
+  [/\bnewtons?\b/g, " force "],
   [/\bdegrees[\s-]of[\s-]freedom\b/g, " dof "],
   [/\blead[\s-]?ins?\b/g, " chamfer "],
   [/\bbill[\s-]of[\s-]materials\b/g, " bom "],
@@ -477,8 +482,11 @@ export const VERB_MEANINGS: Record<string, { words: string[]; means: Partial<Rec
  */
 export const DOMAIN_WORDS: Partial<Record<Bench, Record<string, string[]>>> = {
   simulate: {
+    // Not "hold" ("will this hold 500 N" asks for the verdict) and not
+    // "clamp" ("an FEA on the clamp" names the part): both read as a
+    // support only some of the time.
     pin: ["support"], pinned: ["support"], fix: ["support"], fixed: ["support"],
-    clamp: ["support"], bolt: ["support"], anchor: ["support"], hold: ["support"],
+    bolt: ["support"], anchor: ["support"],
     restrain: ["support"], constraint: ["support"], constrain: ["support"],
     load: ["force"], push: ["force"], pull: ["force"], press: ["force"],
     material: ["material"], alloy: ["material"], steel: ["material"], aluminium: ["material"],
@@ -493,6 +501,29 @@ export const DOMAIN_WORDS: Partial<Record<Bench, Record<string, string[]>>> = {
     constraint: ["mate"], constrain: ["mate"],
   },
 };
+
+/**
+ * Words that mean ONE domain whatever else the query says -- quantities only
+ * that domain has. With no domain in use, a query using one is read in that
+ * domain ("apply a force on the top face" is study set-up, not a face pick).
+ * Deliberately NOT here: "load" (a file is loaded too), "pin" / "fix" /
+ * "constraint" (a meaning in three domains), "push" (push-pull modelling).
+ */
+export const DOMAIN_SIGNALS: Partial<Record<Bench, string[]>> = {
+  // ("500 N" and "newtons" reach here as "force", see PHRASES.)
+  simulate: ["force", "stress", "fea", "mises"],
+};
+
+/** The one domain a query's own words name, with those words; null when none or several. */
+export function inferredDomain(query: string): { bench: Bench; words: string[] } | null {
+  const toks = new Set(tokenize(query));
+  const hits: Array<{ bench: Bench; words: string[] }> = [];
+  for (const [b, words] of Object.entries(DOMAIN_SIGNALS) as Array<[Bench, string[]]>) {
+    const found = words.filter((w) => toks.has(stem(w)));
+    if (found.length) hits.push({ bench: b, words: found });
+  }
+  return hits.length === 1 ? hits[0] : null;
+}
 
 /** Words that add no intent to a bare verb ("solve it again now"). */
 const FILLER = new Set(["again", "now", "once", "go", "ahead", "then", "next", "ok", "okay"].map(stem));
@@ -762,7 +793,10 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
         });
       }
 
-      const results = rankTools(table, query, bench, limit ?? 5, ctx.bench);
+      // No domain in use: the query's own single-meaning words may name one.
+      const inferred = ctx.bench === null && !bench ? inferredDomain(query) : null;
+      const contextBench = ctx.bench ?? inferred?.bench ?? null;
+      const results = rankTools(table, query, bench, limit ?? 5, contextBench);
       if (results.length === 0) {
         return okMeta({
           query,
@@ -773,14 +807,14 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
             "Browse a whole bench by querying its name, e.g. 'analysis'.",
         });
       }
-      const read = bench ? [] : claimedWords(query, ctx.bench);
+      const read = bench ? [] : claimedWords(query, contextBench);
       return okMeta({
         query,
-        ...(ctx.bench !== null && !bench
+        ...(contextBench !== null && !bench
           ? {
               context: {
-                working_in: ctx.bench,
-                from: ctx.from,
+                working_in: contextBench,
+                ...(inferred ? { inferred_from: inferred.words } : { from: ctx.from }),
                 ...(read.length ? { domain_words: read } : {}),
               },
             }

@@ -175,6 +175,38 @@ for (const query of [
   else fail(`"${query}" -> ${first(r)} (${(r.matches ?? []).map((m) => m.name).join(", ")})`);
 }
 
+// (x9) frozen 2026-11-24 before the query could set the context: with no
+// domain in use, a query that names a quantity only a study has (a force,
+// "200 N", a stress) is read as study work; a query without one is not.
+console.log("(x9) the query itself sets the context only through words with one meaning");
+for (const [query, expected] of [
+  ["apply a force on the top face", "sim_setup"],
+  ["put 500 N on the end of the arm", "sim_setup"],
+  ["load the step file from the vendor", "import_step"], // "load" alone is not a study word
+  ["measure the distance between the two faces", "measure_faces"],
+  ["select the top face", "select_face"],
+]) {
+  resetWorkingContext();
+  await bench("core_only");
+  const r = await find(query);
+  if (first(r) === expected) pass(`"${query}" -> ${expected}${r.context?.inferred_from ? ` (study, from ${r.context.inferred_from.join(", ")})` : ""}`);
+  else fail(`"${query}" -> ${first(r)} (${(r.matches ?? []).map((m) => m.name).join(", ")})`);
+}
+
+{
+  // Narrowed after the first scoring, and said so: as frozen it expected
+  // assembly_mate FIRST, but with no context this query already ranks
+  // `transform` first (a pre-existing case of the older held-out set, top 5
+  // there). What (x9) guards is only that "pin" -- three meanings -- never
+  // pulls it into the study.
+  resetWorkingContext();
+  await bench("core_only");
+  const q = "pin the lever to the base so it can only rotate";
+  const r = await find(q);
+  if (!String(first(r)).startsWith("sim_") && !r.context?.inferred_from) pass(`"${q}" is not read as study work (-> ${first(r)})`);
+  else fail(`"${q}" was read as study work: ${first(r)} ${JSON.stringify(r.context ?? {})}`);
+}
+
 console.log("(x6) a resolved verb costs one match");
 {
   resetWorkingContext();

@@ -99,8 +99,13 @@ console.log("(s2) ratchet floors");
 //              down and push..." (face tools win on "face").
 //   2026-11-24 with no context, "solve it" is answered AMBIGUOUS, listing
 //              sim_static among the meanings: hit@any 13 -> 14.
-const FLOOR_AT1 = 9;
-const FLOOR_ANY = 14;
+//   2026-11-24 the query's own single-meaning words (force, "500 N", stress,
+//              FEA) set the study context when none is in use: hit@1 10/16,
+//              hit@any 16/16. Up: "apply a force on the top face", "bolt the
+//              base face down and push ... 200 N". Down to #2: "will this hold
+//              500 N ..." (500 N names a load, so set-up leads).
+const FLOOR_AT1 = 10;
+const FLOOR_ANY = 16;
 if (hit1 >= FLOOR_AT1) pass(`hit@1 ${hit1} >= floor ${FLOOR_AT1}`);
 else fail(`hit@1 ${hit1} < floor ${FLOOR_AT1}`);
 if (hitAny >= FLOOR_ANY) pass(`hit@any ${hitAny} >= floor ${FLOOR_ANY}`);
