@@ -159,6 +159,22 @@ await inBench("simulate", "what material is it made of", "sim_materials");
   else fail(`no domain: "how heavy is this part in aluminium" -> ${first(r)} (${(r.matches ?? []).map((m) => m.name).join(", ")})`);
 }
 
+// (x8) frozen 2026-11-24 before any vocabulary for dependency questions; none
+// is one of the three phrasings used to notice the miss.
+console.log("(x8) a dependency question finds the feature graph");
+for (const query of [
+  "if I change the base box what else rebuilds",
+  "show me the feature dependency graph",
+  "what is built on top of step 6",
+  "is anything downstream of the boolean",
+]) {
+  resetWorkingContext();
+  await bench("core_only");
+  const r = await find(query);
+  if (first(r) === "timeline_dependencies") pass(`"${query}" -> timeline_dependencies`);
+  else fail(`"${query}" -> ${first(r)} (${(r.matches ?? []).map((m) => m.name).join(", ")})`);
+}
+
 console.log("(x6) a resolved verb costs one match");
 {
   resetWorkingContext();

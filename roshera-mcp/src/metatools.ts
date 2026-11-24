@@ -168,6 +168,16 @@ const PHRASES: Array<[RegExp, string]> = [
   [/\broll(?:ed|ing)?[\s-]?back\b/g, " undo "],
   [/\bline[\s-]of[\s-]sight\b/g, " ray "],
   [/\bcent(?:er|re)[\s-]of[\s-](?:gravity|mass)\b/g, " mass "],
+  // A question about what is built from what is a question about the feature
+  // graph (timeline_dependencies): "built on top of", "what else rebuilds",
+  // "downstream of", "depends on". Phrases, not single words: "affect" alone
+  // is a study word ("will the load affect it").
+  [/\bbuilt\s+(?:on\s+top\s+of|on|from|off)\b/g, " dependencies downstream "],
+  [/\bwhat\s+else\s+(?:rebuilds?|changes?|updates?|breaks?|moves?)\b/g, " dependencies downstream "],
+  [/\b(?:down|up)stream(?:\s+of)?\b/g, " dependencies downstream "],
+  [/\bdepends?\s+on\b|\bdependen(?:t|ts|cy|cies)\b/g, " dependencies downstream "],
+  // "step 6" is a step of the history, never the STEP file format.
+  [/\bstep\s+\d+\b/g, " event "],
   [/\bdegrees[\s-]of[\s-]freedom\b/g, " dof "],
   [/\blead[\s-]?ins?\b/g, " chamfer "],
   [/\bbill[\s-]of[\s-]materials\b/g, " bom "],

@@ -174,9 +174,9 @@ export function registerTimelineTools(server: ToolHost) {
     "timeline_dependencies",
     "WHICH FEATURE IS BUILT FROM WHICH: the branch's recorded operations as a " +
       "graph -- each event (seq, op) and the earlier events it uses. With " +
-      "from_seq (or from_event), the features an edit there would rebuild, in " +
-      "order. Read-only: nothing is rebuilt. Use before a mould or an edit to " +
-      "see what it reaches.",
+      "from_seq (or from_event), the downstream impact of an edit there: the " +
+      "features it would affect and rebuild, in order. Read-only: nothing is " +
+      "rebuilt. Use before a mould or an edit to see what it reaches.",
     {
       branch: z.string().default("main").describe("timeline branch id ('main' = trunk)"),
       from_seq: z.number().int().optional().describe("sequence number of the event to edit: returns what it would rebuild"),

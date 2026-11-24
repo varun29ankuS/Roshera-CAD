@@ -809,7 +809,7 @@ fn raw_tools() -> Vec<ToolSpec> {
             Timeline,
             Experimental,
             Curated,
-            "Which feature is built from which: the branch's recorded operations as a graph (each event and the earlier events it uses); with from_seq or from_event, the features an edit there would rebuild, in order. Read-only.",
+            "Which feature is built from which: the branch's recorded operations as a graph (each event and the earlier events it uses); with from_seq or from_event, the downstream impact of an edit there: the features it would affect and rebuild, in order. Read-only.",
             json!({
                 "type": "object",
                 "properties": {
