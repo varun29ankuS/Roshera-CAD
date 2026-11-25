@@ -169,24 +169,147 @@ fn crossing_pairs(mesh: &TriangleMesh, cap: usize) -> Vec<(usize, usize)> {
 
     let n = tris.len();
 
-    // BROAD PHASE — uniform spatial-hash grid. The legacy all-pairs loop was
-    // O(n²); a curved-Boolean part tessellates to tens of thousands of
-    // triangles, so that scan dominated the per-op certificate cost (and was
-    // the reason the full cert was pulled off the hot path). Binning each
-    // triangle into the grid cells its AABB overlaps and testing only
-    // same-cell pairs makes the broad phase ~O(n) on the spatially-coherent
-    // meshes a solid produces, while remaining EXACT — the grid only prunes
-    // pairs whose AABBs cannot overlap, never a real crossing (a genuine
-    // self-intersection forces overlapping AABBs, hence a shared cell).
-    //
-    // Cell size = mean triangle-AABB diagonal (a standard sizing heuristic):
-    // big enough that a triangle spans only a handful of cells, small enough
-    // that few unrelated triangles share one. Degenerate (zero-size) meshes
-    // fall back to a single cell, recovering the all-pairs scan safely.
-    let mut diag_sum = 0.0f64;
+    // BROAD PHASE — a uniform spatial-hash grid over the triangles that fit
+    // it, and a separate list for those that do not (see `grid_plan`).
+    let plan = grid_plan(&aabbs);
+    if std::env::var_os("ROSHERA_CERT_PROFILE").is_some() {
+        eprintln!(
+            "[cert-profile] self-intersection grid: {n} triangles, cell {:.4}, {} insertions, {} oversized",
+            plan.cell,
+            plan.insertions(),
+            plan.oversized.len()
+        );
+    }
+    let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+    for (idx, span) in plan.spans.iter().enumerate() {
+        let Some([(x0, x1), (y0, y1), (z0, z1)]) = *span else {
+            continue;
+        };
+        for cx in x0..=x1 {
+            for cy in y0..=y1 {
+                for cz in z0..=z1 {
+                    grid.entry((cx, cy, cz)).or_default().push(idx as u32);
+                }
+            }
+        }
+    }
+    let mut test_pair = |i: usize, j: usize, found: &mut Vec<(usize, usize)>| -> bool {
+        // Skip topological neighbours (any shared welded vertex).
+        let (wi, wj) = (wtri[i], wtri[j]);
+        if wi.iter().any(|x| wj.contains(x)) || aabb_disjoint(&aabbs[i], &aabbs[j]) {
+            return false;
+        }
+        if triangles_intersect(tris[i], tris[j]) {
+            let pair = (i.min(j), i.max(j));
+            if seen.insert(pair) {
+                found.push(pair);
+                return found.len() >= cap;
+            }
+        }
+        false
+    };
+    // NARROW PHASE — triangles co-located in a cell. The exact per-pair AABB
+    // test guarantees the grid never turns a non-crossing into a crossing;
+    // it only PRUNES pairs that cannot overlap.
+    for bucket in grid.values() {
+        for a in 0..bucket.len() {
+            for &jb in bucket.iter().skip(a + 1) {
+                if test_pair(bucket[a] as usize, jb as usize, &mut found) {
+                    return found;
+                }
+            }
+        }
+    }
+    // The oversized triangles. Against the GRID triangles: every grid
+    // triangle spans at most MAX_CELLS_PER_TRIANGLE cells, so on each axis
+    // its extent is at most `max_ext[axis]`; along the axis where an
+    // oversized triangle is thinnest (a big planar triangle is thin across
+    // its normal), only grid triangles whose low end lies in
+    // [lo - max_ext, hi] can overlap it -- a binary-searched window of the
+    // triangles sorted on that axis. Exact: the window holds every triangle
+    // whose AABB can overlap, and test_pair's AABB test decides the rest.
+    let in_grid: Vec<usize> = (0..n).filter(|&i| plan.spans[i].is_some()).collect();
+    let mut max_ext = [0.0f64; 3];
+    for &i in &in_grid {
+        for a in 0..3 {
+            max_ext[a] = max_ext[a].max(aabbs[i].1[a] - aabbs[i].0[a]);
+        }
+    }
+    let sorted: [Vec<(f64, usize)>; 3] = [0, 1, 2].map(|a| {
+        let mut v: Vec<(f64, usize)> = in_grid.iter().map(|&i| (aabbs[i].0[a], i)).collect();
+        v.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    });
+    for &o in &plan.oversized {
+        let (lo, hi) = aabbs[o];
+        let axis = (0..3)
+            .min_by(|&a, &b| {
+                (hi[a] - lo[a])
+                    .partial_cmp(&(hi[b] - lo[b]))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0);
+        let list = &sorted[axis];
+        let from = list.partition_point(|&(x, _)| x < lo[axis] - max_ext[axis]);
+        for &(x, j) in &list[from..] {
+            if x > hi[axis] {
+                break;
+            }
+            if test_pair(o, j, &mut found) {
+                return found;
+            }
+        }
+    }
+    // Oversized against oversized: each pair once.
+    for (k, &o) in plan.oversized.iter().enumerate() {
+        for &j in &plan.oversized[k + 1..] {
+            if test_pair(o, j, &mut found) {
+                return found;
+            }
+        }
+    }
+    found
+}
+
+/// Most grid cells one triangle may occupy. A triangle needing more is
+/// tested on its own (see [`grid_plan`]): one huge triangle among tiny ones
+/// -- CADGenBench 248's mesh had triangles hundreds of metres across -- would
+/// otherwise be inserted into hundreds of millions of cells (2.7 billion
+/// insertions for 173 k triangles, 9.5 GB, the certificate never finishing).
+const MAX_CELLS_PER_TRIANGLE: u128 = 64;
+
+/// How the broad phase bins the triangles.
+struct GridPlan {
+    /// Cell edge length.
+    cell: f64,
+    /// Per triangle: its cell range on each axis, or `None` when it is
+    /// oversized (tested on its own, never inserted).
+    spans: Vec<Option<[(i64, i64); 3]>>,
+    /// The oversized triangles, in index order.
+    oversized: Vec<usize>,
+}
+
+impl GridPlan {
+    /// Total cell insertions the grid will make -- bounded by
+    /// `MAX_CELLS_PER_TRIANGLE x n`.
+    fn insertions(&self) -> u128 {
+        self.spans.iter().flatten().fold(0u128, |total, s| {
+            let cells = s.iter().fold(1u128, |acc, (a, b)| {
+                acc.saturating_mul((b.saturating_sub(*a).max(0) as u128).saturating_add(1))
+            });
+            total.saturating_add(cells)
+        })
+    }
+}
+
+/// Size the grid by the MEDIAN triangle diagonal (a few huge triangles
+/// cannot inflate it, as they inflated the mean), and leave any triangle that
+/// would span more than [`MAX_CELLS_PER_TRIANGLE`] cells out of it.
+fn grid_plan(aabbs: &[([f64; 3], [f64; 3])]) -> GridPlan {
     let mut scene_lo = [f64::INFINITY; 3];
     let mut scene_hi = [f64::NEG_INFINITY; 3];
-    for (lo, hi) in &aabbs {
+    let mut diags: Vec<f64> = Vec::with_capacity(aabbs.len());
+    for (lo, hi) in aabbs {
         let mut d2 = 0.0;
         for i in 0..3 {
             let e = hi[i] - lo[i];
@@ -194,11 +317,19 @@ fn crossing_pairs(mesh: &TriangleMesh, cap: usize) -> Vec<(usize, usize)> {
             scene_lo[i] = scene_lo[i].min(lo[i]);
             scene_hi[i] = scene_hi[i].max(hi[i]);
         }
-        diag_sum += d2.sqrt();
+        let d = d2.sqrt();
+        if d.is_finite() && d > 0.0 {
+            diags.push(d);
+        }
     }
-    let mut cell = diag_sum / n as f64;
+    let mut cell = if diags.is_empty() {
+        0.0
+    } else {
+        diags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        diags[diags.len() / 2]
+    };
     if !(cell.is_finite() && cell > 0.0) {
-        // All-degenerate mesh (no extent): one bucket, exact all-pairs.
+        // All-degenerate mesh (no extent): one cell spanning the scene.
         let mut max_ext = 0.0f64;
         for i in 0..3 {
             max_ext = max_ext.max(scene_hi[i] - scene_lo[i]);
@@ -211,69 +342,28 @@ fn crossing_pairs(mesh: &TriangleMesh, cap: usize) -> Vec<(usize, usize)> {
     }
     let inv_cell = 1.0 / cell;
     let cell_of = |c: f64, origin: f64| -> i64 { ((c - origin) * inv_cell).floor() as i64 };
-
-    // Map cell → triangle indices. A triangle is inserted into every cell its
-    // AABB spans; the per-pair shared-welded-vertex and exact AABB tests below
-    // reject the false candidates a coarse cell admits, so correctness is
-    // independent of the cell size — only speed depends on it.
-    let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+    let mut spans = Vec::with_capacity(aabbs.len());
+    let mut oversized = Vec::new();
     for (idx, (lo, hi)) in aabbs.iter().enumerate() {
-        let (cx0, cy0, cz0) = (
-            cell_of(lo[0], scene_lo[0]),
-            cell_of(lo[1], scene_lo[1]),
-            cell_of(lo[2], scene_lo[2]),
-        );
-        let (cx1, cy1, cz1) = (
-            cell_of(hi[0], scene_lo[0]),
-            cell_of(hi[1], scene_lo[1]),
-            cell_of(hi[2], scene_lo[2]),
-        );
-        for cx in cx0..=cx1 {
-            for cy in cy0..=cy1 {
-                for cz in cz0..=cz1 {
-                    grid.entry((cx, cy, cz)).or_default().push(idx as u32);
-                }
-            }
+        let span = [0, 1, 2].map(|i| (cell_of(lo[i], scene_lo[i]), cell_of(hi[i], scene_lo[i])));
+        // Saturating: a garbage coordinate (a vertex far off the part) can
+        // make a span near i64::MAX, and the product must not overflow.
+        let cells: u128 = span.iter().fold(1u128, |acc, (a, b)| {
+            acc.saturating_mul((b.saturating_sub(*a).max(0) as u128).saturating_add(1))
+        });
+        let finite = lo.iter().chain(hi.iter()).all(|v| v.is_finite());
+        if finite && cells <= MAX_CELLS_PER_TRIANGLE {
+            spans.push(Some(span));
+        } else {
+            spans.push(None);
+            oversized.push(idx);
         }
     }
-
-    // NARROW PHASE — only triangles co-located in a cell are candidates. A pair
-    // whose AABBs span multiple shared cells may be revisited in more than one
-    // bucket; the triangle/triangle test is symmetric, idempotent, and returns
-    // immediately on a hit, so a redundant test of a NON-crossing pair only
-    // costs a handful of flops (cheaper than maintaining a visited-set). The
-    // exact per-pair AABB-disjoint test below is what guarantees the grid never
-    // turns a true non-crossing into a false positive; the grid only ever
-    // PRUNES pairs that cannot overlap.
-    let _ = n; // `n` is the (now-bypassed) all-pairs bound; kept for clarity above.
-    for bucket in grid.values() {
-        let m = bucket.len();
-        for a in 0..m {
-            let i = bucket[a] as usize;
-            for &jb in bucket.iter().skip(a + 1) {
-                let j = jb as usize;
-                // Skip topological neighbours (any shared welded vertex).
-                let wi = wtri[i];
-                let wj = wtri[j];
-                if wi.iter().any(|x| wj.contains(x)) {
-                    continue;
-                }
-                if aabb_disjoint(&aabbs[i], &aabbs[j]) {
-                    continue;
-                }
-                if triangles_intersect(tris[i], tris[j]) {
-                    let pair = (i.min(j), i.max(j));
-                    if seen.insert(pair) {
-                        found.push(pair);
-                        if found.len() >= cap {
-                            return found;
-                        }
-                    }
-                }
-            }
-        }
+    GridPlan {
+        cell,
+        spans,
+        oversized,
     }
-    found
 }
 
 /// `true` if the solid's tessellated mesh self-intersects at chord `chord`.
@@ -499,6 +589,132 @@ mod tests {
         let mesh = tessellate_solid(solid, model, &params);
         let pairs = crossing_pairs(&mesh, CONFIRM_PAIR_CAP);
         (mesh, pairs)
+    }
+
+    /// A mesh of `n x n` tiny right triangles (0.01 mm) on z = 0, plus `extra`.
+    fn tiny_field_plus(n: usize, extra: &[[Point3; 3]]) -> TriangleMesh {
+        use crate::tessellation::MeshVertex;
+        let mut mesh = TriangleMesh::new();
+        let mut add = |m: &mut TriangleMesh, t: [Point3; 3]| {
+            let ids: Vec<u32> = t
+                .iter()
+                .map(|&p| {
+                    m.add_vertex(MeshVertex {
+                        position: p,
+                        normal: Vector3::Z,
+                        uv: None,
+                    })
+                })
+                .collect();
+            m.add_triangle(ids[0], ids[1], ids[2]);
+        };
+        let s = 0.01;
+        for i in 0..n {
+            for j in 0..n {
+                let (x, y) = (i as f64 * s * 2.0, j as f64 * s * 2.0);
+                add(
+                    &mut mesh,
+                    [
+                        Point3::new(x, y, 0.0),
+                        Point3::new(x + s, y, 0.0),
+                        Point3::new(x, y + s, 0.0),
+                    ],
+                );
+            }
+        }
+        for &t in extra {
+            add(&mut mesh, t);
+        }
+        mesh
+    }
+
+    /// One huge triangle among tiny ones cannot blow the grid up. CADGenBench
+    /// 248's certificate mesh had triangles hundreds of metres across among
+    /// millimetre ones: the mean-sized grid planned 2.7 billion insertions
+    /// for 173 k triangles (9.5 GB, the certificate never finished). The plan
+    /// is bounded by MAX_CELLS_PER_TRIANGLE per triangle; the giant is tested
+    /// on its own.
+    #[test]
+    fn one_huge_triangle_among_tiny_ones_keeps_the_grid_bounded() {
+        let giant = [
+            Point3::new(-50_000.0, -50_000.0, 5.0),
+            Point3::new(50_000.0, -50_000.0, 5.0),
+            Point3::new(0.0, 50_000.0, 5.0),
+        ];
+        let mesh = tiny_field_plus(100, &[giant]);
+        let n = mesh.triangles.len();
+        let aabbs: Vec<_> = mesh
+            .triangles
+            .iter()
+            .map(|t| {
+                tri_aabb(&[
+                    mesh.vertices[t[0] as usize].position,
+                    mesh.vertices[t[1] as usize].position,
+                    mesh.vertices[t[2] as usize].position,
+                ])
+            })
+            .collect();
+        let plan = grid_plan(&aabbs);
+        assert!(
+            plan.insertions() <= MAX_CELLS_PER_TRIANGLE.saturating_mul(n as u128),
+            "{} insertions for {n} triangles",
+            plan.insertions()
+        );
+        assert_eq!(
+            plan.oversized,
+            vec![n - 1],
+            "the giant is tested on its own"
+        );
+        // And the verdict: the giant floats 5 mm above the field, crossing nothing.
+        assert!(crossing_pairs(&mesh, CONFIRM_PAIR_CAP).is_empty());
+    }
+
+    /// A vertex at an absurd coordinate (a mesh defect) is planned without
+    /// overflow: the triangle is simply oversized.
+    #[test]
+    fn a_vertex_far_off_the_part_does_not_overflow_the_plan() {
+        let wild = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1e300, 0.0, 0.0),
+            Point3::new(0.0, -1e300, 1e300),
+        ];
+        let mesh = tiny_field_plus(10, &[wild]);
+        let aabbs: Vec<_> = mesh
+            .triangles
+            .iter()
+            .map(|t| {
+                tri_aabb(&[
+                    mesh.vertices[t[0] as usize].position,
+                    mesh.vertices[t[1] as usize].position,
+                    mesh.vertices[t[2] as usize].position,
+                ])
+            })
+            .collect();
+        let plan = grid_plan(&aabbs);
+        assert_eq!(plan.oversized, vec![mesh.triangles.len() - 1]);
+        assert!(
+            plan.insertions()
+                <= MAX_CELLS_PER_TRIANGLE.saturating_mul(mesh.triangles.len() as u128)
+        );
+    }
+
+    /// An oversized triangle that really crosses a small one is still found:
+    /// leaving it out of the grid never hides a crossing.
+    #[test]
+    fn an_oversized_triangle_that_crosses_is_still_found() {
+        // A vertical giant cutting through the tiny field at x = 0.005.
+        let giant = [
+            Point3::new(0.005, -50_000.0, -1.0),
+            Point3::new(0.005, 50_000.0, -1.0),
+            Point3::new(0.005, 0.0, 1.0),
+        ];
+        let mesh = tiny_field_plus(50, &[giant]);
+        let pairs = crossing_pairs(&mesh, CONFIRM_PAIR_CAP);
+        let g = mesh.triangles.len() - 1;
+        assert!(
+            pairs.iter().any(|&(a, b)| a == g || b == g),
+            "the giant crosses the field: {pairs:?}"
+        );
     }
 
     /// A pair list that reached the collection cap may be truncated: the
