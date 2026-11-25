@@ -1498,15 +1498,25 @@ const STRAIGHT_TURNING: f64 = 1e-6;
 
 impl<'a> ScaledChart<'a> {
     /// `uv_points`: the face's projected boundary samples (native chart).
-    pub(crate) fn for_face(inner: &'a dyn Surface, uv_points: &[(f64, f64)]) -> Option<Self> {
+    /// `allow_torus`: a torus is rescaled too (only as the retry of a
+    /// native-chart mesh that left facets turned; see
+    /// [`tessellate_curved_cdt`]).
+    pub(crate) fn for_face(
+        inner: &'a dyn Surface,
+        uv_points: &[(f64, f64)],
+        allow_torus: bool,
+    ) -> Option<Self> {
         // Not for a developable (it has its own development) nor a surface
         // that closes on itself: the seam and period handling of a torus or
         // revolution lives in native coordinates, and rescaling those faces
         // was measured to break their meshes (part 146's tori and revolution
         // patches opened and folded).
         let periodic = inner.period_u().is_some() || inner.period_v().is_some();
+        let torus_allowed = allow_torus && inner.type_name() == "Torus";
         if inner.is_developable()
-            || (periodic && !matches!(inner.type_name(), "NurbsSurface" | "SurfaceOfRevolution"))
+            || (periodic
+                && !torus_allowed
+                && !matches!(inner.type_name(), "NurbsSurface" | "SurfaceOfRevolution"))
         {
             return None;
         }
@@ -2745,7 +2755,7 @@ fn drop_points_under_turned_facets<S: MeshChart + ?Sized>(
     face: &Face,
     chart_sign: i32,
     cache: &mut FidelityCache,
-) -> (Vec<(f64, f64)>, Vec<[usize; 3]>) {
+) -> (Vec<(f64, f64)>, Vec<[usize; 3]>, usize) {
     let boundary = outer.points_3d.len() + inners.iter().map(|l| l.points_3d.len()).sum::<usize>();
     let (mut pts2d, mut triangles) = (pts2d, triangles);
     let (mut turned, mut drop) = turned_facets(
@@ -2781,7 +2791,7 @@ fn drop_points_under_turned_facets<S: MeshChart + ?Sized>(
             triangles.len()
         );
     }
-    (pts2d, triangles)
+    (pts2d, triangles, turned)
 }
 
 /// Phase H — Step 4 refinement. For each output triangle, evaluate
@@ -3857,11 +3867,11 @@ pub(crate) fn tessellate_curved_cdt(
             ),
             |(ul, uh, vl, vh), &(u, v)| (ul.min(u), uh.max(u), vl.min(v), vh.max(v)),
         );
-        return mesh_in_chart(&chart, face, params, mesh, outer, inners, bbox);
+        return mesh_in_chart(&chart, face, params, mesh, outer, inners, bbox).map(|_| ());
     }
     // A doubly curved face whose chart is strongly stretched one way is
     // meshed in the chart rescaled to equal step lengths (`ScaledChart`).
-    if let Some(chart) = ScaledChart::for_face(surface, &all_uv) {
+    if let Some(chart) = ScaledChart::for_face(surface, &all_uv, false) {
         for lp in std::iter::once(&mut outer).chain(inners.iter_mut()) {
             for p in &mut lp.points_uv {
                 *p = chart.to_chart(*p);
@@ -3876,9 +3886,70 @@ pub(crate) fn tessellate_curved_cdt(
             ),
             |(ul, uh, vl, vh), &(u, v)| (ul.min(u), uh.max(u), vl.min(v), vh.max(v)),
         );
-        return mesh_in_chart(&chart, face, params, mesh, outer, inners, bbox);
+        return mesh_in_chart(&chart, face, params, mesh, outer, inners, bbox).map(|_| ());
     }
-    mesh_in_chart(surface, face, params, mesh, outer, inners, outer_bbox)
+    // Every other face is meshed in its native chart. A torus band whose
+    // chart is strongly stretched (CADGenBench 141: R 115 / r 1, so equal
+    // steps in (u, v) are 1:115 on the surface) can come out with facets
+    // turned against the surface: its native triangles are needles round the
+    // big circle and refinement only multiplies them. Only then is it meshed
+    // again in its rescaled chart, and the mesh with fewer turned facets
+    // kept -- a torus that meshes clean natively is meshed exactly as before
+    // (rescaling every torus was measured to break others: part 146 once,
+    // 214 when tried for all).
+    let rescaled = (surface.type_name() == "Torus").then(|| (outer.clone(), inners.clone()));
+    let mut native = TriangleMesh::new();
+    let turned = mesh_in_chart(
+        surface,
+        face,
+        params,
+        &mut native,
+        outer,
+        inners,
+        outer_bbox,
+    )?;
+    let mut chosen = native;
+    if turned > 0 {
+        if let (Some((mut outer, mut inners)), Some(chart)) =
+            (rescaled, ScaledChart::for_face(surface, &all_uv, true))
+        {
+            for lp in std::iter::once(&mut outer).chain(inners.iter_mut()) {
+                for p in &mut lp.points_uv {
+                    *p = chart.to_chart(*p);
+                }
+            }
+            let bbox = outer.points_uv.iter().fold(
+                (
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                ),
+                |(ul, uh, vl, vh), &(u, v)| (ul.min(u), uh.max(u), vl.min(v), vh.max(v)),
+            );
+            let mut scaled = TriangleMesh::new();
+            if let Ok(turned_scaled) =
+                mesh_in_chart(&chart, face, params, &mut scaled, outer, inners, bbox)
+            {
+                if turned_scaled < turned {
+                    chosen = scaled;
+                }
+            }
+        }
+    }
+    append_mesh(mesh, &chosen);
+    Ok(())
+}
+
+/// Append `part`'s vertices and triangles to `mesh`, rebasing the indices.
+fn append_mesh(mesh: &mut TriangleMesh, part: &TriangleMesh) {
+    let base = mesh.vertices.len() as u32;
+    for v in &part.vertices {
+        mesh.add_vertex(*v);
+    }
+    for t in &part.triangles {
+        mesh.add_triangle(t[0] + base, t[1] + base, t[2] + base);
+    }
 }
 
 /// Steps 1–5 of [`tessellate_curved_cdt`], in whichever chart the face is
@@ -3892,7 +3963,7 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
     outer: ProjectedLoop,
     inners: Vec<ProjectedLoop>,
     outer_bbox: UvBBox,
-) -> Result<(), CurvedCdtError> {
+) -> Result<usize, CurvedCdtError> {
     // Step 1 — chart handedness.
     let chart_sign = compute_chart_sign(surface, outer_bbox);
     let t_stage = std::time::Instant::now();
@@ -3974,7 +4045,7 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
         params,
         &mut cache,
     );
-    let (final_pts2d, final_triangles) = drop_points_under_turned_facets(
+    let (final_pts2d, final_triangles, turned) = drop_points_under_turned_facets(
         &outer,
         &inners,
         &inner_polygons,
@@ -4033,7 +4104,7 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
         );
     }
 
-    Ok(())
+    Ok(turned)
 }
 
 /// `ROSHERA_TESS_PROFILE` set: print per-stage timings of each curved face.
@@ -5920,6 +5991,37 @@ mod refinement_cost_tests {
 }
 
 #[cfg(test)]
+mod stretched_torus_chart_tests {
+    use super::ScaledChart;
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::surface::Torus;
+
+    /// A torus R 115 / r 1 (CADGenBench 141's band): its chart is stretched
+    /// 1:115, past the rescale limit. A torus is rescaled only when the
+    /// caller asks -- the retry of a native mesh that left facets turned --
+    /// never by default (rescaling every torus broke others: 146, 214).
+    #[test]
+    fn a_stretched_torus_is_rescaled_only_on_request() {
+        let torus = Torus::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 115.0, 1.0)
+            .unwrap_or_else(|e| panic!("torus: {e:?}"));
+        // A sector of the band: u over 3 rad, v from the equator up.
+        let uv: Vec<(f64, f64)> = (0..=40)
+            .map(|k| (4.8 + 3.0 * k as f64 / 40.0, 0.0))
+            .chain((0..=40).map(|k| (7.8, 1.2 * k as f64 / 40.0)))
+            .chain((0..=40).map(|k| (7.8 - 3.0 * k as f64 / 40.0, 1.2)))
+            .collect();
+        assert!(
+            ScaledChart::for_face(&torus, &uv, false).is_none(),
+            "a torus must keep its native chart by default"
+        );
+        assert!(
+            ScaledChart::for_face(&torus, &uv, true).is_some(),
+            "a 1:115 torus is rescaled when the retry asks"
+        );
+    }
+}
+
+#[cfg(test)]
 mod off_wall_split_tests {
     use super::{boundary_segment, longest_interior_edge_midpoint};
 
@@ -6306,7 +6408,7 @@ mod turned_facet_tests {
             &mut cache,
         );
         assert!(before > 0, "the fixture has a turned facet");
-        let (pts2d, triangles) = drop_points_under_turned_facets(
+        let (pts2d, triangles, _) = drop_points_under_turned_facets(
             &outer,
             &[],
             &[],
