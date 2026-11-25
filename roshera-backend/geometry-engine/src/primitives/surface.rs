@@ -5954,31 +5954,60 @@ impl Surface for SurfaceOfRevolution {
         // profile's own closest_point (analytic for a NURBS / Line meridian) is
         // both faster and more accurate than a fixed-density sample scan; on any
         // failure fall back to the sample scan so robustness is never reduced.
-        let reference_point = self.axis_origin + self.axis_direction * height + ref_dir * radius;
-        let best_u = match self
-            .profile_curve
-            .closest_point(&reference_point, _tolerance)
-        {
-            // Only the curve parameter matters here; the second tuple element
-            // (the curve's closest 3D point) is unused — position is
-            // re-evaluated through the surface's own point_at below.
-            Ok((u, _)) => u.clamp(0.0, 1.0),
-            Err(_) => {
-                let mut best_u = 0.0;
-                let mut best_dist = f64::MAX;
-                const SAMPLES: usize = 50;
-                for i in 0..=SAMPLES {
-                    let u = i as f64 / SAMPLES as f64;
-                    if let Ok(pt) = self.point_at(u, v) {
-                        let dist = (*point - pt).magnitude();
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_u = u;
-                        }
+        //
+        // `side` is +1 for the reference half-plane and -1 for the one across
+        // the axis; the result is the profile parameter and how far the
+        // profile is from the rotated-back query there.
+        let project_on_side = |side: f64| -> (f64, f64) {
+            let target =
+                self.axis_origin + self.axis_direction * height + ref_dir * (side * radius);
+            if let Ok((u, _)) = self.profile_curve.closest_point(&target, _tolerance) {
+                let u = u.clamp(0.0, 1.0);
+                if let Ok(on_profile) = self.profile_curve.point_at(u) {
+                    return (u, (on_profile - target).magnitude());
+                }
+            }
+            let mut best_u = 0.0;
+            let mut best_dist = f64::MAX;
+            const SAMPLES: usize = 50;
+            for i in 0..=SAMPLES {
+                let u = i as f64 / SAMPLES as f64;
+                if let Ok(pt) = self.profile_curve.point_at(u) {
+                    let dist = (target - pt).magnitude();
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_u = u;
                     }
                 }
-                best_u
             }
+            (best_u, best_dist)
+        };
+        let (near_u, near_dist) = project_on_side(1.0);
+
+        // A profile that crosses the axis has points on BOTH sides of it, and
+        // the same (height, radius) is then also reached by a far-side profile
+        // point turned a further half revolution. When the reference side
+        // leaves the query off the profile, the far side is tried and the
+        // nearer of the two answers stands. For a profile wholly on the
+        // reference side the far-side target is its mirror image through the
+        // axis, farther from every profile point, so the answer is unchanged.
+        // A profile that mirrors itself in the axis (a circle centred on it)
+        // covers its surface twice and both sides answer equally: the
+        // reference side keeps such a tie, so the answer never turns on
+        // rounding.
+        let on_surface = _tolerance.distance().max(1e-12 * (1.0 + radius));
+        let (best_u, v) = if near_dist > on_surface && radius > 1e-15 {
+            let (far_u, far_dist) = project_on_side(-1.0);
+            let far_v = (v + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU);
+            // A partial sweep only reaches the far side where the half
+            // revolution further is still inside it.
+            if far_dist + on_surface < near_dist && far_v <= self.angle {
+                (far_u, far_v)
+            } else {
+                (near_u, v)
+            }
+        } else {
+            (near_u, v)
         };
 
         Ok((best_u, v.clamp(0.0, self.angle)))
@@ -7061,6 +7090,58 @@ mod tests {
             !partial.is_closed_v(),
             "Partial revolution should not be closed in v"
         );
+    }
+
+    /// Every sampled surface point must project back onto itself.
+    fn assert_revolution_projects_onto_itself(rev: &SurfaceOfRevolution, label: &str) {
+        for i in 0..40 {
+            for j in 0..16 {
+                let u = (i as f64 + 0.5) / 40.0;
+                let v = (j as f64 + 0.25) / 16.0 * std::f64::consts::TAU;
+                let p = rev.point_at(u, v).unwrap();
+                let (cu, cv) = rev.closest_point(&p, Tolerance::default()).unwrap();
+                let back = rev.point_at(cu, cv).unwrap();
+                let gap = (back - p).magnitude();
+                assert!(
+                    gap < 1e-6,
+                    "{label}: the point at (u {u:.4}, v {v:.4}) projects to (u {cu:.4}, v {cv:.4}), {gap:.3e} away from itself"
+                );
+            }
+        }
+    }
+
+    /// A profile that CROSSES the axis has points on both sides of it: a
+    /// (height, distance-from-axis) pair is then reached either by a profile
+    /// point on the reference side turned by v, or by one on the far side
+    /// turned by v + pi. CADGenBench part 103 rounds its slots with a
+    /// radius-4 circle revolved about an axis 1 from its centre (a spindle
+    /// torus); only the reference side was searched, so a point of the
+    /// radius-5 lobe projected onto the radius-3 lobe, 2 mm away, and the
+    /// faces there came out meshed inside-out.
+    #[test]
+    fn revolution_closest_point_reaches_the_profile_side_across_the_axis() {
+        use crate::primitives::curve::{Circle, Line};
+
+        let circle = Circle::new(Point3::new(1.0, 0.0, 0.0), Vector3::Y, 4.0).unwrap();
+        let spindle = SurfaceOfRevolution::new(
+            Point3::ORIGIN,
+            Vector3::Z,
+            Box::new(circle),
+            std::f64::consts::TAU,
+        )
+        .unwrap();
+        assert_revolution_projects_onto_itself(&spindle, "spindle torus");
+
+        // A straight profile through the axis: a double cone.
+        let line = Line::new(Point3::new(-3.0, 0.0, 0.0), Point3::new(5.0, 0.0, 10.0));
+        let double_cone = SurfaceOfRevolution::new(
+            Point3::ORIGIN,
+            Vector3::Z,
+            Box::new(line),
+            std::f64::consts::TAU,
+        )
+        .unwrap();
+        assert_revolution_projects_onto_itself(&double_cone, "double cone");
     }
 
     // =============================================

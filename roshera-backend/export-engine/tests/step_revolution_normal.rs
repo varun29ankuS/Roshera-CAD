@@ -598,3 +598,505 @@ fn a_revolution_patch_whose_sides_are_not_rings_meshes_on_its_surface() {
         "(bow bottom, bow top, mesh edges walked twice the same way, worst facet deg, its corners): {bad:?}"
     );
 }
+
+/// An octant of a radius-3 ball about the origin, written as a revolution:
+/// the profile is the quarter arc from the equator (3,0,0) to the pole
+/// (0,0,3), where it meets the axis -- as the cubic that stands within
+/// 0.001 of that arc. The patch is three-sided: the equator ring from
+/// (3,0,0) to (0,3,0) and two meridians up to the pole.
+/// `outward` picks which side the face shows: away from the centre (a ball
+/// corner) or toward it (a ball-ended pocket).
+fn ball_octant(outward: bool) -> String {
+    let (bound, sense) = if outward {
+        ("FACE_OUTER_BOUND('',#70,.T.)", ".T.")
+    } else {
+        ("FACE_BOUND('',#70,.F.)", ".F.")
+    };
+    format!(
+        "#5=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#30=DIRECTION('',(1.,0.,0.));
+#41=CARTESIAN_POINT('',(3.,0.,1.6568542495));
+#42=CARTESIAN_POINT('',(1.6568542495,0.,3.));
+#4=B_SPLINE_CURVE_WITH_KNOTS('',3,(#11,#41,#42,#13),.UNSPECIFIED.,.F.,.F.,(4,4),(0.,1.),.UNSPECIFIED.);
+#6=AXIS1_PLACEMENT('',#5,#2);
+#7=SURFACE_OF_REVOLUTION('',#4,#6);
+#11=CARTESIAN_POINT('',(3.,0.,0.));
+#12=CARTESIAN_POINT('',(0.,3.,0.));
+#13=CARTESIAN_POINT('',(0.,0.,3.));
+#21=VERTEX_POINT('',#11);
+#22=VERTEX_POINT('',#12);
+#23=VERTEX_POINT('',#13);
+#31=AXIS2_PLACEMENT_3D('',#5,#2,#30);
+#32=CIRCLE('',#31,3.);
+#43=CARTESIAN_POINT('',(0.,3.,1.6568542495));
+#45=CARTESIAN_POINT('',(0.,1.6568542495,3.));
+#44=B_SPLINE_CURVE_WITH_KNOTS('',3,(#12,#43,#45,#13),.UNSPECIFIED.,.F.,.F.,(4,4),(0.,1.),.UNSPECIFIED.);
+#51=EDGE_CURVE('',#21,#22,#32,.T.);
+#52=EDGE_CURVE('',#22,#23,#44,.T.);
+#53=EDGE_CURVE('',#21,#23,#4,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#62=ORIENTED_EDGE('',*,*,#52,.T.);
+#63=ORIENTED_EDGE('',*,*,#53,.F.);
+#70=EDGE_LOOP('',(#61,#62,#63));
+#71={bound};
+#80=ADVANCED_FACE('',(#71),#7,{sense});
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));"
+    )
+}
+
+/// How a mesh of a patch of the radius-`r` ball about the origin sits on it:
+/// (facets, facets showing their back to the side asked for, mesh edges
+/// walked the same way by two facets, the farthest a facet's centre is from
+/// the ball).
+fn ball_patch_mesh_report(
+    mesh: &geometry_engine::tessellation::TriangleMesh,
+    r: f64,
+    outward: bool,
+) -> (usize, usize, usize, f64) {
+    use std::collections::HashMap;
+    let key = |p: geometry_engine::math::Point3| {
+        (
+            (p.x * 1e6).round() as i64,
+            (p.y * 1e6).round() as i64,
+            (p.z * 1e6).round() as i64,
+        )
+    };
+    let mut directed: HashMap<_, usize> = HashMap::new();
+    let (mut wrong_side, mut farthest) = (0usize, 0.0_f64);
+    for t in &mesh.triangles {
+        let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+        for (p, q) in [(a, b), (b, c), (c, a)] {
+            *directed.entry((key(p), key(q))).or_default() += 1;
+        }
+        let m = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+        let from_centre = m.to_vec();
+        let facing = (b - a).cross(&(c - a)).dot(&from_centre);
+        if (facing > 0.0) != outward {
+            wrong_side += 1;
+        }
+        farthest = farthest.max((from_centre.magnitude() - r).abs());
+    }
+    let same_way = directed.values().filter(|&&n| n > 1).count();
+    (mesh.triangles.len(), wrong_side, same_way, farthest)
+}
+
+/// A wide pole patch of a revolution -- an eighth of a ball -- meshes ON
+/// the ball and faces the side the file says. The three-sided pole path
+/// filled the patch from its boundary samples alone, which suits a thin
+/// wedge of a kernel revolve but cuts a flat sheet across a quarter-turn
+/// patch (its middle 1.27 from a radius-3 ball), and it read the outward
+/// side as "boundary winding x sense", which turns every Backward patch
+/// inside out. Seven ball-ended pocket corners of CADGenBench part 118
+/// were wound against all their neighbours and stood up to 177 degrees
+/// off their surface.
+#[test]
+fn a_ball_octant_written_as_a_revolution_meshes_on_the_ball_facing_out() {
+    use geometry_engine::tessellation::{
+        edge_cache::EdgeSampleCache, tessellate_face, TessellationParams, TriangleMesh,
+    };
+    let params = TessellationParams::default();
+    let mut bad = Vec::new();
+    for outward in [true, false] {
+        let (model, report) = ExportEngine::new()
+            .import_step_content(&envelope(&ball_octant(outward)), "octant")
+            .expect("imports");
+        let faces: Vec<_> = model.faces.iter().collect();
+        assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
+        let (_, face) = faces[0];
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_face(face, &model, &params, &cache, &mut mesh);
+        let (facets, wrong_side, same_way, farthest) = ball_patch_mesh_report(&mesh, 3.0, outward);
+        if facets == 0 || wrong_side > 0 || same_way > 0 || farthest > 0.05 {
+            bad.push((outward, facets, wrong_side, same_way, farthest));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "(faces outward, facets, facets showing their back, mesh edges walked twice the same way, farthest facet centre from the ball): {bad:?}"
+    );
+}
+
+/// A dome: the quarter arc from the equator (3,0,0) to the pole (0,0,3)
+/// revolved a full turn, bounded by the one closed equator circle. Written
+/// `outward` it is a ball's cap, otherwise the round bottom of a blind hole.
+fn dome(outward: bool) -> String {
+    let (bound, sense) = if outward {
+        ("FACE_OUTER_BOUND('',#70,.T.)", ".T.")
+    } else {
+        ("FACE_BOUND('',#70,.F.)", ".F.")
+    };
+    format!(
+        "#5=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#30=DIRECTION('',(1.,0.,0.));
+#41=CARTESIAN_POINT('',(3.,0.,1.6568542495));
+#42=CARTESIAN_POINT('',(1.6568542495,0.,3.));
+#4=B_SPLINE_CURVE_WITH_KNOTS('',3,(#11,#41,#42,#13),.UNSPECIFIED.,.F.,.F.,(4,4),(0.,1.),.UNSPECIFIED.);
+#6=AXIS1_PLACEMENT('',#5,#2);
+#7=SURFACE_OF_REVOLUTION('',#4,#6);
+#11=CARTESIAN_POINT('',(3.,0.,0.));
+#13=CARTESIAN_POINT('',(0.,0.,3.));
+#21=VERTEX_POINT('',#11);
+#31=AXIS2_PLACEMENT_3D('',#5,#2,#30);
+#32=CIRCLE('',#31,3.);
+#51=EDGE_CURVE('',#21,#21,#32,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#70=EDGE_LOOP('',(#61));
+#71={bound};
+#80=ADVANCED_FACE('',(#71),#7,{sense});
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));"
+    )
+}
+
+/// A dome bounded by one closed rim meshes on its ball and faces the side
+/// the file says, whichever that is. The full-pole fan wound every facet to
+/// "rim winding x sense" -- one direction, along the axis, for a wall that
+/// turns a quarter circle away from it, and the wrong side for a Backward
+/// dome, whose rim the kernel winds about the face's OUTWARD normal.
+#[test]
+fn a_dome_written_as_a_revolution_meshes_facing_the_side_the_file_says() {
+    use geometry_engine::tessellation::{
+        edge_cache::EdgeSampleCache, tessellate_face, TessellationParams, TriangleMesh,
+    };
+    let params = TessellationParams::default();
+    let mut bad = Vec::new();
+    for outward in [true, false] {
+        let (model, report) = ExportEngine::new()
+            .import_step_content(&envelope(&dome(outward)), "dome")
+            .expect("imports");
+        let faces: Vec<_> = model.faces.iter().collect();
+        assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
+        let (_, face) = faces[0];
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_face(face, &model, &params, &cache, &mut mesh);
+        let (facets, wrong_side, same_way, farthest) = ball_patch_mesh_report(&mesh, 3.0, outward);
+        // A dome is the UPPER half: nothing may hang below the equator.
+        let below = mesh
+            .vertices
+            .iter()
+            .filter(|v| v.position.z < -1e-6)
+            .count();
+        if facets == 0 || wrong_side > 0 || same_way > 0 || farthest > 0.05 || below > 0 {
+            bad.push((outward, facets, wrong_side, same_way, farthest, below));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "(faces outward, facets, facets showing their back, mesh edges walked twice the same way, farthest facet centre from the ball, vertices below the equator): {bad:?}"
+    );
+}
+
+//// A three-sided patch of the radius-3 ball about the origin with NO corner
+/// on the axis. The ball is the exact quarter arc from the equator (3,0,0)
+/// to the pole (0,0,3), revolved about +Z. The patch runs a quarter of the
+/// equator from (3,0,0) to (0,3,0), up that meridian to 45 degrees of
+/// latitude, and back down a great circle. `outward` picks the side the
+/// face shows: away from the centre or toward it.
+fn ball_triangle_off_the_axis(outward: bool) -> String {
+    let (bound, sense) = if outward {
+        ("FACE_OUTER_BOUND('',#70,.T.)", ".T.")
+    } else {
+        ("FACE_BOUND('',#70,.F.)", ".F.")
+    };
+    format!(
+        "#5=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#30=DIRECTION('',(1.,0.,0.));
+#40=DIRECTION('',(0.,1.,0.));
+#11=CARTESIAN_POINT('',(3.,0.,0.));
+#12=CARTESIAN_POINT('',(0.,3.,0.));
+#13=CARTESIAN_POINT('',(0.,2.12132034355964257,2.12132034355964257));
+#14=CARTESIAN_POINT('',(3.,0.,3.));
+#15=CARTESIAN_POINT('',(0.,0.,3.));
+#4=( BOUNDED_CURVE() B_SPLINE_CURVE(2,(#11,#14,#15),.UNSPECIFIED.,.F.,.F.)
+ B_SPLINE_CURVE_WITH_KNOTS((3,3),(0.,1.),.UNSPECIFIED.) CURVE()
+ GEOMETRIC_REPRESENTATION_ITEM()
+ RATIONAL_B_SPLINE_CURVE((1.,0.70710678118654752,1.)) REPRESENTATION_ITEM('') );
+#6=AXIS1_PLACEMENT('',#5,#2);
+#7=SURFACE_OF_REVOLUTION('',#4,#6);
+#21=VERTEX_POINT('',#11);
+#22=VERTEX_POINT('',#12);
+#23=VERTEX_POINT('',#13);
+#31=AXIS2_PLACEMENT_3D('',#5,#2,#30);
+#32=CIRCLE('',#31,3.);
+#43=AXIS2_PLACEMENT_3D('',#5,#30,#40);
+#44=CIRCLE('',#43,3.);
+#45=DIRECTION('',(0.,-0.70710678118654752,0.70710678118654752));
+#46=AXIS2_PLACEMENT_3D('',#5,#45,#30);
+#47=CIRCLE('',#46,3.);
+#51=EDGE_CURVE('',#21,#22,#32,.T.);
+#52=EDGE_CURVE('',#22,#23,#44,.T.);
+#53=EDGE_CURVE('',#21,#23,#47,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#62=ORIENTED_EDGE('',*,*,#52,.T.);
+#63=ORIENTED_EDGE('',*,*,#53,.F.);
+#70=EDGE_LOOP('',(#61,#62,#63));
+#71={bound};
+#80=ADVANCED_FACE('',(#71),#7,{sense});
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));"
+    )
+}
+
+/// A three-sided revolution patch that is NOT a pole wedge meshes on its
+/// surface. The three-sided path was written for the wedge a kernel revolve
+/// leaves at a pole and fills from the boundary samples alone; it took
+/// every three-sided revolution face, and a wide patch away from the axis
+/// came out as flat sheets cutting under the surface (one face of
+/// CADGenBench part 127 stood 64.5 degrees off its surface).
+#[test]
+fn a_three_sided_revolution_patch_off_the_axis_meshes_on_its_surface() {
+    use geometry_engine::tessellation::{
+        edge_cache::EdgeSampleCache, tessellate_face, TessellationParams, TriangleMesh,
+    };
+    let params = TessellationParams::default();
+    let mut bad = Vec::new();
+    for outward in [true, false] {
+        let (model, report) = ExportEngine::new()
+            .import_step_content(&envelope(&ball_triangle_off_the_axis(outward)), "patch")
+            .expect("imports");
+        let faces: Vec<_> = model.faces.iter().collect();
+        assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
+        let (_, face) = faces[0];
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_face(face, &model, &params, &cache, &mut mesh);
+        let (facets, wrong_side, same_way, farthest) = ball_patch_mesh_report(&mesh, 3.0, outward);
+        if facets == 0 || wrong_side > 0 || same_way > 0 || farthest > 0.05 {
+            bad.push((outward, facets, wrong_side, same_way, farthest));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "(faces outward, facets, facets showing their back, mesh edges walked twice the same way, farthest facet centre from the ball): {bad:?}"
+    );
+}
+
+/// A three-sided sliver of a radius-100 wall about +Z (a revolved LINE),
+/// so slight a turn (0.06 rad) that it stays within 0.05 of a plane: a
+/// stretch of the bottom ring from (100,0,0), the straight meridian 5 up
+/// from the ring's end, and back down the slanted cut of a plane through
+/// the axis' foot (an ellipse). `outward` picks the side the face shows:
+/// away from the axis or toward it.
+fn nearly_flat_wall_sliver(outward: bool) -> String {
+    let (bound, sense) = if outward {
+        ("FACE_OUTER_BOUND('',#70,.T.)", ".T.")
+    } else {
+        ("FACE_BOUND('',#70,.F.)", ".F.")
+    };
+    let turn = 0.06_f64;
+    let (bx, by) = (100.0 * turn.cos(), 100.0 * turn.sin());
+    // The cut plane z = m y through (100,0,0) and (bx,by,5): an ellipse
+    // about the origin with semi-axes 100 along +X and 100 sqrt(1 + m^2)
+    // along (0,1,m).
+    let m = 5.0 / by;
+    let len = (1.0 + m * m).sqrt();
+    let (yy, yz) = (1.0 / len, m / len);
+    format!(
+        "#1=CARTESIAN_POINT('',(100.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#3=VECTOR('',#2,1.);
+#4=LINE('',#1,#3);
+#5=CARTESIAN_POINT('',(0.,0.,0.));
+#6=AXIS1_PLACEMENT('',#5,#2);
+#7=SURFACE_OF_REVOLUTION('',#4,#6);
+#12=CARTESIAN_POINT('',({bx:.17},{by:.17},0.));
+#13=CARTESIAN_POINT('',({bx:.17},{by:.17},5.));
+#21=VERTEX_POINT('',#1);
+#22=VERTEX_POINT('',#12);
+#23=VERTEX_POINT('',#13);
+#30=DIRECTION('',(1.,0.,0.));
+#31=AXIS2_PLACEMENT_3D('',#5,#2,#30);
+#32=CIRCLE('',#31,100.);
+#37=VECTOR('',#2,1.);
+#38=LINE('',#12,#37);
+#41=DIRECTION('',(0.,{nz:.17},{ny:.17}));
+#43=AXIS2_PLACEMENT_3D('',#5,#41,#30);
+#44=ELLIPSE('',#43,100.,{major:.17});
+#51=EDGE_CURVE('',#21,#22,#32,.T.);
+#52=EDGE_CURVE('',#22,#23,#38,.T.);
+#53=EDGE_CURVE('',#21,#23,#44,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#62=ORIENTED_EDGE('',*,*,#52,.T.);
+#63=ORIENTED_EDGE('',*,*,#53,.F.);
+#70=EDGE_LOOP('',(#61,#62,#63));
+#71={bound};
+#80=ADVANCED_FACE('',(#71),#7,{sense});
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));",
+        nz = -yz,
+        ny = yy,
+        major = 100.0 * len,
+    )
+}
+
+/// A revolution patch flat enough to mesh as a plane (at the certificate's
+/// 0.1 chord) still faces the side the file says. The planar mesher took
+/// the outward side of every non-Plane face as "loop winding x sense",
+/// reading the loop as wound about the SURFACE normal; an imported loop is
+/// wound about the face's OUTWARD normal, so each Backward patch came out
+/// inside out (five nearly flat revolution faces of CADGenBench part 127,
+/// wound against all their neighbours).
+#[test]
+fn a_nearly_flat_revolution_patch_meshes_facing_the_side_the_file_says() {
+    use geometry_engine::tessellation::{
+        edge_cache::EdgeSampleCache, tessellate_face, TessellationParams, TriangleMesh,
+    };
+    let params = TessellationParams {
+        chord_tolerance: 0.1,
+        ..TessellationParams::default()
+    };
+    let mut bad = Vec::new();
+    for outward in [true, false] {
+        let (model, report) = ExportEngine::new()
+            .import_step_content(&envelope(&nearly_flat_wall_sliver(outward)), "sliver")
+            .expect("imports");
+        let faces: Vec<_> = model.faces.iter().collect();
+        assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
+        let (_, face) = faces[0];
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_face(face, &model, &params, &cache, &mut mesh);
+        let mut wrong_side = 0;
+        for t in &mesh.triangles {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+            let m = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+            let from_axis = geometry_engine::math::Vector3::new(m.x, m.y, 0.0);
+            if ((b - a).cross(&(c - a)).dot(&from_axis) > 0.0) != outward {
+                wrong_side += 1;
+            }
+        }
+        if mesh.triangles.is_empty() || wrong_side > 0 {
+            bad.push((outward, mesh.triangles.len(), wrong_side));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "(faces outward, facets, facets showing their back): {bad:?}"
+    );
+}
+
+/// A small three-sided patch of the radius-15 ball about the origin, by its
+/// equator: 0.1137 rad of the equator from (15,0,0), up that meridian by
+/// the same angle, and back down a great circle. It is 1.7 across and bows
+/// 0.024 -- flat to within a 0.1 chord, with every edge bowing OUT of the
+/// plane it is flat to. The ball is the exact quarter arc from the equator
+/// to the pole, revolved about +Z.
+fn slightly_bowed_ball_triangle(outward: bool) -> String {
+    use geometry_engine::math::Vector3;
+    let (bound, sense) = if outward {
+        ("FACE_OUTER_BOUND('',#70,.T.)", ".T.")
+    } else {
+        ("FACE_BOUND('',#70,.F.)", ".F.")
+    };
+    let (r, turn) = (15.0_f64, 0.1137_f64);
+    let b_hat = Vector3::new(turn.cos(), turn.sin(), 0.0);
+    let b = b_hat * r;
+    let c = (b_hat * turn.cos() + Vector3::Z * turn.sin()) * r;
+    // The meridian through b: counter-clockwise about b_hat x Z from b_hat.
+    let meridian_normal = b_hat.cross(&Vector3::Z);
+    // The great circle from (r,0,0) to c: counter-clockwise about X x c.
+    let great_normal = Vector3::X
+        .cross(&c)
+        .normalize()
+        .expect("c is off the X axis");
+    let p = |v: Vector3| format!("({:.17},{:.17},{:.17})", v.x, v.y, v.z);
+    format!(
+        "#5=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#30=DIRECTION('',(1.,0.,0.));
+#11=CARTESIAN_POINT('',(15.,0.,0.));
+#12=CARTESIAN_POINT('',{pb});
+#13=CARTESIAN_POINT('',{pc});
+#14=CARTESIAN_POINT('',(15.,0.,15.));
+#15=CARTESIAN_POINT('',(0.,0.,15.));
+#4=( BOUNDED_CURVE() B_SPLINE_CURVE(2,(#11,#14,#15),.UNSPECIFIED.,.F.,.F.)
+ B_SPLINE_CURVE_WITH_KNOTS((3,3),(0.,1.),.UNSPECIFIED.) CURVE()
+ GEOMETRIC_REPRESENTATION_ITEM()
+ RATIONAL_B_SPLINE_CURVE((1.,0.70710678118654752,1.)) REPRESENTATION_ITEM('') );
+#6=AXIS1_PLACEMENT('',#5,#2);
+#7=SURFACE_OF_REVOLUTION('',#4,#6);
+#21=VERTEX_POINT('',#11);
+#22=VERTEX_POINT('',#12);
+#23=VERTEX_POINT('',#13);
+#31=AXIS2_PLACEMENT_3D('',#5,#2,#30);
+#32=CIRCLE('',#31,15.);
+#40=DIRECTION('',{pbh});
+#41=DIRECTION('',{pmn});
+#43=AXIS2_PLACEMENT_3D('',#5,#41,#40);
+#44=CIRCLE('',#43,15.);
+#45=DIRECTION('',{pgn});
+#46=AXIS2_PLACEMENT_3D('',#5,#45,#30);
+#47=CIRCLE('',#46,15.);
+#51=EDGE_CURVE('',#21,#22,#32,.T.);
+#52=EDGE_CURVE('',#22,#23,#44,.T.);
+#53=EDGE_CURVE('',#21,#23,#47,.T.);
+#61=ORIENTED_EDGE('',*,*,#51,.T.);
+#62=ORIENTED_EDGE('',*,*,#52,.T.);
+#63=ORIENTED_EDGE('',*,*,#53,.F.);
+#70=EDGE_LOOP('',(#61,#62,#63));
+#71={bound};
+#80=ADVANCED_FACE('',(#71),#7,{sense});
+#90=OPEN_SHELL('',(#80));
+#91=SHELL_BASED_SURFACE_MODEL('',(#90));",
+        pb = p(b),
+        pc = p(c),
+        pbh = p(b_hat),
+        pmn = p(meridian_normal),
+        pgn = p(great_normal),
+    )
+}
+
+/// A curved patch whose LOOP is flat to within the chord tolerance has no
+/// facet standing on edge to it. Such a patch is filled in its loop's
+/// plane; an edge that bows out of that plane has its samples on one line
+/// there, and the fill cut facets from three samples of the one edge --
+/// standing in the edge's own plane, square to the face (two on a face of
+/// CADGenBench part 127, 90 degrees off its surface).
+#[test]
+fn a_bowed_revolution_patch_with_a_flat_loop_has_no_facet_on_edge() {
+    use geometry_engine::tessellation::{
+        edge_cache::EdgeSampleCache, tessellate_face, TessellationParams, TriangleMesh,
+    };
+    let params = TessellationParams {
+        chord_tolerance: 0.1,
+        ..TessellationParams::default()
+    };
+    let mut bad = Vec::new();
+    for outward in [true, false] {
+        let (model, report) = ExportEngine::new()
+            .import_step_content(&envelope(&slightly_bowed_ball_triangle(outward)), "patch")
+            .expect("imports");
+        let faces: Vec<_> = model.faces.iter().collect();
+        assert_eq!(faces.len(), 1, "one face: {:#?}", report.warnings);
+        let (_, face) = faces[0];
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_face(face, &model, &params, &cache, &mut mesh);
+        let (facets, wrong_side, same_way, farthest) = ball_patch_mesh_report(&mesh, 15.0, outward);
+        // The steepest a facet stands to the ball under it, in degrees.
+        let mut steepest = 0.0_f64;
+        for t in &mesh.triangles {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+            let g = (b - a).cross(&(c - a));
+            if g.magnitude() < 1e-9 {
+                continue;
+            }
+            let m = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+            let cos = g.dot(&m.to_vec()).abs() / (g.magnitude() * m.to_vec().magnitude());
+            steepest = steepest.max(cos.clamp(0.0, 1.0).acos().to_degrees());
+        }
+        if facets == 0 || wrong_side > 0 || same_way > 0 || farthest > 0.1 || steepest > 45.0 {
+            bad.push((outward, facets, wrong_side, same_way, farthest, steepest));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "(faces outward, facets, facets showing their back, mesh edges walked twice the same way, farthest facet centre from the ball, steepest facet deg): {bad:?}"
+    );
+}

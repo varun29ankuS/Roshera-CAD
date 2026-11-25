@@ -131,6 +131,65 @@ fn main() {
                 }
             }
         }
+        // PROBE_NORMALS: at each mesh vertex that carries its (u, v), the
+        // surface normal there against the normal at the vertex's PROJECTION
+        // (closest_point) -- the two disagree when one 3D point is reached by
+        // two parameters whose normals differ. Then the facets against each.
+        if std::env::var_os("PROBE_NORMALS").is_some() {
+            if let Some(surf) = model.surfaces.get(face.surface_id) {
+                let tol = geometry_engine::math::Tolerance::default();
+                let (mut carried, mut opposed, mut shown) = (0usize, 0usize, 0usize);
+                for v in &mesh.vertices {
+                    let Some((u, w)) = v.uv else { continue };
+                    carried += 1;
+                    let Ok(at_uv) = surf.evaluate_full(u, w) else {
+                        continue;
+                    };
+                    let Ok((pu, pw)) = surf.closest_point(&v.position, tol) else {
+                        continue;
+                    };
+                    let Ok(at_proj) = surf.evaluate_full(pu, pw) else {
+                        continue;
+                    };
+                    if at_uv.normal.dot(&at_proj.normal) < 0.0 {
+                        opposed += 1;
+                        if shown < 4 {
+                            shown += 1;
+                            println!(
+                                "  opposed at ({:.4},{:.4},{:.4}): mesh uv ({u:.6},{w:.6}) point {:?} du {:?} dv {:?} n {:?}",
+                                v.position.x, v.position.y, v.position.z,
+                                at_uv.position, at_uv.du, at_uv.dv, at_uv.normal
+                            );
+                            println!(
+                                "      projection uv ({pu:.6},{pw:.6}) point {:?} du {:?} dv {:?} n {:?}",
+                                at_proj.position, at_proj.du, at_proj.dv, at_proj.normal
+                            );
+                        }
+                    }
+                }
+                let sign = face.orientation.sign();
+                let (mut with_proj, mut against_proj) = (0usize, 0usize);
+                for t in &mesh.triangles {
+                    let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+                    let m = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+                    let Ok((pu, pw)) = surf.closest_point(&m, tol) else {
+                        continue;
+                    };
+                    let Ok(n) = surf.normal_at(pu, pw) else {
+                        continue;
+                    };
+                    if (b - a).cross(&(c - a)).dot(&(n * sign)) >= 0.0 {
+                        with_proj += 1;
+                    } else {
+                        against_proj += 1;
+                    }
+                }
+                println!(
+                    "  normals: {carried} of {} vertices carry uv, {opposed} have a normal opposed to their projection's; facets with the projected normal {with_proj}, against it {against_proj}",
+                    mesh.vertices.len()
+                );
+            }
+        }
         if std::env::var_os("PROBE_DUMP").is_some() {
             for v in &mesh.vertices {
                 println!(

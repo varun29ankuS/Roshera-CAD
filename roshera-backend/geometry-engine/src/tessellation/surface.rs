@@ -446,10 +446,42 @@ pub fn tessellate_face(
                     );
                 }
                 let planar_tol = Tolerance::new(params.chord_tolerance, params.max_angle_deviation);
-                if surface.is_planar(planar_tol)
-                    || is_face_loop_planar_in_3d(face, model, cache, planar_tol)
-                {
+                let surface_is_flat = surface.is_planar(planar_tol);
+                if surface_is_flat || is_face_loop_planar_in_3d(face, model, cache, planar_tol) {
+                    let (vertex_mark, facet_mark) = (mesh.vertices.len(), mesh.triangles.len());
                     tessellate_planar_face(face, model, params, cache, mesh);
+                    // A loop that is flat to within the chord tolerance on a
+                    // surface that is NOT flat: the fill is laid out in the
+                    // loop's plane, and where a boundary edge bows out of that
+                    // plane its samples fall on one line there, so the fill
+                    // cuts a facet standing on edge to the face (two such on a
+                    // face of CADGenBench part 127, 90 degrees off its
+                    // surface). When the flat fill shows such a facet the
+                    // patch is meshed in the surface's own parameters instead,
+                    // where an edge's samples cannot span a facet; the flat
+                    // fill stands if that mesher declines.
+                    if !surface_is_flat && planar_fill_stands_off_its_plane(mesh, facet_mark) {
+                        let mut curved = TriangleMesh::new();
+                        if super::curved_cdt::tessellate_curved_cdt(
+                            surface,
+                            face,
+                            model,
+                            params,
+                            cache,
+                            &mut curved,
+                        )
+                        .is_ok()
+                            && !curved.triangles.is_empty()
+                        {
+                            mesh.vertices.truncate(vertex_mark);
+                            mesh.triangles.truncate(facet_mark);
+                            let base = vertex_mark as u32;
+                            mesh.vertices.extend(curved.vertices.iter().copied());
+                            for t in &curved.triangles {
+                                mesh.add_triangle(base + t[0], base + t[1], base + t[2]);
+                            }
+                        }
+                    }
                 } else if let Err(e) = super::curved_cdt::tessellate_curved_cdt(
                     surface, face, model, params, cache, mesh,
                 ) {
@@ -845,6 +877,25 @@ fn tessellate_planar_face(
                 if n.dot(&eval.normal) < 0.0 {
                     n = -n;
                 }
+            }
+        } else if surface.type_name() == "SurfaceOfRevolution" {
+            // A nearly flat patch of a revolution lands here too, and the
+            // loop of an IMPORTED face is wound about the face's OUTWARD
+            // normal, not the surface's: Newell times the sense then turns
+            // every Backward patch inside out (five faces of CADGenBench
+            // part 127, against all their neighbours). Align Newell to the
+            // surface's own normal where the loop actually is -- the mean
+            // over the loop's samples, each projected onto the surface, not
+            // a parameter midpoint -- before applying the sense.
+            let outer = &all_vertices[outer_start..outer_end];
+            let stride = (outer.len() / 32).max(1);
+            let surface_side = outer
+                .iter()
+                .step_by(stride)
+                .filter_map(|&p| surface_outward_at(surface, 1.0, p))
+                .fold(Vector3::ZERO, |acc, s| acc + s);
+            if n.dot(&surface_side) < 0.0 {
+                n = -n;
             }
         }
         n * face.orientation.sign()
@@ -6723,6 +6774,293 @@ fn revolution_patch_is_rings_and_meridians(
         || (meridian(a) && meridian(c) && ring(b) && ring(d))
 }
 
+/// A face's outward side at `p`: its surface's normal at the projection of
+/// `p`, times the face's sense.
+fn surface_outward_at(surf: &dyn Surface, sign: f64, p: Point3) -> Option<Vector3> {
+    let (u, v) = surf.closest_point(&p, Tolerance::default()).ok()?;
+    surf.normal_at(u, v)
+        .ok()?
+        .normalize()
+        .ok()
+        .map(|n| n * sign)
+}
+
+/// Whether a fill laid out in one plane -- the facets of `mesh` from
+/// `first_facet` on -- has a facet standing nearer to square with that plane
+/// than to lying in it (more than 45 degrees off). The plane's normal is read
+/// from the fill itself: the sum of its facets' area vectors. A fill of a
+/// truly flat loop has every facet in the plane; one standing off it was cut
+/// from boundary samples that only LOOK collinear in the plane.
+fn planar_fill_stands_off_its_plane(mesh: &TriangleMesh, first_facet: usize) -> bool {
+    let area_vector = |t: &[u32; 3]| {
+        let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+        (b - a).cross(&(c - a))
+    };
+    let facets = &mesh.triangles[first_facet.min(mesh.triangles.len())..];
+    let plane = facets
+        .iter()
+        .fold(Vector3::ZERO, |acc, t| acc + area_vector(t));
+    let plane_len = plane.magnitude();
+    if plane_len <= 0.0 {
+        return false;
+    }
+    // A facet with no area to speak of beside the fill's has no direction to
+    // judge (three samples of one straight edge).
+    let negligible = 1e-9 * plane_len;
+    facets.iter().any(|t| {
+        let g = area_vector(t);
+        let len = g.magnitude();
+        len > negligible && g.dot(&plane) < std::f64::consts::FRAC_1_SQRT_2 * len * plane_len
+    })
+}
+
+/// Whether a three-sided patch of a `SurfaceOfRevolution` has a corner on
+/// the surface's axis (a pole), to within 1e-4 of the patch's size. `chains`
+/// are its sides in loop order; each starts at a corner.
+fn revolution_patch_has_a_corner_on_the_axis(
+    face: &Face,
+    model: &BRepModel,
+    chains: [&Vec<Point3>; 3],
+) -> bool {
+    let Some(sr) = model.surfaces.get(face.surface_id).and_then(|s| {
+        s.as_any()
+            .downcast_ref::<crate::primitives::surface::SurfaceOfRevolution>()
+    }) else {
+        return false;
+    };
+    let Ok(axis) = sr.axis_direction.normalize() else {
+        return false;
+    };
+    let origin = sr.axis_origin;
+    let split = |p: Point3| {
+        let w = p - origin;
+        let h = w.dot(&axis);
+        (h, (w - axis * h).magnitude())
+    };
+    let (mut hlo, mut hhi, mut rmax) = (f64::MAX, f64::MIN, 0.0_f64);
+    for side in chains {
+        for &p in side.iter() {
+            let (h, r) = split(p);
+            hlo = hlo.min(h);
+            hhi = hhi.max(h);
+            rmax = rmax.max(r);
+        }
+    }
+    let tol = 1e-4 * (rmax + (hhi - hlo)).max(1.0);
+    chains.iter().any(|side| split(side[0]).1 <= tol)
+}
+
+/// A three-sided POLE patch of a `SurfaceOfRevolution` -- one ring and two
+/// meridians that meet at a pole on the axis -- filled on the surface. Rows
+/// run from the pole to the ring: each interior row is the first meridian's
+/// sample ROTATED about the axis (the exact surface point) at the ring's own
+/// angles, ending on the second meridian's sample; the last row is the ring
+/// verbatim, so every boundary vertex is a shared edge sample. Where a row
+/// stands farther from the axis than the ring, its angular steps are split
+/// so its chords sag no more than the ring's. Every triangle is wound to the
+/// face's outward side, read from the surface.
+///
+/// `chains` are the loop's three sides in loop order, each oriented along
+/// the loop. Declines (returns `false`, nothing emitted) unless exactly one
+/// corner is on the axis, the side opposite it is a ring, the other two are
+/// meridians with the same sample count at matching heights and radii, and
+/// the first meridian turned through the ring's sweep lands on the second.
+///
+/// Before, such a patch was triangulated from its boundary samples alone:
+/// right for the thin wedge a kernel revolve makes, but a flat sheet across
+/// a quarter-turn ball corner (CADGenBench part 118).
+fn tessellate_revolution_pole_patch_stitched(
+    face: &Face,
+    model: &BRepModel,
+    chains: [&Vec<Point3>; 3],
+    mesh: &mut TriangleMesh,
+) -> bool {
+    let Some(surf) = model.surfaces.get(face.surface_id) else {
+        return false;
+    };
+    let Some(sr) = surf
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::SurfaceOfRevolution>()
+    else {
+        return false;
+    };
+    let origin = sr.axis_origin;
+    let Ok(axis) = sr.axis_direction.normalize() else {
+        return false;
+    };
+    // (height on the axis, radial vector) of a point.
+    let split = |p: Point3| {
+        let w = p - origin;
+        let h = w.dot(&axis);
+        (h, w - axis * h)
+    };
+    let rotate = |p: Point3, ang: f64| -> Point3 {
+        let (h, r) = split(p);
+        origin + axis * h + r * ang.cos() + axis.cross(&r) * ang.sin()
+    };
+    // The patch's size sets the tolerance, as for the four-sided patch.
+    let (mut hlo, mut hhi, mut rmax) = (f64::MAX, f64::MIN, 0.0_f64);
+    for side in chains {
+        for &p in side.iter() {
+            let (h, r) = split(p);
+            hlo = hlo.min(h);
+            hhi = hhi.max(h);
+            rmax = rmax.max(r.magnitude());
+        }
+    }
+    let tol = 1e-4 * (rmax + (hhi - hlo)).max(1.0);
+
+    // Exactly one corner on the axis: the pole. `mer_up` leaves it, `ring`
+    // is the side opposite it, `mer_down` returns to it.
+    let on_axis: Vec<usize> = (0..3)
+        .filter(|&k| split(chains[k][0]).1.magnitude() <= tol)
+        .collect();
+    let [pole_corner] = on_axis[..] else {
+        return false;
+    };
+    let mer_up = chains[pole_corner];
+    let ring = chains[(pole_corner + 1) % 3];
+    let mer_down = chains[(pole_corner + 2) % 3];
+    let m = mer_up.len();
+    let n = ring.len();
+    if m < 2 || mer_down.len() != m || n < 2 {
+        return false;
+    }
+    let pole = mer_up[0];
+
+    // The ring keeps its height and radius.
+    let (ring_h, ring_r) = {
+        let (h, r) = split(ring[0]);
+        (h, r.magnitude())
+    };
+    if ring_r <= tol
+        || !ring.iter().all(|&p| {
+            let (h, r) = split(p);
+            (h - ring_h).abs() <= tol && (r.magnitude() - ring_r).abs() <= tol
+        })
+    {
+        return false;
+    }
+    // Each meridian lies in one half-plane through the axis.
+    let meridian = |side: &[Point3]| {
+        let Some(e) = side
+            .iter()
+            .map(|&p| split(p).1)
+            .max_by(|x, y| {
+                x.magnitude()
+                    .partial_cmp(&y.magnitude())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .and_then(|r| r.normalize().ok())
+        else {
+            return false;
+        };
+        let across = axis.cross(&e);
+        side.iter().all(|&p| {
+            let r = split(p).1;
+            r.dot(&across).abs() <= tol && r.dot(&e) >= -tol
+        })
+    };
+    if !meridian(mer_up) || !meridian(mer_down) {
+        return false;
+    }
+
+    // The ring's angles, accumulated step by step so a sweep past a half
+    // turn is still read the way the ring runs.
+    let mut ring_angle = vec![0.0_f64; n];
+    for i in 1..n {
+        let (r0, r1) = (split(ring[i - 1]).1, split(ring[i]).1);
+        ring_angle[i] = ring_angle[i - 1] + r0.cross(&r1).dot(&axis).atan2(r0.dot(&r1));
+    }
+    let total = ring_angle[n - 1];
+    if total.abs() < 1e-9 {
+        return false;
+    }
+
+    // Rows 1..m-1 (row 0 is the pole). Row j runs from `mer_up[j]` to
+    // `mer_down[m - 1 - j]`, which must be the same profile point turned
+    // through the ring's sweep.
+    let mut rows: Vec<Vec<Point3>> = Vec::with_capacity(m - 1);
+    for j in 1..m {
+        if j == m - 1 {
+            let mut row = ring.clone();
+            row[n - 1] = mer_down[0];
+            rows.push(row);
+            continue;
+        }
+        let left = mer_up[j];
+        let right = mer_down[m - 1 - j];
+        if (rotate(left, total) - right).magnitude() > tol {
+            return false;
+        }
+        // A chord's sag grows with the radius and the square of its angle:
+        // a row farther out than the ring takes proportionally finer steps.
+        let row_r = split(left).1.magnitude();
+        let pieces = if row_r > ring_r + tol {
+            (row_r / ring_r).sqrt().ceil().max(1.0) as usize
+        } else {
+            1
+        };
+        let mut row = Vec::with_capacity((n - 1) * pieces + 1);
+        row.push(left);
+        for i in 1..n {
+            for s in 1..=pieces {
+                let f = s as f64 / pieces as f64;
+                let ang = ring_angle[i - 1] + (ring_angle[i] - ring_angle[i - 1]) * f;
+                row.push(rotate(left, ang));
+            }
+        }
+        let last = row.len() - 1;
+        row[last] = right;
+        rows.push(row);
+    }
+
+    let sign = face.orientation.sign();
+    let outward = |p: Point3| surface_outward_at(surf, sign, p);
+    // A patch-wide fallback where the surface gives no normal (the pole of
+    // a pointed profile): the mean of the ring's outward normals.
+    let fallback = ring
+        .iter()
+        .filter_map(|&p| outward(p))
+        .fold(Vector3::ZERO, |acc, nv| acc + nv)
+        .normalize()
+        .unwrap_or(Vector3::Z);
+    let add = |p: Point3, mesh: &mut TriangleMesh| {
+        mesh.add_vertex(MeshVertex {
+            position: p,
+            normal: outward(p).unwrap_or(fallback),
+            uv: None,
+        })
+    };
+    let pole_id = add(pole, mesh);
+    let ids: Vec<Vec<u32>> = rows
+        .iter()
+        .map(|row| row.iter().map(|&p| add(p, mesh)).collect())
+        .collect();
+    let first_tri = mesh.triangles.len();
+    for pair in ids[0].windows(2) {
+        mesh.add_triangle(pole_id, pair[0], pair[1]);
+    }
+    for j in 0..ids.len() - 1 {
+        stitch_open_band(&ids[j], &ids[j + 1], true, mesh);
+    }
+    // Wind every new triangle to face the face's outward side.
+    for t in first_tri..mesh.triangles.len() {
+        let tri = mesh.triangles[t];
+        let [p0, p1, p2] = tri.map(|i| mesh.vertices[i as usize].position);
+        let centroid = Point3::new(
+            (p0.x + p1.x + p2.x) / 3.0,
+            (p0.y + p1.y + p2.y) / 3.0,
+            (p0.z + p1.z + p2.z) / 3.0,
+        );
+        let out = outward(centroid).unwrap_or(fallback);
+        if (p1 - p0).cross(&(p2 - p0)).dot(&out) < 0.0 {
+            mesh.triangles[t] = [tri[0], tri[2], tri[1]];
+        }
+    }
+    true
+}
+
 /// Tessellate a single `SurfaceOfRevolution` wedge face as a structured grid
 /// whose four boundary edges are sampled from the `EdgeSampleCache` (so shared
 /// seams are bit-exact with neighbours) and whose interior is a transfinite
@@ -6786,6 +7124,28 @@ fn tessellate_revolution_wedge(
         {
             return false;
         }
+        // A pole patch the axis tiles -- one ring and two meridians up to a
+        // pole on the axis -- is filled ON the surface, row by row.
+        if tessellate_revolution_pole_patch_stitched(
+            face,
+            model,
+            [&chains[0], &chains[1], &chains[2]],
+            mesh,
+        ) {
+            return true;
+        }
+        // The boundary fill below has no vertex inside the patch. It is for
+        // the wedge at a pole, whose sides all run down to the axis; a
+        // three-sided patch with no corner on the axis is some other piece of
+        // the surface, and is declined to the general mesher, which puts
+        // vertices on the surface inside it.
+        if !revolution_patch_has_a_corner_on_the_axis(
+            face,
+            model,
+            [&chains[0], &chains[1], &chains[2]],
+        ) {
+            return false;
+        }
         // Map the 3 chains onto a CCW triangle in (u,v): corner0=(0,0),
         // corner1=(1,0), corner2=(0.5,1). Drop each chain's shared last corner.
         let corners = [
@@ -6815,15 +7175,27 @@ fn tessellate_revolution_wedge(
         if tris.is_empty() {
             return false;
         }
-        let outward = newell_normal(&p3)
-            .map(|nv| nv * face.orientation.sign())
+        // Outward side from the SURFACE at each point, times the face's
+        // sense -- as the four-sided branch below reads it. Not from the
+        // boundary's winding: the kernel winds a loop about the face's
+        // OUTWARD normal, so "winding x sense" turned every Backward pole
+        // patch inside out.
+        let surf = model.surfaces.get(face.surface_id);
+        let sign = face.orientation.sign();
+        let outward_at = |p: Point3| -> Option<Vector3> { surface_outward_at(surf?, sign, p) };
+        // A patch-wide fallback: the mean of the boundary's outward normals.
+        let fallback = p3
+            .iter()
+            .filter_map(|&p| outward_at(p))
+            .fold(Vector3::ZERO, |acc, n| acc + n)
+            .normalize()
             .unwrap_or(Vector3::Z);
         let idx: Vec<u32> = p3
             .iter()
             .map(|&position| {
                 mesh.add_vertex(MeshVertex {
                     position,
-                    normal: outward,
+                    normal: outward_at(position).unwrap_or(fallback),
                     uv: None,
                 })
             })
@@ -6831,7 +7203,12 @@ fn tessellate_revolution_wedge(
         for t in &tris {
             let (i0, i1, i2) = (t[0], t[1], t[2]);
             let gn = (p3[i1] - p3[i0]).cross(&(p3[i2] - p3[i0]));
-            if gn.dot(&outward) >= 0.0 {
+            let c = Point3::new(
+                (p3[i0].x + p3[i1].x + p3[i2].x) / 3.0,
+                (p3[i0].y + p3[i1].y + p3[i2].y) / 3.0,
+                (p3[i0].z + p3[i1].z + p3[i2].z) / 3.0,
+            );
+            if gn.dot(&outward_at(c).unwrap_or(fallback)) >= 0.0 {
                 mesh.add_triangle(idx[i0], idx[i1], idx[i2]);
             } else {
                 mesh.add_triangle(idx[i0], idx[i2], idx[i1]);
@@ -6855,6 +7232,26 @@ fn tessellate_revolution_wedge(
             Some(s) => s,
             None => return false,
         };
+        let Some(sr) = surf
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::SurfaceOfRevolution>()
+        else {
+            return false;
+        };
+        // A closed profile has no end to be the pole.
+        if sr.profile_curve.is_closed() {
+            return false;
+        }
+        let origin = sr.axis_origin;
+        let Ok(axis) = sr.axis_direction.normalize() else {
+            return false;
+        };
+        // (height on the axis, radial vector) of a point.
+        let split = |p: Point3| {
+            let w = p - origin;
+            let h = w.dot(&axis);
+            (h, w - axis * h)
+        };
         let rim_eid = loop_data.edges[0];
         let mut rim: Vec<Point3> = cache
             .get_or_compute(rim_eid, model)
@@ -6872,7 +7269,31 @@ fn tessellate_revolution_wedge(
         if na < 3 {
             return false;
         }
+        // The rim must be a ring of the surface: one height, one radius.
+        let (rim_h, rim_r) = {
+            let (h, r) = split(rim[0]);
+            (h, r.magnitude())
+        };
+        let tol = 1e-4 * rim_r.max(1.0);
+        if rim_r <= tol
+            || !rim.iter().all(|&p| {
+                let (h, r) = split(p);
+                (h - rim_h).abs() <= tol && (r.magnitude() - rim_r).abs() <= tol
+            })
+        {
+            return false;
+        }
         let ((u_lo, u_hi), (v_lo, v_hi)) = surf.parameter_bounds();
+        // Where the rim sits on the profile. The surface may run on past the
+        // rim (an imported face is a patch of its surface), so the rows start
+        // at the rim's own profile parameter, not at a profile end.
+        let Ok((u_rim, v_rim)) = surf.closest_point(&rim[0], Tolerance::default()) else {
+            return false;
+        };
+        match surf.point_at(u_rim, v_rim) {
+            Ok(q) if (q - rim[0]).magnitude() <= tol => {}
+            _ => return false,
+        }
         // A profile end is a POLE when all angular samples there collapse to one
         // point. Identify it; without a pole this is not our case.
         let is_pole = |u: f64| match (
@@ -6882,111 +7303,117 @@ fn tessellate_revolution_wedge(
             (Some(a), Some(b)) => (a.position - b.position).magnitude() < 1e-6,
             _ => false,
         };
-        let (u_rim, u_apex) = if is_pole(u_hi) {
-            (u_lo, u_hi)
-        } else if is_pole(u_lo) {
-            (u_hi, u_lo)
-        } else {
-            return false;
+        let sign = face.orientation.sign();
+        let outward_at = |p: Point3| surface_outward_at(surf, sign, p);
+        let apex_candidates: Vec<f64> = [u_hi, u_lo]
+            .into_iter()
+            .filter(|&u| (u - u_rim).abs() > 1e-9 && is_pole(u))
+            .collect();
+        let u_apex = match apex_candidates[..] {
+            [only] => only,
+            // Poles at BOTH profile ends (a ball): the rim alone bounds either
+            // cap. The kernel winds a loop with its face on the left, seen
+            // from the face's outward side, so the cap is the one lying to the
+            // left of the rim's travel.
+            [hi, lo] => {
+                let (Some(out), Ok(sp)) = (outward_at(rim[0]), surf.evaluate_full(u_rim, v_rim))
+                else {
+                    return false;
+                };
+                let into_face = out.cross(&(rim[1] - rim[0]));
+                let toward_hi = sp.du.dot(&into_face);
+                if toward_hi.abs() <= 1e-12 * rim_r {
+                    return false;
+                }
+                if toward_hi > 0.0 {
+                    hi
+                } else {
+                    lo
+                }
+            }
+            _ => return false,
         };
-        let apex_p = match surf.evaluate_full(u_apex, v_lo) {
-            Ok(sp) => sp.position,
+        let apex_p = match surf.point_at(u_apex, v_lo) {
+            Ok(q) => q,
             Err(_) => return false,
         };
-        // Outward sense from the real rim ring (CCW about the surface normal).
-        let outward = newell_normal(&rim)
-            .map(|nv| nv * face.orientation.sign())
-            .unwrap_or(Vector3::Z);
-        // Angle of rim sample i (uniform from the seam, matching the circle edge
-        // cache) — used to sample the intermediate rings so they align
-        // index-for-index with the exact rim ring above.
-        let ang_at = |i: usize| v_lo + (v_hi - v_lo) * (i as f64) / (na as f64);
         // Meridian resolution: interior-only, so watertightness rides entirely on
         // the shared rim ring; pick enough rings for a smooth wall.
         let m = na.clamp(16, 64);
-        let wind =
-            |a: u32, b: u32, c: u32, pa: Point3, pb: Point3, pc: Point3| -> (u32, u32, u32) {
-                let gn = (pb - pa).cross(&(pc - pa));
-                if gn.dot(&outward) >= 0.0 {
-                    (a, b, c)
-                } else {
-                    (a, c, b)
-                }
-            };
         // Ring stack: ring 0 = exact rim; rings 1..m march on the surface toward
-        // the apex.
-        let mut rings: Vec<Vec<(u32, Point3)>> = Vec::with_capacity(m);
-        let mut row0 = Vec::with_capacity(na);
-        for i in 0..na {
-            let normal = surf
-                .evaluate_full(u_rim, ang_at(i))
-                .ok()
-                .map(|sp| {
-                    if sp.normal.dot(&outward) < 0.0 {
-                        -sp.normal
-                    } else {
-                        sp.normal
-                    }
-                })
-                .unwrap_or(outward);
-            let id = mesh.add_vertex(MeshVertex {
-                position: rim[i],
-                normal,
-                uv: None,
-            });
-            row0.push((id, rim[i]));
-        }
-        rings.push(row0);
+        // the apex. Ring k is the profile point at its parameter, turned to
+        // each rim sample's own direction from the axis: on the surface, and
+        // index-for-index over the rim wherever the rim starts and whichever
+        // way it runs. (Reading the angle from the sample index instead put
+        // the rings a turn-fraction away from an imported rim, or running the
+        // other way round it, and the first band folded through the solid.)
+        let mut rings: Vec<Vec<Point3>> = Vec::with_capacity(m);
+        rings.push(rim.clone());
         for k in 1..m {
             let t = k as f64 / m as f64;
             let u = u_rim + (u_apex - u_rim) * t;
-            let mut row = Vec::with_capacity(na);
-            for i in 0..na {
-                let sp = match surf.evaluate_full(u, ang_at(i)) {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
-                let normal = if sp.normal.dot(&outward) < 0.0 {
-                    -sp.normal
-                } else {
-                    sp.normal
-                };
-                let id = mesh.add_vertex(MeshVertex {
-                    position: sp.position,
-                    normal,
-                    uv: None,
-                });
-                row.push((id, sp.position));
-            }
-            rings.push(row);
+            let Ok(q) = surf.point_at(u, v_lo) else {
+                return false;
+            };
+            let (h, r) = split(q);
+            let r = r.magnitude();
+            rings.push(
+                rim.iter()
+                    .map(|&p| origin + axis * h + split(p).1 * (r / rim_r))
+                    .collect(),
+            );
         }
+        // Outward side from the SURFACE at each point, times the face's
+        // sense; the rim's winding times the sense turned a Backward dome
+        // inside out, and one direction for the whole wall cannot serve a
+        // wall that turns a quarter circle.
+        let ids: Vec<Vec<u32>> = rings
+            .iter()
+            .map(|ring| {
+                ring.iter()
+                    .map(|&p| {
+                        mesh.add_vertex(MeshVertex {
+                            position: p,
+                            normal: outward_at(p).unwrap_or(axis),
+                            uv: None,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
         let apex_id = mesh.add_vertex(MeshVertex {
             position: apex_p,
-            normal: outward,
+            normal: outward_at(apex_p).unwrap_or(axis),
             uv: None,
         });
+        let first_tri = mesh.triangles.len();
         // Quad strips between consecutive rings (wrap i → i+1 mod na).
         for k in 0..rings.len() - 1 {
             for i in 0..na {
                 let j = (i + 1) % na;
-                let (a, pa) = rings[k][i];
-                let (b, pb) = rings[k][j];
-                let (c, pc) = rings[k + 1][j];
-                let (d, pd) = rings[k + 1][i];
-                let (x, y, z) = wind(a, b, c, pa, pb, pc);
-                mesh.add_triangle(x, y, z);
-                let (x, y, z) = wind(a, c, d, pa, pc, pd);
-                mesh.add_triangle(x, y, z);
+                mesh.add_triangle(ids[k][i], ids[k][j], ids[k + 1][j]);
+                mesh.add_triangle(ids[k][i], ids[k + 1][j], ids[k + 1][i]);
             }
         }
         // Apex fan from the last ring.
-        if let Some(last) = rings.last() {
+        if let Some(last) = ids.last() {
             for i in 0..na {
-                let j = (i + 1) % na;
-                let (a, pa) = last[i];
-                let (b, pb) = last[j];
-                let (x, y, z) = wind(a, b, apex_id, pa, pb, apex_p);
-                mesh.add_triangle(x, y, z);
+                mesh.add_triangle(last[i], last[(i + 1) % na], apex_id);
+            }
+        }
+        // Wind every new triangle to face the face's outward side.
+        for t in first_tri..mesh.triangles.len() {
+            let tri = mesh.triangles[t];
+            let [p0, p1, p2] = tri.map(|i| mesh.vertices[i as usize].position);
+            let centroid = Point3::new(
+                (p0.x + p1.x + p2.x) / 3.0,
+                (p0.y + p1.y + p2.y) / 3.0,
+                (p0.z + p1.z + p2.z) / 3.0,
+            );
+            if let Some(out) = outward_at(centroid) {
+                if (p1 - p0).cross(&(p2 - p0)).dot(&out) < 0.0 {
+                    mesh.triangles[t] = [tri[0], tri[2], tri[1]];
+                }
             }
         }
         return true;
