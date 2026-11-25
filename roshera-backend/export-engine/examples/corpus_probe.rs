@@ -137,6 +137,50 @@ fn main() {
                     let cert = model.certify_solid(sid);
                     for b in &cert.blocking {
                         *blocks.entry(b.conjunct.clone()).or_default() += 1;
+                        // PROBE_FACES: each blocking face's surface kind and
+                        // what was measured on it.
+                        if std::env::var("PROBE_FACES").is_ok() {
+                            let kind = b
+                                .face
+                                .and_then(|f| model.faces.get(f))
+                                .and_then(|f| model.surfaces.get(f.surface_id))
+                                .map(|s| s.type_name())
+                                .unwrap_or("-");
+                            // The faces across each of its edges.
+                            let mut next: Vec<u32> = Vec::new();
+                            if let Some(f) = b.face.and_then(|f| model.faces.get(f)) {
+                                let mut loops = vec![f.outer_loop];
+                                loops.extend(f.inner_loops.iter().copied());
+                                for l in loops {
+                                    let Some(lp) = model.loops.get(l) else {
+                                        continue;
+                                    };
+                                    for &e in &lp.edges {
+                                        for (fid, other) in model.faces.iter() {
+                                            if Some(fid) == b.face {
+                                                continue;
+                                            }
+                                            let mut ol = vec![other.outer_loop];
+                                            ol.extend(other.inner_loops.iter().copied());
+                                            if ol.iter().any(|&x| {
+                                                model
+                                                    .loops
+                                                    .get(x)
+                                                    .is_some_and(|q| q.edges.contains(&e))
+                                            }) && !next.contains(&fid)
+                                            {
+                                                next.push(fid);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            next.sort();
+                            println!(
+                                "    {} face {:?} {kind} {:?} next to {:?}",
+                                b.conjunct, b.face, b.measured, next
+                            );
+                        }
                     }
                 }
                 if !blocks.is_empty() {

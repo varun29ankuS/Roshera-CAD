@@ -5785,10 +5785,32 @@ fn rows_between_rails(
     let pi = std::f64::consts::PI;
     let tau = std::f64::consts::TAU;
     let unwrap_from = |base: f64, x: f64| base + (x - base + pi).rem_euclid(tau) - pi;
+    // A row's `along` values unwrapped STEP BY STEP from its first point: a
+    // row may run more than half a turn (a turned part's fillet round its
+    // axis), so its span is read along its own samples, never as the short
+    // way between its two ends.
+    let unwrapped = |pts: &[Point3]| -> Vec<f64> {
+        let mut out: Vec<f64> = Vec::with_capacity(pts.len());
+        for &p in pts {
+            let s = match out.last() {
+                Some(&prev) => unwrap_from(prev, along(p)),
+                None => along(p),
+            };
+            out.push(s);
+        }
+        out
+    };
     // Row j's endpoints: rail_a read from the first row's end of it.
     let rail_a: Vec<Point3> = rail_a_loop_order.iter().rev().copied().collect();
     let last_row: Vec<Point3> = last_row_loop_order.iter().rev().copied().collect();
     let (n0, n1) = (first_row.len(), last_row.len());
+    // The patch's true span along its rows, from its two real rows; an
+    // interior row runs the same way, its span between theirs.
+    let span_of = |pts: &[Point3]| {
+        let s = unwrapped(pts);
+        s[s.len() - 1] - s[0]
+    };
+    let (span0, span1) = (span_of(first_row), span_of(&last_row));
     let mut rows: Vec<Vec<(Point3, u32, f64)>> = Vec::with_capacity(k);
     for j in 0..k {
         let pts: Vec<Point3> = if j == 0 {
@@ -5798,10 +5820,14 @@ fn rows_between_rails(
         } else {
             let (a, b) = (rail_a[j], rail_b[j]);
             let s0 = along(a);
-            let s1 = unwrap_from(s0, along(b));
+            let frac = j as f64 / (k - 1) as f64;
+            // The way the real rows run (never the short way between a and
+            // b), landing on b's own angle: the interpolated span rounded to
+            // the nearest turn-consistent end.
+            let guess = s0 + span0 + (span1 - span0) * frac;
+            let s1 = unwrap_from(guess, along(b));
             let c0 = across(a);
             let c = 0.5 * (c0 + unwrap_from(c0, across(b)));
-            let frac = j as f64 / (k - 1) as f64;
             let m = ((n0 as f64 + (n1 as f64 - n0 as f64) * frac).round() as usize).max(2);
             (0..m)
                 .map(|i| {
@@ -5815,9 +5841,10 @@ fn rows_between_rails(
                 })
                 .collect()
         };
-        // Each vertex's position along its row, 0 at rail_a, 1 at rail_b.
-        let s0 = along(pts[0]);
-        let mut ss: Vec<f64> = pts.iter().map(|&p| unwrap_from(s0, along(p))).collect();
+        // Each vertex's position along its row, 0 at rail_a, 1 at rail_b --
+        // unwrapped step by step, so a row past half a turn keeps its order.
+        let mut ss: Vec<f64> = unwrapped(&pts);
+        let s0 = ss[0];
         let span = ss[ss.len() - 1] - ss[0];
         if span.abs() < 1e-15 {
             return false;
@@ -14957,6 +14984,174 @@ mod torus_patch_tests {
             .faces
             .add(Face::new(0, sid, lid, FaceOrientation::Forward));
         (m, fid)
+    }
+
+    /// The same fillet patch running `sweep` radians round the ring (tube
+    /// angle 0..90 deg): round the ring at radius 13 (z = 0), across the tube
+    /// at ring angle `sweep`, back round the ring at radius 10 (z = 3), back
+    /// across the tube at ring angle 0. A turned part's fillet often runs more
+    /// than half way round its axis.
+    fn wide_fillet_patch(sweep: f64) -> (BRepModel, u32) {
+        let mut m = BRepModel::new();
+        let (c, s) = (sweep.cos(), sweep.sin());
+        let a = m.vertices.add(13.0, 0.0, 0.0);
+        let b = m.vertices.add(13.0 * c, 13.0 * s, 0.0);
+        let cc = m.vertices.add(10.0 * c, 10.0 * s, 3.0);
+        let d = m.vertices.add(10.0, 0.0, 3.0);
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let mut arc_edge = |m: &mut BRepModel,
+                            sweep: f64,
+                            centre: Point3,
+                            normal: Vector3,
+                            x_axis: Vector3,
+                            r: f64,
+                            from: u32,
+                            to: u32| {
+            let arc = Arc::with_x_axis(centre, normal, x_axis, r, 0.0, sweep).expect("arc");
+            let cid = m.curves.add(Box::new(arc));
+            m.edges.add(Edge::new(
+                0,
+                from,
+                to,
+                cid,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            ))
+        };
+        let p = Point3::new;
+        let radial = Vector3::new(c, s, 0.0);
+        // A -> B round the ring at radius 13.
+        let e0 = arc_edge(
+            &mut m,
+            sweep,
+            p(0.0, 0.0, 0.0),
+            Vector3::Z,
+            Vector3::X,
+            13.0,
+            a,
+            b,
+        );
+        // B -> C across the tube, in the plane at ring angle `sweep`.
+        let e1 = arc_edge(
+            &mut m,
+            quarter,
+            p(10.0 * c, 10.0 * s, 0.0),
+            Vector3::new(s, -c, 0.0),
+            radial,
+            SMALL,
+            b,
+            cc,
+        );
+        // D -> C round the ring at radius 10 (used reversed: C -> D).
+        let e2 = arc_edge(
+            &mut m,
+            sweep,
+            p(0.0, 0.0, 3.0),
+            Vector3::Z,
+            Vector3::X,
+            10.0,
+            d,
+            cc,
+        );
+        // A -> D across the tube, in the plane y = 0 (used reversed: D -> A).
+        let e3 = arc_edge(
+            &mut m,
+            quarter,
+            p(10.0, 0.0, 0.0),
+            -Vector3::Y,
+            Vector3::X,
+            SMALL,
+            a,
+            d,
+        );
+        let mut lp = Loop::new(0, LoopType::Outer);
+        lp.add_edge(e0, true);
+        lp.add_edge(e1, true);
+        lp.add_edge(e2, false);
+        lp.add_edge(e3, false);
+        let lid = m.loops.add(lp);
+        let torus = Torus::new(Point3::ZERO, Vector3::Z, BIG, SMALL).expect("torus");
+        let sid = m.surfaces.add(Box::new(torus));
+        let fid = m
+            .faces
+            .add(Face::new(0, sid, lid, FaceOrientation::Forward));
+        (m, fid)
+    }
+
+    /// A fillet patch running MORE than half way round the ring meshes as a
+    /// sound patch. Its interior rows were unwrapped the SHORT way between
+    /// their two rail points (`unwrap_from`), so past 180 deg every interior
+    /// row ran the other way round the ring from the patch's own ring sides,
+    /// and the strips between them folded over -- the CADGenBench 110
+    /// regression (4 quad-patch faces 90 deg off the surface, triangles across
+    /// their boundary) once the size-relative edge cap sent these faces here.
+    #[test]
+    fn a_fillet_patch_past_half_a_turn_meshes_without_folding() {
+        for deg in [200.0_f64, 270.0] {
+            let (m, fid) = wide_fillet_patch(deg.to_radians());
+            let face = m.faces.get(fid).expect("face");
+            let params = params();
+            let cache = super::super::edge_cache::EdgeSampleCache::new(&params);
+            TORUS_PATHS.with(|log| log.borrow_mut().clear());
+            let mut mesh = TriangleMesh::new();
+            tessellate_face(face, &m, &params, &cache, &mut mesh);
+            let path = TORUS_PATHS.with(|log| log.borrow().last().map(|(_, p)| *p));
+            assert_eq!(
+                path,
+                Some("quad patch"),
+                "{deg} deg: the patch took {path:?}"
+            );
+            assert!(!mesh.triangles.is_empty(), "{deg} deg: meshed");
+            let key = |q: &Point3| {
+                (
+                    (q.x * 1e9).round() as i64,
+                    (q.y * 1e9).round() as i64,
+                    (q.z * 1e9).round() as i64,
+                )
+            };
+            let mut directed: std::collections::HashMap<_, usize> =
+                std::collections::HashMap::new();
+            for tri in &mesh.triangles {
+                let ps: Vec<Point3> = tri
+                    .iter()
+                    .map(|&i| mesh.vertices[i as usize].position)
+                    .collect();
+                let n = (ps[1] - ps[0]).cross(&(ps[2] - ps[0]));
+                let centroid = Point3::new(
+                    (ps[0].x + ps[1].x + ps[2].x) / 3.0,
+                    (ps[0].y + ps[1].y + ps[2].y) / 3.0,
+                    (ps[0].z + ps[1].z + ps[2].z) / 3.0,
+                );
+                let rho = (centroid.x * centroid.x + centroid.y * centroid.y).sqrt();
+                let core = Point3::new(centroid.x * BIG / rho, centroid.y * BIG / rho, 0.0);
+                assert!(
+                    n.dot(&(centroid - core)) > 0.0,
+                    "{deg} deg: a triangle faces into the tube at {centroid:?}"
+                );
+                // Inside the patch's ring span (0..deg), never round the far
+                // side. A centroid a rounding error below 0 deg is AT 0 deg.
+                let a = centroid.y.atan2(centroid.x);
+                let ang = if a < -1e-6 {
+                    a + std::f64::consts::TAU
+                } else {
+                    a.max(0.0)
+                };
+                assert!(
+                    ang <= deg.to_radians() + 1e-6,
+                    "{deg} deg: a triangle lies outside the patch at ring angle {:.6} deg ({:?})",
+                    ang.to_degrees(),
+                    ps
+                );
+                for k in 0..3 {
+                    *directed
+                        .entry((key(&ps[k]), key(&ps[(k + 1) % 3])))
+                        .or_insert(0) += 1;
+                }
+            }
+            for &n in directed.values() {
+                assert_eq!(n, 1, "{deg} deg: a directed edge is used twice (a fold)");
+            }
+        }
     }
 
     /// Fine enough that the two ring sides take different sample counts.
