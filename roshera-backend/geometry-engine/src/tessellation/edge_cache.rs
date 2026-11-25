@@ -302,9 +302,28 @@ impl EdgeSampleCache {
         // each arc's cache would terminate at its private endpoint (~1e-2 apart)
         // and the shared rim would not weld. Anchoring the cache to the shared
         // vertex makes every face bounding the edge emit the identical corner
-        // point, so the rim is watertight by construction. The closed-edge case
-        // (start == end vertex) is left untouched (the seam sample is correct).
-        if !is_closed_edge && out.len() >= 2 {
+        // point, so the rim is watertight by construction. A CLOSED edge
+        // (start == end vertex) is pinned the same way, both ends to its one
+        // vertex: an imported closed curve closes only to within the file's
+        // tolerance and may sit a little off its vertex (CADGenBench 217: ends
+        // 2 um apart, vertex 0.8 um off the cylinder, tolerance 5 um), and an
+        // unpinned end left the edges meeting there on different points -- the
+        // rim and the cylinder's seam did not weld. Only a curve that closes ON
+        // its vertex -- both ends within the edge's tolerance of it, the gap
+        // that tolerance exists to cover -- is pinned: a closed edge whose
+        // curve starts elsewhere (the primitive torus's rim circles start 1 and
+        // 3.5 mm from their vertex) keeps its own samples, since pinning would
+        // drag a whole sample onto a distant point.
+        let closes_on_vertex = || {
+            let Some(vp) = model.vertices.get_position(edge.start_vertex) else {
+                return false;
+            };
+            let v = Point3::new(vp[0], vp[1], vp[2]);
+            let reach = 2.0 * edge.tolerance;
+            out.first().is_some_and(|p| (*p - v).magnitude() <= reach)
+                && out.last().is_some_and(|p| (*p - v).magnitude() <= reach)
+        };
+        if out.len() >= 2 && (!is_closed_edge || closes_on_vertex()) {
             if let Some(sp) = model.vertices.get_position(edge.start_vertex) {
                 let last = out.len() - 1;
                 out[0] = Point3::new(sp[0], sp[1], sp[2]);
@@ -703,6 +722,106 @@ mod tests {
             assert!(
                 d_end < 1e-9,
                 "samples[last] for edge {edge_id} disagrees with end vertex by {d_end:e}"
+            );
+        }
+    }
+
+    /// A closed edge (start vertex == end vertex) begins and ends at its
+    /// vertex too. An imported closed curve can close only to within the
+    /// file's tolerance and sit a little off its vertex (CADGenBench 217: a
+    /// closed NURBS rim around a cylinder, its vertex 0.8 um off the cylinder
+    /// and its ends 2 um apart, within the file's 5 um). Left unpinned, the
+    /// edges meeting at that vertex end at different points and the rim and
+    /// the cylinder's seam do not weld: 4 open mesh edges.
+    #[test]
+    fn a_closed_edge_starts_and_ends_at_its_vertex() {
+        let mut model = BRepModel::new();
+        match TopologyBuilder::new(&mut model).create_cylinder_3d(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::Z,
+            5.0,
+            10.0,
+        ) {
+            Ok(GeometryId::Solid(_)) => {}
+            other => panic!("expected a solid, got {other:?}"),
+        }
+        let closed: Vec<(EdgeId, u32)> = model
+            .edges
+            .iter()
+            .filter(|(_, e)| e.start_vertex == e.end_vertex)
+            .map(|(id, e)| (id, e.start_vertex))
+            .collect();
+        assert!(
+            !closed.is_empty(),
+            "fixture: a cylinder has closed rim edges"
+        );
+        // Move each rim vertex 2 um off its circle, as an imported file can,
+        // inside the 5 um edge tolerance such a file declares.
+        for &(e, v) in &closed {
+            let p = model.vertices.get_position(v).expect("rim vertex");
+            assert!(model.vertices.set_position(v, p[0] + 2e-3, p[1], p[2]));
+            assert!(model.edges.set_tolerance(e, 5e-3));
+        }
+        let cache = EdgeSampleCache::new(&TessellationParams::default());
+        for (edge_id, v) in closed {
+            let samples = cache.get_or_compute(edge_id, &model);
+            let p = model.vertices.get_position(v).expect("rim vertex");
+            let p = Point3::new(p[0], p[1], p[2]);
+            let last = samples.len() - 1;
+            assert!(
+                (samples[0] - p).magnitude() < 1e-12 && (samples[last] - p).magnitude() < 1e-12,
+                "closed edge {edge_id}: ends at {:?} / {:?}, vertex at {p:?}",
+                samples[0],
+                samples[last]
+            );
+        }
+    }
+
+    /// A closed edge whose curve does NOT close on its vertex -- it starts
+    /// farther from the vertex than the edge's tolerance -- keeps its own
+    /// samples: pinning would drag a whole sample onto a distant point (the
+    /// primitive torus's rim circles start 1 and 3.5 mm from their vertex,
+    /// and pinning them opened the torus's mesh).
+    #[test]
+    fn a_closed_edge_that_starts_away_from_its_vertex_keeps_its_samples() {
+        let mut model = BRepModel::new();
+        match TopologyBuilder::new(&mut model).create_cylinder_3d(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::Z,
+            5.0,
+            10.0,
+        ) {
+            Ok(GeometryId::Solid(_)) => {}
+            other => panic!("expected a solid, got {other:?}"),
+        }
+        let closed: Vec<(EdgeId, u32)> = model
+            .edges
+            .iter()
+            .filter(|(_, e)| e.start_vertex == e.end_vertex)
+            .map(|(id, e)| (id, e.start_vertex))
+            .collect();
+        assert!(
+            !closed.is_empty(),
+            "fixture: a cylinder has closed rim edges"
+        );
+        let unmoved = EdgeSampleCache::new(&TessellationParams::default());
+        let curve_ends: Vec<(Point3, Point3)> = closed
+            .iter()
+            .map(|&(e, _)| {
+                let s = unmoved.get_or_compute(e, &model);
+                (s[0], s[s.len() - 1])
+            })
+            .collect();
+        for &(_, v) in &closed {
+            let p = model.vertices.get_position(v).expect("rim vertex");
+            assert!(model.vertices.set_position(v, p[0] + 1.0, p[1], p[2]));
+        }
+        let cache = EdgeSampleCache::new(&TessellationParams::default());
+        for (&(edge_id, _), &(first, last)) in closed.iter().zip(&curve_ends) {
+            let s = cache.get_or_compute(edge_id, &model);
+            assert!(
+                (s[0] - first).magnitude() < 1e-12 && (s[s.len() - 1] - last).magnitude() < 1e-12,
+                "closed edge {edge_id} was pinned to a vertex 1 mm away"
             );
         }
     }

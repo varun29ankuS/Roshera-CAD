@@ -290,10 +290,13 @@ pub(crate) fn project_loop_to_uv(
     let mut points_3d: Vec<Point3> = Vec::new();
     let mut points_uv: Vec<(f64, f64)> = Vec::new();
     let mut last_uv: Option<(f64, f64)> = None;
+    // Each sample's edge tolerance: how far it may lie off the surface.
+    let mut points_tol: Vec<f64> = Vec::new();
 
     for (i, &edge_id) in loop_data.edges.iter().enumerate() {
         let forward = loop_data.orientations.get(i).copied().unwrap_or(true);
         let samples = cache.get_or_compute(edge_id, model);
+        let edge_tol = model.edges.get(edge_id).map_or(0.0, |e| e.tolerance);
         let n = samples.len();
         if n < 2 {
             // Degenerate or unfetchable edge; skip but keep walking.
@@ -358,6 +361,7 @@ pub(crate) fn project_loop_to_uv(
             }
 
             points_3d.push(p_3d);
+            points_tol.push(edge_tol);
             points_uv.push((u, v));
             last_uv = Some((u, v));
         }
@@ -384,15 +388,6 @@ pub(crate) fn project_loop_to_uv(
             && still(surface.point_at(u, v_hi));
         (free_u, free_v)
     };
-    // A sample OFF the pole whose footpoint search stalled ON it (the search
-    // cannot tell which way to leave a pole): search again from its nearest
-    // neighbours that are not on the pole, keeping the closer footpoint.
-    let residual = |i: usize, (u, v): (f64, f64)| -> f64 {
-        surface
-            .point_at(u, v)
-            .map_or(f64::INFINITY, |q| (q - points_3d[i]).magnitude())
-    };
-    let n_pts = points_uv.len();
     let on_pole: Vec<bool> = points_uv
         .iter()
         .map(|&(u, v)| {
@@ -400,31 +395,14 @@ pub(crate) fn project_loop_to_uv(
             fu || fv
         })
         .collect();
-    for i in 0..n_pts {
-        if !on_pole[i] {
-            continue;
-        }
-        let here = residual(i, points_uv[i]);
-        if here <= POLE_DISTANCE_RATIO * (1.0 + points_3d[i].magnitude()) * 1e3 {
-            continue; // genuinely on the pole
-        }
-        let neighbour = |step: isize| -> Option<(f64, f64)> {
-            (1..n_pts as isize).find_map(|k| {
-                let j = (i as isize + step * k).rem_euclid(n_pts as isize) as usize;
-                (!on_pole[j]).then(|| points_uv[j])
-            })
-        };
-        let mut best = (here, points_uv[i]);
-        for seed in [neighbour(-1), neighbour(1)].into_iter().flatten() {
-            if let Ok(uv) = surface.closest_point_near(&points_3d[i], seed, Tolerance::default()) {
-                let r = residual(i, uv);
-                if r < best.0 {
-                    best = (r, uv);
-                }
-            }
-        }
-        points_uv[i] = best.1;
-    }
+    research_missed_footpoints(
+        surface,
+        &points_3d,
+        &mut points_uv,
+        &on_pole,
+        &points_tol,
+        (u_period, v_period),
+    );
     let flags: Vec<(bool, bool)> = points_uv.iter().map(|&(u, v)| collapsed(u, v)).collect();
     let free_u: Vec<bool> = flags.iter().map(|f| f.0).collect();
     let free_v: Vec<bool> = flags.iter().map(|f| f.1).collect();
@@ -436,6 +414,78 @@ pub(crate) fn project_loop_to_uv(
         points_uv,
         loop_type: loop_data.loop_type,
     })
+}
+
+/// A boundary sample whose footpoint MISSES it -- farther from it than
+/// [`MARCH_ACCEPT`] -- is searched for again from its nearest loop
+/// neighbours not on a pole, keeping whichever footpoint lands closest. The
+/// search cannot tell which way to leave a pole, so a sample next to one can
+/// stall on it; and near a pole the pole test cannot see (CADGenBench 122: a
+/// patch whose collapsed row lies 2.6e-6 outside its v domain, so sweeping u
+/// at v_min still moves the point) the sample next to the corner landed at
+/// u = 1.35 on that row, 0.05 mm from where it is, the outline crossed
+/// itself, and the face meshed to nothing. A footpoint found from a seed is
+/// unwrapped to the seed's period branch, so a periodic face's outline stays
+/// continuous. A sample genuinely on a pole is left to
+/// [`take_pole_parameters_from_neighbours`].
+fn research_missed_footpoints(
+    surface: &dyn Surface,
+    points_3d: &[Point3],
+    points_uv: &mut [(f64, f64)],
+    on_pole: &[bool],
+    tolerance: &[f64],
+    (u_period, v_period): (Option<f64>, Option<f64>),
+) {
+    let n_pts = points_uv.len().min(points_3d.len()).min(on_pole.len());
+    let residual = |i: usize, (u, v): (f64, f64)| -> f64 {
+        surface
+            .point_at(u, v)
+            .map_or(f64::INFINITY, |q| (q - points_3d[i]).magnitude())
+    };
+    let unwrap_to = |x: f64, seed: f64, period: Option<f64>| match period {
+        Some(t) if t > 0.0 => x - ((x - seed) / t).round() * t,
+        _ => x,
+    };
+    for i in 0..n_pts {
+        let here = residual(i, points_uv[i]);
+        let accept = if on_pole[i] {
+            // On the pole: genuinely there unless it misses by more than this.
+            POLE_DISTANCE_RATIO * (1.0 + points_3d[i].magnitude()) * 1e3
+        } else {
+            // Off it: a footpoint may lie as far from its sample as the
+            // sample's edge is allowed to lie off the surface (its
+            // tolerance, raised where import repaired a gap). Re-searching
+            // within that cannot help: CADGenBench 208 (file tolerance 5 um)
+            // has ~30,000 samples 1e-4..3e-2 mm off, all fine, and searching
+            // them all again doubled the import.
+            MARCH_ACCEPT.max(1.5 * tolerance.get(i).copied().unwrap_or(0.0))
+        };
+        if here <= accept {
+            continue;
+        }
+        let neighbour = |step: isize| -> Option<(f64, f64)> {
+            (1..n_pts as isize).find_map(|k| {
+                let j = (i as isize + step * k).rem_euclid(n_pts as isize) as usize;
+                (!on_pole[j]).then(|| points_uv[j])
+            })
+        };
+        let mut best = (here, points_uv[i]);
+        for seed in [neighbour(-1), neighbour(1)].into_iter().flatten() {
+            if let Ok((u, v)) =
+                surface.closest_point_near(&points_3d[i], seed, Tolerance::default())
+            {
+                let uv = (
+                    unwrap_to(u, seed.0, u_period),
+                    unwrap_to(v, seed.1, v_period),
+                );
+                let r = residual(i, uv);
+                if r < best.0 {
+                    best = (r, uv);
+                }
+            }
+        }
+        points_uv[i] = best.1;
+    }
 }
 
 /// A boundary sample is ON A POLE in u when sweeping u over its whole domain
@@ -5581,6 +5631,105 @@ mod refinement_cost_tests {
             "{evals} surface evaluations for {tris} triangles ({:.1} per triangle): \
              refinement is re-evaluating unchanged work",
             evals as f64 / tris as f64
+        );
+    }
+}
+
+#[cfg(test)]
+mod missed_footpoint_tests {
+    use super::research_missed_footpoints;
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::surface::{Cylinder, Plane, Surface};
+
+    /// A sample whose footpoint missed it, on no pole, is searched again
+    /// from its neighbours (CADGenBench 122: the miss sat next to a pole
+    /// the pole test could not see, and the face meshed to nothing).
+    #[test]
+    fn a_footpoint_that_misses_its_sample_is_searched_again() {
+        let plane = Plane::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, Vector3::X)
+            .unwrap_or_else(|e| panic!("plane: {e:?}"));
+        let pts: Vec<Point3> = (0..5).map(|k| Point3::new(0.0, k as f64, 0.0)).collect();
+        let mut uv: Vec<(f64, f64)> = pts
+            .iter()
+            .map(|p| {
+                plane
+                    .closest_point(p, crate::math::Tolerance::default())
+                    .unwrap_or_else(|e| panic!("project: {e:?}"))
+            })
+            .collect();
+        let right = uv[2];
+        uv[2] = (1.35, 0.0); // 2.2 mm from its sample, as the march left it
+        research_missed_footpoints(&plane, &pts, &mut uv, &[false; 5], &[0.0; 5], (None, None));
+        let d = ((uv[2].0 - right.0).powi(2) + (uv[2].1 - right.1).powi(2)).sqrt();
+        assert!(
+            d < 1e-6,
+            "sample 2 still at {:?}, belongs at {right:?}",
+            uv[2]
+        );
+    }
+
+    /// A sample off its surface by less than its edge's tolerance is not a
+    /// miss: its footpoint stands (re-searching such samples -- ~30,000 on
+    /// CADGenBench 208 -- doubled the import and changed nothing).
+    #[test]
+    fn a_sample_within_its_edge_tolerance_is_left_alone() {
+        let plane = Plane::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, Vector3::X)
+            .unwrap_or_else(|e| panic!("plane: {e:?}"));
+        // Samples 3 um above the plane, edge tolerance 5 um.
+        let pts: Vec<Point3> = (0..5).map(|k| Point3::new(0.0, k as f64, 3e-3)).collect();
+        let mut uv: Vec<(f64, f64)> = pts
+            .iter()
+            .map(|p| {
+                plane
+                    .closest_point(p, crate::math::Tolerance::default())
+                    .unwrap_or_else(|e| panic!("project: {e:?}"))
+            })
+            .collect();
+        // Sample 2's footpoint 1 um along the plane from its true foot: a
+        // 3.2 um miss, inside the tolerance -- a re-search would move it.
+        uv[2].0 += 1e-3;
+        let before = uv[2];
+        research_missed_footpoints(&plane, &pts, &mut uv, &[false; 5], &[5e-3; 5], (None, None));
+        assert_eq!(uv[2], before, "a footpoint within tolerance was moved");
+        // And with a zero tolerance the same footpoint IS a miss.
+        research_missed_footpoints(&plane, &pts, &mut uv, &[false; 5], &[0.0; 5], (None, None));
+        assert!(
+            uv[2].0.abs() < 1e-6,
+            "with no tolerance the miss is searched again"
+        );
+    }
+
+    /// On a periodic face the repaired footpoint stays on its neighbours'
+    /// branch: an outline unwrapped past the seam must not jump a period.
+    #[test]
+    fn a_repaired_footpoint_keeps_its_neighbours_period_branch() {
+        let cyl = Cylinder::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 10.0)
+            .unwrap_or_else(|e| panic!("cylinder: {e:?}"));
+        let tau = std::f64::consts::TAU;
+        // Unwrapped just past the seam: u = 2pi - 0.2 .. 2pi + 0.2.
+        let us: Vec<f64> = (0..5).map(|k| tau - 0.2 + 0.1 * k as f64).collect();
+        let pts: Vec<Point3> = us
+            .iter()
+            .map(|&u| {
+                cyl.point_at(u, 1.0)
+                    .unwrap_or_else(|e| panic!("eval: {e:?}"))
+            })
+            .collect();
+        let mut uv: Vec<(f64, f64)> = us.iter().map(|&u| (u, 1.0)).collect();
+        uv[3] = (3.0, 1.0); // a miss across the cylinder
+        research_missed_footpoints(
+            &cyl,
+            &pts,
+            &mut uv,
+            &[false; 5],
+            &[0.0; 5],
+            (Some(tau), None),
+        );
+        assert!(
+            (uv[3].0 - us[3]).abs() < 1e-6 && (uv[3].1 - 1.0).abs() < 1e-6,
+            "sample 3 at {:?}, belongs at ({}, 1.0) on its neighbours' branch",
+            uv[3],
+            us[3]
         );
     }
 }

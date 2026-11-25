@@ -135,6 +135,51 @@ fn main() {
                 let mut blocks: std::collections::BTreeMap<String, usize> = Default::default();
                 for sid in ids {
                     let cert = model.certify_solid(sid);
+                    if std::env::var("PROBE_SELFX").is_ok()
+                        && cert
+                            .blocking
+                            .iter()
+                            .any(|b| b.conjunct == "self_intersection_free")
+                    {
+                        let tess_bad: Vec<u32> = cert
+                            .blocking
+                            .iter()
+                            .filter(|b| {
+                                b.conjunct == "tessellation" || b.conjunct == "mesh_quality"
+                            })
+                            .filter_map(|b| b.face)
+                            .collect();
+                        let pairs =
+                            geometry_engine::harness::self_intersection::self_intersecting_faces(
+                                &model, sid, 0.5,
+                            );
+                        let kind = |f: u32| {
+                            model
+                                .faces
+                                .get(f)
+                                .and_then(|f| model.surfaces.get(f.surface_id))
+                                .map(|s| s.type_name())
+                                .unwrap_or("?")
+                        };
+                        println!("    selfx {} pairs", pairs.len());
+                        for (a, b) in pairs.iter().take(8) {
+                            println!(
+                                "    selfx {a} {} {} x {b} {} {}",
+                                kind(*a),
+                                if tess_bad.contains(a) {
+                                    "[TESS-BAD]"
+                                } else {
+                                    ""
+                                },
+                                kind(*b),
+                                if tess_bad.contains(b) {
+                                    "[TESS-BAD]"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
+                    }
                     for b in &cert.blocking {
                         *blocks.entry(b.conjunct.clone()).or_default() += 1;
                         // PROBE_FACES: each blocking face's surface kind and

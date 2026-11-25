@@ -14,6 +14,143 @@ fn main() {
         println!("import failed");
         return;
     };
+    // PROBE_OPEN: the certificate mesh's (chord 0.1, weld 1e-6) open edges --
+    // each with its face, the nearest B-Rep edge, and the nearest vertex the
+    // OTHER face on that edge put there.
+    if std::env::var_os("PROBE_OPEN").is_some() {
+        use geometry_engine::math::Point3;
+        use std::collections::HashMap;
+        let params = geometry_engine::tessellation::TessellationParams {
+            chord_tolerance: 0.1,
+            ..geometry_engine::tessellation::TessellationParams::default()
+        };
+        let ids: Vec<u32> = model.solids.iter().map(|(id, _)| id).collect();
+        for sid in ids {
+            let Some(solid) = model.solids.get(sid) else {
+                continue;
+            };
+            let mesh = geometry_engine::tessellation::tessellate_solid(&solid, &model, &params);
+            let key = |p: &Point3| {
+                (
+                    (p.x * 1e6).round() as i64,
+                    (p.y * 1e6).round() as i64,
+                    (p.z * 1e6).round() as i64,
+                )
+            };
+            let mut canon: HashMap<(i64, i64, i64), u32> = HashMap::new();
+            let w: Vec<u32> = mesh
+                .vertices
+                .iter()
+                .map(|v| {
+                    let n = canon.len() as u32;
+                    *canon.entry(key(&v.position)).or_insert(n)
+                })
+                .collect();
+            let mut uses: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+            for (ti, t) in mesh.triangles.iter().enumerate() {
+                for k in 0..3 {
+                    let (a, b) = (w[t[k] as usize], w[t[(k + 1) % 3] as usize]);
+                    uses.entry((a.min(b), a.max(b))).or_default().push(ti);
+                }
+            }
+            let mut pos_of: HashMap<u32, Point3> = HashMap::new();
+            for (i, v) in mesh.vertices.iter().enumerate() {
+                pos_of.insert(w[i], v.position);
+            }
+            // Per face, its mesh vertices (welded ids).
+            let mut verts_of: HashMap<u32, Vec<u32>> = HashMap::new();
+            for (ti, t) in mesh.triangles.iter().enumerate() {
+                let f = mesh.face_map.get(ti).copied().unwrap_or(u32::MAX);
+                for &i in t {
+                    verts_of.entry(f).or_default().push(w[i as usize]);
+                }
+            }
+            for v in verts_of.values_mut() {
+                v.sort();
+                v.dedup();
+            }
+            let mut open: Vec<((u32, u32), usize)> = uses
+                .iter()
+                .filter(|(_, t)| t.len() == 1)
+                .map(|(e, t)| (*e, t[0]))
+                .collect();
+            open.sort();
+            println!("solid {sid}: {} open mesh edges", open.len());
+            // B-Rep edge nearest a point (sampled).
+            let edges: Vec<(u32, Vec<Point3>)> = model
+                .edges
+                .iter()
+                .filter_map(|(eid, e)| {
+                    let c = model.curves.get(e.curve_id)?;
+                    let r = e.param_range;
+                    Some((
+                        eid,
+                        (0..=64)
+                            .filter_map(|k| {
+                                c.point_at(r.start + (r.end - r.start) * k as f64 / 64.0)
+                                    .ok()
+                            })
+                            .collect(),
+                    ))
+                })
+                .collect();
+            for ((a, b), ti) in open.iter().take(40) {
+                let (pa, pb) = (pos_of[a], pos_of[b]);
+                let mid = Point3::new(
+                    (pa.x + pb.x) / 2.0,
+                    (pa.y + pb.y) / 2.0,
+                    (pa.z + pb.z) / 2.0,
+                );
+                let f = mesh.face_map.get(*ti).copied().unwrap_or(u32::MAX);
+                let (mut be, mut bd) = (u32::MAX, f64::INFINITY);
+                for (eid, pts) in &edges {
+                    for p in pts {
+                        let d = (*p - mid).magnitude();
+                        if d < bd {
+                            bd = d;
+                            be = *eid;
+                        }
+                    }
+                }
+                // Faces using that B-Rep edge.
+                let users: Vec<u32> = model
+                    .faces
+                    .iter()
+                    .filter(|(_, fc)| {
+                        std::iter::once(fc.outer_loop)
+                            .chain(fc.inner_loops.iter().copied())
+                            .any(|l| model.loops.get(l).is_some_and(|lp| lp.edges.contains(&be)))
+                    })
+                    .map(|(fid, _)| fid)
+                    .collect();
+                let other: Vec<String> = users
+                    .iter()
+                    .filter(|&&u| u != f)
+                    .map(|&u| {
+                        let near = verts_of
+                            .get(&u)
+                            .map(|vs| {
+                                vs.iter()
+                                    .map(|v| {
+                                        (pos_of[v] - pa)
+                                            .magnitude()
+                                            .min((pos_of[v] - pb).magnitude())
+                                    })
+                                    .fold(f64::INFINITY, f64::min)
+                            })
+                            .unwrap_or(f64::NAN);
+                        let nv = verts_of.get(&u).map(|v| v.len()).unwrap_or(0);
+                        format!("face {u} ({nv} verts) nearest {near:.2e}")
+                    })
+                    .collect();
+                println!(
+                    "  open ({:.4},{:.4},{:.4})-({:.4},{:.4},{:.4}) len {:.3e} face {f} | brep edge {be} at {bd:.2e} used by {users:?} | {}",
+                    pa.x, pa.y, pa.z, pb.x, pb.y, pb.z, (pb - pa).magnitude(), other.join("; ")
+                );
+            }
+        }
+        return;
+    }
     // PROBE_FACE=<id>: the face's loops, each edge sampled and placed on the
     // surface chart (u, v) by closest point.
     let want = std::env::var("PROBE_FACE").ok();
