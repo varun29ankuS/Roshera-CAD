@@ -3378,6 +3378,42 @@ fn scan_one_pass<S: MeshChart + ?Sized>(
     }
 }
 
+/// `true` when points `a` and `b` are consecutive on one loop (a boundary
+/// segment the triangulation must keep). `loops`: each loop's (first index,
+/// length) in the point list.
+fn boundary_segment(loops: &[(usize, usize)], a: usize, b: usize) -> bool {
+    loops.iter().any(|&(s, len)| {
+        len > 1 && a >= s && a < s + len && b >= s && b < s + len && {
+            let (x, y) = (a - s, b - s);
+            (x + 1) % len == y || (y + 1) % len == x
+        }
+    })
+}
+
+/// The midpoint of the longest edge of `tri` that is not a boundary
+/// segment and whose midpoint `usable` accepts, trying the edges longest
+/// first; `None` when there is none.
+fn longest_interior_edge_midpoint(
+    tri: [usize; 3],
+    pts: &[(f64, f64)],
+    is_boundary: impl Fn(usize, usize) -> bool,
+    usable: impl Fn((f64, f64)) -> bool,
+) -> Option<(f64, f64)> {
+    let [a, b, c] = tri;
+    let mut edges = [(a, b), (b, c), (c, a)];
+    let len2 =
+        |(i, j): (usize, usize)| (pts[i].0 - pts[j].0).powi(2) + (pts[i].1 - pts[j].1).powi(2);
+    edges.sort_by(|x, y| {
+        len2(*y)
+            .partial_cmp(&len2(*x))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    edges.into_iter().find_map(|(i, j)| {
+        let m = ((pts[i].0 + pts[j].0) / 2.0, (pts[i].1 + pts[j].1) / 2.0);
+        (!is_boundary(i, j) && usable(m)).then_some(m)
+    })
+}
+
 /// A developable facet standing more than this far off its surface (degrees)
 /// is split. Long thin facets along a cylinder's or cone's rulings lie on the
 /// wall and are left alone; a facet this far off cuts across the curve. Kept
@@ -3412,15 +3448,78 @@ fn split_developable_facets_off_the_wall<S: MeshChart + ?Sized>(
     surface: &S,
     face: &Face,
 ) -> (Vec<(f64, f64)>, Vec<[usize; 3]>) {
+    // The established split (down the ruling) first. Only where it leaves
+    // facets off the wall is the face split again from its first
+    // triangulation with each facet's longest interior edge halved first,
+    // and the result with fewer off-wall facets kept: every face the
+    // established split finishes is meshed exactly as before.
+    let (pts, tris, remaining) = split_off_wall_passes(
+        outer,
+        inners,
+        inner_polygons,
+        initial_steiner.clone(),
+        initial_pts2d.clone(),
+        initial_triangles.clone(),
+        surface,
+        face,
+        false,
+    );
+    if remaining == 0 {
+        return (pts, tris);
+    }
+    let (pts_m, tris_m, remaining_m) = split_off_wall_passes(
+        outer,
+        inners,
+        inner_polygons,
+        initial_steiner,
+        initial_pts2d,
+        initial_triangles,
+        surface,
+        face,
+        true,
+    );
+    if remaining_m < remaining {
+        (pts_m, tris_m)
+    } else {
+        (pts, tris)
+    }
+}
+
+/// The split passes of [`split_developable_facets_off_the_wall`]:
+/// `midpoint_first` tries each off-wall facet's longest interior edge
+/// midpoint before the point down the ruling. Returns the final
+/// triangulation and how many facets in it still stand off the wall.
+#[allow(clippy::too_many_arguments)]
+fn split_off_wall_passes<S: MeshChart + ?Sized>(
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    inner_polygons: &[Vec<(f64, f64)>],
+    initial_steiner: Vec<(f64, f64)>,
+    initial_pts2d: Vec<(f64, f64)>,
+    initial_triangles: Vec<[usize; 3]>,
+    surface: &S,
+    face: &Face,
+    midpoint_first: bool,
+) -> (Vec<(f64, f64)>, Vec<[usize; 3]>, usize) {
     let keepout = boundary_keepout_uv(outer);
     let hole_refs: Vec<&[(f64, f64)]> = inners.iter().map(|p| p.points_uv.as_slice()).collect();
     let domain = TrimIndex::new(&outer.points_uv, &hole_refs);
     let limit = DEVELOPABLE_FACET_OFF_WALL_DEG.to_radians().cos();
+    // Each loop's (first index, length) in `pts2d`: outer first, then the
+    // inner loops, as `run_cdt` lays them out.
+    let mut loop_ranges: Vec<(usize, usize)> = vec![(0, outer.points_uv.len())];
+    let mut next_start = outer.points_uv.len();
+    for l in inners {
+        loop_ranges.push((next_start, l.points_uv.len()));
+        next_start += l.points_uv.len();
+    }
     let mut steiner = initial_steiner;
     let mut pts2d = initial_pts2d;
     let mut triangles = initial_triangles;
-    for _pass in 0..DEVELOPABLE_SPLIT_PASSES {
+    let mut remaining = 0usize;
+    for _pass in 0..=DEVELOPABLE_SPLIT_PASSES {
         let mut splits: Vec<(f64, f64)> = Vec::new();
+        let mut off_wall = 0usize;
         for tri in &triangles {
             let (ia, ib, ic) = (tri[0], tri[1], tri[2]);
             if ia >= pts2d.len() || ib >= pts2d.len() || ic >= pts2d.len() {
@@ -3447,8 +3546,13 @@ fn split_developable_facets_off_the_wall<S: MeshChart + ?Sized>(
             if facet.dot(&n).abs() >= limit {
                 continue;
             }
-            // Such a facet lies flat along a rim: its corners are rim samples
-            // or close to the rim. A point at its centre is close to the rim
+            off_wall += 1;
+            if _pass == DEVELOPABLE_SPLIT_PASSES {
+                continue; // the last round only counts
+            }
+            // When no interior edge can be split (every edge a rim segment, or
+            // no midpoint usable): such a facet lies flat along a rim, its
+            // corners rim samples. A point at its centre is close to the rim
             // too and only makes smaller flat facets, so the new point goes
             // DOWN THE RULING (the chart's v), about the facet's own length
             // into the face -- the rim samples then join a point below them
@@ -3479,8 +3583,26 @@ fn split_developable_facets_off_the_wall<S: MeshChart + ?Sized>(
                     .all(|q| (q.0 - p.0).powi(2) + (q.1 - p.1).powi(2) >= clear_sq)
             };
             let usable = |p: (f64, f64)| domain.inside(p) && !domain.near(p, keepout) && clear(p);
-            let mut chosen = None;
-            if along_v > 0.0 && length > 0.0 {
+            // First: the midpoint of the facet's longest edge that is not a
+            // boundary segment. A facet lying flat across the wall is long
+            // ROUND the curve (CADGenBench 148: slivers between a rim and the
+            // interior row tangent to its highest point, 0.5-0.7 mm round an
+            // r = 3.5 wall and 0.02 mm across it); halving that extent cuts
+            // its drop off the wall four-fold, and the pieces stand along the
+            // wall. A point down the ruling cannot shorten it: inserting
+            // there fanned the row out round the wall, and each pass made
+            // more such facets (2, 7, 5, 12) until 46-49 degrees remained.
+            let mut chosen = if midpoint_first {
+                longest_interior_edge_midpoint(
+                    [ia, ib, ic],
+                    &pts2d,
+                    |a, b| boundary_segment(&loop_ranges, a, b),
+                    |p| domain.inside(p) && !domain.near(p, keepout),
+                )
+            } else {
+                None
+            };
+            if chosen.is_none() && along_v > 0.0 && length > 0.0 {
                 let step = length / along_v;
                 'search: for t in [1.0, 0.5, 0.25] {
                     for sign in [1.0, -1.0] {
@@ -3499,6 +3621,7 @@ fn split_developable_facets_off_the_wall<S: MeshChart + ?Sized>(
                 splits.push(p);
             }
         }
+        remaining = off_wall;
         if splits.is_empty() {
             break;
         }
@@ -3518,7 +3641,7 @@ fn split_developable_facets_off_the_wall<S: MeshChart + ?Sized>(
             Err(_) => break,
         }
     }
-    (pts2d, triangles)
+    (pts2d, triangles, remaining)
 }
 
 /// Ruppert-style iterative refinement to convergence (or
@@ -5793,6 +5916,64 @@ mod refinement_cost_tests {
              refinement is re-evaluating unchanged work",
             evals as f64 / tris as f64
         );
+    }
+}
+
+#[cfg(test)]
+mod off_wall_split_tests {
+    use super::{boundary_segment, longest_interior_edge_midpoint};
+
+    /// The 148 sliver: rim samples 0 and 1 (a boundary segment) and an
+    /// interior row point 5 far round the curve. The split halves the long
+    /// interior edge -- shortening the facet ROUND the wall -- never the
+    /// rim segment.
+    #[test]
+    fn a_facet_long_round_the_wall_is_split_on_its_longest_interior_edge() {
+        let loops = [(0usize, 5usize)];
+        let mut pts = vec![
+            (-6.33, 17.315),
+            (-6.12, 17.3335),
+            (0.0, 30.0),
+            (-9.0, 30.0),
+            (-9.0, 17.0),
+        ];
+        pts.push((-6.817, 17.335)); // 5: interior row point
+        let m = longest_interior_edge_midpoint(
+            [0, 1, 5],
+            &pts,
+            |a, b| boundary_segment(&loops, a, b),
+            |_| true,
+        );
+        // Longest edge is 1-5 (0.697), interior: its midpoint.
+        let want = ((-6.12 + -6.817) / 2.0, (17.3335 + 17.335) / 2.0);
+        let m = m.unwrap_or_else(|| panic!("no split chosen"));
+        assert!(
+            (m.0 - want.0).abs() < 1e-12 && (m.1 - want.1).abs() < 1e-12,
+            "split at {m:?}"
+        );
+    }
+
+    /// A rim segment is never split, however long; with no usable interior
+    /// edge there is no choice (the caller falls back).
+    #[test]
+    fn a_rim_segment_is_never_split() {
+        let loops = [(0usize, 3usize)];
+        let pts = vec![(0.0, 0.0), (10.0, 0.0), (5.0, 0.1)];
+        // Every edge of this facet is a boundary segment.
+        assert!(boundary_segment(&loops, 0, 1) && boundary_segment(&loops, 2, 0));
+        assert_eq!(
+            longest_interior_edge_midpoint(
+                [0, 1, 2],
+                &pts,
+                |a, b| boundary_segment(&loops, a, b),
+                |_| true
+            ),
+            None
+        );
+        // Not consecutive on the loop: interior.
+        let loops5 = [(0usize, 5usize)];
+        assert!(!boundary_segment(&loops5, 0, 2));
+        assert!(boundary_segment(&loops5, 4, 0), "the loop wraps");
     }
 }
 
