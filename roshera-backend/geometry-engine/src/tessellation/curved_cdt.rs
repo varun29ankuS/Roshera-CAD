@@ -408,6 +408,7 @@ pub(crate) fn project_loop_to_uv(
     let free_v: Vec<bool> = flags.iter().map(|f| f.1).collect();
     take_pole_parameters_from_neighbours(&mut points_uv, &free_u, true);
     take_pole_parameters_from_neighbours(&mut points_uv, &free_v, false);
+    untangle_outline(surface, &points_3d, &mut points_uv, &points_tol);
 
     Ok(ProjectedLoop {
         points_3d,
@@ -415,6 +416,166 @@ pub(crate) fn project_loop_to_uv(
         loop_type: loop_data.loop_type,
     })
 }
+
+/// The crossing segment pairs of a closed outline, segment `i` running from
+/// point `i` to point `i + 1` (wrapping). Segments sharing a point are not
+/// tested. A sweep over the segments' u extents, so an outline that does
+/// not cross itself costs about a sort.
+fn outline_crossings(pts: &[(f64, f64)]) -> Vec<(usize, usize)> {
+    let n = pts.len();
+    if n < 4 {
+        return Vec::new();
+    }
+    let seg = |i: usize| (pts[i], pts[(i + 1) % n]);
+    let mut order: Vec<usize> = (0..n).collect();
+    let lo = |i: usize| {
+        let (a, b) = seg(i);
+        a.0.min(b.0)
+    };
+    order.sort_by(|&a, &b| {
+        lo(a)
+            .partial_cmp(&lo(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let side = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+        (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+    };
+    let mut out = Vec::new();
+    for (k, &i) in order.iter().enumerate() {
+        let (a, b) = seg(i);
+        let hi_i = a.0.max(b.0);
+        let (vlo, vhi) = (a.1.min(b.1), a.1.max(b.1));
+        for &j in &order[k + 1..] {
+            if lo(j) > hi_i {
+                break;
+            }
+            let adjacent = (i + 1) % n == j || (j + 1) % n == i;
+            if adjacent {
+                continue;
+            }
+            let (c, d) = seg(j);
+            if c.1.max(d.1) < vlo || c.1.min(d.1) > vhi {
+                continue;
+            }
+            if side(a, b, c) * side(a, b, d) < 0.0 && side(c, d, a) * side(c, d, b) < 0.0 {
+                out.push((i.min(j), i.max(j)));
+            }
+        }
+    }
+    out
+}
+
+/// Untangle an outline that crosses itself by less than its edges'
+/// tolerance. Its points' 3D positions are fixed (the shared edge samples
+/// the mesh is built from); only their chart `(u, v)` -- which decides the
+/// triangulation's connectivity -- may move, and only to a `(u, v)` still
+/// within its edge's tolerance of its sample. For each crossing pair the one
+/// endpoint that can be put back on its own segment's side of the other
+/// segment with the smallest move is moved there; a crossing no such move
+/// clears is left for the triangulator to refuse, as before.
+///
+/// CADGenBench 207: a torus face whose two fillet edges leave the top arc
+/// (exactly on v = pi/2) tangentially, 1.4 um off the torus inside the
+/// file's 10 um tolerance; near the tangency that wobble put a sample on the
+/// far side of the arc, the outline crossed itself, and the face meshed to
+/// nothing.
+fn untangle_outline(
+    surface: &dyn Surface,
+    points_3d: &[Point3],
+    points_uv: &mut [(f64, f64)],
+    tolerance: &[f64],
+) {
+    let n = points_uv.len().min(points_3d.len());
+    let first = outline_crossings(&points_uv[..n]);
+    if first.is_empty() {
+        return;
+    }
+    let allowed = |k: usize| MARCH_ACCEPT.max(1.5 * tolerance.get(k).copied().unwrap_or(0.0));
+    let miss = |k: usize, uv: (f64, f64)| {
+        surface
+            .point_at(uv.0, uv.1)
+            .map_or(f64::INFINITY, |q| (q - points_3d[k]).magnitude())
+    };
+    // A crossing pair of segments encloses a POCKET of the loop: the points
+    // between them the short way round. The fold is a run of pocket points
+    // on the wrong side; the repair lays one contiguous run of pocket points
+    // on the straight chart chord between the run's two neighbours. Of the
+    // runs that keep every point within tolerance and lower the crossing
+    // count, the one moving the points least is taken.
+    for _ in 0..(2 * first.len() + 2) {
+        let crossings = outline_crossings(&points_uv[..n]);
+        let Some(&(i, j)) = crossings.first() else {
+            return;
+        };
+        let count = crossings.len();
+        // Pocket: from segment j's end round to segment i's end, or from
+        // segment i's end round to segment j's end -- the shorter.
+        let fwd = (i + n - j) % n; // points j+1 ..= i
+        let bwd = (j + n - i) % n; // points i+1 ..= j
+        let (start, len) = if fwd <= bwd {
+            ((j + 1) % n, fwd)
+        } else {
+            ((i + 1) % n, bwd)
+        };
+        if len == 0 || len > MAX_UNTANGLE_POCKET {
+            return;
+        }
+        let idx = |m: usize| (start + m) % n;
+        let mut best: Option<(f64, Vec<(usize, (f64, f64))>)> = None;
+        for a in 0..len {
+            for b in a..len {
+                // Replace pocket points a..=b by the chord between their
+                // neighbours (indices a-1 and b+1 round the loop).
+                let before = points_uv[(idx(a) + n - 1) % n];
+                let after = points_uv[(idx(b) + 1) % n];
+                let m = b - a + 1;
+                let mut moves = Vec::with_capacity(m);
+                let mut moved = 0.0;
+                let mut ok = true;
+                for r in 0..m {
+                    let t = (r + 1) as f64 / (m + 1) as f64;
+                    let k = idx(a + r);
+                    let target = (
+                        before.0 + (after.0 - before.0) * t,
+                        before.1 + (after.1 - before.1) * t,
+                    );
+                    if miss(k, target) > allowed(k) {
+                        ok = false;
+                        break;
+                    }
+                    moved += (target.0 - points_uv[k].0).hypot(target.1 - points_uv[k].1);
+                    moves.push((k, target));
+                }
+                if !ok || best.as_ref().is_some_and(|(bm, _)| moved >= *bm) {
+                    continue;
+                }
+                let saved: Vec<(usize, (f64, f64))> =
+                    moves.iter().map(|&(k, _)| (k, points_uv[k])).collect();
+                for &(k, t) in &moves {
+                    points_uv[k] = t;
+                }
+                let after_count = outline_crossings(&points_uv[..n]).len();
+                for &(k, p) in &saved {
+                    points_uv[k] = p;
+                }
+                if after_count < count {
+                    best = Some((moved, moves));
+                }
+            }
+        }
+        let Some((_, moves)) = best else {
+            return; // no run within tolerance clears it
+        };
+        for (k, t) in moves {
+            points_uv[k] = t;
+        }
+    }
+}
+
+/// Most points a fold's pocket may hold for [`untangle_outline`] to lay a run
+/// of them straight: a tolerance-level wobble at a tangency spans a few
+/// samples; a longer pocket is a real projection fault and stays refused.
+const MAX_UNTANGLE_POCKET: usize = 32;
 
 /// A boundary sample whose footpoint MISSES it -- farther from it than
 /// [`MARCH_ACCEPT`] -- is searched for again from its nearest loop
@@ -5697,6 +5858,62 @@ mod missed_footpoint_tests {
             uv[2].0.abs() < 1e-6,
             "with no tolerance the miss is searched again"
         );
+    }
+
+    /// The 207 shape on a plane: boundary B runs along v = 0 into vertex
+    /// P0; edge A leaves P0 tangentially, its first samples 1e-4 on the
+    /// wrong side of B (a tolerance-level wobble), so the outline crosses
+    /// itself. Laying A's wobbling samples on the chord clears it.
+    fn tangential_fold(w: f64) -> (Plane, Vec<Point3>, Vec<(f64, f64)>) {
+        let plane = Plane::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, Vector3::X)
+            .unwrap_or_else(|e| panic!("plane: {e:?}"));
+        let uv = vec![
+            (1.0, 0.0),
+            (0.6, 0.0),
+            (0.4, 0.0),
+            (0.2, 0.0),
+            (0.0, 0.0), // P0
+            (0.1, -w),
+            (0.2, -w),
+            (0.3, w),
+            (0.3, 1.0),
+            (1.0, 1.0),
+        ];
+        let pts: Vec<Point3> = uv
+            .iter()
+            .map(|&(u, v)| {
+                plane
+                    .point_at(u, v)
+                    .unwrap_or_else(|e| panic!("eval: {e:?}"))
+            })
+            .collect();
+        (plane, pts, uv)
+    }
+
+    #[test]
+    fn a_tangential_fold_within_tolerance_is_untangled() {
+        let (plane, pts, mut uv) = tangential_fold(1e-4);
+        assert!(
+            !super::outline_crossings(&uv).is_empty(),
+            "fixture: the outline crosses itself"
+        );
+        let tol = vec![1e-3; uv.len()];
+        super::untangle_outline(&plane, &pts, &mut uv, &tol);
+        assert!(
+            super::outline_crossings(&uv).is_empty(),
+            "still crossing: {:?}",
+            super::outline_crossings(&uv)
+        );
+    }
+
+    /// A fold the tolerance does not cover stays: the triangulator refuses
+    /// it, as before -- no point is moved farther than its edge allows.
+    #[test]
+    fn a_fold_beyond_tolerance_is_left_crossing() {
+        let (plane, pts, mut uv) = tangential_fold(5e-3);
+        let before = uv.clone();
+        super::untangle_outline(&plane, &pts, &mut uv, &[0.0; 10]);
+        assert_eq!(uv, before, "a point moved beyond its tolerance");
     }
 
     /// On a periodic face the repaired footpoint stays on its neighbours'

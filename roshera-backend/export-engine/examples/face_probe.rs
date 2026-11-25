@@ -1178,6 +1178,89 @@ fn main() {
             }
         }
     }
+    // PROBE_DEV=<face>: that face's facets on the default mesh, worst tilt
+    // from the true normal first, with their vertices' (u, v) and how far
+    // the centroid sits off the surface.
+    if let Ok(arg) = std::env::var("PROBE_DEV") {
+        let want: u32 = arg.parse().unwrap_or(u32::MAX);
+        let ids: Vec<u32> = model.solids.iter().map(|(id, _)| id).collect();
+        for sid in ids {
+            let Some(solid) = model.solids.get(sid) else {
+                continue;
+            };
+            let mesh = geometry_engine::tessellation::tessellate_solid(
+                &solid,
+                &model,
+                &geometry_engine::tessellation::TessellationParams::default(),
+            );
+            drop(solid);
+            let normals = geometry_engine::harness::watertight::facet_true_normals(&model, &mesh);
+            let surf = model
+                .faces
+                .get(want)
+                .and_then(|f| model.surfaces.get(f.surface_id));
+            let Some(surf) = surf else { continue };
+            let tol = geometry_engine::math::Tolerance::default();
+            let mut rows: Vec<(f64, String)> = Vec::new();
+            for (t, tri) in mesh.triangles.iter().enumerate() {
+                if mesh.face_map.get(t) != Some(&want) {
+                    continue;
+                }
+                let [a, b, c] = tri.map(|i| mesh.vertices[i as usize].position);
+                let w = (b - a).cross(&(c - a));
+                let Some(n) = normals.get(t).copied().flatten() else {
+                    continue;
+                };
+                let m = w.magnitude();
+                if m <= 1e-15 {
+                    continue;
+                }
+                let dev = (w.dot(&n) / (m * n.magnitude()))
+                    .clamp(-1.0, 1.0)
+                    .acos()
+                    .to_degrees();
+                let cen = geometry_engine::math::Point3::new(
+                    (a.x + b.x + c.x) / 3.0,
+                    (a.y + b.y + c.y) / 3.0,
+                    (a.z + b.z + c.z) / 3.0,
+                );
+                let off = surf
+                    .closest_point(&cen, tol)
+                    .and_then(|(u, v)| surf.point_at(u, v))
+                    .map(|q| (q - cen).magnitude())
+                    .unwrap_or(f64::NAN);
+                let uvs: Vec<String> = [a, b, c]
+                    .iter()
+                    .map(|p| {
+                        surf.closest_point(p, tol)
+                            .map(|(u, v)| format!("({u:.4},{v:.4})"))
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let lens = [
+                    (b - a).magnitude(),
+                    (c - b).magnitude(),
+                    (a - c).magnitude(),
+                ];
+                rows.push((
+                    dev,
+                    format!(
+                        "facet {t} dev {dev:.1} off {off:.3e} edges {:.3} {:.3} {:.3} uv {}",
+                        lens[0],
+                        lens[1],
+                        lens[2],
+                        uvs.join(" ")
+                    ),
+                ));
+            }
+            rows.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+            println!("dev face {want}: {} facets", rows.len());
+            for (_, r) in rows.iter().take(8) {
+                println!("  {r}");
+            }
+        }
+        return;
+    }
     // PROBE_QUALITY: the certificate's own mesh-quality verdict, with the
     // worst face described (same run, so the face id is meaningful).
     if std::env::var_os("PROBE_QUALITY").is_some() {
