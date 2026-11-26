@@ -16,6 +16,15 @@
  * switch (and with the active document when the list first loads). This
  * module has no imports so the stores and components that cache history can
  * all depend on it without an import cycle through the document store.
+ *
+ * THE ONE PLACE the open document changes. `enterDocument` is the only way
+ * the app moves to another document, whoever moved it: a tab clicked here, or
+ * a re-read of the document list that finds the server somewhere else (an
+ * agent opened another document over MCP). Everything that must start over
+ * hears it from here -- the scoped caches, and the document store's `epoch`,
+ * which is a count of the `switched` entries below and nothing else. The
+ * epoch used to be bumped by hand in the tab-switch path only, so a document
+ * moved by an agent emptied the caches and reloaded no panel (2026-11-26).
  */
 
 /** A snapshot of the scope a request was started in. */
@@ -24,7 +33,20 @@ export interface ScopeToken {
   readonly generation: number
 }
 
-type Listener = (documentId: string) => void
+/**
+ * What entering a document meant for the app.
+ *
+ * - `same`: it was already the document in scope. Nothing happened.
+ * - `learned`: the app did not yet know which document the server has open
+ *   (the list had not loaded) and now does. Nothing on screen was about any
+ *   other document, so nothing has to start over.
+ * - `switched`: the open document changed under what the app shows -- another
+ *   document, or the same one re-opened (its history replayed). Everything
+ *   read for the document before is stale.
+ */
+export type DocumentEntry = 'same' | 'learned' | 'switched'
+
+type Listener = (documentId: string, entry: Exclude<DocumentEntry, 'same'>) => void
 
 let current: string | null = null
 let generation = 0
@@ -51,13 +73,16 @@ export function isCurrentScope(token: ScopeToken): boolean {
  * Make `documentId` the scope. A different document -- or the same one
  * re-opened, whose history the backend has just replayed -- starts a new
  * scope: every subscriber hears it once and every scoped cache empties.
- * Entering the document already in scope is a no-op.
+ * Entering the document already in scope is a no-op. Returns what the entry
+ * meant (see `DocumentEntry`); listeners are told the same.
  */
-export function enterDocument(documentId: string, opts: { reopened?: boolean } = {}): void {
-  if (documentId === current && !opts.reopened) return
+export function enterDocument(documentId: string, opts: { reopened?: boolean } = {}): DocumentEntry {
+  if (documentId === current && !opts.reopened) return 'same'
+  const entry = current === null && !opts.reopened ? 'learned' : 'switched'
   current = documentId
   generation += 1
-  for (const listener of [...listeners]) listener(documentId)
+  for (const listener of [...listeners]) listener(documentId, entry)
+  return entry
 }
 
 /** Hear every document change. Returns the unsubscribe. */

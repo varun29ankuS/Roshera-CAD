@@ -13,7 +13,8 @@
  * "like" a view already on the sheet and the kernel places them.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
+import { useDismiss } from '@/hooks/use-dismiss'
 import {
   Check,
   ChevronDown,
@@ -50,27 +51,6 @@ export interface PartRow {
 // what is under it read through.
 const card = 'bg-card border border-border rounded-md shadow-md'
 
-/** Close a popover on an outside click or Escape. */
-function useDismiss(open: boolean, onClose: () => void) {
-  const ref = useRef<HTMLDivElement | null>(null)
-  useEffect(() => {
-    if (!open) return
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose()
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    window.addEventListener('mousedown', onDown)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('mousedown', onDown)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [open, onClose])
-  return ref
-}
-
 // ── Drawing switcher (top-left) ──────────────────────────────────────────
 
 export function DrawingSwitcher({
@@ -87,6 +67,8 @@ export function DrawingSwitcher({
   parts: PartRow[]
   onSelect: (id: string) => void
   onRename: (id: string, name: string) => void
+  /** Ask for a drawing to be deleted. The owner of the action confirms it
+   *  with the engineer -- not this menu, or the question is asked twice. */
   onDelete: (id: string) => void
   onCreateFromPart: (part: PartRow) => void
 }) {
@@ -176,9 +158,7 @@ export function DrawingSwitcher({
                 type="button"
                 aria-label={`Delete ${d.name}`}
                 title="Delete drawing"
-                onClick={() => {
-                  if (confirm(`Delete the drawing "${d.name}"? This cannot be undone.`)) onDelete(d.id)
-                }}
+                onClick={() => onDelete(d.id)}
                 className="cad-focus p-1 rounded text-muted-foreground opacity-0 group-hover:opacity-100 hover:text-destructive"
               >
                 <Trash2 size={12} />
@@ -676,6 +656,88 @@ export function TitleBlockCard({
       <p className="mt-2 text-muted-foreground">
         Mass, units, the verification stamp and the tolerance class are filled in by the kernel.
       </p>
+    </div>
+  )
+}
+
+// ── Notices (bottom centre of the sheet area) ───────────────────────────
+
+/**
+ * What the workspace has to tell the engineer about the open sheet, in ONE
+ * stack: the outcome of the last edit (or a pointer on what to do next) and
+ * the removed-view Undo.
+ *
+ * They used to be two boxes, each placed on its own at the same spot (bottom
+ * centre): a view removed and then anything that says a note -- a dimension
+ * moved, a view rescaled -- drew one box over the other, and the Undo could
+ * sit under the note. One container lays them out, so they cannot overlap
+ * whatever their sizes: the Undo keeps the bottom place (it does not move
+ * when a note arrives or leaves) and the note sits above it.
+ *
+ * The stack spans the sheet area (right of the Sheet panel) and passes
+ * presses through everywhere but on the notices themselves.
+ */
+export function SheetNotices({
+  note,
+  onDismissNote,
+  removedView,
+  undoBusy,
+  onUndo,
+  onDismissRemoved,
+}: {
+  /** A confirmation (`done`) or something to read (`info`); null for none. */
+  note: { kind: 'done' | 'info'; text: string } | null
+  onDismissNote: () => void
+  /** The name of the view just removed, while its removal can be undone. */
+  removedView: string | null
+  undoBusy: boolean
+  onUndo: () => void
+  onDismissRemoved: () => void
+}) {
+  if (note === null && removedView === null) return null
+  const notice = `${card} pointer-events-auto flex max-w-full items-center gap-2 px-3 py-1.5 text-xs`
+  return (
+    <div
+      data-sheet-notices
+      className="pointer-events-none absolute bottom-14 left-[17rem] right-3 z-30 flex flex-col items-center gap-1.5"
+    >
+      {note !== null && (
+        <div role="status" className={notice}>
+          <span aria-hidden className={`shrink-0 ${note.kind === 'done' ? 'text-green-700' : 'text-sky-700'}`}>
+            {note.kind === 'done' ? '✓' : 'ⓘ'}
+          </span>
+          <span className="min-w-0 font-mono">{note.text}</span>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={onDismissNote}
+            className="cad-focus shrink-0 text-muted-foreground hover:text-foreground"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      )}
+      {removedView !== null && (
+        <div role="status" className={notice}>
+          <span className="min-w-0">Removed view {removedView}</span>
+          <button
+            type="button"
+            disabled={undoBusy}
+            onClick={onUndo}
+            className="cad-focus shrink-0 font-medium text-primary hover:underline disabled:opacity-50"
+          >
+            Undo
+          </button>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={onDismissRemoved}
+            className="cad-focus shrink-0 text-muted-foreground hover:text-foreground"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      )}
     </div>
   )
 }

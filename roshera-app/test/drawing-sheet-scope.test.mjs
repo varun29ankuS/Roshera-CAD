@@ -48,9 +48,21 @@ test('another sheet starts clean', () => {
     'setViewGhost(null)',
     'dimDragRef.current = null',
     'viewDragRef.current = null',
+    'panStateRef.current.dragging = false',
+    // The view pointed at in the Sheet panel: its row is gone with the sheet.
+    'setHoverViewId(null)',
   ]) {
     assert.ok(effect.includes(dropped), `${dropped} when the sheet changes`)
   }
+})
+
+test("another sheet opens fitted to the window, not at the last sheet's zoom", () => {
+  // An A4 detail zoomed to 400% used to open the next sheet at 400% too.
+  const at = ws.indexOf('sheetReads.current.show(activeId)')
+  assert.ok(at > 0)
+  const effect = ws.slice(at, ws.indexOf('}, [activeId, refreshActive])', at))
+  assert.ok(effect.includes("setZoomMode('fit')"), 'the zoom belongs to the sheet')
+  assert.ok(effect.includes('setPan({ x: 0, y: 0 })'), 'and so does the pan')
 })
 
 test('a note about one sheet is not said on another', () => {

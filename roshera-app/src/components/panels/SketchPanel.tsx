@@ -39,6 +39,8 @@ import {
   type StandardPlane,
 } from '@/stores/scene-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
+import { partWorkspaceParked } from '@/lib/workspaces'
 import {
   buildProfile2D,
   perimeter,
@@ -347,9 +349,12 @@ export function SketchPanel() {
     sketch.tool,
   ])
 
-  // Keyboard shortcuts — guarded against typing inside inputs.
+  // Keyboard shortcuts — guarded against typing inside inputs, and silent
+  // while the Part workspace is parked under Drawing or Assembly (the sketch
+  // is not on screen; Backspace there must not take a point off it).
+  const parked = useDocModeStore((s) => partWorkspaceParked(s.mode ?? 'part'))
   useEffect(() => {
-    if (!sketch.active) return
+    if (!sketch.active || parked) return
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
@@ -380,7 +385,7 @@ export function SketchPanel() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [sketch.active, exitSketch, popSketchPoint, setSketchTool, handleFinish])
+  }, [sketch.active, parked, exitSketch, popSketchPoint, setSketchTool, handleFinish])
 
   // Live measurements summary for the bottom of the panel.
   // Important: compute these from the *materialised* profile (rectangle

@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import { ChevronDown, ChevronRight, MoreHorizontal, Plus, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { Drawing, DrawingQualityReport, ProjectedView } from '@/lib/drawings-api'
 import { VIEW_PRESETS, checkSummary, sheetContents, type ViewPreset } from '@/lib/sheet-contents'
+import { useDismiss } from '@/hooks/use-dismiss'
 
 /** A view's kind as a small drawn glyph: an outline for an orthographic
  *  view, a cube for the iso, a hatched square for a section. */
@@ -69,9 +70,25 @@ export function SheetPanel({
   /** Mark a view on the sheet while it is pointed at here. */
   onHoverView: (viewId: string | null) => void
 }) {
+  // Folded or not is how the engineer keeps the panel: it stays across sheets.
   const [open, setOpen] = useState(true)
+  // What is open ABOUT a sheet -- its check's findings, its add-a-view menu
+  // -- belongs to that sheet. The panel stays mounted when another sheet is
+  // chosen, so these are let go when the sheet changes: the findings box of
+  // one sheet used to stand open over the next, listing its findings as if
+  // they had been asked for.
   const [issuesOpen, setIssuesOpen] = useState(false)
   const [adding, setAdding] = useState(false)
+  const [sheetId, setSheetId] = useState(drawing.id)
+  if (sheetId !== drawing.id) {
+    setSheetId(drawing.id)
+    setIssuesOpen(false)
+    setAdding(false)
+  }
+  // The add-a-view menu closes on a press anywhere else, or Escape; it used
+  // to stay open until its own + was pressed again.
+  const closeAdding = useCallback(() => setAdding(false), [])
+  const addMenuRef = useDismiss(adding, closeAdding)
   const { views, dimensionCount } = sheetContents(drawing)
   const check = checkSummary(quality)
   const issues = quality?.issues ?? []
@@ -118,7 +135,7 @@ export function SheetPanel({
           {check.tone === 'positive' ? '✓' : check.tone === 'negative' ? `✗ ${issues.length}` : check.tone === 'caution' ? `⚠ ${issues.length}` : '…'}
         </button>
         {missing.length > 0 && (
-          <div className="relative">
+          <div ref={addMenuRef} className="relative">
             <button
               type="button"
               disabled={busy}

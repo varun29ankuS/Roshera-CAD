@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useSketchBench } from '@/stores/sketch-bench-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
+import { partWorkspaceParked } from '@/lib/workspaces'
 import { HISTORY_CHANGED_EVENT } from '@/lib/history'
 import { Check, PencilRuler, Trash2, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -94,8 +96,12 @@ export function FeatureEditPanel({
   // The Delete key deletes the selected feature -- not while a size is being
   // typed (the key then belongs to the field). One card owns the key: the
   // callout when the feature is on the part, else the column card.
+  // Nor while the Part workspace is parked under Drawing or Assembly: the
+  // card is not on screen, and the key belongs to the workspace that is.
   const sketching = useSketchBench((s) => s.sketchId !== null)
-  const ownsKey = !sketching && chapter !== null && (placement === 'callout') === located.has(chapter.anchor)
+  const parked = useDocModeStore((s) => partWorkspaceParked(s.mode ?? 'part'))
+  const ownsKey =
+    !parked && !sketching && chapter !== null && (placement === 'callout') === located.has(chapter.anchor)
   useEffect(() => {
     if (!ownsKey) return
     const onKey = (e: KeyboardEvent) => {

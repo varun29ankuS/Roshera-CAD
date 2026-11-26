@@ -134,8 +134,24 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
     [setOpenIds],
   )
 
+  // The server says which document is open; ask it on load, and again
+  // whenever someone else may have moved it: an agent's turn just ended (it
+  // can open another document over MCP), or this window was away and is
+  // looked at again. `refresh` follows the server when it has moved. The
+  // server sends no frame when the open document changes, so these are the
+  // moments the app can know to ask.
   useEffect(() => {
     void refresh()
+    const ask = () => void refresh()
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') ask()
+    }
+    window.addEventListener('roshera:agent-turn-ended', ask)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.removeEventListener('roshera:agent-turn-ended', ask)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [refresh])
 
   useEffect(() => {

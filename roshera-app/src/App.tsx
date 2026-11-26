@@ -29,6 +29,7 @@ import { useKeyboardShortcuts } from '@/lib/shortcuts'
 import { useUserContextPublisher } from '@/hooks/use-user-context-publisher'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
+import { partWorkspaceParked } from '@/lib/workspaces'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
 import { installBackendBlackboard } from '@/lib/blackboard-api'
 import { establishAcpSession } from '@/lib/acp-blackboard'
@@ -63,7 +64,7 @@ export function App() {
   const docMode = useDocModeStore((s) => s.mode) ?? 'part'
   // Drawing and Assembly bring their own workspace; the Part workspace stays
   // mounted underneath, parked (see below).
-  const sheetWorkspace = docMode === 'drawing' || docMode === 'assembly'
+  const sheetWorkspace = partWorkspaceParked(docMode)
   // DFM and Simulate are checks ON the part: its model and history stay, the
   // modelling tools go, and the check's panel takes the left column.
   const checkWorkspace = docMode === 'dfm' || docMode === 'simulate'

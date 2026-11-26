@@ -22,13 +22,12 @@
 
 import { SheetPanel } from './SheetPanel'
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import {
-  X,
-} from '@/components/ui/icons'
+import { X } from '@/components/ui/icons'
 import {
   DrawingSwitcher,
   SheetActions,
   SheetHint,
+  SheetNotices,
   TitleBlockCard,
   ViewMenu,
   type PartRow,
@@ -67,6 +66,7 @@ import { CompletenessChip, DimensionPanel } from '@/components/panels/DimensionP
 import { draggedShift } from '@/lib/dimension-annotate'
 import { latestOnly } from '@/lib/latest-only'
 import { sheetPress } from '@/lib/sheet-press'
+import { releaseWasMissed } from '@/lib/sheet-drag-release'
 import { sheetRequests } from '@/lib/sheet-requests'
 import { applySavedTitleBlock } from '@/lib/title-block-draft'
 import { drawingsForDocument } from '@/lib/drawings-for-document'
@@ -180,7 +180,12 @@ function DocumentDrawings() {
   // ── Overlay state ────────────────────────────────────────────────
   const [titleBlockOpen, setTitleBlockOpen] = useState(false)
   const [viewsBusy, setViewsBusy] = useState(false)
-  // The last removed view, so its removal can be undone.
+  // The last removed view, so its removal can be undone. The offer's Undo is
+  // a history undo: it takes back the NEWEST step, so it stands only while
+  // the removal is that step. Every other recorded edit of the sheet -- and
+  // any undo or redo, and an agent's turn -- withdraws it (`setRemovedView(
+  // null)` at each); otherwise "Removed view TOP -- Undo" took back the
+  // dimension moved since, and said the view was restored.
   const [removedView, setRemovedView] = useState<{
     name: string
     projection: Drawing['views'][number]['projection']
@@ -396,6 +401,7 @@ function DocumentDrawings() {
   // Reload what this window shows.
   useEffect(() => {
     const onHistory = () => {
+      setRemovedView(null)
       void refreshList(activeId ?? undefined)
       if (activeId) void refreshActive(activeId)
     }
@@ -408,6 +414,7 @@ function DocumentDrawings() {
   // appeared and never reached the screen, 2026-11-19). Re-read it.
   useEffect(() => {
     const onTurnEnded = () => {
+      setRemovedView(null)
       if (activeId) void refreshActive(activeId)
     }
     window.addEventListener('roshera:agent-turn-ended', onTurnEnded)
@@ -453,7 +460,10 @@ function DocumentDrawings() {
       setLoading(false)
     }
     // Switching drawings resets the view so the new sheet is centred
-    // in fit mode without inheriting the previous drawing's pan.
+    // in fit mode without inheriting the previous drawing's pan -- or its
+    // zoom: an A4 detail zoomed to 400% used to open the next sheet (an A1)
+    // at 400% too, showing a blank corner of it.
+    setZoomMode('fit')
     setPan({ x: 0, y: 0 })
   }, [activeId, refreshActive])
 
@@ -495,6 +505,7 @@ function DocumentDrawings() {
       setError(null)
       try {
         await renameDrawing(id, trimmed)
+        setRemovedView(null)
         await refreshList()
         if (activeId === id) {
           await refreshActive(id)
@@ -506,9 +517,13 @@ function DocumentDrawings() {
     [drawings, activeId, refreshList, refreshActive],
   )
 
+  // The one place a drawing is deleted, so the one place that asks: whatever
+  // offers Delete (the switcher today) only passes the request on. It used
+  // to ask too, and the engineer answered the same question twice.
   const handleDelete = useCallback(
     async (id: string) => {
-      if (!confirm('Delete this drawing?')) return
+      const name = drawings.find((d) => d.id === id)?.name
+      if (!confirm(name ? `Delete the drawing "${name}"?` : 'Delete this drawing?')) return
       setError(null)
       try {
         await deleteDrawing(id)
@@ -520,7 +535,7 @@ function DocumentDrawings() {
         setError(e instanceof Error ? e.message : String(e))
       }
     },
-    [activeId, refreshList],
+    [drawings, activeId, refreshList],
   )
 
   // "Add view ▸ Left": another view of the part already on the sheet; the
@@ -568,6 +583,8 @@ function DocumentDrawings() {
       setViewsBusy(true)
       try {
         await removeView(activeId, viewId)
+        // Its row in the Sheet panel is gone without the pointer leaving it.
+        setHoverViewId((cur) => (cur === viewId ? null : cur))
         setRemovedView({
           name: v.name,
           projection: v.projection,
@@ -639,8 +656,10 @@ function DocumentDrawings() {
     setDimListing(null)
     setSheetCheck(null)
     setViewGhost(null)
+    setHoverViewId(null)
     dimDragRef.current = null
     viewDragRef.current = null
+    panStateRef.current.dragging = false
   }, [activeId])
 
   /** The view whose drawn box contains a screen point (smallest wins). */
@@ -706,8 +725,12 @@ function DocumentDrawings() {
   )
 
   // Delete removes the selected view; Escape lets go of it. Not while the
-  // engineer types, and not while a dimension's change box is open.
+  // engineer types, and not while a dimension's change box is open. And only
+  // while this workspace is the one open: it stays mounted when parked, and
+  // a key listener on the window hears every key -- Delete pressed on a part
+  // in the Part workspace also removed the view left selected here.
   useEffect(() => {
+    if (docMode !== 'drawing') return
     const onKey = (e: KeyboardEvent) => {
       if (!selectedViewId) return
       const t = e.target as HTMLElement | null
@@ -725,7 +748,7 @@ function DocumentDrawings() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [selectedViewId, dimEdit, handleRemoveView])
+  }, [docMode, selectedViewId, dimEdit, handleRemoveView])
 
   // The selected view's outline, measured off the rendered sheet (follows
   // pan, zoom and re-renders).
@@ -808,7 +831,7 @@ function DocumentDrawings() {
       width: r.width + 2 * pad,
       height: r.height + 2 * pad,
     })
-  }, [selectedViewId, svgMarkup, pan, displayW, displayH])
+  }, [selectedViewId, svgMarkup, pan, displayW, displayH, containerSize])
 
   // The view pointed at in the Sheet panel: a light box on the sheet.
   useLayoutEffect(() => {
@@ -821,7 +844,7 @@ function DocumentDrawings() {
     const r = el.getBoundingClientRect()
     const base = (root.parentElement ?? root).getBoundingClientRect()
     setHoverRect({ left: r.left - base.left - 4, top: r.top - base.top - 4, width: r.width + 8, height: r.height + 8 })
-  }, [hoverViewId, selectedViewId, svgMarkup, pan, displayW, displayH])
+  }, [hoverViewId, selectedViewId, svgMarkup, pan, displayW, displayH, containerSize])
 
   const zoomIn = useCallback(() => {
     setZoom((prev) => {
@@ -1132,6 +1155,7 @@ function DocumentDrawings() {
         await annotateDimension(drawingId, id, {
           text_shift_mm: draggedShift(known?.edit?.text_shift_mm, dxPx, dyPx, pxPerMm),
         })
+        setRemovedView(null)
         noteFor(drawingId, 'done', `${label} moved. Ctrl+Z undoes it.`)
         await refreshActive(drawingId)
       } catch (e) {
@@ -1249,7 +1273,36 @@ function DocumentDrawings() {
   }, [beginViewDrag, sheetWMm, cancelLook])
 
   useEffect(() => {
+    const dragInHand = () =>
+      dimDragRef.current !== null || viewDragRef.current !== null || panStateRef.current.dragging
+    // Let go of whatever is in hand and send nothing: the dimension's text
+    // goes back, the view's ghost goes, the sheet stops following. Every way
+    // a drag ends WITHOUT its own mouse-up comes here -- Escape, a release
+    // the page never saw, the window losing focus, a new press.
+    const abandonDrags = () => {
+      const dd = dimDragRef.current
+      if (dd) {
+        dd.els.forEach((el) => {
+          el.style.translate = ''
+        })
+        dimDragRef.current = null
+      }
+      if (viewDragRef.current) {
+        viewDragRef.current = null
+        setViewGhost(null)
+      }
+      panStateRef.current.dragging = false
+      const el = canvasRef.current
+      if (el) el.style.cursor = ''
+    }
     const onMouseMove = (e: MouseEvent) => {
+      // The button is up but no mouse-up reached the page (Alt+Tab mid-drag,
+      // a system dialog): the drag is over, and where it would have been
+      // dropped is not known -- so nothing is sent (lib/sheet-drag-release).
+      if (dragInHand() && releaseWasMissed(e)) {
+        abandonDrags()
+        return
+      }
       const dd = dimDragRef.current
       if (dd) {
         const dx = e.clientX - dd.startX
@@ -1319,28 +1372,31 @@ function DocumentDrawings() {
         setViewGhost(null),
       )
     }
-    // Escape while dragging drops the drag; nothing is sent.
+    // Escape while dragging a view or a dimension drops the drag; nothing
+    // is sent.
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && dimDragRef.current) {
-        dimDragRef.current.els.forEach((el) => {
-          el.style.translate = ''
-        })
-        dimDragRef.current = null
-        return
-      }
-      if (e.key === 'Escape' && viewDragRef.current) {
-        viewDragRef.current = null
-        setViewGhost(null)
-        const el = canvasRef.current
-        if (el) el.style.cursor = ''
-      }
+      if (e.key === 'Escape' && (dimDragRef.current || viewDragRef.current)) abandonDrags()
     }
+    // Any press, anywhere, begins with nothing in hand: a drag whose release
+    // was missed must not ride along with the next press. In the capture
+    // phase, so it runs before the sheet's own mouse-down starts a new drag
+    // and whatever a panel does with the event.
+    const onPressBegins = () => abandonDrags()
+    // The window lost focus mid-drag: the release will happen elsewhere.
+    const onWindowBlur = () => abandonDrags()
     window.addEventListener('mousemove', onMouseMove)
     window.addEventListener('mouseup', onMouseUp)
+    window.addEventListener('mousedown', onPressBegins, true)
+    window.addEventListener('blur', onWindowBlur)
     window.addEventListener('keydown', onKeyDown)
     return () => {
+      // Unmounted mid-drag (the document changed): the translated text and
+      // the cursor are this component's to put back.
+      abandonDrags()
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mouseup', onMouseUp)
+      window.removeEventListener('mousedown', onPressBegins, true)
+      window.removeEventListener('blur', onWindowBlur)
       window.removeEventListener('keydown', onKeyDown)
     }
   }, [])
@@ -1434,6 +1490,7 @@ function DocumentDrawings() {
     try {
       const drawingId = activeDrawing.id
       const r = await setDrawingDimension(drawingId, dimEdit.dim.id, value, abort.signal)
+      setRemovedView(null)
       // Another sheet was opened while the part rebuilt: its editor and its
       // note are not this edit's to touch.
       if (!sheetReads.current.isShowing(drawingId)) return
@@ -1465,6 +1522,17 @@ function DocumentDrawings() {
     }
   }, [dimEdit, activeDrawing, refreshActive, noteFor])
 
+  /** A dimension of `drawingId` was annotated (tolerance, text, suppression,
+   *  put back): say so and show the sheet as the kernel now draws it. */
+  const annotated = useCallback(
+    (drawingId: string, note: string) => {
+      setRemovedView(null)
+      noteFor(drawingId, 'done', note)
+      void refreshActive(drawingId)
+    },
+    [noteFor, refreshActive],
+  )
+
   const changeProjection = useCallback(
     async (projection: ProjectionAngle) => {
       if (!activeDrawing || (activeDrawing.projection ?? 'third') === projection) return
@@ -1472,6 +1540,7 @@ function DocumentDrawings() {
       setError(null)
       try {
         await setDrawingProjection(activeDrawing.id, projection)
+        setRemovedView(null)
         await refreshActive(activeDrawing.id)
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
@@ -1683,6 +1752,7 @@ function DocumentDrawings() {
             // The card of THIS drawing saved: the answer may arrive after
             // another sheet was opened, and must not land on it.
             const id = activeDrawing.id
+            setRemovedView(null)
             setActiveDrawing((prev) => applySavedTitleBlock(prev, id, updated))
             void refreshActive(id)
           }}
@@ -1758,27 +1828,14 @@ function DocumentDrawings() {
         </div>
       )}
 
-      {removedView && (
-        <div className="absolute bottom-14 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs shadow-md">
-          <span>Removed view {removedView.name}</span>
-          <button
-            type="button"
-            disabled={viewsBusy}
-            onClick={() => void undoRemoveView()}
-            className="cad-focus font-medium text-primary hover:underline"
-          >
-            Undo
-          </button>
-          <button
-            type="button"
-            aria-label="Dismiss"
-            onClick={() => setRemovedView(null)}
-            className="cad-focus text-muted-foreground hover:text-foreground"
-          >
-            <X size={12} />
-          </button>
-        </div>
-      )}
+      <SheetNotices
+        note={editNote === null ? null : { kind: noteKind, text: editNote }}
+        onDismissNote={() => setEditNote(null)}
+        removedView={removedView?.name ?? null}
+        undoBusy={viewsBusy}
+        onUndo={() => void undoRemoveView()}
+        onDismissRemoved={() => setRemovedView(null)}
+      />
 
             {dimEdit && activeDrawing && (
               <DimensionPanel
@@ -1799,10 +1856,7 @@ function DocumentDrawings() {
                 onApplyValue={() => void applyDimEdit()}
                 onStop={() => dimEditAbort.current?.abort()}
                 onClose={() => setDimEdit(null)}
-                onChanged={(note) => {
-                  noteFor(activeDrawing.id, 'done', note)
-                  void refreshActive(activeDrawing.id)
-                }}
+                onChanged={(note) => annotated(activeDrawing.id, note)}
               />
             )}
             {activeDrawing && svg && (
@@ -1810,28 +1864,8 @@ function DocumentDrawings() {
                 key={activeDrawing.id}
                 drawing={activeDrawing}
                 certificate={dimListing?.certificate ?? null}
-                onChanged={(note) => {
-                  noteFor(activeDrawing.id, 'done', note)
-                  void refreshActive(activeDrawing.id)
-                }}
+                onChanged={(note) => annotated(activeDrawing.id, note)}
               />
-            )}
-
-            {editNote && (
-              <div className="absolute bottom-14 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 bg-card border border-border rounded-md shadow-md px-2 py-1 text-xs">
-                <span aria-hidden className={noteKind === 'done' ? 'text-green-700' : 'text-sky-700'}>
-                  {noteKind === 'done' ? '✓' : 'ⓘ'}
-                </span>
-                <span className="font-mono">{editNote}</span>
-                <button
-                  type="button"
-                  aria-label="Dismiss"
-                  onClick={() => setEditNote(null)}
-                  className="cad-focus text-muted-foreground hover:text-foreground"
-                >
-                  <X size={12} />
-                </button>
-              </div>
             )}
 
             {/* Zoom toolbar. Always visible while a drawing is open

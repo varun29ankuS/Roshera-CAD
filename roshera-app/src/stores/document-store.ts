@@ -44,6 +44,16 @@
  * idiom as `units-store.ts`'s `unitEpoch` — a monotonic counter a subscriber
  * adds to its own fetch-on-mount `useEffect` dependency array.
  *
+ * `epoch` is NOT set by any action here. It counts the document changes
+ * `lib/document-scope.ts` announces (the subscription at the foot of this
+ * file), and every path that changes the open document goes through
+ * `enterDocument` there: `switchTo` (a tab, a new document) and `refresh`
+ * (the list re-read finds the server in another document: an agent moved it
+ * over MCP). `File > New` reloads the page instead. It used to be bumped by
+ * hand in `switchTo` alone, so after an agent's switch the caches emptied
+ * but no panel keyed by `epoch` reloaded: the Drawing workspace kept the
+ * previous document's sheets (2026-11-26).
+ *
  * ★ Never optimistic: `active` on every `DocumentInfo` in `documents`, and
  * `epoch`, only change AFTER the backend confirms — never on click. A tab
  * that highlights before the switch actually lands is the exact
@@ -54,7 +64,7 @@ import { createDocument, listDocuments, openDocument, renameDocument, type Docum
 import { refreshSceneFromServer } from '@/lib/ws-bridge'
 import { syncNotebook } from '@/lib/blackboard-api'
 import { establishAcpSession, getAcpSessionId, resetAcpClient } from '@/lib/acp-blackboard'
-import { enterDocument } from '@/lib/document-scope'
+import { enterDocument, onDocumentChange } from '@/lib/document-scope'
 
 export interface DocumentSwitchResult {
   success: boolean
@@ -67,8 +77,12 @@ interface DocumentStoreState {
    *  busy indicator on its tab — a switch with zero visible feedback reads
    *  as a dead click, not a fast one. */
   switchingId: string | null
+  /** How many times the open document has changed under the app. Moved only
+   *  by `lib/document-scope.ts` (see the foot of this file), never set here. */
   epoch: number
-  /** Re-fetch the document list without switching anything. */
+  /** Re-fetch the document list. Switches nothing on the server; when the
+   *  server turns out to be in another document than the app shows (an agent
+   *  moved it), the app follows: scene, notebook and every `epoch` panel. */
   refresh: () => Promise<void>
   /** Create a document and switch to it in place. */
   createAndSwitch: (name?: string) => Promise<DocumentSwitchResult>
@@ -84,6 +98,13 @@ interface DocumentStoreState {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : 'backend unreachable'
+}
+
+/** What the app holds of a document beyond the panels that load themselves
+ *  on `epoch`: the scene and the Blackboard's notebook. Loaded on every
+ *  change of document, whoever made it. */
+function loadDocumentContents(): Promise<unknown> {
+  return Promise.all([refreshSceneFromServer(), syncNotebook()])
 }
 
 export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
@@ -102,9 +123,16 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
       // live model -- and every connected agent -- to a new blank on each
       // page load. A new document is made only when asked for.
       const active = docs.find((d) => d.active)
-      // The history caches belong to whatever the server has open -- also
-      // when something other than this tab strip (an agent over MCP) moved it.
-      if (active && !get().switchingId) enterDocument(active.id)
+      // The app belongs to whatever the server has open -- also when
+      // something other than this tab strip (an agent over MCP) moved it.
+      // `enterDocument` says whether that is news: `switched` means the
+      // server is in another document than the one on screen, so load it as
+      // a tab switch does. (The agent's own session is left alone: it is the
+      // one that moved.) A switch of this app's own, still landing, is not
+      // second-guessed.
+      if (active && !get().switchingId && enterDocument(active.id) === 'switched') {
+        await loadDocumentContents()
+      }
     } catch {
       // Backend not reachable yet — leave the previous list (possibly
       // empty) in place; the caller decides whether to retry.
@@ -135,12 +163,13 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
       // PARALLEL with the scene below, instead of waiting behind the
       // snapshot -- the largest payload of the switch, megabytes of mesh on
       // an imported document. Still never optimistic: nothing here moves
-      // before `openDocument` returned 200.
-      enterDocument(id, { reopened: true })
+      // before `openDocument` returned 200. The tab first, then the scope:
+      // `enterDocument` moves `epoch` (the foot of this file), and a panel
+      // reloading on it must already find this document marked active.
       set((state) => ({
         documents: state.documents.map((d) => ({ ...d, active: d.id === id })),
-        epoch: state.epoch + 1,
       }))
+      enterDocument(id, { reopened: true })
       // Re-hydrate the stores that own server-sourced state. A failure in
       // any one of these is reported by that primitive itself (scene sync
       // already posts a Blackboard line on failure); we still complete the
@@ -151,11 +180,7 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
       try {
         // A failed re-list keeps the locally confirmed list above: the switch
         // itself has landed and is not reported as failed.
-        const [docs] = await Promise.all([
-          listDocuments().catch(() => null),
-          refreshSceneFromServer(),
-          syncNotebook(),
-        ])
+        const [docs] = await Promise.all([listDocuments().catch(() => null), loadDocumentContents()])
         if (docs) set({ documents: docs })
       } finally {
         set({ switchingId: null })
@@ -198,3 +223,13 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
     }
   },
 }))
+
+// The open document changed -- by a tab here, or under the app (an agent).
+// This is the only writer of `epoch`: one count of one fact, kept where the
+// fact is announced, so no path can change the document and forget it.
+// Learning which document the server has open when the list first loads is
+// not a change: nothing on screen was about another document. Module
+// lifetime, like the scoped caches' own subscriptions.
+onDocumentChange((_documentId, entry) => {
+  if (entry === 'switched') useDocumentStore.setState((state) => ({ epoch: state.epoch + 1 }))
+})

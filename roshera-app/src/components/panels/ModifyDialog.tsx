@@ -32,6 +32,8 @@ import {
 } from '@/components/ui/icons'
 import { Button } from '@/components/ui/button'
 import { useSceneStore, type SelectionMode } from '@/stores/scene-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
+import { partWorkspaceParked } from '@/lib/workspaces'
 import { cn } from '@/lib/utils'
 
 export type ModifyMode =
@@ -442,9 +444,12 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
     close,
   ])
 
-  // Keyboard: Enter applies, Escape cancels.
+  // Keyboard: Enter applies, Escape cancels. Not while the Part workspace is
+  // parked under Drawing or Assembly: Enter in a title-block field there
+  // must not apply a fillet left open here.
+  const parked = useDocModeStore((s) => partWorkspaceParked(s.mode ?? 'part'))
   useEffect(() => {
-    if (!open) return
+    if (!open || parked) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault()
@@ -462,7 +467,7 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, handleApply, close])
+  }, [open, parked, handleApply, close])
 
   if (!open || !spec || !mode) return null
 

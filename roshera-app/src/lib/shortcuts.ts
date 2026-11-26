@@ -4,6 +4,8 @@ import { invalidate } from '@react-three/fiber'
 import { useSceneStore } from '@/stores/scene-store'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import { timelineAction } from '@/lib/history'
+import { useDocModeStore } from '@/stores/doc-mode-store'
+import { sceneShortcutApplies } from '@/lib/workspaces'
 import * as THREE from 'three'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
@@ -69,6 +71,10 @@ export function useKeyboardShortcuts() {
       ) {
         return
       }
+
+      // These are the part scene's keys. From a workspace where the scene
+      // is parked out of sight they must not act on it (lib/workspaces).
+      if (!sceneShortcutApplies(useDocModeStore.getState().mode ?? 'part', e.key, ctrl)) return
 
       // While the sketch workbench is open it owns the keyboard: its own
       // tools, Delete, Esc, Enter and Ctrl+Z act on the sketch, never on
