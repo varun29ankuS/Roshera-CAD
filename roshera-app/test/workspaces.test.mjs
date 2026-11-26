@@ -11,6 +11,7 @@ test('the workspaces, in tab order, with the names engineers know', () => {
       ['assembly', 'Assembly'],
       ['drawing', 'Drawing'],
       ['dfm', 'DFM'],
+      ['simulate', 'Simulate'],
     ],
   )
 })
@@ -18,7 +19,7 @@ test('the workspaces, in tab order, with the names engineers know', () => {
 test('every workspace id round-trips; anything else is refused', () => {
   for (const w of WORKSPACES) assert.equal(parseWorkspace(w.id), w.id)
   assert.equal(parseWorkspace('PART'), 'part', 'case-insensitive, as a URL hash may be')
-  for (const junk of ['', 'simulate', 'modeling', null, undefined, 3]) {
+  for (const junk of ['', 'simulation', 'modeling', null, undefined, 3]) {
     assert.equal(parseWorkspace(junk), null, String(junk))
   }
 })

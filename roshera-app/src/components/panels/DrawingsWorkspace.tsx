@@ -66,6 +66,9 @@ import { useDocumentStore } from '@/stores/document-store'
 import { CompletenessChip, DimensionPanel } from '@/components/panels/DimensionPanel'
 import { draggedShift } from '@/lib/dimension-annotate'
 import { latestOnly } from '@/lib/latest-only'
+import { sheetPress } from '@/lib/sheet-press'
+import { sheetRequests } from '@/lib/sheet-requests'
+import { applySavedTitleBlock } from '@/lib/title-block-draft'
 import { drawingsForDocument } from '@/lib/drawings-for-document'
 import { currentDocument } from '@/lib/document-scope'
 import { HISTORY_CHANGED_EVENT, timelineAction } from '@/lib/history'
@@ -148,7 +151,25 @@ const DIM_KIND_WORDS: Record<string, string> = {
   chamfer: 'chamfer',
 }
 
+/**
+ * The Drawing workspace of the document that is open.
+ *
+ * The workspace stays mounted for the life of the page (parked under the
+ * other workspaces), so anything it holds would outlive the document it was
+ * about: the title block card and the "moved" note of one document were
+ * still on screen in a freshly created one (2026-11-26). It is therefore ONE
+ * COMPONENT PER DOCUMENT -- keyed by the document store's `epoch`, which
+ * moves when the server confirms a switch. A new document starts a new
+ * component: its sheets, its selection, its open cards, its notes, its zoom,
+ * and every request still in flight for the previous document (whose answer
+ * now lands on nothing).
+ */
 export function DrawingsWorkspace() {
+  const documentEpoch = useDocumentStore((st) => st.epoch)
+  return <DocumentDrawings key={documentEpoch} />
+}
+
+function DocumentDrawings() {
   const [drawings, setDrawings] = useState<DrawingSummary[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
   const [activeDrawing, setActiveDrawing] = useState<Drawing | null>(null)
@@ -327,33 +348,50 @@ export function DrawingsWorkspace() {
   // authored on each) and its completeness: what the property panel and the
   // completeness chip show. Reloaded with the sheet; `null` while unknown.
   const [dimListing, setDimListing] = useState<DimensionListing | null>(null)
+  // Reads of the sheet overlap (an edit's re-read, an agent turn ending,
+  // another sheet chosen): only the newest read of the sheet ON SCREEN may
+  // apply, or a slow answer puts the previous sheet -- or its certificate --
+  // on the one now open (lib/sheet-requests).
+  const sheetReads = useRef(sheetRequests())
   const refreshActive = useCallback(async (id: string) => {
+    const ticket = sheetReads.current.begin(id)
+    if (ticket === null) return
     setLoading(true)
     setError(null)
     try {
       // The on-screen sheet is a draft for review: shown even when its layout
       // check fails (SheetPanel lists the findings); downloads stay refused.
       const [d, s] = await Promise.all([getDrawing(id), previewDrawingSvg(id)])
+      if (!sheetReads.current.isCurrent(ticket)) return
       setActiveDrawing(d)
       setSvg(s)
       // Not fatal to the sheet: without it the panel shows the measured
       // label and the chip says "not verified".
       void listDimensions(id)
-        .then(setDimListing)
-        .catch(() => setDimListing(null))
+        .then((listing) => {
+          if (sheetReads.current.isCurrent(ticket)) setDimListing(listing)
+        })
+        .catch(() => {
+          if (sheetReads.current.isCurrent(ticket)) setDimListing(null)
+        })
     } catch (e) {
+      if (!sheetReads.current.isCurrent(ticket)) return
       setError(e instanceof Error ? e.message : String(e))
       setActiveDrawing(null)
       setSvg('')
     } finally {
-      setLoading(false)
+      // A newer read owns the busy state from here.
+      if (sheetReads.current.isCurrent(ticket)) setLoading(false)
     }
   }, [])
+  /** Say a note about one sheet -- only while that sheet is on screen. An
+   *  edit answers after a wait; its note must not appear on another sheet. */
+  const noteFor = useCallback((drawingId: string, kind: 'done' | 'info', text: string) => {
+    if (!sheetReads.current.isShowing(drawingId)) return
+    setNoteKind(kind)
+    setEditNote(text)
+  }, [])
 
-  // A document switch (including the app reopening the last document right
-  // after load, which can finish AFTER this panel first listed sheets) must
-  // reload the sheet list and the parts: otherwise the panel shows the
-  // previous document's sheets and loading them fails (409).
   // Undo / redo rewinds the history; the server rebuilds the sheets from it.
   // Reload what this window shows.
   useEffect(() => {
@@ -376,21 +414,9 @@ export function DrawingsWorkspace() {
     return () => window.removeEventListener('roshera:agent-turn-ended', onTurnEnded)
   }, [activeId, refreshActive])
 
-  const documentEpoch = useDocumentStore((st) => st.epoch)
-  const firstEpoch = useRef(documentEpoch)
   useEffect(() => {
-    if (documentEpoch === firstEpoch.current) return
-    setActiveId(null)
-    setActiveDrawing(null)
-    setSvg('')
-    setError(null)
-    void refreshList()
-    void refreshParts()
-    // Only a change of document triggers this.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [documentEpoch])
-
-  useEffect(() => {
+    // A document switch starts this component afresh (see DrawingsWorkspace),
+    // so this also lists the new document's sheets and parts.
     // The viewport "Create Drawing" flow stashes the new drawing id and
     // flips the workspace mode; consume it here so this mount lands on
     // that sheet instead of the first in the list.
@@ -417,16 +443,29 @@ export function DrawingsWorkspace() {
   }, [pendingDrawingId])
 
   useEffect(() => {
+    // From here every read in flight is for the sheet that was open before.
+    sheetReads.current.show(activeId)
     if (activeId) {
       void refreshActive(activeId)
     } else {
       setActiveDrawing(null)
       setSvg('')
+      setLoading(false)
     }
     // Switching drawings resets the view so the new sheet is centred
     // in fit mode without inheriting the previous drawing's pan.
     setPan({ x: 0, y: 0 })
   }, [activeId, refreshActive])
+
+  // Coming back to this workspace: the part may have been edited while it
+  // was parked, and the sheet and certificate on screen were read before
+  // that. Re-read them, so the chip never vouches for a part that has since
+  // changed.
+  useEffect(() => {
+    if (docMode === 'drawing' && activeId) void refreshActive(activeId)
+    // Only entering the workspace triggers this; a change of sheet loads itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [docMode])
 
   // ── Mutations ────────────────────────────────────────────────────
   // A drawing starts from a part: the server builds the standard sheet.
@@ -503,8 +542,9 @@ export function DrawingsWorkspace() {
         // The view is back (or new): the last removal's Undo no longer applies.
         setRemovedView(null)
         if (!aligned && kind !== 'isometric') {
-          setNoteKind('info')
-          setEditNote(
+          noteFor(
+            activeId,
+            'info',
             `No room ${label === 'Left' || label === 'Right' ? 'beside' : 'above or below'} ${like.name} for ${label.toUpperCase()}; placed in the nearest free space. A larger sheet keeps views aligned.`,
           )
         }
@@ -515,7 +555,7 @@ export function DrawingsWorkspace() {
         setViewsBusy(false)
       }
     },
-    [activeId, activeDrawing, refreshActive],
+    [activeId, activeDrawing, refreshActive, noteFor],
   )
 
   // Remove a view, keeping what is needed to put it back exactly.
@@ -582,10 +622,25 @@ export function DrawingsWorkspace() {
     setSelectedViewId(viewId)
     setViewMenu({ viewId, x, y })
   }, [])
-  // A different sheet (or document) drops the selection.
+  // Another sheet starts clean: everything the engineer opened, was told or
+  // had in hand belonged to the sheet that was on screen. Left in place, the
+  // "moved" note and the title block card of one sheet stayed over the next,
+  // the removed-view Undo would undo a step of another sheet, the dimension
+  // editor would send one sheet's dimension to another, and the chip showed
+  // the previous sheet's certificate until the new one answered.
   useEffect(() => {
     setSelectedViewId(null)
     setViewMenu(null)
+    setEditNote(null)
+    setRemovedView(null)
+    dimEditAbort.current?.abort()
+    setDimEdit(null)
+    setTitleBlockOpen(false)
+    setDimListing(null)
+    setSheetCheck(null)
+    setViewGhost(null)
+    dimDragRef.current = null
+    viewDragRef.current = null
   }, [activeId])
 
   /** The view whose drawn box contains a screen point (smallest wins). */
@@ -639,17 +694,15 @@ export function DrawingsWorkspace() {
                 : edit.position_mm !== undefined
                   ? describeMove(v.name, v.position_mm, position ?? edit.position_mm)
                   : `${v.name} renamed ${edit.name ?? ''}`
-        setNoteKind(moved && aligned === false ? 'info' : 'done')
-        setEditNote(`${what}. Ctrl+Z undoes it.`)
+        noteFor(activeId, moved && aligned === false ? 'info' : 'done', `${what}. Ctrl+Z undoes it.`)
       } catch (e) {
-        setNoteKind('info')
-        setEditNote(e instanceof DrawingRefusal ? `Not changed: ${e.message}` : null)
-        if (!(e instanceof DrawingRefusal)) setError(e instanceof Error ? e.message : String(e))
+        if (e instanceof DrawingRefusal) noteFor(activeId, 'info', `Not changed: ${e.message}`)
+        else setError(e instanceof Error ? e.message : String(e))
       } finally {
         setViewsBusy(false)
       }
     },
-    [activeId, activeDrawing, refreshActive],
+    [activeId, activeDrawing, refreshActive, noteFor],
   )
 
   // Delete removes the selected view; Escape lets go of it. Not while the
@@ -1024,19 +1077,18 @@ export function DrawingsWorkspace() {
           (carried.length ? `, carrying ${carried.join(', ')}` : '')
         const now = await getDrawingQuality(drawingId).catch(() => null)
         if (!now) {
-          setNoteKind('info')
-          setEditNote(`${moved}; the sheet check did not answer. Ctrl+Z undoes the move.`)
+          noteFor(drawingId, 'info', `${moved}; the sheet check did not answer. Ctrl+Z undoes the move.`)
           return
         }
         const problems = newLayoutIssues(had, now)
         if (problems.length > 0) {
-          setNoteKind('info')
-          setEditNote(
+          noteFor(
+            drawingId,
+            'info',
             `${moved}, but the sheet check now finds: ${problems.join('; ')}. Ctrl+Z undoes the move.`,
           )
         } else {
-          setNoteKind('done')
-          setEditNote(`${moved}. Ctrl+Z undoes it.`)
+          noteFor(drawingId, 'done', `${moved}. Ctrl+Z undoes it.`)
         }
       } catch (e) {
         // The view did not move; the sheet still shows it where it was.
@@ -1051,7 +1103,7 @@ export function DrawingsWorkspace() {
         setViewsBusy(false)
       }
     },
-    [activeDrawing, refreshActive],
+    [activeDrawing, refreshActive, noteFor],
   )
   // ── Dragging a dimension ─────────────────────────────────────────
   // A press on a dimension that travels is a move: its text follows the
@@ -1067,28 +1119,29 @@ export function DrawingsWorkspace() {
     els: SVGElement[]
     moved: boolean
   } | null>(null)
-  const dimDraggedRef = useRef(false)
+  // The press in hand: whether the click that ends it is a drag's drop is
+  // decided per press, never carried to the next one (lib/sheet-press).
+  const press = useRef(sheetPress())
   const commitDimMove = useCallback(
     async (id: string, dxPx: number, dyPx: number, pxPerMm: number, els: SVGElement[]) => {
       if (!activeDrawing) return
+      const drawingId = activeDrawing.id
       const known = dimListing?.dimensions.find((d) => d.id === id)
       const label = known?.ink ?? 'Dimension'
       try {
-        await annotateDimension(activeDrawing.id, id, {
+        await annotateDimension(drawingId, id, {
           text_shift_mm: draggedShift(known?.edit?.text_shift_mm, dxPx, dyPx, pxPerMm),
         })
-        setNoteKind('done')
-        setEditNote(`${label} moved. Ctrl+Z undoes it.`)
-        await refreshActive(activeDrawing.id)
+        noteFor(drawingId, 'done', `${label} moved. Ctrl+Z undoes it.`)
+        await refreshActive(drawingId)
       } catch (e) {
         els.forEach((el) => {
           el.style.translate = ''
         })
-        setNoteKind('info')
-        setEditNote(`Not moved: ${e instanceof Error ? e.message : String(e)}`)
+        noteFor(drawingId, 'info', `Not moved: ${e instanceof Error ? e.message : String(e)}`)
       }
     },
-    [activeDrawing, dimListing, refreshActive],
+    [activeDrawing, dimListing, refreshActive, noteFor],
   )
   const commitDimMoveRef = useRef(commitDimMove)
   useEffect(() => {
@@ -1143,6 +1196,9 @@ export function DrawingsWorkspace() {
   // its parent is `overflow-hidden`, the user can drag it anywhere —
   // there are no scroll boundaries to clip against.
   const onCanvasMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    // A new press: nothing the last one did (a drag whose drop never reached
+    // the sheet as a click) decides what this one's click means.
+    press.current.begin()
     // Ignore clicks on the zoom toolbar so the buttons still work.
     if ((e.target as HTMLElement).closest('button')) return
     // The user's own press stops the agent's glide.
@@ -1200,6 +1256,7 @@ export function DrawingsWorkspace() {
         const dy = e.clientY - dd.startY
         if (!dd.moved && !isDrag(dx, dy)) return
         dd.moved = true
+        press.current.dragged()
         // The SVG's user unit is the sheet millimetre. `translate` (not
         // `transform`) so a vertical dimension keeps its rotation.
         const t = `${dx / dd.pxPerMm}px ${dy / dd.pxPerMm}px`
@@ -1244,8 +1301,6 @@ export function DrawingsWorkspace() {
       if (dd) {
         dimDragRef.current = null
         if (dd.moved) {
-          // The click that ends a drag does not also open the panel.
-          dimDraggedRef.current = true
           void commitDimMoveRef.current(dd.id, e.clientX - dd.startX, e.clientY - dd.startY, dd.pxPerMm, dd.els)
         }
         return
@@ -1335,11 +1390,9 @@ export function DrawingsWorkspace() {
 
   const onSheetClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
-      // The click that ends a dimension drag is the drop, not a selection.
-      if (dimDraggedRef.current) {
-        dimDraggedRef.current = false
-        return
-      }
+      // The click that ends a dimension drag is the drop, not a selection
+      // (also when Escape abandoned the drag before the release).
+      if (press.current.clickIsDrop()) return
       const el = (e.target as Element).closest('[data-dim-id]')
       if (!el) {
         // A drag pans the sheet; only a click selects.
@@ -1379,17 +1432,24 @@ export function DrawingsWorkspace() {
     dimEditAbort.current = abort
     setDimEdit({ ...dimEdit, busy: true, startedAt: Date.now(), refusal: null })
     try {
-      const r = await setDrawingDimension(activeDrawing.id, dimEdit.dim.id, value, abort.signal)
-      setDimEdit(null)
-      setNoteKind('done')
+      const drawingId = activeDrawing.id
+      const r = await setDrawingDimension(drawingId, dimEdit.dim.id, value, abort.signal)
+      // Another sheet was opened while the part rebuilt: its editor and its
+      // note are not this edit's to touch.
+      if (!sheetReads.current.isShowing(drawingId)) return
+      // Close THIS dimension's editor; one opened on another dimension while
+      // the part rebuilt stays.
+      setDimEdit((cur) => (cur && cur.dim.id === dimEdit.dim.id ? null : cur))
       const fmt = (n: number) => String(Number(n.toFixed(4)))
       const steps = [r.driver.sequence, ...(r.driver.linked ?? []).map((l) => l.target_sequence)]
       const where = steps.length > 1 ? `steps ${steps.join(' + ')}` : `step ${steps[0]}`
-      setEditNote(
+      noteFor(
+        drawingId,
+        'done',
         `${dimEdit.dim.label} \u2192 ${fmt(value)}: ${r.driver.parameter} ` +
           `${fmt(r.driver.from_value)} \u2192 ${fmt(r.driver.new_value)} (${where})`,
       )
-      await refreshActive(activeDrawing.id)
+      await refreshActive(drawingId)
     } catch (e) {
       const stopped = e instanceof DOMException && e.name === 'AbortError'
       const reason = stopped
@@ -1397,11 +1457,13 @@ export function DrawingsWorkspace() {
         : e instanceof DrawingRefusal || e instanceof Error
           ? e.message
           : String(e)
-      setDimEdit((cur) => (cur ? { ...cur, busy: false, startedAt: null, refusal: reason } : cur))
+      setDimEdit((cur) =>
+        cur && cur.dim.id === dimEdit.dim.id ? { ...cur, busy: false, startedAt: null, refusal: reason } : cur,
+      )
     } finally {
       if (dimEditAbort.current === abort) dimEditAbort.current = null
     }
-  }, [dimEdit, activeDrawing, refreshActive])
+  }, [dimEdit, activeDrawing, refreshActive, noteFor])
 
   const changeProjection = useCallback(
     async (projection: ProjectionAngle) => {
@@ -1618,8 +1680,11 @@ export function DrawingsWorkspace() {
           key={activeDrawing.id}
           drawing={activeDrawing}
           onUpdated={(updated) => {
-            setActiveDrawing((prev) => (prev ? { ...prev, title_block: updated } : prev))
-            void refreshActive(activeDrawing.id)
+            // The card of THIS drawing saved: the answer may arrive after
+            // another sheet was opened, and must not land on it.
+            const id = activeDrawing.id
+            setActiveDrawing((prev) => applySavedTitleBlock(prev, id, updated))
+            void refreshActive(id)
           }}
           onError={setError}
           onClose={() => setTitleBlockOpen(false)}
@@ -1717,6 +1782,7 @@ export function DrawingsWorkspace() {
 
             {dimEdit && activeDrawing && (
               <DimensionPanel
+                key={`${activeDrawing.id}:${dimEdit.dim.id}`}
                 drawing={activeDrawing}
                 dim={dimEdit.dim}
                 view={dimEdit.view}
@@ -1734,19 +1800,18 @@ export function DrawingsWorkspace() {
                 onStop={() => dimEditAbort.current?.abort()}
                 onClose={() => setDimEdit(null)}
                 onChanged={(note) => {
-                  setNoteKind('done')
-                  setEditNote(note)
+                  noteFor(activeDrawing.id, 'done', note)
                   void refreshActive(activeDrawing.id)
                 }}
               />
             )}
             {activeDrawing && svg && (
               <CompletenessChip
+                key={activeDrawing.id}
                 drawing={activeDrawing}
                 certificate={dimListing?.certificate ?? null}
                 onChanged={(note) => {
-                  setNoteKind('done')
-                  setEditNote(note)
+                  noteFor(activeDrawing.id, 'done', note)
                   void refreshActive(activeDrawing.id)
                 }}
               />
