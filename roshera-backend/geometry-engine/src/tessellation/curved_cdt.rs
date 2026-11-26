@@ -36,7 +36,7 @@
 //! the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use super::edge_cache::EdgeSampleCache;
+use super::edge_cache::{BoundaryClashKind, EdgeSampleCache};
 use super::surface::polygon_signed_area_uv;
 use super::trim_index::TrimIndex;
 use super::{MeshVertex, TessellationParams, TriangleMesh};
@@ -2677,6 +2677,12 @@ fn facet_turned_against_chart(
 /// Rounds of [`drop_points_under_turned_facets`].
 const TURNED_FACET_PASSES: usize = 4;
 
+/// Further rounds of [`drop_points_under_turned_facets`] taken only when the
+/// first rounds leave facets turned: every round removes at least one point
+/// beyond a boundary chord, so this bounds how deep a crowd of them is
+/// cleared.
+const TURNED_FACET_EXHAUST_PASSES: usize = 64;
+
 /// The facets of `triangles` turned against the surface, with the interior
 /// point to drop for each: the corner opposite the facet's longest 3D edge
 /// (a sliver's middle point), when that corner is not a boundary point.
@@ -2784,6 +2790,50 @@ fn drop_points_under_turned_facets<S: MeshChart + ?Sized>(
         turned = next_turned;
         drop = next_drop;
     }
+    // Those rounds stop at the first one that does not leave fewer turned
+    // facets. Where several interior points lie beyond the same boundary
+    // chord -- refinement crowds a curved boundary it cannot make finer --
+    // removing the nearest only hands the chord to the next, the count
+    // stays where it was and the round was thrown away with the facets
+    // still turned (CADGenBench parts 217 and 203). Only then are the
+    // points under turned facets removed round after round, each of them a
+    // point beyond a chord, until none is left to remove; the
+    // triangulation with the fewest turned facets is kept, and the one
+    // above stays unless a later one beats it.
+    if turned > 0 && !drop.is_empty() && boundary <= pts2d.len() {
+        let (mut round_pts, mut round_drop) = (pts2d.clone(), drop);
+        for _round in 0..TURNED_FACET_EXHAUST_PASSES {
+            let steiner: Vec<(f64, f64)> = round_pts[boundary..]
+                .iter()
+                .copied()
+                .filter(|&p| !round_drop.contains(&FidelityCache::key(p)))
+                .collect();
+            let Ok((next_pts, next_tris)) = run_cdt(&outer.points_uv, inner_polygons, &steiner)
+            else {
+                break;
+            };
+            let (next_turned, next_drop) = turned_facets(
+                &next_tris, &next_pts, outer, inners, surface, face, chart_sign, cache,
+            );
+            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                eprintln!(
+                    "[turned] {} round {_round}: {} point(s) removed, {next_turned} facet(s) turned (best {turned})",
+                    surface.type_name(),
+                    round_drop.len()
+                );
+            }
+            if next_turned < turned {
+                pts2d = next_pts.clone();
+                triangles = next_tris;
+                turned = next_turned;
+            }
+            if next_turned == 0 || next_drop.is_empty() || boundary > next_pts.len() {
+                break;
+            }
+            round_pts = next_pts;
+            round_drop = next_drop;
+        }
+    }
     if std::env::var("ROSHERA_TESS_TRACE").is_ok() && turned > 0 {
         eprintln!(
             "[turned] {} {turned} of {} facet(s) still turned against the surface",
@@ -2792,6 +2842,188 @@ fn drop_points_under_turned_facets<S: MeshChart + ?Sized>(
         );
     }
     (pts2d, triangles, turned)
+}
+
+/// Passes of [`flip_edges_under_turned_facets`].
+const TURNED_FACET_FLIP_PASSES: usize = 4;
+
+/// The least a facet made by swapping a diagonal must face its surface: the
+/// cosine of the angle between its plane and the surface normal (60
+/// degrees). A swap that only trades a turned sliver for a needle standing
+/// nearly edge-on to the surface is no cure -- a stretched torus band has
+/// such slivers by the dozen, each too thin to have a direction, and
+/// swapping them made needles 2.6 mm long standing at 90 degrees
+/// (CADGenBench part 149, which certified before and must still).
+const FLIPPED_FACET_MIN_FACING: f64 = 0.5;
+
+/// How squarely the facet `tri` faces its surface: the cosine of the angle
+/// between its plane and the oriented surface normal at its centre, negative
+/// when it faces against the surface (as [`turned_facets`] judges it);
+/// `None` where it cannot be judged.
+fn facet_facing<S: MeshChart + ?Sized>(
+    tri: [usize; 3],
+    pts2d: &[(f64, f64)],
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    surface: &S,
+    face: &Face,
+    chart_sign: i32,
+    cache: &mut FidelityCache,
+) -> Option<f64> {
+    let p0 = cache.position(tri[0], outer, inners, pts2d, surface).ok()?;
+    let p1 = cache.position(tri[1], outer, inners, pts2d, surface).ok()?;
+    let p2 = cache.position(tri[2], outer, inners, pts2d, surface).ok()?;
+    let n = (p1 - p0).cross(&(p2 - p0)).normalize().ok()?;
+    let (a, b, c) = (pts2d[tri[0]], pts2d[tri[1]], pts2d[tri[2]]);
+    let area_uv = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+    if area_uv == 0.0 {
+        return None;
+    }
+    let (u, v) = ((a.0 + b.0 + c.0) / 3.0, (a.1 + b.1 + c.1) / 3.0);
+    let face_normal = cache.normal(surface, face, u, v).ok()?.normalize().ok()?;
+    Some(area_uv.signum() * f64::from(chart_sign) * face.orientation.sign() * n.dot(&face_normal))
+}
+
+/// Whether the facet `tri` faces against the surface, as
+/// [`turned_facets`] judges it; `None` where it cannot be judged.
+fn facet_is_turned<S: MeshChart + ?Sized>(
+    tri: [usize; 3],
+    pts2d: &[(f64, f64)],
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    surface: &S,
+    face: &Face,
+    chart_sign: i32,
+    cache: &mut FidelityCache,
+) -> Option<bool> {
+    let p0 = cache.position(tri[0], outer, inners, pts2d, surface).ok()?;
+    let p1 = cache.position(tri[1], outer, inners, pts2d, surface).ok()?;
+    let p2 = cache.position(tri[2], outer, inners, pts2d, surface).ok()?;
+    let n = (p1 - p0).cross(&(p2 - p0)).normalize().ok()?;
+    let (a, b, c) = (pts2d[tri[0]], pts2d[tri[1]], pts2d[tri[2]]);
+    let (u, v) = ((a.0 + b.0 + c.0) / 3.0, (a.1 + b.1 + c.1) / 3.0);
+    let face_normal = cache.normal(surface, face, u, v).ok()?;
+    Some(facet_turned_against_chart(
+        [a, b, c],
+        n,
+        face_normal,
+        chart_sign,
+        face.orientation.sign(),
+    ))
+}
+
+/// A turned facet that removing points did not cure is a sliver lying along
+/// its longest edge, its third corner a hair across that edge in 3D though
+/// on the right side of it in the chart -- and that corner is a boundary
+/// sample, or the last interior point near it (CADGenBench part 207: a
+/// facet 0.0005 mm high at the pointed end of a blend patch). When the long
+/// edge is an interior one, the facet across it and the sliver make a
+/// quadrilateral, and its OTHER diagonal divides it into two facets that do
+/// not lie along the long edge. The diagonal is swapped only when both new
+/// facets keep the chart's winding and both face the surface squarely
+/// ([`FLIPPED_FACET_MIN_FACING`]), so every swap leaves one turned facet
+/// fewer and none standing edge-on; a facet whose long edge is a boundary
+/// segment is left to the boundary resampling.
+fn flip_edges_under_turned_facets<S: MeshChart + ?Sized>(
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    pts2d: &[(f64, f64)],
+    mut triangles: Vec<[usize; 3]>,
+    surface: &S,
+    face: &Face,
+    chart_sign: i32,
+    cache: &mut FidelityCache,
+) -> (Vec<[usize; 3]>, usize) {
+    let area_uv = |t: [usize; 3]| {
+        let (a, b, c) = (pts2d[t[0]], pts2d[t[1]], pts2d[t[2]]);
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    let edge_key = |a: usize, b: usize| if a < b { (a, b) } else { (b, a) };
+    for _pass in 0..TURNED_FACET_FLIP_PASSES {
+        let mut users: std::collections::HashMap<(usize, usize), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (t, tri) in triangles.iter().enumerate() {
+            for k in 0..3 {
+                users
+                    .entry(edge_key(tri[k], tri[(k + 1) % 3]))
+                    .or_default()
+                    .push(t);
+            }
+        }
+        let mut changed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for t in 0..triangles.len() {
+            if changed.contains(&t) {
+                continue;
+            }
+            let tri = triangles[t];
+            if facet_is_turned(tri, pts2d, outer, inners, surface, face, chart_sign, cache)
+                != Some(true)
+            {
+                continue;
+            }
+            let corners = (
+                cache.position(tri[0], outer, inners, pts2d, surface),
+                cache.position(tri[1], outer, inners, pts2d, surface),
+                cache.position(tri[2], outer, inners, pts2d, surface),
+            );
+            let (Ok(p0), Ok(p1), Ok(p2)) = corners else {
+                continue;
+            };
+            // The corner opposite the longest edge, and that edge a -> b in
+            // the facet's own winding.
+            let lengths = [
+                (p1 - p2).magnitude(),
+                (p2 - p0).magnitude(),
+                (p0 - p1).magnitude(),
+            ];
+            let mut k = 0;
+            for j in 1..3 {
+                if lengths[j] > lengths[k] {
+                    k = j;
+                }
+            }
+            let (c, a, b) = (tri[k], tri[(k + 1) % 3], tri[(k + 2) % 3]);
+            let Some(across) = users.get(&edge_key(a, b)) else {
+                continue;
+            };
+            let [first, second] = across[..] else {
+                continue; // a boundary segment, or not a manifold edge
+            };
+            let other = if first == t { second } else { first };
+            if other == t || changed.contains(&other) {
+                continue;
+            }
+            let Some(&d) = triangles[other].iter().find(|&&i| i != a && i != b) else {
+                continue;
+            };
+            let (new_one, new_two) = ([c, a, d], [c, d, b]);
+            let winding = area_uv(tri);
+            if winding == 0.0
+                || area_uv(new_one) * winding <= 0.0
+                || area_uv(new_two) * winding <= 0.0
+            {
+                continue; // the quadrilateral is not convex in the chart
+            }
+            let sound = |tri, cache: &mut FidelityCache| {
+                facet_facing(tri, pts2d, outer, inners, surface, face, chart_sign, cache)
+                    .is_some_and(|facing| facing >= FLIPPED_FACET_MIN_FACING)
+            };
+            if !sound(new_one, cache) || !sound(new_two, cache) {
+                continue;
+            }
+            triangles[t] = new_one;
+            triangles[other] = new_two;
+            changed.insert(t);
+            changed.insert(other);
+        }
+        if changed.is_empty() {
+            break;
+        }
+    }
+    let (turned, _) = turned_facets(
+        &triangles, pts2d, outer, inners, surface, face, chart_sign, cache,
+    );
+    (triangles, turned)
 }
 
 /// Phase H — Step 4 refinement. For each output triangle, evaluate
@@ -3867,7 +4099,27 @@ pub(crate) fn tessellate_curved_cdt(
             ),
             |(ul, uh, vl, vh), &(u, v)| (ul.min(u), uh.max(u), vl.min(v), vh.max(v)),
         );
-        return mesh_in_chart(&chart, face, params, mesh, outer, inners, bbox).map(|_| ());
+        let mut attempt = ChartAttempt::default();
+        let (vertex_base, triangle_base) = (mesh.vertices.len() as u32, mesh.triangles.len());
+        let outcome = mesh_in_chart(
+            &chart,
+            face,
+            params,
+            mesh,
+            outer,
+            inners,
+            bbox,
+            &mut attempt,
+        );
+        return settle_attempt(
+            cache,
+            face,
+            mesh,
+            vertex_base,
+            triangle_base,
+            outcome,
+            attempt,
+        );
     }
     // A doubly curved face whose chart is strongly stretched one way is
     // meshed in the chart rescaled to equal step lengths (`ScaledChart`).
@@ -3886,7 +4138,27 @@ pub(crate) fn tessellate_curved_cdt(
             ),
             |(ul, uh, vl, vh), &(u, v)| (ul.min(u), uh.max(u), vl.min(v), vh.max(v)),
         );
-        return mesh_in_chart(&chart, face, params, mesh, outer, inners, bbox).map(|_| ());
+        let mut attempt = ChartAttempt::default();
+        let (vertex_base, triangle_base) = (mesh.vertices.len() as u32, mesh.triangles.len());
+        let outcome = mesh_in_chart(
+            &chart,
+            face,
+            params,
+            mesh,
+            outer,
+            inners,
+            bbox,
+            &mut attempt,
+        );
+        return settle_attempt(
+            cache,
+            face,
+            mesh,
+            vertex_base,
+            triangle_base,
+            outcome,
+            attempt,
+        );
     }
     // Every other face is meshed in its native chart. A torus band whose
     // chart is strongly stretched (CADGenBench 141: R 115 / r 1, so equal
@@ -3899,7 +4171,8 @@ pub(crate) fn tessellate_curved_cdt(
     // 214 when tried for all).
     let rescaled = (surface.type_name() == "Torus").then(|| (outer.clone(), inners.clone()));
     let mut native = TriangleMesh::new();
-    let turned = mesh_in_chart(
+    let mut attempt = ChartAttempt::default();
+    let native_outcome = mesh_in_chart(
         surface,
         face,
         params,
@@ -3907,7 +4180,15 @@ pub(crate) fn tessellate_curved_cdt(
         outer,
         inners,
         outer_bbox,
-    )?;
+        &mut attempt,
+    );
+    let turned = match &native_outcome {
+        Ok(turned) => *turned,
+        Err(_) => {
+            return settle_attempt(cache, face, &mut native, 0, 0, native_outcome, attempt);
+        }
+    };
+    let mut kept_turned = turned;
     let mut chosen = native;
     if turned > 0 {
         if let (Some((mut outer, mut inners)), Some(chart)) =
@@ -3928,15 +4209,28 @@ pub(crate) fn tessellate_curved_cdt(
                 |(ul, uh, vl, vh), &(u, v)| (ul.min(u), uh.max(u), vl.min(v), vh.max(v)),
             );
             let mut scaled = TriangleMesh::new();
-            if let Ok(turned_scaled) =
-                mesh_in_chart(&chart, face, params, &mut scaled, outer, inners, bbox)
-            {
+            let mut scaled_attempt = ChartAttempt::default();
+            if let Ok(turned_scaled) = mesh_in_chart(
+                &chart,
+                face,
+                params,
+                &mut scaled,
+                outer,
+                inners,
+                bbox,
+                &mut scaled_attempt,
+            ) {
                 if turned_scaled < turned {
                     chosen = scaled;
+                    kept_turned = turned_scaled;
+                    attempt = scaled_attempt;
                 }
             }
         }
     }
+    // The mesh chosen as it always was; only then, for facets still turned,
+    // its swapped division.
+    settle_attempt(cache, face, &mut chosen, 0, 0, Ok(kept_turned), attempt)?;
     append_mesh(mesh, &chosen);
     Ok(())
 }
@@ -3952,9 +4246,207 @@ fn append_mesh(mesh: &mut TriangleMesh, part: &TriangleMesh) {
     }
 }
 
+/// The most clashes one face reports per meshing attempt.
+const MAX_REPORTED_CLASHES: usize = 64;
+
+/// The boundary loops as (first point index, point count), in the order
+/// `run_cdt` lays the boundary points out.
+fn boundary_loop_spans(outer: &ProjectedLoop, inners: &[ProjectedLoop]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::with_capacity(1 + inners.len());
+    let mut start = 0usize;
+    for lp in std::iter::once(outer).chain(inners.iter()) {
+        spans.push((start, lp.points_uv.len()));
+        start += lp.points_uv.len();
+    }
+    spans
+}
+
+/// Every pair of boundary segments that pass through each other in the
+/// chart, each pair as its two segments' 3D end points (the cached edge
+/// samples). Run only on an outline the triangulator has just refused.
+fn crossing_boundary_segments(
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+) -> Vec<Vec<[Point3; 2]>> {
+    // (uv a, uv b, 3D a, 3D b) per boundary segment.
+    let mut segments: Vec<((f64, f64), (f64, f64), Point3, Point3)> = Vec::new();
+    for lp in std::iter::once(outer).chain(inners.iter()) {
+        let n = lp.points_uv.len().min(lp.points_3d.len());
+        if n < 3 {
+            continue;
+        }
+        for i in 0..n {
+            let j = (i + 1) % n;
+            segments.push((
+                lp.points_uv[i],
+                lp.points_uv[j],
+                lp.points_3d[i],
+                lp.points_3d[j],
+            ));
+        }
+    }
+    let side = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+        (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+    };
+    let mut out = Vec::new();
+    for (i, &(a, b, a3, b3)) in segments.iter().enumerate() {
+        for &(c, d, c3, d3) in segments.iter().skip(i + 1) {
+            if a == c || a == d || b == c || b == d {
+                continue;
+            }
+            if side(a, b, c) * side(a, b, d) < 0.0 && side(c, d, a) * side(c, d, b) < 0.0 {
+                out.push(vec![[a3, b3], [c3, d3]]);
+                if out.len() >= MAX_REPORTED_CLASHES {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The turned facets no point can be removed from: all three corners are
+/// boundary samples. Each is reported as those of its sides that are
+/// boundary segments (two samples next to each other on one loop).
+fn turned_boundary_facets<S: MeshChart + ?Sized>(
+    triangles: &[[usize; 3]],
+    pts2d: &[(f64, f64)],
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    surface: &S,
+    face: &Face,
+    chart_sign: i32,
+    cache: &mut FidelityCache,
+) -> Vec<Vec<[Point3; 2]>> {
+    let spans = boundary_loop_spans(outer, inners);
+    let boundary: usize = spans.iter().map(|s| s.1).sum();
+    let neighbours = |i: usize, j: usize| {
+        spans.iter().any(|&(start, n)| {
+            let inside = |k: usize| k >= start && k < start + n;
+            inside(i)
+                && inside(j)
+                && n >= 3
+                && ((i - start + 1) % n == j - start || (j - start + 1) % n == i - start)
+        })
+    };
+    let mut out = Vec::new();
+    for tri in triangles {
+        if tri.iter().any(|&i| i >= boundary) {
+            continue;
+        }
+        let corners = (
+            cache.position(tri[0], outer, inners, pts2d, surface),
+            cache.position(tri[1], outer, inners, pts2d, surface),
+            cache.position(tri[2], outer, inners, pts2d, surface),
+        );
+        let (Ok(p0), Ok(p1), Ok(p2)) = corners else {
+            continue;
+        };
+        let Ok(n) = (p1 - p0).cross(&(p2 - p0)).normalize() else {
+            continue;
+        };
+        let (a, b, c) = (pts2d[tri[0]], pts2d[tri[1]], pts2d[tri[2]]);
+        let (u, v) = ((a.0 + b.0 + c.0) / 3.0, (a.1 + b.1 + c.1) / 3.0);
+        let Ok(face_normal) = cache.normal(surface, face, u, v) else {
+            continue;
+        };
+        if !facet_turned_against_chart(
+            [a, b, c],
+            n,
+            face_normal,
+            chart_sign,
+            face.orientation.sign(),
+        ) {
+            continue;
+        }
+        let p = [p0, p1, p2];
+        let sides: Vec<[Point3; 2]> = (0..3)
+            .filter(|&k| neighbours(tri[k], tri[(k + 1) % 3]))
+            .map(|k| [p[k], p[(k + 1) % 3]])
+            .collect();
+        if !sides.is_empty() {
+            out.push(sides);
+            if out.len() >= MAX_REPORTED_CLASHES {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// What one [`mesh_in_chart`] attempt leaves beside its mesh.
+#[derive(Default)]
+struct ChartAttempt {
+    /// The boundary segments that failed the mesh as emitted.
+    clashes: Vec<Vec<[Point3; 2]>>,
+    /// The same vertices re-divided by [`flip_edges_under_turned_facets`],
+    /// present only when that leaves fewer facets turned.
+    swapped: Option<SwappedMesh>,
+}
+
+/// A face's facets after diagonal swaps: indices into the attempt's own
+/// vertices (from 0), already wound for emission.
+struct SwappedMesh {
+    triangles: Vec<[u32; 3]>,
+    turned: usize,
+    clashes: Vec<Vec<[Point3; 2]>>,
+}
+
+/// Close a meshing attempt that is the face's answer. `mesh` holds the
+/// attempt's vertices from `vertex_base` and its facets from
+/// `triangle_base`. Where the mesh was kept with facets turned and the
+/// attempt offers a swapped division with fewer, the facets are replaced by
+/// that one; the clashes of whichever stands are reported.
+fn settle_attempt(
+    cache: &EdgeSampleCache,
+    face: &Face,
+    mesh: &mut TriangleMesh,
+    vertex_base: u32,
+    triangle_base: usize,
+    outcome: Result<usize, CurvedCdtError>,
+    attempt: ChartAttempt,
+) -> Result<(), CurvedCdtError> {
+    let ChartAttempt { clashes, swapped } = attempt;
+    let (outcome, clashes) = match (outcome, swapped) {
+        (Ok(turned), Some(better)) if turned > 0 && better.turned < turned => {
+            mesh.triangles.truncate(triangle_base);
+            for t in &better.triangles {
+                mesh.add_triangle(t[0] + vertex_base, t[1] + vertex_base, t[2] + vertex_base);
+            }
+            (Ok(better.turned), better.clashes)
+        }
+        (outcome, _) => (outcome, clashes),
+    };
+    report_boundary_clashes(cache, face, &outcome, clashes);
+    outcome.map(|_| ())
+}
+
+/// Hand a meshing attempt's boundary clashes to the edge-sample cache, once
+/// the attempt is the face's answer: a refused crossing outline, or a mesh
+/// kept with facets still turned. A clean mesh reports nothing, so a face
+/// that meshes well is never a reason to resample an edge.
+fn report_boundary_clashes(
+    cache: &EdgeSampleCache,
+    face: &Face,
+    outcome: &Result<usize, CurvedCdtError>,
+    clashes: Vec<Vec<[Point3; 2]>>,
+) {
+    let kind = match outcome {
+        Err(CurvedCdtError::OutlineCrossesItself { .. }) => BoundaryClashKind::Crossing,
+        Ok(turned) if *turned > 0 => BoundaryClashKind::TurnedFacet,
+        _ => return,
+    };
+    for segments in clashes {
+        cache.note_boundary_clash(face.id, kind, segments);
+    }
+}
+
 /// Steps 1–5 of [`tessellate_curved_cdt`], in whichever chart the face is
 /// meshed in (native or developed): handedness, Steiner seeding, CDT,
 /// refinement, emission. `outer` / `inners` carry chart coordinates.
+/// `attempt` receives what the caller may need beside the mesh: the boundary
+/// segments that failed it, and the mesh with its diagonals swapped where
+/// that leaves fewer facets turned (see [`ChartAttempt`]).
 fn mesh_in_chart<S: MeshChart + ?Sized>(
     surface: &S,
     face: &Face,
@@ -3963,6 +4455,7 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
     outer: ProjectedLoop,
     inners: Vec<ProjectedLoop>,
     outer_bbox: UvBBox,
+    attempt: &mut ChartAttempt,
 ) -> Result<usize, CurvedCdtError> {
     // Step 1 — chart handedness.
     let chart_sign = compute_chart_sign(surface, outer_bbox);
@@ -4006,6 +4499,11 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
                     inner_polygons.len(),
                     steiner.len()
                 );
+            }
+            if matches!(e, CurvedCdtError::OutlineCrossesItself { .. }) {
+                attempt
+                    .clashes
+                    .extend(crossing_boundary_segments(&outer, &inners));
             }
             return Err(e);
         }
@@ -4056,6 +4554,70 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
         chart_sign,
         &mut cache,
     );
+    // Winding flip: the CDT crate emits triangles CCW in (u, v). For
+    // the mesh to be outward-facing in 3D we need:
+    //   (chart_sign == +1) ∧ (orientation Forward)  → keep (a,b,c)
+    //   (chart_sign == -1) ∧ (orientation Backward) → keep (a,b,c)
+    //   otherwise                                   → swap to (a,c,b)
+    let keep_winding = (chart_sign == 1) == face.orientation.is_forward();
+    if turned > 0 {
+        attempt.clashes.extend(turned_boundary_facets(
+            &final_triangles,
+            &final_pts2d,
+            &outer,
+            &inners,
+            surface,
+            face,
+            chart_sign,
+            &mut cache,
+        ));
+        // The same points with the diagonals under turned facets swapped,
+        // offered beside the mesh above, never in its place: the count
+        // returned stays the established one, so whatever the caller does
+        // on seeing facets turned (a torus is meshed again in its rescaled
+        // chart) it still does, and takes this only for what is left.
+        let (swapped, swapped_turned) = flip_edges_under_turned_facets(
+            &outer,
+            &inners,
+            &final_pts2d,
+            final_triangles.clone(),
+            surface,
+            face,
+            chart_sign,
+            &mut cache,
+        );
+        if swapped_turned < turned {
+            let clashes = if swapped_turned > 0 {
+                turned_boundary_facets(
+                    &swapped,
+                    &final_pts2d,
+                    &outer,
+                    &inners,
+                    surface,
+                    face,
+                    chart_sign,
+                    &mut cache,
+                )
+            } else {
+                Vec::new()
+            };
+            attempt.swapped = Some(SwappedMesh {
+                triangles: swapped
+                    .iter()
+                    .map(|t| {
+                        let (a, b, c) = (t[0] as u32, t[1] as u32, t[2] as u32);
+                        if keep_winding {
+                            [a, b, c]
+                        } else {
+                            [a, c, b]
+                        }
+                    })
+                    .collect(),
+                turned: swapped_turned,
+                clashes,
+            });
+        }
+    }
 
     // Step 5 — mesh emission. Vertex base offset must be recorded so
     // triangle indices are rebased into `mesh.vertices` numbering.
@@ -4072,12 +4634,6 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
         });
     }
 
-    // Winding flip: the CDT crate emits triangles CCW in (u, v). For
-    // the mesh to be outward-facing in 3D we need:
-    //   (chart_sign == +1) ∧ (orientation Forward)  → keep (a,b,c)
-    //   (chart_sign == -1) ∧ (orientation Backward) → keep (a,b,c)
-    //   otherwise                                   → swap to (a,c,b)
-    let keep_winding = (chart_sign == 1) == face.orientation.is_forward();
     for tri in &final_triangles {
         let a = vertex_base + tri[0] as u32;
         let b = vertex_base + tri[1] as u32;
@@ -5925,6 +6481,7 @@ mod refinement_cost_tests {
             outer,
             Vec::new(),
             (u0, u1, v0, v1),
+            &mut ChartAttempt::default(),
         )
         .expect("a sphere patch meshes");
         mesh
@@ -6364,9 +6921,177 @@ mod outer_keepout_tests {
 #[cfg(test)]
 mod turned_facet_tests {
     use super::{
-        drop_points_under_turned_facets, run_cdt, turned_facets, FidelityCache, LoopType,
-        ProjectedLoop,
+        drop_points_under_turned_facets, flip_edges_under_turned_facets, run_cdt, turned_facets,
+        FidelityCache, LoopType, ProjectedLoop,
     };
+
+    /// A boundary sample in the middle of the bottom edge sits 0.01 inward
+    /// in 3D (within its edge's tolerance of the surface), and two interior
+    /// points lie 0.006 above that edge either side of it: in the chart the
+    /// sample is below the line joining them, in 3D above it, so the sliver
+    /// on the three faces down. Its long edge joins the two interior points
+    /// and the corner across it is the boundary sample: there is no point to
+    /// remove. The quadrilateral it makes with the facet above has another
+    /// diagonal -- from the sample up -- and both facets on that one face up.
+    #[test]
+    fn a_turned_sliver_on_a_boundary_sample_is_cured_by_the_other_diagonal() {
+        let plane = Plane::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, Vector3::X).expect("plane");
+        let surface: &dyn Surface = &plane;
+        let face = Face::new(0, 0, 0, FaceOrientation::Forward);
+        let outer_uv = vec![(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let outer = ProjectedLoop {
+            points_3d: vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(0.5, 0.01, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+            ],
+            points_uv: outer_uv.clone(),
+            loop_type: LoopType::Outer,
+        };
+        // 5, 6: the two interior points by the bottom edge; 7: the middle.
+        let mut pts2d = outer_uv;
+        pts2d.extend([(0.25, 0.006), (0.75, 0.006), (0.5, 0.5)]);
+        let triangles: Vec<[usize; 3]> = vec![
+            [0, 1, 5],
+            [1, 2, 6],
+            [5, 1, 6], // the sliver on the displaced sample
+            [5, 6, 7],
+            [0, 5, 4],
+            [5, 7, 4],
+            [2, 3, 6],
+            [6, 3, 7],
+            [7, 3, 4],
+        ];
+        let area = |tris: &[[usize; 3]]| -> f64 {
+            tris.iter()
+                .map(|t| {
+                    let (a, b, c) = (pts2d[t[0]], pts2d[t[1]], pts2d[t[2]]);
+                    0.5 * ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0))
+                })
+                .sum()
+        };
+        assert!(
+            (area(&triangles) - 1.0).abs() < 1e-12,
+            "the fixture tiles the square"
+        );
+        let mut cache = FidelityCache::default();
+        let (before, droppable) = turned_facets(
+            &triangles,
+            &pts2d,
+            &outer,
+            &[],
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        assert_eq!(before, 1, "the fixture has one turned facet");
+        assert!(droppable.is_empty(), "and no point to remove under it");
+        // Removing points leaves it as it is.
+        let (pts_after, tris_after, still) = drop_points_under_turned_facets(
+            &outer,
+            &[],
+            &[],
+            pts2d.clone(),
+            triangles.clone(),
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        assert_eq!(still, 1);
+        assert_eq!((pts_after, tris_after), (pts2d.clone(), triangles.clone()));
+
+        let (flipped, after) = flip_edges_under_turned_facets(
+            &outer,
+            &[],
+            &pts2d,
+            triangles.clone(),
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        assert_eq!(after, 0, "no facet is left turned");
+        assert_eq!(flipped.len(), triangles.len(), "the same number of facets");
+        assert!(
+            (area(&flipped) - 1.0).abs() < 1e-12,
+            "still tiling the square"
+        );
+        for t in &flipped {
+            let (a, b, c) = (pts2d[t[0]], pts2d[t[1]], pts2d[t[2]]);
+            assert!(
+                (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0) > 0.0,
+                "every facet keeps the chart's winding: {t:?}"
+            );
+        }
+        assert!(
+            flipped.contains(&[1, 6, 7]) && flipped.contains(&[1, 7, 5]),
+            "the sliver and the facet above were re-divided from the sample up: {flipped:?}"
+        );
+    }
+
+    /// The same sliver, but the sample also stands 0.02 off the surface and
+    /// the facet above it is only 0.006 high: the other diagonal would make
+    /// two facets standing nearly edge-on to the surface (84 degrees off
+    /// it). That trades one bad facet for two; the diagonal is left alone.
+    #[test]
+    fn a_diagonal_that_would_leave_facets_edge_on_is_not_swapped() {
+        let plane = Plane::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, Vector3::X).expect("plane");
+        let surface: &dyn Surface = &plane;
+        let face = Face::new(0, 0, 0, FaceOrientation::Forward);
+        let outer_uv = vec![(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let outer = ProjectedLoop {
+            points_3d: vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(0.5, 0.01, 0.02),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+            ],
+            points_uv: outer_uv.clone(),
+            loop_type: LoopType::Outer,
+        };
+        let mut pts2d = outer_uv;
+        pts2d.extend([(0.25, 0.006), (0.75, 0.006), (0.5, 0.012)]);
+        let triangles: Vec<[usize; 3]> = vec![
+            [0, 1, 5],
+            [1, 2, 6],
+            [5, 1, 6], // the sliver on the displaced sample
+            [5, 6, 7],
+            [0, 5, 4],
+            [5, 7, 4],
+            [2, 3, 6],
+            [6, 3, 7],
+            [7, 3, 4],
+        ];
+        let mut cache = FidelityCache::default();
+        let (before, _) = turned_facets(
+            &triangles,
+            &pts2d,
+            &outer,
+            &[],
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        assert_eq!(before, 1, "the fixture has one turned facet");
+        let (after_tris, after) = flip_edges_under_turned_facets(
+            &outer,
+            &[],
+            &pts2d,
+            triangles.clone(),
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        assert_eq!(after_tris, triangles, "nothing was swapped");
+        assert_eq!(after, 1, "and the facet is still reported turned");
+    }
     use crate::math::{Point3, Vector3};
     use crate::primitives::face::{Face, FaceOrientation};
     use crate::primitives::surface::{Plane, Surface};
@@ -6433,6 +7158,84 @@ mod turned_facet_tests {
         assert!(
             pts2d.contains(&(0.5, 0.5)),
             "the well-placed interior point is kept"
+        );
+    }
+
+    /// The same boundary with a CROWD of interior points beyond its chord
+    /// (the chord passes uv (0.5, 0.001); refinement piles points against a
+    /// curved boundary it cannot make finer). Removing the nearest hands the
+    /// chord to the next one: the facet on the chord is still turned, the
+    /// count is no smaller, and a rule that keeps a round only when the
+    /// count falls gave up with the facet still turned. Every point beyond
+    /// the chord has to go, however many rounds that takes; the points
+    /// inside it stay.
+    #[test]
+    fn a_crowd_of_interior_points_beyond_a_boundary_chord_is_cleared() {
+        let plane = Plane::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, Vector3::X).expect("plane");
+        let surface: &dyn Surface = &plane;
+        let face = Face::new(0, 0, 0, FaceOrientation::Forward);
+        let outer_uv = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let outer = ProjectedLoop {
+            points_3d: vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.002, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+            ],
+            points_uv: outer_uv.clone(),
+            loop_type: LoopType::Outer,
+        };
+        // Nine points stacked beyond the chord at u = 0.5, one above the
+        // other, and two well inside the face.
+        let mut steiner: Vec<(f64, f64)> = (1..=9).map(|k| (0.5, 0.0001 * k as f64)).collect();
+        steiner.extend([(0.5, 0.5), (0.25, 0.75)]);
+        let (pts2d, triangles) = run_cdt(&outer_uv, &[], &steiner).expect("cdt");
+        let mut cache = FidelityCache::default();
+        let (before, _) = turned_facets(
+            &triangles,
+            &pts2d,
+            &outer,
+            &[],
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        assert!(before > 0, "the fixture has a turned facet");
+        let (pts2d, triangles, reported) = drop_points_under_turned_facets(
+            &outer,
+            &[],
+            &[],
+            pts2d,
+            triangles,
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        let (after, _) = turned_facets(
+            &triangles,
+            &pts2d,
+            &outer,
+            &[],
+            surface,
+            &face,
+            1,
+            &mut cache,
+        );
+        assert_eq!(after, 0, "no facet is left turned ({before} before)");
+        assert_eq!(reported, 0, "and the count returned says so");
+        for kept in [(0.5, 0.5), (0.25, 0.75)] {
+            assert!(pts2d.contains(&kept), "{kept:?} is inside and is kept");
+        }
+        assert_eq!(
+            triangles
+                .iter()
+                .flatten()
+                .filter(|&&i| i >= pts2d.len())
+                .count(),
+            0,
+            "every facet refers to a point that is there"
         );
     }
 }

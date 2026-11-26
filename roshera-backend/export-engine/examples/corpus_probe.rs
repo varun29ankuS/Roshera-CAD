@@ -13,6 +13,14 @@ fn main() {
         .map(|r| r.filter_map(Result::ok).map(|e| e.path()).collect())
         .unwrap_or_default();
     entries.sort();
+    // PROBE_ONLY=109,149: run just those parts.
+    if let Ok(only) = std::env::var("PROBE_ONLY") {
+        let want: Vec<&str> = only.split(',').collect();
+        entries.retain(|p| {
+            p.file_name()
+                .is_some_and(|n| want.contains(&n.to_string_lossy().as_ref()))
+        });
+    }
     let (mut parts, mut imported, mut sound, mut watertight, mut brep) = (0, 0, 0, 0, 0);
     let mut total = std::time::Duration::ZERO;
     for case in entries {

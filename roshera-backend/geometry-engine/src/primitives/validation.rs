@@ -2521,6 +2521,19 @@ fn outward_walk_is_forward(
     if outward.magnitude() < 1e-12 {
         return None;
     }
+    // The same gate, second half. A curved face can keep every normal within
+    // that cosine of this one and still not be pictured by its projection: a
+    // thread flank winds round its axis many times, each turn landing on the
+    // one before (CADGenBench part 109: seven turns of a helicoid, every
+    // normal 60 degrees from the edge's). The projected outline then passes
+    // through itself and an even-odd count against it means nothing. A
+    // planar loop projected along its own normal is the face itself, and
+    // whether IT crosses is the planar self-overlap check's question.
+    if surface.type_name() != "Plane"
+        && loop_polygon.is_some_and(|poly| projected_outline_crosses_itself(poly, outward))
+    {
+        return None;
+    }
 
     // interior_dir: a unit "into the face" reference at the edge midpoint, in the
     // face plane and perpendicular to the edge tangent. The in-plane perpendicular
@@ -2611,6 +2624,114 @@ fn edge_samples_start_to_end(model: &BRepModel, edge_id: EdgeId) -> Option<Vec<V
     Some(pts)
 }
 
+/// Samples round a CLOSED edge (one vertex at both ends), from that vertex
+/// back to it in the edge's own direction. `None` when the edge is not
+/// closed or its curve cannot be evaluated.
+fn closed_edge_samples(model: &BRepModel, edge_id: EdgeId) -> Option<Vec<Vector3>> {
+    const SAMPLES: usize = 33;
+    let edge = model.edges.get(edge_id)?;
+    let curve = model.curves.get(edge.curve_id)?;
+    let a = model.vertices.get(edge.start_vertex)?.position;
+    let b = model.vertices.get(edge.end_vertex)?.position;
+    let a = Vector3::new(a[0], a[1], a[2]);
+    let b = Vector3::new(b[0], b[1], b[2]);
+    if (b - a).magnitude() >= 1e-12 {
+        return None;
+    }
+    let r = edge.param_range;
+    let mut pts = Vec::with_capacity(SAMPLES);
+    for i in 0..SAMPLES {
+        let t = r.start + (r.end - r.start) * i as f64 / (SAMPLES - 1) as f64;
+        pts.push(curve.evaluate(t).ok()?.position.to_vec());
+    }
+    if matches!(
+        edge.orientation,
+        crate::primitives::edge::EdgeOrientation::Backward
+    ) {
+        pts.reverse();
+    }
+    Some(pts)
+}
+
+/// The two coordinate axes [`point_in_loop_polygon`] keeps when it projects
+/// along `plane_normal` (it drops the normal's dominant component); `None`
+/// for a zero normal.
+fn projection_axes(plane_normal: Vector3) -> Option<(usize, usize)> {
+    let n = plane_normal.normalize_or_zero();
+    if n.magnitude() < 1e-12 {
+        return None;
+    }
+    let (nx, ny, nz) = (n.x.abs(), n.y.abs(), n.z.abs());
+    Some(if nx >= ny && nx >= nz {
+        (1, 2) // drop X → use (Y,Z)
+    } else if ny >= nx && ny >= nz {
+        (0, 2) // drop Y → use (X,Z)
+    } else {
+        (0, 1) // drop Z → use (X,Y)
+    })
+}
+
+/// Whether the outline `polygon`, projected as [`point_in_loop_polygon`]
+/// projects it, crosses itself: two of its segments that are not neighbours
+/// pass through each other. A segment lying along another (a seam walked
+/// both ways) or touching it at a point is not a crossing.
+fn projected_outline_crosses_itself(polygon: &[Vector3], plane_normal: Vector3) -> bool {
+    let Some((ax, ay)) = projection_axes(plane_normal) else {
+        return false;
+    };
+    let m = polygon.len();
+    if m < 4 {
+        return false;
+    }
+    let comp = |v: &Vector3, i: usize| -> f64 {
+        match i {
+            0 => v.x,
+            1 => v.y,
+            _ => v.z,
+        }
+    };
+    let pts: Vec<(f64, f64)> = polygon.iter().map(|p| (comp(p, ax), comp(p, ay))).collect();
+    // Segment i runs pts[i] -> pts[i + 1]; swept in order of its left end.
+    let seg = |i: usize| (pts[i], pts[(i + 1) % m]);
+    let mut order: Vec<usize> = (0..m).collect();
+    let left = |i: usize| {
+        let (p, q) = seg(i);
+        p.0.min(q.0)
+    };
+    order.sort_by(|&i, &j| {
+        left(i)
+            .partial_cmp(&left(j))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let side = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| -> f64 {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    for (k, &i) in order.iter().enumerate() {
+        let (p1, p2) = seg(i);
+        let right = p1.0.max(p2.0);
+        let (lo_y, hi_y) = (p1.1.min(p2.1), p1.1.max(p2.1));
+        for &j in &order[k + 1..] {
+            if left(j) > right {
+                break;
+            }
+            // Neighbours share an end point.
+            if (i + 1) % m == j || (j + 1) % m == i {
+                continue;
+            }
+            let (q1, q2) = seg(j);
+            if q1.1.min(q2.1) > hi_y || q1.1.max(q2.1) < lo_y {
+                continue;
+            }
+            let (d1, d2) = (side(p1, p2, q1), side(p1, p2, q2));
+            let (d3, d4) = (side(q1, q2, p1), side(q1, q2, p2));
+            if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The loop's outline as points along its edges in walk order, each edge's
 /// samples taken start-to-end and reversed where the loop walks it backward.
 /// `None` when any edge cannot be sampled (a closed edge among them), so the
@@ -2621,7 +2742,14 @@ fn sampled_loop_outline(
 ) -> Option<Vec<Vector3>> {
     let mut out = Vec::new();
     for (i, &edge_id) in loop_data.edges.iter().enumerate() {
-        let mut pts = edge_samples_start_to_end(model, edge_id)?;
+        // A closed edge among open ones (a countersink's whole rim beside its
+        // seam) is part of the outline like any other: without it the loop
+        // fell back to its few vertices, which are not the face.
+        let mut pts = match edge_samples_start_to_end(model, edge_id) {
+            Some(pts) => pts,
+            None if loop_data.edges.len() > 1 => closed_edge_samples(model, edge_id)?,
+            None => return None,
+        };
         if !loop_data.orientations.get(i).copied().unwrap_or(true) {
             pts.reverse();
         }

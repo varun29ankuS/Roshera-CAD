@@ -94,7 +94,45 @@ pub struct EdgeSampleCache {
     /// a 64-gon prism). One full walk amortised across all edges is
     /// the same cost as a single old lookup.
     adjacency: parking_lot::RwLock<Option<Arc<std::collections::HashMap<EdgeId, Vec<FaceId>>>>>,
+    /// Edge → how many times its sample count was doubled by
+    /// [`Self::refine_clashing_edges`]; absent for an edge sampled as
+    /// [`Self::compute_samples`] first decided.
+    doublings: DashMap<EdgeId, u32>,
+    /// Boundary clashes the face meshers reported since the last
+    /// [`Self::take_boundary_clashes`].
+    clashes: parking_lot::Mutex<Vec<BoundaryClash>>,
 }
+
+/// How a face's sampled boundary failed it: see [`BoundaryClash`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundaryClashKind {
+    /// Two boundary segments pass through each other in the face's chart,
+    /// so the outline is not a polygon and nothing was triangulated.
+    Crossing,
+    /// The face was triangulated, but a facet whose three corners are all
+    /// boundary samples faces against the surface: one edge's chord passes
+    /// on the far side of another edge's sample.
+    TurnedFacet,
+}
+
+/// A place where the CHORDS of a face's boundary edges disagree with the
+/// edges themselves. Two edges that leave a vertex almost tangent to each
+/// other never cross, but their chords do whenever the edge on the outside
+/// of the bend is sampled in longer steps than the one inside it: the long
+/// chord cuts the corner and passes through the short ones (CADGenBench part
+/// 134: a 3.4 mm chord through 1.2 mm chords, a sliver of cylinder between a
+/// pocket wall and its fillet). `segments` are the boundary segments
+/// involved, each as the two consecutive cached samples it joins.
+#[derive(Debug, Clone)]
+pub(crate) struct BoundaryClash {
+    pub face: FaceId,
+    pub kind: BoundaryClashKind,
+    pub segments: Vec<[Point3; 2]>,
+}
+
+/// The most times [`EdgeSampleCache::refine_clashing_edges`] doubles one
+/// edge's samples (sixteen times the first count).
+const MAX_CLASH_DOUBLINGS: u32 = 4;
 
 impl EdgeSampleCache {
     /// Build an empty cache parameterised by `params`. The params are
@@ -105,7 +143,127 @@ impl EdgeSampleCache {
             params: params.clone(),
             samples: DashMap::new(),
             adjacency: parking_lot::RwLock::new(None),
+            doublings: DashMap::new(),
+            clashes: parking_lot::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Record that `face`'s sampled boundary failed it at `segments`.
+    pub(crate) fn note_boundary_clash(
+        &self,
+        face: FaceId,
+        kind: BoundaryClashKind,
+        segments: Vec<[Point3; 2]>,
+    ) {
+        if !segments.is_empty() {
+            self.clashes.lock().push(BoundaryClash {
+                face,
+                kind,
+                segments,
+            });
+        }
+    }
+
+    /// The clashes recorded since the last call, in face order (faces mesh
+    /// in parallel, so the order they were recorded in is not fixed).
+    pub(crate) fn take_boundary_clashes(&self) -> Vec<BoundaryClash> {
+        let mut taken = std::mem::take(&mut *self.clashes.lock());
+        let key = |c: &BoundaryClash| {
+            c.segments
+                .first()
+                .map(|s| [s[0].x, s[0].y, s[0].z, s[1].x, s[1].y, s[1].z])
+                .unwrap_or([0.0; 6])
+        };
+        taken.sort_by(|a, b| {
+            a.face.cmp(&b.face).then_with(|| {
+                key(a)
+                    .partial_cmp(&key(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        taken
+    }
+
+    /// For each clash, double the samples of the edge that owns the clashing
+    /// segment sagging farthest from its curve -- the chord that cuts the
+    /// corner. The doubled stations contain the old ones, so every face on
+    /// the edge keeps the points it had and gains the ones between. Returns
+    /// the edges whose samples changed; each face using one must be meshed
+    /// again, and every face bounding the edge then reads the same new
+    /// samples, so shared-edge coherence holds as before. An edge already
+    /// doubled [`MAX_CLASH_DOUBLINGS`] times is left alone.
+    pub(crate) fn refine_clashing_edges(
+        &self,
+        model: &BRepModel,
+        clashes: &[BoundaryClash],
+    ) -> std::collections::BTreeSet<EdgeId> {
+        let mut refined = std::collections::BTreeSet::new();
+        for clash in clashes {
+            let Some(face) = model.faces.get(clash.face) else {
+                continue;
+            };
+            // (sag, edge): the worst clashing segment of this face.
+            let mut worst: Option<(f64, EdgeId)> = None;
+            for loop_id in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied())
+            {
+                let Some(lp) = model.loops.get(loop_id) else {
+                    continue;
+                };
+                for &edge_id in &lp.edges {
+                    if refined.contains(&edge_id) {
+                        continue;
+                    }
+                    let Some(edge) = model.edges.get(edge_id) else {
+                        continue;
+                    };
+                    let Some(curve) = model.curves.get(edge.curve_id) else {
+                        continue;
+                    };
+                    let samples = self.get_or_compute(edge_id, model);
+                    let n = samples.len().saturating_sub(1);
+                    if n == 0 {
+                        continue;
+                    }
+                    let (t0, t1) = (edge.param_range.start, edge.param_range.end);
+                    for j in 0..n {
+                        let (a, b) = (samples[j], samples[j + 1]);
+                        let clashing = clash
+                            .segments
+                            .iter()
+                            .any(|s| (s[0] == a && s[1] == b) || (s[0] == b && s[1] == a));
+                        if !clashing {
+                            continue;
+                        }
+                        let t = t0 + (j as f64 + 0.5) * (t1 - t0) / n as f64;
+                        let Ok(on_curve) = curve.point_at(t) else {
+                            continue;
+                        };
+                        // How far the curve stands off the chord's line (the
+                        // parameter's midpoint need not be the chord's).
+                        let chord = b - a;
+                        let length = chord.magnitude();
+                        if length <= 0.0 {
+                            continue;
+                        }
+                        let sag = chord.cross(&(on_curve - a)).magnitude() / length;
+                        if sag > 0.0 && worst.is_none_or(|(w, _)| sag > w) {
+                            worst = Some((sag, edge_id));
+                        }
+                    }
+                }
+            }
+            let Some((_, edge_id)) = worst else {
+                continue;
+            };
+            let done = self.doublings.get(&edge_id).map(|d| *d).unwrap_or(0);
+            if done >= MAX_CLASH_DOUBLINGS {
+                continue;
+            }
+            self.doublings.insert(edge_id, done + 1);
+            self.samples.remove(&edge_id);
+            refined.insert(edge_id);
+        }
+        refined
     }
 
     /// The lazily-built edge→faces index. First caller pays one full
@@ -276,6 +434,13 @@ impl EdgeSampleCache {
             }
         }
 
+        // An edge whose chords clashed with a neighbouring edge's on some
+        // face is sampled twice as finely per clash round (see
+        // `refine_clashing_edges`).
+        if let Some(doublings) = self.doublings.get(&edge_id) {
+            n = n.saturating_mul(1usize << (*doublings).min(MAX_CLASH_DOUBLINGS));
+        }
+
         // Emit n+1 samples spanning [t_start, t_end] inclusive of both
         // endpoints. Any individual point_at failure leaves a gap; the
         // resulting vector is dropped down to the runs of valid samples
@@ -371,44 +536,68 @@ pub(crate) fn compute_curve_sample_count(
 ) -> usize {
     const PROBE: usize = 16;
 
-    // 16-point parametric probe → polyline.
-    let mut pts: Vec<Option<Point3>> = Vec::with_capacity(PROBE + 1);
-    pts.push(curve.point_at(t_start).ok());
-    for i in 1..=PROBE {
-        let t = t_start + (i as f64) * (t_end - t_start) / (PROBE as f64);
-        pts.push(curve.point_at(t).ok());
-    }
-
-    // Total chord length (lower-bound on arc length).
-    let mut total_length = 0.0_f64;
-    for i in 1..pts.len() {
-        if let (Some(a), Some(b)) = (pts[i - 1].as_ref(), pts[i].as_ref()) {
-            total_length += (*b - *a).magnitude();
+    // The probe polyline's total chord length (a lower bound on the arc
+    // length) and total turning angle (a lower bound on the tangent's
+    // rotation: the probe misses up to one segment of curvature per
+    // endpoint, but for any reasonably refined curve this underestimate is
+    // small and we always clamp by min_segments afterwards).
+    let measure = |steps: usize| -> (f64, f64) {
+        let mut pts: Vec<Option<Point3>> = Vec::with_capacity(steps + 1);
+        pts.push(curve.point_at(t_start).ok());
+        for i in 1..=steps {
+            let t = t_start + (i as f64) * (t_end - t_start) / (steps as f64);
+            pts.push(curve.point_at(t).ok());
         }
-    }
-
-    // Total turning angle (lower-bound on tangent rotation). The probe
-    // misses up to one segment of curvature per endpoint, but for any
-    // reasonably refined curve this underestimate is small and we
-    // always clamp by min_segments afterwards.
-    let mut total_angle = 0.0_f64;
-    for i in 1..pts.len() - 1 {
-        if let (Some(a), Some(b), Some(c)) =
-            (pts[i - 1].as_ref(), pts[i].as_ref(), pts[i + 1].as_ref())
-        {
-            let v1 = *b - *a;
-            let v2 = *c - *b;
-            let m1 = v1.magnitude();
-            let m2 = v2.magnitude();
-            if m1 > 1e-12 && m2 > 1e-12 {
-                let cos_t = (v1.dot(&v2) / (m1 * m2)).clamp(-1.0, 1.0);
-                total_angle += cos_t.acos();
+        let mut total_length = 0.0_f64;
+        for i in 1..pts.len() {
+            if let (Some(a), Some(b)) = (pts[i - 1].as_ref(), pts[i].as_ref()) {
+                total_length += (*b - *a).magnitude();
             }
         }
+        let mut total_angle = 0.0_f64;
+        for i in 1..pts.len() - 1 {
+            if let (Some(a), Some(b), Some(c)) =
+                (pts[i - 1].as_ref(), pts[i].as_ref(), pts[i + 1].as_ref())
+            {
+                let v1 = *b - *a;
+                let v2 = *c - *b;
+                let m1 = v1.magnitude();
+                let m2 = v2.magnitude();
+                if m1 > 1e-12 && m2 > 1e-12 {
+                    let cos_t = (v1.dot(&v2) / (m1 * m2)).clamp(-1.0, 1.0);
+                    total_angle += cos_t.acos();
+                }
+            }
+        }
+        (total_length, total_angle)
+    };
+
+    // 16-point parametric probe.
+    let (mut total_length, mut total_angle) = measure(PROBE);
+    // A curve that winds round more than twice (a thread's helix: seven
+    // turns in CADGenBench part 109) turns most of a radian between probe
+    // points: sixteen points cut its arcs to chords 30% short and can read
+    // its turning as anything. Only such a curve is probed again, more
+    // finely, until the turning between probe points is under half a radian;
+    // every other curve is measured exactly as before.
+    let mut steps = PROBE;
+    while total_angle > MULTI_TURN_ANGLE
+        && total_angle > 0.5 * steps as f64
+        && steps < MAX_PROBE_STEPS
+    {
+        steps *= 4;
+        (total_length, total_angle) = measure(steps);
     }
 
     sample_count_from_length_angle(total_length, total_angle, params)
 }
+
+/// The probe's turning angle beyond which a curve is taken to wind round
+/// more than twice and is probed again more finely (two full turns).
+const MULTI_TURN_ANGLE: f64 = 2.0 * std::f64::consts::TAU;
+
+/// The most steps the finer probe of a many-turn curve takes.
+const MAX_PROBE_STEPS: usize = 4096;
 
 /// The triple-guard sample count from a polyline's total chord length and
 /// total turning angle: the strictest of the max-edge-length,
@@ -496,11 +685,18 @@ fn sample_count_from_length_angle(
         return n_chord.max(1).min(params.max_segments);
     }
 
+    // `max_segments` bounds the samples of one turn. A curve that goes round
+    // several times gets that many per turn: one cap for all seven turns of a
+    // helix left it 22 mm chords on a 51 mm radius, sagging five times the
+    // chord tolerance, and no facet built on such a chord can lie on the
+    // surface (CADGenBench part 109). A curve of one turn or less is capped
+    // as it always was.
+    let turns = (total_angle / std::f64::consts::TAU).ceil().max(1.0) as usize;
     n_len
         .max(n_angle)
         .max(n_sag)
         .max(params.min_segments.max(3))
-        .min(params.max_segments)
+        .min(params.max_segments.saturating_mul(turns))
 }
 
 /// Surface-curvature-driven boundary sample count contributed by ONE
@@ -910,6 +1106,110 @@ mod tests {
         assert!(
             n > 0,
             "a curved edge on a sphere should request surface-curvature densification, got {n}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod many_turn_curve_tests {
+    //! `max_segments` capped the samples of a whole edge. A thread's helix
+    //! goes round seven times; a hundred samples for all of it are chords
+    //! 22 mm long on a 51 mm radius, sagging five times the chord tolerance
+    //! (CADGenBench part 109).
+    use super::*;
+    use crate::math::nurbs::{interpolate_nurbs_curve, ParameterizationType};
+    use crate::primitives::curve::{Circle, NurbsCurve};
+    use std::f64::consts::TAU;
+
+    const RADIUS: f64 = 51.0;
+    const PITCH: f64 = 7.0;
+
+    fn helix(turns: f64) -> (NurbsCurve, f64, f64) {
+        let n = (turns * 96.0).ceil() as usize;
+        let pts: Vec<Point3> = (0..=n)
+            .map(|k| {
+                let a = TAU * turns * k as f64 / n as f64;
+                Point3::new(RADIUS * a.cos(), RADIUS * a.sin(), PITCH * a / TAU)
+            })
+            .collect();
+        let fit = interpolate_nurbs_curve(&pts, 3, ParameterizationType::ChordLength).expect("fit");
+        let knots = fit.knots.values().to_vec();
+        let (t0, t1) = (knots[0], knots[knots.len() - 1]);
+        let curve = NurbsCurve::new(
+            fit.degree,
+            fit.control_points.clone(),
+            fit.weights.clone(),
+            knots,
+        )
+        .expect("curve");
+        (curve, t0, t1)
+    }
+
+    /// The farthest the curve stands off its chords when cut into `n` equal
+    /// parameter steps.
+    fn worst_sag(curve: &dyn Curve, t0: f64, t1: f64, n: usize) -> f64 {
+        (0..n)
+            .map(|j| {
+                let at = |f: f64| {
+                    curve
+                        .point_at(t0 + (t1 - t0) * f / n as f64)
+                        .expect("point")
+                };
+                let (a, b, m) = (at(j as f64), at(j as f64 + 1.0), at(j as f64 + 0.5));
+                let chord = b - a;
+                chord.cross(&(m - a)).magnitude() / chord.magnitude()
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// The parameters a 520 mm part is meshed with: the chord and edge
+    /// length floored to its size.
+    fn part_params() -> TessellationParams {
+        TessellationParams {
+            chord_tolerance: 0.26,
+            max_edge_length: 1000.0,
+            max_angle_deviation: 1.0,
+            ..TessellationParams::default()
+        }
+    }
+
+    #[test]
+    fn a_seven_turn_helix_is_sampled_to_the_chord_tolerance() {
+        let (curve, t0, t1) = helix(7.0);
+        let params = part_params();
+        let n = compute_curve_sample_count(&curve, t0, t1, &params);
+        let sag = worst_sag(&curve, t0, t1, n);
+        assert!(
+            sag <= 1.25 * params.chord_tolerance,
+            "{n} samples leave chords sagging {sag:.3}, against a chord tolerance of {}",
+            params.chord_tolerance
+        );
+        assert!(
+            n <= 7 * params.max_segments,
+            "and no more than the cap for each of its seven turns: {n}"
+        );
+    }
+
+    /// One turn of the same helix, and a plain circle, are sampled exactly
+    /// as they were: the cap is the cap.
+    #[test]
+    fn a_curve_of_one_turn_keeps_its_cap() {
+        let tight = TessellationParams {
+            chord_tolerance: 1e-4,
+            max_edge_length: 1000.0,
+            max_angle_deviation: 1.0,
+            ..TessellationParams::default()
+        };
+        let (curve, t0, t1) = helix(1.0);
+        assert_eq!(
+            compute_curve_sample_count(&curve, t0, t1, &tight),
+            tight.max_segments
+        );
+        let circle = Circle::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, RADIUS).expect("circle");
+        let range = circle.parameter_range();
+        assert_eq!(
+            compute_curve_sample_count(&circle, range.start, range.end, &tight),
+            tight.max_segments
         );
     }
 }

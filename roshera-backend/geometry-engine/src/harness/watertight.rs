@@ -1060,6 +1060,63 @@ fn at_pole_point(surface: &dyn Surface, q: crate::math::Point3, p: f64) -> bool 
     })
 }
 
+/// True when the facet `corners` lies ON a pole of `surface` with the pole
+/// strictly inside it: the three corners stand round the pole.
+///
+/// **Why this exists.** [`at_pole_point`] excuses a facet with a corner AT
+/// the pole, whose `u` is arbitrary. A face that contains a pole in its
+/// interior -- a spherical pocket floor bounded by four arcs -- is as often
+/// meshed with no vertex on the pole at all, and the facet covering it has
+/// its corners on three sides of it: their `u` are well defined and
+/// necessarily spread over more than half the period, because going round
+/// the pole IS going round in `u`. Read on `u` alone that facet is a bridge;
+/// it is 0.2 mm across and lies on the sphere (CADGenBench part 203: five
+/// such floors, one such facet each, 1.5 degrees off the true normal).
+///
+/// A facet that really bridges cannot pass this. The pole must lie within
+/// `on_surface_tol` -- the mesh's own chord -- of the facet's plane, so the
+/// facet is on the surface there, and its foot on that plane must be
+/// strictly inside the facet. A facet cutting through the solid has its
+/// corners on the surface and its plane through the interior: either the
+/// pole is far from that plane, or the plane passes through the pole and
+/// cuts the surface in a curve through all three corners and the pole, and
+/// a point of that curve is not inside a triangle of three others on it.
+fn facet_encloses_pole(
+    surface: &dyn Surface,
+    corners: [crate::math::Point3; 3],
+    p: f64,
+    on_surface_tol: f64,
+) -> bool {
+    let (_, (v_lo, v_hi)) = surface.parameter_bounds();
+    let [a, b, c] = corners;
+    let normal = (b - a).cross(&(c - a));
+    let area2 = normal.magnitude();
+    if area2 <= 0.0 {
+        return false;
+    }
+    let unit = normal * (1.0 / area2);
+    [v_lo, v_hi].iter().filter(|v| v.is_finite()).any(|&v| {
+        if !u_is_degenerate_at(surface, v, p) {
+            return false;
+        }
+        let Ok(pole) = surface.point_at(0.0, v) else {
+            return false;
+        };
+        let height = (pole - a).dot(&unit);
+        if height.abs() > on_surface_tol {
+            return false;
+        }
+        let foot = pole - unit * height;
+        // Barycentric coordinates of the foot: each a sub-triangle's share
+        // of the facet's area, signed.
+        let share = |x: crate::math::Point3, y: crate::math::Point3| {
+            (x - foot).cross(&(y - foot)).dot(&unit) / area2
+        };
+        const INSIDE: f64 = 1e-6;
+        share(b, c) > INSIDE && share(c, a) > INSIDE && share(a, b) > INSIDE
+    })
+}
+
 /// Each periodic face's u-extent, measured from the tessellated vertices.
 ///
 /// Deliberately NOT read from `Face::uv_bounds`: on the boolean-produced faces
@@ -1362,7 +1419,8 @@ pub fn mesh_quality_with_normals(
             let at_singularity = [uv0, uv1, uv2]
                 .iter()
                 .any(|uv| u_is_degenerate_at(surface, uv.1, p))
-                || [p0, p1, p2].iter().any(|&q| at_pole_point(surface, q, p));
+                || [p0, p1, p2].iter().any(|&q| at_pole_point(surface, q, p))
+                || facet_encloses_pole(surface, [p0, p1, p2], p, on_surface_tol);
             if !at_singularity && is_bridging_facet(uv0.0, uv1.0, uv2.0, p, span) {
                 e.3 += 1;
             }
@@ -2551,5 +2609,97 @@ mod manifold_report_sort_tests {
             two.face_map.push(*f + 1000);
         }
         same(&two, "two boxes");
+    }
+}
+
+#[cfg(test)]
+mod pole_enclosing_facet_tests {
+    //! A face that contains a sphere's pole in its interior is meshed with
+    //! a facet covering the pole, its corners on three sides of it. Their
+    //! `u` necessarily spread over more than half the period.
+    use super::mesh_quality_of_mesh;
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::face::{Face, FaceOrientation};
+    use crate::primitives::surface::{Sphere, Surface};
+    use crate::primitives::topology_builder::BRepModel;
+    use crate::tessellation::{MeshVertex, TriangleMesh};
+
+    const RADIUS: f64 = 2.0;
+
+    /// A radius-2 sphere face and one facet on it whose corners are the
+    /// surface points at the three `(u, v)` given.
+    fn one_facet(corners: [(f64, f64); 3]) -> (BRepModel, TriangleMesh) {
+        let mut model = BRepModel::new();
+        let sphere = Sphere::new(Point3::new(0.0, 0.0, 0.0), RADIUS).expect("sphere");
+        let positions: Vec<Point3> = corners
+            .iter()
+            .map(|&(u, v)| sphere.point_at(u, v).expect("point"))
+            .collect();
+        let surface = model.surfaces.add(Box::new(sphere));
+        let face = model
+            .faces
+            .add(Face::new(0, surface, 0, FaceOrientation::Forward));
+        let mut mesh = TriangleMesh::new();
+        let ids: Vec<u32> = positions
+            .iter()
+            .map(|&position| {
+                mesh.add_vertex(MeshVertex {
+                    position,
+                    normal: Vector3::Z,
+                    uv: None,
+                })
+            })
+            .collect();
+        mesh.add_triangle(ids[0], ids[1], ids[2]);
+        mesh.face_map.push(face);
+        (model, mesh)
+    }
+
+    /// The v of the sphere's pole at the end of its domain, and a v a
+    /// little way (0.02 rad, 0.04 mm) from it.
+    fn pole_and_near() -> (f64, f64) {
+        let sphere = Sphere::new(Point3::new(0.0, 0.0, 0.0), RADIUS).expect("sphere");
+        let (_, (v_lo, v_hi)) = sphere.parameter_bounds();
+        (v_hi, v_hi - 0.02 * (v_hi - v_lo).signum())
+    }
+
+    /// Three corners round the pole, 0.04 mm from it: a facet 0.07 mm across
+    /// lying on the sphere. It bridges nothing.
+    #[test]
+    fn a_facet_round_a_pole_is_not_a_bridge() {
+        let (_, near) = pole_and_near();
+        let third = std::f64::consts::TAU / 3.0;
+        let (model, mesh) =
+            one_facet([(0.3, near), (0.3 + third, near), (0.3 + 2.0 * third, near)]);
+        let q = mesh_quality_of_mesh(&model, &mesh).expect("quality");
+        assert_eq!(q.boundary_crossing_facets, 0, "{q:?}");
+    }
+
+    /// The same three directions at the equator: a facet through the middle
+    /// of the ball, two radii from either pole. Still a bridge.
+    #[test]
+    fn a_facet_through_the_ball_is_still_a_bridge() {
+        let (pole, near) = pole_and_near();
+        let equator = pole - (pole - near) * 25.0 * std::f64::consts::PI;
+        let third = std::f64::consts::TAU / 3.0;
+        let (model, mesh) = one_facet([
+            (0.3, equator),
+            (0.3 + third, equator),
+            (0.3 + 2.0 * third, equator),
+        ]);
+        let q = mesh_quality_of_mesh(&model, &mesh).expect("quality");
+        assert_eq!(q.boundary_crossing_facets, 1, "{q:?}");
+    }
+
+    /// Round the pole but far from it (1 rad down the sphere): the facet's
+    /// plane passes 0.9 mm under the pole, through the ball. Still a bridge.
+    #[test]
+    fn a_wide_facet_under_a_pole_is_still_a_bridge() {
+        let (pole, near) = pole_and_near();
+        let far = pole - (pole - near) * 50.0;
+        let third = std::f64::consts::TAU / 3.0;
+        let (model, mesh) = one_facet([(0.3, far), (0.3 + third, far), (0.3 + 2.0 * third, far)]);
+        let q = mesh_quality_of_mesh(&model, &mesh).expect("quality");
+        assert_eq!(q.boundary_crossing_facets, 1, "{q:?}");
     }
 }

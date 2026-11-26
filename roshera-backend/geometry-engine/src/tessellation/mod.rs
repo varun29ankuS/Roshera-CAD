@@ -438,6 +438,89 @@ pub fn tessellate_shell(
     tessellate_shell_with(shell, model, params, cache, mesh, true);
 }
 
+/// Rounds of [`resample_clashing_boundaries`].
+const BOUNDARY_CLASH_ROUNDS: usize = 6;
+
+/// One face's mesh as [`tessellate_shell_with`] collects it: the face, its
+/// surface, its triangles and how long they took.
+type FacePart = (u32, u32, TriangleMesh, std::time::Duration);
+
+/// Where a face could not be meshed soundly because the CHORDS of two of its
+/// boundary edges clash although the edges do not (see
+/// [`edge_cache::BoundaryClash`]), sample the offending edge twice as finely
+/// and mesh again every face of the shell that uses it -- the face itself
+/// and its neighbour across the edge, which must read the same samples.
+///
+/// Only a face that was left with nothing (its outline refused as crossing
+/// itself) or with facets turned against its surface is a reason to
+/// resample; every other face of the shell keeps the mesh it has, bit for
+/// bit, and a shell with no such face is not touched at all. Repeats while
+/// faces still report clashes, at most [`BOUNDARY_CLASH_ROUNDS`] times; an
+/// edge is doubled at most a fixed number of times, after which a face that
+/// still cannot be meshed stays refused, as before.
+fn resample_clashing_boundaries(
+    shell: &Shell,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    parts: &mut [FacePart],
+    mesh_faces: &dyn Fn(&[u32]) -> Vec<FacePart>,
+    trace: bool,
+) {
+    use edge_cache::BoundaryClashKind;
+    for round in 0..BOUNDARY_CLASH_ROUNDS {
+        let clashes: Vec<_> = cache
+            .take_boundary_clashes()
+            .into_iter()
+            .filter(|clash| {
+                parts.iter().any(|part| {
+                    part.0 == clash.face
+                        && match clash.kind {
+                            // A crossing outline that some other path still
+                            // meshed is not a face left with nothing.
+                            BoundaryClashKind::Crossing => part.2.triangles.is_empty(),
+                            BoundaryClashKind::TurnedFacet => true,
+                        }
+                })
+            })
+            .collect();
+        if clashes.is_empty() {
+            return;
+        }
+        let refined = cache.refine_clashing_edges(model, &clashes);
+        if refined.is_empty() {
+            return;
+        }
+        let uses_refined = |face_id: u32| {
+            model.faces.get(face_id).is_some_and(|face| {
+                std::iter::once(face.outer_loop)
+                    .chain(face.inner_loops.iter().copied())
+                    .filter_map(|l| model.loops.get(l))
+                    .any(|l| l.edges.iter().any(|e| refined.contains(e)))
+            })
+        };
+        let again: Vec<u32> = shell
+            .faces
+            .iter()
+            .copied()
+            .filter(|&f| uses_refined(f))
+            .collect();
+        if trace {
+            eprintln!(
+                "[tess] boundary clash round {round}: {} clash(es), edges {refined:?} resampled, faces {again:?} meshed again",
+                clashes.len()
+            );
+        }
+        for redone in mesh_faces(&again) {
+            if let Some(slot) = parts.iter_mut().find(|part| part.0 == redone.0) {
+                *slot = redone;
+            }
+        }
+    }
+    // Clashes of the last round stay unanswered; they are not the next
+    // shell's.
+    let _ = cache.take_boundary_clashes();
+}
+
 /// Faces of a shell are meshed independently -- a face reads only the model
 /// and the edge-sample cache (a concurrent map; an edge's samples are the
 /// same whichever face asks first) -- so they mesh in parallel, each into its
@@ -466,16 +549,16 @@ pub(crate) fn tessellate_shell_with(
         surface::tessellate_face(face, model, params, cache, &mut part);
         Some((face_id, face.surface_id, part, t0.elapsed()))
     };
-    let parts: Vec<_> = if parallel && shell.faces.len() > 1 {
-        use rayon::prelude::*;
-        shell
-            .faces
-            .par_iter()
-            .filter_map(|&f| mesh_one(f))
-            .collect()
-    } else {
-        shell.faces.iter().filter_map(|&f| mesh_one(f)).collect()
+    let mesh_faces = |faces: &[u32]| -> Vec<_> {
+        if parallel && faces.len() > 1 {
+            use rayon::prelude::*;
+            faces.par_iter().filter_map(|&f| mesh_one(f)).collect()
+        } else {
+            faces.iter().filter_map(|&f| mesh_one(f)).collect()
+        }
     };
+    let mut parts = mesh_faces(&shell.faces);
+    resample_clashing_boundaries(shell, model, cache, &mut parts, &mesh_faces, trace);
     for (face_id, surface_id, part, elapsed) in parts {
         if trace {
             let surface_kind = model
@@ -1443,5 +1526,587 @@ mod size_relative_edge_tests {
             0.0,
             "no cap stays no cap"
         );
+    }
+}
+
+#[cfg(test)]
+mod boundary_clash_tests {
+    //! Two edges of a face that leave a vertex at a shallow angle never
+    //! cross, but their CHORDS do when the outer one is sampled in longer
+    //! steps than the inner: the long chord cuts the corner and passes
+    //! through the short ones. The outline is then not a polygon, the face
+    //! was refused and left a hole in the shell (CADGenBench part 134).
+    use super::*;
+    use crate::math::nurbs::{
+        interpolate_nurbs_curve, NurbsSurface as MathNurbs, ParameterizationType,
+    };
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::curve::{NurbsCurve, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    use crate::primitives::face::{Face, FaceOrientation};
+    use crate::primitives::r#loop::{Loop, LoopType};
+    use crate::primitives::shell::{Shell, ShellType};
+    use crate::primitives::surface::{GeneralNurbsSurface, Plane};
+    use crate::primitives::topology_builder::BRepModel;
+    use std::f64::consts::PI;
+
+    const OUTER: f64 = 1.0;
+    const INNER: f64 = 0.97;
+
+    /// The curve through `points`, parameterised uniformly over them.
+    fn curve_through(points: &[Point3]) -> (NurbsCurve, ParameterRange) {
+        let fit = interpolate_nurbs_curve(points, 3, ParameterizationType::Uniform).expect("fit");
+        let knots = fit.knots.values().to_vec();
+        let range = ParameterRange::new(knots[0], knots[knots.len() - 1]);
+        let curve = NurbsCurve::new(
+            fit.degree,
+            fit.control_points.clone(),
+            fit.weights.clone(),
+            knots,
+        )
+        .expect("curve");
+        (curve, range)
+    }
+
+    /// A lens in the plane z = 0 (on a flat NURBS patch, or with `plane` on a
+    /// plane proper, which is meshed by the planar path), between
+    /// y = 0.97 sin x below and y = sin x above, for x in [0, pi]. The upper
+    /// edge runs at even speed; the lower one starts slowly (x = pi t^2), so
+    /// equal steps of its parameter are short near x = 0. Returns the model,
+    /// the shell, and the (lower, upper) edges.
+    fn lens(plane: bool) -> (BRepModel, Shell, u32, u32) {
+        let mut model = BRepModel::new();
+        let cp = vec![
+            vec![Point3::new(-1.0, -2.0, 0.0), Point3::new(-1.0, 2.0, 0.0)],
+            vec![Point3::new(5.0, -2.0, 0.0), Point3::new(5.0, 2.0, 0.0)],
+        ];
+        // u runs along +X and v along +Y, so the patch's normal is +Z.
+        let patch = MathNurbs::new(
+            cp,
+            vec![vec![1.0, 1.0], vec![1.0, 1.0]],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            1,
+            1,
+        )
+        .expect("patch");
+        let surface = if plane {
+            model.surfaces.add(Box::new(
+                Plane::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, Vector3::X).expect("plane"),
+            ))
+        } else {
+            model
+                .surfaces
+                .add(Box::new(GeneralNurbsSurface { nurbs: patch }))
+        };
+        let n = 64;
+        let upper_pts: Vec<Point3> = (0..=n)
+            .map(|k| {
+                let x = PI * k as f64 / n as f64;
+                Point3::new(x, OUTER * x.sin(), 0.0)
+            })
+            .collect();
+        let lower_pts: Vec<Point3> = (0..=n)
+            .map(|k| {
+                let t = k as f64 / n as f64;
+                let x = PI * t * t;
+                Point3::new(x, INNER * x.sin(), 0.0)
+            })
+            .collect();
+        let start = model.vertices.add(0.0, 0.0, 0.0);
+        let end = model.vertices.add(PI, 0.0, 0.0);
+        let (upper, upper_range) = curve_through(&upper_pts);
+        let (lower, lower_range) = curve_through(&lower_pts);
+        let upper_curve = model.curves.add(Box::new(upper));
+        let lower_curve = model.curves.add(Box::new(lower));
+        let e_upper = model.edges.add(Edge::new(
+            0,
+            start,
+            end,
+            upper_curve,
+            EdgeOrientation::Forward,
+            upper_range,
+        ));
+        let e_lower = model.edges.add(Edge::new(
+            0,
+            start,
+            end,
+            lower_curve,
+            EdgeOrientation::Forward,
+            lower_range,
+        ));
+        // Anticlockwise about +Z: out along the lower edge, back along the
+        // upper one.
+        let mut outer = Loop::new(0, LoopType::Outer);
+        outer.add_edge(e_lower, true);
+        outer.add_edge(e_upper, false);
+        let outer = model.loops.add(outer);
+        let face = model
+            .faces
+            .add(Face::new(0, surface, outer, FaceOrientation::Forward));
+        let mut shell = Shell::new(0, ShellType::Open);
+        shell.add_face(face);
+        (model, shell, e_lower, e_upper)
+    }
+
+    /// Coarse enough that each edge is first sampled in four steps.
+    fn coarse() -> TessellationParams {
+        TessellationParams {
+            max_edge_length: 10.0,
+            max_angle_deviation: 0.6,
+            chord_tolerance: 0.05,
+            min_segments: 3,
+            max_segments: 100,
+        }
+    }
+
+    fn area(mesh: &TriangleMesh) -> f64 {
+        mesh.triangles
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+                0.5 * (b - a).cross(&(c - a)).magnitude()
+            })
+            .sum()
+    }
+
+    /// The fixture is what it claims: meshed by itself with the first
+    /// samples, the face's outline crosses and it gets no triangles.
+    #[test]
+    fn the_lens_outline_crosses_at_the_first_sampling() {
+        let (model, shell, e_lower, e_upper) = lens(false);
+        let params = coarse();
+        let cache = EdgeSampleCache::new(&params);
+        let face = model.faces.get(shell.faces[0]).expect("face");
+        let mut alone = TriangleMesh::new();
+        surface::tessellate_face(face, &model, &params, &cache, &mut alone);
+        assert!(
+            alone.triangles.is_empty(),
+            "the outline crosses, so the face alone is refused ({} triangles)",
+            alone.triangles.len()
+        );
+        assert_eq!(cache.get_or_compute(e_upper, &model).len(), 5);
+        assert_eq!(cache.get_or_compute(e_lower, &model).len(), 5);
+        let clashes = cache.take_boundary_clashes();
+        assert!(
+            clashes
+                .iter()
+                .any(|c| c.kind == edge_cache::BoundaryClashKind::Crossing),
+            "and the refusal names the crossing segments: {clashes:?}"
+        );
+    }
+
+    /// Meshed as part of its shell, the edges whose chords clash are sampled
+    /// more finely and the face is meshed: all of it, facing up. (Near x = 0
+    /// the upper edge's first chord cuts the corner; at the crest each
+    /// edge's chord sags farther than the two edges stand apart.)
+    #[test]
+    fn a_face_whose_boundary_chords_cross_is_meshed_after_resampling() {
+        let (model, shell, e_lower, e_upper) = lens(false);
+        let params = coarse();
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_shell(&shell, &model, &params, &cache, &mut mesh);
+        assert!(!mesh.triangles.is_empty(), "the lens is meshed");
+        let upper = cache.get_or_compute(e_upper, &model);
+        let lower = cache.get_or_compute(e_lower, &model);
+        assert!(
+            upper.len() > 5,
+            "the upper edge, whose chord cut the corner, was resampled ({} samples)",
+            upper.len()
+        );
+        // The doubled stations contain the first ones, on both edges.
+        let first = EdgeSampleCache::new(&params);
+        for (edge, now) in [(e_upper, &upper), (e_lower, &lower)] {
+            assert_eq!((now.len() - 1) % 4, 0, "four steps, doubled: {}", now.len());
+            for p in first.get_or_compute(edge, &model).iter() {
+                assert!(
+                    now.iter().any(|q| (*q - *p).magnitude() < 1e-12),
+                    "a first sample {p:?} of edge {edge} is still a sample"
+                );
+            }
+        }
+        for t in &mesh.triangles {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+            assert!(
+                (b - a).cross(&(c - a)).z > 0.0,
+                "every facet faces up: {a:?} {b:?} {c:?}"
+            );
+        }
+        // The lens between the two sampled outlines; the true lens is
+        // 2 (1 - 0.97) = 0.06.
+        let polygon: Vec<Point3> = lower
+            .iter()
+            .copied()
+            .chain(upper.iter().rev().skip(1).copied())
+            .collect();
+        let outline_area = 0.5
+            * (0..polygon.len() - 1)
+                .map(|i| polygon[i].x * polygon[i + 1].y - polygon[i + 1].x * polygon[i].y)
+                .sum::<f64>();
+        assert!(
+            (area(&mesh) - outline_area).abs() < 1e-9,
+            "the mesh fills its outline exactly: {} against {outline_area}",
+            area(&mesh)
+        );
+        assert!(
+            outline_area > 0.0 && (outline_area - 0.06).abs() < 0.03,
+            "and the outline is the lens: {outline_area}"
+        );
+    }
+
+    /// The same lens as a face of a PLANE, which the planar triangulator
+    /// meshes: it refuses the crossing outline too (CADGenBench part 225),
+    /// and is answered the same way.
+    #[test]
+    fn a_flat_face_whose_boundary_chords_cross_is_meshed_after_resampling() {
+        let (model, shell, _, e_upper) = lens(true);
+        let params = coarse();
+        let face = model.faces.get(shell.faces[0]).expect("face");
+        let first = EdgeSampleCache::new(&params);
+        let mut alone = TriangleMesh::new();
+        surface::tessellate_face(face, &model, &params, &first, &mut alone);
+        assert!(
+            alone.triangles.is_empty(),
+            "the outline crosses, so the face alone is refused ({} triangles)",
+            alone.triangles.len()
+        );
+
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_shell(&shell, &model, &params, &cache, &mut mesh);
+        assert!(!mesh.triangles.is_empty(), "the lens is meshed");
+        assert!(cache.get_or_compute(e_upper, &model).len() > 5);
+        for t in &mesh.triangles {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+            assert!(
+                (b - a).cross(&(c - a)).z > 0.0,
+                "every facet faces up: {a:?} {b:?} {c:?}"
+            );
+        }
+        assert!(
+            (area(&mesh) - 0.06).abs() < 0.03,
+            "and fills the lens: {}",
+            area(&mesh)
+        );
+    }
+}
+
+#[cfg(test)]
+mod spherical_crescent_tests {
+    //! A sphere face bounded by arcs is filled by a fan from the centroid of
+    //! its rim, the rim first sorted by azimuth about that centroid. A
+    //! crescent's rim centroid lies in its hollow: both arcs span the same
+    //! azimuths from there, and the sort deals their samples together. The
+    //! fan then joined samples that are not neighbours on the boundary, and
+    //! the face did not meet the faces across its edges (CADGenBench part
+    //! 202).
+    use super::*;
+    use crate::math::nurbs::{interpolate_nurbs_curve, ParameterizationType};
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::curve::{NurbsCurve, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    use crate::primitives::face::{Face, FaceOrientation};
+    use crate::primitives::r#loop::{Loop, LoopType};
+    use crate::primitives::shell::{Shell, ShellType};
+    use crate::primitives::surface::Sphere;
+    use crate::primitives::topology_builder::BRepModel;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const RADIUS: f64 = 10.0;
+    /// Both arcs end on the chord from (8, 0, 6) to (-8, 0, 6).
+    const CHORD_HEIGHT: f64 = 6.0;
+
+    /// Points along the sphere's section by the plane through that chord
+    /// tilted `tilt` about it, from (8, 0, 6) over the far side to (-8, 0, 6).
+    fn arc(tilt: f64, n: usize) -> Vec<Point3> {
+        let normal = Vector3::new(0.0, tilt.sin(), tilt.cos());
+        let centre = normal * (CHORD_HEIGHT * tilt.cos());
+        let across = Vector3::new(0.0, tilt.cos(), -tilt.sin());
+        let rho = (RADIUS * RADIUS - (CHORD_HEIGHT * tilt.cos()).powi(2)).sqrt();
+        let t0 = (-CHORD_HEIGHT * tilt.sin() / rho).asin();
+        (0..=n)
+            .map(|k| {
+                let t = t0 + (std::f64::consts::PI - 2.0 * t0) * k as f64 / n as f64;
+                let p = centre + Vector3::X * (rho * t.cos()) + across * (rho * t.sin());
+                Point3::new(p.x, p.y, p.z)
+            })
+            .collect()
+    }
+
+    fn curve_through(points: &[Point3]) -> (NurbsCurve, ParameterRange) {
+        let fit =
+            interpolate_nurbs_curve(points, 3, ParameterizationType::ChordLength).expect("fit");
+        let knots = fit.knots.values().to_vec();
+        let range = ParameterRange::new(knots[0], knots[knots.len() - 1]);
+        let curve = NurbsCurve::new(
+            fit.degree,
+            fit.control_points.clone(),
+            fit.weights.clone(),
+            knots,
+        )
+        .expect("curve");
+        (curve, range)
+    }
+
+    /// The crescent on a radius-10 sphere between the sections tilted 0.3
+    /// and 0.45 rad, the sphere parameterised about `north`: the model, its
+    /// shell, and the (far, near) edges.
+    fn crescent(north: Vector3) -> (BRepModel, Shell, u32, u32) {
+        let mut model = BRepModel::new();
+        let sphere =
+            Sphere::with_orientation(Point3::new(0.0, 0.0, 0.0), RADIUS, Vector3::X, north)
+                .expect("sphere");
+        let surface = model.surfaces.add(Box::new(sphere));
+        let right = model.vertices.add(8.0, 0.0, CHORD_HEIGHT);
+        let left = model.vertices.add(-8.0, 0.0, CHORD_HEIGHT);
+        let (far, far_range) = curve_through(&arc(-0.3, 64));
+        let (near, near_range) = curve_through(&arc(-0.45, 64));
+        let far_curve = model.curves.add(Box::new(far));
+        let near_curve = model.curves.add(Box::new(near));
+        let e_far = model.edges.add(Edge::new(
+            0,
+            right,
+            left,
+            far_curve,
+            EdgeOrientation::Forward,
+            far_range,
+        ));
+        let e_near = model.edges.add(Edge::new(
+            0,
+            right,
+            left,
+            near_curve,
+            EdgeOrientation::Forward,
+            near_range,
+        ));
+        // Anticlockwise seen from outside: along the far arc, back along
+        // the near one.
+        let mut outer = Loop::new(0, LoopType::Outer);
+        outer.add_edge(e_far, true);
+        outer.add_edge(e_near, false);
+        let outer = model.loops.add(outer);
+        let face = model
+            .faces
+            .add(Face::new(0, surface, outer, FaceOrientation::Forward));
+        let mut shell = Shell::new(0, ShellType::Open);
+        shell.add_face(face);
+        (model, shell, e_far, e_near)
+    }
+
+    fn key(p: Point3) -> (i64, i64, i64) {
+        (
+            (p.x * 1e7).round() as i64,
+            (p.y * 1e7).round() as i64,
+            (p.z * 1e7).round() as i64,
+        )
+    }
+
+    /// The point of the sphere at `colatitude` from +Z and `azimuth` from +X.
+    fn on_sphere(colatitude: f64, azimuth: f64) -> Vector3 {
+        Vector3::new(
+            colatitude.sin() * azimuth.cos(),
+            colatitude.sin() * azimuth.sin(),
+            colatitude.cos(),
+        ) * RADIUS
+    }
+
+    /// Points along the great arc from `a` to `b`.
+    fn great_arc(a: Vector3, b: Vector3, n: usize) -> Vec<Point3> {
+        let (ua, ub) = (a * (1.0 / RADIUS), b * (1.0 / RADIUS));
+        let angle = ua.dot(&ub).clamp(-1.0, 1.0).acos();
+        (0..=n)
+            .map(|k| {
+                let t = k as f64 / n as f64;
+                let p = (ua * ((1.0 - t) * angle).sin() + ub * (t * angle).sin())
+                    * (RADIUS / angle.sin());
+                Point3::new(p.x, p.y, p.z)
+            })
+            .collect()
+    }
+
+    /// A sliver of the sphere: a triangle 10 mm long and 0.5 mm high whose
+    /// long side runs straight over the pole. Returns the model, its shell
+    /// and its three edges.
+    fn sliver_over_the_pole() -> (BRepModel, Shell, [u32; 3]) {
+        let mut model = BRepModel::new();
+        let sphere = Sphere::new(Point3::new(0.0, 0.0, 0.0), RADIUS).expect("sphere");
+        let surface = model.surfaces.add(Box::new(sphere));
+        let corners = [
+            on_sphere(0.5, 0.0),
+            on_sphere(0.05, std::f64::consts::FRAC_PI_2),
+            on_sphere(0.5, std::f64::consts::PI),
+        ];
+        let vertices: Vec<u32> = corners
+            .iter()
+            .map(|c| model.vertices.add(c.x, c.y, c.z))
+            .collect();
+        // Anticlockwise seen from outside: +X corner, the low apex on +Y,
+        // -X corner, and back over the pole.
+        let mut outer = Loop::new(0, LoopType::Outer);
+        let mut edges = [0u32; 3];
+        for k in 0..3 {
+            let (curve, range) = curve_through(&great_arc(corners[k], corners[(k + 1) % 3], 64));
+            let curve = model.curves.add(Box::new(curve));
+            edges[k] = model.edges.add(Edge::new(
+                0,
+                vertices[k],
+                vertices[(k + 1) % 3],
+                curve,
+                EdgeOrientation::Forward,
+                range,
+            ));
+            outer.add_edge(edges[k], true);
+        }
+        let outer = model.loops.add(outer);
+        let face = model
+            .faces
+            .add(Face::new(0, surface, outer, FaceOrientation::Forward));
+        let mut shell = Shell::new(0, ShellType::Open);
+        shell.add_face(face);
+        (model, shell, edges)
+    }
+
+    /// The mesh's boundary (edges one facet uses) against the edges' own
+    /// sample segments, and every facet facing out of the sphere.
+    fn assert_conforms(
+        mesh: &TriangleMesh,
+        model: &BRepModel,
+        cache: &EdgeSampleCache,
+        edges: &[u32],
+    ) {
+        let mut uses: BTreeMap<((i64, i64, i64), (i64, i64, i64)), usize> = BTreeMap::new();
+        for t in &mesh.triangles {
+            for k in 0..3 {
+                let (a, b) = (
+                    key(mesh.vertices[t[k] as usize].position),
+                    key(mesh.vertices[t[(k + 1) % 3] as usize].position),
+                );
+                *uses.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let open: BTreeSet<_> = uses
+            .iter()
+            .filter(|(_, &n)| n == 1)
+            .map(|(e, _)| *e)
+            .collect();
+        let mut wanted = BTreeSet::new();
+        for &edge in edges {
+            let samples = cache.get_or_compute(edge, model);
+            for pair in samples.windows(2) {
+                let (a, b) = (key(pair[0]), key(pair[1]));
+                wanted.insert((a.min(b), a.max(b)));
+            }
+        }
+        assert_eq!(
+            open,
+            wanted,
+            "the mesh's boundary is the edges' samples, each joined to the next: {} mesh \
+             boundary edges against {} sample segments",
+            open.len(),
+            wanted.len()
+        );
+        for t in &mesh.triangles {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+            let centre = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+            assert!(
+                (b - a).cross(&(c - a)).dot(&centre.to_vec()) >= 0.0,
+                "a facet faces into the sphere: {a:?} {b:?} {c:?}"
+            );
+        }
+    }
+
+    /// Near each sharp corner of a sliver, the samples of its two long sides
+    /// have nearly one azimuth from the centroid, and sorting by azimuth
+    /// dealt them together.
+    #[test]
+    fn a_spherical_sliver_over_the_pole_meets_its_edges_sample_for_sample() {
+        let (model, shell, edges) = sliver_over_the_pole();
+        let params = TessellationParams::coarse();
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_shell(&shell, &model, &params, &cache, &mut mesh);
+        assert!(!mesh.triangles.is_empty(), "the sliver is meshed");
+        assert_conforms(&mesh, &model, &cache, &edges);
+    }
+
+    /// The same crescent on a sphere whose pole lies INSIDE it (midway
+    /// between the two arcs): the sphere's own chart has no outline of such
+    /// a region, so it is triangulated in the chart of the sphere turned to
+    /// face it.
+    #[test]
+    fn a_spherical_crescent_holding_a_pole_meets_its_edges_sample_for_sample() {
+        let (model, shell, e_far, e_near) = crescent(Vector3::new(0.0, 0.568, 0.823));
+        let params = TessellationParams::coarse();
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_shell(&shell, &model, &params, &cache, &mut mesh);
+        assert!(!mesh.triangles.is_empty(), "the crescent is meshed");
+        assert_conforms(&mesh, &model, &cache, &[e_far, e_near]);
+        assert!(
+            mesh.triangles.iter().all(|t| {
+                let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+                let centre = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+                (b - a).cross(&(c - a)).dot(&centre.to_vec()) > 0.0
+            }),
+            "every facet faces out of the sphere"
+        );
+    }
+
+    #[test]
+    fn a_spherical_crescent_meets_its_edges_sample_for_sample() {
+        let (model, shell, e_far, e_near) = crescent(Vector3::Z);
+        let params = TessellationParams::coarse();
+        let cache = EdgeSampleCache::new(&params);
+        let mut mesh = TriangleMesh::new();
+        tessellate_shell(&shell, &model, &params, &cache, &mut mesh);
+        assert!(!mesh.triangles.is_empty(), "the crescent is meshed");
+
+        // The mesh's own boundary: the edges one facet uses.
+        let mut uses: BTreeMap<((i64, i64, i64), (i64, i64, i64)), usize> = BTreeMap::new();
+        for t in &mesh.triangles {
+            for k in 0..3 {
+                let (a, b) = (
+                    key(mesh.vertices[t[k] as usize].position),
+                    key(mesh.vertices[t[(k + 1) % 3] as usize].position),
+                );
+                *uses.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let open: BTreeSet<_> = uses
+            .iter()
+            .filter(|(_, &n)| n == 1)
+            .map(|(e, _)| *e)
+            .collect();
+        assert!(
+            uses.values().all(|&n| n <= 2),
+            "no edge is used by more than two facets"
+        );
+        // The boundary's own segments: each edge's samples, one to the next.
+        let mut wanted = BTreeSet::new();
+        for edge in [e_far, e_near] {
+            let samples = cache.get_or_compute(edge, &model);
+            for pair in samples.windows(2) {
+                let (a, b) = (key(pair[0]), key(pair[1]));
+                wanted.insert((a.min(b), a.max(b)));
+            }
+        }
+        assert_eq!(
+            open,
+            wanted,
+            "the mesh's boundary is the edges' samples, each joined to the next: {} mesh \
+             boundary edges against {} sample segments",
+            open.len(),
+            wanted.len()
+        );
+        // Every facet faces out of the sphere.
+        for t in &mesh.triangles {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+            let centre = (a + b.to_vec() + c.to_vec()) * (1.0 / 3.0);
+            assert!(
+                (b - a).cross(&(c - a)).dot(&centre.to_vec()) > 0.0,
+                "a facet faces into the sphere: {a:?} {b:?} {c:?}"
+            );
+        }
     }
 }

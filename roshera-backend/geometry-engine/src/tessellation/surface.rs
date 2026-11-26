@@ -955,6 +955,20 @@ fn tessellate_planar_face(
     // the polygon, the retain filter then dropped them all, and the
     // face emitted zero triangles.
     let triangles = triangulate_planar_polygon(&all_vertices, &loop_boundaries, &normal);
+    if triangles.is_empty() {
+        // Left with nothing: if that is because two of the outline's chords
+        // pass through each other, say which, so the shell can sample the
+        // edge that owns the offending chord more finely and mesh this face
+        // and its neighbours again (`resample_clashing_boundaries`).
+        for segments in crossing_planar_boundary_segments(&all_vertices, &loop_boundaries, &normal)
+        {
+            cache.note_boundary_clash(
+                face.id,
+                super::edge_cache::BoundaryClashKind::Crossing,
+                segments,
+            );
+        }
+    }
 
     // Add vertices to mesh and build index mapping
     let mut vertex_map = Vec::new();
@@ -987,6 +1001,61 @@ fn tessellate_planar_face(
             vertex_map[triangle[2]],
         );
     }
+}
+
+/// Every pair of a planar face's outline segments that pass through each
+/// other, seen along `normal`, each pair as its two segments' 3D end points
+/// (the cached edge samples). Two edges that meet at a shallow angle never
+/// cross, but their chords do when one is sampled in longer steps than the
+/// other (CADGenBench part 225: two flat faces of 192 samples each refused
+/// for one crossing, and the thirty cylinders round them left open).
+fn crossing_planar_boundary_segments(
+    vertices: &[Point3],
+    loop_boundaries: &[(usize, usize, bool)],
+    normal: &Vector3,
+) -> Vec<Vec<[Point3; 2]>> {
+    const MOST: usize = 64;
+    let (u_axis, v_axis) = compute_plane_axes(normal);
+    let Some(&origin) = vertices.first() else {
+        return Vec::new();
+    };
+    let flat = |p: Point3| {
+        let r = p - origin;
+        (r.dot(&u_axis), r.dot(&v_axis))
+    };
+    let mut segments: Vec<((f64, f64), (f64, f64), Point3, Point3)> = Vec::new();
+    for &(start, end, _) in loop_boundaries {
+        if end > vertices.len() || end < start + 3 {
+            continue;
+        }
+        for i in start..end {
+            let j = if i + 1 == end { start } else { i + 1 };
+            segments.push((
+                flat(vertices[i]),
+                flat(vertices[j]),
+                vertices[i],
+                vertices[j],
+            ));
+        }
+    }
+    let side = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+        (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+    };
+    let mut out = Vec::new();
+    for (i, &(a, b, a3, b3)) in segments.iter().enumerate() {
+        for &(c, d, c3, d3) in segments.iter().skip(i + 1) {
+            if a3 == c3 || a3 == d3 || b3 == c3 || b3 == d3 {
+                continue;
+            }
+            if side(a, b, c) * side(a, b, d) < 0.0 && side(c, d, a) * side(c, d, b) < 0.0 {
+                out.push(vec![[a3, b3], [c3, d3]]);
+                if out.len() >= MOST {
+                    return out;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Sample a loop's edges into a dense 3D polygon for the planar
@@ -3373,6 +3442,47 @@ fn tessellate_spherical_large_region(
     true
 }
 
+/// How far from its centre direction a region may reach and still be meshed
+/// in the turned chart of [`sphere_turned_to_face`]: 70 degrees, which keeps
+/// it 20 degrees clear of that chart's poles.
+const TURNED_SPHERE_REACH: f64 = 1.2217304763960306;
+
+/// The same sphere parameterised about an axis square to `centre_dir`, with
+/// its seam on the far side: a region round `centre_dir` then lies on the
+/// chart's equator. `None` when the region (its rim directions `rim_dirs`)
+/// reaches too far from `centre_dir` to stay clear of the turned chart's
+/// poles, or the turned sphere's normal would not be the original's.
+fn sphere_turned_to_face(
+    sphere: &crate::primitives::surface::Sphere,
+    centre_dir: Vector3,
+    square_to_it: Vector3,
+    rim_dirs: &[Vector3],
+) -> Option<crate::primitives::surface::Sphere> {
+    let reach = rim_dirs
+        .iter()
+        .map(|d| d.dot(&centre_dir).clamp(-1.0, 1.0).acos())
+        .fold(0.0_f64, f64::max);
+    if reach > TURNED_SPHERE_REACH {
+        return None;
+    }
+    let turned = crate::primitives::surface::Sphere::with_orientation(
+        sphere.center,
+        sphere.radius,
+        centre_dir * -1.0,
+        square_to_it,
+    )
+    .ok()?;
+    // Both must call the same side of the sphere "out".
+    let at = sphere.center + centre_dir * sphere.radius;
+    let tol = Tolerance::default();
+    let normal_of = |s: &dyn Surface| -> Option<Vector3> {
+        let (u, v) = s.closest_point(&at, tol).ok()?;
+        s.normal_at(u, v).ok()
+    };
+    let (a, b) = (normal_of(sphere)?, normal_of(&turned)?);
+    (a.dot(&b) > 0.0).then_some(turned)
+}
+
 /// Tessellate an arc-bounded spherical POLYGON (a face of a mutually-intersecting
 /// cut-circle arrangement — the corner-poke case, where the region is a spherical
 /// triangle/quad bounded by circle arcs with no inner holes).
@@ -3471,6 +3581,92 @@ fn tessellate_spherical_polygon(
             let aj = dirs[j].dot(&e2).atan2(dirs[j].dot(&e1));
             ai.partial_cmp(&aj).unwrap_or(std::cmp::Ordering::Equal)
         });
+        // That sort assumes the region is seen whole from its rim's centroid.
+        // A crescent -- two arcs bulging the same way between two corners --
+        // is not: the centroid lies in its hollow, both arcs span the same
+        // azimuths from there, and the sort deals their samples together
+        // like two halves of a deck. The fan then joins samples that are
+        // not neighbours on the boundary and the face no longer meets the
+        // faces across its edges (CADGenBench part 202: 12 open mesh edges
+        // on a three-arc spherical sliver). The tell is measured, not
+        // assumed: a sort that only rotates or reverses the loop's own order
+        // changes nothing, and one that repairs a loop assembled out of
+        // order makes the rim SHORTER; a sort that makes the rim LONGER has
+        // scrambled a boundary that was in order. Such a face is meshed from
+        // its edges by the constrained triangulation instead. Where the
+        // region holds one of the sphere's poles the sphere's own chart has
+        // no outline of it to triangulate (the boundary goes once round the
+        // chart), so the triangulation is then tried in the chart of the
+        // same sphere turned to put the region on its equator, away from
+        // both poles and the seam (CADGenBench part 202: a sliver with a
+        // pole 0.2 mm inside its long edge). If both refuse, the fan below
+        // stands as before.
+        let in_loop_order = (0..m).all(|k| (order[(k + 1) % m] + m - order[k]) % m == 1)
+            || (0..m).all(|k| (order[k] + m - order[(k + 1) % m]) % m == 1);
+        if !in_loop_order {
+            let length = |idx: &dyn Fn(usize) -> usize| -> f64 {
+                (0..m)
+                    .map(|k| (rim[idx((k + 1) % m)] - rim[idx(k)]).magnitude())
+                    .sum()
+            };
+            let as_stored = length(&|k| k);
+            let as_sorted = length(&|k| order[k]);
+            if as_sorted > as_stored * (1.0 + 1e-9) {
+                let mut from_edges = TriangleMesh::new();
+                if super::curved_cdt::tessellate_curved_cdt(
+                    surface,
+                    face,
+                    model,
+                    params,
+                    cache,
+                    &mut from_edges,
+                )
+                .is_ok()
+                    && !from_edges.triangles.is_empty()
+                {
+                    let base = mesh.vertices.len() as u32;
+                    mesh.vertices.extend(from_edges.vertices);
+                    mesh.triangles.extend(
+                        from_edges
+                            .triangles
+                            .into_iter()
+                            .map(|t| [t[0] + base, t[1] + base, t[2] + base]),
+                    );
+                    return true;
+                }
+                if let Some(turned) = sphere_turned_to_face(sphere, cdir, e1, &dirs) {
+                    let mut from_edges = TriangleMesh::new();
+                    if super::curved_cdt::tessellate_curved_cdt(
+                        &turned as &dyn Surface,
+                        face,
+                        model,
+                        params,
+                        cache,
+                        &mut from_edges,
+                    )
+                    .is_ok()
+                        && !from_edges.triangles.is_empty()
+                    {
+                        let base = mesh.vertices.len() as u32;
+                        // The (u, v) these vertices carry are the turned
+                        // chart's, not the face's surface's: dropped.
+                        mesh.vertices.extend(
+                            from_edges
+                                .vertices
+                                .into_iter()
+                                .map(|v| MeshVertex { uv: None, ..v }),
+                        );
+                        mesh.triangles.extend(
+                            from_edges
+                                .triangles
+                                .into_iter()
+                                .map(|t| [t[0] + base, t[1] + base, t[2] + base]),
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
         rim = order.iter().map(|&i| rim[i]).collect();
         dirs = order.iter().map(|&i| dirs[i]).collect();
     }
