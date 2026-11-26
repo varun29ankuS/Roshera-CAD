@@ -2,6 +2,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
+import { certificateTable } from "../cert_table.js";
 import { api, ok, fail, ApiError, imageFreshness, recordImageSent, lastPartMutationTurn, lastGlobalMutationTurnValue, PART_ID_DOC } from "../core.js";
 
 export function registerPerceptionTools(server: ToolHost) {
@@ -187,12 +188,7 @@ export function registerPerceptionTools(server: ToolHost) {
         const valid = (cert?.brep_valid ?? p.valid) === true;
         const sound = p?.sound === true;
         const meshClean = r.open_edges === 0 && r.nonmanifold_edges === 0;
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
+        const answer = {
                   part_id,
                   sound,
                   brep_valid: valid,
@@ -233,11 +229,24 @@ export function registerPerceptionTools(server: ToolHost) {
                   // silently served). `sound`/`verdict` above stay a true statement about
                   // THIS solid; this never rewrites them. Absent = nothing withheld.
                   durability: p?.durability ?? undefined,
-                },
-                null,
-                2,
-              ),
+        };
+        return {
+          content: [
+            // The certificate one check per line, verdict at the right edge
+            // (Varun, 2026-11-26) -- read first; the JSON below carries the
+            // same facts for programs.
+            {
+              type: "text",
+              text: certificateTable({
+                ...answer,
+                part: p?.name ?? undefined,
+                face_count: p?.face_count,
+                open_edges: p?.open_edges,
+                nonmanifold_edges: p?.nonmanifold_edges,
+                euler_characteristic: p?.euler_characteristic,
+              }),
             },
+            { type: "text", text: JSON.stringify(answer, null, 2) },
             { type: "image", data: r.png_base64, mimeType: "image/png" },
           ],
         };
