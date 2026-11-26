@@ -22,15 +22,26 @@
 //!
 //! | entry                                   | drilled wall | far end                         |
 //! |-----------------------------------------|--------------|---------------------------------|
-//! | the wall itself                         | cylinder     | exit plane (THRU), flat floor, or a drill-point cone |
-//! | counterbore: larger coaxial cylinder + planar annular step (concave outer rim, convex inner rim) | cylinder | exit plane (THRU) |
-//! | countersink: coaxial cone opening to the entry plane, meeting the wall convexly | cylinder | exit plane (THRU) |
+//! | the wall itself                         | cylinder     | exit plane (THRU), flat floor, a drill-point cone, or a closed end of unclaimed form |
+//! | counterbore: larger coaxial cylinder + planar annular step (concave outer rim, convex inner rim) | cylinder | exit plane (THRU), flat floor, or a drill-point cone |
+//! | countersink: coaxial cone opening to the entry plane, meeting the wall convexly | cylinder | exit plane (THRU), flat floor, or a drill-point cone |
+//!
+//! A blind hole's depth is always the full-diameter depth from the ENTRY face
+//! (the face the counterbore or countersink opens onto), so a counterbored
+//! blind hole reads `Ø3.81 ↧ 6.35 ⌴ Ø6.35 ↧ 3.17`: one hole, not a Ø3.81 hole
+//! and a Ø6.35 hole printed on the same centre.
+//!
+//! A "closed end of unclaimed form" is a blind end made of faces that are
+//! neither a plane nor an analytic coaxial cone — a drill point or ball end a
+//! STEP exporter wrote as spline surfaces. The recogniser proves only that the
+//! hole ENDS there (those faces touch nothing but each other and the wall) and
+//! states the full-diameter depth; it claims no drill-point angle.
 //!
 //! Every rim must be a full circle, every plane perpendicular to the axis,
 //! every wall a cavity (material surrounding the axis). Anything else — a
-//! counterbore over a blind hole, a counterbore AND a countersink, a hole that
-//! breaks out into another feature, a chamfered exit — is not claimed: those
-//! bores keep their plain hole-table rows. THRU is decided by TOPOLOGY (the
+//! counterbore AND a countersink, two counterbores, a hole that breaks out
+//! into another feature, a chamfered exit — is not claimed: those bores keep
+//! their plain hole-table rows. THRU is decided by TOPOLOGY (the
 //! drilled wall's far rim opens onto a plane facing away from the entry), not
 //! by comparing the wall's length with the part's extent — the comparison
 //! that called the counterbored hole blind.
@@ -338,6 +349,12 @@ enum End {
     Floor { faces: Vec<u32> },
     /// A coaxial cone wall sharing the rim.
     Cone { wall: usize, convex: bool },
+    /// A closed end whose form is not claimed: faces that are neither a plane
+    /// nor a coaxial analytic cone (a drill point or ball end a STEP exporter
+    /// wrote as spline surfaces), meeting the wall concavely or tangentially
+    /// and bounded by nothing but the wall's rim. The hole provably ends
+    /// there; only its full-diameter depth is stated.
+    Closed { faces: Vec<u32> },
     /// Anything else.
     Other,
 }
@@ -539,6 +556,17 @@ fn classify_end(
         return End::Other;
     }
 
+    // A closed end of unclaimed form: no neighbour is a plane, and the faces
+    // reached from the rim touch nothing but each other and this wall.
+    if others.iter().all(|&f| plane_normal(g, f).is_none())
+        && matches!(convexity, EdgeConvexity::Concave | EdgeConvexity::Tangent)
+    {
+        return match closed_cap(g, w, &others) {
+            Some(faces) => End::Closed { faces },
+            None => End::Other,
+        };
+    }
+
     // Otherwise every neighbour must be ONE plane perpendicular to the axis.
     let mut plane: Option<([f64; 3], [f64; 3])> = None;
     for &f in &others {
@@ -631,6 +659,40 @@ fn classify_end(
         }
         _ => End::Other,
     }
+}
+
+/// Most faces a closed hole end may have (a drill point or ball end split
+/// into halves or quarters); a search that grows past it is not a cap.
+const MAX_CAP_FACES: usize = 8;
+
+/// The faces closing the end of wall `w` that starts at `rim_faces`: every
+/// face reachable from the rim without crossing the wall. `None` when that set
+/// touches any face outside itself and the wall (the "end" opens into another
+/// feature), holds a plane (a floor or a step is classified as such, never as
+/// an unclaimed form), or grows past [`MAX_CAP_FACES`].
+fn closed_cap(
+    g: &AttributedAdjacencyGraph,
+    w: &Wall,
+    rim_faces: &BTreeSet<u32>,
+) -> Option<Vec<u32>> {
+    let mut cap: BTreeSet<u32> = rim_faces.clone();
+    let mut frontier: Vec<u32> = rim_faces.iter().copied().collect();
+    while let Some(f) = frontier.pop() {
+        if plane_normal(g, f).is_some() {
+            return None;
+        }
+        for (_, other) in g.neighbours(f) {
+            if w.faces.contains(&other) || cap.contains(&other) {
+                continue;
+            }
+            if cap.len() >= MAX_CAP_FACES {
+                return None;
+            }
+            cap.insert(other);
+            frontier.push(other);
+        }
+    }
+    Some(cap.into_iter().collect())
 }
 
 /// Station of the far end of a cone wall away from the end that touches
@@ -768,14 +830,14 @@ pub fn recognize_hole_stacks(model: &BRepModel, solid_id: SolidId) -> Vec<HoleSt
             let through;
             match far {
                 End::Opening { .. } => through = true,
-                End::Floor { faces } if counterbore.is_none() && countersink.is_none() => {
+                End::Floor { faces } => {
                     through = false;
                     floor_faces.extend(faces.iter().copied());
                 }
                 End::Cone {
                     wall,
                     convex: false,
-                } if counterbore.is_none() && countersink.is_none() => {
+                } => {
                     // A drill point: the cone closes to its apex — it has no
                     // other rim, and it narrows away from the entry.
                     let c = &walls[*wall];
@@ -796,6 +858,12 @@ pub fn recognize_hole_stacks(model: &BRepModel, solid_id: SolidId) -> Vec<HoleSt
                     floor_faces.extend(c.faces.iter().copied());
                     extra_walls.push(*wall);
                     drill_point_deg = Some(2.0 * half_angle.to_degrees());
+                }
+                End::Closed { faces } => {
+                    // Closed by faces whose form is not claimed: blind, to the
+                    // end of the full-diameter wall.
+                    through = false;
+                    floor_faces.extend(faces.iter().copied());
                 }
                 _ => continue,
             }

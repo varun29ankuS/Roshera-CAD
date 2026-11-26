@@ -158,8 +158,9 @@ const table = buildTable();
   // 139 -> 140 (2026-11-23): sim_materials -- the cited material library.
   // 140 -> 141 (2026-11-24): timeline_dependencies.
   // 141 -> 142 (2026-11-24): timeline_material_change.
-  if (table.size === 142) pass("table holds 142 tools (137 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 142`);
+  // 142 -> 143 (2026-11-26): drawing_set_sheet.
+  if (table.size === 143) pass("table holds 143 tools (138 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 143`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -200,8 +201,9 @@ const table = buildTable();
   // 136 -> 137 (2026-11-23): sim_materials.
   // 137 -> 138 (2026-11-24): timeline_dependencies.
   // 138 -> 139 (2026-11-24): timeline_material_change.
-  if (full.length === 139) pass("full surface exposes exactly 139 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 139`);
+  // 139 -> 140 (2026-11-26): drawing_set_sheet.
+  if (full.length === 140) pass("full surface exposes exactly 140 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 140`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");

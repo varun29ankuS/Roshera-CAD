@@ -41,7 +41,7 @@
 use crate::dependency_projection::build_dependency_graph;
 use crate::mould::{is_param_meta, OverrideSet};
 use crate::replay::{
-    apply_event, projection_switches, rederive_part_drawing, AssemblyStore, DrawingRederive,
+    apply_event, rederive_part_drawing, sheet_switches, AssemblyStore, DrawingRederive,
     DrawingStore, ReplayError, ReplayOutcome,
 };
 use crate::types::{Operation, TimelineEvent};
@@ -199,7 +199,7 @@ fn replay_with_report(
     let mut assemblies = AssemblyStore::default();
     let mut drawings = DrawingStore::default();
     let mut per_event: HashMap<u64, EventResult> = HashMap::new();
-    let switches = projection_switches(events);
+    let switches = sheet_switches(events);
     let mut deferred_sheets: Vec<(u64, TimelineEvent)> = Vec::new();
 
     for event in events {
@@ -440,7 +440,7 @@ fn replay_with_report_frames(
     // through every later feature -- against the final model, under the same
     // cache key the live sheet rebuild uses.
     let overrides = OverrideSet::collect(events);
-    let switches = projection_switches(events);
+    let switches = sheet_switches(events);
     let mut ordered: Vec<&TimelineEvent> = events.iter().collect();
     ordered.sort_by_key(|e| e.sequence_number);
     let geometry: Vec<TimelineEvent> = ordered

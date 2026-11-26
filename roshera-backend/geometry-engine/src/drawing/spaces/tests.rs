@@ -283,16 +283,26 @@ fn title_block_labels_under_2_5_mm_get_text_height() {
 }
 
 #[test]
-fn dimension_text_under_3_5_mm_on_a3_gets_text_height() {
-    let d = sheet(SheetSize::A3);
+fn dimension_text_under_3_5_mm_on_a2_gets_text_height() {
+    let d = sheet(SheetSize::A2);
     let l = layout_of(&d, &[GEO], vec![hdim("a", "60", 100.0, 160.0, 10.0, &GEO)]);
     let map = space_map(&d, &l);
     let f = map
         .space("view:FRONT/band:top/lane:1")
         .and_then(|s| s.findings.iter().find(|f| f.rule == Rule::TextHeight))
-        .expect("2.52 mm capitals on A3");
+        .expect("2.52 mm capitals on A2");
     assert_eq!(f.severity, Severity::Warning);
     assert_eq!(f.tolerance.min, Some(TEXT_HEIGHT_LARGE_SHEET_MM));
+}
+
+#[test]
+fn dimension_text_of_2_5_mm_on_a3_meets_text_height() {
+    // The 3.5 mm step starts at A2 (BS 8888's table after ISO 3098; the
+    // founder's rule, 2026-11-26). A3 takes the 2.5 mm minimum like A4.
+    let d = sheet(SheetSize::A3);
+    let l = layout_of(&d, &[GEO], vec![hdim("a", "60", 100.0, 160.0, 10.0, &GEO)]);
+    let map = space_map(&d, &l);
+    assert!(!rules_in(&map, "view:FRONT/band:top/lane:1").contains(&Rule::TextHeight));
 }
 
 // ── TRAILING-ZERO ─────────────────────────────────────────────────────────

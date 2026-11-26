@@ -308,6 +308,7 @@ const EXPERIMENTAL = new Set<string>([
   "drawing_query",
   "drawing_set_dimension",
   "drawing_set_projection",
+  "drawing_set_sheet",
   "drawing_set_title",
   "drawing_dimensions",
   "drawing_dimension_properties",
@@ -421,6 +422,7 @@ const BENCH_OF: Record<string, Bench> = {
   drawing_export_sheet: "drawing",
   drawing_set_dimension: "drawing",
   drawing_set_projection: "drawing",
+  drawing_set_sheet: "drawing",
   drawing_set_title: "drawing",
   drawing_dimensions: "drawing",
   // The space map: the agent sees a sheet as its scored spaces

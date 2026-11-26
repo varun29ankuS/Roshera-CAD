@@ -99,7 +99,8 @@ console.log("(w1) WORKBENCH status shape");
     // drawing_remove_view, drawing_remove_dimension) landed 2026-11-20 with the
     // ceiling raised to 58 but this pin left at 21 -- this file was in no npm
     // script; it now runs in test:gates.
-    drawing: 27,
+    // 27 -> 28 (2026-11-26): drawing_set_sheet (ceiling 58 -> 59).
+    drawing: 28,
     // 14 -> 19 (sim_* landed 2026-11-23) -> 14 (2026-11-24): the five sim_*
     // tools moved to their own 'simulate' bench.
     analysis: 14,

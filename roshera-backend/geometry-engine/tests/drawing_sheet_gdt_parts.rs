@@ -1472,15 +1472,35 @@ fn the_flange_frame_leaders_are_seen_by_leader_angle() {
     }
 }
 
-/// The hub's angle callout hangs on a leader 62 mm long at 14 degrees to its
-/// shoulder (LEADER-ANGLE). `drawing_reattach_leader` re-routes it short, at
-/// 30-60 degrees, its text clear: the leader is in band, its band's score
+/// The hub's angle callout, dragged down beside its arrow, hangs on a shallow
+/// leader (LEADER-ANGLE). `drawing_reattach_leader` re-routes it short, at
+/// 30-60 degrees, its text clear: the leader is in band, its space's score
 /// rises, the certificate passes, the recorded edit replays to the same
 /// sheet, and the record it replaced puts the sheet back exactly (undo).
 #[test]
 fn reattaching_the_hub_angle_leader_brings_it_into_band() {
     use geometry_engine::drawing::hands;
-    let (m, d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    let (m, mut d) = sheet_with_model(en1092_weld_neck_with_gdt);
+    // The automatic route now leads it out at 45 degrees (every clear way
+    // out is tried, the shortest kept), so the shallow leader this verb
+    // repairs is made the way an engineer makes one: the callout dragged
+    // down beside its arrow, a recorded text shift.
+    let auto = compute_layout(&d);
+    let leg0 = auto
+        .dimensions
+        .iter()
+        .find(|p| p.dim_id == "d27")
+        .expect("d27 placed")
+        .ext[0];
+    d.set_dimension_edit(
+        "d27",
+        geometry_engine::drawing::dimension_edit::DimensionEdit {
+            text_shift_mm: Some([0.0, 0.8 * (leg0[0][1] - leg0[1][1])]),
+            ..Default::default()
+        },
+        false,
+    )
+    .expect("drag d27");
     let before = compute_layout(&d);
     let pd = before
         .dimensions
@@ -1501,8 +1521,10 @@ fn reattaching_the_hub_angle_leader_brings_it_into_band() {
     let leg = |p: &geometry_engine::drawing::layout::PlacedDimension| {
         (p.ext[0][1][0] - p.ext[0][0][0]).hypot(p.ext[0][1][1] - p.ext[0][0][1])
     };
+    // Shorter than the dragged leg (18.6 mm on this sheet; the re-route is
+    // the 10 mm minimum run at 45 degrees).
     assert!(
-        leg(pd2) < 0.5 * leg(pd),
+        leg(pd2) < leg(pd) - 1.0,
         "shorter: {} -> {}",
         leg(pd),
         leg(pd2)
@@ -1511,8 +1533,10 @@ fn reattaching_the_hub_angle_leader_brings_it_into_band() {
         .delta
         .spaces_changed
         .iter()
-        .find(|c| c.space == "view:FRONT/band:right")
-        .expect("its band changed");
+        // Dragged beside its arrow, the callout lies over FRONT's geometry;
+        // that space carries the LEADER-ANGLE finding the re-route clears.
+        .find(|c| c.space == "view:FRONT/geometry")
+        .unwrap_or_else(|| panic!("its space changed: {:?}", a.delta.spaces_changed));
     assert!(band.after > band.before, "{band:?}");
     assert!(a
         .delta

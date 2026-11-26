@@ -20,6 +20,7 @@
  * kernel's `escape_xml()` helper sanitises).
  */
 
+import { ISO_SHEET_SIZES, sheetRefusal, sheetRequest, type SheetChoice, type SheetRefusal } from '@/lib/sheet-size'
 import { SheetPanel } from './SheetPanel'
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { X } from '@/components/ui/icons'
@@ -46,6 +47,8 @@ import {
   DrawingRefusal,
   setDrawingDimension,
   setDrawingProjection,
+  setDrawingSheet,
+  SheetChangeRefused,
   sheetDimensionsMm,
   addView,
   createSolidDrawing,
@@ -244,6 +247,9 @@ function DocumentDrawings() {
   // read (ⓘ) -- a fallback is not a success.
   const [noteKind, setNoteKind] = useState<'done' | 'info'>('done')
   const [projectionBusy, setProjectionBusy] = useState(false)
+  // The Sheet control: laying out on other paper, and the kernel's refusal.
+  const [sheetBusy, setSheetBusy] = useState(false)
+  const [sheetRefused, setSheetRefused] = useState<SheetRefusal | null>(null)
 
   // ── Zoom / pan ────────────────────────────────────────────────────
   // `zoomMode = 'fit'` makes the sheet auto-shrink to fill the canvas
@@ -1551,6 +1557,49 @@ function DocumentDrawings() {
     [activeDrawing, refreshActive],
   )
 
+  // What the open sheet is on: its ISO size, way up and its FRONT view's
+  // scale (every automatic sheet has one). `null` for a custom size.
+  const sheetNow = useMemo<SheetChoice | null>(() => {
+    if (!activeDrawing || typeof activeDrawing.sheet_size !== 'string') return null
+    const size = ISO_SHEET_SIZES.find((s) => s === activeDrawing.sheet_size)
+    const main =
+      activeDrawing.views.find((v) => v.projection.kind === 'front') ?? activeDrawing.views[0]
+    if (!size || !main) return null
+    return { size, way: activeDrawing.orientation ?? 'landscape', scale: main.scale }
+  }, [activeDrawing])
+
+  const changeSheet = useCallback(
+    async (asked: SheetChoice) => {
+      if (!activeDrawing || !sheetNow) return
+      const request = sheetRequest(sheetNow, asked)
+      if (!request) return
+      setSheetBusy(true)
+      setSheetRefused(null)
+      setError(null)
+      try {
+        const done = await setDrawingSheet(activeDrawing.id, request)
+        setRemovedView(null)
+        const kept =
+          done.not_applied.length > 0
+            ? ` ${done.not_applied.length} earlier move${done.not_applied.length === 1 ? '' : 's'} did not fit and were laid out again.`
+            : ''
+        noteFor(
+          activeDrawing.id,
+          done.not_applied.length > 0 ? 'info' : 'done',
+          `Sheet is now ${done.sheet.sheet_size} ${done.sheet.orientation} at ${done.sheet.scale_label}.${kept}`,
+        )
+        await refreshActive(activeDrawing.id)
+      } catch (e) {
+        if (e instanceof SheetChangeRefused) setSheetRefused(sheetRefusal(e.message, e.details))
+        else setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setSheetBusy(false)
+      }
+    },
+    [activeDrawing, sheetNow, noteFor, refreshActive],
+  )
+  const dismissSheetRefusal = useCallback(() => setSheetRefused(null), [])
+
   return (
     <div className="relative flex-1 min-h-0 bg-background text-foreground">
       {/* The sheet fills the window; every control is a small overlay on it. */}
@@ -1730,6 +1779,11 @@ function DocumentDrawings() {
           projection={activeDrawing.projection ?? 'third'}
           projectionBusy={projectionBusy}
           onProjection={(pr) => void changeProjection(pr)}
+          sheet={sheetNow}
+          sheetBusy={sheetBusy}
+          sheetRefused={sheetRefused}
+          onSheet={(asked) => void changeSheet(asked)}
+          onDismissSheetRefusal={dismissSheetRefusal}
           titleBlockOpen={titleBlockOpen}
           onToggleTitleBlock={() => {
             // One property card at a time.

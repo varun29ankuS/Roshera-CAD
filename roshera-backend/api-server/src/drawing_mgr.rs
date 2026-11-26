@@ -1993,6 +1993,297 @@ async fn create_part_drawing_inner(
     }))
 }
 
+/// Body of `PATCH /api/drawings/{id}/sheet`.
+#[derive(Debug, Deserialize)]
+pub struct SetSheetRequest {
+    /// The paper: `"A4"` .. `"A0"`, or `{"CUSTOM": {"width", "height"}}`.
+    pub sheet_size: SheetSize,
+    /// Which way up; omitted, the sheet keeps the way it lies now.
+    #[serde(default)]
+    pub orientation: Option<SheetOrientation>,
+    /// The views' scale (ISO 5455: `1` is full size, `0.5` is 1:2); omitted,
+    /// the sheet keeps its scale.
+    #[serde(default)]
+    pub scale: Option<f64>,
+}
+
+/// The part a sheet draws and the scale of its main views: its FRONT view's
+/// (every automatic sheet has one), else its first view's.
+fn sheet_part_and_scale(drawing: &Drawing) -> Option<(Uuid, SolidId, f64)> {
+    let main = drawing
+        .views
+        .iter()
+        .find(|v| matches!(v.projection, ProjectionType::Front))
+        .or_else(|| drawing.views.first())?;
+    let ViewSource::Part { part_id, solid_id } = main.source;
+    Some((part_id, solid_id, main.scale))
+}
+
+/// The recorded history up to the live position, in order.
+async fn live_events(state: &AppState) -> Vec<timeline_engine::TimelineEvent> {
+    let _ = state.timeline_recorder.settle().await;
+    let timeline = state.timeline.read().await;
+    let live = crate::handlers::timeline::live_session_id(&timeline_engine::BranchId::main());
+    let limit = timeline
+        .get_session_position(live)
+        .map(|p| p.event_index as usize);
+    let mut all = timeline
+        .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+        .unwrap_or_default();
+    all.sort_by_key(|e| e.sequence_number);
+    if let Some(limit) = limit {
+        all.truncate(limit);
+    }
+    all
+}
+
+/// `PATCH /api/drawings/{id}/sheet` -- put an existing sheet on other paper,
+/// or draw it at another scale: "put this drawing on A2", "A1 at 1:2".
+///
+/// The sheet is drawn again from its part on exactly the paper and scale
+/// asked for (`standard_drawing_on_sheet`): the same views, dimensions,
+/// tables and section, laid out for that paper. It is REFUSED, with the
+/// overflow in millimetres and the largest scale that would fit, when the
+/// views at that scale do not fit the paper -- the scale is never quietly
+/// reduced. The choice is recorded (`drawing.set_sheet`), so undo takes it
+/// back and a sheet re-derived after a part edit keeps it; everything
+/// authored on the sheet -- title block, tolerances and texts, suppressed
+/// dimensions, added and removed views, moved views that still fit -- is
+/// replayed over the new paper from its own recorded events, and what no
+/// longer applies there is listed in `not_applied`.
+pub async fn set_sheet(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SetSheetRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (owner, handle) = state
+        .drawings
+        .get_with_owner(&id)
+        .ok_or_else(|| not_found(id))?;
+    let before = { handle.read().await.clone() };
+    let Some((part_uuid, solid_id, current_scale)) = sheet_part_and_scale(&before) else {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("drawing {id} has no view of a part to lay out again"),
+        )
+        .with_details(serde_json::json!({ "gate": "sheet_has_no_part_view", "drawing": id })));
+    };
+    let Some(model_handle) = resolve_owner_model(&state, &owner).await else {
+        return Err(
+            ApiError::new(ErrorCode::InvalidParameter, unresolvable_reason(&owner)).with_details(
+                serde_json::json!({ "gate": "sheet_part_unavailable", "drawing": id }),
+            ),
+        );
+    };
+    let sheet = geometry_engine::drawing::Sheet::new(
+        req.sheet_size,
+        req.orientation.unwrap_or(before.orientation),
+    );
+    if let Some(asked) = req.orientation {
+        if asked != sheet.orientation {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "a {} sheet is {}: its dimensions say so, and orientation '{}' contradicts them",
+                    sheet.size.label(),
+                    sheet.orientation.label(),
+                    asked.label()
+                ),
+            )
+            .with_hint(
+                "Give the custom width and height the way up you want, or omit orientation.",
+            ));
+        }
+    }
+    let scale = req.scale.unwrap_or(current_scale);
+    let projection = before.projection;
+
+    // Draw it on a copy of the model, off the lock and off the async workers,
+    // in the frame the sheet is drawn in -- before anything is recorded.
+    let snap = {
+        let model = model_handle.read().await;
+        if model.solids.get(solid_id).is_none() {
+            return Err(ApiError::solid_not_found(solid_id));
+        }
+        ModelSnapshot::take(&model)
+    };
+    let built = tokio::task::spawn_blocking(move || {
+        let mut owned = BRepModel::new();
+        snap.restore(&mut owned);
+        let (_, drawn_frame) = geometry_engine::drawing::frame_for_drawing(&mut owned, solid_id);
+        match geometry_engine::drawing::standard_drawing_on_sheet(
+            &owned, solid_id, part_uuid, projection, sheet, scale,
+        ) {
+            Ok(mut drawing) => {
+                drawing.drawn_frame = drawn_frame;
+                Ok(drawing)
+            }
+            Err(e) => {
+                // The scale that would fit, for the refusal to name.
+                let fits = geometry_engine::drawing::largest_scale_on_sheet(
+                    &owned, solid_id, part_uuid, projection, sheet,
+                )
+                .ok()
+                .flatten();
+                Err((e, fits))
+            }
+        }
+    })
+    .await
+    .map_err(|_| ApiError::new(ErrorCode::KernelError, "the sheet layout task failed"))?;
+    let mut candidate = match built {
+        Ok(d) => d,
+        Err((e, fits)) => {
+            use geometry_engine::drawing::ProjectionError as PE;
+            let message = e.to_string();
+            return Err(match e {
+                PE::ScaleDoesNotFitSheet {
+                    scale,
+                    sheet: on,
+                    overflow_x_mm,
+                    overflow_y_mm,
+                } => ApiError::new(ErrorCode::InvalidParameter, message)
+                    .with_details(serde_json::json!({
+                        "gate": "sheet_does_not_fit",
+                        "drawing": id,
+                        "scale": scale,
+                        "sheet": on,
+                        "overflow_x_mm": overflow_x_mm,
+                        "overflow_y_mm": overflow_y_mm,
+                        "largest_scale_that_fits": fits,
+                    }))
+                    .with_hint(match fits {
+                        Some(s) => format!(
+                            "The largest ISO scale these views fit this sheet at is {}; ask for it, or for larger paper.",
+                            scale_label(s)
+                        ),
+                        None => "These views fit this sheet at no ISO scale; ask for larger paper."
+                            .to_string(),
+                    }),
+                PE::InvalidScale { scale, .. } => {
+                    ApiError::new(ErrorCode::InvalidParameter, message).with_details(
+                        serde_json::json!({
+                            "gate": "sheet_scale_invalid",
+                            "parameter": "scale",
+                            "value": format!("{scale}"),
+                        }),
+                    )
+                }
+                _ => ApiError::new(ErrorCode::KernelError, message),
+            });
+        }
+    };
+
+    // Recorded first, then the sheet is rebuilt from its history, so every
+    // edit authored on it is replayed over the new paper exactly as an undo
+    // or a restart will replay it.
+    state.drawings.record_event(
+        RecordedOperation::new(timeline_engine::replay::DRAWING_SET_SHEET_KIND)
+            // The replay's own type, so what is recorded is what it reads.
+            .with_parameters(
+                serde_json::to_value(timeline_engine::replay::PinnedSheet {
+                    sheet_size: sheet.size,
+                    orientation: sheet.orientation,
+                    scale,
+                })
+                .unwrap_or_else(|_| serde_json::json!({})),
+            )
+            .with_input_drawing(id)
+            .with_output_drawing(id),
+    );
+    let events = live_events(&state).await;
+    let frames = Arc::clone(&state.frames);
+    let rebuild = tokio::task::spawn_blocking(move || {
+        timeline_engine::drawing_history::rebuild_drawings(&events, &frames)
+    })
+    .await
+    .ok();
+    let mut not_applied: Vec<String> = Vec::new();
+    let replayed = rebuild.and_then(|mut r| {
+        not_applied = r
+            .issues
+            .iter()
+            .filter(|i| i.contains("no longer applies"))
+            .cloned()
+            .collect();
+        r.drawings.remove(&id)
+    });
+    // The history's sheet is taken when it IS this sheet on this paper. A
+    // part made outside the recorded history (an import, a live edit not yet
+    // settled) replays to something else or to nothing: the sheet just drawn
+    // from the live part stands, carrying what was authored on the old one.
+    let on_asked_paper = |d: &Drawing| {
+        d.sheet() == sheet
+            && sheet_part_and_scale(d).is_some_and(|(_, _, s)| (s - scale).abs() < 1e-9)
+    };
+    let from_history = replayed.as_ref().is_some_and(on_asked_paper);
+    let mut after = match replayed {
+        Some(d) if from_history => d,
+        _ => {
+            candidate.id = before.id;
+            candidate.name = before.name.clone();
+            candidate.title_block = before.title_block.clone();
+            candidate.dimension_edits = before.dimension_edits.clone();
+            candidate.stabilize_view_ids();
+            candidate
+        }
+    };
+    if after.title_block.date.trim().is_empty() {
+        after.title_block.date = before.title_block.date.clone();
+    }
+    stamp_issue_date(&mut after);
+    let quality = verify_drawing(&after);
+    let views: Vec<serde_json::Value> = after
+        .views
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "id": v.id.0,
+                "name": v.name,
+                "scale": v.scale,
+                "position_mm": v.position_mm,
+            })
+        })
+        .collect();
+    *handle.write().await = after.clone();
+    // The certificate re-runs on the new sheet, against the live part.
+    let certificate = certify_off_lock(model_handle, after).await.ok();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "id": id,
+        "sheet": {
+            "sheet_size": sheet.size,
+            "orientation": sheet.orientation,
+            "scale": scale,
+            "scale_label": scale_label(scale),
+        },
+        "previous": {
+            "sheet_size": before.sheet_size,
+            "orientation": before.orientation,
+            "scale": current_scale,
+        },
+        "views": views,
+        "replayed_from_history": from_history,
+        "not_applied": not_applied,
+        "quality": quality,
+        "certificate": certificate.map(|c| serde_json::json!({
+            "sound": c.sound,
+            "complete": c.complete,
+            "counts": c.counts,
+        })),
+    })))
+}
+
+/// An ISO 5455 scale as a drawing states it: `2:1`, `1:1`, `1:2`.
+fn scale_label(scale: f64) -> String {
+    let r = |v: f64| (v * 100.0).round() / 100.0;
+    if scale >= 1.0 {
+        format!("{}:1", r(scale))
+    } else {
+        format!("1:{}", r(1.0 / scale))
+    }
+}
+
 /// `GET /api/drawings/{id}/quality` — re-run the drawing quality oracle
 /// over a stored drawing and return its report. The perception layer for
 /// 2D output, mirroring the geometry watertight/validity oracles.

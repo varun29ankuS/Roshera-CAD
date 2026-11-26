@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::frames::FrameCache;
 use crate::mould::{is_param_meta, OverrideSet};
 use crate::replay::{
-    projection_switches, rederive_part_drawing, with_followed_solid, DrawingRederive,
+    rederive_part_drawing, sheet_switches, with_followed_solid, DrawingRederive, SheetSwitch,
 };
 use crate::types::{Operation, TimelineEvent};
 
@@ -89,7 +89,7 @@ fn kind(e: &TimelineEvent) -> &str {
 pub fn sheet_key(
     geometry: &[TimelineEvent],
     event: &TimelineEvent,
-    switch: Option<geometry_engine::drawing::ProjectionAngle>,
+    switch: Option<SheetSwitch>,
 ) -> [u8; 32] {
     FrameCache::derived_key(
         &FrameCache::key_of(geometry),
@@ -117,7 +117,7 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
     // stood when the sheet was made: fillets added after a drawing never
     // reached it, and the export refused the stale sheet for good.
     let overrides = OverrideSet::collect(events);
-    let switches = projection_switches(events);
+    let switches = sheet_switches(events);
     let geometry: Vec<TimelineEvent> = ordered
         .iter()
         // Deletes travel with the geometry: the replay below skips the deleted
@@ -466,7 +466,8 @@ pub fn rebuild_drawings(events: &[TimelineEvent], frames: &FrameCache) -> Drawin
                     out.drawings.remove(&id);
                 }
             }
-            // Projection switches are applied at creation (`switches`);
+            // Projection switches and the paper chosen for a sheet
+            // (`drawing.set_sheet`) are applied at creation (`switches`);
             // exports, renders and quality runs change nothing on the sheet.
             _ => {}
         }

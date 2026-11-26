@@ -602,18 +602,28 @@ pub(crate) fn count_equal_features(drawing: &mut super::types::Drawing) {
             let key = (d.kind.clone(), (d.value * 100.0).round() as i64);
             match head.get(&key) {
                 Some(&i) => {
+                    // Where a leader's arrow may reach each member: a point
+                    // callout's own point, a diameter's centre.
                     let point = d.kind == "radius" || is_blend_callout(&d.kind);
+                    let reach = |m: &Dimension2d| -> Option<[f64; 2]> {
+                        if point {
+                            Some(m.a)
+                        } else if m.kind == "diameter" {
+                            Some([0.5 * (m.a[0] + m.b[0]), 0.5 * (m.a[1] + m.b[1])])
+                        } else {
+                            None
+                        }
+                    };
                     if kept[i].members.is_empty() {
                         let own = dimension_identity(&kept[i]);
                         kept[i].members.push(own);
-                        if point {
-                            let a = kept[i].a;
-                            kept[i].member_points.push(a);
+                        if let Some(p) = reach(&kept[i]) {
+                            kept[i].member_points.push(p);
                         }
                     }
                     kept[i].members.push(dimension_identity(&d));
-                    if point {
-                        kept[i].member_points.push(d.a);
+                    if let Some(p) = reach(&d) {
+                        kept[i].member_points.push(p);
                     }
                 }
                 None => {
@@ -937,7 +947,8 @@ fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
 /// **Pass B — cross-view dedup**: the same (sorted entity ids, kind, quantized
 /// value) in multiple views → keep one. Diameters/radii keep the AXIAL view
 /// (`|axis3 · view_dir| > 0.99`), else keep the view with the largest
-/// projected span, tie → lowest view index. Whole-part extents (empty
+/// projected span, tie → the view where the feature sits nearest the outline
+/// ([`outline_reach`]), then the lowest view index. Whole-part extents (empty
 /// `entities`) are deduplicated by (kind, quantized value, quantized 3D
 /// direction) — identical direction+value = duplicate; different direction at
 /// same value = not a duplicate and must survive.
@@ -949,6 +960,7 @@ fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
 pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
     // ── Pass A: same-view same-interval dedup ────────────────────────────────
     for view in &mut drawing.views {
+        let vdir = view_dir(&view.projection);
         // Classification helper: orientation 'H' or 'V', and projected
         // interval [lo, hi] in view-space (pre-scale; scale cancels within
         // one view because we're comparing within the same view). We use
@@ -1043,10 +1055,21 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
                 // it reads as a circle, by its hole-table row or the cross-view
                 // pass below, and two of its diameters kept here would be
                 // inked over one interval.
+                //
+                // Two equal bosses or pins seen END-ON, side by side, are two
+                // circles in this view and two features likewise: the count
+                // states them on one callout. Dropped as duplicates, four
+                // Ø4.76 pins in two rows were stated "2× Ø4.76" -- a count
+                // of the rows, not of the pins (NIST heatsink 827-9999-904).
+                let end_on = |d: &Dimension2d| match (d.axis3, vdir) {
+                    (Some(ax), Some(vd)) => dot3(ax, vd).abs() > 0.99,
+                    _ => false,
+                };
+                let both_round_here = (vi.axis3.is_none() && vj.axis3.is_none())
+                    || (vi.kind == "diameter" && end_on(vi) && end_on(vj));
                 let distinct_features = vi.kind == vj.kind
                     && is_counted_kind(&vi.kind)
-                    && vi.axis3.is_none()
-                    && vj.axis3.is_none()
+                    && both_round_here
                     && !vi.entities.is_empty()
                     && !vj.entities.is_empty()
                     && vi.entities.iter().all(|e| !vj.entities.contains(e))
@@ -1193,10 +1216,25 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
     let mut movable: Vec<(Vec<u32>, String, i64, Vec<(usize, usize, f64)>)> = Vec::new();
 
     // Entity groups: keep one per group.
+    // How many dimensions each view states that no other view offers: a view
+    // with none would otherwise be left with nothing of its own.
+    let mut uncontested = vec![0usize; n_views];
+    for entries in entity_groups.values() {
+        if let [only] = entries.as_slice() {
+            uncontested[only.0] += 1;
+        }
+    }
+    for entries in extent_groups.values() {
+        if let [only] = entries.as_slice() {
+            uncontested[only.0] += 1;
+        }
+    }
+
     for ((ents, kind, qval), mut entries) in entity_groups {
         if entries.len() < 2 {
             continue;
         }
+        let sized_here = kind == "length";
         if entries.iter().all(|e| !e.3) && matches!(kind.as_str(), "position" | "length") {
             movable.push((
                 ents,
@@ -1212,13 +1250,56 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
         let keeper_view_idx = if let Some(ai) = axial_idx {
             entries[ai].0
         } else {
-            // Largest span wins; tie → smallest view index.
+            // Largest span wins; tie -> smallest view index.
             entries.sort_by(|a, b| {
                 b.2.partial_cmp(&a.2)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.0.cmp(&b.0))
             });
-            entries[0].0
+            let first = entries[0];
+            // ...except that a feature's own SIZE (a height, a depth, a
+            // width) goes to a view that would otherwise state NOTHING, when
+            // that view shows it at the same length and nearer its outline.
+            // Extension lines start at the view's outline, so a feature deep
+            // inside a view is dimensioned by lines that touch nothing: the
+            // NIST heatsink's boss height hung in the gap between FRONT and
+            // RIGHT, while RIGHT -- where the boss stands at the edge --
+            // carried no dimension at all.
+            //
+            // Only into a view with nothing else to state: its bands are
+            // free. Moved into a view that has its own dimensions, sizes took
+            // lanes those needed (CADGenBench 139: two 1.88 widths moved into
+            // TOP and its overall 314 found no lane). And never a LOCATION:
+            // locations of one datum belong together in one ladder
+            // (CADGenBench 103: moved one by one, they piled twelve lanes deep
+            // under RIGHT).
+            let reach = |e: &(usize, usize, f64, bool)| -> f64 {
+                drawing
+                    .views
+                    .get(e.0)
+                    .and_then(|v| v.dimensions.get(e.1).map(|d| outline_reach(v, d)))
+                    .unwrap_or(f64::INFINITY)
+            };
+            let nearer = sized_here
+                .then(|| {
+                    let first_reach = reach(&first);
+                    entries
+                        .iter()
+                        .filter(|e| {
+                            e.0 != first.0
+                                && (e.2 - first.2).abs() <= SAME_SPAN_MM
+                                && uncontested.get(e.0).copied() == Some(0)
+                        })
+                        .map(|e| (reach(e), e.0))
+                        .filter(|(r, _)| *r < first_reach - SAME_SPAN_MM)
+                        .min_by(|a, b| {
+                            a.0.partial_cmp(&b.0)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(a.1.cmp(&b.1))
+                        })
+                })
+                .flatten();
+            nearer.map_or(first.0, |(_, view)| view)
         };
         for (vi, di, _, _) in &entries {
             if *vi != keeper_view_idx {
@@ -1287,6 +1368,35 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
             r
         });
     }
+}
+
+/// Two views show a dimension "at the same length" when its projected spans
+/// differ by no more than this (view mm): numerical noise of the projection,
+/// not a drafting tolerance.
+const SAME_SPAN_MM: f64 = 1e-6;
+
+/// How far inside its view a linear dimension's feature sits (paper mm): the
+/// distance from the dimension's span, across its own direction, to the
+/// nearer edge of the view's outline on the sides its lane can lie -- left or
+/// right for an upright span, above or below for a level one. Zero for a
+/// feature on the outline; the length of the gap its extension lines leave
+/// untouched otherwise. A point callout or an oblique span has no lane side
+/// and reaches nothing (`0.0`).
+fn outline_reach(view: &super::types::ProjectedView, d: &Dimension2d) -> f64 {
+    let dx = (d.a[0] - d.b[0]).abs();
+    let dy = (d.a[1] - d.b[1]).abs();
+    if (dx < 1e-6 && dy < 1e-6) || draws_aligned(d) {
+        return 0.0;
+    }
+    let e = &view.extent;
+    let inside = if dx >= dy {
+        let y = 0.5 * (d.a[1] + d.b[1]);
+        (y - e.min_y).min(e.max_y - y)
+    } else {
+        let x = 0.5 * (d.a[0] + d.b[0]);
+        (x - e.min_x).min(e.max_x - x)
+    };
+    inside.max(0.0) * view.scale.abs()
 }
 
 /// How close (paper mm) the ends of two same-direction intervals of one view
@@ -2652,6 +2762,83 @@ pub fn standard_drawing_auto_with_options(
     )
 }
 
+/// The automatic sheet on paper and at a scale the caller CHOSE: the same
+/// views, dimensions, tables, section and certificate claims
+/// [`standard_drawing_auto`] draws, laid out on `sheet` at exactly `scale`
+/// ("put this drawing on A2", "A1 at 1:2").
+///
+/// Nothing is searched and nothing is silently shrunk: when the four views at
+/// `scale`, with the room their dimension lanes need between them, do not fit
+/// the sheet's drawing area, the call is refused with
+/// [`ProjectionError::ScaleDoesNotFitSheet`](super::projection::ProjectionError::ScaleDoesNotFitSheet),
+/// naming the overflow in millimetres; a `scale` that is not a ratio is
+/// refused with `InvalidScale`. [`largest_scale_on_sheet`] names the scale
+/// that would fit. Dimensions that then find no room among the placed views
+/// are reported by the sheet's own checks (`verify_drawing`, the certificate's
+/// `not_dimensioned`), as on any sheet.
+pub fn standard_drawing_on_sheet(
+    model: &BRepModel,
+    solid_id: SolidId,
+    part_uuid: uuid::Uuid,
+    angle: super::types::ProjectionAngle,
+    sheet: super::types::Sheet,
+    scale: f64,
+) -> Result<super::types::Drawing, super::projection::ProjectionError> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(super::projection::ProjectionError::InvalidScale {
+            scale,
+            reason: "it must be a finite number greater than zero",
+        });
+    }
+    let _visibility = super::visibility::VisibilityCacheScope::enter(model);
+    let _sections = super::section_view::SectionCacheScope::enter(model);
+    let _adjacency = crate::readable::adjacency::AdjacencyCacheScope::enter(model);
+    let plan = plan_sheet(model, solid_id, part_uuid, angle)?;
+    let placement = plan.placement_on(&sheet, scale, angle);
+    if !placement.overflow_is_measurable() {
+        return Err(super::projection::ProjectionError::InvalidScale {
+            scale,
+            reason: "the view arrangement it produces has no finite size on this sheet",
+        });
+    }
+    if !placement.fits() {
+        return Err(super::projection::ProjectionError::ScaleDoesNotFitSheet {
+            scale,
+            sheet: sheet.describe(),
+            overflow_x_mm: placement.overflow_x_mm,
+            overflow_y_mm: placement.overflow_y_mm,
+        });
+    }
+    let mut views = Vec::new();
+    build_sheet(
+        model,
+        solid_id,
+        part_uuid,
+        angle,
+        &plan,
+        SheetChoice::Exact(sheet, scale, scale),
+        &mut views,
+    )
+}
+
+/// The largest ISO 5455 scale at which the automatic sheet's four views fit
+/// `sheet` ([`standard_drawing_on_sheet`] accepts it); `None` when not even
+/// the smallest does.
+pub fn largest_scale_on_sheet(
+    model: &BRepModel,
+    solid_id: SolidId,
+    part_uuid: uuid::Uuid,
+    angle: super::types::ProjectionAngle,
+    sheet: super::types::Sheet,
+) -> Result<Option<f64>, super::projection::ProjectionError> {
+    let _adjacency = crate::readable::adjacency::AdjacencyCacheScope::enter(model);
+    let plan = plan_sheet(model, solid_id, part_uuid, angle)?;
+    Ok(ISO_SCALES
+        .iter()
+        .copied()
+        .find(|&s| plan.placement_on(&sheet, s, angle).fits()))
+}
+
 /// The search after the size ladder: which sheets to `build` and which to
 /// keep. First the most preferred pair -- the smallest sheet, at the largest
 /// scale the views fit it ([`SheetShape::candidate`]); then, when the best
@@ -2698,6 +2885,19 @@ fn search_sheets<D, E>(
         built,
     ) {
         try_one(c, built, &mut best)?;
+    }
+    // Mostly empty paper: the same sheet at a larger scale, BEFORE any larger
+    // sheet is tried. A sheet's layout errors are often two dimensions whose
+    // lines fall within half a millimetre of each other at a small scale, and
+    // a larger scale parts them on the paper already chosen. Trying more
+    // paper first drew NIST FTC 09 (a 190 x 279 mm plate) on A0 at 1:1: its
+    // seed, A1 at 1:2, filled 5 % of the sheet with two such errors; the next
+    // size up at the largest scale it holds cleared them, and A1 at 1:1 --
+    // the same cure on half the paper -- was never drawn.
+    if best.2 .0 == EMPTY_TIER {
+        if let Some(c) = shape.fuller(&best.3, best.4, built) {
+            try_one(c, built, &mut best)?;
+        }
     }
     if let Some(c) = escape_candidate(shape, &best.3, best.4, &best.1, built) {
         try_one(c, built, &mut best)?;
@@ -3440,6 +3640,30 @@ struct SheetPlan {
     dimensions: Vec<Option<Vec<Dimension2d>>>,
     /// The part's features, found once for the whole search.
     features: PartFeatures,
+}
+
+impl SheetPlan {
+    /// Where the four views go on `sheet` at `scale` under `angle`, with the
+    /// gaps their dimension lanes need, and by how much they overrun the
+    /// drawing area ([`FourViewPlacement::fits`]).
+    fn placement_on(
+        &self,
+        sheet: &super::types::Sheet,
+        scale: f64,
+        angle: super::types::ProjectionAngle,
+    ) -> FourViewPlacement {
+        place_four_view(
+            sheet,
+            self.extents[0],
+            self.extents[1],
+            self.extents[2],
+            self.extents[3],
+            scale,
+            angle,
+            self.vgap,
+            self.hgap,
+        )
+    }
 }
 
 /// Order matches `layout_four_view`'s returned positions: [Front, Top, Right,
@@ -5171,12 +5395,75 @@ pub fn set_projection(
             (i, [(x0 + x1 - c[0]) - c[0], (y0 + y1 - c[1]) - c[1]])
         })
         .collect();
-    for (i, d) in moves {
-        let v = &mut drawing.views[i];
-        v.position_mm[0] += d[0];
-        v.position_mm[1] += d[1];
-    }
-    drawing.projection = angle;
+    // The arrangement the sheet's builder would give these views under the
+    // new angle, on this paper at this scale: the gaps between the views are
+    // sized by the lanes that lie in them, and which lanes those are changes
+    // with the angle (third angle: TOP's lanes lie between TOP and FRONT;
+    // first angle: FRONT's do). The reflection alone keeps the old gaps, so
+    // lanes found no room and their dimensions left the sheet -- the NIST
+    // heatsink went from every dimension placed to one missing, CADGenBench
+    // 105 to nine. Taken when the arrangement fits the paper and leaves the
+    // sheet no worse than the reflection does; else the reflection stands.
+    let relaid = {
+        let scale = drawing.views[front].scale;
+        let unit = |i: usize| {
+            let v = &drawing.views[i];
+            scaled_extent(v.extent, v.scale / scale)
+        };
+        let tabled = super::layout::tabled_face_ids(drawing);
+        let (vgap, hgap) = dimension_band_gaps(&drawing.views, &tabled, angle);
+        let fourth_extent = fourth.map(unit).unwrap_or_default();
+        let sheet = drawing.sheet();
+        let placement = place_four_view(
+            &sheet,
+            unit(front),
+            unit(top),
+            unit(right),
+            fourth_extent,
+            scale,
+            angle,
+            vgap,
+            hgap,
+        );
+        (scale.is_finite() && scale > 0.0 && placement.fits()).then(|| {
+            let left_bands: Vec<f64> = [front, top, right]
+                .iter()
+                .map(|&i| super::layout::dimension_band_depths(&drawing.views[i], &tabled).1)
+                .collect();
+            let extents = [unit(front), unit(top), unit(right), fourth_extent];
+            room_for_left_lanes(&sheet, &extents, scale, placement.positions, &left_bands)
+        })
+    };
+    let reflected = {
+        let mut d = drawing.clone();
+        for (i, by) in &moves {
+            let v = &mut d.views[*i];
+            v.position_mm[0] += by[0];
+            v.position_mm[1] += by[1];
+        }
+        d.projection = angle;
+        d
+    };
+    let rearranged = relaid.map(|positions| {
+        let mut d = drawing.clone();
+        for (slot, i) in [Some(front), Some(top), Some(right), fourth]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(i) = i {
+                d.views[i].position_mm = positions[slot];
+            }
+        }
+        d.projection = angle;
+        d
+    });
+    // What the sheet states comes first: a dimension without a place, then
+    // a table without paper, then layout errors.
+    let badness = |d: &super::types::Drawing| sheet_shortfall_and_utilization(d).0;
+    *drawing = match rearranged {
+        Some(r) if badness(&r) <= badness(&reflected) => r,
+        _ => reflected,
+    };
     if let Some(i) = floating_iso {
         // Re-place the pictorial exactly as a sheet built in this angle
         // would: the same search over the re-placed sheet. Its shaded image is
@@ -6836,6 +7123,57 @@ mod tests {
         );
     }
 
+    /// A mostly empty sheet with layout errors is drawn larger on the SAME
+    /// paper before any larger sheet is tried. Scores scripted as measured on
+    /// NIST FTC 09 (a 190 x 279 mm plate): A1 at 1:2 fills 5 % of the paper
+    /// and has two errors (pairs of dimension lines under half a millimetre
+    /// apart at that scale); a larger scale clears them on A1 and on A0
+    /// alike. The search tried more paper first and kept A0 at 1:1.
+    ///
+    /// Mutation: try `escape_candidate` before the first `fuller` in
+    /// `search_sheets` -> the larger sheet is kept -> RED.
+    #[test]
+    fn a_mostly_empty_sheet_is_drawn_larger_before_more_paper_is_tried() {
+        use super::super::types::SheetSize;
+        let shape = rib_shape(false);
+        let score = |errors, unplaced, utilization| SheetScore {
+            errors,
+            unplaced,
+            table: 0,
+            utilization,
+        };
+        let a1 = SheetSize::A1.landscape();
+        let ladder_pref = shape.preference(&a1, 0.5, false, 0.052);
+        assert_eq!(ladder_pref.0, EMPTY_TIER, "fixture: the seed is empty");
+        let fuller = shape
+            .fuller(&a1, 0.5, &[(a1, 0.5, 0.5)])
+            .expect("a larger scale fits A1");
+        let mut built = vec![(a1, 0.5, 0.5)];
+        let mut tried: Vec<(super::super::types::Sheet, f64)> = Vec::new();
+        let got = search_sheets(
+            &shape,
+            ((a1, 0.5), score(2, 0, 0.052), ladder_pref, a1, 0.5),
+            &mut built,
+            |c| {
+                tried.push((c.sheet, c.scale));
+                // Clean wherever the scale is larger than the seed's; short
+                // of paper on anything smaller than the seed's sheet.
+                let s = if c.scale > 0.5 + 1e-9 {
+                    score(0, 0, 0.2)
+                } else {
+                    score(2, 2, 0.11)
+                };
+                Ok::<_, ()>(((c.sheet, c.scale), s))
+            },
+        )
+        .expect("search");
+        assert_eq!(
+            got,
+            (a1, fuller.scale),
+            "the same paper at a larger scale is kept: tried {tried:?}"
+        );
+    }
+
     /// The search builds the most preferred pair FIRST and escapes to more
     /// room only from the best sheet after it: escaping from the ladder's
     /// sheet in its place drew NIST CTC 03 (A1 at 1:5, 11 errors) on A0 at
@@ -7251,6 +7589,177 @@ mod tests {
         assert_eq!(ids(0).len(), 1, "TOP keeps one: {:?}", ids(0));
         assert_eq!(ids(1).len(), 1, "RIGHT states the other: {:?}", ids(1));
         assert_ne!(ids(0), ids(1), "each stated once");
+    }
+
+    /// A view that would otherwise state nothing is given the height it shows
+    /// nearer its outline than the first view does: a boss in the middle of
+    /// FRONT but at the edge of RIGHT is dimensioned in RIGHT. Extension
+    /// lines start at the view's outline, so in FRONT the dimension hung
+    /// beside the view touching nothing, and RIGHT carried no dimension at
+    /// all (NIST heatsink 827-9999-904). A feature equally deep in both views
+    /// stays in the first -- and so does everything once RIGHT has a
+    /// dimension of its own: sizes moved into a view that had its own took
+    /// the lanes those needed (CADGenBench 139).
+    ///
+    /// Mutations: keep the first view always (drop `nearer`) -> FRONT keeps
+    /// the boss height -> RED; move into any view (drop the `uncontested`
+    /// test) -> the boss leaves FRONT although RIGHT has its own -> RED.
+    #[test]
+    fn a_height_is_stated_where_its_feature_stands_at_the_outline() {
+        use super::super::types::{Drawing, SheetSize, ViewSource};
+        let mut m = BRepModel::new();
+        let part = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(100.0, 60.0, 20.0)
+            .expect("box"));
+        let src = ViewSource::Part {
+            part_id: uuid::Uuid::nil(),
+            solid_id: part,
+        };
+        // Three features of different heights, each from z = 0.
+        let height = |id: &str, face: u32, x: f64| Dimension2d {
+            id: id.to_string(),
+            kind: "length".to_string(),
+            value: f64::from(face),
+            unit: "mm".to_string(),
+            label: face.to_string(),
+            a: [x, 0.0],
+            b: [x, f64::from(face)],
+            entities: vec![face],
+            axis3: None,
+            dir3: Some([0.0, 0.0, 1.0]),
+            pid: None,
+            datum: None,
+            tolerance: None,
+            key: None,
+            members: Vec::new(),
+            member_points: Vec::new(),
+            chain_from: None,
+        };
+        let view = |p: ProjectionType, name: &str| {
+            super::super::projection::project_solid_view(&m, src, p, name, [100.0, 100.0], 1.0)
+                .expect("view")
+        };
+        let mut d = Drawing::new("t", SheetSize::A3);
+        // FRONT spans x in [-50, 50], RIGHT spans [-30, 30].
+        let mut front = view(ProjectionType::Front, "FRONT");
+        front.dimensions = vec![
+            height("boss", 7, 5.0),  // 45 mm inside FRONT
+            height("lug", 8, -48.0), // 2 mm inside FRONT
+            height("post", 9, 28.0), // 22 mm inside FRONT
+        ];
+        let mut right = view(ProjectionType::Right, "RIGHT");
+        right.dimensions = vec![
+            height("boss", 7, 27.0), // 3 mm inside RIGHT
+            height("lug", 8, 0.0),   // 30 mm inside RIGHT
+            height("post", 9, 8.0),  // 22 mm inside RIGHT: a tie
+        ];
+        d.add_view(front);
+        d.add_view(right);
+        dedup_dimensions_global(&mut d);
+        let ids = |i: usize| -> Vec<&str> {
+            d.views[i]
+                .dimensions
+                .iter()
+                .map(|x| x.id.as_str())
+                .collect()
+        };
+        assert_eq!(
+            ids(0),
+            ["lug", "post"],
+            "FRONT keeps what stands at its outline, and a tie"
+        );
+        assert_eq!(ids(1), ["boss"], "RIGHT states the boss at its edge");
+
+        // RIGHT with a dimension only it shows: nothing is moved into it.
+        let mut d = Drawing::new("t", SheetSize::A3);
+        let mut front = view(ProjectionType::Front, "FRONT");
+        front.dimensions = vec![height("boss", 7, 5.0), height("lug", 8, -48.0)];
+        let mut right = view(ProjectionType::Right, "RIGHT");
+        right.dimensions = vec![
+            height("boss", 7, 27.0),
+            height("lug", 8, 0.0),
+            height("own", 11, 12.0),
+        ];
+        d.add_view(front);
+        d.add_view(right);
+        dedup_dimensions_global(&mut d);
+        let ids = |i: usize| -> Vec<&str> {
+            d.views[i]
+                .dimensions
+                .iter()
+                .map(|x| x.id.as_str())
+                .collect()
+        };
+        assert_eq!(ids(0), ["boss", "lug"], "FRONT keeps both");
+        assert_eq!(ids(1), ["own"], "RIGHT states what only it shows");
+    }
+
+    /// Four equal pins in two rows, seen end-on, are counted as FOUR. Two pins
+    /// in one row project onto one interval, and the same-view pass dropped
+    /// one of each row as a duplicate dimension before the count, so the
+    /// sheet stated "2× Ø4.76" for four pins and the certificate found a pin
+    /// with no size (NIST heatsink 827-9999-904).
+    ///
+    /// Mutation: keep only axis-less features (spheres) distinct in Pass A
+    /// (drop the `end_on` clause) -> "2× Ø4.76" -> RED.
+    #[test]
+    fn equal_pins_in_a_row_are_each_counted() {
+        use super::super::types::{Drawing, SheetSize, ViewSource};
+        let mut m = BRepModel::new();
+        let part = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(100.0, 60.0, 20.0)
+            .expect("box"));
+        let src = ViewSource::Part {
+            part_id: uuid::Uuid::nil(),
+            solid_id: part,
+        };
+        let pin = |id: &str, face: u32, x: f64, y: f64| Dimension2d {
+            id: id.to_string(),
+            kind: "diameter".to_string(),
+            value: 4.76,
+            unit: "mm".to_string(),
+            label: "\u{00D8}4.76".to_string(),
+            a: [x, y - 2.38],
+            b: [x, y + 2.38],
+            entities: vec![face, face + 1],
+            axis3: Some([0.0, 0.0, 1.0]),
+            dir3: None,
+            pid: None,
+            datum: None,
+            tolerance: None,
+            key: None,
+            members: Vec::new(),
+            member_points: Vec::new(),
+            chain_from: None,
+        };
+        let mut d = Drawing::new("t", SheetSize::A3);
+        let mut top = super::super::projection::project_solid_view(
+            &m,
+            src,
+            ProjectionType::Top,
+            "TOP",
+            [100.0, 200.0],
+            1.0,
+        )
+        .expect("top");
+        top.dimensions = vec![
+            pin("p1", 33, -30.0, 10.0),
+            pin("p2", 35, -44.0, 10.0),
+            pin("p3", 37, -30.0, -9.0),
+            pin("p4", 39, -44.0, -9.0),
+        ];
+        d.add_view(top);
+        dedup_dimensions_global(&mut d);
+        count_equal_features(&mut d);
+        let dims = &d.views[0].dimensions;
+        assert_eq!(dims.len(), 1, "one callout for the four pins");
+        assert_eq!(dims[0].label, "4\u{00D7} \u{00D8}4.76");
+        assert_eq!(dims[0].members.len(), 4);
+        assert_eq!(
+            dims[0].member_points.len(),
+            4,
+            "the leader may reach any of the four"
+        );
     }
 
     /// The isometric inks only the edges the viewer can see: on a box, nine

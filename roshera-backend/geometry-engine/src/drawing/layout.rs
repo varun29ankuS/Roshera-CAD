@@ -364,6 +364,10 @@ pub(crate) const OUTSIDE_TEXT_AIR: f64 = 2.0;
 pub(crate) const LINE_HALF: f64 = 0.15;
 /// The most a point leader's shoulder row rises above its point.
 pub(crate) const POINT_LEADER_MAX_RISE: f64 = 15.0;
+/// The least a POINT leader led out through a view's top or bottom edge runs
+/// sideways before its shoulder (sheet mm), so a feature right at the edge is
+/// not given a near-vertical leg.
+pub(crate) const POINT_LEADER_MIN_RUN: f64 = 6.0;
 /// Two dimensions share a lane when their spans do not overlap by more than
 /// this: the two links of a chain meet at one extension line.
 pub(crate) const CHAIN_EPS: f64 = 1e-6;
@@ -1582,7 +1586,17 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         // and dimension lines): a later callout's text must not sit on one.
         let ink_lines: Vec<[[f64; 2]; 2]> =
             all_placed.iter().flat_map(placed_line_segments).collect();
-        let pds = place_dimensions_routed(
+        // Views laid out after this one that have dimensions of their own
+        // to lay out: the gap under such a view is its lanes'. A section or
+        // a pictorial carries none and reserves nothing.
+        let later_views: Vec<Rect2> = drawing
+            .views
+            .iter()
+            .skip(idx + 1)
+            .filter(|v| !v.dimensions.is_empty())
+            .filter_map(|v| view_geometry_rect(v, h))
+            .collect();
+        let pds = place_dimensions_among(
             view,
             h,
             idx,
@@ -1592,6 +1606,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
             &ink_lines,
             &drawing.dimension_edits,
             drawing.document_unit,
+            &later_views,
         );
         for pd in &pds {
             items.push(SheetItem {
@@ -3709,10 +3724,120 @@ pub(crate) fn place_dimensions_routed(
     edits: &super::dimension_edit::DimensionEdits,
     unit: crate::units::LengthUnit,
 ) -> Vec<PlacedDimension> {
+    place_dimensions_among(
+        view,
+        sheet_h,
+        owner,
+        tabled_face_ids,
+        frame,
+        obstacles,
+        ink_lines,
+        edits,
+        unit,
+        &[],
+    )
+}
+
+/// [`place_dimensions_routed`], knowing where the views laid out AFTER this
+/// one stand (`later_views`, their geometry in sheet mm). The band under a
+/// view holds its level dimensions' lanes; a view standing above this one
+/// that has not been laid out yet will put its lanes in the gap between the
+/// two, so a leader of this view is led out through its top edge, into that
+/// gap, only as a last resort. Found on NIST CTC 03: two radius leaders of
+/// FRONT took the gap under TOP, and TOP's "211.46" found no lane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn place_dimensions_among(
+    view: &ProjectedView,
+    sheet_h: f64,
+    owner: usize,
+    tabled_face_ids: &std::collections::HashSet<u32>,
+    frame: Option<[f64; 4]>,
+    obstacles: &[Rect2],
+    ink_lines: &[[[f64; 2]; 2]],
+    edits: &super::dimension_edit::DimensionEdits,
+    unit: crate::units::LengthUnit,
+    later_views: &[Rect2],
+) -> Vec<PlacedDimension> {
+    let place = |edge_exits: bool| {
+        place_dimensions_led(
+            view,
+            sheet_h,
+            owner,
+            tabled_face_ids,
+            frame,
+            obstacles,
+            ink_lines,
+            edits,
+            unit,
+            later_views,
+            edge_exits,
+        )
+    };
+    // A leader never costs a dimension its place. Leaders are laid first and
+    // the stacked and aligned dimensions round them, so a leader led out
+    // through the view's top or bottom edge can stand where a dimension with
+    // nowhere else to go was to be drawn (CADGenBench 112: an aligned
+    // "22.76" over TOP, taken by two radius callouts). When that happens the
+    // view is laid again with its leaders led out through its sides only,
+    // and that layout is kept if it places more dimensions.
+    let placed_count = |placed: &[PlacedDimension]| -> usize {
+        placed
+            .iter()
+            .map(|p| base_dim_id(&p.dim_id))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    };
+    let owed = view
+        .dimensions
+        .iter()
+        .filter(|d| {
+            let suppressed = d
+                .key
+                .as_ref()
+                .and_then(|k| edits.get(k))
+                .is_some_and(|e| e.suppressed.is_some());
+            let tabled = matches!(d.kind.as_str(), "position" | "diameter")
+                && !d.entities.is_empty()
+                && d.entities.iter().all(|e| tabled_face_ids.contains(e));
+            !suppressed && !tabled
+        })
+        .count();
+    let with_edge_exits = place(true);
+    if placed_count(&with_edge_exits) >= owed {
+        return with_edge_exits;
+    }
+    let sides_only = place(false);
+    if placed_count(&sides_only) > placed_count(&with_edge_exits) {
+        sides_only
+    } else {
+        with_edge_exits
+    }
+}
+
+/// [`place_dimensions_among`]'s one layout: `edge_exits` allows a leader to
+/// be led out through the view's top or bottom edge as well as its sides.
+#[allow(clippy::too_many_arguments)]
+fn place_dimensions_led(
+    view: &ProjectedView,
+    sheet_h: f64,
+    owner: usize,
+    tabled_face_ids: &std::collections::HashSet<u32>,
+    frame: Option<[f64; 4]>,
+    obstacles: &[Rect2],
+    ink_lines: &[[[f64; 2]; 2]],
+    edits: &super::dimension_edit::DimensionEdits,
+    unit: crate::units::LengthUnit,
+    later_views: &[Rect2],
+    edge_exits: bool,
+) -> Vec<PlacedDimension> {
     let Some(gr) = view_geometry_rect(view, sheet_h) else {
         return Vec::new();
     };
     let bbox = [gr.x0, gr.y0, gr.x1, gr.y1];
+    // A view not laid out yet stands above this one: the gap is its lanes'.
+    let lanes_above = later_views
+        .iter()
+        .any(|r| r.y1 <= gr.y0 && r.x0 < gr.x1 && r.x1 > gr.x0);
 
     // The dimensions as inked: suppressed ones gone, authored tolerance and
     // text composed into the label (one function for layout, renderers and
@@ -3793,7 +3918,74 @@ pub(crate) fn place_dimensions_routed(
         )
     };
 
-    for d in &shown {
+    // Which bands this view's stacked dimensions will use: level ones are
+    // laid below the part, upright ones to its left. A leader is led out
+    // through those edges only as a last resort.
+    let (stacks_below, stacks_left) = {
+        let (mut below, mut left) = (false, false);
+        for d in &shown {
+            if is_tabled(d)
+                || matches!(d.kind.as_str(), "hole_callout" | "radius" | "angle")
+                || crate::drawing::dimensioning::is_blend_callout(&d.kind)
+                || crate::drawing::dimensioning::draws_aligned(d)
+            {
+                continue;
+            }
+            let a = dim_to_sheet(view, sheet_h, d.a);
+            let b = dim_to_sheet(view, sheet_h, d.b);
+            let dx = (a[0] - b[0]).abs();
+            let dy = (a[1] - b[1]).abs();
+            if dx < 1e-6 && dy < 1e-6 {
+                continue;
+            }
+            // A circle too small to hold its own label is called out on a
+            // leader (below), not stacked; any other diameter is stacked.
+            let on_a_leader = d.kind == "diameter"
+                && drawn_width(d) > dx.max(dy)
+                && match (
+                    d.axis3,
+                    crate::drawing::dimensioning::view_dir(&view.projection),
+                ) {
+                    (Some(ax), Some(vd)) => {
+                        (ax[0] * vd[0] + ax[1] * vd[1] + ax[2] * vd[2]).abs() > 0.99
+                    }
+                    _ => false,
+                };
+            if on_a_leader {
+                continue;
+            }
+            if dx >= dy {
+                below = true;
+            } else {
+                left = true;
+            }
+        }
+        (below, left)
+    };
+
+    // An angular dimension stands where its geometry puts it (an arc about
+    // the bevel's corner, its number beyond the end face): nothing searches
+    // for its place. It is laid FIRST, so every leader routed after it sees
+    // its arc and its number. Laid in turn, a leader routed before it could
+    // not: on the weld-neck flange at 1:2 the hub's "28.5°" leader was led
+    // straight through "37.5°", and the sheet was refused A3.
+    let fixed_angle = |d: &crate::drawing::dimensioning::Dimension2d| {
+        angular_dimension(
+            view,
+            sheet_h,
+            d,
+            dim_to_sheet(view, sheet_h, d.a),
+            dim_to_sheet(view, sheet_h, d.b),
+            owner,
+        )
+        .is_some()
+    };
+    let in_order: Vec<&crate::drawing::dimensioning::Dimension2d> = shown
+        .iter()
+        .filter(|d| fixed_angle(d))
+        .chain(shown.iter().filter(|d| !fixed_angle(d)))
+        .collect();
+    for d in in_order {
         // Tabled-position / tabled-diameter suppression: skip position or
         // diameter dims whose faces are all tabled bore
         // faces. These X/Y/Ø values are represented in the hole table and
@@ -3875,7 +4067,6 @@ pub(crate) fn place_dimensions_routed(
                     d.member_points
                         .iter()
                         .skip(1)
-                        .filter(|_| r == 0.0)
                         .map(|p| dim_to_sheet(view, sheet_h, *p)),
                 )
                 .collect();
@@ -3982,11 +4173,51 @@ pub(crate) fn place_dimensions_routed(
                 .map(|f| f[1] + DIM_TEXT_FONT_MM + TGAP + 1.0)
                 .unwrap_or(f64::NEG_INFINITY);
             let bottom = frame.map(|f| f[3] - 1.0).unwrap_or(f64::INFINITY);
-            let mut placed: Option<(f64, f64, f64)> = None;
-            let mut centre = head_centre;
-            for &tip in &tips {
-                centre = tip;
-                for &(side, elbow_x) in &shoulders {
+            // Every clear way out of the view is tried -- from each member,
+            // through the view's side (the shoulders above) and through its
+            // top or bottom edge -- and the SHORTEST leg is drawn. The first
+            // clear shoulder on the right used to win whatever its length:
+            // the NIST heatsink's "2× Ø4.76" and "2× Ø9.52" ran diagonally
+            // across the whole TOP view to labels on its far side, from
+            // features a few millimetres inside its top and bottom edges.
+            // An exit through an edge whose band the stacked dimensions use
+            // (level ones below, upright ones to the left) is a last resort:
+            // those lanes are laid after the leaders and would cross it.
+            let first_clear_wins = pinned_side.is_some();
+            // (leg length, tip, side, elbow x, shoulder row)
+            let mut best: Option<(f64, [f64; 2], f64, f64, f64)> = None;
+            let mut last_resort: Option<(f64, [f64; 2], f64, f64, f64)> = None;
+            'tips: for &tip in &tips {
+                let centre = tip;
+                // (side, elbow x, the one row of an exit through the top or
+                // bottom edge, last resort)
+                let mut candidates: Vec<(f64, f64, Option<f64>, bool)> = shoulders
+                    .iter()
+                    .map(|&(sd, x)| (sd, x, None, sd < 0.0 && stacks_left))
+                    .collect();
+                if edge_exits && !first_clear_wins {
+                    for (up, edge_y, resort) in
+                        [(true, bbox[1], lanes_above), (false, bbox[3], stacks_below)]
+                    {
+                        for out in [0.0, 12.0] {
+                            let y = if up {
+                                edge_y - STANDOFF - out
+                            } else {
+                                edge_y + STANDOFF + out + DIM_TEXT_FONT_MM + TGAP
+                            };
+                            let rise_y = (y - centre[1]).abs();
+                            let run = if point_leader {
+                                rise_y.max(POINT_LEADER_MIN_RUN)
+                            } else {
+                                rise_y
+                            };
+                            for sd in [1.0, -1.0] {
+                                candidates.push((sd, centre[0] + sd * run, Some(y), resort));
+                            }
+                        }
+                    }
+                }
+                for &(side, elbow_x, fixed_row, resort) in &candidates {
                     let nominal = (centre[1] - rise(centre, elbow_x)).max(top);
                     // The shoulder + text box for a row at `y`.
                     let text_box = |y: f64| {
@@ -4086,36 +4317,53 @@ pub(crate) fn place_dimensions_routed(
                         && !crosses_placed(y)
                     };
                     // Nearest free row to the nominal one: up first, then down.
-                    let mut ey = nominal;
-                    let mut found = free(nominal);
-                    for k in 1..=200 {
-                        if found {
-                            break;
+                    // An exit through the top or bottom edge has one row, and
+                    // its shoulder must stay inside the frame.
+                    let (mut ey, mut found) = match fixed_row {
+                        Some(y) => {
+                            let inside_frame = frame.map_or(true, |f| {
+                                let b = text_box(y);
+                                b.x0 >= f[0] && b.x1 <= f[2]
+                            });
+                            (y, inside_frame && free(y))
                         }
-                        for cand in [
-                            nominal - k as f64 * 0.5 * row,
-                            nominal + k as f64 * 0.5 * row,
-                        ] {
-                            if free(cand) {
-                                ey = cand;
-                                found = true;
+                        None => (nominal, free(nominal)),
+                    };
+                    if fixed_row.is_none() {
+                        for k in 1..=200 {
+                            if found {
                                 break;
+                            }
+                            for cand in [
+                                nominal - k as f64 * 0.5 * row,
+                                nominal + k as f64 * 0.5 * row,
+                            ] {
+                                if free(cand) {
+                                    ey = cand;
+                                    found = true;
+                                    break;
+                                }
                             }
                         }
                     }
-                    if found {
-                        placed = Some((side, elbow_x, ey));
-                        break;
+                    if !found {
+                        continue;
+                    }
+                    let (_, lines) = own_ink(ey);
+                    let leg = lines[0];
+                    let cost = (leg[1][0] - leg[0][0]).hypot(leg[1][1] - leg[0][1]);
+                    let slot = if resort { &mut last_resort } else { &mut best };
+                    if slot.map_or(true, |b| cost < b.0 - 1e-9) {
+                        *slot = Some((cost, centre, side, elbow_x, ey));
+                    }
+                    if first_clear_wins {
+                        break 'tips;
                     }
                 }
-                if placed.is_some() {
-                    break;
-                }
             }
-            if placed.is_none() {
-                centre = head_centre;
-            }
-            let (side, elbow_x, ey) = match placed {
+            let placed = best.or(last_resort);
+            let centre = placed.map_or(head_centre, |p| p.1);
+            let (side, elbow_x, ey) = match placed.map(|p| (p.2, p.3, p.4)) {
                 Some(p) => p,
                 None => {
                     // No clear row for any shoulder: the preferred one, at the
@@ -5785,7 +6033,9 @@ mod tests {
         let h = SheetSize::A3.landscape().height();
         let sheet = |sites: Vec<HoleSite>| {
             let mut view = simple_view("TOP", ProjectionType::Top, [200.0, 150.0]);
-            let mut radius = pos_dim("4× R2", [-9.0, -9.0], [-9.0, -7.0]);
+            // An arc in the middle of the view: whichever edge its leader
+            // leaves by, the leg crosses the view.
+            let mut radius = pos_dim("4× R2", [0.0, 0.0], [0.0, 2.0]);
             radius.kind = "radius".to_string();
             view.dimensions = vec![radius];
             let mut d = Drawing::new("tag-place", SheetSize::A3);
@@ -5812,9 +6062,18 @@ mod tests {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .expect("the leader has a leg");
+        // A point on the leg inside the view: a quarter of the way out from
+        // the arrow's end (the end nearer the view's origin).
+        let origin = [200.0, h - 150.0];
+        let from_origin = |p: [f64; 2]| (p[0] - origin[0]).hypot(p[1] - origin[1]);
+        let (near, far) = if from_origin(longest[0]) <= from_origin(longest[1]) {
+            (longest[0], longest[1])
+        } else {
+            (longest[1], longest[0])
+        };
         let mid = [
-            0.5 * (longest[0][0] + longest[1][0]),
-            0.5 * (longest[0][1] + longest[1][1]),
+            near[0] + 0.25 * (far[0] - near[0]),
+            near[1] + 0.25 * (far[1] - near[1]),
         ];
         // Sheet (y down) to the view's coordinates (scale 1).
         let centre = [mid[0] - 200.0, (h - 150.0) - mid[1]];
@@ -5951,6 +6210,253 @@ mod tests {
             (tip[0] - 109.0).abs() < 1e-6 && (tip[1] - 138.0).abs() < 1e-6,
             "the arrow is on the free fillet at (109, 138): {tip:?}"
         );
+    }
+
+    /// A 100 x 70 plate seen in plan, its origin at sheet (200, 150).
+    fn plate_view() -> ProjectedView {
+        let mut view = simple_view("TOP", ProjectionType::Top, [200.0, 150.0]);
+        view.polylines = vec![Polyline2d::from_points(vec![
+            [-50.0, -35.0],
+            [50.0, -35.0],
+            [50.0, 35.0],
+            [-50.0, 35.0],
+            [-50.0, -35.0],
+        ])];
+        view.extent = ViewExtent {
+            min_x: -50.0,
+            min_y: -35.0,
+            max_x: 50.0,
+            max_y: 35.0,
+        };
+        view
+    }
+
+    fn place_alone(view: &ProjectedView) -> Vec<PlacedDimension> {
+        place_dimensions_routed(
+            view,
+            297.0,
+            0,
+            &std::collections::HashSet::new(),
+            Some([10.0, 10.0, 410.0, 287.0]),
+            &[],
+            &[],
+            &crate::drawing::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+        )
+    }
+
+    fn leg_length(pd: &PlacedDimension) -> f64 {
+        let leg = pd.ext[0];
+        (leg[1][0] - leg[0][0]).hypot(leg[1][1] - leg[0][1])
+    }
+
+    /// A leader leaves its view by the nearest clear edge. An arc 5 mm inside
+    /// the top-left corner of a 100 mm wide view was led to a shoulder on the
+    /// view's RIGHT, the leg across the whole view (NIST heatsink: "2× Ø4.76"
+    /// and "2× Ø9.52" ran diagonally across TOP). Through the top edge the
+    /// leg is a quarter of that.
+    ///
+    /// Mutation: let the first clear shoulder win (`first_clear_wins = true`)
+    /// -> the leg is over 90 mm -> RED.
+    #[test]
+    fn a_leader_leaves_its_view_by_the_nearest_clear_edge() {
+        let mut view = plate_view();
+        let mut radius = pos_dim("R3", [-45.0, 30.0], [-45.0, 33.0]);
+        radius.kind = "radius".to_string();
+        view.dimensions = vec![radius];
+        let placed = place_alone(&view);
+        let leader = placed.first().expect("the radius is placed");
+        let len = leg_length(leader);
+        assert!(
+            len < 30.0,
+            "the leg crosses the view ({len:.1} mm): {:?}",
+            leader.ext[0]
+        );
+        // Out through the top edge: the shoulder is above the view.
+        let top_edge = 297.0 - 150.0 - 35.0;
+        assert!(
+            leader.line[0][1] < top_edge,
+            "the shoulder is not above the view: {:?}",
+            leader.line
+        );
+    }
+
+    /// A counted hole callout ("2× Ø4") may end its leader on ANY member, and
+    /// ends it on the one with the shortest clear way out. Only point
+    /// callouts (radii, chamfers) were offered their members; a counted
+    /// diameter was always led from its first, however far inside the view.
+    ///
+    /// Mutation: offer members to point callouts only (restore
+    /// `.filter(|_| r == 0.0)` on the tips) -> the arrow is on the far member
+    /// and the leg is over 60 mm -> RED.
+    #[test]
+    fn a_counted_hole_callout_is_led_from_its_nearest_member() {
+        let mut view = plate_view();
+        let mut hole = pos_dim("2× Ø4", [-42.0, 0.0], [-38.0, 0.0]);
+        hole.kind = "diameter".to_string();
+        hole.axis3 = Some([0.0, 0.0, 1.0]);
+        hole.members = vec!["a".to_string(), "b".to_string()];
+        hole.member_points = vec![[-40.0, 0.0], [45.0, 0.0]];
+        view.dimensions = vec![hole];
+        let placed = place_alone(&view);
+        let leader = placed.first().expect("the callout is placed");
+        let tip = leader.arrows[0].tip;
+        // The second member's centre is at sheet (245, 147); the arrow ends
+        // on its circle (r = 2).
+        let off = (tip[0] - 245.0).hypot(tip[1] - 147.0);
+        assert!(
+            (off - 2.0).abs() < 1e-6,
+            "the arrow is not on the member by the edge: {tip:?}"
+        );
+        let len = leg_length(leader);
+        assert!(len < 30.0, "the leg is {len:.1} mm long");
+    }
+
+    /// A leader is not led out through the band the stacked dimensions use
+    /// while another clear way exists: below the view lie the level
+    /// dimensions' lanes, laid after the leaders, and a shoulder there would
+    /// be crossed by them. An arc by the middle of the bottom edge of a view that has a
+    /// level dimension goes out by the side instead.
+    ///
+    /// Mutation: never mark the bottom exit a last resort -> the shoulder is
+    /// below the view, in the lanes -> RED.
+    #[test]
+    fn a_leader_keeps_out_of_the_stacked_dimensions_band() {
+        let mut view = plate_view();
+        let mut radius = pos_dim("R3", [0.0, -30.0], [0.0, -33.0]);
+        radius.kind = "radius".to_string();
+        let width = len_dim("100", [-50.0, -35.0], [50.0, -35.0]);
+        view.dimensions = vec![radius, width];
+        let placed = place_alone(&view);
+        let leader = placed
+            .iter()
+            .find(|p| p.label == "R3")
+            .expect("the radius is placed");
+        let bottom_edge = 297.0 - 150.0 + 35.0;
+        assert!(
+            leader.line[0][1] < bottom_edge,
+            "the shoulder is in the band below the view: {:?}",
+            leader.line
+        );
+    }
+
+    /// The gap under a view that is laid out later belongs to that view's
+    /// lanes: a leader of the view below is not led up into it while another
+    /// clear way exists. NIST CTC 03: FRONT's "R3.26" and "R0.54" went up
+    /// into the gap under TOP and TOP's "211.46" then found no lane.
+    ///
+    /// Mutation: ignore `later_views` (`lanes_above = false`) -> the shoulder
+    /// is above the view, in the gap -> RED.
+    #[test]
+    fn a_leader_keeps_out_of_the_gap_under_a_view_laid_out_later() {
+        let mut view = plate_view();
+        let mut radius = pos_dim("R3", [0.0, 30.0], [0.0, 33.0]);
+        radius.kind = "radius".to_string();
+        view.dimensions = vec![radius];
+        let top_edge = 297.0 - 150.0 - 35.0;
+        // Alone, the arc by the top edge is led out through it.
+        let alone = place_alone(&view);
+        assert!(
+            alone[0].line[0][1] < top_edge,
+            "fixture: the short way out is up: {:?}",
+            alone[0].line
+        );
+        // With a view standing 40 mm above, it is not.
+        let above = Rect2 {
+            x0: 150.0,
+            y0: top_edge - 110.0,
+            x1: 250.0,
+            y1: top_edge - 40.0,
+        };
+        let placed = place_dimensions_among(
+            &view,
+            297.0,
+            0,
+            &std::collections::HashSet::new(),
+            Some([10.0, 10.0, 410.0, 287.0]),
+            &[above],
+            &[],
+            &crate::drawing::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+            &[above],
+        );
+        let elbow = placed[0].line[0];
+        assert!(
+            !(elbow[1] < top_edge && elbow[0] > 150.0 && elbow[0] < 250.0),
+            "the shoulder is in the gap under the later view: {:?}",
+            placed[0].line
+        );
+    }
+
+    /// A leader never costs a dimension its place. Leaders are laid before the
+    /// stacked dimensions; when a leader led out through the view's top edge
+    /// stands where a dimension with nowhere else to go was to be drawn, the
+    /// view is laid again with its leaders led out by the sides, and the
+    /// dimension is drawn. CADGenBench 112: two radius callouts over TOP took
+    /// the place of the aligned "22.76" and the sheet lost it.
+    ///
+    /// The fixture leaves one free strip of paper, above the view: everything
+    /// below and beyond that strip is taken.
+    ///
+    /// Mutation: keep the first layout whatever it places (drop the
+    /// sides-only retry in `place_dimensions_among`) -> "8" is not placed ->
+    /// RED.
+    #[test]
+    fn a_leader_does_not_take_a_dimensions_only_place() {
+        let mut view = plate_view();
+        // An arc just under the top edge, below the middle of a short width.
+        let mut radius = pos_dim("R3", [-16.0, 30.0], [-16.0, 33.0]);
+        radius.kind = "radius".to_string();
+        let width = len_dim("8", [-4.0, 35.0], [4.0, 35.0]);
+        view.dimensions = vec![radius, width];
+        let (top_edge, bottom_edge) = (297.0 - 150.0 - 35.0, 297.0 - 150.0 + 35.0);
+        // Paper taken under the view and above the first lane over it.
+        let below = Rect2 {
+            x0: 100.0,
+            y0: bottom_edge + 2.0,
+            x1: 300.0,
+            y1: bottom_edge + 60.0,
+        };
+        let above = Rect2 {
+            x0: 100.0,
+            y0: top_edge - 80.0,
+            x1: 300.0,
+            y1: top_edge - STANDOFF - DIM_TEXT_FONT_MM - TGAP - 1.0,
+        };
+        let lay = |edge_exits: bool| {
+            place_dimensions_led(
+                &view,
+                297.0,
+                0,
+                &std::collections::HashSet::new(),
+                Some([10.0, 10.0, 410.0, 287.0]),
+                &[below, above],
+                &[],
+                &crate::drawing::dimension_edit::DimensionEdits::new(),
+                crate::units::LengthUnit::default(),
+                &[],
+                edge_exits,
+            )
+        };
+        let has = |placed: &[PlacedDimension], label: &str| placed.iter().any(|p| p.label == label);
+        assert!(
+            !has(&lay(true), "8") && has(&lay(false), "8"),
+            "fixture: the leader's way out through the top edge takes the width's only place"
+        );
+        let placed = place_dimensions_among(
+            &view,
+            297.0,
+            0,
+            &std::collections::HashSet::new(),
+            Some([10.0, 10.0, 410.0, 287.0]),
+            &[below, above],
+            &[],
+            &crate::drawing::dimension_edit::DimensionEdits::new(),
+            crate::units::LengthUnit::default(),
+            &[],
+        );
+        assert!(has(&placed, "8"), "the width is drawn");
+        assert!(has(&placed, "R3"), "and so is the radius");
     }
 
     /// A section letter "A" is placed clear of every dimension's LINE, not

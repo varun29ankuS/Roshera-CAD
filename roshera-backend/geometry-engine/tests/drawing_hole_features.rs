@@ -312,23 +312,143 @@ fn a_countersink_and_a_drill_point_are_recognised() {
     assert!(cert.sound);
 }
 
-/// A counterbore over a blind hole is not one of the claimed shapes: the
-/// recogniser refuses rather than stating a callout it has not proven, and
-/// the bores keep their plain hole-table rows.
-#[test]
-fn a_counterbore_over_a_blind_hole_is_not_claimed() {
+/// Ø8 blind ↧ `depth` under a ⌴ Ø14 ↧ 6, both from the top face (z = 10).
+fn counterbored_blind(depth: f64) -> (BRepModel, SolidId) {
     let mut m = BRepModel::new();
     let p = plate(&mut m);
-    let s = blind(&mut m, p, 0.0, 0.0, 15.0);
+    let s = blind(&mut m, p, 0.0, 0.0, depth);
     let c = cyl(&mut m, 0.0, 0.0, 4.0, 7.0, 10.0);
     let s = cut(&mut m, s, c);
-    let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+    (m, s)
+}
+
+/// A counterbore over a BLIND hole is one hole. Before, the recogniser
+/// refused the shape, so the sheet tabled a Ø8 hole and a Ø14 hole on the same
+/// centre, printed two tags on top of each other there, and dimensioned each
+/// wall's length separately in the side view (NIST heatsink 827-9999-904).
+/// The hole's depth is the full-diameter depth from the ENTRY face.
+#[test]
+fn a_counterbore_over_a_blind_hole_is_one_hole() {
+    let (m, s) = counterbored_blind(15.0);
+    let (d, svg) = sheet(&m, s, "counterbore_over_blind");
+    let hf = d.hole_features.as_ref().expect("the stack is recognised");
+    assert_eq!(hf.stacks.len(), 1, "{:#?}", hf.stacks);
+    let st = &hf.stacks[0];
+    assert!(!st.through);
+    assert!((st.diameter - 8.0).abs() < 1e-9, "{st:?}");
     assert!(
-        d.hole_features.is_none(),
-        "not a claimed shape: {:#?}",
-        d.hole_features
+        (st.depth.unwrap() - 15.0).abs() < 1e-6,
+        "depth from the entry face, not the 9 mm wall below the step: {st:?}"
     );
-    assert_eq!(d.hole_sites.len(), 2, "both bores stay tabled");
+    let cb = st.counterbore.as_ref().expect("counterbore");
+    assert!((cb.diameter - 14.0).abs() < 1e-9 && (cb.depth - 6.0).abs() < 1e-6);
+    assert_eq!(st.label(), "Ø8.00 ↧ 15.00 ⌴ Ø14.00 ↧ 6.00");
+    // ONE table row, so one tag at the centre, stating both sizes.
+    let rows: Vec<_> = d
+        .hole_sites
+        .iter()
+        .map(|h| (h.tag.clone(), h.dia_label.clone(), h.depth_label.clone()))
+        .collect();
+    assert_eq!(rows.len(), 1, "one hole, one row: {rows:?}");
+    assert!(rows[0].1.contains('⌴'), "{rows:?}");
+    assert_eq!(rows[0].2, "↧ 15", "{rows:?}");
+    assert!(inks(&svg, "Ø8 ⌴ Ø14 ↧ 6"));
+    // The walls' own lengths (9 and 6) are stated by the callout: no
+    // side-view depth dimension repeats them.
+    let stack_faces = st.faces();
+    let stray: Vec<_> = d
+        .views
+        .iter()
+        .flat_map(|v| v.dimensions.iter())
+        .filter(|x| x.kind == "length" && x.entities.iter().any(|e| stack_faces.contains(e)))
+        .map(|x| x.label.clone())
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "wall lengths inked beside the callout: {stray:?}"
+    );
+    // The claim is certified against the live model.
+    let (f, sound) = facts(&m, &d, SheetFactKind::HoleStack);
+    assert_eq!(f.len(), 1);
+    assert_eq!(
+        f[0].live.verdict,
+        SheetVerdict::Consistent,
+        "{:?}",
+        f[0].live
+    );
+    assert!(sound);
+}
+
+/// The same hole with a drill point: still one hole, the depth still the
+/// full-diameter depth from the entry face.
+#[test]
+fn a_counterbore_over_a_drill_pointed_hole_is_one_hole() {
+    let mut m = BRepModel::new();
+    let p = plate(&mut m);
+    let s = drilled(&mut m, p, 0.0, 0.0);
+    let c = cyl(&mut m, 0.0, 0.0, 6.0, 7.0, 10.0);
+    let s = cut(&mut m, s, c);
+    let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+    let hf = d.hole_features.as_ref().expect("the stack is recognised");
+    assert_eq!(hf.stacks.len(), 1, "{:#?}", hf.stacks);
+    let st = &hf.stacks[0];
+    assert!((st.depth.unwrap() - 12.0).abs() < 1e-6, "{st:?}");
+    assert!((st.drill_point_deg.unwrap() - 118.0).abs() < 1e-6);
+    assert!((st.counterbore.as_ref().unwrap().depth - 4.0).abs() < 1e-6);
+    assert_eq!(d.hole_sites.len(), 1, "one hole, one row");
+}
+
+/// A changed blind depth under a counterbore turns the claim stale: what the
+/// wider envelope states is re-measured like every other stack.
+#[test]
+fn a_counterbored_blind_hole_that_gets_deeper_is_stale() {
+    use geometry_engine::drawing::hole_features::hole_stack_live_check;
+    let (m, s) = counterbored_blind(15.0);
+    let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+    let st = d.hole_features.as_ref().expect("stacks").stacks[0].clone();
+    assert!(hole_stack_live_check(&m, s, &st, 1e-6).is_none());
+    let (m2, s2) = counterbored_blind(17.0);
+    let why = hole_stack_live_check(&m2, s2, &st, 1e-6);
+    assert!(
+        why.as_deref().is_some_and(|w| w.contains("depth")),
+        "a deeper hole must be reported: {why:?}"
+    );
+}
+
+/// A blind hole closed by something that is neither a flat floor nor an
+/// analytic drill-point cone (here a ball end; on imported STEP, a drill point
+/// written as spline surfaces — NIST heatsink 827-9999-904) is still ONE blind
+/// hole to its full-diameter depth. The recogniser claims no floor form.
+/// RED before: the far end was "anything else", the stack was refused, and a
+/// counterbore over it stayed two tabled holes with two tags on one centre.
+#[test]
+fn a_hole_closed_by_an_unclaimed_form_is_blind_to_its_full_diameter_depth() {
+    let mut m = BRepModel::new();
+    let p = plate(&mut m);
+    let s = blind(&mut m, p, 0.0, 0.0, 12.0);
+    let ball = solid(
+        TopologyBuilder::new(&mut m)
+            .create_sphere_3d(Point3::new(0.0, 0.0, -2.0), 4.0)
+            .unwrap(),
+    );
+    let s = cut(&mut m, s, ball);
+    let c = cyl(&mut m, 0.0, 0.0, 6.0, 7.0, 10.0);
+    let s = cut(&mut m, s, c);
+    let d = standard_drawing_auto(&m, s, uuid::Uuid::nil()).expect("sheet");
+    let hf = d.hole_features.as_ref().expect("the stack is recognised");
+    assert_eq!(hf.stacks.len(), 1, "{:#?}", hf.stacks);
+    let st = &hf.stacks[0];
+    assert!(!st.through);
+    assert!((st.depth.unwrap() - 12.0).abs() < 1e-6, "{st:?}");
+    assert!(st.drill_point_deg.is_none(), "no floor form is claimed");
+    assert!(
+        !st.floor_faces.is_empty(),
+        "the closing faces are the stack's"
+    );
+    assert!(st.counterbore.is_some());
+    assert_eq!(d.hole_sites.len(), 1, "one hole, one row");
+    let cert = certify_drawing(&m, &d);
+    assert!(cert.sound);
 }
 
 // ── Patterns ─────────────────────────────────────────────────────────────────

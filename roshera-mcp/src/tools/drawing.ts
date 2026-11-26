@@ -614,6 +614,51 @@ export function registerDrawingTools(server: ToolHost): void {
     },
   );
 
+  // ── drawing_set_sheet ──────────────────────────────────────────────────
+  server.tool(
+    "drawing_set_sheet",
+    "Put an EXISTING sheet on other paper and/or draw it at another scale " +
+      "('put it on A2', 'A1 at 1:2'). Title block, tolerances, texts and " +
+      "suppressed dimensions are kept; views and dimensions are laid out " +
+      "again for the paper. REFUSED (never shrunk) when the views at that " +
+      "scale do not fit: the refusal names the overflow in mm and the " +
+      "largest ISO scale that fits. Undoable; kept when the part is edited.",
+    {
+      drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
+      sheet_size: z.enum(["A4", "A3", "A2", "A1", "A0"]).describe("ISO 216 paper size"),
+      orientation: z
+        .enum(["landscape", "portrait"])
+        .optional()
+        .describe("which way up; omitted = keep the sheet's own"),
+      scale: z
+        .number()
+        .positive()
+        .optional()
+        .describe("ISO 5455 scale as a ratio: 1 = 1:1, 0.5 = 1:2, 2 = 2:1; omitted = keep"),
+    },
+    async ({ drawing_id, sheet_size, orientation, scale }) => {
+      try {
+        const body: Record<string, unknown> = { sheet_size };
+        if (orientation !== undefined) body.orientation = orientation;
+        if (scale !== undefined) body.scale = scale;
+        const { result: r, sheet_effect } = await withSheetEffect(drawing_id, () =>
+          api("PATCH", `/api/drawings/${drawing_id}/sheet`, body),
+        );
+        return ok({
+          drawing_id,
+          sheet: r?.sheet ?? null,
+          previous: r?.previous ?? null,
+          not_applied: r?.not_applied ?? [],
+          certificate: r?.certificate ?? null,
+          quality: r?.quality ?? null,
+          sheet_effect,
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
   // ── drawing_set_title ──────────────────────────────────────────────────
   server.tool(
     "drawing_set_title",

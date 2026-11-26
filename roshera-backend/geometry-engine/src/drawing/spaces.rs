@@ -155,9 +155,9 @@ pub(crate) const LEADER_ANGLE_MAX_DEG: f64 = 60.0;
 /// measured as font size x `CAP_HEIGHT_OF_EM`, as the bench's SVG check
 /// measures it.
 pub(crate) const TEXT_HEIGHT_MIN_MM: f64 = 2.5;
-/// `TEXT-HEIGHT`: 3.5 mm capitals on A3 and larger, as the design spec
-/// states. Practice tables (BS 8888's, after ISO 3098) put the 3.5 mm step at
-/// A2 and larger; the spec's A3 is kept here and is one comparison to change.
+/// `TEXT-HEIGHT`: 3.5 mm capitals on A2 and larger. Practice tables (BS
+/// 8888's, after ISO 3098) put the 3.5 mm step at A2; A3 and A4 take the
+/// 2.5 mm minimum (founder's rule, 2026-11-26).
 pub(crate) const TEXT_HEIGHT_LARGE_SHEET_MM: f64 = 3.5;
 
 /// Free rectangles: the occupancy grid's cell (paper mm).
@@ -750,9 +750,9 @@ pub(crate) fn view_key(name: &str) -> String {
 
 fn large_sheet(size: &SheetSize) -> bool {
     match size {
-        SheetSize::A4 => false,
-        SheetSize::A3 | SheetSize::A2 | SheetSize::A1 | SheetSize::A0 => true,
-        SheetSize::Custom { width, height } => width.min(*height) >= 297.0 - 1e-6,
+        SheetSize::A4 | SheetSize::A3 => false,
+        SheetSize::A2 | SheetSize::A1 | SheetSize::A0 => true,
+        SheetSize::Custom { width, height } => width.min(*height) >= 420.0 - 1e-6,
     }
 }
 

@@ -17,6 +17,7 @@ import type {
   DimensionEdit,
   Waiver,
 } from './dimension-annotate'
+import type { SheetRefusalDetails, SheetRequest } from './sheet-size'
 
 const API_HOST = import.meta.env.VITE_API_URL || ''
 
@@ -680,6 +681,54 @@ export async function setDrawingProjection(
     body: JSON.stringify({ projection }),
   })
   await jsonOrRefusal<unknown>(r)
+}
+
+/** What `PATCH /api/drawings/{id}/sheet` answers. */
+export interface SheetChangeResult {
+  sheet: { sheet_size: SheetSize; orientation: SheetOrientation; scale: number; scale_label: string }
+  previous: { sheet_size: SheetSize; orientation: SheetOrientation; scale: number }
+  /** Edits authored for the old paper that no longer apply on the new one
+   *  (a moved view that does not fit), in the kernel's words. */
+  not_applied: string[]
+}
+
+/** The kernel would not put the sheet on that paper: its sentence and the
+ *  measured parts of it (overflow, the scale that would fit). */
+export class SheetChangeRefused extends Error {
+  readonly details: SheetRefusalDetails | null
+  constructor(message: string, details: SheetRefusalDetails | null) {
+    super(message)
+    this.name = 'SheetChangeRefused'
+    this.details = details
+  }
+}
+
+/**
+ * Put an existing sheet on other paper and/or draw it at another scale. The
+ * kernel lays it out again and keeps what was authored on it; it refuses
+ * ({@link SheetChangeRefused}) when the views at that scale do not fit.
+ * Recorded: Ctrl+Z takes it back and a part edit keeps it.
+ */
+export async function setDrawingSheet(
+  drawingId: string,
+  request: SheetRequest,
+): Promise<SheetChangeResult> {
+  const r = await fetch(`${API_HOST}/api/drawings/${drawingId}/sheet`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  })
+  if (r.ok) return r.json() as Promise<SheetChangeResult>
+  let message = `${r.status} ${r.statusText}`
+  let details: SheetRefusalDetails | null = null
+  try {
+    const body = await r.json()
+    if (typeof body?.error === 'string') message = body.error
+    if (body?.details && typeof body.details === 'object') details = body.details as SheetRefusalDetails
+  } catch {
+    /* non-JSON body: the status line is the reason */
+  }
+  throw new SheetChangeRefused(message, details)
 }
 
 /** One finding of the kernel's sheet check (`verify_drawing`). */

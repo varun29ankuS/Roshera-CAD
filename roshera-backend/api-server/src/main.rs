@@ -91,6 +91,8 @@ mod router_integration_tests;
 mod sheet_export_gate_tests;
 #[cfg(test)]
 mod sheet_orientation_tests;
+#[cfg(test)]
+mod sheet_resize_tests;
 mod sketch;
 mod transactions;
 #[cfg(test)]
@@ -11433,6 +11435,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/drawings/{id}/projection",
             axum::routing::patch(drawing_edit::set_projection),
+        )
+        .route(
+            "/api/drawings/{id}/sheet",
+            axum::routing::patch(drawing_mgr::set_sheet),
         )
         .route(
             "/api/drawings/{id}/views/{view_id}",

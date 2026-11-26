@@ -279,8 +279,10 @@ pub fn rederive_part_drawing(
     model: &BRepModel,
     event: &TimelineEvent,
     id_remap: &HashMap<u64, u64>,
-    projection_switch: Option<geometry_engine::drawing::ProjectionAngle>,
+    switch: Option<SheetSwitch>,
 ) -> DrawingRederive {
+    let projection_switch = switch.and_then(|s| s.projection);
+    let pinned_sheet = switch.and_then(|s| s.sheet);
     let Operation::Generic { parameters, .. } = &event.operation else {
         return DrawingRederive::Failed("non-Generic drawing operation".to_string());
     };
@@ -345,13 +347,32 @@ pub fn rederive_part_drawing(
     let mut framed = BRepModel::new();
     geometry_engine::primitives::snapshot::ModelSnapshot::take(model).restore(&mut framed);
     let (_, drawn_frame) = geometry_engine::drawing::frame_for_drawing(&mut framed, solid_id);
-    let mut drawing = match geometry_engine::drawing::standard_drawing_auto_with_options(
-        &framed,
-        solid_id,
-        part_uuid,
-        projection,
-        orientation,
-    ) {
+    // The paper and scale chosen for the sheet after it was made
+    // (`drawing.set_sheet`): drawn on exactly that, as the live route drew
+    // it. When the part has since outgrown that paper at that scale, the
+    // sheet is found by the search again, as a sheet with no choice recorded:
+    // a part edit must still yield a drawing, and its title block states the
+    // size and scale it is actually on.
+    let pinned = pinned_sheet.and_then(|p| {
+        geometry_engine::drawing::standard_drawing_on_sheet(
+            &framed,
+            solid_id,
+            part_uuid,
+            projection,
+            geometry_engine::drawing::Sheet::new(p.sheet_size, p.orientation),
+            p.scale,
+        )
+        .ok()
+    });
+    let mut drawing = match pinned.map(Ok).unwrap_or_else(|| {
+        geometry_engine::drawing::standard_drawing_auto_with_options(
+            &framed,
+            solid_id,
+            part_uuid,
+            projection,
+            orientation,
+        )
+    }) {
         Ok(d) => d,
         Err(e) => {
             return DrawingRederive::Failed(format!("sheet derivation failed: {e}"));
@@ -513,6 +534,79 @@ pub fn projection_switches(
         {
             out.insert(id, angle);
         }
+    }
+    out
+}
+
+/// Command recorded when a sheet is put on other paper, or drawn at another
+/// scale, after creation (`PATCH /api/drawings/{id}/sheet`).
+pub const DRAWING_SET_SHEET_KIND: &str = "drawing.set_sheet";
+
+/// The paper and scale a sheet was put on after it was made: the parameters
+/// of a [`DRAWING_SET_SHEET_KIND`] event, written by the route that records
+/// it and read back here, so the two cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PinnedSheet {
+    /// The ISO size (or custom dimensions).
+    pub sheet_size: geometry_engine::drawing::SheetSize,
+    /// Which way up the paper lies.
+    pub orientation: geometry_engine::drawing::SheetOrientation,
+    /// The views' scale (ISO 5455: 1.0 is full size, 0.5 is 1:2).
+    pub scale: f64,
+}
+
+/// What was chosen for a sheet after it was made: its projection method
+/// (`drawing.set_projection`) and its paper and scale (`drawing.set_sheet`).
+/// The sheet is re-derived under both.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SheetSwitch {
+    /// The latest projection switch, when there is one.
+    pub projection: Option<geometry_engine::drawing::ProjectionAngle>,
+    /// The latest paper and scale chosen, when there is one.
+    pub sheet: Option<PinnedSheet>,
+}
+
+/// The latest paper and scale recorded for each drawing in `events` (keyed by
+/// the drawing's `drawing:<uuid>` output), in sequence order.
+fn pinned_sheets(events: &[TimelineEvent]) -> HashMap<uuid::Uuid, PinnedSheet> {
+    let mut ordered: Vec<&TimelineEvent> = events.iter().collect();
+    ordered.sort_by_key(|e| e.sequence_number);
+    let mut out = HashMap::new();
+    for e in ordered {
+        let Operation::Generic {
+            command_type,
+            parameters,
+        } = &e.operation
+        else {
+            continue;
+        };
+        if command_type != DRAWING_SET_SHEET_KIND {
+            continue;
+        }
+        let inner = parameters.get("params").unwrap_or(parameters);
+        let Ok(pinned) = serde_json::from_value::<PinnedSheet>(inner.clone()) else {
+            continue;
+        };
+        if let Some(id) = parameters
+            .get("outputs")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.iter().find_map(parse_drawing_ref))
+        {
+            out.insert(id, pinned);
+        }
+    }
+    out
+}
+
+/// Every drawing's [`SheetSwitch`] in `events`: its latest projection switch
+/// and its latest chosen paper.
+pub fn sheet_switches(events: &[TimelineEvent]) -> HashMap<uuid::Uuid, SheetSwitch> {
+    let mut out: HashMap<uuid::Uuid, SheetSwitch> = HashMap::new();
+    for (id, angle) in projection_switches(events) {
+        out.entry(id).or_default().projection = Some(angle);
+    }
+    for (id, pinned) in pinned_sheets(events) {
+        out.entry(id).or_default().sheet = Some(pinned);
     }
     out
 }
@@ -5816,6 +5910,20 @@ mod tests {
                     .map(|kind| vec![kind.to_string()])
                     .unwrap_or_default()
             }),
+            // `RecordedOperation::new(timeline_engine::replay::DRAWING_SET_SHEET_KIND)`:
+            // the sheet route records this crate's own sheet-pin kind, a
+            // dotted drawing event (replayed by `drawing_history`, no B-Rep
+            // arm), excluded exactly like the dotted kinds above.
+            (
+                "api-server/src/drawing_mgr.rs",
+                "timeline_engine",
+                |_code| {
+                    Some(DRAWING_SET_SHEET_KIND)
+                        .filter(|kind| !kind.contains('.'))
+                        .map(|kind| vec![kind.to_string()])
+                        .unwrap_or_default()
+                },
+            ),
         ];
 
         let mut recorded: BTreeSet<String> = BTreeSet::new();

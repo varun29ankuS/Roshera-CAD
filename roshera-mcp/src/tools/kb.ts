@@ -235,6 +235,7 @@ const PLAYBOOK_META: Record<string, PlaybookMeta> = {
       "ask_choice", "kb_lookup", "verify_part", "gdt_datum", "gdt_fcf", "make_drawing",
       "drawing_read_semantics", "drawing_dimensions", "iso286_limits",
       "drawing_set_dimension", "drawing_dimension_properties", "drawing_set_projection",
+      "drawing_set_sheet",
       "drawing_set_title", "drawing_query", "drawing_spaces", "drawing_look",
       "drawing_move_dimension", "drawing_align", "drawing_move_view",
       "drawing_reattach_leader", "drawing_remove_view", "drawing_remove_dimension",

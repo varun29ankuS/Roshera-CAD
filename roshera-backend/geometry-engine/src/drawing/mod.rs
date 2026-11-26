@@ -61,11 +61,11 @@ pub use dimension_edit::{
     DimensionEdits, Waiver,
 };
 pub use dimensioning::{
-    added_view, auto_dimensions, candidate_dimensions, section_slot_rule, set_projection,
-    standard_drawing, standard_drawing_auto, standard_drawing_auto_with_options,
+    added_view, auto_dimensions, candidate_dimensions, largest_scale_on_sheet, section_slot_rule,
+    set_projection, standard_drawing, standard_drawing_auto, standard_drawing_auto_with_options,
     standard_drawing_auto_with_projection, standard_drawing_hlr,
-    standard_drawing_hlr_with_projection, visible_dimensions, CuttingPlaneLine, Dimension2d,
-    SectionSlotRule,
+    standard_drawing_hlr_with_projection, standard_drawing_on_sheet, visible_dimensions,
+    CuttingPlaneLine, Dimension2d, SectionSlotRule,
 };
 pub use dxf::{render_drawing_dxf, DxfRenderError};
 pub use hands::{

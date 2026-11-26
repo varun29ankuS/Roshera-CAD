@@ -1313,6 +1313,23 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "drawing_set_sheet",
+            Drawing,
+            Experimental,
+            Curated,
+            "Put an existing sheet on other paper and/or another scale; refused with the overflow when the views do not fit.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "drawing_id": {"type": "string", "format": "uuid", "description": "drawing_id from make_drawing"},
+                    "sheet_size": {"type": "string", "enum": ["A4", "A3", "A2", "A1", "A0"], "description": "ISO 216 paper size"},
+                    "orientation": {"type": "string", "enum": ["landscape", "portrait"], "description": "which way up; omitted = keep the sheet's own"},
+                    "scale": {"type": "number", "exclusiveMinimum": 0, "description": "ISO 5455 scale as a ratio: 1 = 1:1, 0.5 = 1:2, 2 = 2:1; omitted = keep"}
+                },
+                "required": ["drawing_id", "sheet_size"]
+            }),
+        ),
+        t(
             "drawing_set_title",
             Drawing,
             Experimental,
@@ -2583,7 +2600,9 @@ mod tests {
         // what an edit would rebuild, for the agent.
         // 126 -> 127 (2026-11-24): timeline_material_change -- where material
         // changed between two steps, on the exact solid.
-        assert_eq!(tools.len(), 127, "expected 127 tools, got {}", tools.len());
+        // 127 -> 128 (2026-11-26): drawing_set_sheet -- an existing sheet put
+        // on other paper or another scale (PATCH /api/drawings/{id}/sheet).
+        assert_eq!(tools.len(), 128, "expected 128 tools, got {}", tools.len());
     }
 
     /// The served registry = this table + the backend-owned definitions, with
@@ -2600,7 +2619,7 @@ mod tests {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(tools.len(), 139, "127 table rows + 12 assembly definitions");
+        assert_eq!(tools.len(), 140, "128 table rows + 12 assembly definitions");
         let table: std::collections::HashSet<&str> = raw_tools().iter().map(|s| s.name).collect();
         let Ok(defs) = crate::agent_tools::definitions() else {
             unreachable!("definitions load");

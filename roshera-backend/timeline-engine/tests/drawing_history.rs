@@ -1053,3 +1053,106 @@ fn a_replayed_sheet_and_its_added_view_share_the_part_frame() {
         "the added LEFT view is projected squared (height 40), read {h:.2}"
     );
 }
+
+fn set_sheet(seq: u64, did: Uuid, size: &str, orientation: &str, scale: f64) -> TimelineEvent {
+    generic(
+        "drawing.set_sheet",
+        seq,
+        json!({
+            "params": { "sheet_size": size, "orientation": orientation, "scale": scale },
+            "inputs": [format!("drawing:{did}")],
+            "outputs": [format!("drawing:{did}")]
+        }),
+    )
+}
+
+/// A sheet put on other paper after it was made (`drawing.set_sheet`) is
+/// rebuilt on that paper at that scale, with what was authored on it: a
+/// restart, an undo of a later edit or a dimension edit re-derives the sheet
+/// from the part, and must not send it back to the paper the search picks.
+/// The latest choice wins; a history cut before it (an undo) gives the
+/// searched sheet again.
+///
+/// Mutation: drop the pinned sheet in `replay::rederive_part_drawing` (always
+/// search) -> the sheet is rebuilt on the searched paper -> RED.
+#[test]
+fn a_sheet_keeps_the_paper_and_scale_it_was_put_on() {
+    use geometry_engine::drawing::{SheetOrientation, SheetSize};
+    let did = Uuid::new_v4();
+    let tb = TitleBlock {
+        material: "S275".into(),
+        ..TitleBlock::default()
+    };
+    let mut events = plate();
+    events.extend([from_part(3, 3, did), title_block(4, did, &tb)]);
+    let searched = rebuild_drawings(&events, &FrameCache::new(64));
+    let before = searched.drawings.get(&did).expect("the searched sheet");
+    assert_ne!(
+        before.sheet_size,
+        SheetSize::A1,
+        "fixture: the search does not pick A1 for a 20 mm block"
+    );
+    let (searched_size, searched_orientation) = (before.sheet_size, before.orientation);
+
+    events.extend([
+        set_sheet(5, did, "A2", "landscape", 1.0),
+        set_sheet(6, did, "A1", "portrait", 2.0),
+        mould(1, "radius", 4.0, 7),
+    ]);
+    let built = rebuild_drawings(&events, &FrameCache::new(64));
+    let d = built.drawings.get(&did).expect("the sheet on its paper");
+    assert_eq!(d.sheet_size, SheetSize::A1, "the latest choice wins");
+    assert_eq!(d.orientation, SheetOrientation::Portrait);
+    for v in d
+        .views
+        .iter()
+        .filter(|v| matches!(v.name.as_str(), "FRONT" | "TOP" | "RIGHT"))
+    {
+        assert!((v.scale - 2.0).abs() < 1e-12, "{} at {}", v.name, v.scale);
+    }
+    assert_eq!(d.title_block.material, "S275", "authored fields are kept");
+    // An undo to before the choice: the searched sheet again.
+    let undone = rebuild_drawings(&events[..5], &FrameCache::new(64));
+    let u = undone
+        .drawings
+        .get(&did)
+        .expect("the sheet before the choice");
+    assert_eq!(u.sheet_size, searched_size);
+    assert_eq!(u.orientation, searched_orientation);
+}
+
+/// A part that has outgrown the paper it was put on is still drawn: the
+/// choice no longer fits, so the sheet is found by the search again rather
+/// than lost or drawn off the paper.
+#[test]
+fn a_part_that_outgrows_its_chosen_paper_is_still_drawn() {
+    use geometry_engine::drawing::SheetSize;
+    let did = Uuid::new_v4();
+    let mut events = plate();
+    // 10:1 fits a 20 mm block on A0; after the block grows to 200 mm it
+    // cannot.
+    events.extend([
+        from_part(3, 3, did),
+        set_sheet(4, did, "A0", "landscape", 10.0),
+    ]);
+    let pinned = rebuild_drawings(&events, &FrameCache::new(64));
+    let d = pinned.drawings.get(&did).expect("the pinned sheet");
+    assert_eq!(d.sheet_size, SheetSize::A0);
+    assert!((d.views[0].scale - 10.0).abs() < 1e-12);
+
+    events.extend([
+        mould(0, "width", 200.0, 5),
+        mould(0, "height", 200.0, 6),
+        mould(0, "depth", 200.0, 7),
+    ]);
+    let grown = rebuild_drawings(&events, &FrameCache::new(64));
+    let g = grown
+        .drawings
+        .get(&did)
+        .expect("the grown part still has its sheet");
+    assert!(
+        g.views[0].scale < 10.0,
+        "the grown part cannot be at 10:1: {}",
+        g.views[0].scale
+    );
+}

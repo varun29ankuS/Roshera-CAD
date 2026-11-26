@@ -104,8 +104,14 @@ export const SWITCHABLE_BENCHES: Bench[] = [
  * (31 + 27 = 58, the sole max). Raised by exactly the overshoot, same policy:
  * the eyes find the worst space and these are the verbs that fix it; a bench
  * that can see a defect and not touch it is half a bench.
+ *
+ * 58 -> 59 (2026-11-26): drawing_set_sheet joined the drawing bench (31 + 28
+ * = 59, the sole max). Raised by exactly the overshoot, same policy: changing
+ * the paper and scale of a sheet is the one layout edit the hands above
+ * cannot make, and a sheet stuck on the wrong paper cannot be fixed by moving
+ * what is on it.
  */
-export const LIVE_SURFACE_CEILING = 58;
+export const LIVE_SURFACE_CEILING = 59;
 
 /** Callback that flips real server tool handles on a bench switch. */
 export type ApplyTransition = (toEnable: string[], toDisable: string[]) => void;

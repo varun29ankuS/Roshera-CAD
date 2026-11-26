@@ -34,9 +34,11 @@ use geometry_engine::drawing::dimension_edit::dimension_ink;
 use geometry_engine::drawing::layout::compute_layout;
 use geometry_engine::drawing::spaces::{space_map, SpaceKind, SpaceMap};
 use geometry_engine::drawing::title_block::compute_render_facts;
+use geometry_engine::drawing::types::ProjectionAngle;
 use geometry_engine::drawing::{
     analyse_natural_frame, certify_drawing, frame_for_drawing, render_drawing_dxf,
-    render_drawing_pdf, render_drawing_svg, standard_drawing_auto, verify_drawing, Severity,
+    render_drawing_pdf, render_drawing_svg, set_projection, standard_drawing_auto,
+    standard_drawing_auto_with_projection, verify_drawing, Severity,
 };
 use geometry_engine::primitives::snapshot::ModelSnapshot;
 use geometry_engine::primitives::topology_builder::BRepModel;
@@ -227,9 +229,27 @@ fn main() {
         }),
         Err(e) => json!({ "error": e.to_string() }),
     };
+    // ROSHERA_BENCH_PROJECTION: unset = third angle (the default sheet);
+    // "first" = built in first angle; "switch" = built in third angle, then
+    // switched to first the way the app's projection control does it
+    // (`set_projection`). What a sheet states must not depend on which.
+    let projection_mode = std::env::var("ROSHERA_BENCH_PROJECTION").unwrap_or_default();
+    summary["projection_mode"] = json!(projection_mode);
     let t = Instant::now();
-    let built = catch_unwind(AssertUnwindSafe(|| {
-        standard_drawing_auto(&model, solid, uuid::Uuid::new_v4())
+    let built = catch_unwind(AssertUnwindSafe(|| match projection_mode.as_str() {
+        "first" => standard_drawing_auto_with_projection(
+            &model,
+            solid,
+            uuid::Uuid::new_v4(),
+            ProjectionAngle::First,
+        ),
+        "switch" => standard_drawing_auto(&model, solid, uuid::Uuid::new_v4()).map(|mut d| {
+            if let Err(e) = set_projection(&mut d, ProjectionAngle::First) {
+                eprintln!("the projection switch was refused: {e}");
+            }
+            d
+        }),
+        _ => standard_drawing_auto(&model, solid, uuid::Uuid::new_v4()),
     }));
     let sheet_ms = ms(t);
     let mut drawing = match built {

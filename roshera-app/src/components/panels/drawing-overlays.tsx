@@ -16,6 +16,14 @@
 import { useCallback, useMemo, useState } from 'react'
 import { useDismiss } from '@/hooks/use-dismiss'
 import {
+  ISO_SHEET_SIZES,
+  scaleLabel,
+  scaleOptions,
+  sheetRequest,
+  type SheetChoice,
+  type SheetRefusal,
+} from '@/lib/sheet-size'
+import {
   Check,
   ChevronDown,
   Pencil,
@@ -195,10 +203,154 @@ export function DrawingSwitcher({
 
 // ── Sheet actions (top-right) ────────────────────────────────────────────
 
+// ── Sheet size and scale (top-right) ─────────────────────────────────────
+
+/**
+ * The paper and scale of the open sheet, and the control that changes them:
+ * A4..A0, which way up, and an ISO scale. The kernel lays the sheet out again
+ * on Apply; when the views at that scale do not fit it refuses, and the
+ * reason is shown here in plain words with the scale that would fit.
+ */
+export function SheetSizeControl({
+  now,
+  busy,
+  refusal,
+  onApply,
+  onDismissRefusal,
+}: {
+  /** What the sheet is on; `null` for a custom size the control cannot name. */
+  now: SheetChoice | null
+  busy: boolean
+  refusal: SheetRefusal | null
+  onApply: (asked: SheetChoice) => void
+  onDismissRefusal: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [draft, setDraft] = useState<SheetChoice | null>(null)
+  const close = useCallback(() => {
+    setOpen(false)
+    setDraft(null)
+    onDismissRefusal()
+  }, [onDismissRefusal])
+  const ref = useDismiss(open, close)
+  if (!now) return null
+  const asked = draft ?? now
+  const changed = sheetRequest(now, asked) !== null
+  const pick = (patch: Partial<SheetChoice>) => {
+    onDismissRefusal()
+    setDraft({ ...asked, ...patch })
+  }
+  const option = (on: boolean) =>
+    `cad-focus px-2 py-1 text-xs ${on ? 'bg-accent/40 font-medium' : 'hover:bg-accent/20'}`
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        title="Sheet size and scale"
+        onClick={() => (open ? close() : setOpen(true))}
+        className={`${card} cad-focus flex items-center gap-1 px-2.5 py-1.5 text-xs hover:bg-accent/20`}
+      >
+        {now.size} · {scaleLabel(now.scale)}
+        <ChevronDown size={12} />
+      </button>
+      {open && (
+        <div role="dialog" aria-label="Sheet size and scale" className={`${card} absolute right-0 mt-1 w-64 p-2 text-xs`}>
+          <div className="mb-1 text-muted-foreground">Paper</div>
+          <div role="radiogroup" aria-label="Sheet size" className="mb-2 flex overflow-hidden rounded border border-border">
+            {ISO_SHEET_SIZES.map((s) => (
+              <button
+                key={s}
+                type="button"
+                role="radio"
+                aria-checked={asked.size === s}
+                disabled={busy}
+                onClick={() => pick({ size: s })}
+                className={`${option(asked.size === s)} flex-1`}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+          <div role="radiogroup" aria-label="Orientation" className="mb-2 flex overflow-hidden rounded border border-border">
+            {(['landscape', 'portrait'] as const).map((w) => (
+              <button
+                key={w}
+                type="button"
+                role="radio"
+                aria-checked={asked.way === w}
+                disabled={busy}
+                onClick={() => pick({ way: w })}
+                className={`${option(asked.way === w)} flex-1`}
+              >
+                {w === 'landscape' ? 'Landscape' : 'Portrait'}
+              </button>
+            ))}
+          </div>
+          <label className="mb-2 flex items-center justify-between gap-2">
+            <span className="text-muted-foreground">Scale</span>
+            <select
+              aria-label="Scale"
+              value={String(asked.scale)}
+              disabled={busy}
+              onChange={(e) => pick({ scale: Number(e.target.value) })}
+              className="cad-focus rounded border border-border bg-background px-1.5 py-1 text-xs"
+            >
+              {scaleOptions(now.scale).map((s) => (
+                <option key={s} value={String(s)}>
+                  {scaleLabel(s)}
+                </option>
+              ))}
+            </select>
+          </label>
+          {refusal && (
+            <div role="alert" className="mb-2 rounded border border-destructive/50 bg-destructive/10 p-1.5 text-xs">
+              <div>{refusal.text}</div>
+              {refusal.fits !== null && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    const next = { ...asked, scale: refusal.fits as number }
+                    setDraft(next)
+                    onApply(next)
+                  }}
+                  className="cad-focus mt-1 underline"
+                >
+                  Use {scaleLabel(refusal.fits)}
+                </button>
+              )}
+            </div>
+          )}
+          <div className="flex justify-end gap-2">
+            <button type="button" onClick={close} className="cad-focus px-2 py-1 hover:bg-accent/20">
+              Close
+            </button>
+            <button
+              type="button"
+              disabled={busy || !changed}
+              onClick={() => onApply(asked)}
+              className="cad-focus rounded bg-accent/40 px-2 py-1 font-medium disabled:opacity-50"
+            >
+              {busy ? 'Laying out…' : 'Apply'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function SheetActions({
   projection,
   projectionBusy,
   onProjection,
+  sheet,
+  sheetBusy,
+  sheetRefused,
+  onSheet,
+  onDismissSheetRefusal,
   titleBlockOpen,
   onToggleTitleBlock,
   onDownload,
@@ -207,6 +359,12 @@ export function SheetActions({
   projection: ProjectionAngle
   projectionBusy: boolean
   onProjection: (p: ProjectionAngle) => void
+  /** The paper and scale the sheet is on (`null`: a custom size). */
+  sheet: SheetChoice | null
+  sheetBusy: boolean
+  sheetRefused: SheetRefusal | null
+  onSheet: (asked: SheetChoice) => void
+  onDismissSheetRefusal: () => void
   /** Annotate > tolerance / text / suppress: the engineer picks a dimension next. */
   onPickDimension: () => void
   titleBlockOpen: boolean
@@ -244,6 +402,13 @@ export function SheetActions({
           </button>
         ))}
       </div>
+      <SheetSizeControl
+        now={sheet}
+        busy={sheetBusy}
+        refusal={sheetRefused}
+        onApply={onSheet}
+        onDismissRefusal={onDismissSheetRefusal}
+      />
       <AnnotateMenu onPickDimension={onPickDimension} />
       <button
         type="button"
@@ -541,10 +706,6 @@ export function ViewMenu({
       </button>
     </div>
   )
-}
-
-function scaleLabel(s: number): string {
-  return s >= 1 ? `${Number(s.toFixed(2))}:1` : `1:${Number((1 / s).toFixed(2))}`
 }
 
 // ── Title block card (opens under the actions) ──────────────────────────
