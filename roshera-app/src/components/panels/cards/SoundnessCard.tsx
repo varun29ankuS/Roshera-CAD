@@ -1,14 +1,23 @@
 import type { ComponentType } from 'react'
 import {
+  Box,
   Droplet,
+  Eye,
+  GitMerge,
+  Grid3x3,
+  Move3d,
+  Ruler,
   ShieldCheck,
+  Square,
+  Tags,
+  Wrench,
 } from '@/components/ui/icons'
 import {
   invariantState,
   type InvariantValue,
   type SoundnessCard as SoundnessCardData,
 } from '@/lib/blackboard-cards'
-import { CardShell, Chip, Claim, ClaimBadge, KV, type CardAccent } from './card-chrome'
+import { CardShell, CertRow, CertRows, Chip, Claim, KV, type CardAccent } from './card-chrome'
 import { eulerGenus, fmtNum } from './format'
 
 /**
@@ -23,23 +32,14 @@ import { eulerGenus, fmtNum } from './format'
  * fourth state, not_applicable (nothing to check on this part): a grey "n/a",
  * neither a tick nor a cross, and not counted as not-run.
  *
- * The nine invariants render as a wrapped row of compact `ClaimBadge`s (not
- * a vertical list — Varun, 2026-08-01: a sound part should read as one
- * glance of green, and nine lines all saying "fine" buries the one that
- * doesn't). `label` is the badge's visible short text; `long` is the full
- * claim, used ONLY for the hover/`aria-label` detail — never abbreviated,
- * so a badge's tooltip is never shorter than the thing it certifies.
- *
- * Only ONE invariant gets a pictograph instead of a label: watertight's
- * droplet, because waterproof/leak iconography is genuinely universal (IP
- * ratings, packaging) — no legend needed. `dual-eye` LOOKED like a second
- * candidate (an eye glyph reads naturally as "vision"), but on reflection
- * it decodes to the wrong thing: a bare eye in a certificate row reads as
- * "visible/viewed," not "two independent synthetic viewpoints reconciled
- * face coverage" — a private mapping this codebase's own rule (never ship
- * a lookalike a reader has to be taught) forbids. Every other invariant is
- * an abstract B-Rep/topology term with no real-world icon at all, so all
- * nine keep short text labels rather than inventing glyphs for them.
+ * The invariants render ONE PER LINE (Varun, 2026-11-26, superseding the
+ * 2026-08-01 wrapped badge row: "line by line with a right tick at the end
+ * with icons ... so that the whole thing looks very professional"): an icon,
+ * the full claim name, the measured evidence where the certificate carries
+ * it, and the verdict aligned at the right edge. The icon only marks the
+ * row; the full name beside it carries the meaning, so no icon has to be
+ * learned. A failed line is set heavier, so the one that does not hold still
+ * stands out in a column of ticks.
  */
 type InvariantKey =
   | 'brep_valid'
@@ -64,22 +64,48 @@ const BADGE: Record<ReturnType<typeof invariantState>, { status: boolean | null 
 
 const INVARIANTS: ReadonlyArray<{
   key: InvariantKey
-  /** Visible badge text (or nothing, if `glyph` is set). */
-  label: string
-  /** Full claim name — hover/`aria-label` only, never truncated. */
+  /** The full claim, shown on its line, never abbreviated. */
+  name: string
+  /** Hover text: what the claim asserts. */
   long: string
-  glyph?: ComponentType<{ size?: number | string; className?: string }>
+  icon: ComponentType<{ size?: number | string; className?: string }>
+  /** The measured evidence for this line, when the card carries it. */
+  value?: (card: SoundnessCardData) => string | undefined
 }> = [
-  { key: 'brep_valid', label: 'B-Rep', long: 'B-Rep valid' },
-  { key: 'watertight', label: 'watertight', long: 'watertight', glyph: Droplet },
-  { key: 'manifold', label: 'manifold', long: 'manifold' },
-  { key: 'shells_outward', label: 'outward', long: 'every shell faces out of the material' },
-  { key: 'self_intersection_free', label: 'no self-int.', long: 'self-intersection-free' },
-  { key: 'construction_consistent', label: 'construction', long: 'construction consistent' },
-  { key: 'labels_consistent', label: 'labels', long: 'labels consistent' },
-  { key: 'tessellation_clean', label: 'tessellation', long: 'tessellation clean' },
-  { key: 'mesh_quality_clean', label: 'mesh quality', long: 'mesh quality clean' },
-  { key: 'eyes_consistent', label: 'dual-eye', long: 'dual-eye consistency' },
+  {
+    key: 'brep_valid',
+    name: 'B-Rep valid',
+    long: 'B-Rep valid',
+    icon: Box,
+    value: (c) => (c.face_count != null ? `${fmtNum(c.face_count)} faces` : undefined),
+  },
+  {
+    key: 'watertight',
+    name: 'Watertight',
+    long: 'watertight: every edge shared by exactly two faces',
+    icon: Droplet,
+    value: (c) => (c.open_edges != null ? `${fmtNum(c.open_edges)} open edges` : undefined),
+  },
+  {
+    key: 'manifold',
+    name: 'Manifold',
+    long: 'manifold',
+    icon: Square,
+    value: (c) =>
+      c.nonmanifold_edges != null ? `${fmtNum(c.nonmanifold_edges)} non-manifold` : undefined,
+  },
+  { key: 'shells_outward', name: 'Shells face outward', long: 'every shell faces out of the material', icon: Move3d },
+  { key: 'self_intersection_free', name: 'No self-intersection', long: 'self-intersection-free', icon: GitMerge },
+  { key: 'construction_consistent', name: 'Construction consistent', long: 'construction consistent', icon: Wrench },
+  { key: 'labels_consistent', name: 'Labels consistent', long: 'labels consistent', icon: Tags },
+  { key: 'tessellation_clean', name: 'Tessellation clean', long: 'tessellation clean', icon: Grid3x3 },
+  { key: 'mesh_quality_clean', name: 'Mesh quality', long: 'mesh quality clean', icon: Ruler },
+  {
+    key: 'eyes_consistent',
+    name: 'Dual-view consistent',
+    long: 'two independent synthetic viewpoints reconcile face coverage',
+    icon: Eye,
+  },
 ]
 
 export function SoundnessCard({ card }: { card: SoundnessCardData }) {
@@ -116,20 +142,21 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
         )
       }
     >
-      <div className="mt-1.5 flex flex-wrap items-center gap-1">
-        {INVARIANTS.map(({ key, label, long, glyph }) => {
+      <CertRows>
+        {INVARIANTS.map(({ key, name, long, icon, value }) => {
           const badge = BADGE[stateOf(key)]
           return (
-            <ClaimBadge
+            <CertRow
               key={key}
               status={badge.status}
-              label={label}
-              glyph={glyph}
-              detail={`${long}: ${badge.word}`}
+              name={name}
+              icon={icon}
+              value={value?.(card)}
+              title={`${long}: ${badge.word}`}
             />
           )
         })}
-      </div>
+      </CertRows>
 
       {card.verdict && <div className="mt-1.5 text-[11px] text-foreground/80">{card.verdict}</div>}
 
@@ -137,11 +164,6 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
         {card.euler_characteristic != null && (
           <KV label="Euler characteristic χ">{fmtNum(card.euler_characteristic)}</KV>
         )}
-        {card.open_edges != null && <KV label="open edges">{fmtNum(card.open_edges)}</KV>}
-        {card.nonmanifold_edges != null && (
-          <KV label="non-manifold edges">{fmtNum(card.nonmanifold_edges)}</KV>
-        )}
-        {card.face_count != null && <KV label="faces">{fmtNum(card.face_count)}</KV>}
         {card.volume != null && <KV label="volume">{fmtNum(card.volume)} mm³</KV>}
       </div>
       {card.euler_characteristic != null &&

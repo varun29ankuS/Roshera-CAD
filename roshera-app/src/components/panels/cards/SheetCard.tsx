@@ -1,6 +1,6 @@
-import { DraftingCompass } from '@/components/ui/icons'
+import { DraftingCompass, ListChecks, Ruler, ShieldCheck } from '@/components/ui/icons'
 import type { SheetCard as SheetCardData } from '@/lib/blackboard-cards'
-import { CardShell, Chip, Claim, ClaimBadge, KV, type CardAccent } from './card-chrome'
+import { CardShell, CertRow, CertRows, Chip, Claim, KV, type CardAccent } from './card-chrome'
 import { CardText } from './CardText'
 
 /**
@@ -50,23 +50,31 @@ export function SheetCard({ card }: { card: SheetCardData }) {
         </>
       }
     >
-      <div className="mt-1.5 flex flex-wrap items-center gap-1">
-        <ClaimBadge
+      <CertRows>
+        <CertRow
           status={sound}
-          label="sound"
-          detail={`sound — every printed fact matches the model: ${BADGE_WORD(sound)}`}
+          name="Sound"
+          icon={ShieldCheck}
+          value="printed facts match the model"
+          title={`sound — every printed fact matches the model: ${BADGE_WORD(sound)}`}
         />
-        <ClaimBadge
+        <CertRow
           status={complete}
-          label="complete"
-          detail={`complete — every model dimension is on a view or signed off: ${BADGE_WORD(complete)}`}
+          name="Complete"
+          icon={ListChecks}
+          value={
+            card.dimensions_omitted !== undefined ? `${card.dimensions_omitted} not dimensioned` : undefined
+          }
+          title={`complete — every model dimension is on a view or signed off: ${BADGE_WORD(complete)}`}
         />
-        <ClaimBadge
+        <CertRow
           status={layout}
-          label="layout"
-          detail={`layout check — no collisions or redundant dimensions: ${BADGE_WORD(layout)}`}
+          name="Layout"
+          icon={Ruler}
+          value="no collisions or redundant dimensions"
+          title={`layout check — no collisions or redundant dimensions: ${BADGE_WORD(layout)}`}
         />
-      </div>
+      </CertRows>
       <div className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-0.5">
         {card.projection && (
           <KV label="projection">{card.projection === 'first' ? 'first angle (ISO)' : 'third angle (ASME)'}</KV>

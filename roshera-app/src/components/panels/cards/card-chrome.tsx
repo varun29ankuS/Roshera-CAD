@@ -172,6 +172,89 @@ export function Claim({
 }
 
 /**
+ * One certificate check on one line (Varun, 2026-11-26: "line by line with a
+ * right tick at the end with icons ... so that the whole thing looks very
+ * professional"): the check's icon, its full name, the measured evidence,
+ * and the verdict at the right edge -- a tick, a cross, "n/a" (nothing to
+ * check on this part) or a dashed "not run" (not run is never a pass).
+ * Rows sit in a `CertRows` grid so names, values and ticks align in columns.
+ */
+export function CertRow({
+  status,
+  name,
+  value,
+  icon: Icon,
+  title,
+}: {
+  status: boolean | null | 'na'
+  /** The full claim, never abbreviated. */
+  name: string
+  /** The measured evidence ("0 open edges"), when the certificate carries it. */
+  value?: ReactNode
+  icon: ComponentType<{ size?: number | string; className?: string }>
+  /** Hover text: the claim and its verdict word. */
+  title: string
+}) {
+  const verdict =
+    status === true ? 'proven' : status === false ? 'failed' : status === 'na' ? 'not applicable' : 'not run'
+  return (
+    <div
+      title={title}
+      aria-label={`${name}: ${verdict}`}
+      className={cn(
+        'contents text-[11px] leading-5',
+        status === false ? 'text-foreground' : status === true ? 'text-foreground/90' : 'text-foreground/70',
+      )}
+      role="row"
+    >
+      <span role="cell" className="inline-flex items-center text-muted-foreground">
+        <Icon size={12} />
+      </span>
+      <span role="cell" className={cn(status === false && 'font-medium')}>
+        {name}
+      </span>
+      <span role="cell" className="cad-readout text-right font-mono text-[11px] text-muted-foreground">
+        {value}
+      </span>
+      <span
+        role="cell"
+        className={cn(
+          'inline-flex items-center justify-end',
+          status === true && 'text-emerald-600 dark:text-emerald-400',
+          status === false && 'text-red-600 dark:text-red-400',
+          status === null && 'text-caution',
+          status === 'na' && 'font-mono text-[10px] text-muted-foreground',
+        )}
+      >
+        {status === true ? (
+          <Check size={13} />
+        ) : status === false ? (
+          <X size={13} />
+        ) : status === 'na' ? (
+          'n/a'
+        ) : (
+          <span className="rounded border border-dashed border-caution-border px-1 font-mono text-[10px] leading-4">
+            not run
+          </span>
+        )}
+      </span>
+    </div>
+  )
+}
+
+/** The aligned grid `CertRow`s sit in: icon | name | value | verdict. */
+export function CertRows({ children }: { children: ReactNode }) {
+  return (
+    <div
+      role="table"
+      className="mt-2 grid grid-cols-[22px_minmax(0,1fr)_auto_auto] items-center border-t border-border/60 pt-1 [&>div>span]:self-stretch [&>div>span]:border-b [&>div>span]:border-border/30 [&>div>span]:py-1 [&>div>span:nth-child(3)]:pl-3 [&>div>span:nth-child(4)]:pl-3"
+    >
+      {children}
+    </div>
+  )
+}
+
+/**
  * Compact tri-state BADGE — the row counterpart to `Claim`, for a set of
  * invariants that are each a single word or two ("watertight", "manifold")
  * rather than a sentence. A wrapped row of these reads as one glance: a
