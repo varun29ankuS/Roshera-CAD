@@ -653,7 +653,11 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
       <div
         ref={scrollRef}
         onScroll={onBodyScroll}
-        className="board-type flex-1 overflow-y-auto min-h-0 scrollbar-thin"
+        // Prose stays in the app's reading face (Varun 2026-11-27: the
+        // mechanical lettering over whole paragraphs could not be read "in
+        // 1 go"). The mechanical face is for the cards -- certificate rows,
+        // readouts, chips -- where it marks kernel output (card-chrome).
+        className="flex-1 overflow-y-auto min-h-0 scrollbar-thin"
         style={
           docked
             ? undefined
