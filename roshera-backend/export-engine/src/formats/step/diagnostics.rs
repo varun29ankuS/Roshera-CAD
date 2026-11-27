@@ -117,6 +117,16 @@ pub enum HealingKind {
     /// tolerance it exceeded. A gap beyond the cap is refused instead (a
     /// warning, and the edge keeps the declared tolerance).
     EdgeToleranceRaised,
+    /// An `EDGE_CURVE` lay farther from an analytic surface of a face using
+    /// it than [`super::EDGE_GAP_REPAIR_CAP`] but within
+    /// [`super::EDGE_GAP_ACCEPT_CEILING`], after the rebuild on its faces'
+    /// intersection could not bring it closer: the two faces do not meet
+    /// there. The edge is ACCEPTED as a tolerant edge -- its tolerance is the
+    /// measured gap (`deviation`), no more -- and named: `tolerance` is the
+    /// accuracy it carried from the file, and a warning beside this record
+    /// states the gap, that accuracy and the face in words. A gap beyond the
+    /// ceiling is refused.
+    EdgeGapAccepted,
     /// A face walked most of its shared edges the SAME way as the
     /// neighbouring face using each edge, while two faces of a consistently
     /// oriented shell walk a shared edge in opposite directions: its loops

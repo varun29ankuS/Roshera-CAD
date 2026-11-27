@@ -991,9 +991,20 @@ fn reverse_loops_walking_against_neighbours(
 }
 
 /// The largest gap between an edge and a face's surface that the importer
-/// repairs by raising the edge's tolerance (mm). Beyond it an edge is not on
-/// its face and the part is refused, with the gap in the report.
+/// repairs by raising the edge's tolerance (mm) as a matter of course.
+/// Beyond it, see [`EDGE_GAP_ACCEPT_CEILING`].
 pub const EDGE_GAP_REPAIR_CAP: f64 = 0.01;
+
+/// The largest gap between an edge and a face's surface that the importer
+/// ACCEPTS at all (mm). Between [`EDGE_GAP_REPAIR_CAP`] and this, an edge
+/// that the rebuild on its faces' intersection could not put on both faces
+/// -- the faces do not meet there -- is kept as a tolerant edge whose
+/// tolerance is the measured gap, and is named in the report
+/// ([`diagnostics::HealingKind::EdgeGapAccepted`] and a warning with the
+/// numbers); the file's writer, like every exchange kernel, carried the same
+/// gap silently. Beyond it an edge is not on its face and the part is
+/// refused, with the gap in the report.
+pub const EDGE_GAP_ACCEPT_CEILING: f64 = 0.05;
 
 /// The farthest the importer moves any point of an edge to put it on the
 /// intersection of its two faces (mm). The file's curve is the evidence of
@@ -1567,13 +1578,64 @@ fn raise_edge_tolerances_to_measured_gaps(
                     );
                 }
             }
+        } else if g <= EDGE_GAP_ACCEPT_CEILING {
+            // The rebuild on the faces' intersection has already run and
+            // left this edge where it is: its faces do not meet within
+            // reach. Accepted, at exactly the measured gap, and named.
+            edge.set_tolerance(g * (1.0 + 1e-6));
+            report.healings.push(diagnostics::Healing {
+                kind: diagnostics::HealingKind::EdgeGapAccepted,
+                entity: "EDGE_CURVE".into(),
+                instance,
+                deviation: g,
+                tolerance: declared,
+            });
+            let mut off_faces: Vec<String> = Vec::new();
+            for (f, off) in edge_faces.get(&eid).into_iter().flatten() {
+                if *off <= declared {
+                    continue;
+                }
+                let face_name = match face_instance.get(f) {
+                    Some(n) => format!("face #{n} ({off:.3e} mm)"),
+                    None => format!("face {f} ({off:.3e} mm)"),
+                };
+                off_faces.push(face_name);
+                if let Some(&n) = face_instance.get(f) {
+                    caches.record_lens(
+                        n,
+                        geometry_engine::lens::Stage::Repair,
+                        geometry_engine::lens::EventKind::EdgeToleranceRaised,
+                        Some(instance),
+                        "edge lies off this face beyond the repair cap and its faces do not meet there; accepted as a tolerant edge at the measured gap",
+                        &[
+                            ("gap_mm", *off),
+                            ("declared_mm", declared),
+                            ("accept_ceiling_mm", EDGE_GAP_ACCEPT_CEILING),
+                        ],
+                    );
+                }
+            }
+            off_faces.sort();
+            report.push_warning(diagnostics::Warning {
+                severity: diagnostics::Severity::Warn,
+                entity: "EDGE_CURVE".into(),
+                instance: Some(instance),
+                message: format!(
+                    "edge lies {g:.3e} mm off {}; the file states an accuracy of {declared:.1e} mm and the repair cap is {EDGE_GAP_REPAIR_CAP} mm; its faces do not meet there, so it is accepted as a tolerant edge of {g:.3e} mm (ceiling {EDGE_GAP_ACCEPT_CEILING} mm)",
+                    if off_faces.is_empty() {
+                        "its face".to_string()
+                    } else {
+                        off_faces.join(", ")
+                    }
+                ),
+            });
         } else {
             report.push_warning(diagnostics::Warning {
                 severity: diagnostics::Severity::Warn,
                 entity: "EDGE_CURVE".into(),
                 instance: Some(instance),
                 message: format!(
-                    "edge lies {g:.3e} mm off its face, beyond the {EDGE_GAP_REPAIR_CAP} mm repair                      cap; left at its declared tolerance {declared:.1e}"
+                    "edge lies {g:.3e} mm off its face, beyond the {EDGE_GAP_ACCEPT_CEILING} mm ceiling for a tolerant edge; left at its declared tolerance {declared:.1e}"
                 ),
             });
         }

@@ -320,118 +320,140 @@ impl EntityHandler for EdgeCurveHandler {
         // curve and adopt its native parameter range. `edge_param_range`
         // carries the per-curve domain so the `Edge` is parameterised
         // consistently with its backing curve.
+        // The edge is the WHOLE of a closed curve only when it starts and
+        // ends at one vertex: the same vertex entity, or two written at the
+        // very same point. Two different vertices a hair apart bound a hair
+        // of arc, however short -- never "the same point within the file's
+        // accuracy" (CADGenBench parts 247, 248 and 250: arcs of 3 to 19
+        // micrometres built as the full circles they lie on).
+        let closed = start_vid == end_vid || start_pos == end_pos;
         let mut edge_param_range = ParameterRange::unit();
-        let curve_box: Box<dyn Curve> = if let Some(line_geom) =
-            ctx.caches.step_lines.get(&geom_ref).copied()
-        {
-            build_line_curve(line_geom, start_pos, end_pos)
-        } else if let Some(circle_geom) = ctx.caches.step_circles.get(&geom_ref).copied() {
-            match build_circle_curve(circle_geom, start_pos, end_pos, same_sense, instance, ctx) {
-                Some(c) => c,
-                None => {
-                    return HandlerOutcome::Failed {
-                        message: "kernel rejected circle/arc".into(),
+        let curve_box: Box<dyn Curve> =
+            if let Some(line_geom) = ctx.caches.step_lines.get(&geom_ref).copied() {
+                build_line_curve(line_geom, start_pos, end_pos)
+            } else if let Some(circle_geom) = ctx.caches.step_circles.get(&geom_ref).copied() {
+                match build_circle_curve(
+                    circle_geom,
+                    start_pos,
+                    end_pos,
+                    same_sense,
+                    closed,
+                    instance,
+                    ctx,
+                ) {
+                    Some(c) => c,
+                    None => {
+                        return HandlerOutcome::Failed {
+                            message: "kernel rejected circle/arc".into(),
+                        }
                     }
                 }
-            }
-        } else if let Some(ellipse_geom) = ctx.caches.step_ellipses.get(&geom_ref).copied() {
-            match build_ellipse_curve(ellipse_geom, start_pos, end_pos, same_sense, instance, ctx) {
-                Some((c, range)) => {
-                    edge_param_range = range;
-                    c
-                }
-                None => {
-                    return HandlerOutcome::Failed {
-                        message: "kernel rejected ellipse".into(),
+            } else if let Some(ellipse_geom) = ctx.caches.step_ellipses.get(&geom_ref).copied() {
+                match build_ellipse_curve(
+                    ellipse_geom,
+                    start_pos,
+                    end_pos,
+                    same_sense,
+                    closed,
+                    instance,
+                    ctx,
+                ) {
+                    Some((c, range)) => {
+                        edge_param_range = range;
+                        c
+                    }
+                    None => {
+                        return HandlerOutcome::Failed {
+                            message: "kernel rejected ellipse".into(),
+                        }
                     }
                 }
-            }
-        } else if let Some(conic) = ctx.caches.step_open_conics.get(&geom_ref).copied() {
-            match build_open_conic_curve(conic, start_pos, end_pos, instance, ctx) {
-                Some((c, range)) => {
-                    edge_param_range = range;
-                    c
-                }
-                None => {
-                    return HandlerOutcome::Failed {
-                        message: "kernel rejected the conic arc".into(),
+            } else if let Some(conic) = ctx.caches.step_open_conics.get(&geom_ref).copied() {
+                match build_open_conic_curve(conic, start_pos, end_pos, instance, ctx) {
+                    Some((c, range)) => {
+                        edge_param_range = range;
+                        c
+                    }
+                    None => {
+                        return HandlerOutcome::Failed {
+                            message: "kernel rejected the conic arc".into(),
+                        }
                     }
                 }
-            }
-        } else if let Some(curve_id) = ctx.caches.curves.get(&geom_ref).copied() {
-            // Free-form edge backed by an already-materialised kernel
-            // curve (B-spline / NURBS). Clone it so this edge owns an
-            // independent curve instance and preserve its native domain.
-            match ctx.model.curves.get(curve_id) {
-                Some(c) => {
-                    edge_param_range =
-                        match span_between_vertices(c, start_pos, end_pos, same_sense) {
-                            Ok(span) => {
-                                if span.off_curve > VERTEX_ON_CURVE {
-                                    ctx.report.push_warning(Warning {
-                                        severity: Severity::Warn,
-                                        entity: names::EDGE_CURVE.into(),
-                                        instance: Some(instance),
-                                        message: format!(
+            } else if let Some(curve_id) = ctx.caches.curves.get(&geom_ref).copied() {
+                // Free-form edge backed by an already-materialised kernel
+                // curve (B-spline / NURBS). Clone it so this edge owns an
+                // independent curve instance and preserve its native domain.
+                match ctx.model.curves.get(curve_id) {
+                    Some(c) => {
+                        edge_param_range =
+                            match span_between_vertices(c, start_pos, end_pos, same_sense) {
+                                Ok(span) => {
+                                    if span.off_curve > VERTEX_ON_CURVE {
+                                        ctx.report.push_warning(Warning {
+                                            severity: Severity::Warn,
+                                            entity: names::EDGE_CURVE.into(),
+                                            instance: Some(instance),
+                                            message: format!(
                                             "a vertex lies {:.3e} off its curve #{geom_ref}; the \
                                          edge, {:.3e} long, is trimmed at the curve's nearest \
                                          point",
                                             span.off_curve, span.length
                                         ),
-                                    });
+                                        });
+                                    }
+                                    span.range
                                 }
-                                span.range
-                            }
-                            Err(refusal) => {
-                                // Reported here: an edge is usually reached
-                                // through its loop, and that path drops the
-                                // `Failed` message.
-                                ctx.report.push_warning(Warning {
-                                    severity: Severity::Warn,
-                                    entity: names::EDGE_CURVE.into(),
-                                    instance: Some(instance),
-                                    message: format!(
+                                Err(refusal) => {
+                                    // Reported here: an edge is usually reached
+                                    // through its loop, and that path drops the
+                                    // `Failed` message.
+                                    ctx.report.push_warning(Warning {
+                                        severity: Severity::Warn,
+                                        entity: names::EDGE_CURVE.into(),
+                                        instance: Some(instance),
+                                        message: format!(
                                         "a vertex lies {:.3e} off its curve #{geom_ref}, beyond \
                                          the {:.3e} allowed for an edge {:.3e} long; the edge is \
                                          refused",
                                         refusal.distance, refusal.allowed, refusal.edge_length
                                     ),
-                                });
-                                return HandlerOutcome::Failed {
-                                    message: "edge vertex too far from the edge's curve".into(),
-                                };
-                            }
+                                    });
+                                    return HandlerOutcome::Failed {
+                                        message: "edge vertex too far from the edge's curve".into(),
+                                    };
+                                }
+                            };
+                        c.clone_box()
+                    }
+                    None => {
+                        ctx.report.push_warning(Warning {
+                            severity: Severity::Warn,
+                            entity: names::EDGE_CURVE.into(),
+                            instance: Some(instance),
+                            message: format!(
+                                "edge_geometry #{geom_ref} cached a curve id absent from the model"
+                            ),
+                        });
+                        return HandlerOutcome::Failed {
+                            message: "edge curve id dangling".into(),
                         };
-                    c.clone_box()
+                    }
                 }
-                None => {
-                    ctx.report.push_warning(Warning {
-                        severity: Severity::Warn,
-                        entity: names::EDGE_CURVE.into(),
-                        instance: Some(instance),
-                        message: format!(
-                            "edge_geometry #{geom_ref} cached a curve id absent from the model"
-                        ),
-                    });
-                    return HandlerOutcome::Failed {
-                        message: "edge curve id dangling".into(),
-                    };
-                }
-            }
-        } else {
-            ctx.report.push_warning(Warning {
-                severity: Severity::Warn,
-                entity: names::EDGE_CURVE.into(),
-                instance: Some(instance),
-                message: format!(
-                    "edge_geometry #{geom_ref} did not resolve to a supported curve \
+            } else {
+                ctx.report.push_warning(Warning {
+                    severity: Severity::Warn,
+                    entity: names::EDGE_CURVE.into(),
+                    instance: Some(instance),
+                    message: format!(
+                        "edge_geometry #{geom_ref} did not resolve to a supported curve \
                      (LINE / CIRCLE / ELLIPSE / B_SPLINE_CURVE_WITH_KNOTS / rational B-spline)"
-                ),
-            });
-            return HandlerOutcome::Failed {
-                message: "unsupported edge_geometry".into(),
+                    ),
+                });
+                return HandlerOutcome::Failed {
+                    message: "unsupported edge_geometry".into(),
+                };
             };
-        };
 
         // Per-edge snap check between the curve's endpoint evaluation
         // and the recorded vertex position. STEP doesn't always emit
@@ -496,6 +518,7 @@ fn build_ellipse_curve(
     start: [f64; 3],
     end: [f64; 3],
     same_sense: bool,
+    closed: bool,
     instance: u64,
     ctx: &mut ImportContext<'_>,
 ) -> Option<(Box<dyn Curve>, ParameterRange)> {
@@ -513,11 +536,9 @@ fn build_ellipse_curve(
         (d.dot(&y) / b).atan2(d.dot(&x) / a)
     };
     let t0 = angle(start);
-    let seam = {
-        let d = [start[0] - end[0], start[1] - end[1], start[2] - end[2]];
-        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() < ctx.default_tolerance
-    };
-    let mut t1 = if seam { t0 + TAU } else { angle(end) };
+    // The whole ellipse only for an edge closed on one vertex (see the
+    // caller); otherwise the arc from `start` round to `end`.
+    let mut t1 = if closed { t0 + TAU } else { angle(end) };
     while t1 <= t0 {
         t1 += TAU;
     }
@@ -903,6 +924,7 @@ fn build_circle_curve(
     start: [f64; 3],
     end: [f64; 3],
     same_sense: bool,
+    closed: bool,
     instance: u64,
     ctx: &mut ImportContext<'_>,
 ) -> Option<Box<dyn Curve>> {
@@ -935,11 +957,8 @@ fn build_circle_curve(
         }
     };
 
-    // Seam edge: start == end → full circle.
-    let dx = start[0] - end[0];
-    let dy = start[1] - end[1];
-    let dz = start[2] - end[2];
-    if (dx * dx + dy * dy + dz * dz).sqrt() < ctx.default_tolerance {
+    // Seam edge: closed on one vertex (decided by the caller) → full circle.
+    if closed {
         // The whole circle, starting and ending at the edge's vertex.
         let vertex = Point3::new(start[0], start[1], start[2]);
         return match Circle::new_starting_at(center, normal, circle.radius, vertex) {

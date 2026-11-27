@@ -88,17 +88,79 @@ fn an_edge_within_the_cap_has_its_tolerance_raised_and_reported() {
     }
 }
 
+/// Between the repair cap (0.01 mm) and the acceptance ceiling (0.05 mm) an
+/// edge whose faces truly do not meet is ACCEPTED as a tolerant edge -- what
+/// every exchange kernel does silently -- but named: a healing of its own
+/// kind carrying the measured gap and the accuracy the file states, and a
+/// warning that says so in words with the face it is off.
 #[test]
-fn an_edge_beyond_the_cap_is_refused_and_reported() {
+fn an_edge_between_the_cap_and_the_ceiling_is_accepted_and_named() {
     let (model, report) = ExportEngine::new()
-        .import_step_content(&envelope(&lifted_plate(0.05)), "gap")
+        .import_step_content(&envelope(&lifted_plate(0.03)), "gap")
         .expect("imports");
+    let accepted: Vec<_> = report
+        .healings
+        .iter()
+        .filter(|h| format!("{:?}", h.kind) == "EdgeGapAccepted")
+        .collect();
+    assert_eq!(
+        accepted.len(),
+        4,
+        "every edge's acceptance is reported: {:#?}",
+        report.healings
+    );
+    for h in &accepted {
+        assert!(
+            (h.deviation - 0.03).abs() < 1e-6,
+            "the measured gap is reported ({})",
+            h.deviation
+        );
+        assert!(
+            h.tolerance < 0.01,
+            "with the accuracy the edge carried from the file ({})",
+            h.tolerance
+        );
+    }
     assert!(
         report
             .healings
             .iter()
             .all(|h| format!("{:?}", h.kind) != "EdgeToleranceRaised"),
-        "no raise beyond the cap: {:#?}",
+        "an acceptance is not passed off as an ordinary raise: {:#?}",
+        report.healings
+    );
+    let said: Vec<_> = report
+        .warnings
+        .iter()
+        .filter(|w| w.message.contains("accepted as a tolerant edge"))
+        .collect();
+    assert_eq!(said.len(), 4, "{:#?}", report.warnings);
+    assert!(
+        said.iter()
+            .all(|w| w.message.contains("3.000e-2") && w.message.contains("face")),
+        "each says the gap and the face: {:#?}",
+        said
+    );
+    for (_, e) in model.edges.iter() {
+        assert!(
+            e.tolerance >= 0.03 && e.tolerance < 0.0301,
+            "the edge carries the measured gap as its tolerance, no more ({})",
+            e.tolerance
+        );
+    }
+}
+
+#[test]
+fn an_edge_beyond_the_ceiling_is_refused_and_reported() {
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&lifted_plate(0.06)), "gap")
+        .expect("imports");
+    assert!(
+        report.healings.iter().all(|h| {
+            let kind = format!("{:?}", h.kind);
+            kind != "EdgeToleranceRaised" && kind != "EdgeGapAccepted"
+        }),
+        "no raise and no acceptance beyond the ceiling: {:#?}",
         report.healings
     );
     assert!(
@@ -109,9 +171,17 @@ fn an_edge_beyond_the_cap_is_refused_and_reported() {
         "the refusal is reported: {:#?}",
         report.warnings
     );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("6.000e-2") && w.message.contains("0.05")),
+        "with the gap and the ceiling it exceeded: {:#?}",
+        report.warnings
+    );
     for (_, e) in model.edges.iter() {
         assert!(
-            e.tolerance < 0.05,
+            e.tolerance < 0.01,
             "edge keeps the declared tolerance ({})",
             e.tolerance
         );
