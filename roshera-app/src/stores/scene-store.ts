@@ -156,6 +156,10 @@ export interface CameraPreset {
   position: [number, number, number]
   target: [number, number, number]
   up: [number, number, number]
+  /** A viewing DIRECTION, not an exact pose: the camera's distance and
+   *  target come from the model (the fit a named view gets). Set for the
+   *  view cube's edge, corner and rolled views. */
+  fit?: boolean
 }
 
 export const CAMERA_PRESETS: Record<string, CameraPreset> = {
@@ -831,6 +835,10 @@ interface SceneState {
   setSnapValue: (value: number) => void
 
   setCameraPreset: (preset: string) => void
+  /** Turn to a view given by its direction (from the model toward the
+   *  camera) and screen-up, fitted to the model: the view cube's edges,
+   *  corners and quarter-turn rolls. */
+  setCameraView: (view: { direction: [number, number, number]; up: [number, number, number] }) => void
   clearPendingCameraPreset: () => void
   setPendingFrameObject: (id: string | null) => void
   setCameraProjection: (projection: CameraProjection) => void
@@ -1491,6 +1499,22 @@ const sceneCreator: StateCreator<
       if (presetData) {
         set({ cameraPreset: preset, pendingCameraPreset: presetData })
       }
+    },
+
+    setCameraView: ({ direction, up }) => {
+      const n = Math.hypot(direction[0], direction[1], direction[2])
+      if (!(n > 0)) return
+      set({
+        // No named view is current: the view bar highlights none of its buttons.
+        cameraPreset: null,
+        pendingCameraPreset: {
+          name: 'View',
+          position: [(direction[0] / n) * 30, (direction[1] / n) * 30, (direction[2] / n) * 30],
+          target: [0, 0, 0],
+          up: [up[0], up[1], up[2]],
+          fit: true,
+        },
+      })
     },
 
     clearPendingCameraPreset: () => set({ pendingCameraPreset: null }),

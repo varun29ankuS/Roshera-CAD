@@ -5,6 +5,8 @@ import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useCursorStore } from '@/stores/cursor-store'
 import { useChapters } from '@/hooks/use-chapters'
 import { formatPoint, soundLabel, underCursorLabel } from '@/lib/status-bar'
+import { formatSheetPoint } from '@/lib/sheet-cursor'
+import { useSheetCursorStore } from '@/stores/sheet-cursor-store'
 import { AgentSeesChip } from '@/components/layout/AgentSeesChip'
 
 const PICKS: { mode: SelectionMode; label: string; key: string }[] = [
@@ -40,6 +42,8 @@ export function StatusBar() {
   const lastPing = useWSStore((s) => s.lastPingMs)
   const mode = useDocModeStore((s) => s.mode)
   const hit = useCursorStore((s) => s.hit)
+  const sheetPoint = useSheetCursorStore((s) => s.point)
+  const sheet = useSheetCursorStore((s) => s.sheet)
   const hitName = useSceneStore((s) => (hit ? (s.objects.get(hit.objectId)?.name ?? 'part') : null))
   const { chapters, loading, error, isSound } = useChapters('main')
 
@@ -56,6 +60,18 @@ export function StatusBar() {
     return (
       <div className="flex h-6 items-center border-t border-border bg-background px-3 text-[11px] text-muted-foreground">
         <span className="font-medium uppercase tracking-wider">Drawing</span>
+        {sheet && (
+          <>
+            <Divider />
+            <span title="Sheet size and scale">{sheet}</span>
+          </>
+        )}
+        <Divider />
+        {/* The cursor on the paper, in sheet millimetres from the bottom-left
+            corner. A fixed width, so the bar does not twitch as digits change. */}
+        <span className="cad-readout min-w-[11rem] text-foreground/80" title="Cursor position on the sheet, from its bottom-left corner">
+          {sheetPoint ? formatSheetPoint(sheetPoint) : 'X \u2014  Y \u2014 mm'}
+        </span>
         <div className="flex-1" />
         {ping}
       </div>
@@ -75,7 +91,7 @@ export function StatusBar() {
             title={`${p.label} · ${p.key}`}
             onClick={() => setSelectionMode(p.mode)}
             className={cn(
-              'cad-focus h-[18px] rounded px-1.5 leading-none transition-colors',
+              'cad-focus h-6 rounded px-1.5 leading-none transition-colors',
               selectionMode === p.mode
                 ? 'bg-[var(--cad-selected-wash)] font-medium text-foreground'
                 : 'hover:bg-accent hover:text-foreground',
@@ -92,7 +108,7 @@ export function StatusBar() {
         aria-pressed={snapMode !== 'none'}
         onClick={() => setSnapMode(snapMode === 'none' ? 'grid' : 'none')}
         title="Snap moves to the grid"
-        className="cad-focus h-[18px] rounded px-1.5 leading-none hover:bg-accent hover:text-foreground"
+        className="cad-focus h-6 rounded px-1.5 leading-none hover:bg-accent hover:text-foreground"
       >
         Snap <span className="text-foreground">{snapMode !== 'none' ? `${snapValue} mm` : 'off'}</span>
       </button>

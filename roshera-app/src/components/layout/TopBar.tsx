@@ -30,11 +30,12 @@ import { useBlackboardStore } from '@/stores/blackboard-store'
 import { getDocumentUnit } from '@/lib/units-api'
 import { newDocument } from '@/lib/documents-api'
 import { runNewProject } from '@/lib/new-project'
+import { confirmNewDocument } from '@/lib/confirm-new-document'
 import { useDocumentStore } from '@/stores/document-store'
 import { UnitSelector } from '@/components/layout/UnitSelector'
 import { timelineAction } from '@/lib/history'
 import { VIEW_SHORTCUT_LABEL, type StandardView } from '@/lib/view-shortcuts'
-import { deleteSelectedParts } from '@/lib/shortcuts'
+import { deleteAllParts, deleteSelectedParts } from '@/lib/shortcuts'
 
 // Two-step export (POST /api/export → GET /api/download/:filename) is
 // implemented in `lib/export-api.ts` and shared with the ToolBar Export
@@ -55,7 +56,6 @@ async function exportGeometry(format: string) {
 }
 
 export function TopBar() {
-  const clearScene = useSceneStore((s) => s.clearScene)
   const setCameraPreset = useSceneStore((s) => s.setCameraPreset)
   const gridSettings = useSceneStore((s) => s.gridSettings)
   const setGridSettings = useSceneStore((s) => s.setGridSettings)
@@ -109,12 +109,10 @@ export function TopBar() {
   // strip (`DocumentTabs.tsx`, rendered below TopBar) — that is the
   // constant, every-day action; this menu item is for the rare one.
   const handleNewProject = useCallback(() => {
-    if (!window.confirm('Start a new, empty document? Your current document is saved.')) {
-      return
-    }
-    void runNewProject(newDocument, (line) =>
-      useBlackboardStore.getState().addLine(line, 'system'),
-    )
+    void confirmNewDocument().then((ok) => {
+      if (!ok) return
+      void runNewProject(newDocument, (line) => useBlackboardStore.getState().addLine(line, 'system'))
+    })
   }, [])
 
   const handleSelectAll = useCallback(() => {
@@ -180,7 +178,9 @@ export function TopBar() {
               </MenubarSubContent>
             </MenubarSub>
             <MenubarSeparator />
-            <MenubarItem onClick={clearScene}>Clear Scene</MenubarItem>
+            <MenubarItem variant="destructive" onClick={() => void deleteAllParts()}>
+              Delete all parts…
+            </MenubarItem>
             <MenubarSeparator />
             <MenubarItem onClick={() => (window.location.hash = '#/demos')}>
               Demo Gallery

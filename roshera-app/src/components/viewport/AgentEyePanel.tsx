@@ -347,7 +347,7 @@ export function AgentEyePanel({
           renders the whole-scene composite (the implicit "everything" assembly). */}
       {scope === 'assembly' && (
         <div className="border-b border-border px-2 py-1">
-          <input
+          <input name="assembly-id-uuid-blank-whole-scene"
             type="text"
             value={assemblyId}
             onChange={(e) => setAssemblyId(e.target.value)}

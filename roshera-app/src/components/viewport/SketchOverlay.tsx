@@ -2442,7 +2442,7 @@ function DimLabel({
       zIndexRange={[100, 0]}
     >
       {editing ? (
-        <input
+        <input name="sketch-overlay-field-1"
           ref={inputRef}
           type="text"
           inputMode="decimal"

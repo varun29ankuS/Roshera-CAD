@@ -240,7 +240,7 @@ export function FeatureEditPanel({
                       bad ? 'border-red-500/60' : drafts[dk] !== undefined ? 'border-[#2F6FDB]' : 'border-border/70',
                     )}
                   >
-                    <input
+                    <input name="feature-edit-panel-field-1"
                       value={text}
                       inputMode="decimal"
                       disabled={mine?.kind === 'busy'}

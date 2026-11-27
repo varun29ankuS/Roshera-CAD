@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, type CSSProperties } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { AgentShowBar } from '@/components/layout/AgentShowBar'
 import { ToolBar } from '@/components/layout/ToolBar'
@@ -22,6 +22,10 @@ import { DemoGallery } from '@/components/demo-gallery/DemoGallery'
 import { BlackboardFixtures } from '@/components/dev/BlackboardFixtures'
 import { SemanticsPanel } from '@/components/dev/SemanticsPanel'
 import { CommandPalette } from '@/components/CommandPalette'
+import { ChevronRight, X } from '@/components/ui/icons'
+import { DockResizeHandle } from '@/components/layout/DockResizeHandle'
+import { useDockWidth, useTrackWindowWidth } from '@/stores/dock-store'
+import { AppDialogHost } from '@/components/AppDialogHost'
 import { LoginDialog } from '@/components/LoginDialog'
 import { FirstRunGuide } from '@/components/FirstRunGuide'
 import { cn } from '@/lib/utils'
@@ -57,6 +61,8 @@ function routeFromHash(): Route {
 
 export function App() {
   useKeyboardShortcuts()
+  useTrackWindowWidth()
+  const dockPx = useDockWidth()
   const hasSelection = useSceneStore((s) => s.selectedIds.size > 0)
   // Default to Part workspace when nothing has been chosen yet so the
   // UI is never blank. The tab strip still mirrors the store so users
@@ -68,7 +74,17 @@ export function App() {
   // DFM and Simulate are checks ON the part: its model and history stay, the
   // modelling tools go, and the check's panel takes the left column.
   const checkWorkspace = docMode === 'dfm' || docMode === 'simulate'
-  const leftInset = docMode === 'simulate' ? 'left-[21rem]' : docMode === 'dfm' ? 'left-[19rem]' : 'left-[15.5rem]'
+  // The check's panel (DFM, Simulate) can be closed like any other overlay.
+  const [checkOpen, setCheckOpen] = useState(true)
+  const checkName = docMode === 'simulate' ? 'Static strength' : 'Manufacturability'
+  const leftInset =
+    checkWorkspace && !checkOpen
+      ? 'left-[15.5rem]'
+      : docMode === 'simulate'
+        ? 'left-[21rem]'
+        : docMode === 'dfm'
+          ? 'left-[19rem]'
+          : 'left-[15.5rem]'
   // Drawing and Assembly mount on first visit and then STAY mounted, parked
   // when another tab is open: Assembly rebuilt its whole 3D view from every
   // part's mesh on each entry (a 15.9 s freeze, measured 2026-11-18).
@@ -187,7 +203,11 @@ export function App() {
   }
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-background text-foreground select-none">
+    <div
+      className="flex flex-col h-screen w-screen bg-background text-foreground select-none"
+      // The docked Blackboard's width, for the dock and everything beside it.
+      style={{ '--bb-w': `${dockPx}px` } as CSSProperties}
+    >
       <ViewportBridge />
       {/* The active workspace is chosen from the tabs in `TopBar`
           (lib/workspaces.ts lists them). They were a drop-down, kept
@@ -228,8 +248,9 @@ export function App() {
           // Blackboard in other tabs ... users can't keep going back and
           // forth"). Docked as a column here, beside the sheet or the
           // assembly, so nothing of theirs sits under it.
-          <div className="flex w-[21rem] shrink-0 flex-col border-l border-border bg-background p-2">
+          <div className="relative flex w-[calc(var(--bb-w)+1rem)] shrink-0 flex-col border-l border-border bg-background p-2">
             <Blackboard docked />
+            <DockResizeHandle />
           </div>
         )}
         {/* The Part workspace is PARKED, never unmounted, while Drawing or
@@ -273,9 +294,42 @@ export function App() {
                 )}
               >
                 {checkWorkspace ? (
-                  <div className="pointer-events-auto flex min-h-0 flex-1 flex-col overflow-hidden rounded border border-border bg-card/95">
-                    {docMode === 'simulate' ? <SimPanel /> : <DfmPanel />}
-                  </div>
+                  // The check's panel obeys the layout law like every other:
+                  // a see-through card ON the canvas, only as tall as what it
+                  // holds, and closable. It was an opaque column the full
+                  // height of the viewport. Closed, it stays mounted (hidden)
+                  // so a study half set up is still there when it reopens.
+                  <>
+                    <div
+                      className={cn(
+                        'pointer-events-auto relative flex min-h-0 flex-col overflow-y-auto rounded-lg border border-border/70 bg-card/90 shadow-sm scrollbar-thin',
+                        !checkOpen && 'hidden',
+                      )}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setCheckOpen(false)}
+                        aria-label={`Close the ${checkName} panel`}
+                        title="Close this panel (the check keeps its settings)"
+                        className="cad-icon-btn absolute right-1.5 top-1.5 z-10 h-6 w-6"
+                      >
+                        <X size={14} />
+                      </button>
+                      {docMode === 'simulate' ? <SimPanel /> : <DfmPanel />}
+                    </div>
+                    {!checkOpen && (
+                      <button
+                        type="button"
+                        onClick={() => setCheckOpen(true)}
+                        aria-expanded={false}
+                        title={`Open the ${checkName} panel`}
+                        className="cad-focus pointer-events-auto inline-flex h-7 items-center gap-1.5 self-start rounded-lg border border-border/70 bg-card/90 px-2.5 text-xs font-medium shadow-sm hover:bg-accent"
+                      >
+                        {checkName}
+                        <ChevronRight size={12} />
+                      </button>
+                    )}
+                  </>
                 ) : (
                   <>
                     <div className="pointer-events-auto flex min-h-0 flex-col overflow-hidden rounded-lg border border-border/70 bg-card/90 shadow-sm">
@@ -296,7 +350,7 @@ export function App() {
               </div>
 
               {/* The view bar, top centre over the model (the approved mockup). */}
-              <div className="pointer-events-none absolute left-[15.5rem] right-[21rem] top-2 z-20 flex justify-center">
+              <div className="pointer-events-none absolute left-[15.5rem] right-[calc(var(--bb-w)+1rem)] top-2 z-20 flex justify-center">
                 <ViewBar />
               </div>
 
@@ -305,7 +359,7 @@ export function App() {
               <div
                 ref={attachTopSlot}
                 className={cn(
-                  'pointer-events-none absolute right-[21rem] top-12 z-30 flex flex-col items-center gap-2',
+                  'pointer-events-none absolute right-[calc(var(--bb-w)+1rem)] top-12 z-30 flex flex-col items-center gap-2',
                   leftInset,
                 )}
               >
@@ -321,7 +375,7 @@ export function App() {
                   the section controls, live readouts -- stacked. */}
               <div
                 ref={attachRightSlot}
-                className="pointer-events-none absolute bottom-[9rem] right-[21rem] top-[9.5rem] z-20 flex w-64 flex-col gap-2"
+                className="pointer-events-none absolute bottom-[9rem] right-[calc(var(--bb-w)+1rem)] top-[9.5rem] z-20 flex w-64 flex-col gap-2"
               >
                 {hasSelection && (
                   <div className="pointer-events-auto flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-card/95 shadow-sm">
@@ -341,8 +395,9 @@ export function App() {
                   Blackboard at a time (two would both poll and both own a
                   composer). */}
               {!sheetWorkspace && (
-                <div className="pointer-events-none absolute bottom-2 right-2 top-2 z-20 flex w-80 flex-col items-end justify-start">
+                <div className="pointer-events-none absolute bottom-2 right-2 top-2 z-20 flex w-[var(--bb-w)] flex-col items-end justify-start">
                   <Blackboard docked />
+                  <DockResizeHandle />
                 </div>
               )}
 
@@ -360,7 +415,7 @@ export function App() {
                   to be completely from left to right?"). */}
               <div
                 className={cn(
-                  'pointer-events-none absolute bottom-2 right-[21rem] z-20 flex flex-col items-center gap-1.5',
+                  'pointer-events-none absolute bottom-2 right-[calc(var(--bb-w)+1rem)] z-20 flex flex-col items-center gap-1.5',
                   leftInset,
                 )}
               >
@@ -383,6 +438,7 @@ export function App() {
           the keybinding works the moment the app loads, not after
           the first interaction. */}
       <CommandPalette />
+      <AppDialogHost />
       {/* Sign-in dialog — mounted unconditionally but only opens when a
           backend request returns 401 (auth-required signal). Invisible
           against a local insecure-bypass backend. */}

@@ -12,7 +12,8 @@ import { useSceneStore } from '@/stores/scene-store'
 import { useChapters } from '@/hooks/use-chapters'
 import { useHistoryView } from '@/stores/history-view-store'
 import { featureFields, fetchEditableParameters, sizeSummary, type EditableParameter } from '@/lib/feature-edit'
-import { Box, Check, ChevronDown, ChevronRight, Eye, EyeOff, X, ToolIcons } from '@/components/ui/icons'
+import { Box, ChevronDown, ChevronRight, Eye, EyeOff, X, ToolIcons } from '@/components/ui/icons'
+import { PartVerdictMark } from '@/components/ui/part-verdict'
 import { isStandardPlane, type SketchPlane } from '@/stores/scene-store'
 import type { ServerSketchSession } from '@/lib/sketch-api'
 
@@ -64,8 +65,8 @@ function SketchRow({ sketch, depth, actions }: { sketch: TreeSketch; depth: numb
         title={`${sketch.name} -- on the ${sketch.plane} plane`}
         className={cn(
           'group flex h-6 items-center gap-1.5 rounded px-1.5 cursor-default outline-none',
-          'hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring',
-          selected && 'bg-accent/60',
+          'cad-row-hover focus-visible:ring-1 focus-visible:ring-ring',
+          selected && 'cad-row-selected',
           !visible && 'opacity-50',
         )}
         style={{ paddingLeft: 6 + depth * 14 }}
@@ -81,7 +82,7 @@ function SketchRow({ sketch, depth, actions }: { sketch: TreeSketch; depth: numb
             e.stopPropagation()
             actions.onToggleVisible(sketch.id)
           }}
-          className={cn('shrink-0 text-muted-foreground hover:text-foreground', visible && 'opacity-0 group-hover:opacity-100')}
+          className={cn('cad-focus hit-24 shrink-0 text-muted-foreground hover:text-foreground', visible && 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100')}
         >
           {visible ? <Eye size={12} /> : <EyeOff size={12} />}
         </button>
@@ -96,11 +97,15 @@ function ChapterIcon({ c, size }: { c: Chapter; size: number }) {
   return <Icon size={size} />
 }
 
+/**
+ * A feature row's mark. A feature is a history step: when the kernel
+ * re-measured it sound there is nothing to say, so there is no mark -- a
+ * green tick here read as "this part is sound" and stayed green beside parts
+ * whose certificate failed. Only a step that did NOT re-measure sound is
+ * marked, with why. The PART's verdict is on the part row (PartVerdictMark).
+ */
 function Verdict({ c }: { c: Chapter }) {
-  if (c.sound)
-    return (
-      <Check size={12} className="text-emerald-600/60 dark:text-emerald-400/60" title="sound — the kernel re-measured every step" />
-    )
+  if (c.sound) return null
   const why = c.refusals.map((r) => `step ${r.sequence}: ${r.status}${r.reason ? ` — ${r.reason}` : ''}`).join('\n')
   return <X size={14} title={why || 'not sound'} />
 }
@@ -163,8 +168,8 @@ function Row({
         title={byline(c) || undefined}
         className={cn(
           'flex h-6 items-center gap-1.5 rounded px-1.5 cursor-default outline-none',
-          'hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring',
-          selected === c.anchor && 'bg-accent/60',
+          'cad-row-hover focus-visible:ring-1 focus-visible:ring-ring',
+          selected === c.anchor && 'cad-row-selected',
           ahead && 'opacity-45',
         )}
         style={{ paddingLeft: 6 + depth * 14 }}
@@ -177,7 +182,7 @@ function Row({
               e.stopPropagation()
               setOpen((o) => !o)
             }}
-            className="shrink-0 text-muted-foreground"
+            className="cad-focus hit-24 shrink-0 text-muted-foreground"
           >
             {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
           </button>
@@ -233,10 +238,13 @@ function PartRow({
   onFold,
   selected,
   visible,
+  sound,
   onSelect,
   onToggleVisible,
   onContextMenu,
 }: {
+  /** The part's certificate verdict; absent = not certified yet. */
+  sound: boolean | undefined
   part: TreePart
   count: number
   open: boolean
@@ -247,10 +255,17 @@ function PartRow({
   onToggleVisible: () => void
   onContextMenu?: (e: React.MouseEvent) => void
 }) {
+  // Pointing at the row pre-highlights the part in the viewport, and pointing
+  // at the part pre-highlights its row -- both in the hover blue.
+  const hovered = useSceneStore((s) => s.hoveredId === part.id)
+  const setHovered = useSceneStore((s) => s.setHovered)
   return (
     <div
       role="treeitem"
       aria-selected={selected}
+      onMouseEnter={() => setHovered(part.id)}
+      onMouseLeave={() => setHovered(null)}
+      data-hovered={hovered && !selected ? '' : undefined}
       aria-expanded={count > 0 ? open : undefined}
       tabIndex={0}
       onClick={(e) => onSelect(e.shiftKey || e.ctrlKey || e.metaKey)}
@@ -264,8 +279,8 @@ function PartRow({
       title={`${part.name} -- ${count} feature${count === 1 ? '' : 's'}`}
       className={cn(
         'group flex h-6 items-center gap-1.5 rounded px-1.5 cursor-default outline-none',
-        'hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring',
-        selected && 'bg-accent/60',
+        'cad-row-hover focus-visible:ring-1 focus-visible:ring-ring',
+        selected && 'cad-row-selected',
         !visible && 'opacity-50',
       )}
     >
@@ -277,7 +292,7 @@ function PartRow({
             e.stopPropagation()
             onFold()
           }}
-          className="shrink-0 text-muted-foreground"
+          className="cad-focus hit-24 shrink-0 text-muted-foreground"
         >
           {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
         </button>
@@ -286,6 +301,7 @@ function PartRow({
       )}
       <Box size={16} />
       <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-foreground">{part.name}</span>
+      <PartVerdictMark sound={sound} />
       <button
         type="button"
         aria-label={visible ? `Hide ${part.name}` : `Show ${part.name}`}
@@ -293,7 +309,7 @@ function PartRow({
           e.stopPropagation()
           onToggleVisible()
         }}
-        className={cn('shrink-0 text-muted-foreground hover:text-foreground', visible && 'opacity-0 group-hover:opacity-100')}
+        className={cn('cad-focus hit-24 shrink-0 text-muted-foreground hover:text-foreground', visible && 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100')}
       >
         {visible ? <Eye size={12} /> : <EyeOff size={12} />}
       </button>
@@ -430,6 +446,7 @@ export function ChapterList({
               }
               selected={selectedIds.has(g.part.id)}
               visible={objects.get(g.part.id)?.visible ?? true}
+              sound={objects.get(g.part.id)?.sound}
               onSelect={(additive) => selectObject((g.part as TreePart).id, additive)}
               onToggleVisible={() => {
                 const id = (g.part as TreePart).id

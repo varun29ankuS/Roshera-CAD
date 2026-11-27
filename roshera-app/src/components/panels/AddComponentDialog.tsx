@@ -169,7 +169,7 @@ export function AddComponentDialog({ assemblyId, defaultName, onClose, onCreated
           </FormField>
 
           <FormField label="Primitive">
-            <select
+            <select name="add-component-dialog-field-1"
               value={primitive}
               onChange={(e) => setPrimitive(e.target.value as PrimitiveChoice)}
               className="cad-focus h-8 rounded border border-border bg-background px-2 text-xs"

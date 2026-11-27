@@ -208,7 +208,7 @@ export function CompletenessChip({
               </div>
               <label className="mt-2 flex items-center gap-2">
                 <span className="shrink-0 text-muted-foreground">Signed by</span>
-                <input
+                <input name="your-name"
                   value={signer}
                   onChange={(e) => setSigner(e.target.value)}
                   placeholder="your name"
@@ -438,7 +438,7 @@ export function DimensionPanel(p: DimensionPanelProps) {
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <input
+            <input name="value"
               inputMode="decimal"
               value={driven ? p.draft : String(Number(dim.value.toFixed(4)))}
               readOnly={!driven}
@@ -526,7 +526,7 @@ export function DimensionPanel(p: DimensionPanelProps) {
             {tol.form === 'symmetric' && (
               <label className="flex items-center gap-2">
                 <span className="w-16 shrink-0 text-muted-foreground">± value</span>
-                <input
+                <input name="0-1"
                   autoFocus
                   inputMode="decimal"
                   value={tol.pm}
@@ -546,7 +546,7 @@ export function DimensionPanel(p: DimensionPanelProps) {
                     <span className="w-16 shrink-0 text-muted-foreground">
                       {k === 'upper' ? 'Upper' : 'Lower'}
                     </span>
-                    <input
+                    <input name="dimension-panel-field-1"
                       autoFocus={k === 'upper'}
                       inputMode="decimal"
                       value={tol[k]}
@@ -588,7 +588,7 @@ export function DimensionPanel(p: DimensionPanelProps) {
                       </button>
                     ))}
                   </div>
-                  <select
+                  <select name="fundamental-deviation"
                     aria-label="Fundamental deviation"
                     value={tol.fitLetter}
                     disabled={locked}
@@ -601,7 +601,7 @@ export function DimensionPanel(p: DimensionPanelProps) {
                       </option>
                     ))}
                   </select>
-                  <select
+                  <select name="tolerance-grade"
                     aria-label="Tolerance grade"
                     value={tol.fitGrade}
                     disabled={locked}
@@ -674,7 +674,7 @@ export function DimensionPanel(p: DimensionPanelProps) {
         <section>
           <div className={`mb-1 ${sectionTitle}`}>Dimension text</div>
           <div className="flex items-center gap-1 font-mono">
-            <input
+            <input name="text-before-the-value"
               aria-label="Text before the value"
               value={prefix}
               disabled={locked}
@@ -690,7 +690,7 @@ export function DimensionPanel(p: DimensionPanelProps) {
             >
               {dim.label}
             </span>
-            <input
+            <input name="text-after-the-value"
               aria-label="Text after the value"
               value={suffix}
               disabled={locked}
@@ -759,7 +759,7 @@ export function DimensionPanel(p: DimensionPanelProps) {
               </div>
               <label className="flex items-center gap-2">
                 <span className="w-16 shrink-0 text-muted-foreground">Signed by</span>
-                <input
+                <input name="dimension-panel-field-2"
                   autoFocus
                   value={signer}
                   disabled={locked}
@@ -769,7 +769,7 @@ export function DimensionPanel(p: DimensionPanelProps) {
               </label>
               <label className="flex items-center gap-2">
                 <span className="w-16 shrink-0 text-muted-foreground">Reason</span>
-                <input
+                <input name="optional"
                   value={reason}
                   disabled={locked}
                   placeholder="optional"

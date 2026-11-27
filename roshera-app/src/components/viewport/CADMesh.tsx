@@ -82,9 +82,13 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
   const sketchActive = useSceneStore((s) => s.sketch.active) || benchOpen
   const sectionView = useSceneStore((s) => s.sectionView)
 
+  // Two colours, two meanings (the convention of NX and SolidWorks): what is
+  // pointed at pre-highlights in BLUE (`--cad-hovered`), what is selected is
+  // AMBER. Hover used the selection's own amber, so a part about to be picked
+  // and a part already picked differed only by a fill.
   const { defaultEdgeHex, accentEdgeHex, selectedEdgeHex } = useMemo(() => {
     const tick = resolveCssVar('--cad-tick')
-    const accent = resolveCssVar('--cad-selected')
+    const accent = resolveCssVar('--cad-hovered')
     const selected = resolveCssVar('--cad-edge-selected')
     return {
       defaultEdgeHex: `#${tick.color.getHexString()}`,

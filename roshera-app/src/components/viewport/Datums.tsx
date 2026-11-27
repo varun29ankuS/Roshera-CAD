@@ -20,24 +20,7 @@ import { useThemeStore } from '@/stores/theme-store'
  * squares so they hint at orientation without dominating the viewport.
  */
 
-const API_BASE = import.meta.env.VITE_API_URL || ''
-
-type DatumKindWire = 'origin' | 'plane' | 'axis'
-
-interface DatumDto {
-  id: number
-  name: string
-  kind: DatumKindWire
-  plane_orientation?: 'xy' | 'xz' | 'yz' | 'custom'
-  axis_direction?: 'x' | 'y' | 'z'
-  origin: [number, number, number]
-  visible: boolean
-  is_default: boolean
-}
-
-interface DatumListResponse {
-  datums: DatumDto[]
-}
+import { subscribeDatums, type DatumDto } from '@/lib/datums-feed'
 
 const AXIS_LEN = 100
 const PLANE_HALF = 25
@@ -84,40 +67,9 @@ export function Datums() {
   const planeTint = theme === 'dark' ? PLANE_TINT_DARK : PLANE_TINT_LIGHT
   const planeOpacity = theme === 'dark' ? PLANE_OPACITY_DARK : PLANE_OPACITY_LIGHT
 
-  useEffect(() => {
-    let cancelled = false
-
-    const fetchDatums = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/datums`)
-        if (!res.ok) {
-          // A 401 here is already surfaced globally: the fetch interceptor
-          // in `lib/auth.ts` flips `isAuthRequired()` on any API 401, which
-          // opens `LoginDialog` ("This instance requires authentication.").
-          // That is the correct UI treatment — this console.error exists so
-          // a non-auth failure (500, a route regression) is still
-          // diagnosable instead of silently leaving the viewport bare.
-          console.error(`[Datums] GET /api/datums failed: ${res.status} ${res.statusText}`)
-          return
-        }
-        const data: DatumListResponse = await res.json()
-        if (!cancelled) setDatums(data.datums)
-      } catch (err) {
-        // Backend unreachable — leave whatever we already had so the
-        // viewport doesn't flicker between loaded and empty states. The
-        // WS connection-status indicator already tells the user the
-        // backend is down; this log makes the specific failure diagnosable.
-        console.error('[Datums] GET /api/datums threw:', err)
-      }
-    }
-
-    fetchDatums()
-    const interval = window.setInterval(fetchDatums, 5000)
-    return () => {
-      cancelled = true
-      window.clearInterval(interval)
-    }
-  }, [])
+  // The shared reader of the datum list (lib/datums-feed.ts): one request
+  // for the tree and every viewport, none while the tab is hidden.
+  useEffect(() => subscribeDatums(setDatums), [])
 
   return (
     <group name="datums">

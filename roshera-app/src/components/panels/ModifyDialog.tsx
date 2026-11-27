@@ -622,7 +622,7 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
           {!spec.perEdge && spec.profile === 'constant' && (
             <Field label={spec.inputLabel}>
               <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
-                <input
+                <input name="modify-dialog-field-1"
                   ref={inputRef}
                   type="text"
                   inputMode="decimal"
@@ -691,7 +691,7 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
                         {field.label}
                       </span>
                       <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
-                        <input
+                        <input name="modify-dialog-field-2"
                           ref={field.refIt ? inputRef : undefined}
                           type="text"
                           inputMode="decimal"
@@ -757,7 +757,7 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
                       className="grid grid-cols-[1fr_1fr_auto] items-stretch gap-1.5"
                     >
                       <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
-                        <input
+                        <input name="0-5"
                           ref={i === 0 ? inputRef : undefined}
                           type="text"
                           inputMode="decimal"
@@ -772,7 +772,7 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
                         />
                       </div>
                       <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
-                        <input
+                        <input name="modify-dialog-field-3"
                           type="text"
                           inputMode="decimal"
                           value={row.radius}
@@ -836,7 +836,7 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
                           #{eid}
                         </span>
                         <div className="flex flex-1 items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
-                          <input
+                          <input name="modify-dialog-field-4"
                             ref={i === 0 ? inputRef : undefined}
                             type="text"
                             inputMode="decimal"

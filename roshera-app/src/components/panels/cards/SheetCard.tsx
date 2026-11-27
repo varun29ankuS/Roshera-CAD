@@ -1,4 +1,5 @@
-import { DraftingCompass, ListChecks, Ruler, ShieldCheck } from '@/components/ui/icons'
+import { DraftingCompass } from '@/components/ui/icons'
+import { SheetCompleteIcon, SheetLayoutIcon, SheetSoundIcon } from './cert-icons'
 import type { SheetCard as SheetCardData } from '@/lib/blackboard-cards'
 import { CardShell, CertRow, CertRows, Chip, Claim, KV, type CardAccent } from './card-chrome'
 import { CardText } from './CardText'
@@ -32,10 +33,12 @@ export function SheetCard({ card }: { card: SheetCardData }) {
       accent={accent}
       icon={DraftingCompass}
       title={title}
+      // One line: the sheet's name and its verdict. Paper and scale were two
+      // more chips here, which left the name no room and wrapped the header;
+      // they are stated in the rows below, where there is room to read them.
+      titleText={title}
       chip={
         <>
-          {card.sheet && <Chip accent="neutral">{card.sheet}</Chip>}
-          {card.scale && <Chip accent="neutral">{card.scale}</Chip>}
           {ready ? (
             <Chip accent="pass" title="Sound, complete and laid out cleanly — the sheet can be released">
               certified
@@ -54,14 +57,14 @@ export function SheetCard({ card }: { card: SheetCardData }) {
         <CertRow
           status={sound}
           name="Sound"
-          icon={ShieldCheck}
+          icon={SheetSoundIcon}
           value="printed facts match the model"
           title={`sound — every printed fact matches the model: ${BADGE_WORD(sound)}`}
         />
         <CertRow
           status={complete}
           name="Complete"
-          icon={ListChecks}
+          icon={SheetCompleteIcon}
           value={
             card.dimensions_omitted !== undefined ? `${card.dimensions_omitted} not dimensioned` : undefined
           }
@@ -70,12 +73,14 @@ export function SheetCard({ card }: { card: SheetCardData }) {
         <CertRow
           status={layout}
           name="Layout"
-          icon={Ruler}
+          icon={SheetLayoutIcon}
           value="no collisions or redundant dimensions"
           title={`layout check — no collisions or redundant dimensions: ${BADGE_WORD(layout)}`}
         />
       </CertRows>
       <div className="mt-1.5 grid grid-cols-1 gap-x-4 gap-y-0.5 @xs:grid-cols-2">
+        {card.sheet && <KV label="paper">{card.sheet}</KV>}
+        {card.scale && <KV label="scale">{card.scale}</KV>}
         {card.projection && (
           <KV label="projection">{card.projection === 'first' ? 'first angle (ISO)' : 'third angle (ASME)'}</KV>
         )}

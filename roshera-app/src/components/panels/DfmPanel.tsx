@@ -153,7 +153,7 @@ export function DfmPanel() {
       <div className="flex flex-col gap-2 border-b border-border/70 px-3 py-2.5">
         <label className="flex items-center gap-2">
           <span className="w-16 text-muted-foreground">Part</span>
-          <select
+          <select name="dfm-panel-field-1"
             className="cad-focus h-7 min-w-0 flex-1 rounded border border-border/70 bg-background/70 px-1.5"
             value={partId ?? ''}
             onChange={(e) => setChosenId(e.target.value)}
@@ -169,7 +169,7 @@ export function DfmPanel() {
         </label>
         <label className="flex items-center gap-2">
           <span className="w-16 text-muted-foreground">Process</span>
-          <select
+          <select name="dfm-panel-field-2"
             className="cad-focus h-7 min-w-0 flex-1 rounded border border-border/70 bg-background/70 px-1.5 font-medium"
             value={pack}
             onChange={(e) => setPack(e.target.value as DfmPackParams['pack'])}
@@ -184,7 +184,7 @@ export function DfmPanel() {
         {pack === 'fdm' && (
           <label className="flex items-center gap-2">
             <span className="w-16 text-muted-foreground">Nozzle Ø</span>
-            <input
+            <input name="dfm-panel-field-3"
               className="cad-focus h-7 w-16 rounded border border-border/70 bg-background/70 px-1.5 font-mono"
               value={nozzle}
               onChange={(e) => setNozzle(e.target.value)}
@@ -196,7 +196,7 @@ export function DfmPanel() {
         {(pack === 'injection_molding' || pack === 'casting') && (
           <label className="flex items-center gap-2">
             <span className="w-16 text-muted-foreground">Min draft</span>
-            <input
+            <input name="dfm-panel-field-4"
               className="cad-focus h-7 w-16 rounded border border-border/70 bg-background/70 px-1.5 font-mono"
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
@@ -209,7 +209,7 @@ export function DfmPanel() {
           <>
             <label className="flex items-center gap-2">
               <span className="w-16 text-muted-foreground">Setups</span>
-              <select
+              <select name="dfm-panel-field-5"
                 className="cad-focus h-7 min-w-0 flex-1 rounded border border-border/70 bg-background/70 px-1.5"
                 value={planIndex}
                 onChange={(e) => setPlanIndex(Number(e.target.value))}
@@ -223,7 +223,7 @@ export function DfmPanel() {
             </label>
             <label className="flex items-center gap-2">
               <span className="w-16 text-muted-foreground">Min tool Ø</span>
-              <input
+              <input name="dfm-panel-field-6"
                 className="cad-focus h-7 w-16 rounded border border-border/70 bg-background/70 px-1.5 font-mono"
                 value={toolDia}
                 onChange={(e) => setToolDia(e.target.value)}
@@ -236,7 +236,7 @@ export function DfmPanel() {
         {pack === 'sheet_metal' && (
           <label className="flex items-center gap-2">
             <span className="w-16 text-muted-foreground">Gauge</span>
-            <input
+            <input name="auto"
               className="cad-focus h-7 w-16 rounded border border-border/70 bg-background/70 px-1.5 font-mono"
               value={gauge}
               placeholder="auto"
@@ -249,7 +249,7 @@ export function DfmPanel() {
         {(pack === 'fdm' || pack === 'injection_molding' || pack === 'casting') && (
           <label className="flex items-center gap-2">
             <span className="w-16 text-muted-foreground">{pack === 'fdm' ? 'Build' : 'Pull'}</span>
-            <select
+            <select name="dfm-panel-field-7"
               className="cad-focus h-7 w-24 rounded border border-border/70 bg-background/70 px-1.5"
               value={dirIndex}
               onChange={(e) => setDirIndex(Number(e.target.value))}

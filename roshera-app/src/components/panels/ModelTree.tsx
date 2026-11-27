@@ -25,6 +25,8 @@ import { CreateDatumDialog } from '@/components/panels/CreateDatumDialog'
 import { ChapterList } from '@/components/panels/ChapterList'
 import { AssemblyBrowser } from '@/components/panels/AssemblyBrowser'
 import { buildAssemblyTree } from '@/lib/assembly-tree'
+import { alertDialog, confirmDialog, promptDialog } from '@/lib/app-dialog'
+import { refreshDatums, subscribeDatums, type DatumDto } from '@/lib/datums-feed'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
@@ -81,21 +83,6 @@ function symbolForType(type: string): string {
 }
 
 // ─── Datum DTO (GET /api/datums) ────────────────────────────────────
-
-interface DatumDto {
-  id: number
-  name: string
-  kind: 'origin' | 'plane' | 'axis'
-  plane_orientation?: string
-  axis_direction?: string
-  origin: [number, number, number]
-  visible: boolean
-  is_default: boolean
-}
-
-interface DatumListResponse {
-  datums: DatumDto[]
-}
 
 /**
  * Build a tree node for the Datums group from the backend snapshot.
@@ -280,7 +267,7 @@ function TreeItem({
                 e.stopPropagation()
                 setExpanded(!expanded)
               }}
-              className="text-foreground/70 hover:text-foreground transition-colors"
+              className="cad-focus hit-24 text-foreground/70 hover:text-foreground transition-colors"
               aria-label={expanded ? 'Collapse' : 'Expand'}
               aria-expanded={expanded}
             >
@@ -306,7 +293,7 @@ function TreeItem({
                 e.stopPropagation()
                 onAdd(node)
               }}
-              className="text-foreground/60 hover:text-foreground transition-colors w-3 flex items-center justify-center"
+              className="cad-focus hit-24 text-foreground/60 hover:text-foreground transition-colors w-3 flex items-center justify-center"
               aria-label="Add"
               title="New datum"
             >
@@ -338,7 +325,7 @@ function TreeItem({
               e.stopPropagation()
               onToggleLock(node.id)
             }}
-            className="text-foreground/60 hover:text-foreground transition-colors w-3 text-center"
+            className="cad-focus hit-24 text-foreground/60 hover:text-foreground transition-colors w-3 text-center"
             aria-label={locked ? 'Unlock' : 'Lock'}
             title={locked ? 'Unlock' : 'Lock'}
           >
@@ -457,24 +444,10 @@ export function ModelTree({
   // Logged, not surfaced in the UI: the viewport's `Datums.tsx` polls the
   // same endpoint and owns the user-facing failure report (a Blackboard
   // system line), so this tree doesn't double up on the same root cause.
-  const fetchDatums = useCallback(async () => {
-    try {
-      const resp = await fetch(`${API_BASE}/api/datums`)
-      if (resp.ok) {
-        const data: DatumListResponse = await resp.json()
-        if (Array.isArray(data.datums)) {
-          setDatums(data.datums)
-          return
-        }
-      } else {
-        console.error(`[ModelTree] GET /api/datums failed: ${resp.status}`)
-      }
-    } catch (err) {
-      // Backend not running — leave datums as-is rather than clearing,
-      // so the tree doesn't flicker on transient network errors.
-      console.error('[ModelTree] datums fetch threw:', err)
-    }
-  }, [])
+  // One shared reader of the list (lib/datums-feed.ts): this tree and each
+  // viewport used to poll it separately. `fetchDatums` asks for it now.
+  const fetchDatums = useCallback(() => refreshDatums(), [])
+  useEffect(() => subscribeDatums(setDatums), [])
 
   // `documentEpoch` bumps AFTER an in-place document switch is confirmed
   // (`stores/document-store.ts`) — treated exactly like a fresh WS connect:
@@ -488,38 +461,6 @@ export function ModelTree({
       void Promise.resolve().then(fetchDatums)
     }
   }, [wsStatus, fetchDatums, documentEpoch])
-
-  // Poll for hierarchy updates (pause when tab is hidden)
-  useEffect(() => {
-    let timer: ReturnType<typeof setInterval> | null = null
-
-    function startPolling() {
-      stopPolling()
-      timer = setInterval(() => {
-        fetchDatums()
-      }, 5000)
-    }
-
-    function stopPolling() {
-      if (timer) { clearInterval(timer); timer = null }
-    }
-
-    function handleVisibility() {
-      if (document.visibilityState === 'visible') {
-        fetchDatums()
-        startPolling()
-      } else {
-        stopPolling()
-      }
-    }
-
-    startPolling()
-    document.addEventListener('visibilitychange', handleVisibility)
-    return () => {
-      stopPolling()
-      document.removeEventListener('visibilitychange', handleVisibility)
-    }
-  }, [fetchDatums])
 
   // Tree composition order (top → bottom):
   //   1. Datums  — canonical reference frame, listed first so users
@@ -697,7 +638,7 @@ export function ModelTree({
           type="button"
           onClick={onToggle}
           aria-label={expanded ? 'Collapse browser' : 'Expand browser'}
-          className="text-muted-foreground/70 hover:text-foreground transition-colors px-1"
+          className="cad-focus hit-24 text-muted-foreground/70 hover:text-foreground transition-colors px-1"
         >
           {expanded ? '«' : '»'}
         </button>
@@ -820,10 +761,15 @@ function TreeContextMenu({
       : undefined
   const isDefaultDatum = !!datumRecord?.is_default
 
-  const handleRename = useCallback(() => {
+  const handleRename = useCallback(async () => {
     onClose()
     if (!localObj) return
-    const next = window.prompt('Rename', localObj.name)?.trim()
+    const next = await promptDialog({
+      title: 'Rename part',
+      label: 'Part name',
+      initial: localObj.name,
+      confirmLabel: 'Rename',
+    })
     if (!next || next === localObj.name) return
     // Optimistic local update; the backend write is what makes the rename
     // DURABLE — the kernel solid's name is the single source every reload
@@ -848,12 +794,18 @@ function TreeContextMenu({
         if (!resp.ok) {
           console.error('[browser] rename persist failed:', resp.status)
           updateObject(localObj.id, { name: previous })
-          window.alert(`Rename failed (${resp.status}) — reverted to "${previous}".`)
+          void alertDialog({
+            title: 'Rename failed',
+            body: `The kernel refused the new name (${resp.status}). The part is "${previous}" again.`,
+          })
         }
       } catch (err) {
         console.error('[browser] rename persist error:', err)
         updateObject(localObj.id, { name: previous })
-        window.alert(`Rename failed (backend unreachable) — reverted to "${previous}".`)
+        void alertDialog({
+          title: 'Rename failed',
+          body: `The kernel could not be reached. The part is "${previous}" again.`,
+        })
       }
     })()
   }, [localObj, updateObject, onClose])
@@ -916,7 +868,12 @@ function TreeContextMenu({
   const handleRenameDatum = useCallback(async () => {
     onClose()
     if (datumId === null || !datumRecord) return
-    const next = window.prompt('Rename datum', datumRecord.name)?.trim()
+    const next = await promptDialog({
+      title: 'Rename datum',
+      label: 'Datum name',
+      initial: datumRecord.name,
+      confirmLabel: 'Rename',
+    })
     if (!next || next === datumRecord.name) return
     try {
       const resp = await fetch(`${API_BASE}/api/datums/${datumId}`, {
@@ -949,7 +906,12 @@ function TreeContextMenu({
     // Probing first keeps the no-dependents path single-confirm and
     // single-network, while still surfacing the cascade choice
     // explicitly when it actually matters.
-    if (!window.confirm(`Delete datum "${datumRecord.name}"?`)) return
+    const sure = await confirmDialog({
+      title: `Delete datum "${datumRecord.name}"?`,
+      confirmLabel: 'Delete datum',
+      destructive: true,
+    })
+    if (!sure) return
 
     const baseUrl = `${API_BASE}/api/datums/${datumId}`
     try {
@@ -964,9 +926,12 @@ function TreeContextMenu({
         return
       }
       // 409 → either default (impossible here, gated) or has dependents.
-      const proceed = window.confirm(
-        `"${datumRecord.name}" has anchored solids. Re-anchor them to Origin and delete?`,
-      )
+      const proceed = await confirmDialog({
+        title: `"${datumRecord.name}" has parts anchored to it`,
+        body: 'Re-anchor them to the Origin and delete the datum?',
+        confirmLabel: 'Re-anchor and delete',
+        destructive: true,
+      })
       if (!proceed) return
       const cascade = await fetch(`${baseUrl}?cascade=detach`, {
         method: 'DELETE',

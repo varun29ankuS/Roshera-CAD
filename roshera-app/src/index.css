@@ -2,6 +2,10 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/600.css";
+@import "@fontsource/share-tech-mono/400.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -230,7 +234,14 @@
   --radius-4xl: calc(var(--radius) * 2.6);
   --font-heading: var(--font-sans);
   --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  /* Both faces are bundled (@fontsource, SIL OFL 1.1) -- nothing is fetched
+     at runtime. `--font-mono` named JetBrains Mono, which was never bundled,
+     so every readout fell back to whatever the machine had.
+     `--font-board` is the Blackboard's lettering: Share Tech Mono, a squared,
+     condensed technical face (Varun 2026-11-27: "font that feels
+     mechanical"). It has one weight; emphasis falls back to Plex. */
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --font-board: 'Share Tech Mono', 'IBM Plex Mono', ui-monospace, monospace;
   --shadow-panel: var(--shadow-panel);
   --shadow-elevated: var(--shadow-elevated);
   --shadow-floating: var(--shadow-floating);
@@ -341,6 +352,36 @@
     width: 4px;
     height: 4px;
   }
+  /* A control drawn smaller than 24 px still gets a 24 px target: the hit
+     area is grown around its centre without moving anything on screen. For
+     glyph-sized buttons in dense rows (tree arms, row actions), where
+     growing the button itself would break the row's rhythm. */
+  .hit-24 {
+    position: relative;
+  }
+  .hit-24::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: max(100%, 24px);
+    height: max(100%, 24px);
+    transform: translate(-50%, -50%);
+  }
+  /* Tree rows wear the viewport's two colours: BLUE for what is pointed at
+     (`--cad-hovered`, pre-highlight), AMBER for what is selected
+     (`--cad-edge-selected`) -- a wash, plus a bar on the left edge for the
+     selection. One pairing between a row and its part, in both themes. */
+  .cad-row-hover:hover,
+  .cad-row-hover[data-hovered],
+  .cad-row-hovered {
+    background-color: color-mix(in oklch, var(--cad-hovered) 14%, transparent);
+  }
+  .cad-row-selected,
+  .cad-row-selected:hover {
+    background-color: color-mix(in oklch, var(--cad-edge-selected) 22%, transparent);
+    box-shadow: inset 3px 0 0 var(--cad-edge-selected);
+  }
   .scrollbar-thin::-webkit-scrollbar-track {
     background: transparent;
   }
@@ -368,6 +409,75 @@
    digits, and math. */
 .katex {
   font-family: KaTeX_Main, 'Segoe UI Symbol', 'Times New Roman', serif;
+}
+
+/* Print reveal (components/panels/cards/PrintReveal.tsx): the Blackboard
+   writes like a teleprinter. A line is set left to right in discrete steps;
+   the next starts `--print-step` later (`--i` is its place in the order); a
+   certificate verdict is stamped after its row. steps(), never an ease. */
+[data-print='line'] {
+  animation: print-line 80ms steps(5, end) both;
+  animation-delay: calc(var(--i, 0) * var(--print-step, 36ms));
+}
+@keyframes print-line {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+[data-print='stamp'] {
+  animation: print-stamp 90ms steps(3, end) both;
+  animation-delay: calc(var(--i, 0) * var(--print-step, 36ms) + 70ms);
+}
+@keyframes print-stamp {
+  from {
+    opacity: 0;
+    transform: scale(1.7);
+  }
+  34% {
+    opacity: 1;
+    transform: scale(1.7);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+/* Sheet plot (lib/sheet-plot.ts, sheet-plot-dom.ts): a sheet shown for the
+   first time is drawn like a pen plotter. A stroked mark is drawn along its
+   length at constant speed (`pathLength="1"` makes one dash pattern fit any
+   line); a stamped mark -- lettering, a filled arrowhead, a dashed hidden
+   line -- is set down whole at its moment. Linear and stepped, never eased. */
+[data-plot='stroke'] {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: plot-stroke var(--plot-ms, 90ms) linear var(--plot-at, 0ms) both;
+}
+@keyframes plot-stroke {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+[data-plot='show'] {
+  animation: plot-show 1ms steps(1, end) var(--plot-at, 0ms) both;
+}
+@keyframes plot-show {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* The Blackboard's lettering -- its readouts and chips too, so a card is
+   one face, not two. */
+.board-type,
+.board-type .font-mono,
+.board-type .cad-readout {
+  font-family: var(--font-board);
 }
 
 /* Chalk-draw reveal (see components/panels/cards/ChalkReveal.tsx).
@@ -409,6 +519,19 @@
     opacity: 0.15;
   }
 }
+/* One motion language, app-wide: mechanical. Everything that moves -- a
+   menu opening, a panel changing width, a hover changing colour -- moves at
+   constant speed over its short, fixed time. No ease-in-out, no spring, no
+   overshoot. Unlayered on purpose, so it holds over every utility's own
+   curve; the stepped prints and plots above set their own timing and, being
+   more specific, keep it. */
+*,
+*::before,
+*::after {
+  transition-timing-function: linear;
+  animation-timing-function: linear;
+}
+
 /* Reduced motion, app-wide: someone who has asked the OS for less motion gets
    state changes without the travel -- no slides, zooms, pulses or spinners
    in motion. Durations are cut to (almost) nothing rather than removed, so

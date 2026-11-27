@@ -19,6 +19,8 @@ import {
   type ToolCallStatus,
 } from './BlackboardMessageParts'
 import { RevealContext } from './cards/reveal-context'
+import { printLine, usePrintRun } from './cards/PrintReveal'
+import { shouldPrint } from '@/lib/print-reveal'
 import { CardActionsContext, type CardActions } from './cards/card-actions-context'
 import { DetectedChoicesCard } from './cards/DetectedChoicesCard'
 import {
@@ -218,9 +220,14 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
   // Chalk-reveal gate, decided ONCE at mount: only agent content that just
   // arrived animates (actively streaming, or created moments ago). Persisted
   // history re-renders instantly — the reveal is for arrival, not reload.
+  // Every voice prints when it arrives (the app's own lines too -- an export
+  // result, a kernel certificate), not only the agent's.
   const [reveal] = useState(() => ({
-    animate: line.author === 'agent' && (streaming || Date.now() - line.createdAt < 4000),
+    animate: shouldPrint({ createdAt: line.createdAt, streaming }, Date.now(), false),
   }))
+  // The entry itself is one printed line; a card inside it then prints its
+  // own rows. Text still streaming in is already arriving piece by piece.
+  const entryPrint = usePrintRun(reveal.animate && !streaming, 1)
 
   // Answering a Choices card (`cards/ChoicesCard.tsx`) does two things: sends
   // the clicked option's value as the next turn, and rewrites THIS line's
@@ -393,7 +400,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
         )}
       </div>
 
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1" {...printLine(entryPrint.printing, 0)}>
         {streaming ? (
           // Not a <button> — a turn in flight is not editable, and a stop
           // control lives inside this block (nested <button>s are invalid).

@@ -20,6 +20,7 @@
  * not render their children at all.
  */
 import { memo, useCallback, useMemo, useState } from 'react'
+import { PartVerdictMark } from '@/components/ui/part-verdict'
 import { useSceneStore } from '@/stores/scene-store'
 import type { AsmNode, ContainerNode, GroupNode, PartNode } from '@/lib/assembly-tree'
 import { cn } from '@/lib/utils'
@@ -266,8 +267,8 @@ const PartRow = memo(function PartRow({
         selected
           ? 'text-foreground'
           : hovered
-            ? 'bg-accent/60 text-foreground'
-            : 'text-foreground/70 hover:bg-accent/50 hover:text-foreground',
+            ? 'cad-row-hovered text-foreground'
+            : 'cad-row-hover text-foreground/70 hover:text-foreground',
       )}
       // Leaves sit one fold-arrow's width right of their parent's arrow. A
       // selected row wears the SAME yellow as the selected part in the
@@ -291,11 +292,11 @@ const PartRow = memo(function PartRow({
       <span className={cn('flex min-w-0 flex-1', !visible && 'opacity-50')}>
         <Name name={node.name} parent={parentName} />
       </span>
-      <Verdict
-        sound={node.sound === true ? 1 : 0}
-        unsound={node.sound === false ? 1 : 0}
-        total={1}
-      />
+      {/* One part: its own certificate verdict, the same mark as the part
+          rows of the feature tree. */}
+      <span className="flex w-9 shrink-0 justify-end">
+        <PartVerdictMark sound={node.sound} />
+      </span>
       <button
         type="button"
         onClick={(e) => {

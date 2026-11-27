@@ -139,7 +139,7 @@ function ModelPicker({
     if (failure) useBlackboardStore.getState().addLine(failure, 'system')
   }
   return (
-    <select
+    <select name="model"
       aria-label="Model"
       value={current ?? ''}
       disabled={switching}
@@ -653,7 +653,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
       <div
         ref={scrollRef}
         onScroll={onBodyScroll}
-        className="flex-1 overflow-y-auto min-h-0 scrollbar-thin"
+        className="board-type flex-1 overflow-y-auto min-h-0 scrollbar-thin"
         style={
           docked
             ? undefined
@@ -865,7 +865,7 @@ export function Blackboard({ docked = false }: { docked?: boolean } = {}) {
         >
           {/* The selection this message carries (the design's chip row). */}
           <ComposerSelectionChips chips={selectionChips} />
-          <textarea
+          <textarea name="message-the-agent"
             ref={inputRef}
             value={draft}
             rows={2}

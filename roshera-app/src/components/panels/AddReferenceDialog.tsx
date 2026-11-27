@@ -138,7 +138,7 @@ export function AddReferenceDialog({ assemblyId, component, onClose, onCreated }
           </FormField>
 
           <FormField label="Reference type">
-            <select
+            <select name="add-reference-dialog-field-1"
               value={kind}
               onChange={(e) => setKind(e.target.value as RefKind)}
               className="cad-focus h-8 rounded border border-border bg-background px-2 text-xs"

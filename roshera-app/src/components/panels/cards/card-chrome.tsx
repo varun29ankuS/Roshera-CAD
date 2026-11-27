@@ -1,11 +1,26 @@
-import type { ComponentType, ReactNode } from 'react'
+import {
+  Children,
+  cloneElement,
+  createContext,
+  isValidElement,
+  useContext,
+  type ComponentType,
+  type CSSProperties,
+  type ReactElement,
+  type ReactNode,
+} from 'react'
 import {
   Check,
   CircleSlash,
   X,
 } from '@/components/ui/icons'
 import { cn } from '@/lib/utils'
-import { ChalkReveal } from './ChalkReveal'
+import { lineStarts } from '@/lib/print-reveal'
+import { printLine, usePrintRun } from './PrintReveal'
+import { RevealContext } from './reveal-context'
+
+/** Whether the card this row sits in is printing right now (PrintReveal). */
+const PrintingContext = createContext(false)
 
 /**
  * Shared chrome for typed Blackboard cards. One visual system: a bordered
@@ -16,7 +31,8 @@ import { ChalkReveal } from './ChalkReveal'
  *   amber   = honest refusal-to-decide (unverifiable, conflicts)
  *   sky     = typed refusal (a RESULT with options, never styled as an error)
  *   neutral = informational (design intent, partial certificates)
- * Cards arrive with the chalk-draw reveal (skippable; see ChalkReveal).
+ * A card that has just arrived PRINTS, line by line: its header, then each
+ * block under it, a certificate table one row at a time (see PrintReveal).
  */
 
 export type CardAccent = 'pass' | 'fail' | 'warn' | 'info' | 'neutral'
@@ -64,17 +80,31 @@ interface CardShellProps {
 
 export function CardShell({ accent, icon: Icon, title, chip, titleText, children }: CardShellProps) {
   const a = ACCENT[accent]
+  // The print order: the header is line 0, then each block; a certificate
+  // table counts one line per row, so its rows arrive one after another.
+  const { animate } = useContext(RevealContext)
+  const blocks = Children.toArray(children)
+  const isCertRows = (b: unknown): b is ReactElement<CertRowsProps> => isValidElement(b) && b.type === CertRows
+  const { starts, total } = lineStarts([
+    1,
+    ...blocks.map((b) => (isCertRows(b) ? Children.count(b.props.children) : 1)),
+  ])
+  const run = usePrintRun(animate, total)
   return (
-    <ChalkReveal framed className={cn('my-1.5', a.chalk)}>
+    <PrintingContext.Provider value={run.printing}>
+    <div className="my-1.5" style={run.style}>
       <div
         className={cn(
           // `@container`: the card's contents lay themselves out by the CARD's
           // width (a 320px docked Blackboard vs a wide panel), not the window's.
-          '@container select-text rounded-md border border-border/70 border-l-2 bg-card/50 px-3 py-2 text-xs',
+          'board-type @container select-text rounded-md border border-border/70 border-l-2 bg-card/50 px-3 py-2 text-xs',
           a.edge,
         )}
       >
-        <div className={cn('flex items-center gap-x-2 gap-y-1', titleText === undefined && 'flex-wrap')}>
+        <div
+          {...printLine(run.printing, 0)}
+          className={cn('flex items-center gap-x-2 gap-y-1', titleText === undefined && 'flex-wrap')}
+        >
           <Icon size={13} className={cn('shrink-0', a.text)} />
           <span
             title={titleText}
@@ -86,9 +116,18 @@ export function CardShell({ accent, icon: Icon, title, chip, titleText, children
             <span className="ml-auto flex shrink-0 items-center gap-1.5">{chip}</span>
           )}
         </div>
-        {children}
+        {blocks.map((block, k) =>
+          isCertRows(block) ? (
+            cloneElement(block, { printStart: starts[k + 1] })
+          ) : (
+            <div key={isValidElement(block) && block.key != null ? block.key : k} {...printLine(run.printing, starts[k + 1])}>
+              {block}
+            </div>
+          ),
+        )}
       </div>
-    </ChalkReveal>
+    </div>
+    </PrintingContext.Provider>
   )
 }
 
@@ -206,7 +245,10 @@ export function CertRow({
   value,
   icon: Icon,
   title,
+  printIndex = 0,
 }: {
+  /** This row's place in the card's print order (set by `CertRows`). */
+  printIndex?: number
   status: boolean | null | 'na'
   /** The full claim, never abbreviated. */
   name: string
@@ -218,8 +260,10 @@ export function CertRow({
 }) {
   const verdict =
     status === true ? 'proven' : status === false ? 'failed' : status === 'na' ? 'not applicable' : 'not run'
+  const printing = useContext(PrintingContext)
   return (
     <div
+      {...printLine(printing, printIndex)}
       title={title}
       aria-label={`${name}: ${verdict}`}
       className={cn(
@@ -228,9 +272,9 @@ export function CertRow({
       )}
       role="row"
     >
-      {/* 16px is the smallest size the icon set is rendered at: drawn at its
-          native size the pictograph stays crisp instead of a scaled blur. */}
-      <span role="presentation" className="inline-flex items-center">
+      {/* A quiet line icon (cert-icons.tsx): it marks the row; the name
+          beside it carries the meaning, and the verdict keeps the colour. */}
+      <span role="presentation" className="inline-flex items-center text-muted-foreground">
         <Icon size={16} />
       </span>
       <span className="flex min-w-0 items-baseline justify-between gap-3 @xs:contents">
@@ -247,8 +291,11 @@ export function CertRow({
       </span>
       <span
         role="cell"
+        // The verdict is stamped after its row has printed.
+        data-print={printing ? 'stamp' : undefined}
+        style={printing ? ({ '--i': printIndex } as CSSProperties) : undefined}
         className={cn(
-          'col-end-[-1] inline-flex items-center justify-end pl-3',
+          'col-end-[-1] inline-flex origin-right items-center justify-end pl-3',
           status === true && 'text-emerald-600 dark:text-emerald-400',
           status === false && 'text-red-600 dark:text-red-400',
           status === null && 'text-caution',
@@ -279,13 +326,23 @@ export function CertRow({
  * message wrapper sets `break-words` for prose, which would otherwise cut a
  * claim name in half ("Watertig / ht") the moment a column ran short.
  */
-export function CertRows({ children }: { children: ReactNode }) {
+interface CertRowsProps {
+  children: ReactNode
+  /** The print-order index of the first row (set by `CardShell`). */
+  printStart?: number
+}
+
+export function CertRows({ children, printStart = 0 }: CertRowsProps) {
+  let row = 0
+  const rows = Children.map(children, (child) =>
+    isValidElement<{ printIndex?: number }>(child) ? cloneElement(child, { printIndex: printStart + row++ }) : child,
+  )
   return (
     <div
       role="table"
       className="mt-2 grid grid-cols-[24px_minmax(0,1fr)_auto] border-t border-border/60 [overflow-wrap:normal] [word-break:normal] @xs:grid-cols-[24px_max-content_minmax(0,1fr)_auto]"
     >
-      {children}
+      {rows}
     </div>
   )
 }

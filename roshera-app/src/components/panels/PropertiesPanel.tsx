@@ -133,7 +133,7 @@ export function PropertiesPanel() {
         <Box size={16} />
         <div className="min-w-0 flex-1">
           <div className="truncate text-[12.5px] font-semibold">{obj.name}</div>
-          <div className="text-[11px] text-muted-foreground">Part{solidId !== undefined ? ` · solid ${solidId}` : ''}</div>
+          <div className="text-[11px] text-muted-foreground">Part</div>
         </div>
         <button
           type="button"
@@ -237,7 +237,7 @@ export function PropertiesPanel() {
                 <span className="capitalize">{k}</span>
                 <span className="font-mono">{obj.material[k].toFixed(2)}</span>
               </div>
-              <input
+              <input name="properties-panel-field-1"
                 type="range"
                 min={0}
                 max={1}
@@ -325,7 +325,7 @@ function ColorPicker({
           aria-label="Toggle material color picker"
           aria-expanded={open}
         />
-        <input
+        <input name="properties-panel-field-2"
           type="text"
           value={draft}
           onChange={(e) => {
@@ -401,7 +401,7 @@ function EdgeDisplayControls() {
             <span>Threshold</span>
             <span className="font-mono">{edgeSettings.threshold}°</span>
           </div>
-          <input
+          <input name="properties-panel-field-3"
             type="range"
             min={1}
             max={45}
@@ -415,7 +415,7 @@ function EdgeDisplayControls() {
             <span>Line Width</span>
             <span className="font-mono">{edgeSettings.lineWidth.toFixed(1)}</span>
           </div>
-          <input
+          <input name="properties-panel-field-4"
             type="range"
             min={0.5}
             max={5}
@@ -461,6 +461,8 @@ function TransformEditor({ objectId }: { objectId: string }) {
           label="Pos"
           values={obj.position}
           onChange={(axis, val) => handleChange('position', axis, val)}
+          // The scene is in millimetres whatever the document displays in.
+          rowUnit="mm"
         />
         <TransformRow
           label="Rot"
@@ -491,7 +493,10 @@ function TransformRow({
   values,
   onChange,
   suffix = '',
+  rowUnit,
 }: {
+  /** One unit for the whole row, shown once at its end ("mm"). */
+  rowUnit?: string
   label: string
   values: [number, number, number]
   /** Absent: the row is display-only. */
@@ -500,6 +505,7 @@ function TransformRow({
 }) {
   const colors = ['text-red-400', 'text-green-400', 'text-blue-400']
   const axes = ['X', 'Y', 'Z'] as const
+  const NAME: Record<string, string> = { Pos: 'position', Rot: 'rotation', Scl: 'scale' }
 
   return (
     <div className="flex items-center gap-1">
@@ -513,6 +519,8 @@ function TransformRow({
           <span className={`text-[11px] ${colors[i]} shrink-0`}>{axes[i]}</span>
           <input
             type="number"
+            name={`${NAME[label] ?? label.toLowerCase()}-${axes[i].toLowerCase()}`}
+            aria-label={`${NAME[label] ?? label} ${axes[i]}${rowUnit ? `, ${rowUnit}` : suffix === '°' ? ', degrees' : ''}`}
             step={label === 'Scl' ? 0.1 : 1}
             value={values[i].toFixed(label === 'Scl' ? 2 : 1)}
             readOnly={!onChange}
@@ -522,6 +530,9 @@ function TransformRow({
           {suffix && <span className="text-[11px] text-muted-foreground shrink-0">{suffix}</span>}
         </div>
       ))}
+      {/* Every row keeps the same three cells: a row with no unit of its own
+          reserves the same space, so X / Y / Z line up down the block. */}
+      <span className="w-5 shrink-0 text-[11px] text-muted-foreground">{rowUnit ?? ''}</span>
     </div>
   )
 }

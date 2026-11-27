@@ -224,7 +224,7 @@ export function SketchBenchRail() {
         {tool === 'polygon' && (
           <label className="col-span-2 flex items-center justify-center gap-1 text-[11px] text-muted-foreground">
             Sides
-            <input
+            <input name="sketch-bench-rail-field-1"
               type="number"
               min={3}
               max={64}

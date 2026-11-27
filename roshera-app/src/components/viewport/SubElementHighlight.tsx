@@ -37,10 +37,14 @@ export function SubElementHighlight() {
     const face = resolveCssVar('--cad-face-selected').color.getHexString()
     const edge = resolveCssVar('--cad-edge-selected').color.getHexString()
     const vertex = resolveCssVar('--cad-vertex-selected').color.getHexString()
+    // A face / edge / vertex under the cursor pre-highlights in the hover
+    // blue; a picked one keeps the selection colours.
+    const hover = `#${resolveCssVar('--cad-hovered').color.getHexString()}`
     return {
       face: `#${face}`,
       edge: `#${edge}`,
       vertex: `#${vertex}`,
+      hover,
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [theme])
@@ -226,7 +230,7 @@ interface SelectionMarkProps {
   type: 'face' | 'edge' | 'vertex'
   triangles: Triangle[]
   polyline?: THREE.Vector3[]
-  colors: { face: string; edge: string; vertex: string }
+  colors: { face: string; edge: string; vertex: string; hover: string }
   hover: boolean
 }
 
@@ -244,7 +248,7 @@ function SelectionMark({
   hover,
 }: SelectionMarkProps) {
   if (type === 'face') {
-    return <FaceMark triangles={triangles} color={colors.face} hover={hover} />
+    return <FaceMark triangles={triangles} color={hover ? colors.hover : colors.face} hover={hover} />
   }
   if (type === 'edge') {
     // Slice α (kernel Polyline curve type) makes `sample_edge_polyline`
@@ -256,7 +260,7 @@ function SelectionMark({
     // drew a single tessellation triangle border and was the root
     // cause of the "selecting an edge highlights a triangle" bug).
     if (!polyline || polyline.length < 2) return null
-    return <EdgePolyline points={polyline} color={colors.edge} hover={hover} />
+    return <EdgePolyline points={polyline} color={hover ? colors.hover : colors.edge} hover={hover} />
   }
   // Vertex: operate on the single picked triangle.
   const tri = triangles[0]
@@ -264,7 +268,7 @@ function SelectionMark({
   const ao = inflate(tri.a, tri.normal)
   const bo = inflate(tri.b, tri.normal)
   const co = inflate(tri.c, tri.normal)
-  return <VertexMark ao={ao} bo={bo} co={co} color={colors.vertex} hover={hover} />
+  return <VertexMark ao={ao} bo={bo} co={co} color={hover ? colors.hover : colors.vertex} hover={hover} />
 }
 
 interface EdgePolylineProps {

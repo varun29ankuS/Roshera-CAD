@@ -19,6 +19,7 @@ import {
 import { DecisionRail, DurabilityChip } from './TimelineDecisions'
 import { FilmStrip } from './FilmStrip'
 import { useChapters } from '@/hooks/use-chapters'
+import { alertDialog, confirmDialog } from '@/lib/app-dialog'
 
 // Graph ("map") view — a second, toggleable view alongside this strip
 // (see vault Research/2026-07-31-ui-pass-spec.md §3). Lazy-loaded: it
@@ -135,7 +136,7 @@ function HeaderButton({
       title={title}
       aria-label={ariaLabel}
       disabled={disabled}
-      className="px-1.5 py-0.5 rounded text-foreground/70 hover:text-foreground hover:bg-accent/40 transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-foreground/70"
+      className="cad-focus inline-flex h-6 min-w-6 items-center justify-center px-1 rounded text-foreground/70 hover:text-foreground hover:bg-accent/40 transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-foreground/70"
     >
       {children}
     </button>
@@ -1281,9 +1282,11 @@ export function Timeline() {
   const handleMerge = async () => {
     if (activeBranchId === MAIN_BRANCH_ID) return
     const sourceName = activeBranch?.name || 'this branch'
-    const ok = window.confirm(
-      `Merge "${sourceName}" into main?\n\nMain will fast-forward to include every event added on this branch.`,
-    )
+    const ok = await confirmDialog({
+      title: `Merge "${sourceName}" into main?`,
+      body: 'Main will fast-forward to include every event added on this branch.',
+      confirmLabel: 'Merge into main',
+    })
     if (!ok) return
     try {
       const resp = await fetch(
@@ -1297,9 +1300,10 @@ export function Timeline() {
       if (!resp.ok) {
         const body = await resp.text().catch(() => '')
         console.error('[timeline] merge failed:', resp.status, body)
-        window.alert(
-          `Merge failed (${resp.status}). The backend may have rejected a non-fast-forward merge — try squashing instead.`,
-        )
+        void alertDialog({
+          title: `Merge failed (${resp.status})`,
+          body: 'The kernel may have rejected a non-fast-forward merge. Try squashing instead.',
+        })
         return
       }
       // Conflicts are TYPED objects from the backend (subject +
@@ -1315,11 +1319,10 @@ export function Timeline() {
         }>
       }
       if (!result.success) {
-        window.alert(
-          `Merge produced conflicts:\n\n${
-            result.conflicts.map((c) => c.summary).join('\n') || 'unknown conflict'
-          }`,
-        )
+        void alertDialog({
+          title: 'Merge produced conflicts',
+          body: result.conflicts.map((c) => c.summary).join('\n') || 'unknown conflict',
+        })
         return
       }
       // Switch the active recording target back to main so the next
@@ -1393,7 +1396,7 @@ export function Timeline() {
             </div>
           )}
           <div className="flex items-center gap-1.5">
-            <input
+            <input name="branch-name"
               ref={branchInputRef}
               type="text"
               value={nameInput}
@@ -1439,7 +1442,7 @@ export function Timeline() {
             </span>
           </div>
           <div className="flex items-center gap-1.5">
-            <input
+            <input name="e-g-bolt-circle-8-x-d18-on-d160-b-c"
               ref={checkpointInputRef}
               type="text"
               value={checkpointNameInput}
@@ -1564,7 +1567,7 @@ export function Timeline() {
             type="button"
             onClick={() => setGraphOpen(true)}
             title="Open the history as a map: features, their links and branches"
-            className="rounded px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+            className="cad-focus min-h-6 rounded px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent/40 hover:text-foreground"
           >
             Map
           </button>
@@ -1575,7 +1578,7 @@ export function Timeline() {
             title={`Branch ${activeBranchLabel} · ${events.length} recorded step${events.length === 1 ? '' : 's'}${
               otherBranchCount > 0 ? ` · ${otherBranchCount} other branch${otherBranchCount === 1 ? '' : 'es'}` : ''
             }`}
-            className="flex items-center gap-1.5 rounded px-2 py-0.5 text-[11px] hover:bg-accent/40"
+            className="cad-focus flex min-h-6 items-center gap-1.5 rounded px-2 py-0.5 text-[11px] hover:bg-accent/40"
           >
             <span aria-hidden className="inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: '#2ecc71' }} />
             <span className="font-medium text-foreground/90">{activeBranchLabel}</span>
@@ -1590,7 +1593,7 @@ export function Timeline() {
           title={bodyCollapsed ? 'Show the history pictures' : 'Fold the history to one line'}
           aria-label={bodyCollapsed ? 'Expand history' : 'Collapse history'}
           aria-expanded={!bodyCollapsed}
-          className="shrink-0 rounded px-1 text-[11px] leading-none text-foreground/55 hover:text-foreground"
+          className="cad-focus inline-flex h-6 min-w-6 shrink-0 items-center justify-center rounded px-1 text-[11px] leading-none text-foreground/55 hover:bg-accent/40 hover:text-foreground"
         >
           {bodyCollapsed ? '▴' : '▾'}
         </button>

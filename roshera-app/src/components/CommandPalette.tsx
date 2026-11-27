@@ -36,7 +36,8 @@ import { newDocument } from '@/lib/documents-api'
 import { runNewProject } from '@/lib/new-project'
 import { openGuide } from '@/lib/first-run'
 import { VIEW_SHORTCUT_LABEL, type StandardView } from '@/lib/view-shortcuts'
-import { deleteSelectedParts } from '@/lib/shortcuts'
+import { deleteAllParts, deleteSelectedParts } from '@/lib/shortcuts'
+import { confirmNewDocument } from '@/lib/confirm-new-document'
 
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -122,7 +123,6 @@ export function CommandPalette() {
   // We read setters here (not state, to keep the selectors stable so
   // the palette doesn't re-render on every viewport tick).
   const setDocMode = useDocModeStore((s) => s.setMode)
-  const clearScene = useSceneStore((s) => s.clearScene)
   const setCameraPreset = useSceneStore((s) => s.setCameraPreset)
   const setSelectionMode = useSceneStore((s) => s.setSelectionMode)
   const setActiveTool = useSceneStore((s) => s.setActiveTool)
@@ -159,20 +159,18 @@ export function CommandPalette() {
       // The scene is left alone until the backend has switched documents
       // (the page then reloads onto it); a refusal keeps it and says why.
       run: () => {
-        if (!window.confirm('Start a new, empty document? Your current document is saved.')) {
-          return
-        }
-        void runNewProject(newDocument, (line) =>
-          useBlackboardStore.getState().addLine(line, 'system'),
-        )
+        void confirmNewDocument().then((ok) => {
+          if (!ok) return
+          void runNewProject(newDocument, (line) => useBlackboardStore.getState().addLine(line, 'system'))
+        })
       },
     })
     cmds.push({
-      id: 'file.clear-scene',
-      label: 'Clear Scene',
+      id: 'file.delete-all-parts',
+      label: 'Delete all parts…',
       group: 'File',
-      keywords: ['delete all', 'reset'],
-      run: () => clearScene(),
+      keywords: ['clear scene', 'delete all', 'reset', 'empty'],
+      run: () => void deleteAllParts(),
     })
     cmds.push({
       id: 'file.demos',
@@ -304,7 +302,6 @@ export function CommandPalette() {
     return cmds
   }, [
     setDocMode,
-    clearScene,
     setCameraPreset,
     setSelectionMode,
     setActiveTool,
@@ -420,7 +417,7 @@ export function CommandPalette() {
         {/* Input row */}
         <div className="flex items-center gap-2 px-3 py-2 border-b border-border/60">
           <Search size={14} className="text-muted-foreground shrink-0" />
-          <input
+          <input name="type-a-command"
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}

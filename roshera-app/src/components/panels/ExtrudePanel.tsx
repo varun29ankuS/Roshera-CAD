@@ -138,7 +138,7 @@ export function ExtrudePanel() {
           </div>
           <label className="flex items-center gap-2">
             <span className="w-16 text-muted-foreground">Distance</span>
-            <input
+            <input name="extrude-panel-field-1"
               autoFocus
               value={text}
               inputMode="decimal"

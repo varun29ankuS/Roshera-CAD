@@ -70,7 +70,7 @@ export function UnitSelector() {
   }
 
   return (
-    <select
+    <select name="document-display-unit"
       value={documentUnit}
       onChange={handleChange}
       disabled={pending}

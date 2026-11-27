@@ -1,13 +1,18 @@
-import { GizmoHelper, GizmoViewcube } from '@react-three/drei'
-import { useFrame, type ThreeEvent } from '@react-three/fiber'
+import { useMemo } from 'react'
+import { GizmoHelper } from '@react-three/drei'
+import { useFrame, useThree } from '@react-three/fiber'
+import * as THREE from 'three'
 import { useSceneStore } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
-import { cubePreset } from '@/lib/view-cube'
+import { cubeView, squareOnFace } from '@/lib/view-cube'
+import { resolveCssVar } from '@/lib/css-color'
+import { ISO_DIRECTION } from '@/lib/camera-fit'
+import { useViewCubeStore } from '@/stores/view-cube-store'
+import { ViewCube, type ViewCubeColors } from './ViewCube'
+import { CUBE_RIGHT, CUBE_TOP } from './ViewCubeControls'
+import { useDockWidth } from '@/stores/dock-store'
 
-/** The cube's faces in drei's order (+X, −X, +Y, −Y, +Z, −Z), named for the
- *  kernel's Z-up world: +Y is the back, +Z the top. */
-const Z_UP_FACES = ['Right', 'Left', 'Back', 'Front', 'Top', 'Bottom']
 
 /**
  * Render-priority dance — the long version, because this has bitten us
@@ -37,6 +42,9 @@ const Z_UP_FACES = ['Right', 'Left', 'Back', 'Front', 'Top', 'Bottom']
  * The corner widget is a view cube (the approved mockup, 2026-11-14), its
  * faces named for the kernel's Z-up world.
  */
+const _forward = new THREE.Vector3()
+const _up = new THREE.Vector3()
+
 export function GizmoNav() {
   const hasOutlineTarget = useSceneStore(
     (s) => s.selectedIds.size > 0 || s.hoveredId !== null,
@@ -44,40 +52,57 @@ export function GizmoNav() {
   const setCameraPreset = useSceneStore((s) => s.setCameraPreset)
   const dark = useThemeStore((s) => s.theme) === 'dark'
   // In Part and DFM the Blackboard floats over the viewport's right side
-  // (w-80 = 320 px + its 8 px gap), so the cube sits left of it. Elsewhere
+  // (its dock width + its 8 px gap), so the cube sits left of it. Elsewhere
   // (Assembly) the Blackboard is its own column: the cube hugs the edge.
   const overlaid = useDocModeStore((s) => s.mode) !== 'assembly'
-  const onFace = (e: ThreeEvent<MouseEvent>) => {
-    e.stopPropagation()
-    // The app's preset (drei's own tween assumes Y-up and degenerates on Top).
-    if (e.face) setCameraPreset(cubePreset(e.object.position, e.face.normal))
-    return null
+  const dockPx = useDockWidth()
+  const setCameraView = useSceneStore((s) => s.setCameraView)
+  // A click on any of the cube's 26 pieces turns to that piece's view. The
+  // six faces and the home corner go by the app's named views, so the view
+  // bar's buttons stay in step; the other edges and corners go by direction.
+  const onPick = (piece: THREE.Vector3, normal: THREE.Vector3) => {
+    const view = cubeView(piece, normal)
+    if (view.preset) setCameraPreset(view.preset)
+    else setCameraView(view)
   }
+  // Light faces on the dark viewport, mid-grey on the light one, in both
+  // themes; the pre-highlight is the app's hover blue.
+  const colors = useMemo<ViewCubeColors>(
+    () => ({
+      face: dark ? '#d9dce1' : '#cfd4da',
+      text: dark ? '#23282e' : '#1f242a',
+      stroke: dark ? '#5b626b' : '#6f7781',
+      hover: `#${resolveCssVar('--cad-hovered').color.getHexString()}`,
+    }),
+    [dark],
+  )
+  // Tell the controls beside the cube when the camera is square-on to a
+  // face (their arrows only mean something then). Read every rendered frame,
+  // stored only when the answer changes.
+  const camera = useThree((s) => s.camera)
+  const setSquareOn = useViewCubeStore((s) => s.setSquareOn)
+  const setAtHome = useViewCubeStore((s) => s.setAtHome)
+  useFrame(() => {
+    const f = camera.getWorldDirection(_forward)
+    const face = squareOnFace([-f.x, -f.y, -f.z])
+    // Which face is up the screen (a roll changes it): the camera's own up,
+    // read off its orientation.
+    const u = _up.set(0, 1, 0).applyQuaternion(camera.quaternion)
+    setSquareOn(face, face ? squareOnFace([u.x, u.y, u.z]) : null)
+    // Home is the isometric view with Z up the screen (within a few degrees).
+    setAtHome(-f.x * ISO_DIRECTION[0] - f.y * ISO_DIRECTION[1] - f.z * ISO_DIRECTION[2] > 0.999 && u.z > 0.6)
+  })
   return (
     <>
       <ManualSceneRender active={!hasOutlineTarget} />
-      <GizmoHelper alignment="top-right" margin={[overlaid ? 56 + 336 : 56, 56]} renderPriority={2}>
-        {/* A view cube (the approved mockup): click a face, edge or corner
-            to look from that side. */}
-        {/* A light cube with medium-weight grey labels and fine edges, in
-            both themes -- the CAD-standard look (Fusion, SolidWorks). Bold
-            white labels on dark faces crowded the faces (Varun 2026-11-14:
-            "now it looks even bad"). */}
-        <group scale={0.78}>
-          <GizmoViewcube
-            faces={Z_UP_FACES}
-            font="600 22px Inter, system-ui, sans-serif"
-            // Contrast with the viewport in each theme: light faces on the
-            // dark viewport, mid-grey faces on the light one (#f1f2f4 there
-            // vanished into the background).
-            color={dark ? '#d9dce1' : '#c9ced5'}
-            hoverColor="#f2a516"
-            textColor={dark ? '#4a5059' : '#2f353c'}
-            strokeColor={dark ? '#5b626b' : '#6f7781'}
-            opacity={1}
-            onClick={onFace}
-          />
-        </group>
+      <GizmoHelper
+        alignment="top-right"
+        // Below the view bar, with room above the cube for its "face above"
+        // arrow; clear of the docked Blackboard by its width.
+        margin={[overlaid ? CUBE_RIGHT + dockPx + 16 : CUBE_RIGHT, CUBE_TOP]}
+        renderPriority={2}
+      >
+        <ViewCube colors={colors} onPick={onPick} mainCamera={camera} />
       </GizmoHelper>
     </>
   )

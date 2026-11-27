@@ -179,7 +179,7 @@ export function SketchBenchBar() {
             ))}
             {finish.op === "revolve" ? (
               <label className="ml-1 flex items-center gap-1 text-muted-foreground">
-                <input
+                <input name="sketch-bench-bar-field-1"
                   type="number"
                   value={finish.angle}
                   min={1}
@@ -191,7 +191,7 @@ export function SketchBenchBar() {
               </label>
             ) : (
               <label className="ml-1 flex items-center gap-1 text-muted-foreground">
-                <input
+                <input name="sketch-bench-bar-field-2"
                   type="number"
                   value={finish.distance}
                   min={0.01}
@@ -253,7 +253,7 @@ function Num({
   return (
     <label className="flex items-center gap-1 text-muted-foreground">
       {label}
-      <input
+      <input name="sketch-bench-bar-field-3"
         type="number"
         value={Number.isFinite(value) ? Number(value.toFixed(4)) : ""}
         step={step}

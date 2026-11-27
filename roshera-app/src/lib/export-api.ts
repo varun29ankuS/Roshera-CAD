@@ -11,6 +11,7 @@
 // without buffering them into the JSON response.
 
 import { useSceneStore } from '@/stores/scene-store'
+import { promptDialog } from '@/lib/app-dialog'
 
 // Host root — empty string in dev (Vite proxies /api), full origin in
 // production. Routes are prefixed with `/api/...` per request so the
@@ -143,10 +144,12 @@ export async function exportSceneAs(format: string): Promise<ExportResult> {
     // filename and trigger an anchor download. The anchor MUST be in
     // the document tree before `.click()` — Firefox ignores `.click()`
     // on detached anchors.
-    const promptedName = window.prompt(
-      `Save ${format} as:`,
-      meta.filename,
-    )
+    const promptedName = await promptDialog({
+      title: `Save ${format} as`,
+      label: 'File name',
+      initial: meta.filename,
+      confirmLabel: 'Save',
+    })
     if (promptedName === null) {
       // User cancelled the prompt — treat as success, don't download.
       return { ok: true, filename: meta.filename }

@@ -17,7 +17,6 @@ type OrbitControlsRef = any
 
 const prefersReducedMotion = () =>
   typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
-const EASE_OUT_CUBIC = (t: number) => 1 - Math.pow(1 - t, 3)
 
 interface CameraAnimation {
   startPosition: THREE.Vector3
@@ -258,7 +257,7 @@ export function CameraController() {
     // is every view of an empty scene.
     const presetTarget = new THREE.Vector3(...pendingPreset.target)
     const presetPos = new THREE.Vector3(...pendingPreset.position)
-    const isNamedView = Object.values(CAMERA_PRESETS).includes(pendingPreset)
+    const isNamedView = pendingPreset.fit === true || Object.values(CAMERA_PRESETS).includes(pendingPreset)
     let endTarget = presetTarget
     let endPosition = presetPos
     if (isNamedView && sceneBounds.radius > 1e-6) {
@@ -475,7 +474,9 @@ export function CameraController() {
 
     anim.progress = advanceFly(anim.progress, delta, prefersReducedMotion())
     const t = anim.progress
-    const eased = EASE_OUT_CUBIC(t)
+    // Constant angular speed, like a turntable: the app's motion is
+    // mechanical (index.css), so the fly does not ease in or out.
+    const eased = t
 
     camera.position.lerpVectors(anim.startPosition, anim.endPosition, eased)
     controlsRef.current.target.lerpVectors(

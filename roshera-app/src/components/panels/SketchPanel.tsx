@@ -798,7 +798,7 @@ function NumberField({ label, value, onChange, min, step }: NumberFieldProps) {
   return (
     <label className="flex items-center gap-1 text-[11px] text-muted-foreground">
       <span>{label}</span>
-      <input
+      <input name="sketch-panel-field-1"
         type="number"
         value={Number.isFinite(value) ? value : ''}
         min={min}
@@ -830,7 +830,7 @@ function AxisInputs({ label, value, onChange }: AxisInputsProps) {
     <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
       <span>{label}</span>
       {(['x', 'y', 'z'] as const).map((axis, i) => (
-        <input
+        <input name="sketch-panel-field-2"
           key={axis}
           type="number"
           value={Number.isFinite(value[i]) ? value[i] : ''}

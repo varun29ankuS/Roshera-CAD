@@ -436,8 +436,16 @@ export function installBackendBlackboard(intervalMs: number = POLL_INTERVAL_MS):
 
   // Live updates: re-fetch and reconcile. A failed poll is a no-op
   // (offline); the next tick retries.
+  // A hidden tab asks nothing (it was polling every 2.5 s behind other
+  // windows); coming back to it syncs at once.
+  const onVisible = () => {
+    if (document.visibilityState === 'visible') void syncNotebook()
+  }
   if (pollTimer === null && typeof window !== 'undefined') {
-    pollTimer = setInterval(syncNotebook, intervalMs)
+    pollTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') void syncNotebook()
+    }, intervalMs)
+    document.addEventListener('visibilitychange', onVisible)
   }
 
   return () => {
@@ -445,5 +453,6 @@ export function installBackendBlackboard(intervalMs: number = POLL_INTERVAL_MS):
       clearInterval(pollTimer)
       pollTimer = null
     }
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible)
   }
 }

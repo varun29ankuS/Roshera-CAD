@@ -143,7 +143,7 @@ export function AddMateDialog({ assemblyId, components, onClose, onCreated }: Pr
 
         <div className="flex flex-col gap-3">
           <FormField label="Mate type">
-            <select
+            <select name="add-mate-dialog-field-1"
               value={tag}
               onChange={(e) => setTag(e.target.value as MateTypeTag)}
               className="cad-focus h-8 rounded border border-border bg-background px-2 text-xs"
@@ -158,7 +158,7 @@ export function AddMateDialog({ assemblyId, components, onClose, onCreated }: Pr
 
           {mateTypeNeedsParameter(tag) && (
             <FormField label={mateTypeLabel(tag)}>
-              <input
+              <input name="add-mate-dialog-field-2"
                 type="number"
                 value={parameter}
                 onChange={(e) => setParameter(Number(e.target.value))}
@@ -176,7 +176,7 @@ export function AddMateDialog({ assemblyId, components, onClose, onCreated }: Pr
             return (
               <div key={side} className="grid grid-cols-2 gap-2">
                 <FormField label={`Component ${side}`}>
-                  <select
+                  <select name="add-mate-dialog-field-3"
                     value={componentId}
                     onChange={(e) => setComponent(e.target.value)}
                     className="cad-focus h-8 w-full rounded border border-border bg-background px-2 text-xs"
@@ -238,7 +238,7 @@ function ReferenceInput({
   const listId = `ref-slots-${useId()}`
   return (
     <>
-      <input
+      <input name="slot-name"
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}

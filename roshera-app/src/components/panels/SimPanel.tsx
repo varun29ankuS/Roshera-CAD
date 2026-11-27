@@ -132,7 +132,10 @@ export function SimPanel() {
       if (owner) loadSession(owner.id, session)
     }
     void tick()
-    const timer = setInterval(() => void tick(), 2000)
+    // Not from a hidden tab: nobody is watching the study move.
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') void tick()
+    }, 2000)
     return () => {
       stop = true
       clearInterval(timer)
@@ -359,7 +362,7 @@ export function SimPanel() {
           )}
 
           {step === 'part' && (
-            <select className={cn(field, 'min-w-0')} value={partId ?? ''} onChange={(e) => sim.setPart(e.target.value)} disabled={parts.length === 0} aria-label="Part">
+            <select name="part" className={cn(field, 'min-w-0')} value={partId ?? ''} onChange={(e) => sim.setPart(e.target.value)} disabled={parts.length === 0} aria-label="Part">
               {parts.length === 0 && <option value="">No parts</option>}
               {parts.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -456,7 +459,7 @@ export function SimPanel() {
                     {active && <span className="text-[11px] text-orange-800 dark:text-orange-200">Click the faces the force acts on — each turns orange and the arrow follows.</span>}
                     <label className="flex items-center gap-1.5">
                       <span className="w-12 text-muted-foreground">Size</span>
-                      <input
+                      <input name="force-n"
                         className={cn(field, 'h-6 w-20 font-mono')}
                         value={Number.isFinite(l.newtons) ? String(l.newtons) : ''}
                         onChange={(e) => {
@@ -522,7 +525,7 @@ export function SimPanel() {
 
           {step === 'material' && (
             <>
-              <select
+              <select name="material"
                 className={field}
                 aria-label="Material"
                 value={library.find((x) => x.name === m.name)?.id ?? (m.name ? 'own' : '')}
@@ -545,14 +548,14 @@ export function SimPanel() {
               {m.name && (
                 <div className="flex flex-col gap-1 rounded bg-muted/40 px-2 py-1.5">
                   <div className="grid grid-cols-[1fr_auto] items-center gap-x-1.5 gap-y-1">
-                    <input className={cn(field, 'h-6 font-mono')} placeholder="Young's modulus" value={m.youngs_modulus_mpa} onChange={(e) => sim.setMaterial({ youngs_modulus_mpa: e.target.value, yieldBasis: null })} inputMode="decimal" aria-label="Young's modulus (MPa)" />
+                    <input name="young-s-modulus" className={cn(field, 'h-6 font-mono')} placeholder="Young's modulus" value={m.youngs_modulus_mpa} onChange={(e) => sim.setMaterial({ youngs_modulus_mpa: e.target.value, yieldBasis: null })} inputMode="decimal" aria-label="Young's modulus (MPa)" />
                     <span className="text-muted-foreground">MPa (E)</span>
-                    <input className={cn(field, 'h-6 font-mono')} placeholder="Poisson ratio" value={m.poisson_ratio} onChange={(e) => sim.setMaterial({ poisson_ratio: e.target.value })} inputMode="decimal" aria-label="Poisson ratio" />
+                    <input name="poisson-ratio" className={cn(field, 'h-6 font-mono')} placeholder="Poisson ratio" value={m.poisson_ratio} onChange={(e) => sim.setMaterial({ poisson_ratio: e.target.value })} inputMode="decimal" aria-label="Poisson ratio" />
                     <span className="text-muted-foreground">ν</span>
-                    <input className={cn(field, 'h-6 font-mono')} placeholder="Yield strength" value={m.yield_strength_mpa} onChange={(e) => sim.setMaterial({ yield_strength_mpa: e.target.value, yieldBasis: null })} inputMode="decimal" aria-label="Yield strength (MPa)" />
+                    <input name="yield-strength" className={cn(field, 'h-6 font-mono')} placeholder="Yield strength" value={m.yield_strength_mpa} onChange={(e) => sim.setMaterial({ yield_strength_mpa: e.target.value, yieldBasis: null })} inputMode="decimal" aria-label="Yield strength (MPa)" />
                     <span className="text-muted-foreground">MPa yield</span>
                   </div>
-                  <input className={cn(field, 'h-6')} placeholder="Where the yield comes from" value={m.source} onChange={(e) => sim.setMaterial({ source: e.target.value })} aria-label="Source" />
+                  <input name="where-the-yield-comes-from" className={cn(field, 'h-6')} placeholder="Where the yield comes from" value={m.source} onChange={(e) => sim.setMaterial({ source: e.target.value })} aria-label="Source" />
                   {m.yieldBasis === 'specified_minimum' && (
                     <span className="text-[11px] text-emerald-700 dark:text-emerald-300">Yield is a specified minimum: fit for a design check.</span>
                   )}
@@ -569,7 +572,7 @@ export function SimPanel() {
             <>
               <label className="flex items-center gap-2">
                 <span className="w-24 text-muted-foreground">Safety factor ≥</span>
-                <input className={cn(field, 'w-16 font-mono')} placeholder="e.g. 2" value={setup.minSafetyFactor} onChange={(e) => sim.setGoal(e.target.value)} inputMode="decimal" />
+                <input name="e-g-2" className={cn(field, 'w-16 font-mono')} placeholder="e.g. 2" value={setup.minSafetyFactor} onChange={(e) => sim.setGoal(e.target.value)} inputMode="decimal" />
               </label>
               <AccuracySettings />
               <button type="button" className={primary} disabled={!study || !meshed || phase.kind === 'busy'} onClick={() => void run()}>
@@ -681,7 +684,7 @@ function Results({ onEdit }: { onEdit: () => void }) {
           <span>{fmt(range.max, range.unit)}</span>
         </div>
         <label className="flex items-center gap-2">
-          <input type="checkbox" checked={deformed} onChange={(e) => setDeformed(e.target.checked)} />
+          <input name="sim-panel-field-1" type="checkbox" checked={deformed} onChange={(e) => setDeformed(e.target.checked)} />
           <span>Show the bent shape{scale > 1 ? ` (movement ×${scale} so it can be seen)` : ''}</span>
         </label>
       </div>
@@ -767,7 +770,7 @@ function MeshStep({
       {/* How fine */}
       <div className="flex flex-col gap-1.5">
         <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">How fine</span>
-        <input
+        <input name="mesh-density"
           type="range"
           min={0}
           max={DENSITY.length - 1}
@@ -788,7 +791,7 @@ function MeshStep({
         </div>
         <label className="flex items-center gap-2">
           <span className="w-28 text-muted-foreground">Element size</span>
-          <input
+          <input name="element-size-mm"
             className={cn(field, 'w-20 font-mono')}
             placeholder={coarseSize ? coarseSize.toFixed(2) : 'auto'}
             value={setup.meshSizeMm}
@@ -809,7 +812,7 @@ function MeshStep({
         <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">On curves</span>
         <label className="flex items-center gap-2">
           <span className="w-28 text-muted-foreground">Elements per circle</span>
-          <input
+          <input name="12"
             className={cn(field, 'w-16 font-mono')}
             placeholder="12"
             value={setup.curveElements}
@@ -832,7 +835,7 @@ function MeshStep({
                 <span className="flex-1">
                   {l.faces.length} face{l.faces.length === 1 ? '' : 's'}
                 </span>
-                <input
+                <input name="element-size-near-these-faces-mm"
                   className={cn(field, 'h-6 w-16 font-mono')}
                   value={l.sizeMm}
                   onChange={(e) => updateLocal(i, { sizeMm: e.target.value })}
@@ -935,28 +938,28 @@ function AccuracySettings() {
       <div className="mt-2 flex flex-col gap-1.5">
         <label className="flex items-center gap-2">
           <span className="w-40 text-muted-foreground">Peak stress agrees within</span>
-          <input className={cn(field, 'h-6 w-14 font-mono')} placeholder="5" value={setup.stressPct} onChange={(e) => setAccuracy({ stressPct: e.target.value })} inputMode="decimal" />
+          <input name="5" className={cn(field, 'h-6 w-14 font-mono')} placeholder="5" value={setup.stressPct} onChange={(e) => setAccuracy({ stressPct: e.target.value })} inputMode="decimal" />
           <span className="text-muted-foreground">%</span>
         </label>
         <label className="flex items-center gap-2">
           <span className="w-40 text-muted-foreground">Movement agrees within</span>
-          <input className={cn(field, 'h-6 w-14 font-mono')} placeholder="2" value={setup.displacementPct} onChange={(e) => setAccuracy({ displacementPct: e.target.value })} inputMode="decimal" />
+          <input name="2" className={cn(field, 'h-6 w-14 font-mono')} placeholder="2" value={setup.displacementPct} onChange={(e) => setAccuracy({ displacementPct: e.target.value })} inputMode="decimal" />
           <span className="text-muted-foreground">%</span>
         </label>
         <label className="flex items-center gap-2">
-          <input type="checkbox" checked={setup.refineAtPeak} onChange={(e) => setMesh({ refineAtPeak: e.target.checked })} />
+          <input name="sim-panel-field-2" type="checkbox" checked={setup.refineAtPeak} onChange={(e) => setMesh({ refineAtPeak: e.target.checked })} />
           <span>Refine at the peak until it settles</span>
         </label>
         {setup.refineAtPeak && (
           <>
             <label className="flex items-center gap-2 pl-5">
               <span className="w-32 text-muted-foreground">At most</span>
-              <input className={cn(field, 'h-6 w-14 font-mono')} placeholder="3" value={setup.maxRefinements} onChange={(e) => setMesh({ maxRefinements: e.target.value })} inputMode="numeric" />
+              <input name="3" className={cn(field, 'h-6 w-14 font-mono')} placeholder="3" value={setup.maxRefinements} onChange={(e) => setMesh({ maxRefinements: e.target.value })} inputMode="numeric" />
               <span className="text-muted-foreground">refinements</span>
             </label>
             <label className="flex items-center gap-2 pl-5">
               <span className="w-32 text-muted-foreground">Up to</span>
-              <input className={cn(field, 'h-6 w-20 font-mono')} placeholder="150000" value={setup.nodeBudget} onChange={(e) => setMesh({ nodeBudget: e.target.value })} inputMode="numeric" />
+              <input name="150000" className={cn(field, 'h-6 w-20 font-mono')} placeholder="150000" value={setup.nodeBudget} onChange={(e) => setMesh({ nodeBudget: e.target.value })} inputMode="numeric" />
               <span className="text-muted-foreground">nodes</span>
             </label>
           </>

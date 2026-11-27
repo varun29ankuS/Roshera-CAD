@@ -109,7 +109,7 @@ export function SheetPanel({
           onClick={() => setOpen((o) => !o)}
           aria-expanded={open}
           aria-label={open ? 'Fold the sheet panel' : 'Open the sheet panel'}
-          className="cad-focus rounded p-0.5 text-muted-foreground hover:text-foreground"
+          className="cad-focus hit-24 rounded p-0.5 text-muted-foreground hover:text-foreground"
         >
           {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </button>
@@ -130,7 +130,7 @@ export function SheetPanel({
           aria-expanded={issuesOpen}
           title={check.text}
           aria-label={`Sheet check: ${check.text}`}
-          className={cn('cad-focus rounded border px-1.5 py-px text-[11px] font-medium', BADGE[check.tone])}
+          className={cn('cad-focus hit-24 rounded border px-1.5 py-px text-[11px] font-medium', BADGE[check.tone])}
         >
           {check.tone === 'positive' ? '✓' : check.tone === 'negative' ? `✗ ${issues.length}` : check.tone === 'caution' ? `⚠ ${issues.length}` : '…'}
         </button>
@@ -142,7 +142,7 @@ export function SheetPanel({
               onClick={() => setAdding((a) => !a)}
               aria-label="Add a view"
               title="Add a view"
-              className="cad-focus rounded border border-border p-0.5 hover:bg-accent"
+              className="cad-focus hit-24 rounded border border-border p-0.5 hover:bg-accent"
             >
               <Plus size={13} />
             </button>
@@ -201,7 +201,7 @@ export function SheetPanel({
                   <button
                     type="button"
                     onClick={() => onSelectView(v.id)}
-                    className="cad-focus min-w-0 flex-1 truncate text-left font-medium"
+                    className="cad-focus min-h-6 min-w-0 flex-1 truncate text-left font-medium"
                     title="Select this view on the sheet"
                   >
                     {v.name}
@@ -222,7 +222,7 @@ export function SheetPanel({
                       const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
                       onViewMenu(v.id, r.right + 6, r.top)
                     }}
-                    className="cad-focus rounded p-0.5 text-muted-foreground opacity-60 hover:bg-accent hover:text-foreground group-hover:opacity-100"
+                    className="cad-focus hit-24 rounded p-0.5 text-muted-foreground opacity-60 hover:bg-accent hover:text-foreground group-hover:opacity-100"
                   >
                     <MoreHorizontal size={13} />
                   </button>
@@ -232,7 +232,7 @@ export function SheetPanel({
                     aria-label={`Remove ${v.name}`}
                     title="Remove the view (undo offered)"
                     onClick={() => onRemoveView(v.id)}
-                    className="cad-focus rounded p-0.5 text-muted-foreground opacity-0 hover:text-destructive group-hover:opacity-100"
+                    className="cad-focus hit-24 rounded p-0.5 text-muted-foreground opacity-0 hover:text-destructive group-hover:opacity-100 focus-visible:opacity-100"
                   >
                     <X size={12} />
                   </button>

@@ -8,6 +8,7 @@ import { useDocModeStore } from '@/stores/doc-mode-store'
 import { sceneShortcutApplies } from '@/lib/workspaces'
 import { viewPresetForKey } from '@/lib/view-shortcuts'
 import { deleteParts } from '@/lib/delete-parts'
+import { confirmDialog } from '@/lib/app-dialog'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import * as THREE from 'three'
 
@@ -65,10 +66,47 @@ export function deleteSelectedParts(): Promise<number> {
     id,
     name: state.objects.get(id)?.name ?? 'the selected part',
   }))
-  return deleteParts(
-    parts,
-    (id) => fetch(`${API_BASE}/api/geometry/${id}`, { method: 'DELETE' }),
-    (line) => useBlackboardStore.getState().addLine(line, 'system'),
+  return deleteParts(parts, requestDelete, reportOnBlackboard)
+}
+
+const requestDelete = (id: string) => fetch(`${API_BASE}/api/geometry/${id}`, { method: 'DELETE' })
+const reportOnBlackboard = (line: string) => {
+  useBlackboardStore.getState().addLine(line, 'system')
+}
+
+/**
+ * File > Delete all parts. It was "Clear Scene": a client-side wipe that
+ * emptied the viewport while the kernel kept every part, so the screen
+ * showed an empty document that was not empty. It is now a real delete of
+ * every part, through the same kernel path as the Delete key, after a
+ * confirm that names the count. Each deletion is its own step in the
+ * history (the kernel records it), so Undo brings parts back one at a time;
+ * the confirm says exactly that rather than promising a single undo.
+ */
+export async function deleteAllParts(): Promise<void> {
+  const state = useSceneStore.getState()
+  const parts = state.objectOrder.map((id) => ({ id, name: state.objects.get(id)?.name ?? 'a part' }))
+  if (parts.length === 0) {
+    reportOnBlackboard('Nothing to delete: this document has no parts.')
+    return
+  }
+  const n = parts.length
+  const what = n === 1 ? `"${parts[0].name}"` : `all ${n} parts`
+  const confirmed = await confirmDialog({
+    title: `Delete ${what} from this document?`,
+    body:
+      n === 1
+        ? 'The kernel deletes the part and records it in the history. Undo (Ctrl+Z) brings it back.'
+        : `The kernel deletes them one by one and records each in the history. There is no single undo: Undo (Ctrl+Z) brings them back one step at a time, ${n} steps for all of them.`,
+    confirmLabel: n === 1 ? 'Delete part' : `Delete ${n} parts`,
+    destructive: true,
+  })
+  if (!confirmed) return
+  const deleted = await deleteParts(parts, requestDelete, reportOnBlackboard)
+  reportOnBlackboard(
+    deleted === n
+      ? `Deleted ${n === 1 ? 'the part' : `all ${n} parts`}.`
+      : `Deleted ${deleted} of ${n} parts; the rest are still in the document.`,
   )
 }
 

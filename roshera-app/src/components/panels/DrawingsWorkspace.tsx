@@ -20,7 +20,9 @@
  * kernel's `escape_xml()` helper sanitises).
  */
 
-import { ISO_SHEET_SIZES, sheetRefusal, sheetRequest, type SheetChoice, type SheetRefusal } from '@/lib/sheet-size'
+import { ISO_SHEET_SIZES, scaleLabel, sheetRefusal, sheetRequest, type SheetChoice, type SheetRefusal } from '@/lib/sheet-size'
+import { sheetPointMm } from '@/lib/sheet-cursor'
+import { useSheetCursorStore } from '@/stores/sheet-cursor-store'
 import { SheetPanel } from './SheetPanel'
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { X } from '@/components/ui/icons'
@@ -87,6 +89,12 @@ import {
 } from '@/lib/drawing-drag'
 import { fitSheetScale } from '@/lib/sheet-fit'
 import { lookGlide, prefersReducedMotion, PX_PER_MM, sheetLookTarget, type SheetRect } from '@/lib/sheet-look'
+import { shouldPlot } from '@/lib/sheet-plot'
+import { titleBlockVerified } from '@/lib/title-block-verified'
+import { plotSheet } from '@/lib/sheet-plot-dom'
+
+/** The sheets already plotted in this session (lib/sheet-plot.ts). */
+const plottedSheets = new Set<string>()
 import {
   actRunning,
   flashOpacity,
@@ -1055,6 +1063,25 @@ function DocumentDrawings() {
   // overlap, past the frame, out of line with FRONT) and that is reported.
   // Pressing anywhere else still pans the sheet.
   const sheetRef = useRef<HTMLDivElement | null>(null)
+
+  // A sheet is PLOTTED the first time it is shown: border and title block,
+  // each view's visible edges, hidden lines, dimensions, then the lettering
+  // (lib/sheet-plot.ts). Once per sheet per session -- the effect depends on
+  // which sheet is open and whether it has markup, never on the markup
+  // itself, so an edit, a re-render, a pan or a zoom cannot replay it. In a
+  // layout effect, so the first paint is already the empty sheet rather than
+  // the finished one flashing before the pen starts. Any key or click
+  // finishes it; so does leaving the sheet (the cleanup).
+  const plotId = activeDrawing?.id ?? null
+  const plotReady = svg !== '' && docMode === 'drawing'
+  useLayoutEffect(() => {
+    if (!plotReady || !shouldPlot(plottedSheets, plotId, prefersReducedMotion())) return
+    const sheetSvg = sheetRef.current?.querySelector('svg')
+    if (!sheetSvg || plotId === null) return
+    plottedSheets.add(plotId)
+    return plotSheet(sheetSvg)
+  }, [plotId, plotReady])
+
   const viewDragRef = useRef<{
     drawingId: string
     viewId: string
@@ -1216,6 +1243,20 @@ function DocumentDrawings() {
       if (!el || panStateRef.current.dragging || viewDragRef.current) return
       const over = !!selectedViewId && !viewsBusy && viewAt(e.clientX, e.clientY) === selectedViewId
       el.style.cursor = over ? 'move' : ''
+      // Where the cursor is on the paper, for the status bar. The sheet's
+      // millimetres are its SVG's own viewBox.
+      const sheet = sheetRef.current
+      const box = sheet?.querySelector('svg')?.viewBox.baseVal
+      useSheetCursorStore
+        .getState()
+        .setPoint(
+          sheet && box && box.width > 0
+            ? sheetPointMm({ x: e.clientX, y: e.clientY }, sheet.getBoundingClientRect(), {
+                widthMm: box.width,
+                heightMm: box.height,
+              })
+            : null,
+        )
     },
     [selectedViewId, viewsBusy, viewAt],
   )
@@ -1567,6 +1608,14 @@ function DocumentDrawings() {
     if (!size || !main) return null
     return { size, way: activeDrawing.orientation ?? 'landscape', scale: main.scale }
   }, [activeDrawing])
+  // The open sheet's paper and scale, for the status bar.
+  useEffect(() => {
+    useSheetCursorStore.getState().setSheet(sheetNow ? `${sheetNow.size} \u00B7 ${scaleLabel(sheetNow.scale)}` : null)
+    return () => {
+      useSheetCursorStore.getState().setSheet(null)
+      useSheetCursorStore.getState().setPoint(null)
+    }
+  }, [sheetNow])
 
   const changeSheet = useCallback(
     async (asked: SheetChoice) => {
@@ -1610,6 +1659,7 @@ function DocumentDrawings() {
         className={`absolute inset-y-0 right-0 overflow-hidden bg-muted/20 cursor-grab ${activeDrawing ? 'left-[17rem]' : 'left-0'}`}
         onMouseDown={onCanvasMouseDown}
         onMouseMove={onCanvasHover}
+        onMouseLeave={() => useSheetCursorStore.getState().setPoint(null)}
       >
         {activeDrawing ? (
           svg ? (
@@ -1802,6 +1852,7 @@ function DocumentDrawings() {
         <TitleBlockCard
           key={`title-block:${activeDrawing.id}`}
           drawing={activeDrawing}
+          verified={titleBlockVerified(svg)}
           onUpdated={(updated) => {
             // The card of THIS drawing saved: the answer may arrive after
             // another sheet was opened, and must not land on it.
@@ -1931,7 +1982,7 @@ function DocumentDrawings() {
                   type="button"
                   onClick={zoomOut}
                   title="Zoom out"
-                  className="cad-focus px-2 py-0.5 text-sm leading-none hover:bg-accent/30 rounded"
+                  className="cad-focus inline-flex h-6 min-w-6 items-center justify-center px-2 text-sm leading-none hover:bg-accent/30 rounded"
                 >
                   −
                 </button>
@@ -1940,7 +1991,7 @@ function DocumentDrawings() {
                   onClick={zoomFit}
                   title="Fit to window"
                   className={[
-                    'cad-focus px-2 py-0.5 text-[11px] hover:bg-accent/30 rounded',
+                    'cad-focus inline-flex h-6 items-center px-2 text-[11px] hover:bg-accent/30 rounded',
                     zoomMode === 'fit' ? 'bg-accent/40' : '',
                   ].join(' ')}
                 >
@@ -1954,7 +2005,7 @@ function DocumentDrawings() {
                   onClick={zoomActual}
                   title="Actual size (1 mm = 1 mm at 96 DPI)"
                   className={[
-                    'cad-focus px-2 py-0.5 text-[11px] hover:bg-accent/30 rounded',
+                    'cad-focus inline-flex h-6 items-center px-2 text-[11px] hover:bg-accent/30 rounded',
                     zoomMode === 'manual' && zoom === 1 ? 'bg-accent/40' : '',
                   ].join(' ')}
                 >
@@ -1964,7 +2015,7 @@ function DocumentDrawings() {
                   type="button"
                   onClick={zoomIn}
                   title="Zoom in"
-                  className="cad-focus px-2 py-0.5 text-sm leading-none hover:bg-accent/30 rounded"
+                  className="cad-focus inline-flex h-6 min-w-6 items-center justify-center px-2 text-sm leading-none hover:bg-accent/30 rounded"
                 >
                   +
                 </button>

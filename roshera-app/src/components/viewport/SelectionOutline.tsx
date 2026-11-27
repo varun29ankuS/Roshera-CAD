@@ -55,11 +55,13 @@ export function SelectionOutline() {
   const palette = useMemo(() => {
     const tick = resolveCssVar('--cad-tick').color.getHex()
     const selected = resolveCssVar('--cad-edge-selected').color.getHex()
-    const ink = 0x000000
+    // The pre-highlight silhouette is the hover blue, like the hovered
+    // part's edges and its row in the tree.
+    const hover = resolveCssVar('--cad-hovered').color.getHex()
     return {
       selectVisible: selected,
       selectHidden: tick,
-      hoverVisible: ink,
+      hoverVisible: hover,
       hoverHidden: tick,
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

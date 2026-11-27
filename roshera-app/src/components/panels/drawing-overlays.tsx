@@ -42,6 +42,7 @@ import {
   updateTitleBlock,
 } from '@/lib/drawings-api'
 import { mergeTitleBlockDraft } from '@/lib/title-block-draft'
+import { approvalFlag } from '@/lib/title-block-verified'
 
 /** A drawing in the switcher list. */
 export interface DrawingRow {
@@ -121,7 +122,7 @@ export function DrawingSwitcher({
               }`}
             >
               {renaming === d.id ? (
-                <input
+                <input name="drawing-overlays-field-1"
                   autoFocus
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
@@ -290,7 +291,7 @@ export function SheetSizeControl({
           </div>
           <label className="mb-2 flex items-center justify-between gap-2">
             <span className="text-muted-foreground">Scale</span>
-            <select
+            <select name="scale"
               aria-label="Scale"
               value={String(asked.scale)}
               disabled={busy}
@@ -673,7 +674,7 @@ export function ViewMenu({
             onClose()
           }}
         >
-          <input
+          <input name="view-name"
             autoFocus
             value={draft}
             maxLength={40}
@@ -725,11 +726,14 @@ export function TitleBlockCard({
   onUpdated,
   onError,
   onClose,
+  verified,
 }: {
   drawing: Drawing
   onUpdated: (tb: TitleBlock) => void
   onError: (msg: string) => void
   onClose: () => void
+  /** The kernel's verification stamp as the sheet prints it; null = unknown. */
+  verified: boolean | null
 }) {
   const original = useMemo(
     () => ({ ...defaultTitleBlock(), ...(drawing.title_block ?? {}) }),
@@ -764,17 +768,31 @@ export function TitleBlockCard({
   }, [draft, original, drawing.id, onUpdated, onError])
 
   const approved = !!(draft.approved_by ?? '').trim()
+  // Approved by a person while the kernel has not verified the sheet: allowed,
+  // but flagged -- caution style and its mark, never the plain green chip.
+  const flag = approvalFlag(approved, verified)
   return (
     <div className={`${card} absolute top-14 right-3 z-30 w-[360px] p-3 text-xs`}>
       <div className="flex items-center justify-between mb-2">
         <div className="font-medium text-sm">Title block</div>
         <div className="flex items-center gap-2">
           <span
+            title={
+              flag === 'approved-unverified'
+                ? 'Approved but not verified: a person signed this sheet off, and the kernel has not verified it'
+                : flag === 'approved'
+                  ? 'Approved: "approved by" is filled in'
+                  : 'For review: nobody has approved this sheet yet'
+            }
             className={`px-1.5 py-0.5 rounded text-[11px] font-medium ${
-              approved ? 'bg-green-600/15 text-green-700' : 'bg-amber-500/15 text-amber-700'
+              flag === 'approved'
+                ? 'bg-green-600/15 text-green-700 dark:text-green-400'
+                : flag === 'approved-unverified'
+                  ? 'border border-dashed border-caution-border text-caution'
+                  : 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
             }`}
           >
-            {approved ? 'APPROVED' : 'FOR REVIEW'}
+            {flag === 'approved-unverified' ? '\u25B2 APPROVED \u00B7 NOT VERIFIED' : flag === 'approved' ? 'APPROVED' : 'FOR REVIEW'}
           </span>
           <button type="button" aria-label="Close" onClick={onClose} className="cad-focus text-muted-foreground hover:text-foreground">
             <X size={14} />
@@ -791,7 +809,7 @@ export function TitleBlockCard({
         {FIELDS.map((f) => (
           <label key={f.key} className={`flex flex-col gap-0.5 ${f.wide ? 'col-span-2' : ''}`}>
             <span className="text-[11px] uppercase tracking-wider text-muted-foreground">{f.label}</span>
-            <input
+            <input name="drawing-overlays-field-2"
               value={(draft[f.key] ?? '') as string}
               placeholder={f.placeholder}
               onChange={(e) => setDraft({ ...draft, [f.key]: e.target.value })}
@@ -802,7 +820,7 @@ export function TitleBlockCard({
         ))}
         <label className="flex flex-col gap-0.5">
           <span className="text-[11px] uppercase tracking-wider text-muted-foreground">Drawing no.</span>
-          <input
+          <input name="automatic"
             value={draft.drawing_number ?? ''}
             placeholder="automatic"
             onChange={(e) => setDraft({ ...draft, drawing_number: e.target.value })}

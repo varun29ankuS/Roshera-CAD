@@ -1238,7 +1238,7 @@ export function AgentButton() {
                         className="flex items-start gap-2 text-[11px] text-muted-foreground"
                         title="Spawns a local CLI process on this machine and uses your own subscription login — only coherent when the backend and this browser share a machine."
                       >
-                        <input
+                        <input name="provider-settings-dialog-field-1"
                           type="checkbox"
                           className="mt-0.5"
                           checked={consent}

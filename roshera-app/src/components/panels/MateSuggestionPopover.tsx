@@ -198,7 +198,7 @@ export function MateSuggestionPopover() {
         {SUGGESTIONS.map((s) =>
           s === 'Distance' ? (
             <div key={s} className="flex items-center gap-1">
-              <input
+              <input name="distance-in-mm"
                 type="number"
                 value={distance}
                 onChange={(e) => setDistance(e.target.value)}

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
 import { CADGrid } from './CADGrid'
 import { GizmoNav } from './GizmoNav'
+import { ViewCubeControls } from './ViewCubeControls'
 import { SceneLighting } from './SceneLighting'
 import { CameraController } from './CameraController'
 import { Datums } from './Datums'
@@ -230,6 +231,8 @@ export function CADViewport() {
         <FeatureHighlight />
         <AgentFacesHighlight />
       </Canvas>
+      {/* The arrows and Home around the view cube. */}
+      <ViewCubeControls />
 
       <ViewportFrame />
       <SketchCoordReadout />
@@ -749,7 +752,7 @@ function SectionViewPanel() {
         </div>
         <div className="flex items-center gap-2">
           <span className="text-muted-foreground w-12">Offset</span>
-          <input
+          <input name="cadviewport-field-1"
             type="range"
             min={-50}
             max={50}

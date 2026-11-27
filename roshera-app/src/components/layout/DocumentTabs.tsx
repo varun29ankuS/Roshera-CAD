@@ -410,7 +410,7 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
             )}
             <span className="min-w-0 flex items-baseline leading-tight">
               {renamingId === doc.id ? (
-                <input
+                <input name="document-tabs-field-2"
                   ref={renameInputRef}
                   value={renameValue}
                   onChange={(e) => setRenameValue(e.target.value)}

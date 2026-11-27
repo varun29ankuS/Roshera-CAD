@@ -271,7 +271,7 @@ export function StepImportDropzone() {
           STEP); this overlay keeps only the hidden file input + the transient
           result card, so nothing floats over the viewport at rest. */}
       <div className="absolute right-2 top-2 z-30 flex flex-col items-end gap-2">
-        <input
+        <input name="step-import-dropzone-field-1"
           ref={fileInput}
           type="file"
           accept=".step,.stp"
