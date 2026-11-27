@@ -3615,6 +3615,7 @@ impl BRepModel {
         ValidityCertificate {
             blocking,
             peer_count,
+            tolerant_edges: self.tolerant_edges_of(solid_id),
             brep_valid,
             watertight,
             manifold,
@@ -3634,6 +3635,50 @@ impl BRepModel {
             errors,
             model_debris_orphan_faces,
         }
+    }
+
+    /// The edges of `solid_id` carrying a tolerance above
+    /// [`crate::primitives::provenance::TOLERANT_EDGE_THRESHOLD`], in edge
+    /// order -- what the certificate discloses as
+    /// `ValidityCertificate::tolerant_edges`.
+    pub fn tolerant_edges_of(
+        &self,
+        solid_id: SolidId,
+    ) -> Vec<crate::primitives::provenance::TolerantEdge> {
+        use crate::primitives::provenance::{TolerantEdge, TOLERANT_EDGE_THRESHOLD};
+        let Some(solid) = self.solids.get(solid_id) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::BTreeMap::new();
+        for shell_id in solid.all_shells() {
+            let Some(shell) = self.shells.get(shell_id) else {
+                continue;
+            };
+            for &face_id in &shell.faces {
+                let Some(face) = self.faces.get(face_id) else {
+                    continue;
+                };
+                for loop_id in
+                    std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied())
+                {
+                    let Some(lp) = self.loops.get(loop_id) else {
+                        continue;
+                    };
+                    for &edge_id in &lp.edges {
+                        if let Some(edge) = self.edges.get(edge_id) {
+                            if edge.tolerance.is_finite()
+                                && edge.tolerance > TOLERANT_EDGE_THRESHOLD
+                            {
+                                seen.insert(edge_id, edge.tolerance);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        seen.into_iter()
+            .map(|(edge, tolerance)| TolerantEdge { edge, tolerance })
+            .collect()
     }
 
     /// Thin public wrapper over [`Self::certificate`] — the historical name

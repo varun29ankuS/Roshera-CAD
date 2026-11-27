@@ -1035,6 +1035,34 @@ pub(crate) fn u_is_degenerate_at(surface: &dyn Surface, v: f64, p: f64) -> bool 
     step <= 1e-9 || step <= reference * 1e-6
 }
 
+/// A facet corner is on a pole when sweeping `u` half a period from it moves
+/// the point by less than this fraction of the facet's longest edge.
+const POLE_CORNER_RATIO: f64 = 1e-6;
+
+/// True when stepping half a period in `u` from `uv` moves the surface point
+/// by less than `bound`: at the scale `bound` stands for, `u` means nothing
+/// there.
+///
+/// [`u_is_degenerate_at`] asks the same of a `v` in absolute terms (a
+/// nanometre) and [`at_pole_point`] of a pole at an END of the surface's
+/// domain. Neither sees a cone's apex when the cone is unbounded and the
+/// corner's projection lands a few nanometres up the cone: the half-period
+/// step there is twice that, not zero. Such a corner's `u` is as arbitrary as
+/// a pole's -- the apex facets of a drill point read as spanning half the
+/// period (CADGenBench part 244: nine of them, each 0.7 degrees off the true
+/// normal). A facet whose corner is merely NEAR the axis is not excused: a
+/// corner one hundredth of the facet's size from it moves by twice that.
+fn u_moves_less_than(surface: &dyn Surface, uv: (f64, f64), p: f64, bound: f64) -> bool {
+    match (
+        surface.point_at(uv.0, uv.1),
+        surface.point_at(uv.0 + 0.5 * p, uv.1),
+    ) {
+        (Ok(a), Ok(b)) => (b - a).magnitude() <= bound,
+        // A surface that cannot be evaluated here excuses nothing.
+        _ => false,
+    }
+}
+
 /// True when `q` sits ON a pole of `surface`: a domain end in v where every
 /// u maps to one point (a sphere's poles). Judged by position, not by the v a
 /// projection returns -- projecting the pole point lands a hair off the pole
@@ -1422,7 +1450,18 @@ pub fn mesh_quality_with_normals(
                 || [p0, p1, p2].iter().any(|&q| at_pole_point(surface, q, p))
                 || facet_encloses_pole(surface, [p0, p1, p2], p, on_surface_tol);
             if !at_singularity && is_bridging_facet(uv0.0, uv1.0, uv2.0, p, span) {
-                e.3 += 1;
+                // A corner ON a pole that is not an end of the surface's
+                // domain (a cone's apex, with the cone unbounded either
+                // way), and whose projection lands a hair off it: judged at
+                // the facet's own scale. Asked only of the few facets that
+                // reach here.
+                let longest = e0.max(e1).max(e2);
+                let corner_on_a_pole = [uv0, uv1, uv2]
+                    .iter()
+                    .any(|uv| u_moves_less_than(surface, *uv, p, longest * POLE_CORNER_RATIO));
+                if !corner_on_a_pole {
+                    e.3 += 1;
+                }
             }
         }
         entry
@@ -2627,7 +2666,11 @@ mod pole_enclosing_facet_tests {
     const RADIUS: f64 = 2.0;
 
     /// A radius-2 sphere face and one facet on it whose corners are the
-    /// surface points at the three `(u, v)` given.
+    /// surface points at the three `(u, v)` given. The face is given no
+    /// loop (loop id 0 names nothing in this model): the check under test,
+    /// `mesh_quality_of_mesh`, reads a face's surface and the mesh's facets
+    /// and never its loops, and a sphere face round a pole has no natural
+    /// single outline to give it.
     fn one_facet(corners: [(f64, f64); 3]) -> (BRepModel, TriangleMesh) {
         let mut model = BRepModel::new();
         let sphere = Sphere::new(Point3::new(0.0, 0.0, 0.0), RADIUS).expect("sphere");
@@ -2701,5 +2744,161 @@ mod pole_enclosing_facet_tests {
         let (model, mesh) = one_facet([(0.3, far), (0.3 + third, far), (0.3 + 2.0 * third, far)]);
         let q = mesh_quality_of_mesh(&model, &mesh).expect("quality");
         assert_eq!(q.boundary_crossing_facets, 1, "{q:?}");
+    }
+}
+
+#[cfg(test)]
+mod apex_corner_facet_tests {
+    //! A facet with a corner at a cone's apex has an arbitrary `u` there, so
+    //! it can read as spanning half the period without bridging anything.
+    //! The rule ([`super::POLE_CORNER_RATIO`]): the corner is on the pole
+    //! when half a period of `u` moves it by less than 1e-6 of the facet's
+    //! longest edge. The tests bracket that bound from both sides, in
+    //! literal numbers rather than through the constant, so that changing
+    //! the constant fails them.
+    use super::mesh_quality_of_mesh;
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::curve::{Circle, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    use crate::primitives::face::{Face, FaceOrientation};
+    use crate::primitives::r#loop::{Loop, LoopType};
+    use crate::primitives::surface::{Cone, Surface};
+    use crate::primitives::topology_builder::BRepModel;
+    use crate::tessellation::{MeshVertex, TriangleMesh};
+
+    /// The v of the fan's rim: where the two corners off the apex sit.
+    const RIM_V: f64 = 1.0;
+
+    fn cone() -> Cone {
+        Cone::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 1.03).expect("cone")
+    }
+
+    /// A 59-degree cone face from its apex (at the origin) up to the rim
+    /// circle at `RIM_V`, which is the face's outer loop -- one closed edge
+    /// -- and the facets whose corners are its surface points at the
+    /// `(u, v)` given.
+    fn facets(all: &[[(f64, f64); 3]]) -> (BRepModel, TriangleMesh) {
+        let mut model = BRepModel::new();
+        let cone = cone();
+        let mut mesh = TriangleMesh::new();
+        let mut triangles = Vec::new();
+        for corners in all {
+            let ids: Vec<u32> = corners
+                .iter()
+                .map(|&(u, v)| {
+                    mesh.add_vertex(MeshVertex {
+                        position: cone.point_at(u, v).expect("point"),
+                        normal: Vector3::Z,
+                        uv: None,
+                    })
+                })
+                .collect();
+            triangles.push([ids[0], ids[1], ids[2]]);
+        }
+        // The outer loop: the rim circle, closed on one vertex.
+        let on_rim = cone.point_at(0.0, RIM_V).expect("rim point");
+        let rim_radius = on_rim.x.hypot(on_rim.y);
+        let rim = Circle::new_starting_at(
+            Point3::new(0.0, 0.0, on_rim.z),
+            Vector3::Z,
+            rim_radius,
+            on_rim,
+        )
+        .expect("rim circle");
+        let rim_curve = model.curves.add(Box::new(rim));
+        let rim_vertex = model.vertices.add(on_rim.x, on_rim.y, on_rim.z);
+        let rim_edge = model.edges.add(Edge::new(
+            0,
+            rim_vertex,
+            rim_vertex,
+            rim_curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let mut outer = Loop::new(0, LoopType::Outer);
+        outer.add_edge(rim_edge, true);
+        let outer = model.loops.add(outer);
+        let surface = model.surfaces.add(Box::new(cone));
+        let face = model
+            .faces
+            .add(Face::new(0, surface, outer, FaceOrientation::Forward));
+        for t in triangles {
+            mesh.add_triangle(t[0], t[1], t[2]);
+            mesh.face_map.push(face);
+        }
+        (model, mesh)
+    }
+
+    /// The fan round a drill point's apex: each facet has one corner at
+    /// `apex_v` up the cone (on the apex, or as near as a projection leaves
+    /// it) and two on the rim circle. The face goes all the way round, and
+    /// the corner on the apex is given an angle far from the other two, so
+    /// each facet reads as spanning half the period.
+    fn apex_fan(apex_v: f64) -> Vec<[(f64, f64); 3]> {
+        let quarter = std::f64::consts::FRAC_PI_2;
+        (0..4)
+            .map(|k| {
+                let a = quarter * k as f64 + 0.2;
+                [
+                    (a + 2.0 * quarter, apex_v),
+                    (a, RIM_V),
+                    (a + quarter, RIM_V),
+                ]
+            })
+            .collect()
+    }
+
+    /// The `apex_v` at which half a period of `u` moves the apex corner by
+    /// `ratio` times the fan facets' longest edge -- both measured on the
+    /// fixture itself, not assumed.
+    fn apex_v_moving_by(ratio: f64) -> f64 {
+        let cone = cone();
+        let at = |(u, v): (f64, f64)| cone.point_at(u, v).expect("point");
+        // The fan's facets are one facet turned by quarter turns: one size.
+        let [a, b, c] = apex_fan(0.0)[0].map(at);
+        let longest = (b - a)
+            .magnitude()
+            .max((c - b).magnitude())
+            .max((a - c).magnitude());
+        // Half a period of u at height v moves a point by a distance
+        // proportional to v (twice the cone's radius there).
+        let half_period_step_per_v = (at((std::f64::consts::PI, 1.0)) - at((0.0, 1.0))).magnitude();
+        ratio * longest / half_period_step_per_v
+    }
+
+    fn bridges(apex_v: f64) -> usize {
+        let (model, mesh) = facets(&apex_fan(apex_v));
+        mesh_quality_of_mesh(&model, &mesh)
+            .expect("quality")
+            .boundary_crossing_facets
+    }
+
+    /// A corner a few nanometres up the cone, as a projection leaves it.
+    #[test]
+    fn a_facet_with_a_corner_on_the_apex_is_not_a_bridge() {
+        assert_eq!(bridges(1e-8), 0);
+    }
+
+    /// The same corners a hundredth of the rim's height up the cone: those
+    /// facets cut across the cone below the apex. Still bridges.
+    #[test]
+    fn a_facet_with_a_corner_near_the_axis_is_still_a_bridge() {
+        assert!(bridges(1e-2) > 0);
+    }
+
+    /// Just inside the bound: the corner moves by 0.5e-6 of the facet's
+    /// longest edge. On the pole. (Fails if the bound is tightened, e.g. to
+    /// 1e-8.)
+    #[test]
+    fn a_corner_moving_half_the_bound_is_on_the_pole() {
+        assert_eq!(bridges(apex_v_moving_by(0.5e-6)), 0);
+    }
+
+    /// Just outside it: the corner moves by 2e-6 of the facet's longest
+    /// edge. Not on the pole: every facet of the fan is a bridge. (Fails if
+    /// the bound is loosened, e.g. to 1e-3.)
+    #[test]
+    fn a_corner_moving_twice_the_bound_is_not_on_the_pole() {
+        assert_eq!(bridges(apex_v_moving_by(2e-6)), 4);
     }
 }

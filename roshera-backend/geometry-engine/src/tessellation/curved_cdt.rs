@@ -406,6 +406,20 @@ pub(crate) fn project_loop_to_uv(
     let flags: Vec<(bool, bool)> = points_uv.iter().map(|&(u, v)| collapsed(u, v)).collect();
     let free_u: Vec<bool> = flags.iter().map(|f| f.0).collect();
     let free_v: Vec<bool> = flags.iter().map(|f| f.1).collect();
+    // A pole sample's free parameter is whatever the projection landed on,
+    // and the walk above unwrapped the NEXT sample against it. On a periodic
+    // surface that can carry the rest of the loop a whole period away, so
+    // that it no longer closes (CADGenBench part 244: half of a drill-point
+    // cone between u = pi/2 and 3 pi/2; its apex came back as u = 0, the
+    // side after it was unwrapped to u + 2 pi, the outline ran along itself
+    // and the half was meshed by an untrimmed grid). The samples that are
+    // not on a pole are unwrapped again against each other.
+    if let Some(period) = u_period {
+        unwrap_past_pole_samples(&mut points_uv, &free_u, period, true);
+    }
+    if let Some(period) = v_period {
+        unwrap_past_pole_samples(&mut points_uv, &free_v, period, false);
+    }
     take_pole_parameters_from_neighbours(&mut points_uv, &free_u, true);
     take_pole_parameters_from_neighbours(&mut points_uv, &free_v, false);
     untangle_outline(surface, &points_3d, &mut points_uv, &points_tol);
@@ -653,6 +667,76 @@ fn research_missed_footpoints(
 /// moves the point less than this fraction of its distance from the origin
 /// (plus one, so the bound is absolute near the origin).
 const POLE_DISTANCE_RATIO: f64 = 1e-9;
+
+/// Unwrap a periodic coordinate of a loop's samples again, each against the
+/// last sample before it that is NOT on a pole (`free[i]`: the coordinate
+/// does not move the point there, so its value there is arbitrary). Does
+/// nothing unless some sample is free and some is not. `along_u` picks the
+/// coordinate.
+///
+/// Across a pole the step is not just unanchored but undetermined: the two
+/// sides of a cone sector meet at the apex any angle apart, and "the nearer
+/// way round" is the wrong way for every sector wider than half a turn (and
+/// a coin toss at exactly half). What decides it is that the loop CLOSES:
+/// if, unwrapped the nearer way, the last sample is a whole number of
+/// periods from the first, the samples after the first pole run are moved by
+/// that many periods.
+pub(crate) fn unwrap_past_pole_samples(
+    uv: &mut [(f64, f64)],
+    free: &[bool],
+    period: f64,
+    along_u: bool,
+) {
+    let n = uv.len().min(free.len());
+    if n < 3 || !(period > 0.0) || !free.iter().take(n).any(|&f| f) {
+        return;
+    }
+    let Some(start) = (0..n).find(|&i| !free[i]) else {
+        return;
+    };
+    let get = |p: (f64, f64)| if along_u { p.0 } else { p.1 };
+    let mut previous = get(uv[start]);
+    let half = 0.5 * period;
+    for k in 1..n {
+        let i = (start + k) % n;
+        if free[i] {
+            continue;
+        }
+        let mut value = get(uv[i]);
+        while value - previous > half {
+            value -= period;
+        }
+        while value - previous < -half {
+            value += period;
+        }
+        if along_u {
+            uv[i].0 = value;
+        } else {
+            uv[i].1 = value;
+        }
+        previous = value;
+    }
+    // Closure: `previous` is the last fixed sample, `get(uv[start])` the first.
+    let miss = ((previous - get(uv[start])) / period).round();
+    if miss == 0.0 {
+        return;
+    }
+    let mut past_a_pole = false;
+    for k in 1..n {
+        let i = (start + k) % n;
+        if free[i] {
+            past_a_pole = true;
+            continue;
+        }
+        if past_a_pole {
+            if along_u {
+                uv[i].0 -= miss * period;
+            } else {
+                uv[i].1 -= miss * period;
+            }
+        }
+    }
+}
 
 /// Give every run of consecutive pole samples (`free[i]`: the parameter does
 /// not move the point there) the parameter of its loop neighbours: the run's

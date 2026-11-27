@@ -295,6 +295,18 @@ pub enum ValidationWarning {
         distance: f64,
         message: String,
     },
+    /// Two CONSECUTIVE edges of a planar face's loop cross inside the
+    /// tolerance zone of the vertex they share (`location` names the face
+    /// and that vertex): `distance` from the vertex, against a zone of
+    /// radius `tolerance`. Inside that zone the two curves' order is not
+    /// defined, so this is the vertex and not an overlap of the face -- but
+    /// it is said, every time. Edges that are not neighbours, and any
+    /// crossing outside the zone, are a blocking self-overlap instead.
+    TolerantVertexCrossing {
+        location: EntityLocation,
+        distance: f64,
+        tolerance: f64,
+    },
 }
 
 /// Enhanced model statistics
@@ -978,6 +990,42 @@ impl ParallelValidator {
             })
             .collect();
         errors.extend(overlaps);
+        // The crossings that are only a tolerant vertex (consecutive edges,
+        // inside the zone) do not block, and are never silent.
+        let at_vertices: Vec<ValidationWarning> = solid_ids
+            .par_iter()
+            .flat_map(|&sid| {
+                let mut found = Vec::new();
+                let Some(solid) = model.solids.get(sid) else {
+                    return found;
+                };
+                for shell_id in solid.all_shells() {
+                    let Some(shell) = model.shells.get(shell_id) else {
+                        continue;
+                    };
+                    for &fid in &shell.faces {
+                        for c in crate::operations::geometry_validity::tolerant_vertex_crossings(
+                            model, fid,
+                        ) {
+                            found.push(ValidationWarning::TolerantVertexCrossing {
+                                location: EntityLocation {
+                                    solid_id: Some(sid),
+                                    shell_id: Some(shell_id),
+                                    face_id: Some(c.face),
+                                    loop_id: None,
+                                    edge_id: None,
+                                    vertex_id: Some(c.vertex),
+                                },
+                                distance: c.distance,
+                                tolerance: c.tolerance,
+                            });
+                        }
+                    }
+                }
+                found
+            })
+            .collect();
+        warnings.extend(at_vertices);
 
         GeometryValidationResults { errors, warnings }
     }
@@ -1149,59 +1197,25 @@ impl ParallelValidator {
         errors: &mut Vec<ValidationError>,
         warnings: &mut Vec<ValidationWarning>,
     ) {
-        // Count V, E, F, R across EVERY shell (outer + any voids), so a
-        // hollow solid with inner shells is handled by the same formula.
-        let shells = std::iter::once(solid.outer_shell)
-            .chain(solid.inner_shells.iter().copied())
-            .chain(solid.peer_shells.iter().copied())
-            .collect::<Vec<_>>();
-        let shell_count = shells.len() as i32;
+        // V, E, F, R are counted across EVERY shell (outer + any voids), so
+        // a hollow solid with inner shells is handled by the same formula.
+        let shell_count = solid_shells(solid).len() as i32;
         let shell_id = solid.outer_shell; // diagnostic location anchor
 
-        let mut vertex_set = std::collections::HashSet::new();
-        let mut edge_set = std::collections::HashSet::new();
-        let mut face_count = 0i32;
-        let mut ring_count = 0i32; // R: inner loops summed over all faces
-                                   // Faces modelled as a single fully-periodic CLOSED surface with no
-                                   // bounding B-Rep edges (a sphere/torus as one seamless face). Such a
-                                   // face is itself a closed surface (χ=2), not a polyhedral 2-cell/disk
-                                   // (χ=1), so the plain V−E+F count under-reports it by 1 per face.
-        let mut seamless_closed_faces = 0i32;
-
-        for sid in &shells {
-            let Some(shell) = model.shells.get(*sid) else {
-                continue;
-            };
-            for &face_id in &shell.faces {
-                face_count += 1;
-                if let Some(face) = model.faces.get(face_id) {
-                    ring_count += face.inner_loops.len() as i32;
-                    let mut all_loops = vec![face.outer_loop];
-                    all_loops.extend(&face.inner_loops);
-                    let mut face_edge_count = 0usize;
-                    for &loop_id in &all_loops {
-                        if let Some(loop_data) = model.loops.get(loop_id) {
-                            for &edge_id in &loop_data.edges {
-                                face_edge_count += 1;
-                                edge_set.insert(edge_id);
-                                if let Some(edge) = model.edges.get(edge_id) {
-                                    vertex_set.insert(edge.start_vertex);
-                                    vertex_set.insert(edge.end_vertex);
-                                }
-                            }
-                        }
-                    }
-                    if face_edge_count == 0 {
-                        seamless_closed_faces += 1;
-                    }
-                }
-            }
-        }
-
-        let v = vertex_set.len() as i32;
-        let e = edge_set.len() as i32;
-        let f = face_count;
-        let r = ring_count;
+        // What is counted, and what is left out of it (an edge two loops of
+        // one face walk opposite ways, and a vertex only such edges touch),
+        // is `euler_tally`'s to say.
+        let tally = euler_tally(model, solid);
+        trace_euler_tally(model, solid_id, solid, &tally);
+        let v = tally.vertices as i32;
+        let e = tally.edges as i32;
+        let f = tally.faces as i32;
+        let r = tally.rings as i32;
+        // Faces modelled as a single fully-periodic CLOSED surface with no
+        // bounding B-Rep edges (a sphere/torus as one seamless face). Such a
+        // face is itself a closed surface (χ=2), not a polyhedral 2-cell/disk
+        // (χ=1), so the plain V−E+F count under-reports it by 1 per face.
+        let seamless_closed_faces = tally.seamless_closed_faces as i32;
 
         // A solid built ENTIRELY from seamless closed faces (e.g. a lone
         // sphere: V=0, E=0, F=1) is a valid closed surface but not a
@@ -1904,6 +1918,295 @@ pub fn validate_pcurve_references(model: &BRepModel) -> Vec<ValidationError> {
         }
     }
     errors
+}
+
+/// Every shell of `solid`: outer, voids and peers.
+fn solid_shells(solid: &Solid) -> Vec<ShellId> {
+    std::iter::once(solid.outer_shell)
+        .chain(solid.inner_shells.iter().copied())
+        .chain(solid.peer_shells.iter().copied())
+        .collect()
+}
+
+/// How one face's loops bound it, for the Euler-Poincare count.
+///
+/// A face's loops are its boundary only when each of their edges has the
+/// face on one side. Two things break the reading "one inner loop, one
+/// ring", and both are settled here from the loops alone:
+///
+/// * **Loops that share a vertex** are ONE boundary component. A hole whose
+///   rim touches the face's outline at a point does not make the face an
+///   annulus: the region is a disk pinched there (CADGenBench part 248).
+///   The same holds for two holes touching each other.
+/// * **An edge two DIFFERENT loops walk, once each way,** is not boundary at
+///   all. Each loop keeps the face on its own one side of the edge, so
+///   between them the face is on neither: the edge runs between two holes
+///   that are really one (a hole written as a circle plus the crescent
+///   beside it), or between a hole and the outside it notches. It is a
+///   [void edge](Self::void_edges): it and any vertex only such edges touch
+///   are not part of the solid's surface, and are left out of V and E.
+///
+/// What is deliberately NOT a void edge:
+///
+/// * a **seam** -- an edge ONE loop walks twice, once each way (the closing
+///   line of a cylinder, cone, sphere or torus face). The face is on both
+///   sides of it; it is an edge of the surface and counts as one.
+/// * an edge two loops walk the **same** way
+///   ([`same_way_shared_edges`](Self::same_way_shared_edges)). No region has
+///   two holes on the same side of one edge; that is a defect, the edge
+///   stays counted, and the solid is left to fail.
+/// * an edge walked more than twice by the face's loops.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FaceBoundary {
+    /// Boundary components beyond the first: the R of `V - E + F - R`.
+    /// Loops are joined when their edges that ARE boundary share a vertex.
+    pub rings: usize,
+    /// Edges walked by two different loops of the face, once each way.
+    /// Sorted.
+    pub void_edges: Vec<EdgeId>,
+    /// Edges walked by two different loops of the face the same way. Sorted.
+    pub same_way_shared_edges: Vec<EdgeId>,
+}
+
+/// Read `face`'s loops as its boundary: see [`FaceBoundary`].
+pub fn face_boundary(model: &BRepModel, face: &crate::primitives::face::Face) -> FaceBoundary {
+    let loops: Vec<LoopId> = std::iter::once(face.outer_loop)
+        .chain(face.inner_loops.iter().copied())
+        .collect();
+    if loops.len() < 2 {
+        // One loop: nothing to share with, no rings. (Its seam, if it has
+        // one, is walked twice by this one loop and is not looked at.)
+        return FaceBoundary::default();
+    }
+
+    // Every walk of every edge: (loop, forward?).
+    let mut walks: std::collections::HashMap<EdgeId, Vec<(usize, bool)>> =
+        std::collections::HashMap::new();
+    for (k, &loop_id) in loops.iter().enumerate() {
+        let Some(loop_data) = model.loops.get(loop_id) else {
+            continue;
+        };
+        for (i, &edge_id) in loop_data.edges.iter().enumerate() {
+            let forward = loop_data.orientations.get(i).copied().unwrap_or(true);
+            walks.entry(edge_id).or_default().push((k, forward));
+        }
+    }
+    let mut void_edges = Vec::new();
+    let mut same_way_shared_edges = Vec::new();
+    for (&edge_id, uses) in &walks {
+        if let [(loop_a, forward_a), (loop_b, forward_b)] = uses[..] {
+            if loop_a != loop_b {
+                if forward_a != forward_b {
+                    void_edges.push(edge_id);
+                } else {
+                    same_way_shared_edges.push(edge_id);
+                }
+            }
+        }
+    }
+    void_edges.sort_unstable();
+    same_way_shared_edges.sort_unstable();
+
+    // Union-find over the loops; two loops whose boundary edges have a
+    // common vertex are joined.
+    let mut parent: Vec<usize> = (0..loops.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut owner: std::collections::HashMap<VertexId, usize> = std::collections::HashMap::new();
+    // A loop every edge of which is void bounds nothing and is no component.
+    let mut bounds_something = vec![false; loops.len()];
+    for (k, &loop_id) in loops.iter().enumerate() {
+        let Some(loop_data) = model.loops.get(loop_id) else {
+            bounds_something[k] = true;
+            continue;
+        };
+        if loop_data.edges.is_empty() {
+            bounds_something[k] = true;
+        }
+        for &edge_id in &loop_data.edges {
+            if void_edges.binary_search(&edge_id).is_ok() {
+                continue;
+            }
+            bounds_something[k] = true;
+            let Some(edge) = model.edges.get(edge_id) else {
+                continue;
+            };
+            for v in [edge.start_vertex, edge.end_vertex] {
+                match owner.get(&v) {
+                    Some(&other) => {
+                        let (a, b) = (root(&mut parent, k), root(&mut parent, other));
+                        if a != b {
+                            parent[a] = b;
+                        }
+                    }
+                    None => {
+                        owner.insert(v, k);
+                    }
+                }
+            }
+        }
+    }
+    let components = (0..loops.len())
+        .filter(|&k| bounds_something[k] && root(&mut parent, k) == k)
+        .count();
+    FaceBoundary {
+        rings: components.saturating_sub(1),
+        void_edges,
+        same_way_shared_edges,
+    }
+}
+
+/// The numbers the Euler-Poincare relation `V - E + F - R = 2(S - G)` is
+/// evaluated on for one solid, and what was left out of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EulerTally {
+    /// V: vertices of edges that are part of the surface.
+    pub vertices: usize,
+    /// E: edges that are part of the surface -- every edge some face has as
+    /// boundary or as a seam.
+    pub edges: usize,
+    /// F.
+    pub faces: usize,
+    /// R: [`FaceBoundary::rings`] summed over the faces.
+    pub rings: usize,
+    /// S.
+    pub shells: usize,
+    /// Faces with no edges at all (a sphere or torus as one seamless face):
+    /// each is a closed surface, counted once more than a 2-cell.
+    pub seamless_closed_faces: usize,
+    /// Edges left out of E: void edges of some face that no face has as
+    /// boundary ([`FaceBoundary::void_edges`]).
+    pub void_edges: usize,
+    /// Vertices left out of V: touched by void edges only.
+    pub void_vertices: usize,
+    /// Edges two loops of one face walk the same way, over all faces. Not
+    /// left out of anything; reported because they are a defect.
+    pub same_way_shared_edges: usize,
+    /// Inner loops over all faces: what R was before loops were read as
+    /// boundary components.
+    pub inner_loops: usize,
+}
+
+impl EulerTally {
+    /// `V - E + F - R`, with each seamless closed face counted once more.
+    /// Even for a closed orientable solid: `2(S - G)`.
+    pub fn characteristic(&self) -> i64 {
+        self.vertices as i64 - self.edges as i64 + self.faces as i64 - self.rings as i64
+            + self.seamless_closed_faces as i64
+    }
+}
+
+/// Count `solid` for the Euler-Poincare relation: see [`EulerTally`] and
+/// [`FaceBoundary`].
+pub fn euler_tally(model: &BRepModel, solid: &Solid) -> EulerTally {
+    let shells = solid_shells(solid);
+    let mut tally = EulerTally {
+        shells: shells.len(),
+        ..EulerTally::default()
+    };
+    // An edge is part of the surface if ANY face has it as boundary or seam;
+    // it is left out only if every walk of it is a void one.
+    let mut surface_edges: std::collections::HashSet<EdgeId> = std::collections::HashSet::new();
+    let mut void_edges: std::collections::HashSet<EdgeId> = std::collections::HashSet::new();
+    for shell_id in shells {
+        let Some(shell) = model.shells.get(shell_id) else {
+            continue;
+        };
+        for &face_id in &shell.faces {
+            tally.faces += 1;
+            let Some(face) = model.faces.get(face_id) else {
+                continue;
+            };
+            let boundary = face_boundary(model, face);
+            tally.rings += boundary.rings;
+            tally.inner_loops += face.inner_loops.len();
+            tally.same_way_shared_edges += boundary.same_way_shared_edges.len();
+            let mut walked = 0usize;
+            for loop_id in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied())
+            {
+                let Some(loop_data) = model.loops.get(loop_id) else {
+                    continue;
+                };
+                for &edge_id in &loop_data.edges {
+                    walked += 1;
+                    if boundary.void_edges.binary_search(&edge_id).is_ok() {
+                        void_edges.insert(edge_id);
+                    } else {
+                        surface_edges.insert(edge_id);
+                    }
+                }
+            }
+            if walked == 0 {
+                tally.seamless_closed_faces += 1;
+            }
+        }
+    }
+    let vertices_of = |edges: &std::collections::HashSet<EdgeId>| {
+        let mut vertices: std::collections::HashSet<VertexId> = std::collections::HashSet::new();
+        for &edge_id in edges {
+            if let Some(edge) = model.edges.get(edge_id) {
+                vertices.insert(edge.start_vertex);
+                vertices.insert(edge.end_vertex);
+            }
+        }
+        vertices
+    };
+    void_edges.retain(|e| !surface_edges.contains(e));
+    let surface_vertices = vertices_of(&surface_edges);
+    tally.edges = surface_edges.len();
+    tally.vertices = surface_vertices.len();
+    tally.void_edges = void_edges.len();
+    tally.void_vertices = vertices_of(&void_edges)
+        .difference(&surface_vertices)
+        .count();
+    tally
+}
+
+/// With `ROSHERA_EULER_TRACE` set, one line on stderr for every solid whose
+/// count involves loops sharing an edge or a vertex: what is shared, and the
+/// characteristic under the plain reading (every inner loop a ring, every
+/// edge counted) beside the one used. For measuring what the reading of
+/// [`FaceBoundary`] changes across a corpus or a test suite.
+fn trace_euler_tally(model: &BRepModel, solid_id: SolidId, solid: &Solid, tally: &EulerTally) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("ROSHERA_EULER_TRACE").is_ok()) {
+        return;
+    }
+    if tally.void_edges == 0 && tally.same_way_shared_edges == 0 && tally.rings == tally.inner_loops
+    {
+        return;
+    }
+    let faces = solid_shells(solid)
+        .into_iter()
+        .filter_map(|s| model.shells.get(s))
+        .flat_map(|s| s.faces.iter().copied())
+        .filter_map(|f| model.faces.get(f))
+        .filter(|f| {
+            let b = face_boundary(model, f);
+            !b.void_edges.is_empty() || !b.same_way_shared_edges.is_empty()
+        })
+        .count();
+    let plain = (tally.vertices + tally.void_vertices) as i64
+        - (tally.edges + tally.void_edges) as i64
+        + tally.faces as i64
+        - tally.inner_loops as i64
+        + tally.seamless_closed_faces as i64;
+    eprintln!(
+        "EULER_TRACE solid={solid_id} faces_sharing_an_edge={faces} void_edges={} \
+         void_vertices={} same_way_shared_edges={} inner_loops={} rings={} plain={plain} \
+         now={}",
+        tally.void_edges,
+        tally.void_vertices,
+        tally.same_way_shared_edges,
+        tally.inner_loops,
+        tally.rings,
+        tally.characteristic(),
+    );
 }
 
 /// Automatic repair functionality
@@ -3010,6 +3313,17 @@ impl std::fmt::Display for ValidationWarning {
             }
             ValidationWarning::GeometryInconsistency { message, .. } => {
                 write!(f, "{}", message)
+            }
+            ValidationWarning::TolerantVertexCrossing {
+                location,
+                distance,
+                tolerance,
+            } => {
+                write!(
+                    f,
+                    "two consecutive edges of planar face {:?} cross {:.3e} from their shared vertex {:?}, inside its tolerance zone of {:.3e}",
+                    location.face_id, distance, location.vertex_id, tolerance
+                )
             }
         }
     }

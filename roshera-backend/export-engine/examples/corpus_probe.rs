@@ -130,6 +130,12 @@ fn main() {
                 if !v.is_empty() && b == v.len() {
                     brep += 1;
                 }
+                // PROBE_ERRORS: every validation error, not only the first.
+                if std::env::var("PROBE_ERRORS").is_ok() {
+                    for x in v.iter().flat_map(|x| x.errors.iter()) {
+                        println!("    error: {}", x.chars().take(400).collect::<String>());
+                    }
+                }
                 let why = v
                     .iter()
                     .flat_map(|x| x.errors.iter().take(1))

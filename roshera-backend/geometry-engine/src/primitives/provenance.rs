@@ -710,6 +710,34 @@ pub struct ValidityCertificate {
     /// for a part, so the kernel's own verdict says which it is. Before this
     /// field, the multi-body fact existed only on an opt-in pipeline trace.
     pub peer_count: usize,
+    /// TOLERANT-EDGE DISCLOSURE -- the solid's edges that carry a tolerance
+    /// above [`TOLERANT_EDGE_THRESHOLD`], each with that tolerance, in edge
+    /// order. Empty for a part whose every edge lies on its faces to
+    /// ordinary accuracy.
+    ///
+    /// An imported part can hold edges whose two faces do not meet: the
+    /// importer accepts such an edge up to a ceiling, at exactly its measured
+    /// gap, and says so on the import report. The B-Rep check then judges the
+    /// edge at that tolerance, so the solid can certify -- and without this
+    /// field nothing on the certificate would say that "valid" here means
+    /// "valid to within these edges' tolerances". It does not block
+    /// [`ValidityCertificate::is_sound`]; it qualifies it. Anything that
+    /// needs the solid finer than an edge named here (an exact mass property,
+    /// a boolean or blend through that edge) has to take this into account.
+    pub tolerant_edges: Vec<TolerantEdge>,
+}
+
+/// An edge tolerance above this (mm) is disclosed on the solid's certificate
+/// ([`ValidityCertificate::tolerant_edges`]): the bound of an edge repaired
+/// as a matter of course on import.
+pub const TOLERANT_EDGE_THRESHOLD: f64 = 0.01;
+
+/// One edge named by [`ValidityCertificate::tolerant_edges`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TolerantEdge {
+    pub edge: u32,
+    /// The tolerance the edge carries (mm): how far it may lie off its faces.
+    pub tolerance: f64,
 }
 
 impl ValidityCertificate {
@@ -773,7 +801,20 @@ impl GroundTruth {
             self.certificate.mesh_quality.min_angle_deg,
             self.certificate.mesh_quality.max_normal_deviation_deg,
             self.certificate.mesh_quality.boundary_crossing_facets,
-        ) + &if self.certificate.peer_count > 0 {
+        ) + &if self.certificate.tolerant_edges.is_empty() {
+            String::new()
+        } else {
+            // Tolerant-edge disclosure: valid to within these edges' tolerances.
+            format!(
+                " | ⚠ {} tolerant edge(s), widest {:.3e} mm",
+                self.certificate.tolerant_edges.len(),
+                self.certificate
+                    .tolerant_edges
+                    .iter()
+                    .map(|e| e.tolerance)
+                    .fold(0.0_f64, f64::max)
+            )
+        } + &if self.certificate.peer_count > 0 {
             // Multi-body disclosure — the result is several disjoint lumps, not
             // one. Sound, but a different answer than "a part".
             format!(
@@ -930,6 +971,7 @@ impl ValidityCertificate {
             model_debris_orphan_faces: 0,
             // A single-lump part: no sibling bodies to disclose.
             peer_count: 0,
+            tolerant_edges: vec![],
             blocking: vec![],
         }
     }

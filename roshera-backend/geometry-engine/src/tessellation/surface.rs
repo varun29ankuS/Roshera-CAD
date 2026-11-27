@@ -347,7 +347,27 @@ pub fn tessellate_face(
                     face, model, surface, cache, params, mesh,
                 ) {
                     "blend conforming"
-                } else if tessellate_toroidal_trimmed(face, model, surface, cache, params, mesh) {
+                } else if {
+                    // The trimmed path is built for a boolean's rim-poke bump:
+                    // a grid of the torus kept where it is inside the face,
+                    // stitched to the oval. It also takes any single-loop
+                    // patch, and on a small imported one (CADGenBench part
+                    // 136: a 5-edge patch 0.02 x 0.04 rad) the stitch does
+                    // not find the outline -- 3421 facets that neither meet
+                    // the face's edges nor face one way. Its mesh is kept
+                    // only if its boundary IS the face's sampled outline;
+                    // otherwise it is taken back and the face goes on to
+                    // the paths below.
+                    let (v0, t0) = (mesh.vertices.len(), mesh.triangles.len());
+                    let made =
+                        tessellate_toroidal_trimmed(face, model, surface, cache, params, mesh);
+                    let kept = made && patch_boundary_is_the_outline(face, model, cache, mesh, t0);
+                    if made && !kept {
+                        mesh.vertices.truncate(v0);
+                        mesh.triangles.truncate(t0);
+                    }
+                    kept
+                } {
                     "trimmed"
                 } else if tessellate_torus_quad_patch(face, model, surface, cache, mesh) {
                     "quad patch"
@@ -4873,6 +4893,83 @@ fn tessellate_conical_with_apex(
             }
         }
     }
+}
+
+/// Whether the facets added to `mesh` from index `first_triangle` on -- one
+/// face's patch -- are bounded by exactly the face's sampled outline: every
+/// mesh edge used by one facet is two consecutive cached samples of one of
+/// the face's edges, every such sample pair is a mesh edge used by one
+/// facet, and no mesh edge is used by more than two. A patch that fails this
+/// cannot weld to its neighbours.
+fn patch_boundary_is_the_outline(
+    face: &Face,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    mesh: &TriangleMesh,
+    first_triangle: usize,
+) -> bool {
+    use std::collections::{HashMap, HashSet};
+    // Positions quantised well below any sample spacing and well above the
+    // noise between a cached sample and the copy a mesher stored of it.
+    const QUANTUM: f64 = 1e-7;
+    type Key = (i64, i64, i64);
+    let key = |p: Point3| -> Key {
+        (
+            (p.x / QUANTUM).round() as i64,
+            (p.y / QUANTUM).round() as i64,
+            (p.z / QUANTUM).round() as i64,
+        )
+    };
+    let pair = |a: Key, b: Key| if a <= b { (a, b) } else { (b, a) };
+    let mut uses: HashMap<(Key, Key), u32> = HashMap::new();
+    for tri in mesh.triangles.iter().skip(first_triangle) {
+        for k in 0..3 {
+            let (Some(a), Some(b)) = (
+                mesh.vertices.get(tri[k] as usize),
+                mesh.vertices.get(tri[(k + 1) % 3] as usize),
+            ) else {
+                return false;
+            };
+            let (ka, kb) = (key(a.position), key(b.position));
+            if ka == kb {
+                continue;
+            }
+            *uses.entry(pair(ka, kb)).or_default() += 1;
+        }
+    }
+    if uses.is_empty() || uses.values().any(|&n| n > 2) {
+        return false;
+    }
+    let mut outline: HashSet<(Key, Key)> = HashSet::new();
+    let mut walked_twice: HashSet<(Key, Key)> = HashSet::new();
+    for l in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+        let Some(lp) = model.loops.get(l) else {
+            return false;
+        };
+        for &e in &lp.edges {
+            let samples = cache.get_or_compute(e, model);
+            for w in samples.windows(2) {
+                let (ka, kb) = (key(w[0]), key(w[1]));
+                if ka == kb {
+                    continue;
+                }
+                // A seam is walked twice by its own face: it is interior to
+                // the patch, not part of its boundary.
+                if !outline.insert(pair(ka, kb)) {
+                    walked_twice.insert(pair(ka, kb));
+                }
+            }
+        }
+    }
+    for seam in &walked_twice {
+        outline.remove(seam);
+    }
+    let open: HashSet<(Key, Key)> = uses
+        .iter()
+        .filter(|(_, &n)| n == 1)
+        .map(|(e, _)| *e)
+        .collect();
+    open == outline
 }
 
 /// True when some edge of the face's loops is used only once by the face: a

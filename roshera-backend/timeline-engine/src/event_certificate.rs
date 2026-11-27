@@ -317,6 +317,7 @@ mod tests {
             errors: vec![],
             model_debris_orphan_faces: 0,
             peer_count: 0,
+            tolerant_edges: vec![],
             blocking: vec![],
         }
     }

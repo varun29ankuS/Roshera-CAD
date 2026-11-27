@@ -1285,6 +1285,7 @@ mod tests {
             model_debris_orphan_faces: 0,
             blocking: vec![],
             peer_count: 0,
+            tolerant_edges: vec![],
         }
     }
 
