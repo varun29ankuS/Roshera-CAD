@@ -1,6 +1,7 @@
 import { parseCard, type CardKind } from '@/lib/blackboard-cards'
 import { isStructuredPayload } from '@/lib/card-payload'
 import { ChoicesCard } from './ChoicesCard'
+import { ConceptCard } from './ConceptCard'
 import { DfmCard } from './DfmCard'
 import { FcfCard } from './FcfCard'
 import { MeasuresCard } from './MeasuresCard'
@@ -61,5 +62,7 @@ export function CardRenderer({ kind, source }: { kind: CardKind; source: string 
       return <SheetCard card={card.card} />
     case 'measures':
       return <MeasuresCard card={card.card} />
+    case 'concept':
+      return <ConceptCard card={card.card} />
   }
 }

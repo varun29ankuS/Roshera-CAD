@@ -28,6 +28,9 @@
 //       5-digit sections refuse by name, every answer carries a source, and the
 //       faceting deviation is reported, never an "exact" claim.
 //   (e) EDGE DISTANCE — bolt_edge_distance reproduces EN 1993-1-8 Table 3.3.
+//   (c) CONCEPTS — the concept-board skills (2026-11-27): names real, honesty
+//       words present, and the concepts worked example generated from its
+//       recipe, validated op by op, chained only backwards.
 //
 // Run: npm run test:gates:build && node test/kb_playbooks.test.mjs  (exit 0 = pass)
 
@@ -361,6 +364,173 @@ console.log("(e) EDGE DISTANCE: EN 1993-1-8 Table 3.3 minimums");
   const none = await lookup("reference", "bolt_edge_distance", {});
   if (none && none.refused === true) pass("bolt_edge_distance with no hole refuses");
   else fail(`bolt_edge_distance({}) must refuse: ${JSON.stringify(none)}`);
+}
+
+// ── (c) CONCEPT-BOARD SKILLS (2026-11-27) ───────────────────────────────────
+// concepts / pov / explain_with_maths: not part families (no datum plan, no
+// SPEC FIRST -- an open-ended request is the opposite case), so they carry
+// their own checks: every tool they name is real, the honesty words are
+// there, and the concepts worked example -- generated from concept A's recipe
+// by recipeToProgram -- validates op by op, chains only to earlier ops that
+// produce what it reads, and uses the cited clearance sizes.
+console.log("(c) CONCEPTS: the concept-board skills and the recipe -> program mapping");
+{
+  const { recipeToProgram, BRACKET_CONCEPT_SET, bracketAVolume } = await import("./.build/tools/kb_concepts.js");
+  const SKILLS = ["concepts", "pov", "explain_with_maths"];
+  const skill = {};
+  for (const key of SKILLS) {
+    const p = await lookup("playbook", key);
+    skill[key] = p;
+    if (!p || p.refused) {
+      fail(`playbook:${key} did not resolve: ${JSON.stringify(p)?.slice(0, 200)}`);
+      continue;
+    }
+    pass(`playbook:${key} resolves`);
+    const text = String(p.text ?? "");
+    if (/\bTODO\b|placeholder|TBD/i.test(text)) fail(`playbook:${key} carries a TODO/placeholder`);
+    const missingSeq = (p.tool_sequence ?? []).filter((n) => !table.has(n));
+    if (p.tool_sequence?.length > 0 && missingSeq.length === 0) pass(`playbook:${key} tool_sequence all resolve (${p.tool_sequence.length})`);
+    else fail(`playbook:${key} tool_sequence empty or names unknown tools: ${missingSeq.join(", ")}`);
+    const prose = text + "\n" + JSON.stringify(p.worked_example ?? {});
+    const named = [...new Set([...prose.matchAll(PREFIX)].map((m) => m[0]))].filter((n) => !NOT_TOOLS.has(n));
+    const unknown = named.filter((n) => !table.has(n));
+    if (unknown.length === 0) pass(`playbook:${key} prose names ${named.length} tools, all real`);
+    else fail(`playbook:${key} prose names unknown tools: ${unknown.join(", ")}`);
+  }
+  const c = String(skill.concepts?.text ?? "");
+  const want = [
+    [/open-ended/i, "when: an open-ended request"],
+    [/straight to building/, "a sized request goes straight to building"],
+    [/SPEC FIRST/, "a standard-governed part stays SPEC FIRST"],
+    [/THREE concepts/, "three concepts"],
+    [/roshera:concept/, "names the card fence"],
+    [/create_box[\s\S]*create_cylinder[\s\S]*create_cone[\s\S]*psketch_extrude/, "maps every shape to its verb"],
+    [/difference/, "subtract is a boolean difference"],
+    [/fillet_edges at r/, "a blend is a fillet on the junction"],
+    [/never approximate/, "never approximate"],
+    [/REFUSES the build/, "refuses with the reason"],
+    [/NOT certified/, "a concept is not certified"],
+    [/estimate/, "numbers are estimates"],
+  ];
+  for (const [re, what] of want) (re.test(c) ? pass : fail)(`concepts text: ${what}`);
+  const pv = String(skill.pov?.text ?? "");
+  for (const [re, what] of [
+    [/LOAD PATH/, "load path"],
+    [/MAKER, mill/, "maker: milling reach"],
+    [/45 degrees past vertical downward/, "maker: FDM overhang rule"],
+    [/estimate/, "says estimate"],
+    [/NOT AVAILABLE YET[\s\S]*FIT[\s\S]*HAND AND EYE/, "Fit and Hand-and-eye named as not available"],
+  ]) (re.test(pv) ? pass : fail)(`pov text: ${what}`);
+  const mx = String(skill.explain_with_maths?.text ?? "");
+  for (const [re, what] of [
+    [/\\frac\{F L\^3\}\{3 E I\}/, "a worked derivation in LaTeX"],
+    [/never an invented diagram/, "graphics only from recipe or kernel data"],
+    [/estimate/, "a hand calculation is an estimate"],
+  ]) (re.test(mx) ? pass : fail)(`explain_with_maths text: ${what}`);
+
+  // Chaining: every '$N.key' reads an EARLIER op that produces that key.
+  const PRODUCES = {
+    csketch_id: new Set(["psketch_begin"]),
+    edge_id: new Set(["select_edge"]),
+    object_uuid: new Set(["create_box", "create_cylinder", "create_cone", "psketch_extrude", "boolean", "boolean_many", "fillet_edges"]),
+    part_id: new Set(["create_box", "create_cylinder", "create_cone", "psketch_extrude", "boolean", "boolean_many", "fillet_edges"]),
+  };
+  const chainFaults = (ops) => {
+    const faults = [];
+    ops.forEach((op, i) => {
+      for (const m of JSON.stringify(op.args).matchAll(/"\$(\d+)\.([a-z_]+)"/g)) {
+        const n = Number(m[1]);
+        const from = ops[n];
+        if (!(n < i) || !from || !PRODUCES[m[2]]?.has(from.tool)) faults.push(`op ${i} ${op.tool} reads $${n}.${m[2]} from ${from?.tool ?? "nothing"}`);
+      }
+    });
+    return faults;
+  };
+  {
+    const planted = [{ tool: "create_box", args: {} }, { tool: "boolean", args: { object_a: "$0.object_uuid", object_b: "$5.object_uuid" } }];
+    if (chainFaults(planted).length === 1) pass("chain check catches a planted forward reference (mutation control)");
+    else fail("chain check is vacuous -- a forward reference passed");
+  }
+
+  // The worked example: every op validates against its schema, names only its own parameters.
+  const ex = skill.concepts?.worked_example;
+  if (!ex) fail(`concepts must carry a worked_example: ${JSON.stringify(skill.concepts?.worked_example_refused ?? null)}`);
+  else {
+    let bad = 0;
+    let checked = 0;
+    for (const o of opsOf(ex)) {
+      const entry = table.get(o.tool);
+      if (!entry) {
+        bad += 1;
+        fail(`concepts ${o.where}: unknown tool ${o.tool}`);
+        continue;
+      }
+      const args = o.tool === "cad_program" ? { ...o.args, ops: (o.args.ops ?? []).map(({ bind, ...op }) => op) } : o.args;
+      const full = dummify(withBind(args, o.bind), "", false);
+      const res = entry.schema.safeParse(full);
+      checked += 1;
+      if (!res.success) {
+        bad += 1;
+        fail(`concepts ${o.where} ${o.tool} args fail its schema: ${JSON.stringify(res.error.issues).slice(0, 300)}`);
+      }
+      const extra = unknownKeys(entry.schema, full);
+      if (extra.length > 0) {
+        bad += 1;
+        fail(`concepts ${o.where} ${o.tool} passes parameters its schema does not have: ${extra.join(", ")}`);
+      }
+    }
+    if (bad === 0) pass(`concepts worked example: ${checked} calls validate against their tool schemas`);
+
+    const prog = ex.steps.find((s) => s.tool === "cad_program");
+    const faults = chainFaults(prog?.args?.ops ?? []);
+    if (prog && faults.length === 0) pass(`concepts program: all ${prog.args.ops.length} ops chain to earlier ops that produce what they read`);
+    else fail(`concepts program chaining: ${faults.join("; ") || "no cad_program step"}`);
+
+    // The program IS the mapping's output for concept A (it cannot drift from the recipe).
+    const again = recipeToProgram(BRACKET_CONCEPT_SET.concepts[0].recipe);
+    if (!again.refused && JSON.stringify(again.ops) === JSON.stringify(prog?.args?.ops)) pass("concepts program == recipeToProgram(concept A)");
+    else fail("the worked example's program must be recipeToProgram's output for concept A");
+    // One boolean per later step; subtract -> difference.
+    const steps = BRACKET_CONCEPT_SET.concepts[0].recipe.steps;
+    const booleans = (prog?.args?.ops ?? []).filter((o) => o.tool === "boolean");
+    if (booleans.length === steps.length - 1 && booleans.filter((b) => b.args.op === "difference").length === steps.filter((s) => s.op === "subtract").length)
+      pass(`one boolean per later step (${booleans.length}), subtract -> difference`);
+    else fail(`boolean count/op mismatch: ${JSON.stringify(booleans.map((b) => b.args.op))}`);
+    // The worked example's verify_claim expects the hand volume.
+    const claim = ex.steps.find((s) => s.tool === "verify_claim");
+    const hand = 60 * 40 * 5 + 60 * 5 * 50 + 2 * 0.5 * 30 * 30 * 5 - Math.PI * 5 * (11.5 ** 2 + 4 * 1.7 ** 2 + 2 * 2.75 ** 2);
+    if (claim && Math.abs(claim.args.expected - hand) < 1e-3 && Math.abs(bracketAVolume() - hand) < 1e-3)
+      pass(`verify_claim expects the hand volume ${claim.args.expected} mm^3`);
+    else fail(`verify_claim volume wrong: ${claim?.args?.expected} vs ${hand}`);
+    // The card posted in the example is the concept set itself.
+    const post = ex.steps.find((s) => s.tool === "blackboard_add_entry");
+    const body = /^```roshera:concept\n([\s\S]*)\n```$/.exec(String(post?.args?.text ?? ""));
+    if (body && JSON.stringify(JSON.parse(body[1])) === JSON.stringify(BRACKET_CONCEPT_SET)) pass("the example posts the concept set as one roshera:concept fence");
+    else fail("the example must post the concept set verbatim in a roshera:concept fence");
+  }
+
+  // Hole sizes are the cited clearances, not typed from memory.
+  const m5 = await lookup("reference", "clearance_hole", { fastener: "M5" });
+  const m3 = await lookup("reference", "clearance_hole", { fastener: "M3" });
+  const holes = BRACKET_CONCEPT_SET.concepts[0].recipe.steps.filter((s) => s.op === "subtract" && s.shape.radius < 5).map((s) => s.shape.radius * 2);
+  const okSizes = holes.length === 6 && holes.every((d) => d === m5?.value?.diameter_mm || d === m3?.value?.diameter_mm);
+  if (okSizes) pass(`concept A's holes are ISO 273 clearances (M5 D${m5.value.diameter_mm}, M3 D${m3.value.diameter_mm})`);
+  else fail(`concept A's hole diameters ${JSON.stringify(holes)} must be the clearance_hole values (M5 ${m5?.value?.diameter_mm}, M3 ${m3?.value?.diameter_mm})`);
+
+  // A blend cannot be planned before the union exists: refused with the procedure, never dropped.
+  const blended = recipeToProgram(BRACKET_CONCEPT_SET.concepts[2].recipe);
+  if (blended.refused === true && /select_edge/.test(blended.reason) && /fillet_edges/.test(blended.reason) && /refuse the build/.test(blended.reason))
+    pass("a blended recipe is refused with the fillet procedure (never silently built without it)");
+  else fail(`a blend must refuse static planning: ${JSON.stringify(blended)}`);
+  // The plate and the slot map to their verbs, and chain correctly.
+  const b = recipeToProgram(BRACKET_CONCEPT_SET.concepts[1].recipe);
+  const tools = (b.ops ?? []).map((o) => o.tool);
+  if (!b.refused && tools.filter((t) => t === "select_edge").length === 4 && tools.includes("fillet_edges") && tools.includes("boolean_many"))
+    pass("plate -> create_box + 4 select_edge + fillet_edges; slot -> box + 2 cylinders + boolean_many union");
+  else fail(`plate/slot mapping wrong: ${tools.join(", ")}`);
+  const bFaults = b.refused ? ["refused"] : chainFaults(b.ops);
+  if (bFaults.length === 0) pass("concept B's program chains to earlier ops that produce what they read");
+  else fail(`concept B chaining: ${bFaults.join("; ")}`);
 }
 
 console.log(failures === 0 ? "\nPASS — part-family playbooks hold" : `\nFAIL — ${failures} problem(s)`);

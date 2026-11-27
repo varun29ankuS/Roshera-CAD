@@ -485,6 +485,12 @@ console.log("(2) TIER 2: playbook chunks + tool_sequence resolve against the tab
     // map, the rules no verb reaches, the stop rule (two tries on one space),
     // undo a verb that makes a space worse, and the end-of-loop report.
     manufacturing_drawing: 1303,
+    // The concept-board skills (2026-11-27, authored in kb_data.ts): concepts
+    // before building on an open-ended request, the points of view, and a
+    // worked derivation beside the view.
+    concepts: 961,
+    pov: 389,
+    explain_with_maths: 270,
   };
   for (const [key, tokens] of Object.entries(PLAYBOOK_TOKENS)) {
     const p = await lookup("playbook", key);

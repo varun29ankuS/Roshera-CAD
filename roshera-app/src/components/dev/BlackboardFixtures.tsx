@@ -9,6 +9,7 @@ import { Blackboard } from '@/components/panels/Blackboard'
 import { MessageMarkdown } from '@/components/panels/MessageMarkdown'
 import { StreamingLineText } from '@/components/panels/StreamingLineText'
 import { RevealContext } from '@/components/panels/cards/reveal-context'
+import { CardActionsContext, type CardActions } from '@/components/panels/cards/card-actions-context'
 import {
   useBlackboardStore,
   type AgentAttention,
@@ -752,6 +753,135 @@ function StreamingDemo() {
   )
 }
 
+// ── Concept board (roshera:concept) ───────────────────────────────────
+//
+// The concepts playbook's worked example (roshera-mcp/src/tools/kb_concepts.ts):
+// a motor-to-frame bracket, three ways. Rendered through the real fence ->
+// schema -> card path at the docked Blackboard's widths and at a wide width.
+
+const CONCEPT_SET = card('concept', {
+  id: 'motor-bracket',
+  title: 'NEMA 17 motor to 20 mm frame',
+  material: { name: '6082-T6', density: 2700 },
+  concepts: [
+    {
+      id: 'A',
+      title: 'L bracket, two gussets',
+      recipe: {
+        steps: [
+          { op: 'union', shape: { kind: 'box', center: [0, 0, 0], width: 60, depth: 40, height: 5 } },
+          { op: 'union', shape: { kind: 'box', center: [0, -17.5, 5], width: 60, depth: 5, height: 50 } },
+          { op: 'union', shape: { kind: 'rib', origin: [25, -15, 5], leg_a: [0, 30, 0], leg_b: [0, 0, 30], thickness: 5 } },
+          { op: 'union', shape: { kind: 'rib', origin: [-25, -15, 5], leg_a: [0, 30, 0], leg_b: [0, 0, 30], thickness: 5 } },
+          { op: 'subtract', shape: { kind: 'cylinder', center: [0, -22, 30], axis: [0, 1, 0], radius: 11.5, height: 9 } },
+          { op: 'subtract', shape: { kind: 'cylinder', center: [15.5, -22, 14.5], axis: [0, 1, 0], radius: 1.7, height: 9 } },
+          { op: 'subtract', shape: { kind: 'cylinder', center: [-15.5, -22, 14.5], axis: [0, 1, 0], radius: 1.7, height: 9 } },
+          { op: 'subtract', shape: { kind: 'cylinder', center: [15.5, -22, 45.5], axis: [0, 1, 0], radius: 1.7, height: 9 } },
+          { op: 'subtract', shape: { kind: 'cylinder', center: [-15.5, -22, 45.5], axis: [0, 1, 0], radius: 1.7, height: 9 } },
+          { op: 'subtract', shape: { kind: 'cylinder', center: [15, 10, -1], radius: 2.75, height: 7 } },
+          { op: 'subtract', shape: { kind: 'cylinder', center: [-15, 10, -1], radius: 2.75, height: 7 } },
+        ],
+      },
+      numbers: [{ label: 'bore deflection, gussets ignored', value: 0.0024, unit: 'mm', basis: 'cantilever F L^3 / 3 E I, 20 N, E 70 GPa' }],
+      note: 'stiffest; motor bores need a side setup',
+      supports: [{ at: [0, 10, 0], label: 'frame bolts' }],
+      loads: [{ at: [0, -17.5, 30], dir: [0, 0, -1], magnitude_n: 20, label: 'motor weight' }],
+    },
+    {
+      id: 'B',
+      title: 'Flat plate, motor face-mounted',
+      recipe: {
+        steps: [
+          { op: 'union', shape: { kind: 'plate', center: [0, 0, 0], width: 60, depth: 60, height: 6, corner_radius: 6 } },
+          { op: 'subtract', shape: { kind: 'cylinder', center: [0, 0, -1], radius: 11.5, height: 8 } },
+          { op: 'subtract', shape: { kind: 'slot', center: [0, 24, -1], dir: [1, 0, 0], normal: [0, 0, 1], length: 30, width: 5.5, depth: 8 } },
+        ],
+      },
+      note: 'one setup; frame bolt slides in the slot',
+      supports: [{ at: [0, 24, 0], label: 'frame bolt' }],
+      loads: [{ at: [0, 0, 6], dir: [0, 0, -1], magnitude_n: 20, label: 'motor weight' }],
+    },
+    {
+      id: 'C',
+      title: 'Round saddle',
+      recipe: {
+        steps: [
+          { op: 'union', shape: { kind: 'box', center: [0, 0, 0], width: 56, depth: 50, height: 8 } },
+          { op: 'union', shape: { kind: 'cone', center: [0, 0, 8], base_radius: 18, top_radius: 13, height: 20 }, blend: 3 },
+          { op: 'subtract', shape: { kind: 'cylinder', center: [0, 0, -1], radius: 11.5, height: 30 } },
+        ],
+      },
+      note: 'round, so turned or printed; heaviest',
+    },
+  ],
+})
+
+/** A bad concept payload: a misspelt field must show the validation path, never a half card. */
+const CONCEPT_BAD = card('concept', {
+  concepts: [{ id: 'A', title: 'typo', recipe: { steps: [{ op: 'union', shape: { kind: 'box', center: [0, 0, 0], width: 10, depth: 10, heigth: 5 } }] } }],
+})
+
+/**
+ * The concept card at the widths it really meets. The live board's actions
+ * send a turn; here they are captured and SHOWN instead, so "Build this one"
+ * can be checked without spending an agent turn.
+ */
+function ConceptBoardDemo() {
+  const [sent, setSent] = useState<string[]>([])
+  const [key, setKey] = useState(0)
+  const actions: CardActions = {
+    selectChoice: (_source, value) => setSent((s) => [...s, value]),
+    sendDetectedChoice: (value) => setSent((s) => [...s, value]),
+    requestBuild: (request) => setSent((s) => [...s, request]),
+  }
+  return (
+    <div>
+      <button
+        onClick={() => {
+          setKey((k) => k + 1)
+          setSent([])
+        }}
+        className="cad-icon-btn mb-2 h-6 px-1.5 text-[11px]"
+        title="Re-mount the concept cards to replay the print"
+      >
+        <RotateCcw size={11} /> <span className="ml-1">replay</span>
+      </button>
+      <CardActionsContext.Provider value={actions}>
+        <RevealContext.Provider value={{ animate: true }}>
+          <div key={key} className="flex flex-wrap items-start gap-6">
+            {[380, 440].map((w) => (
+              <div key={w} data-concept-width={w} style={{ width: w }} className="shrink-0 rounded-md border border-border/60 bg-background/40 px-2 py-1 text-sm">
+                <div className="mb-1 font-mono text-[11px] text-muted-foreground">docked Blackboard · {w} px</div>
+                <MessageMarkdown content={CONCEPT_SET} />
+              </div>
+            ))}
+            <div data-concept-width={900} style={{ width: 900 }} className="shrink-0 rounded-md border border-border/60 bg-background/40 px-2 py-1 text-sm">
+              <div className="mb-1 font-mono text-[11px] text-muted-foreground">wide · 900 px</div>
+              <MessageMarkdown content={CONCEPT_SET} />
+              <div className="mt-3 font-mono text-[11px] text-muted-foreground">a payload with a misspelt field</div>
+              <MessageMarkdown content={CONCEPT_BAD} />
+            </div>
+          </div>
+        </RevealContext.Provider>
+      </CardActionsContext.Provider>
+      <div className="mt-2 max-w-3xl rounded border border-dashed border-border/70 px-2 py-1 text-[11px]" data-concept-sent>
+        <div className="text-muted-foreground">
+          Preview only -- nothing goes to the agent from this page. On the live board each line below is sent as your next turn:
+        </div>
+        {sent.length === 0 ? (
+          <div className="text-muted-foreground/70">(no build requested yet)</div>
+        ) : (
+          sent.map((t, i) => (
+            <div key={i} className="font-mono text-foreground/90">
+              {t}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── Symbol reference (doubles as the font-coverage check at boot) ─────
 
 const GROUP_LABELS: Record<GdtGroup, string> = {
@@ -1106,6 +1236,13 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
           note="Prose streams fast; an expression or typed card is withheld behind the chalk cursor and typeset exactly once when its closing delimiter arrives. Settled chunks never re-render."
         >
           <StreamingDemo />
+        </Section>
+
+        <Section
+          title="Concept board -- roshera:concept"
+          note="Three concepts before anything is built, each a rotatable sketch of its SDF recipe with a point of view (load path, maker) and estimates. Drag a sketch to turn it. Build this one is captured below instead of sent."
+        >
+          <ConceptBoardDemo />
         </Section>
 
         <Section

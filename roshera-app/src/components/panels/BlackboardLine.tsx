@@ -273,9 +273,15 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
     // Queue-visible for the same reason as `selectChoice` above.
     void sendPrompt(value, processBlackboardMessage)
   }, [])
+  // A Concept card's "Build this one" (`cards/ConceptCard.tsx`): the request
+  // goes out as the user's next turn through the same queue-visible path;
+  // the agent builds the concept in the kernel and certifies it.
+  const requestBuild = useCallback((request: string) => {
+    void sendPrompt(request, processBlackboardMessage)
+  }, [])
   const cardActions = useMemo<CardActions>(
-    () => ({ selectChoice, sendDetectedChoice }),
-    [selectChoice, sendDetectedChoice],
+    () => ({ selectChoice, sendDetectedChoice, requestBuild }),
+    [selectChoice, sendDetectedChoice, requestBuild],
   )
 
   const isAgent = line.author === 'agent'

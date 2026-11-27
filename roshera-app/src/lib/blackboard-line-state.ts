@@ -121,6 +121,10 @@ export function cardVerdict(card: BlackboardCard): LineVerdict | null {
       if (votes.includes(null)) return 'inconclusive'
       return 'pass'
     }
+    case 'concept':
+      // A proposal, not a verdict: a concept is not yet a part, so it has
+      // no pass/fail state and never colours the marker.
+      return null
   }
 }
 

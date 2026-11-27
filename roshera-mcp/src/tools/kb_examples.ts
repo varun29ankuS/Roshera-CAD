@@ -24,6 +24,7 @@
  */
 
 import { referenceLookup } from "./kb_reference.js";
+import { conceptsExample } from "./kb_concepts.js";
 
 export interface ExampleStep {
   step: number;
@@ -510,6 +511,9 @@ const BUILDERS: Record<string, () => WorkedExample> = {
   aerofoil_section: aerofoilExample,
   sheet_metal_bracket: bracketExample,
   mounting_plate: plateExample,
+  // The concept-board skill (2026-11-27): concepts on the board, then concept
+  // A built from its recipe (kb_concepts.ts).
+  concepts: conceptsExample,
 };
 
 export const WORKED_EXAMPLE_KEYS = Object.keys(BUILDERS);

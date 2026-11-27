@@ -290,6 +290,31 @@ const PLAYBOOK_META: Record<string, PlaybookMeta> = {
     certification:
       "kernel verdicts: the set-up check (the part cannot move under the supports; the loads are consistent), the force balance, the mesh-to-mesh convergence and the solved-on-the-approved-mesh check. Engine results (Gmsh mesh, CalculiX solve) are interim engines' numbers, named as such. NOT verdicts: the supports, loads, material and safety factor (the person's facts), a TYPICAL yield (indicative only), and fatigue, buckling, contact, plasticity, dynamics and temperature -- never claimed.",
   },
+  // Concept-board skills (2026-11-27, authored in kb_data.ts). The concepts
+  // playbook's worked example is kb_concepts.ts.
+  concepts: {
+    tool_sequence: [
+      "kb_lookup", "blackboard_add_entry", "ask_choice", "timeline_checkpoint", "cad_program",
+      "create_box", "select_edge", "fillet_edges", "create_cylinder", "create_cone",
+      "psketch_begin", "psketch_add_entity", "psketch_extrude", "boolean", "boolean_many",
+      "verify_part", "verify_claim",
+    ],
+    section: "concept-board skill 2026-11-27",
+    certification:
+      "kernel verdicts: only for the BUILT concept -- each program op's certificate, verify_part soundness, verify_claim on the volume. NOT kernel verdicts: the concept itself (a proposal, never a part), every number on the card (estimates that name their basis; the board's volume and mass by sampling the sketch's field), the load-path and maker views (heuristics), and the sketch's blend (a round union, not the kernel's fillet).",
+  },
+  pov: {
+    tool_sequence: ["blackboard_add_entry", "ray_query", "point_query", "section_view", "dfm_check", "mass_properties"],
+    section: "concept-board skill 2026-11-27",
+    certification:
+      "kernel verdicts: ray_query, point_query, section_view, dfm_check(fdm) and mass_properties on a BUILT part. NOT kernel verdicts: every view on a concept card -- the load path (straight load-to-support lines, no stiffness or stress), milling reach (a straight tool along Z, no cutter radius or reach) and FDM overhang (a 45 degree rule) -- each labelled estimate.",
+  },
+  explain_with_maths: {
+    tool_sequence: ["blackboard_add_entry", "kb_lookup", "mass_properties", "ray_query", "measure_faces", "section_view"],
+    section: "concept-board skill 2026-11-27",
+    certification:
+      "kernel verdicts: the measurements quoted from mass_properties, ray_query and measure_faces on a built part, and section_view's cut. NOT kernel verdicts: a hand derivation (an estimate with its stated model), reference values (cited data), and any figure not drawn from the recipe or the kernel -- which is never used.",
+  },
 };
 
 const KB_DOC = "policy KB (vault Research/2026-07-31-policy-knowledge-base.md)";

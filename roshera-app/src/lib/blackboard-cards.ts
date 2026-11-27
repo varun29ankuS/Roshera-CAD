@@ -65,6 +65,11 @@
  *   but every field is named after the wire field it is copied from (see
  *   each schema). Never probed against raw tool output: they are written
  *   by the agent on purpose, not sniffed.
+ * - `roshera:concept`  → NOT a kernel wire type and NOT a result: a set of up
+ *   to three design CONCEPTS (concept-recipe.ts) the agent proposes before
+ *   it builds. A concept is a proposal, never a verdict — it carries no
+ *   soundness, colours no marker, and every number on it is an estimate.
+ *   Like the summary cards it is authored on purpose, never probed.
  *
  * Envelope fields beyond the wire payloads (`unit`, `note`, `standard`,
  * `options`, `part`) are authoring annotations — presentation the agent adds,
@@ -73,6 +78,7 @@
 
 import { z } from 'zod'
 import { parse as parseYaml } from 'yaml'
+import { conceptSetSchema, type ConceptSet } from './concept-recipe.ts'
 
 // ── DFM (geometry-engine/src/dfm/report.rs) ───────────────────────────
 
@@ -694,6 +700,10 @@ export const measuresCardSchema = z.object({
 export type MeasuresCard = z.infer<typeof measuresCardSchema>
 export type MeasureRow = z.infer<typeof measureRowSchema>
 
+// ── Concept set (authoring convention — concept-recipe.ts) ────────────
+
+export type ConceptCard = ConceptSet
+
 // ── Fence parsing ─────────────────────────────────────────────────────
 
 export const CARD_FENCE_PREFIX = 'roshera:'
@@ -708,6 +718,7 @@ export type BlackboardCard =
   | { kind: 'part'; card: PartCard }
   | { kind: 'sheet'; card: SheetCard }
   | { kind: 'measures'; card: MeasuresCard }
+  | { kind: 'concept'; card: ConceptCard }
 
 export type CardKind = BlackboardCard['kind']
 
@@ -724,6 +735,7 @@ export const CARD_KINDS: readonly CardKind[] = [
   'part',
   'sheet',
   'measures',
+  'concept',
 ]
 
 /** `choices` is hand-authored YAML per `.goosehints`; every other card is a
@@ -806,6 +818,10 @@ export function parseCard(kind: CardKind, source: string): CardParseResult {
     }
     case 'measures': {
       const r = measuresCardSchema.safeParse(json)
+      return r.success ? { ok: true, card: { kind, card: r.data } } : fail(r)
+    }
+    case 'concept': {
+      const r = conceptSetSchema.safeParse(json)
       return r.success ? { ok: true, card: { kind, card: r.data } } : fail(r)
     }
   }
