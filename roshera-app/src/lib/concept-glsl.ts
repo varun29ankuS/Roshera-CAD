@@ -7,8 +7,9 @@
  * Change a formula in one and change it in the other.
  *
  * The shader sphere-traces an orthographic view of the field and shades it
- * like a pencil sketch (three tones, hatching in the darker two, ink on the
- * silhouette and on creases). The point of view (`uPov`) recolours it with
+ * in the shared pencil look (lib/sketch-style.ts -- three tones, hatching in
+ * the darker two, ink on the silhouette and on creases; the viewport's Sketch
+ * mode draws with the same library). The point of view (`uPov`) recolours it with
  * the rules concept-pov.ts holds and tests:
  *   1 load path  -- material within the load path in ink, the rest faded;
  *   2 maker mill -- surface reachable from +Z plain, only from -Z hatched,
@@ -23,15 +24,9 @@ import type { Recipe } from './concept-recipe.ts'
 import { prepareRecipe, type Prepared, type PreparedStep, type Vec3 } from './concept-sdf.ts'
 import { LOAD_PATH_ON, OVERHANG_COS } from './concept-pov.ts'
 import { MAX_LOAD_POINTS } from './concept-recipe.ts'
+import { SKETCH_STYLE_GLSL, glslFloat } from './sketch-style.ts'
 
-/** A GLSL ES float literal: always with a decimal point, never NaN. */
-export function glslFloat(n: number): string {
-  if (!Number.isFinite(n)) throw new Error(`not a finite number: ${n}`)
-  if (Number.isInteger(n)) return `${n === 0 ? 0 : n}.0`
-  let s = String(n)
-  if (s.includes('e')) s = n.toFixed(12).replace(/0+$/, '')
-  return s.includes('.') ? s : `${s}.0`
-}
+export { glslFloat }
 
 const v3 = (v: Vec3) => `vec3(${glslFloat(v[0])}, ${glslFloat(v[1])}, ${glslFloat(v[2])})`
 const f = glslFloat
@@ -185,6 +180,7 @@ uniform int uNSup;
 uniform float uSigma;
 uniform float uZmin;
 uniform float uCell;
+${SKETCH_STYLE_GLSL}
 ${GLSL_SDF_LIBRARY}
 ${sceneGlsl(recipe)}
 
@@ -233,14 +229,9 @@ bool reachZ(vec3 p, vec3 n, float dir, float diag) {
   return true;
 }
 
-float hatch(float spacing, float slope) {
-  float c = gl_FragCoord.x * slope + gl_FragCoord.y;
-  return step(mod(c, spacing), 1.0);
-}
-
 void main() {
   // Top-to-bottom print: rows below the reveal line are not drawn yet.
-  if (1.0 - gl_FragCoord.y / uRes.y > uReveal) discard;
+  if (sketchUnrevealed(uReveal, uRes.y)) discard;
   vec2 ndc = vUv * 2.0 - 1.0;
   float aspect = uRes.x / uRes.y;
   float diag = length(uBMax - uBMin);
@@ -279,12 +270,9 @@ void main() {
   vec3 n = sceneNormal(p, 0.5 * pix);
   vec3 nWide = sceneNormal(p, 3.0 * pix);
   float crease = 1.0 - dot(n, nWide);
-  vec3 light = normalize(-uFwd + 0.7 * uUp - 0.45 * uRight);
+  vec3 light = sketchLightDir(uRight, uUp, uFwd);
   float lam = max(dot(n, light), 0.0);
-  float tone = lam > 0.62 ? 0.0 : lam > 0.3 ? 1.0 : 2.0;
-  float ink = 0.0;
-  if (tone >= 1.0) ink = max(ink, 0.55 * hatch(5.0, 1.0));
-  if (tone >= 2.0) ink = max(ink, 0.55 * hatch(5.0, -1.0));
+  float ink = sketchShadeInk(lam);
   vec3 col = uFace;
   float warn = 0.0;
   float alpha = 1.0;
@@ -296,20 +284,20 @@ void main() {
     bool stock = n.z < 0.0 && p.z - uZmin < 0.5 * uCell;
     if (!stock && !reachZ(p, n, 1.0, diag)) {
       if (reachZ(p, n, -1.0, diag)) {
-        ink = max(ink, 0.8 * hatch(3.0, 0.0));
+        ink = max(ink, 0.8 * sketchHatch(3.0, 0.0));
       } else {
         col = mix(uFace, uWarn, 0.35);
-        warn = 0.9 * max(hatch(4.0, 1.0), hatch(4.0, -1.0));
+        warn = 0.9 * max(sketchHatch(4.0, 1.0), sketchHatch(4.0, -1.0));
       }
     }
   } else if (uPov == ${POV_CODE.print}) {
     bool bed = n.z < 0.0 && p.z - uZmin < 0.5 * uCell;
     if (!bed && -n.z > ${glslFloat(OVERHANG_COS)} + 1e-9) {
       col = mix(uFace, uWarn, 0.35);
-      warn = 0.9 * hatch(4.0, 1.0);
+      warn = 0.9 * sketchHatch(4.0, 1.0);
     }
   }
-  float edge = smoothstep(0.03, 0.08, crease);
+  float edge = sketchCrease(crease);
   col = mix(col, uWarn, warn);
   col = mix(col, uInk, max(ink, edge));
   gl_FragColor = vec4(col, alpha);

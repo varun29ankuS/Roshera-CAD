@@ -1,4 +1,5 @@
 import { cn } from '@/lib/utils'
+import { displayModeOf, displayModeSettings, type DisplayMode } from '@/lib/display-mode'
 import { FRAME_FIT, useSceneStore } from '@/stores/scene-store'
 
 const VIEWS: { preset: string; label: string; key: string }[] = [
@@ -10,13 +11,22 @@ const VIEWS: { preset: string; label: string; key: string }[] = [
 
 /**
  * The viewport's view bar (the approved mockup): how the part is drawn --
- * shaded with its edges, shaded only, a section cut -- then which side it
+ * shaded with its edges, shaded only, sketched (the concept cards' pencil
+ * look on the real mesh), a section cut -- then which side it
  * is seen from, and Fit -- then perspective/ortho, grid, labels and GD&T.
  * One compact row over the top of the viewport.
  */
 export function ViewBar() {
   const edges = useSceneStore((s) => s.edgeSettings.visible)
   const setEdgeSettings = useSceneStore((s) => s.setEdgeSettings)
+  const sketch = useSceneStore((s) => s.sketchStyle)
+  const setSketchStyle = useSceneStore((s) => s.setSketchStyle)
+  const mode = displayModeOf({ edges, sketch })
+  const setMode = (m: DisplayMode) => {
+    const next = displayModeSettings(m)
+    setEdgeSettings({ visible: next.edges })
+    setSketchStyle(next.sketch)
+  }
   const section = useSceneStore((s) => s.sectionView.enabled)
   const toggleSection = useSceneStore((s) => s.toggleSectionView)
   const preset = useSceneStore((s) => s.cameraPreset)
@@ -45,11 +55,20 @@ export function ViewBar() {
       // wrapping a label or sliding under the panels beside it.
       className="pointer-events-auto flex max-w-full items-center gap-px overflow-x-auto rounded-lg border border-border bg-card/95 p-0.5 shadow-sm [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
     >
-      <button type="button" className={btn(edges)} aria-pressed={edges} onClick={() => setEdgeSettings({ visible: true })}>
+      <button type="button" className={btn(mode === 'edges')} aria-pressed={mode === 'edges'} onClick={() => setMode('edges')}>
         Shaded + edges
       </button>
-      <button type="button" className={btn(!edges)} aria-pressed={!edges} onClick={() => setEdgeSettings({ visible: false })}>
+      <button type="button" className={btn(mode === 'shaded')} aria-pressed={mode === 'shaded'} onClick={() => setMode('shaded')}>
         Shaded
+      </button>
+      <button
+        type="button"
+        className={btn(mode === 'sketch')}
+        aria-pressed={mode === 'sketch'}
+        onClick={() => setMode('sketch')}
+        title="Draw the parts as a pencil sketch (display only)"
+      >
+        Sketch
       </button>
       <button type="button" className={btn(section)} aria-pressed={section} onClick={toggleSection} title="Cut the part with a plane">
         Section

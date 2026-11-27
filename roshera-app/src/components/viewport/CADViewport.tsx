@@ -1,4 +1,5 @@
 import { HistoryViewBanner } from './HistoryViewBanner'
+import { SketchStyleController } from './SketchStyleController'
 import { AgentFacesHighlight } from './AgentFacesHighlight'
 import { FeatureHighlight } from './FeatureHighlight'
 import { InSlot } from '@/components/viewport/overlay-slots'
@@ -207,6 +208,7 @@ export function CADViewport() {
       >
         <CameraController />
         <SceneLighting />
+        <SketchStyleController />
         <CADGrid />
         <Datums />
         <GizmoNav />

@@ -14,6 +14,7 @@ import {
   type OrbitView,
   type ViewFrame,
 } from '@/lib/concept-renderer'
+import { nextReveal, prefersReducedMotion, revealStart, REVEAL_STEP_MS } from '@/lib/sketch-style'
 import { cn } from '@/lib/utils'
 import { CardShell, Chip } from './card-chrome'
 import { CardActionsContext } from './card-actions-context'
@@ -42,16 +43,6 @@ import { RevealContext } from './reveal-context'
 type Pov = 'sketch' | 'load' | 'maker'
 type MakerMode = 'mill' | 'print'
 
-const REVEAL_STEPS = [0.25, 0.5, 0.75, 1]
-const REVEAL_STEP_MS = 70
-
-function prefersReducedMotion(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof window.matchMedia === 'function' &&
-    window.matchMedia('(prefers-reduced-motion: reduce)').matches
-  )
-}
 
 interface SketchProps {
   concept: Concept
@@ -68,7 +59,7 @@ function ConceptSketch({ concept, bounds, pov, maker, animate }: SketchProps) {
   const viewRef = useRef<OrbitView>({ ...DEFAULT_VIEW })
   const dragRef = useRef<{ x: number; y: number } | null>(null)
   const frameRef = useRef<number | null>(null)
-  const [reveal, setReveal] = useState(() => (animate && !prefersReducedMotion() ? 0 : 1))
+  const [reveal, setReveal] = useState(() => (animate ? revealStart(prefersReducedMotion()) : 1))
   const [size, setSize] = useState<{ w: number; h: number } | null>(null)
   const [noGl, setNoGl] = useState(false)
   const sigma = useMemo(() => loadPathSigma(bounds), [bounds])
@@ -76,8 +67,7 @@ function ConceptSketch({ concept, bounds, pov, maker, animate }: SketchProps) {
   // The sketch prints top to bottom in a few fixed steps, like the board.
   useEffect(() => {
     if (reveal >= 1) return
-    const next = REVEAL_STEPS.find((r) => r > reveal) ?? 1
-    const t = window.setTimeout(() => setReveal(next), REVEAL_STEP_MS)
+    const t = window.setTimeout(() => setReveal(nextReveal(reveal)), REVEAL_STEP_MS)
     return () => window.clearTimeout(t)
   }, [reveal])
 

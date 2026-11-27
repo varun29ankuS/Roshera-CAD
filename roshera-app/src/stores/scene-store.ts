@@ -687,6 +687,14 @@ interface SceneState {
   // Edges
   edgeSettings: EdgeSettings
 
+  /**
+   * The Sketch display mode: the parts drawn in the concept cards' pencil
+   * look (lib/sketch-material.ts) with ink edges. Display only -- picking,
+   * highlights, section and every overlay are unchanged. Held for the
+   * session like the other display modes (lib/display-mode.ts).
+   */
+  sketchStyle: boolean
+
   // Grid
   gridSettings: GridSettings
 
@@ -845,6 +853,7 @@ interface SceneState {
   toggleCameraProjection: () => void
 
   setEdgeSettings: (settings: Partial<EdgeSettings>) => void
+  setSketchStyle: (on: boolean) => void
   setGridSettings: (settings: Partial<GridSettings>) => void
   /** Toggle the LABELLER viewport overlay on/off. */
   toggleLabelsVisible: () => void
@@ -1157,6 +1166,7 @@ const sceneCreator: StateCreator<
       infiniteGrid: true,
     },
     labelsVisible: false,
+    sketchStyle: false,
     gdtVisible: false,
     showDimensions: new Set<string>(),
     dimensionKindFilter: new Set<string>(ALL_DIMENSION_KINDS),
@@ -1542,6 +1552,8 @@ const sceneCreator: StateCreator<
       set((state) => ({
         edgeSettings: { ...state.edgeSettings, ...settings },
       })),
+
+    setSketchStyle: (on) => set({ sketchStyle: on }),
 
     setGridSettings: (settings) =>
       set((state) => ({

@@ -10,6 +10,7 @@ import { useThemeStore } from '@/stores/theme-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useAssemblyStore } from '@/stores/assembly-store'
 import { resolveCssVar } from '@/lib/css-color'
+import { applySketchStyle, viewportSketchUniforms } from '@/lib/sketch-material'
 import { wsClient } from '@/lib/ws-client'
 import { isRaycastSuppressed } from './orbit-raycast-gate'
 import * as THREE from 'three'
@@ -64,6 +65,9 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
   const registerMeshRef = useSceneStore((s) => s.registerMeshRef)
   const unregisterMeshRef = useSceneStore((s) => s.unregisterMeshRef)
   const edgeSettings = useSceneStore((s) => s.edgeSettings)
+  // The Sketch display mode (lib/sketch-material.ts): the same material,
+  // patched to the concept cards' pencil look, with ink edges.
+  const sketchStyle = useSceneStore((s) => s.sketchStyle)
   const theme = useThemeStore((s) => s.theme)
   // While the user is editing an existing sketch, dim every solid so
   // the focus is on the 2D profile + dimension labels, not the
@@ -86,12 +90,14 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
   // pointed at pre-highlights in BLUE (`--cad-hovered`), what is selected is
   // AMBER. Hover used the selection's own amber, so a part about to be picked
   // and a part already picked differed only by a fill.
-  const { defaultEdgeHex, accentEdgeHex, selectedEdgeHex } = useMemo(() => {
+  const { defaultEdgeHex, inkEdgeHex, accentEdgeHex, selectedEdgeHex } = useMemo(() => {
     const tick = resolveCssVar('--cad-tick')
+    const ink = resolveCssVar('--foreground')
     const accent = resolveCssVar('--cad-hovered')
     const selected = resolveCssVar('--cad-edge-selected')
     return {
       defaultEdgeHex: `#${tick.color.getHexString()}`,
+      inkEdgeHex: `#${ink.color.getHexString()}`,
       accentEdgeHex: `#${accent.color.getHexString()}`,
       selectedEdgeHex: `#${selected.color.getHexString()}`,
     }
@@ -152,7 +158,7 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
   const material = useMemo(() => {
     const editingOpacity = 0.18
     const opacity = editingSketch ? editingOpacity : object.material.opacity
-    return new THREE.MeshStandardMaterial({
+    const m = new THREE.MeshStandardMaterial({
       color: object.material.color,
       metalness: object.material.metalness,
       roughness: object.material.roughness,
@@ -179,7 +185,11 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
       // once in CADViewport's onCreated).
       clippingPlanes,
     })
-  }, [object.material, editingSketch, clippingPlanes])
+    // Sketch mode patches this very material, so clipping, the selection
+    // glow and the editing opacity above all keep working in it.
+    if (sketchStyle) applySketchStyle(m, viewportSketchUniforms)
+    return m
+  }, [object.material, editingSketch, clippingPlanes, sketchStyle])
 
   // Dispose GPU resources when geometry/material are replaced (every mesh edit
   // swaps object.mesh / object.material, recomputing the memos) or when this
@@ -430,7 +440,9 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
     ? selectedEdgeHex
     : isHovered
       ? accentEdgeHex
-      : edgeSettings.color || defaultEdgeHex
+      : sketchStyle
+        ? inkEdgeHex
+        : edgeSettings.color || defaultEdgeHex
   useEffect(() => {
     edgesRef.current?.material?.color?.set(edgeHex)
     invalidate()
@@ -462,7 +474,7 @@ export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: 
       onPointerOut={handlePointerOut}
       userData={{ cadObjectId: object.id }}
     >
-      {edgeSettings.visible && (
+      {(edgeSettings.visible || sketchStyle) && (
         // Hover recolours the edges IN PLACE (see the effect above). This
         // used to be `key={isHovered ? 'hov' : 'def'}`, which remounted the
         // drei `<Edges>` on every hover change and threw away its cached

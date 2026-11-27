@@ -18,7 +18,7 @@ import type { ConceptLoad, ConceptSupport, Recipe } from './concept-recipe.ts'
 import { MAX_LOAD_POINTS } from './concept-recipe.ts'
 import { CONCEPT_VERTEX_SHADER, conceptFragmentShader, type PovCode } from './concept-glsl.ts'
 import { cross, dot, length, normalize, scale, sub, add, type Bounds, type Vec3 } from './concept-sdf.ts'
-import { resolveCssVar } from './css-color.ts'
+import { sketchColors, type SketchColors } from './sketch-style.ts'
 
 export interface OrbitView {
   /** Radians about +Z, measured from +X. */
@@ -152,25 +152,8 @@ function materialFor(recipe: Recipe): THREE.ShaderMaterial {
   return m
 }
 
-export interface SketchColors {
-  ink: [number, number, number]
-  face: [number, number, number]
-  warn: [number, number, number]
-}
-
-/** Ink = the board's foreground, face = a whisper of it on the background,
- *  warn = the caution colour. Read per draw so a theme change is honoured. */
-export function sketchColors(): SketchColors {
-  const fg = resolveCssVar('--foreground').color
-  const bg = resolveCssVar('--background').color
-  const warn = resolveCssVar('--caution').color
-  const mix = (a: number, b: number, t: number) => a + (b - a) * t
-  return {
-    ink: [fg.r, fg.g, fg.b],
-    face: [mix(bg.r, fg.r, 0.07), mix(bg.g, fg.g, 0.07), mix(bg.b, fg.b, 0.07)],
-    warn: [warn.r, warn.g, warn.b],
-  }
-}
+export type { SketchColors }
+export { sketchColors }
 
 export interface SketchRequest {
   recipe: Recipe
