@@ -444,7 +444,9 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
           // the argument. Text stays selectable; deleting stays allowed
           // (a deletion is visible, an edit is invisible and looks
           // authored — that is the whole distinction).
-          <div className="flex w-full items-start gap-1.5 select-text text-left text-xs leading-snug text-foreground/60">
+          // Quieter than prose, never faint: 13 px at 80% (Varun 2026-11-27 --
+          // 12 px at 60% had to be studied rather than read).
+          <div className="flex w-full items-start gap-1.5 select-text text-left text-[13px] leading-normal text-foreground/80">
             {isAgent && line.turnStatus && <TurnStatusGlyph status={line.turnStatus} />}
             <span className="min-w-0 max-w-[72ch] flex-1">
               {line.text.trim() ? (
@@ -484,7 +486,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
           // of an answer, not a person retyping the kernel.
           <div
             className={cn(
-              'flex items-start gap-1.5 select-text text-left text-sm leading-relaxed text-foreground/90',
+              'flex items-start gap-1.5 select-text text-left text-sm leading-relaxed text-foreground',
               // The user's container shrink-wraps its own words; every
               // other voice runs the full lane. A one-line ask therefore
               // reads as a small object against a full-bleed paragraph —

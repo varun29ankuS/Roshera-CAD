@@ -472,6 +472,26 @@
   }
 }
 
+/* Inline maths reads in the same face as the prose around it (Varun
+   2026-11-27): numbers, letters and operators take the reading face at the
+   text's own size; KaTeX keeps its own fonts only for the glyphs it builds
+   from pieces (radicals, big delimiters, accents), so the layout holds. */
+.katex {
+  font-size: 1.04em;
+}
+.katex .mathnormal,
+.katex .mathit,
+.katex .mathrm,
+.katex .mord,
+.katex .mbin,
+.katex .mrel,
+.katex .mopen,
+.katex .mclose,
+.katex .mpunct,
+.katex .text {
+  font-family: var(--font-sans);
+}
+
 /* The Blackboard's lettering -- its readouts and chips too, so a card is
    one face, not two. */
 .board-type,
