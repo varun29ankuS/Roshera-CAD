@@ -371,7 +371,9 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: 
       // The evidence strip's marks scroll to their card's line by this id.
       data-line-id={line.id}
       className={cn(
-        'group/line flex items-start gap-2 px-3 py-1.5 hover:bg-accent/50 rounded-md',
+        // Tight gutters: every pixel of a narrow dock goes to the text's
+        // measure, so a sentence is not broken every few words.
+        'group/line flex items-start gap-1.5 px-2 py-1.5 hover:bg-accent/50 rounded-md',
         isUser && 'ml-6',
       )}
     >

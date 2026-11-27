@@ -48,14 +48,14 @@ function codeText(children: ReactNode): string {
 // Tighten the default markdown element spacing so equations and prose sit
 // comfortably inside the compact chat bubble rather than the browser defaults.
 const markdownComponents: Components = {
-  p: ({ children }) => <p className="my-1 first:mt-0 last:mb-0">{children}</p>,
+  p: ({ children }) => <p className="my-1.5 first:mt-0 last:mb-0">{children}</p>,
   ul: ({ children }) => (
     <ul className="my-1 ml-4 list-disc space-y-0.5">{children}</ul>
   ),
   ol: ({ children }) => (
     <ol className="my-1 ml-4 list-decimal space-y-0.5">{children}</ol>
   ),
-  li: ({ children }) => <li className="leading-snug">{children}</li>,
+  li: ({ children }) => <li className="leading-normal">{children}</li>,
   strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
   em: ({ children }) => <em className="text-foreground/90">{children}</em>,
   h1: ({ children }) => <h1 className="mt-2 mb-1 text-sm font-semibold text-foreground first:mt-0">{children}</h1>,
@@ -73,7 +73,12 @@ const markdownComponents: Components = {
   // scroll instead of overflowing the panel.
   table: ({ children }) => (
     <div className="my-1.5 overflow-x-auto rounded-md border border-border/70">
-      <table className="w-full border-collapse text-[11px] tabular-nums">{children}</table>
+      {/* A value never breaks across lines ("2.50 /" over "2.20"): every
+          column after the first keeps its cell on one line, and the label
+          column takes what is left. */}
+      <table className="w-full border-collapse text-[12px] tabular-nums [&_td:not(:first-child)]:whitespace-nowrap [&_th:not(:first-child)]:whitespace-nowrap">
+        {children}
+      </table>
     </div>
   ),
   thead: ({ children }) => <thead className="bg-foreground/5">{children}</thead>,
@@ -87,7 +92,7 @@ const markdownComponents: Components = {
     </th>
   ),
   td: ({ children, style }) => (
-    <td style={style} className="px-2 py-1 align-baseline text-foreground/90">
+    <td style={style} className="px-1.5 py-1 align-baseline text-foreground/90">
       {children}
     </td>
   ),

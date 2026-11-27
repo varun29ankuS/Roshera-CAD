@@ -1,12 +1,18 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-const { dockWidth, DOCK_DEFAULT, DOCK_MIN, DOCK_MAX } = await import('../src/lib/dock-width.ts')
+const { dockWidth, DOCK_DEFAULT, DOCK_WIDE, DOCK_MIN, DOCK_MAX } = await import('../src/lib/dock-width.ts')
 
 test('the Blackboard dock is about 380 px on a normal window', () => {
   assert.equal(DOCK_DEFAULT, 380)
-  assert.equal(dockWidth(null, 1920), 380)
+  assert.equal(dockWidth(null, 1679), 380)
   assert.equal(dockWidth(null, 1280), 380)
+})
+
+test('a wide window gives the Blackboard a readable measure, 440 px', () => {
+  assert.equal(DOCK_WIDE, 440)
+  assert.equal(dockWidth(null, 1920), 440)
+  assert.equal(dockWidth(null, 1680), 440)
 })
 
 test('a narrow window gets the narrow dock unless the user chose a width', () => {
@@ -28,6 +34,6 @@ test('the dock never takes more than 40% of the window, and never less than its 
 })
 
 test('a saved value that is not a width is ignored', () => {
-  assert.equal(dockWidth(NaN, 1920), 380)
-  assert.equal(dockWidth(Infinity, 1920), 380)
+  assert.equal(dockWidth(NaN, 1280), 380)
+  assert.equal(dockWidth(Infinity, 1280), 380)
 })
