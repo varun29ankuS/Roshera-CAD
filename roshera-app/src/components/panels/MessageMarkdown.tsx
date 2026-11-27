@@ -4,7 +4,7 @@ import type { Components } from 'react-markdown'
 import { cn } from '@/lib/utils'
 import { cardKindFromLanguage } from '@/lib/blackboard-cards'
 import { REHYPE_PLUGINS, REMARK_PLUGINS } from '@/lib/markdown-pipeline'
-import { normalizeMathDelimiters } from '@/lib/math-delimiters'
+import { normalizeMathDelimiters, promoteDisplayMath } from '@/lib/math-delimiters'
 import { CardRenderer } from './cards/CardRenderer'
 
 /**
@@ -48,7 +48,7 @@ function codeText(children: ReactNode): string {
 // Tighten the default markdown element spacing so equations and prose sit
 // comfortably inside the compact chat bubble rather than the browser defaults.
 const markdownComponents: Components = {
-  p: ({ children }) => <p className="my-1.5 first:mt-0 last:mb-0">{children}</p>,
+  p: ({ children }) => <p className="my-2 first:mt-0 last:mb-0">{children}</p>,
   ul: ({ children }) => (
     <ul className="my-1 ml-4 list-disc space-y-0.5">{children}</ul>
   ),
@@ -58,10 +58,12 @@ const markdownComponents: Components = {
   li: ({ children }) => <li className="leading-normal">{children}</li>,
   strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
   em: ({ children }) => <em className="text-foreground/90">{children}</em>,
-  h1: ({ children }) => <h1 className="mt-2 mb-1 text-sm font-semibold text-foreground first:mt-0">{children}</h1>,
-  h2: ({ children }) => <h2 className="mt-2 mb-1 text-[13px] font-semibold text-foreground first:mt-0">{children}</h2>,
+  // A heading is never smaller than the text it heads: 16 px of air above
+  // (it starts a new section), 4 px below (it belongs to what follows).
+  h1: ({ children }) => <h1 className="mt-4 mb-1 text-[15px] font-semibold text-foreground first:mt-0">{children}</h1>,
+  h2: ({ children }) => <h2 className="mt-4 mb-1 text-[14px] font-semibold text-foreground first:mt-0">{children}</h2>,
   h3: ({ children }) => (
-    <h3 className="mt-1.5 mb-0.5 text-[12px] font-medium text-foreground/90 first:mt-0">{children}</h3>
+    <h3 className="mt-4 mb-1 text-[13px] font-semibold text-foreground first:mt-0">{children}</h3>
   ),
   blockquote: ({ children }) => (
     <blockquote className="my-1 border-l-2 border-border/70 pl-2 text-foreground/75">{children}</blockquote>
@@ -72,7 +74,7 @@ const markdownComponents: Components = {
   // labels, tabular numerals so a column of values lines up, and horizontal
   // scroll instead of overflowing the panel.
   table: ({ children }) => (
-    <div className="my-1.5 overflow-x-auto rounded-md border border-border/70">
+    <div className="my-3 overflow-x-auto rounded-md border border-border/70">
       {/* A value never breaks across lines ("2.50 /" over "2.20"): every
           column after the first keeps its cell on one line, and the label
           column takes what is left. */}
@@ -139,13 +141,16 @@ const markdownComponents: Components = {
 }
 
 function MessageMarkdownImpl({ content, className }: Props) {
-  const source = useMemo(() => normalizeMathDelimiters(content), [content])
+  const source = useMemo(() => promoteDisplayMath(normalizeMathDelimiters(content)), [content])
   return (
     <div
       className={cn(
-        // Center block-level equations and let them scroll horizontally
-        // instead of overflowing the bubble.
-        'space-y-1 break-words [&_.katex-display]:my-1 [&_.katex-display]:overflow-x-auto [&_.katex-display]:overflow-y-hidden',
+        // One vertical rhythm (Varun 2026-11-27, "the gap between paragraphs,
+        // the gap between equations and text"): 8 px between paragraphs, a
+        // displayed equation set off by 12 px and indented like a worked
+        // calculation, a heading 16 px above what it heads and tight to it.
+        // Displayed equations scroll sideways rather than overflow.
+        'break-words [&_.katex-display]:my-3 [&_.katex-display]:pl-3 [&_.katex-display>.katex]:text-left [&_.katex-display]:overflow-x-auto [&_.katex-display]:overflow-y-hidden',
         className,
       )}
     >

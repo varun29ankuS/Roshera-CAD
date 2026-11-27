@@ -201,3 +201,42 @@ export function splitInlineMath(text: string): InlineMathSegment[] {
   pushText(text.slice(textStart))
   return segments
 }
+
+/** A line that is exactly one `$$…$$` equation and nothing else. The body
+ *  must not itself contain `$$` (that would be two equations on a line). */
+const LONE_DISPLAY_RE = /^\s*\$\$((?:(?!\$\$).)+)\$\$\s*$/
+
+/**
+ * Turn an equation written alone on its line (`$$m = \rho V$$`) into a
+ * displayed equation. remark-math reads a one-line `$$…$$` as INLINE math,
+ * so such an equation rendered as a short paragraph of text with no space
+ * around it and blended into the prose (Varun 2026-11-27). The rewrite is to
+ * the fenced form, set off by blank lines; a code fence is never touched,
+ * and an equation sharing its line with text stays inline. Used for the
+ * committed render only -- the streaming splitter keeps its own contract.
+ */
+export function promoteDisplayMath(text: string): string {
+  if (!text.includes('$$')) return text
+  const out: string[] = []
+  let fence: string | null = null
+  for (const line of text.split('\n')) {
+    const marker = FENCE_RE.exec(line)?.[1] ?? null
+    if (fence !== null) {
+      out.push(line)
+      if (marker !== null && marker[0] === fence[0] && marker.length >= fence.length) fence = null
+      continue
+    }
+    if (marker !== null) {
+      fence = marker
+      out.push(line)
+      continue
+    }
+    const lone = LONE_DISPLAY_RE.exec(line)
+    if (lone) {
+      out.push('', '$$', lone[1].trim(), '$$', '')
+    } else {
+      out.push(line)
+    }
+  }
+  return out.join('\n')
+}
