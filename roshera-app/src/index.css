@@ -327,12 +327,19 @@
   .cad-leader > :first-child {
     @apply flex items-baseline w-full text-muted-foreground;
   }
-  .scrollbar-thin {
-    scrollbar-width: thin;
-    scrollbar-color: var(--border) transparent;
+  /* The standard properties only where `::-webkit-scrollbar` is not
+     understood (Firefox). Chrome and Edge honour BOTH, and the standard pair
+     wins there: `scrollbar-width: thin` on Windows is still an 11px bar with
+     arrow buttons, which silently replaced the 4px bar drawn below. */
+  @supports not selector(::-webkit-scrollbar) {
+    .scrollbar-thin {
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
   }
   .scrollbar-thin::-webkit-scrollbar {
     width: 4px;
+    height: 4px;
   }
   .scrollbar-thin::-webkit-scrollbar-track {
     background: transparent;
@@ -400,6 +407,21 @@
 @keyframes chalk-cursor-blink {
   50% {
     opacity: 0.15;
+  }
+}
+/* Reduced motion, app-wide: someone who has asked the OS for less motion gets
+   state changes without the travel -- no slides, zooms, pulses or spinners
+   in motion. Durations are cut to (almost) nothing rather than removed, so
+   `transitionend` / `animationend` handlers still fire. The 3D camera's
+   fly-to honours the same setting in CameraController. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
 @media (prefers-reduced-motion: reduce) {

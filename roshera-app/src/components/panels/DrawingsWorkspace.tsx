@@ -1800,7 +1800,7 @@ function DocumentDrawings() {
       )}
       {activeDrawing && titleBlockOpen && (
         <TitleBlockCard
-          key={activeDrawing.id}
+          key={`title-block:${activeDrawing.id}`}
           drawing={activeDrawing}
           onUpdated={(updated) => {
             // The card of THIS drawing saved: the answer may arrive after
@@ -1915,7 +1915,7 @@ function DocumentDrawings() {
             )}
             {activeDrawing && svg && (
               <CompletenessChip
-                key={activeDrawing.id}
+                key={`certificate:${activeDrawing.id}`}
                 drawing={activeDrawing}
                 certificate={dimListing?.certificate ?? null}
                 onChanged={(note) => annotated(activeDrawing.id, note)}

@@ -35,8 +35,9 @@ import { exportSceneAs } from '@/lib/export-api'
 import { newDocument } from '@/lib/documents-api'
 import { runNewProject } from '@/lib/new-project'
 import { openGuide } from '@/lib/first-run'
+import { VIEW_SHORTCUT_LABEL, type StandardView } from '@/lib/view-shortcuts'
+import { deleteSelectedParts } from '@/lib/shortcuts'
 
-const API_BASE = import.meta.env.VITE_API_URL || ''
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -109,15 +110,6 @@ async function runExport(format: string): Promise<void> {
   )
 }
 
-function deleteSelected(): void {
-  const state = useSceneStore.getState()
-  for (const id of Array.from(state.selectedIds)) {
-    void fetch(`${API_BASE}/api/geometry/${id}`, { method: 'DELETE' }).catch(
-      (err) => console.error('[command-palette] delete error:', err),
-    )
-  }
-}
-
 // ── Component ───────────────────────────────────────────────────────
 
 export function CommandPalette() {
@@ -162,7 +154,6 @@ export function CommandPalette() {
       id: 'file.new',
       label: 'New Project',
       group: 'File',
-      hint: 'Ctrl+N',
       keywords: ['clear', 'reset', 'fresh'],
       // Same action as File → New in the TopBar: a new backend document.
       // The scene is left alone until the backend has switched documents
@@ -184,13 +175,6 @@ export function CommandPalette() {
       run: () => clearScene(),
     })
     cmds.push({
-      id: 'help.getting-started',
-      label: 'Getting started',
-      group: 'Help',
-      keywords: ['help', 'guide', 'tour', 'how', 'first', 'start'],
-      run: () => openGuide(),
-    })
-    cmds.push({
       id: 'file.demos',
       label: 'Open Demo Gallery',
       group: 'File',
@@ -210,6 +194,15 @@ export function CommandPalette() {
         },
       })
     }
+
+    // Help -- after File, so each heading's commands stay together.
+    cmds.push({
+      id: 'help.getting-started',
+      label: 'Getting started',
+      group: 'Help',
+      keywords: ['help', 'guide', 'tour', 'how', 'first', 'start'],
+      run: () => openGuide(),
+    })
 
     // Edit
     cmds.push({
@@ -236,7 +229,7 @@ export function CommandPalette() {
       group: 'Edit',
       hint: 'Del',
       keywords: ['remove'],
-      run: () => deleteSelected(),
+      run: () => void deleteSelectedParts(),
     })
     cmds.push({
       id: 'edit.select-all',
@@ -255,6 +248,7 @@ export function CommandPalette() {
         id: `view.camera.${key}`,
         label: `View: ${preset.name}`,
         group: 'View',
+        hint: key in VIEW_SHORTCUT_LABEL ? VIEW_SHORTCUT_LABEL[key as StandardView] : undefined,
         keywords: ['camera', 'orient', key],
         run: () => setCameraPreset(key),
       })
@@ -276,7 +270,7 @@ export function CommandPalette() {
     ] as const) {
       cmds.push({
         id: `select.${mode}`,
-        label: `Selection: ${mode[0].toUpperCase() + mode.slice(1)} Mode`,
+        label: `Pick: ${mode === 'object' ? 'Part' : mode[0].toUpperCase() + mode.slice(1)}`,
         group: 'Selection',
         hint,
         run: () => setSelectionMode(mode),
@@ -415,7 +409,7 @@ export function CommandPalette() {
       aria-modal="true"
       aria-label="Command palette"
       onKeyDown={onKeyDown}
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh] bg-background/60 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh] bg-foreground/15 animate-in fade-in duration-150"
       onMouseDown={(e) => {
         // Mouse-down on backdrop closes; mouse-down on the panel
         // bubbles up here, so check the target identity.
@@ -440,19 +434,18 @@ export function CommandPalette() {
         </div>
 
         {/* Results */}
-        <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto py-1">
+        <div ref={listRef} className="scrollbar-thin flex-1 min-h-0 overflow-y-auto py-1">
           {filtered.length === 0 ? (
             <div className="px-3 py-6 text-xs text-muted-foreground text-center">
               No commands match “{query}”.
             </div>
           ) : (
             (() => {
-              // Render with sticky group headers, in score order. We
-              // render the header the first time a new group appears.
-              const seenGroup = new Set<string>()
+              // Group headings, in score order: a heading wherever the
+              // group changes from the row above, so a command is never
+              // listed under another group's heading.
               return filtered.map((s, i) => {
-                const header = !seenGroup.has(s.cmd.group)
-                seenGroup.add(s.cmd.group)
+                const header = i === 0 || filtered[i - 1].cmd.group !== s.cmd.group
                 const isActive = i === activeIndex
                 return (
                   <div key={s.cmd.id}>

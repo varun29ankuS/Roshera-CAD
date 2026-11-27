@@ -393,7 +393,7 @@ function ConstraintMarks() {
             }}
             style={{ pointerEvents: 'auto', transform: `translate(${10 + m.n * 14}px, ${-10 - m.n * 2}px)` }}
             className={cn(
-              'cad-focus whitespace-nowrap rounded border px-1 text-[10px] leading-4 shadow-sm',
+              'cad-focus whitespace-nowrap rounded border px-1 text-[11px] leading-4 shadow-sm',
               m.dim === null ? 'min-w-4 bg-card/90 text-muted-foreground' : 'bg-card font-medium text-foreground',
               picked === m.id ? 'border-[var(--cad-selected)] text-foreground' : 'border-border',
             )}

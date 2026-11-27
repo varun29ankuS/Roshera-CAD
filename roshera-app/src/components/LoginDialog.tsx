@@ -67,7 +67,7 @@ export function LoginDialog() {
 
   if (!open) return null
 
-  const mono = 'font-mono text-[10.5px] uppercase tracking-[0.08em]'
+  const mono = 'font-mono text-[11px] uppercase tracking-[0.08em]'
   return (
     <div
       role="dialog"

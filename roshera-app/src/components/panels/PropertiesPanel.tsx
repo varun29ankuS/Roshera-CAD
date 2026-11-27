@@ -33,7 +33,7 @@ function Section({ title, defaultOpen = true, children }: { title: string; defau
         type="button"
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
-        className="cad-focus flex w-full items-center gap-1 px-3 py-1.5 text-left text-[10.5px] font-medium uppercase tracking-[0.08em] text-muted-foreground hover:text-foreground"
+        className="cad-focus flex w-full items-center gap-1 px-3 py-1.5 text-left text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground hover:text-foreground"
       >
         {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
         {title}
@@ -133,7 +133,7 @@ export function PropertiesPanel() {
         <Box size={16} />
         <div className="min-w-0 flex-1">
           <div className="truncate text-[12.5px] font-semibold">{obj.name}</div>
-          <div className="text-[10.5px] text-muted-foreground">Part{solidId !== undefined ? ` · solid ${solidId}` : ''}</div>
+          <div className="text-[11px] text-muted-foreground">Part{solidId !== undefined ? ` · solid ${solidId}` : ''}</div>
         </div>
         <button
           type="button"

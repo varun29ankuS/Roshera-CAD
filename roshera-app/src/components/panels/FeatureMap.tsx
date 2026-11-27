@@ -78,7 +78,7 @@ function FeatureNode({ data }: NodeProps<Node<FeatureNodeData>>) {
           <span
             title={who.title}
             className={cn(
-              'grid h-4 min-w-4 shrink-0 place-items-center rounded px-0.5 text-[10px] font-semibold',
+              'grid h-4 min-w-4 shrink-0 place-items-center rounded px-0.5 text-[11px] font-semibold',
               f.author === 'agent' ? 'bg-sky-500/15 text-sky-500' : 'bg-amber-500/15 text-amber-600 dark:text-amber-400',
             )}
           >

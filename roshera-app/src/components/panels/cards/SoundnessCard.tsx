@@ -115,10 +115,17 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
   const notRun = INVARIANTS.filter((inv) => stateOf(inv.key) === 'not_run').length
   const genus = card.euler_characteristic != null ? eulerGenus(card.euler_characteristic) : null
 
+  const titleText = card.part
+    ? `Soundness — ${card.part}`
+    : card.part_id != null
+      ? `Soundness — part ${card.part_id}`
+      : 'Soundness certificate'
+
   return (
     <CardShell
       accent={accent}
       icon={ShieldCheck}
+      titleText={titleText}
       title={
         card.part ? (
           <>Soundness — {card.part}</>
@@ -160,7 +167,7 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
 
       {card.verdict && <div className="mt-1.5 text-[11px] text-foreground/80">{card.verdict}</div>}
 
-      <div className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-0.5">
+      <div className="mt-1.5 grid grid-cols-1 gap-x-4 gap-y-0.5 @xs:grid-cols-2">
         {card.euler_characteristic != null && (
           <KV label="Euler characteristic χ">{fmtNum(card.euler_characteristic)}</KV>
         )}

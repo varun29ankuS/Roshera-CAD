@@ -6,6 +6,9 @@ import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import { timelineAction } from '@/lib/history'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { sceneShortcutApplies } from '@/lib/workspaces'
+import { viewPresetForKey } from '@/lib/view-shortcuts'
+import { deleteParts } from '@/lib/delete-parts'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 import * as THREE from 'three'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
@@ -46,6 +49,27 @@ function focusSelected() {
   // The canvas renders on demand; a camera moved outside React must ask
   // for the frame that shows it.
   invalidate()
+}
+
+/**
+ * Delete the selected parts (the Delete key and Edit > Delete). Routed
+ * through the canonical REST endpoint -- the same one ModelTree's context
+ * menu uses -- so the kernel, timeline and viewport stay in sync: a part
+ * leaves the screen only on the kernel's `ObjectDeleted` broadcast
+ * (ws-bridge.ts), never before. A delete that does not happen is reported on
+ * the Blackboard by the part's name (lib/delete-parts.ts).
+ */
+export function deleteSelectedParts(): Promise<number> {
+  const state = useSceneStore.getState()
+  const parts = Array.from(state.selectedIds).map((id) => ({
+    id,
+    name: state.objects.get(id)?.name ?? 'the selected part',
+  }))
+  return deleteParts(
+    parts,
+    (id) => fetch(`${API_BASE}/api/geometry/${id}`, { method: 'DELETE' }),
+    (line) => useBlackboardStore.getState().addLine(line, 'system'),
+  )
 }
 
 export function useKeyboardShortcuts() {
@@ -89,6 +113,17 @@ export function useKeyboardShortcuts() {
       if (state.sketch.active) {
         const k = e.key.toLowerCase()
         if ((k === 'z' || k === 'y') && ctrl) return
+      }
+
+      // Standard views: Shift+1..7 and the numpad (lib/view-shortcuts.ts).
+      // Read from the physical key, so it is checked before the switch on
+      // `e.key` below -- the old numpad cases compared `e.key` to 'numpad1',
+      // which is a `code`, never a `key`, so no view key ever fired.
+      const view = viewPresetForKey(e)
+      if (view) {
+        e.preventDefault()
+        state.setCameraPreset(view)
+        return
       }
 
       switch (e.key.toLowerCase()) {
@@ -176,49 +211,12 @@ export function useKeyboardShortcuts() {
           }
           break
 
-        // Camera presets (numpad)
-        case 'numpad1':
-          e.preventDefault()
-          state.setCameraPreset(e.ctrlKey ? 'back' : 'front')
-          break
-        case 'numpad3':
-          e.preventDefault()
-          state.setCameraPreset(e.ctrlKey ? 'left' : 'right')
-          break
-        case 'numpad7':
-          e.preventDefault()
-          state.setCameraPreset(e.ctrlKey ? 'bottom' : 'top')
-          break
-        case 'numpad0':
-          e.preventDefault()
-          state.setCameraPreset('isometric')
-          break
-
-        // Delete selected. Route through the canonical REST endpoint —
-        // the same one ModelTree's context menu uses — so the kernel,
-        // timeline, and viewport stay in sync. Local removal happens via
-        // the `ObjectDeleted` broadcast (ws-bridge.ts) so a server-side
-        // failure leaves the scene in sync with the kernel rather than
-        // creating ghosts. The previous implementation sent a
-        // `DeleteObject` WS command that had no backend handler, so the
-        // object vanished from the viewport but persisted in the kernel.
+        // Delete selected, through the kernel (see `deleteSelectedParts`).
         case 'delete':
         case 'backspace':
           if (!ctrl) {
             e.preventDefault()
-            const ids = Array.from(state.selectedIds)
-            for (const id of ids) {
-              void fetch(`${API_BASE}/api/geometry/${id}`, { method: 'DELETE' })
-                .then((resp) => {
-                  if (!resp.ok) {
-                    return resp.text().catch(() => '').then((text) => {
-                      console.error('[shortcuts] delete failed:', resp.status, text)
-                    })
-                  }
-                  return undefined
-                })
-                .catch((err) => console.error('[shortcuts] delete error:', err))
-            }
+            void deleteSelectedParts()
           }
           break
 

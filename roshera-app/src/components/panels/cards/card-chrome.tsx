@@ -55,23 +55,36 @@ interface CardShellProps {
   title: ReactNode
   /** Right-aligned chip(s) in the header row. */
   chip?: ReactNode
+  /** The title as plain text. When given, the header stays on ONE line: the
+   *  title truncates with an ellipsis (this text on hover) and the chip keeps
+   *  its place at the right edge instead of dropping to a line of its own. */
+  titleText?: string
   children?: ReactNode
 }
 
-export function CardShell({ accent, icon: Icon, title, chip, children }: CardShellProps) {
+export function CardShell({ accent, icon: Icon, title, chip, titleText, children }: CardShellProps) {
   const a = ACCENT[accent]
   return (
     <ChalkReveal framed className={cn('my-1.5', a.chalk)}>
       <div
         className={cn(
-          'select-text rounded-md border border-border/70 border-l-2 bg-card/50 px-3 py-2 text-xs',
+          // `@container`: the card's contents lay themselves out by the CARD's
+          // width (a 320px docked Blackboard vs a wide panel), not the window's.
+          '@container select-text rounded-md border border-border/70 border-l-2 bg-card/50 px-3 py-2 text-xs',
           a.edge,
         )}
       >
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <div className={cn('flex items-center gap-x-2 gap-y-1', titleText === undefined && 'flex-wrap')}>
           <Icon size={13} className={cn('shrink-0', a.text)} />
-          <span className="font-medium text-foreground/90">{title}</span>
-          {chip !== undefined && <span className="ml-auto flex items-center gap-1.5">{chip}</span>}
+          <span
+            title={titleText}
+            className={cn('font-medium text-foreground/90', titleText !== undefined && 'min-w-0 truncate')}
+          >
+            {title}
+          </span>
+          {chip !== undefined && (
+            <span className="ml-auto flex shrink-0 items-center gap-1.5">{chip}</span>
+          )}
         </div>
         {children}
       </div>
@@ -177,7 +190,15 @@ export function Claim({
  * professional"): the check's icon, its full name, the measured evidence,
  * and the verdict at the right edge -- a tick, a cross, "n/a" (nothing to
  * check on this part) or a dashed "not run" (not run is never a pass).
- * Rows sit in a `CertRows` grid so names, values and ticks align in columns.
+ *
+ * The row lays itself out by the width of the card it sits in (the nearest
+ * `@container`, which `CardShell` provides). In a wide card it is four
+ * aligned columns: icon | name | value | verdict. In a narrow card -- the
+ * docked Blackboard is 320px -- it is still ONE line (Varun, 2026-11-27:
+ * "every check should be single line only"): the name is never wrapped or
+ * broken, and the value sits right-aligned beside the verdict, using
+ * whatever that row has left; only a value that cannot fit is cut with an
+ * ellipsis, and it stays readable on hover.
  */
 export function CertRow({
   status,
@@ -202,38 +223,46 @@ export function CertRow({
       title={title}
       aria-label={`${name}: ${verdict}`}
       className={cn(
-        'contents text-[11px] leading-5',
+        'col-span-full grid grid-cols-subgrid items-center border-b border-border/30 py-1 text-[11px] leading-4 last:border-b-0',
         status === false ? 'text-foreground' : status === true ? 'text-foreground/90' : 'text-foreground/70',
       )}
       role="row"
     >
-      <span role="cell" className="inline-flex items-center text-muted-foreground">
-        <Icon size={12} />
+      {/* 16px is the smallest size the icon set is rendered at: drawn at its
+          native size the pictograph stays crisp instead of a scaled blur. */}
+      <span role="presentation" className="inline-flex items-center">
+        <Icon size={16} />
       </span>
-      <span role="cell" className={cn(status === false && 'font-medium')}>
-        {name}
-      </span>
-      <span role="cell" className="cad-readout text-right font-mono text-[11px] text-muted-foreground">
-        {value}
+      <span className="flex min-w-0 items-baseline justify-between gap-3 @xs:contents">
+        <span role="cell" className={cn('shrink-0 whitespace-nowrap', status === false && 'font-medium')}>
+          {name}
+        </span>
+        <span
+          role="cell"
+          title={typeof value === 'string' ? value : undefined}
+          className="cad-readout min-w-0 truncate text-right font-mono text-[11px] text-muted-foreground empty:hidden @xs:pl-3"
+        >
+          {value}
+        </span>
       </span>
       <span
         role="cell"
         className={cn(
-          'inline-flex items-center justify-end',
+          'col-end-[-1] inline-flex items-center justify-end pl-3',
           status === true && 'text-emerald-600 dark:text-emerald-400',
           status === false && 'text-red-600 dark:text-red-400',
           status === null && 'text-caution',
-          status === 'na' && 'font-mono text-[10px] text-muted-foreground',
+          status === 'na' && 'font-mono text-[11px] text-muted-foreground',
         )}
       >
         {status === true ? (
-          <Check size={13} />
+          <Check size={16} />
         ) : status === false ? (
-          <X size={13} />
+          <X size={16} />
         ) : status === 'na' ? (
           'n/a'
         ) : (
-          <span className="rounded border border-dashed border-caution-border px-1 font-mono text-[10px] leading-4">
+          <span className="whitespace-nowrap rounded border border-dashed border-caution-border px-1 font-mono text-[11px] leading-4">
             not run
           </span>
         )}
@@ -242,12 +271,19 @@ export function CertRow({
   )
 }
 
-/** The aligned grid `CertRow`s sit in: icon | name | value | verdict. */
+/**
+ * The aligned grid `CertRow`s sit in. Three columns in a narrow card
+ * (icon | name ... value | verdict, each row sharing its own line), four in
+ * a wide one (icon | name | value | verdict, aligned down the card). The
+ * name column is as wide as the longest name. Words are never split: the Blackboard's
+ * message wrapper sets `break-words` for prose, which would otherwise cut a
+ * claim name in half ("Watertig / ht") the moment a column ran short.
+ */
 export function CertRows({ children }: { children: ReactNode }) {
   return (
     <div
       role="table"
-      className="mt-2 grid grid-cols-[22px_minmax(0,1fr)_auto_auto] items-center border-t border-border/60 pt-1 [&>div>span]:self-stretch [&>div>span]:border-b [&>div>span]:border-border/30 [&>div>span]:py-1 [&>div>span:nth-child(3)]:pl-3 [&>div>span:nth-child(4)]:pl-3"
+      className="mt-2 grid grid-cols-[24px_minmax(0,1fr)_auto] border-t border-border/60 [overflow-wrap:normal] [word-break:normal] @xs:grid-cols-[24px_max-content_minmax(0,1fr)_auto]"
     >
       {children}
     </div>
@@ -312,7 +348,7 @@ export function ClaimBadge({
           status === true && 'text-emerald-600 dark:text-emerald-400',
           status === false && 'text-red-600 dark:text-red-400',
           status === null && 'text-caution ',
-          status === 'na' && 'font-mono text-[10px] text-muted-foreground',
+          status === 'na' && 'font-mono text-[11px] text-muted-foreground',
         )}
       >
         {status === true ? (

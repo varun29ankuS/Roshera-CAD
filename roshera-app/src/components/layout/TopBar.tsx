@@ -33,8 +33,8 @@ import { runNewProject } from '@/lib/new-project'
 import { useDocumentStore } from '@/stores/document-store'
 import { UnitSelector } from '@/components/layout/UnitSelector'
 import { timelineAction } from '@/lib/history'
-
-const API_BASE = import.meta.env.VITE_API_URL || ''
+import { VIEW_SHORTCUT_LABEL, type StandardView } from '@/lib/view-shortcuts'
+import { deleteSelectedParts } from '@/lib/shortcuts'
 
 // Two-step export (POST /api/export → GET /api/download/:filename) is
 // implemented in `lib/export-api.ts` and shared with the ToolBar Export
@@ -61,6 +61,7 @@ export function TopBar() {
   const setGridSettings = useSceneStore((s) => s.setGridSettings)
   const setSelectionMode = useSceneStore((s) => s.setSelectionMode)
   const selectionMode = useSceneStore((s) => s.selectionMode)
+  const hasSelection = useSceneStore((s) => s.selectedIds.size > 0)
   const status = useWSStore((s) => s.status)
   const docMode = useDocModeStore((s) => s.mode) ?? 'part'
   const setDocMode = useDocModeStore((s) => s.setMode)
@@ -116,29 +117,6 @@ export function TopBar() {
     )
   }, [])
 
-  const handleDelete = useCallback(() => {
-    // Route through the canonical REST endpoint — the same one
-    // ModelTree's context menu uses — so the kernel, timeline, and
-    // viewport stay in sync. Local removal arrives via the
-    // `ObjectDeleted` broadcast (ws-bridge.ts); the previous
-    // implementation sent a `DeleteObject` WS command that had no
-    // backend handler.
-    const state = useSceneStore.getState()
-    const ids = Array.from(state.selectedIds)
-    for (const id of ids) {
-      void fetch(`${API_BASE}/api/geometry/${id}`, { method: 'DELETE' })
-        .then((resp) => {
-          if (!resp.ok) {
-            return resp.text().catch(() => '').then((text) => {
-              console.error('[topbar] delete failed:', resp.status, text)
-            })
-          }
-          return undefined
-        })
-        .catch((err) => console.error('[topbar] delete error:', err))
-    }
-  }, [])
-
   const handleSelectAll = useCallback(() => {
     const state = useSceneStore.getState()
     for (const id of state.objectOrder) {
@@ -162,7 +140,10 @@ export function TopBar() {
           </MenubarTrigger>
           <MenubarContent>
             <MenubarItem onClick={handleNewProject}>
-              New Project <MenubarShortcut>Ctrl+N</MenubarShortcut>
+              {/* No shortcut is printed: Ctrl+N is the browser's "new window"
+                  and never reaches the page, so a hint here would be a key
+                  that does nothing. */}
+              New Project
             </MenubarItem>
             <MenubarSeparator />
             {/* Import: STEP is the only format the backend can ingest today
@@ -219,7 +200,9 @@ export function TopBar() {
               Redo <MenubarShortcut>Ctrl+Shift+Z</MenubarShortcut>
             </MenubarItem>
             <MenubarSeparator />
-            <MenubarItem onClick={handleDelete}>
+            {/* Nothing selected, nothing to delete: the item says so by
+                being unavailable instead of doing nothing when clicked. */}
+            <MenubarItem disabled={!hasSelection} onClick={() => void deleteSelectedParts()}>
               Delete <MenubarShortcut>Del</MenubarShortcut>
             </MenubarItem>
             <MenubarItem onClick={handleSelectAll}>
@@ -236,9 +219,9 @@ export function TopBar() {
             {Object.entries(CAMERA_PRESETS).map(([key, preset]) => (
               <MenubarItem key={key} onClick={() => setCameraPreset(key)}>
                 {preset.name}
-                {key === 'front' && <MenubarShortcut>1</MenubarShortcut>}
-                {key === 'right' && <MenubarShortcut>3</MenubarShortcut>}
-                {key === 'top' && <MenubarShortcut>7</MenubarShortcut>}
+                {key in VIEW_SHORTCUT_LABEL && (
+                  <MenubarShortcut>{VIEW_SHORTCUT_LABEL[key as StandardView]}</MenubarShortcut>
+                )}
               </MenubarItem>
             ))}
             <MenubarSeparator />
@@ -261,25 +244,25 @@ export function TopBar() {
               onClick={() => setSelectionMode('object')}
               className={selectionMode === 'object' ? 'bg-accent' : ''}
             >
-              Object Mode <MenubarShortcut>1</MenubarShortcut>
+              Part <MenubarShortcut>1</MenubarShortcut>
             </MenubarItem>
             <MenubarItem
               onClick={() => setSelectionMode('face')}
               className={selectionMode === 'face' ? 'bg-accent' : ''}
             >
-              Face Mode <MenubarShortcut>2</MenubarShortcut>
+              Face <MenubarShortcut>2</MenubarShortcut>
             </MenubarItem>
             <MenubarItem
               onClick={() => setSelectionMode('edge')}
               className={selectionMode === 'edge' ? 'bg-accent' : ''}
             >
-              Edge Mode <MenubarShortcut>3</MenubarShortcut>
+              Edge <MenubarShortcut>3</MenubarShortcut>
             </MenubarItem>
             <MenubarItem
               onClick={() => setSelectionMode('vertex')}
               className={selectionMode === 'vertex' ? 'bg-accent' : ''}
             >
-              Vertex Mode <MenubarShortcut>4</MenubarShortcut>
+              Vertex <MenubarShortcut>4</MenubarShortcut>
             </MenubarItem>
           </MenubarContent>
         </MenubarMenu>

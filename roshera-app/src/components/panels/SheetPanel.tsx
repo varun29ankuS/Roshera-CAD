@@ -207,11 +207,11 @@ export function SheetPanel({
                     {v.name}
                   </button>
                   {v.dimensions.length > 0 && (
-                    <span className="text-[10.5px] tabular-nums text-muted-foreground" title={`${v.dimensions.length} dimensions`}>
+                    <span className="text-[11px] tabular-nums text-muted-foreground" title={`${v.dimensions.length} dimensions`}>
                       {v.dimensions.length} dims
                     </span>
                   )}
-                  <span className="font-mono text-[10.5px] text-muted-foreground" title="Scale">
+                  <span className="font-mono text-[11px] text-muted-foreground" title="Scale">
                     {v.scale}
                   </span>
                   <button

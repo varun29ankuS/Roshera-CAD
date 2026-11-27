@@ -56,8 +56,8 @@ function Section({ title, count, action, children }: { title: string; count?: nu
   return (
     <section className="border-t border-border/70">
       <div className="flex items-center gap-1.5 px-3 pb-1 pt-2">
-        <span className="text-[10.5px] font-medium uppercase tracking-[0.08em] text-muted-foreground">{title}</span>
-        {count !== undefined && <span className="text-[10.5px] text-muted-foreground">{count}</span>}
+        <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">{title}</span>
+        {count !== undefined && <span className="text-[11px] text-muted-foreground">{count}</span>}
         <span className="flex-1" />
         {action}
       </div>
@@ -345,7 +345,7 @@ export function AssemblyWorkspace() {
                             className="cad-focus flex flex-col items-center rounded border border-border bg-card py-1 hover:border-[var(--cad-selected)]"
                           >
                             <span className="text-[15px] leading-none">{mateGlyph(j.kind)}</span>
-                            <span className="mt-0.5 text-[10.5px]">{j.label}</span>
+                            <span className="mt-0.5 text-[11px]">{j.label}</span>
                           </button>
                         ))}
                       </div>

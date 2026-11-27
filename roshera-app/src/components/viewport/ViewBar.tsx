@@ -33,7 +33,7 @@ export function ViewBar() {
 
   const btn = (on: boolean) =>
     cn(
-      'cad-focus h-6 rounded px-2 text-[11.5px] transition-colors',
+      'cad-focus h-6 shrink-0 whitespace-nowrap rounded px-2 text-[11.5px] transition-colors',
       on ? 'bg-muted font-medium text-foreground' : 'text-muted-foreground hover:bg-accent hover:text-foreground',
     )
 
@@ -41,7 +41,9 @@ export function ViewBar() {
     <div
       role="toolbar"
       aria-label="View"
-      className="pointer-events-auto flex items-center gap-px rounded-lg border border-border bg-card/95 p-0.5 shadow-sm"
+      // In a narrow window the bar scrolls sideways inside its slot rather than
+      // wrapping a label or sliding under the panels beside it.
+      className="pointer-events-auto flex max-w-full items-center gap-px overflow-x-auto rounded-lg border border-border bg-card/95 p-0.5 shadow-sm [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
     >
       <button type="button" className={btn(edges)} aria-pressed={edges} onClick={() => setEdgeSettings({ visible: true })}>
         Shaded + edges

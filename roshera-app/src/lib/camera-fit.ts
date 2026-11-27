@@ -56,3 +56,44 @@ export function frameView(
   if (kind === 'new' && !sketching) return { direction: ISO_DIRECTION, up: Z_UP }
   return { direction: current, up: usable ? currentUp : Z_UP }
 }
+
+/** How long a view change takes (a named view, Fit, a part being framed).
+ *  A third of a second: long enough to see which way the model turned,
+ *  short enough never to be waited for. It was 0.6 s. */
+export const FLY_SECONDS = 0.3
+
+/** The longest step one frame may take. The canvas renders on demand, so the
+ *  first frame of a fly reports the time since the LAST frame drawn -- often
+ *  many seconds -- and an unclamped step finished the whole fly in that one
+ *  frame: the view jumped instead of turning. */
+const FLY_MAX_STEP_SECONDS = 1 / 30
+
+/** A fly's progress (0..1) after one more frame of `deltaSeconds`. With
+ *  reduced motion the view arrives at once. */
+export function advanceFly(progress: number, deltaSeconds: number, reducedMotion: boolean): number {
+  if (reducedMotion) return 1
+  const step = Math.min(Math.max(deltaSeconds, 0), FLY_MAX_STEP_SECONDS)
+  return Math.min(progress + step / FLY_SECONDS, 1)
+}
+
+/** The view a camera opens with when the model is already loaded and no view
+ *  was kept for it (the Assembly viewport's first visit): the iso view,
+ *  fitted, Z up. Its fixed start pose is 30 mm from the origin -- inside any
+ *  real part. `zoom` gives an orthographic camera the same footprint on a
+ *  viewport `viewportHeightPx` tall. */
+export function openingPose(
+  center: [number, number, number],
+  radius: number,
+  vfovDeg: number,
+  aspect: number,
+  viewportHeightPx: number,
+): { position: [number, number, number]; target: [number, number, number]; up: [number, number, number]; zoom: number } {
+  const d = fitDistance(radius, vfovDeg, aspect)
+  const zoom = viewportHeightPx > 0 ? viewportHeightPx / (2 * d * Math.tan((vfovDeg * Math.PI) / 360)) : 1
+  return {
+    position: [center[0] + ISO_DIRECTION[0] * d, center[1] + ISO_DIRECTION[1] * d, center[2] + ISO_DIRECTION[2] * d],
+    target: [center[0], center[1], center[2]],
+    up: [Z_UP[0], Z_UP[1], Z_UP[2]],
+    zoom,
+  }
+}

@@ -75,7 +75,7 @@ export function SheetCard({ card }: { card: SheetCardData }) {
           title={`layout check — no collisions or redundant dimensions: ${BADGE_WORD(layout)}`}
         />
       </CertRows>
-      <div className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-0.5">
+      <div className="mt-1.5 grid grid-cols-1 gap-x-4 gap-y-0.5 @xs:grid-cols-2">
         {card.projection && (
           <KV label="projection">{card.projection === 'first' ? 'first angle (ISO)' : 'third angle (ASME)'}</KV>
         )}

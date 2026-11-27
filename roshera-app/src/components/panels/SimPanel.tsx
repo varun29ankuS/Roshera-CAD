@@ -316,13 +316,13 @@ export function SimPanel() {
               >
                 <span
                   className={cn(
-                    'flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-semibold',
+                    'flex h-5 w-5 items-center justify-center rounded-full text-[11px] font-semibold',
                     done[s.id] ? 'bg-emerald-600 text-white' : here ? 'bg-sky-600 text-white' : 'border border-border text-muted-foreground',
                   )}
                 >
                   {done[s.id] ? <Check size={11} aria-hidden /> : i + 1}
                 </span>
-                <span className="truncate text-[10px] font-medium">{s.label}</span>
+                <span className="truncate text-[11px] font-medium">{s.label}</span>
               </button>
             </li>
           )
@@ -422,7 +422,7 @@ export function SimPanel() {
                     }}
                   >
                     <Plus size={11} aria-hidden /> {k.label}
-                    {!k.solved && <span className="text-[10px] text-muted-foreground"> (check only)</span>}
+                    {!k.solved && <span className="text-[11px] text-muted-foreground"> (check only)</span>}
                   </button>
                 ))}
               </div>
@@ -781,7 +781,7 @@ function MeshStep({
           aria-label="Mesh density"
           className="w-full accent-sky-600"
         />
-        <div className="flex justify-between text-[10px] text-muted-foreground">
+        <div className="flex justify-between text-[11px] text-muted-foreground">
           <span>Coarse · faster</span>
           <span className="font-medium text-foreground">{DENSITY[stop].label}</span>
           <span>Fine · more accurate</span>

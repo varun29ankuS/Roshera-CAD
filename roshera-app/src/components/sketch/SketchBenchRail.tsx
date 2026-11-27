@@ -116,7 +116,7 @@ function RailButton({ item }: { item: RailItem }) {
       )}
     >
       <item.icon size={18} />
-      <span className="w-full truncate text-center text-[9.5px] leading-tight">{item.label}</span>
+      <span className="w-full truncate text-center text-[11px] leading-tight">{item.label}</span>
     </button>
   )
 }
@@ -124,7 +124,7 @@ function RailButton({ item }: { item: RailItem }) {
 function Group({ label, items }: { label: string; items: RailItem[] }) {
   return (
     <>
-      <span className="col-span-2 mt-1.5 text-center text-[10px] font-medium tracking-[0.08em] text-muted-foreground">{label}</span>
+      <span className="col-span-2 mt-1.5 text-center text-[11px] font-medium tracking-[0.08em] text-muted-foreground">{label}</span>
       {items.map((d) => (
         <RailButton key={d.id} item={d} />
       ))}
@@ -222,7 +222,7 @@ export function SketchBenchRail() {
       <div className="grid min-h-0 w-full flex-1 grid-cols-2 content-start justify-items-center gap-px overflow-y-auto py-1 [scrollbar-width:none]">
         <Group label="DRAW" items={withTool(DRAW)} />
         {tool === 'polygon' && (
-          <label className="col-span-2 flex items-center justify-center gap-1 text-[10px] text-muted-foreground">
+          <label className="col-span-2 flex items-center justify-center gap-1 text-[11px] text-muted-foreground">
             Sides
             <input
               type="number"

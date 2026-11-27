@@ -91,8 +91,14 @@ test('a panel about one dimension or one sheet is keyed by it', () => {
     /<DimensionPanel\s+key=\{`\$\{activeDrawing\.id\}:\$\{dimEdit\.dim\.id\}`\}/.test(ws),
     'the dimension panel: a half-written suppression must not move to the next dimension clicked',
   )
-  assert.ok(/<CompletenessChip\s+key=\{activeDrawing\.id\}/.test(ws), 'the completeness card')
-  assert.ok(/<TitleBlockCard\s+key=\{activeDrawing\.id\}/.test(ws), 'the title block card')
+  // Both are keyed by the sheet, and by DIFFERENT keys: they are siblings, and
+  // two siblings sharing one key (the bare sheet id) is a React error the
+  // moment the title block card opens beside the certificate chip.
+  const chip = /<CompletenessChip\s+key=\{(`[^`]*\$\{activeDrawing\.id\}[^`]*`)\}/.exec(ws)
+  const title = /<TitleBlockCard\s+key=\{(`[^`]*\$\{activeDrawing\.id\}[^`]*`)\}/.exec(ws)
+  assert.ok(chip, 'the completeness card is keyed by the sheet')
+  assert.ok(title, 'the title block card is keyed by the sheet')
+  assert.notEqual(chip[1], title[1], 'sibling cards do not share a key')
 })
 
 test('coming back to the Drawing workspace re-reads the open sheet', () => {

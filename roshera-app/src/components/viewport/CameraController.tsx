@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { useSketchBench } from '@/stores/sketch-bench-store'
 import { keepCameraPose, keptCameraPose } from '@/lib/camera-memory'
-import { FIT_MARGIN, fitDistance, frameView } from '@/lib/camera-fit'
+import { FIT_MARGIN, advanceFly, fitDistance, frameView, openingPose } from '@/lib/camera-fit'
 import { CAMERA_PRESETS, FRAME_ALL, FRAME_FIT, FRAME_NEW } from '@/stores/scene-store'
 import { useThree, useFrame } from '@react-three/fiber'
 import {
@@ -15,7 +15,8 @@ import * as THREE from 'three'
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type OrbitControlsRef = any
 
-const ANIMATION_DURATION = 0.6
+const prefersReducedMotion = () =>
+  typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
 const EASE_OUT_CUBIC = (t: number) => 1 - Math.pow(1 - t, 3)
 
 interface CameraAnimation {
@@ -54,7 +55,7 @@ const MAX_DOLLY_FLOOR = 500 // never tighter than the previous maxDistance
  *  transformed by its placement — the basis for all scene-adaptive framing. */
 function computeSceneBounds(
   objects: Map<string, CADObject>,
-): { center: THREE.Vector3; radius: number } {
+): { center: THREE.Vector3; radius: number; empty: boolean } {
   const min = new THREE.Vector3(Infinity, Infinity, Infinity)
   const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity)
   const v = new THREE.Vector3()
@@ -77,10 +78,10 @@ function computeSceneBounds(
       any = true
     }
   }
-  if (!any) return { center: new THREE.Vector3(0, 0, 0), radius: MIN_SCENE_RADIUS }
+  if (!any) return { center: new THREE.Vector3(0, 0, 0), radius: MIN_SCENE_RADIUS, empty: true }
   const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5)
   const radius = Math.max(new THREE.Vector3().subVectors(max, min).length() * 0.5, 1e-3)
-  return { center, radius }
+  return { center, radius, empty: false }
 }
 
 export function CameraController() {
@@ -92,6 +93,7 @@ export function CameraController() {
   // requested frame, so starting one must request the first frame and each
   // animated frame must request the next.
   const invalidate = useThree((s) => s.invalidate)
+  const getThree = useThree((s) => s.get)
   const perspRef = useRef<THREE.PerspectiveCamera>(null)
   const orthoRef = useRef<THREE.OrthographicCamera>(null)
 
@@ -134,9 +136,30 @@ export function CameraController() {
   // origin -- inside any real part -- and nothing re-frames it, so the
   // pose is kept on the way out and put back on the way in (both
   // cameras, so a projection toggle afterwards stays seamless).
+  //
+  // With no view kept and the model already loaded (the Assembly viewport's
+  // first visit -- the Part viewport is only parked, so it never handed a
+  // view over), the camera opens fitted on the model instead of at that
+  // start pose inside it. An empty scene keeps the start pose; the first
+  // part to arrive is framed by the auto-frame effect below.
   useLayoutEffect(() => {
     const controls = controlsRef.current
-    const pose = keptCameraPose()
+    let pose = keptCameraPose()
+    if (controls && !pose) {
+      const bounds = computeSceneBounds(useSceneStore.getState().objects)
+      const persp = perspRef.current
+      if (!bounds.empty && persp) {
+        const { width, height } = getThree().size
+        const aspect = width > 0 && height > 0 ? width / height : persp.aspect
+        pose = openingPose(
+          [bounds.center.x, bounds.center.y, bounds.center.z],
+          bounds.radius,
+          persp.fov,
+          aspect,
+          height,
+        )
+      }
+    }
     if (controls && pose) {
       for (const cam of [perspRef.current, orthoRef.current]) {
         if (!cam) continue
@@ -163,7 +186,7 @@ export function CameraController() {
         zoom: ortho?.zoom ?? 1,
       })
     }
-  }, [invalidate])
+  }, [invalidate, getThree])
 
   // When the projection toggles, copy the outgoing camera's transform
   // onto the incoming one so the swap is visually seamless. Runs once
@@ -319,7 +342,7 @@ export function CameraController() {
   // object's transform, place the camera along its current viewing
   // direction at a distance derived from the perspective fov (or 3×
   // the bounding radius for orthographic), and animate over the same
-  // 0.6 s ease-out as preset switches.
+  // ease-out fly as preset switches (FLY_SECONDS).
   useEffect(() => {
     if (!pendingFrameObjectId || !controlsRef.current) return
     const controls = controlsRef.current
@@ -450,8 +473,8 @@ export function CameraController() {
     const anim = animRef.current
     if (!anim || !controlsRef.current) return
 
-    anim.progress += delta / ANIMATION_DURATION
-    const t = Math.min(anim.progress, 1)
+    anim.progress = advanceFly(anim.progress, delta, prefersReducedMotion())
+    const t = anim.progress
     const eased = EASE_OUT_CUBIC(t)
 
     camera.position.lerpVectors(anim.startPosition, anim.endPosition, eased)

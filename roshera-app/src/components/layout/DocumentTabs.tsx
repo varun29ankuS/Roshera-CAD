@@ -175,6 +175,15 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
   // Visible tabs = the documents opened in this browser, and the active one
   // ALWAYS, so the document you're standing in can never vanish.
   const tabs = useMemo(() => visibleTabs(documents, openIds), [documents, openIds])
+  // Keep the open document's tab in view: with many tabs it could sit
+  // scrolled out of the strip, leaving no sign of which document is open.
+  const tabStripRef = useRef<HTMLDivElement>(null)
+  const activeTabId = tabs.find((d) => d.active)?.id
+  useEffect(() => {
+    tabStripRef.current
+      ?.querySelector('[data-active]')
+      ?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [activeTabId, tabs.length])
   // Newest first: the document someone wants back is almost always a recent
   // one, and the list holds every document ever made.
   const hiddenDocuments = useMemo(() => hiddenDocumentsOf(documents, openIds), [documents, openIds])
@@ -338,7 +347,18 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
           `elementFromPoint` hit the panel behind it). The `+` button and
           its dropdown below live OUTSIDE this scroller so they're never
           clipped. */}
-      <div className="flex items-center gap-1 h-full overflow-x-auto min-w-0" role="tablist" aria-label="Open documents">
+      <div
+        ref={tabStripRef}
+        // No scrollbar: a native bar with arrow buttons inside a 36px top bar
+        // is taller than the tabs it scrolls. The wheel moves the strip
+        // sideways, and the open document's tab is always brought into view.
+        onWheel={(e) => {
+          if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY
+        }}
+        className="flex items-center gap-1 h-full overflow-x-auto min-w-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        role="tablist"
+        aria-label="Open documents"
+      >
       {tabs.map((doc) => {
         const isSwitchingHere = switchingId === doc.id
         const onlyTab = tabs.length === 1
@@ -347,6 +367,13 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
             key={doc.id}
             role="tab"
             aria-selected={doc.active}
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+                e.preventDefault()
+                void handleSwitch(doc)
+              }
+            }}
             aria-busy={isSwitchingHere || undefined}
             data-active={doc.active || undefined}
             data-switching={isSwitchingHere || undefined}
@@ -365,7 +392,7 @@ export function DocumentTabs({ inline = false }: { inline?: boolean } = {}) {
               // (a 10% wash of a near-black primary over a near-white bar, a
               // solid dot) read as a hover state, and the dot reads as
               // "unsaved" in every editor an engineer has used.
-              'group relative flex h-7 items-center gap-1.5 pl-2.5 pr-1 rounded-t border text-[12px] shrink-0 max-w-[180px] cursor-pointer transition-colors',
+              'cad-focus group relative flex h-7 items-center gap-1.5 pl-2.5 pr-1 rounded-t border text-[12px] shrink-0 max-w-[180px] cursor-pointer transition-colors',
               'after:pointer-events-none after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:content-[""]',
               doc.active
                 ? 'bg-background border-border-strong/70 text-foreground font-semibold shadow-sm after:bg-primary'

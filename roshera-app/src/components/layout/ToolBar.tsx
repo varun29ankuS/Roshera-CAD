@@ -1134,7 +1134,7 @@ function RailTool({ item }: { item: ToolItem }) {
       )}
     >
       <item.icon size={22} />
-      <span className="w-full truncate text-center text-[10.5px] leading-tight">{item.label}</span>
+      <span className="w-full truncate text-center text-[11px] leading-tight">{item.label}</span>
     </button>
   )
 }
@@ -1198,7 +1198,7 @@ function FlyoutGroup({ group, label, openId, onToggle }: {
         aria-expanded={isOpen}
       >
         <group.icon size={22} />
-        <span className="w-full truncate text-center text-[10.5px] leading-tight">{label}</span>
+        <span className="w-full truncate text-center text-[11px] leading-tight">{label}</span>
         {/* Variants inside: the small corner mark, as CAD toolbars show it. */}
         <span aria-hidden className="absolute right-1 top-1 text-[8px] leading-none text-muted-foreground">▸</span>
       </button>
@@ -1535,7 +1535,7 @@ export function ToolBar() {
         <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-px overflow-y-auto py-1 [scrollbar-width:none]">
         {rail.map((entry, i) =>
           entry.kind === 'cap' ? (
-            <span key={`cap-${entry.label}`} className="mt-1.5 text-[10px] font-medium tracking-[0.08em] text-muted-foreground">
+            <span key={`cap-${entry.label}`} className="mt-1.5 text-[11px] font-medium tracking-[0.08em] text-muted-foreground">
               {entry.label}
             </span>
           ) : entry.kind === 'tool' ? (
