@@ -13,6 +13,9 @@ pub mod simple_box;
 pub mod surface;
 pub(crate) mod trim_index;
 
+#[cfg(test)]
+mod planar_collinear_run_tests;
+
 // Re-export main types
 pub use adaptive::AdaptiveTessellator;
 pub use curve::{tessellate_curve, tessellate_edge};

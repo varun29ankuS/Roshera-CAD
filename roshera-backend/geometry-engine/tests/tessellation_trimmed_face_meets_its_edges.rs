@@ -14,6 +14,7 @@
 //! * a sector of a cone that includes the apex, whose outline was unwrapped
 //!   the wrong way round the pole (CADGenBench part 244).
 
+use geometry_engine::harness::watertight::mesh_quality_of_mesh;
 use geometry_engine::math::nurbs::{interpolate_nurbs_curve, ParameterizationType};
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::primitives::curve::{Curve, Line, NurbsCurve, ParameterRange};
@@ -95,7 +96,7 @@ fn assert_meets_its_edges_and_has_area(
     edges: &[u32],
     true_area: f64,
     area_tolerance: f64,
-) {
+) -> TriangleMesh {
     let params = TessellationParams::coarse();
     let cache = EdgeSampleCache::new(&params);
     let mut mesh = TriangleMesh::new();
@@ -151,6 +152,7 @@ fn assert_meets_its_edges_and_has_area(
         (area - true_area).abs() < area_tolerance * true_area,
         "{label}: it covers the face, no more and no less: {area} against {true_area}"
     );
+    mesh
 }
 
 // ──────────────────────────── a small torus patch ─────────────────────────────
@@ -251,14 +253,30 @@ const HEIGHT: f64 = 3.0;
 /// the azimuths `from` and `from + sweep`: the model, its shell, its edges
 /// (side down, side up, rim) and the rim radius.
 fn cone_sector(from: f64, sweep: f64) -> (BRepModel, Shell, Vec<u32>, f64) {
+    cone_sector_with_apex_vertex(from, sweep, 0.0)
+}
+
+/// [`cone_sector`] with the vertex at the apex placed `up` above the cone's
+/// own apex, on the cone, at the middle of the sector: where an imported
+/// file's apex vertex is, to its last digits.
+fn cone_sector_with_apex_vertex(
+    from: f64,
+    sweep: f64,
+    up: f64,
+) -> (BRepModel, Shell, Vec<u32>, f64) {
     let mut model = BRepModel::new();
-    let apex_point = Point3::new(0.0, 0.0, 0.0);
-    let cone = Cone::new(apex_point, Vector3::Z, HALF_ANGLE).expect("cone");
+    let middle = from + 0.5 * sweep;
+    let apex_point = Point3::new(
+        up * HALF_ANGLE.tan() * middle.cos(),
+        up * HALF_ANGLE.tan() * middle.sin(),
+        up,
+    );
+    let cone = Cone::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, HALF_ANGLE).expect("cone");
     let surface = model.surfaces.add(Box::new(cone));
     let radius = HEIGHT * HALF_ANGLE.tan();
     let rim = |a: f64| Point3::new(radius * a.cos(), radius * a.sin(), HEIGHT);
     let (start, end) = (rim(from), rim(from + sweep));
-    let apex = model.vertices.add(0.0, 0.0, 0.0);
+    let apex = model.vertices.add(apex_point.x, apex_point.y, apex_point.z);
     let v_start = model.vertices.add(start.x, start.y, start.z);
     let v_end = model.vertices.add(end.x, end.y, end.z);
     let arc: Vec<Point3> = (0..=64)
@@ -279,17 +297,66 @@ fn cone_sector(from: f64, sweep: f64) -> (BRepModel, Shell, Vec<u32>, f64) {
 }
 
 fn assert_cone_sector_meets_its_edges(from: f64, sweep: f64) {
-    let (model, shell, edges, radius) = cone_sector(from, sweep);
+    assert_cone_sector_with_apex_vertex_meets_its_edges(from, sweep, 0.0);
+}
+
+fn assert_cone_sector_with_apex_vertex_meets_its_edges(
+    from: f64,
+    sweep: f64,
+    up: f64,
+) -> (BRepModel, TriangleMesh, f64) {
+    let (model, shell, edges, radius) = cone_sector_with_apex_vertex(from, sweep, up);
     // The sector's lateral area: sweep r l / 2.
     let slant = (radius * radius + HEIGHT * HEIGHT).sqrt();
-    assert_meets_its_edges_and_has_area(
-        &format!("cone sector from {from} sweeping {sweep}"),
+    let mesh = assert_meets_its_edges_and_has_area(
+        &format!("cone sector from {from} sweeping {sweep}, apex vertex {up} up"),
         &model,
         &shell,
         &edges,
         0.5 * sweep * radius * slant,
         0.03,
     );
+    (model, mesh, radius)
+}
+
+/// A drill point half whose apex VERTEX is two nanometres up the cone, as a
+/// file's is. The face reaches its apex all the same: it is meshed as the
+/// half with its vertex exactly on the apex is, not in the cone's log-polar
+/// development -- which has the apex infinitely far away, was built twenty
+/// units deep for these two nanometres, and grew a ring of points a
+/// micrometre from the apex with facets 0.002 mm long round it, two of which
+/// the certificate read as bridging the face (CADGenBench parts 244 and
+/// 243: every drill point).
+///
+/// RED with the apex check in `DevelopedChart::for_face` switched off.
+#[test]
+fn a_half_cone_whose_apex_vertex_is_a_hair_up_the_cone_is_meshed_to_its_apex() {
+    let quarter = std::f64::consts::FRAC_PI_2;
+    for from in [-quarter, quarter] {
+        let (model, mesh, radius) =
+            assert_cone_sector_with_apex_vertex_meets_its_edges(from, 2.0 * quarter, 2e-9);
+        let quality = mesh_quality_of_mesh(&model, &mesh).expect("quality");
+        assert_eq!(
+            quality.boundary_crossing_facets, 0,
+            "from {from}: no facet is read as bridging the face: {quality:?}"
+        );
+        // No ring of points crowded round the apex: every facet side is a
+        // real fraction of the rim's radius.
+        let mut shortest = f64::INFINITY;
+        for t in &mesh.triangles {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].position);
+            for (p, q) in [(a, b), (b, c), (c, a)] {
+                let length = (q - p).magnitude();
+                if length > 0.0 {
+                    shortest = shortest.min(length);
+                }
+            }
+        }
+        assert!(
+            shortest > 1e-3 * radius,
+            "from {from}: the shortest facet side is {shortest} on a cone of rim radius {radius}"
+        );
+    }
 }
 
 /// Regression test for the unwrap across the pole

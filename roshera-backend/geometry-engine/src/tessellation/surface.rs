@@ -1593,7 +1593,19 @@ pub(crate) fn triangulate_planar_polygon(
             // to recover it. Both halves are needed: the fan must not
             // claim the contour, and the fallback must not re-claim it.
             let recovered = matches!(e, cdt::Error::PointOnFixedEdge(_))
-                .then(|| cdt_refusal_fallback(&pts2d, outer_range, &inner_ranges))
+                .then(|| {
+                    cdt_refusal_fallback(&pts2d, outer_range, &inner_ranges).or_else(|| {
+                        // Not weakly convex, or holed: triangulate the
+                        // contour without the vertices in the middle of
+                        // its straight runs, and put them back after.
+                        let tris =
+                            triangulate_past_collinear_runs(&pts2d, outer_range, &inner_ranges);
+                        if tris.is_some() {
+                            trace("refused a straight run of vertices; triangulated without them and split them back in");
+                        }
+                        tris
+                    })
+                })
                 .flatten();
             recovered.unwrap_or_else(|| {
                 tracing::warn!(
@@ -1605,9 +1617,19 @@ pub(crate) fn triangulate_planar_polygon(
         }
         Err(_) => {
             trace("panicked");
-            // A panic carries no error class, so nothing here can prove
-            // the contour is merely collinear rather than self-crossing.
-            // Unchanged from before the fallback existed.
+            // A panic carries no error class, so the fan (which would
+            // mis-read a self-crossing contour) is not offered here. The
+            // straight-run answer is: it hands `cdt` the contour again
+            // without the vertices in the middle of its straight runs --
+            // the same input class that draws `PointOnFixedEdge` draws an
+            // out-of-bounds panic in another frame -- and keeps the result
+            // only if `cdt` accepts that contour and the triangles tile
+            // the polygon, neither of which a self-crossing contour does.
+            if let Some(tris) = triangulate_past_collinear_runs(&pts2d, outer_range, &inner_ranges)
+            {
+                trace("panicked on a straight run of vertices; triangulated without them and split them back in");
+                return tris;
+            }
             tracing::warn!("triangulate_planar_polygon: cdt panicked; emitting no triangles");
             Vec::new()
         }
@@ -1634,6 +1656,128 @@ fn cdt_refusal_fallback(
         return None;
     }
     fan_weakly_convex_polygon(pts2d, outer_range)
+}
+
+/// The second answer to a contour `cdt` refused with `PointOnFixedEdge`,
+/// for the ones the fan above cannot take (not weakly convex, or holed).
+///
+/// The refusal means a vertex lies exactly on a constraint edge. On a
+/// well-formed boundary that is a vertex in the MIDDLE of a straight run:
+/// a straight B-Rep edge the sample cache divided for a neighbour's sake,
+/// or two collinear edges meeting at a vertex (CADGenBench part 243, face
+/// 129: twelve collinear samples down one side of a face whose other side
+/// is curved, so not convex -- the face was emitted empty and the shell
+/// left open along all five of its neighbours). Those vertices carry no
+/// shape. So the contours are triangulated WITHOUT them, which `cdt` has no
+/// reason to refuse, and each is then put back by splitting the one
+/// triangle that has its straight run as a side into a fan over the run.
+/// Every boundary vertex is kept, in place (no T-junction against a
+/// neighbour), and the triangles cover exactly the polygon, which is
+/// checked: `None` if `cdt` still refuses, or the result does not tile.
+fn triangulate_past_collinear_runs(
+    pts2d: &[(f64, f64)],
+    outer_range: (usize, usize),
+    inner_ranges: &[(usize, usize)],
+) -> Option<Vec<[usize; 3]>> {
+    // Relative to the two segments' lengths: a vertex is in the middle of a
+    // straight run when it turns the boundary by less than this (radians)
+    // and does not turn it back on itself.
+    const STRAIGHT: f64 = 1e-12;
+    let mid_run = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+        let (ab, bc) = ((b.0 - a.0, b.1 - a.1), (c.0 - b.0, c.1 - b.1));
+        let (lab, lbc) = (ab.0.hypot(ab.1), bc.0.hypot(bc.1));
+        lab > 0.0
+            && lbc > 0.0
+            && (ab.0 * bc.1 - ab.1 * bc.0).abs() <= STRAIGHT * lab * lbc
+            && ab.0 * bc.0 + ab.1 * bc.1 > 0.0
+    };
+    // The kept vertices get compact indices (`cdt` inserts every point it is
+    // handed, constrained or not).
+    let mut kept_points: Vec<(f64, f64)> = Vec::new();
+    let mut original: Vec<usize> = Vec::new();
+    let mut contours: Vec<Vec<usize>> = Vec::new();
+    // Each straight run: its two kept ends and the vertices between, in
+    // loop order (original indices).
+    let mut runs: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    for &(s, e) in std::iter::once(&outer_range).chain(inner_ranges.iter()) {
+        let n = e - s;
+        let keep: Vec<bool> = (0..n)
+            .map(|i| {
+                !mid_run(
+                    pts2d[s + (i + n - 1) % n],
+                    pts2d[s + i],
+                    pts2d[s + (i + 1) % n],
+                )
+            })
+            .collect();
+        let first = keep.iter().position(|&k| k)?;
+        if keep.iter().filter(|&&k| k).count() < 3 {
+            return None;
+        }
+        let mut contour = Vec::new();
+        let mut between: Vec<usize> = Vec::new();
+        let mut run_start = s + first;
+        for step in 0..=n {
+            let i = (first + step) % n;
+            if !keep[i] {
+                between.push(s + i);
+                continue;
+            }
+            if step > 0 && !between.is_empty() {
+                runs.push((run_start, s + i, std::mem::take(&mut between)));
+            }
+            run_start = s + i;
+            if step < n {
+                contour.push(kept_points.len());
+                kept_points.push(pts2d[s + i]);
+                original.push(s + i);
+            }
+        }
+        let closing = *contour.first()?;
+        contour.push(closing);
+        contours.push(contour);
+    }
+    if runs.is_empty() {
+        return None; // nothing was in the way that this can step past
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cdt::triangulate_contours(&kept_points, &contours)
+    }));
+    let Ok(Ok(found)) = outcome else {
+        return None;
+    };
+    let mut tris: Vec<[usize; 3]> = found
+        .into_iter()
+        .map(|(a, b, c)| [original[a], original[b], original[c]])
+        .collect();
+    // Put each run's vertices back: the triangle with the run as a side
+    // becomes a fan from its far corner over the run, wound as it was.
+    for (from, to, between) in runs {
+        let (t, k) = tris.iter().enumerate().find_map(|(t, tri)| {
+            (0..3)
+                .find(|&k| {
+                    let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                    (a == from && b == to) || (a == to && b == from)
+                })
+                .map(|k| (t, k))
+        })?;
+        let tri = tris[t];
+        let (a, far) = (tri[k], tri[(k + 2) % 3]);
+        // The run from the side's first corner to its second.
+        let mut along: Vec<usize> = Vec::with_capacity(between.len() + 2);
+        along.push(a);
+        if a == from {
+            along.extend(between.iter().copied());
+        } else {
+            along.extend(between.iter().rev().copied());
+        }
+        along.push(tri[(k + 1) % 3]);
+        tris.swap_remove(t);
+        for pair in along.windows(2) {
+            tris.push([pair[0], pair[1], far]);
+        }
+    }
+    tiles_polygon(pts2d, &tris, outer_range, inner_ranges).then_some(tris)
 }
 
 /// Triangulate a CONCENTRIC-CIRCLE ANNULUS (one outer ring + one inner ring) as a

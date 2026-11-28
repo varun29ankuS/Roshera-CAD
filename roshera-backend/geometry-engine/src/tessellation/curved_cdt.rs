@@ -1508,6 +1508,25 @@ pub(crate) struct DevelopedChart<'a> {
 impl<'a> DevelopedChart<'a> {
     /// `uv_points`: every projected (unwrapped) boundary sample of the face.
     pub(crate) fn for_face(inner: &'a dyn Surface, uv_points: &[(f64, f64)]) -> Option<Self> {
+        // A cone face that reaches its apex has no development here: the
+        // chart is log-polar, and the apex is infinitely far down it.
+        // `Development::for_region` declines a sample AT the apex (v = 0),
+        // but an imported apex vertex projects a few nanometres up the cone
+        // (v = 2e-9 on CADGenBench part 244), which is not zero: the chart
+        // was then built 20 units deep for a face 2 units high, and the
+        // mesh grew a ring of points a micrometre from the apex -- facets
+        // 0.002 mm long with an aspect ratio of 65000. A sample within the
+        // kernel's coincidence distance of the apex is the apex.
+        if let Some(cone) = inner
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Cone>()
+        {
+            let cos_a = cone.half_angle.cos();
+            let on_the_apex = crate::math::tolerance::authority::TAU_WELD;
+            if cos_a > 0.0 && uv_points.iter().any(|&(_, v)| v / cos_a <= on_the_apex) {
+                return None;
+            }
+        }
         Development::for_region(inner, uv_points).map(|development| Self { inner, development })
     }
 
@@ -1681,6 +1700,268 @@ impl MeshChart for ScaledChart<'_> {
     }
     fn native_uv(&self, x: f64, y: f64) -> (f64, f64) {
         (x / self.su, y / self.sv)
+    }
+    fn rulings_along_v(&self) -> bool {
+        false
+    }
+}
+
+/// A face that TAPERS -- far wider across at one end than at the other, down
+/// to a patch with one side collapsed to a point -- meshed in a chart that
+/// has the face's own shape: `x` is the length along the face, `y` the
+/// distance across it at that station.
+///
+/// With `t` the parameter the face runs along and `c` the one across it,
+/// `x = S(t)` and `y = (c - c0) W(t)`, where `S` is the mean arc length
+/// along and `W(t)` the mean length of a unit step across at station `t`.
+/// A fan-shaped patch (three-sided, written as a four-sided NURBS with one
+/// side of no length) becomes a wedge in this chart, as it is on the
+/// surface.
+///
+/// Why neither other chart will do there: the native chart and the
+/// [`ScaledChart`] (ONE scale each way for the whole face) both show the
+/// fan as a rectangle. Near the collapsed side a step across is hundreds of
+/// times shorter on the surface than the same step at the wide end, so
+/// triangles that are well shaped in the chart are needles on the surface,
+/// refinement never settles, and where the surface also twists the needles
+/// stand edge-on to it (CADGenBench part 240, face 905: 79 facets more than
+/// 70 degrees off the surface within 0.3 mm of the patch's point, one of
+/// them turned over).
+///
+/// Used only as a second attempt, when the face's established chart left
+/// facets turned or could not mesh it at all, and kept only if it does
+/// better ([`prefer_tapered_chart`]).
+pub(crate) struct TaperedChart<'a> {
+    inner: &'a dyn Surface,
+    /// `true`: the face runs along `u` (`t = u`, `c = v`); `false`: along
+    /// `v`.
+    along_u: bool,
+    /// Stations `t0 + k dt`, `k = 0..=TAPER_STATIONS`.
+    t0: f64,
+    dt: f64,
+    /// Arc length along the face at each station (strictly increasing).
+    s: Vec<f64>,
+    /// Length of a unit step across at each station (positive).
+    w: Vec<f64>,
+    /// The cross parameter that maps to `y = 0`, and the range the face
+    /// spans in it.
+    c0: f64,
+    c_range: (f64, f64),
+}
+
+/// Stations along a [`TaperedChart`].
+const TAPER_STATIONS: usize = 64;
+
+/// Lines across the face the station metrics are averaged over.
+const TAPER_LINES: usize = 5;
+
+/// A face tapers when its widest station is more than this many times its
+/// narrowest.
+const TAPER_LIMIT: f64 = 4.0;
+
+/// The narrowest a station is taken to be, as a fraction of the widest: a
+/// side collapsed to a point keeps this much width in the chart, so the
+/// chart stays one-to-one.
+const TAPER_FLOOR: f64 = 1e-3;
+
+impl<'a> TaperedChart<'a> {
+    /// `uv_points`: the face's projected boundary samples (native chart).
+    /// `None` for a developable or periodic surface (they have their own
+    /// charts and seam handling), and for a face that does not taper.
+    pub(crate) fn for_face(inner: &'a dyn Surface, uv_points: &[(f64, f64)]) -> Option<Self> {
+        if inner.is_developable() || inner.period_u().is_some() || inner.period_v().is_some() {
+            return None;
+        }
+        let (mut u_lo, mut u_hi, mut v_lo, mut v_hi) = (
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for &(u, v) in uv_points {
+            u_lo = u_lo.min(u);
+            u_hi = u_hi.max(u);
+            v_lo = v_lo.min(v);
+            v_hi = v_hi.max(v);
+        }
+        if !(u_hi > u_lo && v_hi > v_lo) {
+            return None;
+        }
+        // The metrics at each station, for the face taken as running along
+        // u and as running along v: (speed along, width across).
+        let profile = |along_u: bool| -> Option<(Vec<f64>, Vec<f64>)> {
+            let ((t_lo, t_hi), (c_lo, c_hi)) = if along_u {
+                ((u_lo, u_hi), (v_lo, v_hi))
+            } else {
+                ((v_lo, v_hi), (u_lo, u_hi))
+            };
+            let (mut speed, mut width) = (Vec::new(), Vec::new());
+            for k in 0..=TAPER_STATIONS {
+                let t = t_lo + (t_hi - t_lo) * k as f64 / TAPER_STATIONS as f64;
+                let (mut along, mut across, mut n) = (0.0, 0.0, 0usize);
+                for j in 0..TAPER_LINES {
+                    let c = c_lo + (c_hi - c_lo) * (j as f64 + 0.5) / TAPER_LINES as f64;
+                    let (u, v) = if along_u { (t, c) } else { (c, t) };
+                    if let Ok(e) = Surface::evaluate_full(inner, u, v) {
+                        let (a, b) = if along_u {
+                            (e.du.magnitude(), e.dv.magnitude())
+                        } else {
+                            (e.dv.magnitude(), e.du.magnitude())
+                        };
+                        if a.is_finite() && b.is_finite() {
+                            along += a;
+                            across += b;
+                            n += 1;
+                        }
+                    }
+                }
+                if n == 0 {
+                    return None;
+                }
+                speed.push(along / n as f64);
+                width.push(across / n as f64);
+            }
+            Some((speed, width))
+        };
+        let taper = |width: &[f64]| {
+            let widest = width.iter().copied().fold(0.0, f64::max);
+            let narrowest = width.iter().copied().fold(f64::INFINITY, f64::min);
+            if widest > 0.0 {
+                widest / narrowest.max(widest * TAPER_FLOOR)
+            } else {
+                0.0
+            }
+        };
+        let (by_u, by_v) = (profile(true), profile(false));
+        let (taper_u, taper_v) = (
+            by_u.as_ref().map_or(0.0, |p| taper(&p.1)),
+            by_v.as_ref().map_or(0.0, |p| taper(&p.1)),
+        );
+        let along_u = taper_u >= taper_v;
+        if taper_u.max(taper_v) <= TAPER_LIMIT {
+            return None;
+        }
+        let (speed, mut w) = if along_u { by_u? } else { by_v? };
+        let ((t_lo, t_hi), (c_lo, c_hi)) = if along_u {
+            ((u_lo, u_hi), (v_lo, v_hi))
+        } else {
+            ((v_lo, v_hi), (u_lo, u_hi))
+        };
+        let widest = w.iter().copied().fold(0.0, f64::max);
+        for x in &mut w {
+            *x = x.max(widest * TAPER_FLOOR);
+        }
+        // Arc length along: the speeds integrated, each floored so the
+        // length strictly increases (a station where the surface stands
+        // still along the face would make the chart fold).
+        let fastest = speed.iter().copied().fold(0.0, f64::max);
+        if !(fastest > 0.0 && widest > 0.0) {
+            return None;
+        }
+        let dt = (t_hi - t_lo) / TAPER_STATIONS as f64;
+        let floor = fastest * TAPER_FLOOR;
+        let mut s = Vec::with_capacity(speed.len());
+        let mut total = 0.0;
+        s.push(total);
+        for pair in speed.windows(2) {
+            total += 0.5 * (pair[0].max(floor) + pair[1].max(floor)) * dt;
+            s.push(total);
+        }
+        Some(Self {
+            inner,
+            along_u,
+            t0: t_lo,
+            dt,
+            s,
+            w,
+            c0: 0.5 * (c_lo + c_hi),
+            c_range: (c_lo, c_hi),
+        })
+    }
+
+    /// The station interval `t` falls in and how far through it (clamped to
+    /// the face's range).
+    fn station(&self, t: f64) -> (usize, f64) {
+        let x = ((t - self.t0) / self.dt).clamp(0.0, TAPER_STATIONS as f64);
+        let k = (x.floor() as usize).min(TAPER_STATIONS - 1);
+        (k, x - k as f64)
+    }
+
+    /// Native `(u, v)` -> chart.
+    pub(crate) fn to_chart(&self, (u, v): (f64, f64)) -> (f64, f64) {
+        let (t, c) = if self.along_u { (u, v) } else { (v, u) };
+        let (k, f) = self.station(t);
+        let x = self.s[k] + f * (self.s[k + 1] - self.s[k]);
+        let width = self.w[k] + f * (self.w[k + 1] - self.w[k]);
+        (x, (c - self.c0) * width)
+    }
+
+    /// Chart -> `(t, c)` and the derivatives `(dt/dx, dc/dx, dc/dy)` there
+    /// (`dt/dy` is zero).
+    fn from_chart(&self, x: f64, y: f64) -> ((f64, f64), (f64, f64, f64)) {
+        let x = x.clamp(self.s[0], self.s[TAPER_STATIONS]);
+        // The station interval holding x: `s` is strictly increasing.
+        let k = self
+            .s
+            .partition_point(|&at| at <= x)
+            .saturating_sub(1)
+            .min(TAPER_STATIONS - 1);
+        let span = self.s[k + 1] - self.s[k];
+        let f = ((x - self.s[k]) / span).clamp(0.0, 1.0);
+        let t = self.t0 + (k as f64 + f) * self.dt;
+        let width = self.w[k] + f * (self.w[k + 1] - self.w[k]);
+        let dt_dx = self.dt / span;
+        let dwidth_dx = (self.w[k + 1] - self.w[k]) / span;
+        let offset = y / width;
+        let c = (self.c0 + offset).clamp(self.c_range.0, self.c_range.1);
+        ((t, c), (dt_dx, -offset * dwidth_dx / width, 1.0 / width))
+    }
+
+    fn native(&self, x: f64, y: f64) -> (f64, f64) {
+        let ((t, c), _) = self.from_chart(x, y);
+        if self.along_u {
+            (t, c)
+        } else {
+            (c, t)
+        }
+    }
+}
+
+impl MeshChart for TaperedChart<'_> {
+    fn evaluate_full(&self, x: f64, y: f64) -> MathResult<SurfacePoint> {
+        let ((t, c), (dt_dx, dc_dx, dc_dy)) = self.from_chart(x, y);
+        let (u, v) = if self.along_u { (t, c) } else { (c, t) };
+        let mut e = Surface::evaluate_full(self.inner, u, v)?;
+        let (along, across) = if self.along_u {
+            (e.du, e.dv)
+        } else {
+            (e.dv, e.du)
+        };
+        e.du = along * dt_dx + across * dc_dx;
+        e.dv = across * dc_dy;
+        // Second derivatives in this chart: not read by Steps 1-5 (as in
+        // `DevelopedChart`); zero rather than a wrong chain-rule value.
+        e.duu = Vector3::ZERO;
+        e.duv = Vector3::ZERO;
+        e.dvv = Vector3::ZERO;
+        Ok(e)
+    }
+    fn point_at(&self, x: f64, y: f64) -> MathResult<Point3> {
+        let (u, v) = self.native(x, y);
+        Surface::point_at(self.inner, u, v)
+    }
+    fn normal_at(&self, x: f64, y: f64) -> MathResult<Vector3> {
+        let (u, v) = self.native(x, y);
+        Surface::normal_at(self.inner, u, v)
+    }
+    fn is_developable(&self) -> bool {
+        false
+    }
+    fn type_name(&self) -> &'static str {
+        Surface::type_name(self.inner)
+    }
+    fn native_uv(&self, x: f64, y: f64) -> (f64, f64) {
+        self.native(x, y)
     }
     fn rulings_along_v(&self) -> bool {
         false
@@ -2532,7 +2813,18 @@ fn triangulate_segments(
     use spade::handles::FixedVertexHandle;
     use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
-    let vertices: Vec<Point2<f64>> = pts.iter().map(|&(u, v)| Point2::new(u, v)).collect();
+    // A coordinate that is not zero but smaller than the triangulator can
+    // represent (2^-142) is refused outright (`TooSmall`). Such a value is
+    // rounding noise on a boundary sample that sits ON a chart axis: a
+    // cylinder face whose lowest edge is at v = 0 projected one sample a
+    // denormal away from it, the whole face was refused, and it fell back to the
+    // untrimmed grid -- a band covering what is not the face, crossing its
+    // neighbour (CADGenBench part 243, face 53: the wedge where a thread
+    // runs out). It is zero, and is handed over as zero.
+    let vertices: Vec<Point2<f64>> = pts
+        .iter()
+        .map(|&(u, v)| spade::mitigate_underflow(Point2::new(u, v)))
+        .collect();
     let segments = segments.to_vec();
     let mut conflicts = 0usize;
     let cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::try_bulk_load_cdt(
@@ -3099,6 +3391,186 @@ fn flip_edges_under_turned_facets<S: MeshChart + ?Sized>(
             triangles[other] = new_two;
             changed.insert(t);
             changed.insert(other);
+        }
+        if changed.is_empty() {
+            break;
+        }
+    }
+    let (turned, _) = turned_facets(
+        &triangles, pts2d, outer, inners, surface, face, chart_sign, cache,
+    );
+    if turned == 0 {
+        return (triangles, turned);
+    }
+    walk_points_out_from_under_facets(
+        outer, inners, pts2d, triangles, surface, face, chart_sign, cache,
+    )
+}
+
+/// Passes of [`walk_points_out_from_under_facets`]: a point walks one facet
+/// per pass.
+const TURNED_FACET_WALK_PASSES: usize = 64;
+
+/// The area of facet `tri` that lies turned over on the surface -- its area
+/// times how squarely it faces AGAINST the surface, zero for a facet facing
+/// with it -- and how squarely it faces ([`facet_facing`]). `None` where it
+/// cannot be judged.
+#[allow(clippy::too_many_arguments)]
+fn turned_over_area<S: MeshChart + ?Sized>(
+    tri: [usize; 3],
+    pts2d: &[(f64, f64)],
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    surface: &S,
+    face: &Face,
+    chart_sign: i32,
+    cache: &mut FidelityCache,
+) -> Option<(f64, f64)> {
+    let facing = facet_facing(tri, pts2d, outer, inners, surface, face, chart_sign, cache)?;
+    let p0 = cache.position(tri[0], outer, inners, pts2d, surface).ok()?;
+    let p1 = cache.position(tri[1], outer, inners, pts2d, surface).ok()?;
+    let p2 = cache.position(tri[2], outer, inners, pts2d, surface).ok()?;
+    let area = 0.5 * (p1 - p0).cross(&(p2 - p0)).magnitude();
+    Some((area * (-facing).max(0.0), facing))
+}
+
+/// What is left turned after [`flip_edges_under_turned_facets`]'s swaps: a
+/// point that is on one side of a row of facets in the chart and on the
+/// other side of them on the surface.
+///
+/// Where the chart's parameter lines bow within the surface, a straight
+/// facet edge joining two points far apart along them cuts across the bow,
+/// and a point just beside that edge in the chart lies beyond it on the
+/// surface -- under the facet across the edge, and under the next one of
+/// the fan, and the next (CADGenBench part 240, face 406: a point 0.004 mm
+/// from the face's edge, lying under four facets of a fan 0.14 mm long).
+/// No single swap cures that: swapping the edge the point is beyond only
+/// moves the turned facet one step along the fan, and the rule above
+/// refuses a swap that leaves a facet turned.
+///
+/// Here such a swap is taken when it is a step in the right direction:
+/// the area lying turned over on the surface must get strictly smaller.
+/// That quantity is zero exactly when no facet is turned, and a swap that
+/// lowers it can never be undone by a later one, so the walk ends -- with
+/// the point out from under the fan, or stuck with less turned over than
+/// before. Both new facets must still keep the chart's winding and lie IN
+/// the surface, facing it or squarely against it ([`FLIPPED_FACET_MIN_FACING`]
+/// either way): a facet standing edge-on is never made, turned or not.
+#[allow(clippy::too_many_arguments)]
+fn walk_points_out_from_under_facets<S: MeshChart + ?Sized>(
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    pts2d: &[(f64, f64)],
+    mut triangles: Vec<[usize; 3]>,
+    surface: &S,
+    face: &Face,
+    chart_sign: i32,
+    cache: &mut FidelityCache,
+) -> (Vec<[usize; 3]>, usize) {
+    let area_uv = |t: [usize; 3]| {
+        let (a, b, c) = (pts2d[t[0]], pts2d[t[1]], pts2d[t[2]]);
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    let edge_key = |a: usize, b: usize| if a < b { (a, b) } else { (b, a) };
+    for _pass in 0..TURNED_FACET_WALK_PASSES {
+        let mut users: std::collections::HashMap<(usize, usize), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (t, tri) in triangles.iter().enumerate() {
+            for k in 0..3 {
+                users
+                    .entry(edge_key(tri[k], tri[(k + 1) % 3]))
+                    .or_default()
+                    .push(t);
+            }
+        }
+        let mut changed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for t in 0..triangles.len() {
+            if changed.contains(&t) {
+                continue;
+            }
+            let tri = triangles[t];
+            let Some((turned_over, _)) =
+                turned_over_area(tri, pts2d, outer, inners, surface, face, chart_sign, cache)
+            else {
+                continue;
+            };
+            if turned_over <= 0.0 {
+                continue;
+            }
+            let corners = (
+                cache.position(tri[0], outer, inners, pts2d, surface),
+                cache.position(tri[1], outer, inners, pts2d, surface),
+                cache.position(tri[2], outer, inners, pts2d, surface),
+            );
+            let (Ok(p0), Ok(p1), Ok(p2)) = corners else {
+                continue;
+            };
+            // Its edges, longest first, each as the corner opposite it.
+            let mut by_length = [
+                ((p1 - p2).magnitude(), 0usize),
+                ((p2 - p0).magnitude(), 1usize),
+                ((p0 - p1).magnitude(), 2usize),
+            ];
+            by_length.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+            for (_, k) in by_length {
+                let (c, a, b) = (tri[k], tri[(k + 1) % 3], tri[(k + 2) % 3]);
+                let Some(across) = users.get(&edge_key(a, b)) else {
+                    continue;
+                };
+                let [first, second] = across[..] else {
+                    continue; // a boundary segment, or not a manifold edge
+                };
+                let other = if first == t { second } else { first };
+                if other == t || changed.contains(&other) {
+                    continue;
+                }
+                let Some(&d) = triangles[other].iter().find(|&&i| i != a && i != b) else {
+                    continue;
+                };
+                let (new_one, new_two) = ([c, a, d], [c, d, b]);
+                let winding = area_uv(tri);
+                if winding == 0.0
+                    || area_uv(new_one) * winding <= 0.0
+                    || area_uv(new_two) * winding <= 0.0
+                {
+                    continue; // the quadrilateral is not convex in the chart
+                }
+                let Some((other_over, _)) = turned_over_area(
+                    triangles[other],
+                    pts2d,
+                    outer,
+                    inners,
+                    surface,
+                    face,
+                    chart_sign,
+                    cache,
+                ) else {
+                    continue;
+                };
+                let (Some((one_over, one_facing)), Some((two_over, two_facing))) = (
+                    turned_over_area(
+                        new_one, pts2d, outer, inners, surface, face, chart_sign, cache,
+                    ),
+                    turned_over_area(
+                        new_two, pts2d, outer, inners, surface, face, chart_sign, cache,
+                    ),
+                ) else {
+                    continue;
+                };
+                if one_facing.abs() < FLIPPED_FACET_MIN_FACING
+                    || two_facing.abs() < FLIPPED_FACET_MIN_FACING
+                {
+                    continue; // one would stand edge-on to the surface
+                }
+                if one_over + two_over >= turned_over + other_over {
+                    continue; // not a step out from under
+                }
+                triangles[t] = new_one;
+                triangles[other] = new_two;
+                changed.insert(t);
+                changed.insert(other);
+                break;
+            }
         }
         if changed.is_empty() {
             break;
@@ -4207,6 +4679,11 @@ pub(crate) fn tessellate_curved_cdt(
     }
     // A doubly curved face whose chart is strongly stretched one way is
     // meshed in the chart rescaled to equal step lengths (`ScaledChart`).
+    // The boundary in the surface's own (u, v), kept for a second attempt in
+    // the face's tapered chart should the established one fail.
+    let native_loops =
+        (!surface.is_developable() && surface.period_u().is_none() && surface.period_v().is_none())
+            .then(|| (outer.clone(), inners.clone()));
     if let Some(chart) = ScaledChart::for_face(surface, &all_uv, false) {
         for lp in std::iter::once(&mut outer).chain(inners.iter_mut()) {
             for p in &mut lp.points_uv {
@@ -4222,27 +4699,31 @@ pub(crate) fn tessellate_curved_cdt(
             ),
             |(ul, uh, vl, vh), &(u, v)| (ul.min(u), uh.max(u), vl.min(v), vh.max(v)),
         );
+        let mut scaled = TriangleMesh::new();
         let mut attempt = ChartAttempt::default();
-        let (vertex_base, triangle_base) = (mesh.vertices.len() as u32, mesh.triangles.len());
         let outcome = mesh_in_chart(
             &chart,
             face,
             params,
-            mesh,
+            &mut scaled,
             outer,
             inners,
             bbox,
             &mut attempt,
         );
-        return settle_attempt(
-            cache,
+        let (mut chosen, outcome, attempt) = prefer_tapered_chart(
+            surface,
             face,
-            mesh,
-            vertex_base,
-            triangle_base,
+            params,
+            native_loops,
+            &all_uv,
+            scaled,
             outcome,
             attempt,
         );
+        settle_attempt(cache, face, &mut chosen, 0, 0, outcome, attempt)?;
+        append_mesh(mesh, &chosen);
+        return Ok(());
     }
     // Every other face is meshed in its native chart. A torus band whose
     // chart is strongly stretched (CADGenBench 141: R 115 / r 1, so equal
@@ -4269,7 +4750,19 @@ pub(crate) fn tessellate_curved_cdt(
     let turned = match &native_outcome {
         Ok(turned) => *turned,
         Err(_) => {
-            return settle_attempt(cache, face, &mut native, 0, 0, native_outcome, attempt);
+            let (mut chosen, outcome, attempt) = prefer_tapered_chart(
+                surface,
+                face,
+                params,
+                native_loops,
+                &all_uv,
+                native,
+                native_outcome,
+                attempt,
+            );
+            settle_attempt(cache, face, &mut chosen, 0, 0, outcome, attempt)?;
+            append_mesh(mesh, &chosen);
+            return Ok(());
         }
     };
     let mut kept_turned = turned;
@@ -4313,10 +4806,113 @@ pub(crate) fn tessellate_curved_cdt(
         }
     }
     // The mesh chosen as it always was; only then, for facets still turned,
-    // its swapped division.
-    settle_attempt(cache, face, &mut chosen, 0, 0, Ok(kept_turned), attempt)?;
+    // the face's tapered chart if it has one, and the swapped division of
+    // whichever stands.
+    let (mut chosen, outcome, attempt) = prefer_tapered_chart(
+        surface,
+        face,
+        params,
+        native_loops,
+        &all_uv,
+        chosen,
+        Ok(kept_turned),
+        attempt,
+    );
+    settle_attempt(cache, face, &mut chosen, 0, 0, outcome, attempt)?;
     append_mesh(mesh, &chosen);
     Ok(())
+}
+
+/// The fewest turned facets a meshing attempt can be settled with: its own
+/// count, or that of the swapped division it offers ([`ChartAttempt`]).
+fn least_turned(turned: usize, attempt: &ChartAttempt) -> usize {
+    let swapped = attempt.swapped.as_ref().map_or(turned, |m| m.turned);
+    turned.min(swapped)
+}
+
+/// The face's established attempt, or -- only where that one failed, leaving
+/// facets turned however it is settled or meshing nothing at all -- the
+/// face meshed again in its [`TaperedChart`], if it has one and that does
+/// better: fewer turned facets, or a mesh where there was none.
+///
+/// `native_loops`: the face's boundary in the surface's own `(u, v)`, as
+/// projected (the established attempt consumed its copy, in its own chart).
+#[allow(clippy::too_many_arguments)]
+fn prefer_tapered_chart(
+    surface: &dyn Surface,
+    face: &Face,
+    params: &TessellationParams,
+    native_loops: Option<(ProjectedLoop, Vec<ProjectedLoop>)>,
+    all_uv: &[(f64, f64)],
+    established: TriangleMesh,
+    outcome: Result<usize, CurvedCdtError>,
+    attempt: ChartAttempt,
+) -> (TriangleMesh, Result<usize, CurvedCdtError>, ChartAttempt) {
+    let failed = match &outcome {
+        Ok(turned) => least_turned(*turned, &attempt) > 0,
+        Err(_) => true,
+    };
+    let (true, Some((mut outer, mut inners))) = (failed, native_loops) else {
+        return (established, outcome, attempt);
+    };
+    let Some(chart) = TaperedChart::for_face(surface, all_uv) else {
+        return (established, outcome, attempt);
+    };
+    for lp in std::iter::once(&mut outer).chain(inners.iter_mut()) {
+        for p in &mut lp.points_uv {
+            *p = chart.to_chart(*p);
+        }
+    }
+    let bbox = outer.points_uv.iter().fold(
+        (
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ),
+        |(ul, uh, vl, vh), &(u, v)| (ul.min(u), uh.max(u), vl.min(v), vh.max(v)),
+    );
+    let mut tapered = TriangleMesh::new();
+    let mut tapered_attempt = ChartAttempt::default();
+    let tapered_outcome = mesh_in_chart(
+        &chart,
+        face,
+        params,
+        &mut tapered,
+        outer,
+        inners,
+        bbox,
+        &mut tapered_attempt,
+    );
+    let better = match (&outcome, &tapered_outcome) {
+        (Ok(turned), Ok(tapered_turned)) => {
+            least_turned(*tapered_turned, &tapered_attempt) < least_turned(*turned, &attempt)
+        }
+        (Err(_), Ok(_)) => !tapered.triangles.is_empty(),
+        (_, Err(_)) => false,
+    };
+    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+        eprintln!(
+            "[curved-cdt] face {} tapered chart (along {}): established {:?}, tapered {:?} -> {}",
+            face.id,
+            if chart.along_u { "u" } else { "v" },
+            outcome.as_ref().map(|t| least_turned(*t, &attempt)).ok(),
+            tapered_outcome
+                .as_ref()
+                .map(|t| least_turned(*t, &tapered_attempt))
+                .ok(),
+            if better {
+                "tapered kept"
+            } else {
+                "established kept"
+            }
+        );
+    }
+    if better {
+        (tapered, tapered_outcome, tapered_attempt)
+    } else {
+        (established, outcome, attempt)
+    }
 }
 
 /// Append `part`'s vertices and triangles to `mesh`, rebasing the indices.
@@ -4703,31 +5299,63 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
         }
     }
 
+    // `ROSHERA_TESS_DUMP_FACE=<face id>`: every facet of that face as it is
+    // about to be emitted -- corners in the chart and in space, and how
+    // squarely it faces the surface (negative: turned).
+    if std::env::var("ROSHERA_TESS_DUMP_FACE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        == Some(face.id)
+    {
+        let boundary =
+            outer.points_3d.len() + inners.iter().map(|l| l.points_3d.len()).sum::<usize>();
+        eprintln!(
+            "[tess-dump] face {} {} chart_sign {chart_sign} turned {turned} boundary points {boundary}",
+            face.id,
+            surface.type_name()
+        );
+        for tri in &final_triangles {
+            let facing = facet_facing(
+                *tri,
+                &final_pts2d,
+                &outer,
+                &inners,
+                surface,
+                face,
+                chart_sign,
+                &mut cache,
+            );
+            let corner = |i: usize, cache: &mut FidelityCache| {
+                let p = cache
+                    .position(i, &outer, &inners, &final_pts2d, surface)
+                    .ok();
+                let (x, y) = final_pts2d[i];
+                (i, surface.native_uv(x, y), p)
+            };
+            eprintln!(
+                "[tess-dump]   facing {facing:?} {:?} {:?} {:?}",
+                corner(tri[0], &mut cache),
+                corner(tri[1], &mut cache),
+                corner(tri[2], &mut cache)
+            );
+        }
+    }
+
     // Step 5 — mesh emission. Vertex base offset must be recorded so
     // triangle indices are rebased into `mesh.vertices` numbering.
     let t_refine = t_stage.elapsed();
     let t_stage = std::time::Instant::now();
-    let vertex_base = mesh.vertices.len() as u32;
-    for (i, &(u, v)) in final_pts2d.iter().enumerate() {
-        let position = cache.position(i, &outer, &inners, &final_pts2d, surface)?;
-        let normal = cache.normal(surface, face, u, v).unwrap_or(Vector3::Z);
-        mesh.add_vertex(MeshVertex {
-            position,
-            normal,
-            uv: Some(surface.native_uv(u, v)),
-        });
-    }
-
-    for tri in &final_triangles {
-        let a = vertex_base + tri[0] as u32;
-        let b = vertex_base + tri[1] as u32;
-        let c = vertex_base + tri[2] as u32;
-        if keep_winding {
-            mesh.add_triangle(a, b, c);
-        } else {
-            mesh.add_triangle(a, c, b);
-        }
-    }
+    emit_chart_mesh(
+        mesh,
+        &final_pts2d,
+        &final_triangles,
+        &outer,
+        &inners,
+        surface,
+        face,
+        keep_winding,
+        &mut cache,
+    )?;
     if tess_profile_enabled() {
         eprintln!(
             "[tess-profile] face {} steiner {:.1?} first-cdt {:.1?} refine {:.1?} emit {:.1?}              ({} triangles) scan: fidelity {:.1?} skinny {:.1?} filter {:.1?} encroach {:.1?}",
@@ -4745,6 +5373,46 @@ fn mesh_in_chart<S: MeshChart + ?Sized>(
     }
 
     Ok(turned)
+}
+
+/// Step 5 of [`mesh_in_chart`]: append a chart triangulation to `mesh` --
+/// every point as a vertex (boundary points at their edge samples, the rest
+/// on the surface), every triangle wound to face outward.
+#[allow(clippy::too_many_arguments)]
+fn emit_chart_mesh<S: MeshChart + ?Sized>(
+    mesh: &mut TriangleMesh,
+    pts2d: &[(f64, f64)],
+    triangles: &[[usize; 3]],
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    surface: &S,
+    face: &Face,
+    keep_winding: bool,
+    cache: &mut FidelityCache,
+) -> Result<(), CurvedCdtError> {
+    // Vertex base offset: triangle indices are rebased into
+    // `mesh.vertices` numbering.
+    let vertex_base = mesh.vertices.len() as u32;
+    for (i, &(u, v)) in pts2d.iter().enumerate() {
+        let position = cache.position(i, outer, inners, pts2d, surface)?;
+        let normal = cache.normal(surface, face, u, v).unwrap_or(Vector3::Z);
+        mesh.add_vertex(MeshVertex {
+            position,
+            normal,
+            uv: Some(surface.native_uv(u, v)),
+        });
+    }
+    for tri in triangles {
+        let a = vertex_base + tri[0] as u32;
+        let b = vertex_base + tri[1] as u32;
+        let c = vertex_base + tri[2] as u32;
+        if keep_winding {
+            mesh.add_triangle(a, b, c);
+        } else {
+            mesh.add_triangle(a, c, b);
+        }
+    }
+    Ok(())
 }
 
 /// `ROSHERA_TESS_PROFILE` set: print per-stage timings of each curved face.
@@ -4774,6 +5442,10 @@ impl Drop for RefineProfile {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "curved_cdt_bent_chart_tests.rs"]
+mod bent_chart_tests;
 
 #[cfg(test)]
 mod tests {
